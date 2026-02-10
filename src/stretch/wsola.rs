@@ -309,38 +309,33 @@ impl Wsola {
         let fft_fwd = self.planner.plan_fft_forward(fft_size);
         let fft_inv = self.planner.plan_fft_inverse(fft_size);
 
-        // Resize and fill reusable buffers (grow-only, never shrink)
+        // Resize and fill reusable buffers (grow-only, never shrink).
+        // Zero-fill first, then copy signal data — avoids per-element branch
+        // which inhibits auto-vectorization.
         self.fft_ref_buf.resize(fft_size, COMPLEX_ZERO);
-        for (i, slot) in self.fft_ref_buf.iter_mut().enumerate() {
-            *slot = if i < ref_signal.len() {
-                Complex::new(ref_signal[i], 0.0)
-            } else {
-                COMPLEX_ZERO
-            };
+        for slot in self.fft_ref_buf.iter_mut() {
+            *slot = COMPLEX_ZERO;
+        }
+        for i in 0..ref_signal.len() {
+            self.fft_ref_buf[i] = Complex::new(ref_signal[i], 0.0);
         }
 
         self.fft_search_buf.resize(fft_size, COMPLEX_ZERO);
-        for (i, slot) in self.fft_search_buf.iter_mut().enumerate() {
-            *slot = if i < search_signal.len() {
-                Complex::new(search_signal[i], 0.0)
-            } else {
-                COMPLEX_ZERO
-            };
+        for slot in self.fft_search_buf.iter_mut() {
+            *slot = COMPLEX_ZERO;
+        }
+        for i in 0..search_signal.len() {
+            self.fft_search_buf[i] = Complex::new(search_signal[i], 0.0);
         }
 
         // Forward FFT
         fft_fwd.process(&mut self.fft_ref_buf);
         fft_fwd.process(&mut self.fft_search_buf);
 
-        // Multiply conj(Ref) * Search into corr_buf
+        // Multiply conj(Ref) * Search into corr_buf (index-based for auto-vectorization)
         self.fft_corr_buf.resize(fft_size, COMPLEX_ZERO);
-        for ((corr, r), s) in self
-            .fft_corr_buf
-            .iter_mut()
-            .zip(self.fft_ref_buf.iter())
-            .zip(self.fft_search_buf.iter())
-        {
-            *corr = r.conj() * s;
+        for i in 0..fft_size {
+            self.fft_corr_buf[i] = self.fft_ref_buf[i].conj() * self.fft_search_buf[i];
         }
 
         // Inverse FFT in-place
@@ -348,28 +343,31 @@ impl Wsola {
     }
 
     /// Overlap-adds a segment from input into output with raised-cosine crossfade.
+    ///
+    /// Split into two separate loops (crossfade region vs copy region) so each
+    /// loop body is branch-free and amenable to auto-vectorization.
     #[inline]
     fn overlap_add(&self, input: &[f32], output: &mut [f32], input_pos: usize, output_pos: usize) {
         let segment_end = (input_pos + self.segment_size).min(input.len());
         let segment_len = segment_end - input_pos;
+        let out_avail = output.len().saturating_sub(output_pos);
+        let len = segment_len.min(out_avail);
 
-        for i in 0..segment_len {
-            let out_idx = output_pos + i;
-            if out_idx >= output.len() {
-                break;
-            }
+        let overlap_len = self.overlap_size.min(len);
+        let inv_overlap = 1.0 / self.overlap_size as f32;
 
-            if i < self.overlap_size {
-                // Crossfade region
-                let fade = i as f32 / self.overlap_size as f32;
-                let fade_in = fade;
-                let fade_out = 1.0 - fade;
-                output[out_idx] = output[out_idx] * fade_out + input[input_pos + i] * fade_in;
-            } else {
-                // Non-overlap region: just copy
-                output[out_idx] = input[input_pos + i];
-            }
+        // Crossfade region: branch-free linear fade
+        for i in 0..overlap_len {
+            let fade_in = i as f32 * inv_overlap;
+            let fade_out = 1.0 - fade_in;
+            output[output_pos + i] =
+                output[output_pos + i] * fade_out + input[input_pos + i] * fade_in;
         }
+
+        // Non-overlap region: direct copy
+        let copy_start = overlap_len;
+        output[output_pos + copy_start..output_pos + len]
+            .copy_from_slice(&input[input_pos + copy_start..input_pos + len]);
     }
 }
 

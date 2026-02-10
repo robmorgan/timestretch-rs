@@ -194,17 +194,12 @@ impl PhaseVocoder {
             self.reconstruct_spectrum(num_bins);
             fft_inverse.process(&mut self.fft_buffer);
 
-            // Overlap-add with synthesis window
+            // Overlap-add with synthesis window (structured for auto-vectorization)
             let frame_len = (synthesis_pos + self.fft_size).min(output_len) - synthesis_pos;
-            let out_slice = &mut self.output_buf[synthesis_pos..synthesis_pos + frame_len];
-            let ws_slice = &mut self.window_sum_buf[synthesis_pos..synthesis_pos + frame_len];
-            for ((out, ws), (fft, &w)) in out_slice.iter_mut().zip(ws_slice.iter_mut()).zip(
-                self.fft_buffer[..frame_len]
-                    .iter()
-                    .zip(&self.window[..frame_len]),
-            ) {
-                *out += fft.re * norm * w;
-                *ws += w * w;
+            for i in 0..frame_len {
+                let w = self.window[i];
+                self.output_buf[synthesis_pos + i] += self.fft_buffer[i].re * norm * w;
+                self.window_sum_buf[synthesis_pos + i] += w * w;
             }
         }
 
@@ -214,17 +209,15 @@ impl PhaseVocoder {
     }
 
     /// Windows the input frame and transforms to frequency domain.
+    #[inline]
     fn analyze_frame(
         &mut self,
         input_frame: &[f32],
         fft_forward: &std::sync::Arc<dyn rustfft::Fft<f32>>,
     ) {
-        for (buf, (&sample, &win)) in self
-            .fft_buffer
-            .iter_mut()
-            .zip(input_frame.iter().zip(self.window.iter()))
-        {
-            *buf = Complex::new(sample * win, 0.0);
+        let len = input_frame.len().min(self.fft_buffer.len());
+        for i in 0..len {
+            self.fft_buffer[i] = Complex::new(input_frame[i] * self.window[i], 0.0);
         }
         fft_forward.process(&mut self.fft_buffer);
     }
@@ -234,6 +227,7 @@ impl PhaseVocoder {
     /// Sub-bass bins (below `sub_bass_bin`) use rigid phase propagation to prevent
     /// phase cancellation in the critical sub-bass region. All other bins use
     /// standard phase vocoder deviation tracking.
+    #[inline]
     fn advance_phases(&mut self, num_bins: usize, hop_ratio: f32) {
         for bin in 0..num_bins {
             let c = self.fft_buffer[bin];
@@ -258,13 +252,11 @@ impl PhaseVocoder {
 
     /// Reconstructs the complex spectrum from magnitudes and phases,
     /// then mirrors negative frequencies for inverse FFT.
+    #[inline]
     fn reconstruct_spectrum(&mut self, num_bins: usize) {
-        for ((buf, &mag), &phase) in self.fft_buffer[..num_bins]
-            .iter_mut()
-            .zip(self.magnitudes[..num_bins].iter())
-            .zip(self.new_phases[..num_bins].iter())
-        {
-            *buf = Complex::from_polar(mag, phase);
+        for i in 0..num_bins {
+            self.fft_buffer[i] =
+                Complex::from_polar(self.magnitudes[i], self.new_phases[i]);
         }
         for bin in 1..num_bins - 1 {
             self.fft_buffer[self.fft_size - bin] = self.fft_buffer[bin].conj();
@@ -273,11 +265,13 @@ impl PhaseVocoder {
 
     /// Normalizes output by window sum, clamping to prevent amplification in
     /// low-overlap regions (occurs when synthesis hop > analysis hop).
+    #[inline]
     fn normalize_output(output: &mut [f32], window_sum: &[f32]) {
         let max_window_sum = window_sum.iter().copied().fold(0.0f32, f32::max);
         let min_window_sum = (max_window_sum * WINDOW_SUM_FLOOR_RATIO).max(WINDOW_SUM_EPSILON);
-        for (sample, &ws) in output.iter_mut().zip(window_sum.iter()) {
-            *sample /= ws.max(min_window_sum);
+        let len = output.len().min(window_sum.len());
+        for i in 0..len {
+            output[i] /= window_sum[i].max(min_window_sum);
         }
     }
 }
