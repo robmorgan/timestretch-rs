@@ -390,6 +390,16 @@ impl AsRef<[Sample]> for AudioBuffer {
     }
 }
 
+/// Extracts the underlying sample data, consuming the buffer.
+///
+/// This is useful for passing audio data to APIs that expect raw `Vec<f32>`.
+impl From<AudioBuffer> for Vec<Sample> {
+    #[inline]
+    fn from(buffer: AudioBuffer) -> Self {
+        buffer.data
+    }
+}
+
 /// An iterator over frames of an [`AudioBuffer`].
 ///
 /// Each item is a slice of samples for one frame: a single `&[f32]` for mono,
@@ -940,6 +950,15 @@ impl StretchParams {
     /// workflows and consistent loudness across different stretch ratios.
     pub fn with_normalize(mut self, enabled: bool) -> Self {
         self.normalize = enabled;
+        self
+    }
+
+    /// Sets the stretch ratio, overriding the value passed to [`new()`](Self::new).
+    ///
+    /// Useful for adjusting the ratio after applying a preset or other
+    /// builder methods.
+    pub fn with_stretch_ratio(mut self, ratio: f64) -> Self {
+        self.stretch_ratio = ratio;
         self
     }
 
@@ -1617,5 +1636,54 @@ mod tests {
 
         let params = StretchParams::new(1.5);
         assert!(!params.normalize);
+    }
+
+    #[test]
+    fn test_with_stretch_ratio() {
+        let params = StretchParams::new(1.0)
+            .with_preset(EdmPreset::DjBeatmatch)
+            .with_stretch_ratio(0.984375);
+        assert!((params.stretch_ratio - 0.984375).abs() < 1e-10);
+        assert_eq!(params.preset, Some(EdmPreset::DjBeatmatch));
+    }
+
+    #[test]
+    fn test_from_audio_buffer_to_vec() {
+        let data = vec![1.0, 2.0, 3.0];
+        let buf = AudioBuffer::from_mono(data.clone(), 44100);
+        let extracted: Vec<f32> = buf.into();
+        assert_eq!(extracted, data);
+    }
+
+    #[test]
+    fn test_from_audio_buffer_to_vec_stereo() {
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let buf = AudioBuffer::from_stereo(data.clone(), 48000);
+        let extracted: Vec<f32> = Vec::from(buf);
+        assert_eq!(extracted, data);
+    }
+
+    #[test]
+    fn test_audio_buffer_debug() {
+        let buf = AudioBuffer::from_mono(vec![0.0; 100], 44100);
+        let debug_str = format!("{:?}", buf);
+        assert!(debug_str.contains("AudioBuffer"));
+        assert!(debug_str.contains("sample_rate: 44100"));
+    }
+
+    #[test]
+    fn test_stretch_params_debug() {
+        let params = StretchParams::new(1.5);
+        let debug_str = format!("{:?}", params);
+        assert!(debug_str.contains("StretchParams"));
+        assert!(debug_str.contains("stretch_ratio"));
+    }
+
+    #[test]
+    fn test_frame_iter_debug() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 2.0], 44100);
+        let iter = buf.frames();
+        let debug_str = format!("{:?}", iter);
+        assert!(debug_str.contains("FrameIter"));
     }
 }

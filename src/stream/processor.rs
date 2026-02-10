@@ -285,7 +285,7 @@ impl StreamProcessor {
     ///
     /// When enabled, the processor uses the full hybrid algorithm (transient
     /// detection + WSOLA for transients + phase vocoder for tonal content),
-    /// matching the quality of the batch [`stretch()`](crate::stretch) API.
+    /// matching the quality of the batch [`stretch()`](crate::stretch()) API.
     /// This produces better results for EDM audio with kicks and transients,
     /// but has higher latency since it processes all accumulated input at once.
     ///
@@ -696,7 +696,10 @@ mod tests {
             total_output.extend_from_slice(&out);
         }
 
-        assert!(!total_output.is_empty(), "Hybrid mode should produce output");
+        assert!(
+            !total_output.is_empty(),
+            "Hybrid mode should produce output"
+        );
     }
 
     #[test]
@@ -776,7 +779,10 @@ mod tests {
             total_output.extend_from_slice(&out);
         }
 
-        assert!(!total_output.is_empty(), "Hybrid stereo should produce output");
+        assert!(
+            !total_output.is_empty(),
+            "Hybrid stereo should produce output"
+        );
         assert_eq!(
             total_output.len() % 2,
             0,
