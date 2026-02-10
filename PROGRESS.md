@@ -528,6 +528,26 @@
 - [x] Removed dead `read_i16_le()` helper (wav.rs)
 - [x] All 529 tests passing (205 unit + 302 integration + 22 doc), zero clippy warnings
 
+## Agent-2: Hybrid Streaming Mode
+- [x] Added `use_hybrid` field to `StreamProcessor` for full hybrid algorithm in streaming
+  - When enabled, uses HybridStretcher (transient detection + WSOLA + PV + band splitting)
+  - Deinterleaves, processes per-channel through HybridStretcher, reinterleaves
+  - PV-only remains default for lowest latency
+- [x] Added `set_hybrid_mode(bool)` and `is_hybrid_mode()` API methods
+- [x] `process_hybrid_path()` internal method for hybrid processing pipeline
+- [x] Hybrid mode persists across `reset()` calls (it's a mode setting, not state)
+- [x] 6 new unit tests: mode toggle, output, stretch ratio, NaN rejection, stereo
+- [x] 15 new integration tests in `tests/hybrid_streaming.rs`:
+  - Basic mono/stereo/compression/48kHz hybrid streaming
+  - Hybrid streaming vs batch output comparison (length, RMS)
+  - EDM signal quality tests (kicks + hi-hats + sub-bass + pad)
+  - DJ beatmatch with EDM signal
+  - All 5 EDM presets in hybrid streaming mode
+  - Hybrid vs PV-only mode comparison
+  - Flush, reset, ratio change mid-stream
+- [x] Total: 550+ tests, all passing
+- [x] Zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
