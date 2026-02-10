@@ -45,6 +45,29 @@ pub fn bin_to_freq(bin: usize, fft_size: usize, sample_rate: u32) -> f32 {
     bin as f32 * sample_rate as f32 / fft_size as f32
 }
 
+/// Frequency band index for bin classification.
+#[derive(Debug, Clone, Copy)]
+enum Band {
+    SubBass,
+    Low,
+    Mid,
+    High,
+}
+
+/// Classifies an FFT bin into its frequency band.
+#[inline]
+fn classify_bin(bin: usize, sub_bass_bin: usize, low_bin: usize, mid_bin: usize) -> Band {
+    if bin < sub_bass_bin {
+        Band::SubBass
+    } else if bin < low_bin {
+        Band::Low
+    } else if bin < mid_bin {
+        Band::Mid
+    } else {
+        Band::High
+    }
+}
+
 /// Splits a frequency-domain signal into bands by zeroing out-of-band bins.
 ///
 /// Returns (sub_bass, low, mid, high) spectra, each the same length as input.
@@ -65,14 +88,11 @@ pub fn split_spectrum_into_bands(
     let mut high = vec![Complex::new(0.0f32, 0.0); spectrum.len()];
 
     for bin in 0..num_bins.min(spectrum.len()) {
-        if bin < sub_bass_bin {
-            sub_bass[bin] = spectrum[bin];
-        } else if bin < low_bin {
-            low[bin] = spectrum[bin];
-        } else if bin < mid_bin {
-            mid[bin] = spectrum[bin];
-        } else {
-            high[bin] = spectrum[bin];
+        match classify_bin(bin, sub_bass_bin, low_bin, mid_bin) {
+            Band::SubBass => sub_bass[bin] = spectrum[bin],
+            Band::Low => low[bin] = spectrum[bin],
+            Band::Mid => mid[bin] = spectrum[bin],
+            Band::High => high[bin] = spectrum[bin],
         }
     }
 
@@ -81,14 +101,11 @@ pub fn split_spectrum_into_bands(
         for bin in 1..num_bins - 1 {
             let mirror = fft_size - bin;
             if mirror < spectrum.len() {
-                if bin < sub_bass_bin {
-                    sub_bass[mirror] = spectrum[mirror];
-                } else if bin < low_bin {
-                    low[mirror] = spectrum[mirror];
-                } else if bin < mid_bin {
-                    mid[mirror] = spectrum[mirror];
-                } else {
-                    high[mirror] = spectrum[mirror];
+                match classify_bin(bin, sub_bass_bin, low_bin, mid_bin) {
+                    Band::SubBass => sub_bass[mirror] = spectrum[mirror],
+                    Band::Low => low[mirror] = spectrum[mirror],
+                    Band::Mid => mid[mirror] = spectrum[mirror],
+                    Band::High => high[mirror] = spectrum[mirror],
                 }
             }
         }
@@ -134,14 +151,11 @@ pub fn compute_band_energy(
 
     for (bin, val) in buffer.iter().enumerate().take(num_bins) {
         let energy = val.norm_sqr();
-        if bin < sub_bass_bin {
-            sub_e += energy;
-        } else if bin < low_bin {
-            low_e += energy;
-        } else if bin < mid_bin {
-            mid_e += energy;
-        } else {
-            high_e += energy;
+        match classify_bin(bin, sub_bass_bin, low_bin, mid_bin) {
+            Band::SubBass => sub_e += energy,
+            Band::Low => low_e += energy,
+            Band::Mid => mid_e += energy,
+            Band::High => high_e += energy,
         }
     }
 

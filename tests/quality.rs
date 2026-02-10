@@ -13,32 +13,6 @@ fn rms(signal: &[f32]) -> f32 {
     (signal.iter().map(|x| x * x).sum::<f32>() / signal.len() as f32).sqrt()
 }
 
-/// Compute signal-to-noise ratio in dB between original and processed signals.
-#[allow(dead_code)]
-fn snr_db(original: &[f32], processed: &[f32]) -> f32 {
-    let len = original.len().min(processed.len());
-    if len == 0 {
-        return 0.0;
-    }
-
-    let signal_power: f32 = original[..len].iter().map(|x| x * x).sum::<f32>() / len as f32;
-    let noise_power: f32 = original[..len]
-        .iter()
-        .zip(processed[..len].iter())
-        .map(|(a, b)| {
-            let diff = a - b;
-            diff * diff
-        })
-        .sum::<f32>()
-        / len as f32;
-
-    if noise_power < 1e-12 {
-        return 100.0;
-    }
-
-    10.0 * (signal_power / noise_power).log10()
-}
-
 #[test]
 fn test_stretch_preserves_rms_energy() {
     let sample_rate = 44100;
