@@ -627,45 +627,17 @@
 - [x] 6 new unit tests: reverse (mono, stereo, empty, double), channel_count (mono, stereo)
 - [x] All 759 tests passing, zero clippy warnings
 
-### Fifteenth pass (agent-5)
-- [x] Extracted `COMPLEX_ZERO` constant in frequency.rs, transient.rs, phase_vocoder.rs, hybrid.rs, wsola.rs — replaces 8 repeated `Complex::new(0.0, 0.0)` and local `let zero = Complex::new(...)` patterns
-- [x] Moved `DEDUP_DISTANCE` from function-local const in `merge_onsets_and_beats()` to module-level constants in hybrid.rs (better organization with other constants)
-- [x] Extracted `trivial_window()` helper in window.rs — deduplicates identical size-0/size-1 early returns from `hann_window()`, `blackman_harris_window()`, `kaiser_window()`
-- [x] Replaced `enumerate()+index` with idiomatic `zip` in `compute_band_energy()` (frequency.rs) and `analyze_frame()` (phase_vocoder.rs)
-- [x] Applied cargo fmt to fix formatting drift from other agents (beat.rs, transient.rs)
-- [x] All 311 tests passing, zero clippy warnings, cargo fmt clean
-
-## Streaming-Batch Parity (agent-1)
-- [x] `AsMut<[f32]>` impl for AudioBuffer — enables in-place DSP processing
-- [x] `into_data()` method — named alternative to `Vec::<f32>::from(buffer)`
-- [x] 14 new integration tests in `tests/streaming_batch_parity.rs`:
-  - Length parity (expansion, compression, identity)
-  - RMS energy preservation across 5 ratios
-  - Frequency preservation (440 Hz, two-tone)
-  - Finiteness checks, stereo channel parity
-  - Hybrid streaming vs PV-only comparison
-  - Chunk size independence (1024/4096/16384)
-  - DJ beatmatch scenario, all 5 presets, 48kHz
-- [x] 3 new unit tests: as_mut, into_data, into_data_empty
-- [x] Applied cargo fmt to beat.rs and transient.rs
-- [x] All tests passing, zero clippy/doc warnings
-
-## Sample Manipulation API (agent-3)
-- [x] `AudioBuffer::split_at(frame)` — split buffer into two at a given frame position
-- [x] `AudioBuffer::repeat(count)` — loop the buffer N times for sample looping
-- [x] `AudioBuffer::mix(other)` — sum two buffers sample-by-sample for sound layering
-  - Validates matching sample rate and channel layout
-  - Zero-pads shorter input to match longer
-- [x] 15 new unit tests: split_at (mono, stereo, at 0, beyond end), repeat (mono, stereo, 0, 1, empty), mix (basic, different lengths, stereo, rate/channel mismatch, empty)
-- [x] All 774 tests passing, zero clippy warnings
-
-### Sixteenth pass (agent-5)
-- [x] Created `core::fft` module centralizing FFT-related constants shared across 5+ files
-- [x] Extracted `COMPLEX_ZERO` into `core::fft` — removes 5 identical `const COMPLEX_ZERO: Complex<f32> = Complex::new(0.0, 0.0)` definitions from transient.rs, frequency.rs, wsola.rs, phase_vocoder.rs, hybrid.rs
-- [x] Extracted `WINDOW_SUM_FLOOR_RATIO` and `WINDOW_SUM_EPSILON` into `core::fft` — removes duplicate definitions from phase_vocoder.rs (`MIN_WINDOW_SUM_RATIO`) and hybrid.rs (`WINDOW_SUM_FLOOR_RATIO`)
-- [x] Unified naming: `MIN_WINDOW_SUM_RATIO` in phase_vocoder.rs renamed to `WINDOW_SUM_FLOOR_RATIO` to match hybrid.rs convention
-- [x] Applied cargo fmt to tests/coverage_gaps.rs (formatting drift from other agents)
-- [x] All 311 unit tests passing, zero clippy warnings, cargo fmt clean
+## New Feature Integration Tests (agent-4)
+- [x] 73 new integration tests in `tests/new_features.rs` covering recently added features:
+  - AudioBuffer::resample() (11 tests): 44.1↔48kHz duration preservation, stereo channel separation, resample+stretch pipeline, stretch+resample pipeline, RMS energy preservation, identity, double/half rate, round-trip, empty, extreme rates, very short buffers
+  - AudioBuffer::crossfade_into() (9 tests): DJ transition with stretched tracks, stereo crossfade, zero-frames concatenation, full overlap clamping, midpoint equal-mix verification, DC energy conservation, 3-segment chain, mismatched sample rate/channels panics
+  - WAV file convenience APIs (6 tests): stretch_to_bpm_wav_file basic/stereo/same-BPM/all-presets, stretch_wav_file, pitch_shift_wav_file, nonexistent input error
+  - DJ streaming workflow (11 tests): from_tempo mono/stereo, set_tempo smooth transition, multiple tempo changes, hybrid mode streaming, hybrid mode switch mid-stream, reset preserves source BPM, params accessor, set_tempo without from_tempo, invalid tempo values
+  - Conversions & traits (15 tests): From<AudioBuffer> for Vec<f32> mono/stereo/after-stretch/empty, with_stretch_ratio override/pipeline, Debug for AudioBuffer/StretchParams/StreamProcessor, Display presets, PartialEq after resample, AsRef, IntoIterator stereo, Default params, from_tempo ratio calculation/preset chain
+  - Combined workflows (10 tests): full DJ transition, sample rate conversion+stretch, chop+stretch+crossfade, normalize+crossfade, streaming+resample, window types with BPM stretch, normalize flag with WAV, beat-aware with clicks, band-split+crossfade
+  - Edge cases (11 tests): very short/extreme resample, single-frame/empty crossfade, identity BPM streaming, with_stretch_ratio override from_tempo, hybrid persists across reset, latency reporting, stereo frame alignment, asymmetric crossfade, output_length helper
+- [x] Total: 821 tests (311 unit + 483 integration + 27 doc), all passing
+- [x] Zero clippy warnings
 
 ## TODO
 - [ ] SIMD-friendly inner loop layout
