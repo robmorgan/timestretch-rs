@@ -218,6 +218,23 @@
   - Stretched output preservation through WAV encode/decode
 - [x] Applied cargo fmt to fix formatting drift from other agents' changes
 - [x] Total: 177 tests (168 integration/unit + 9 doc-tests), all passing
+
+## Spectral Quality Tests (agent-3)
+- [x] 13 spectral quality tests covering:
+  - Frequency preservation: 440Hz energy dominant after stretch at 5 ratios (0.75-2.0)
+  - Multi-tone: two-tone signal preserves both frequencies, no broadband smearing
+  - Sub-bass: 60Hz energy preserved after 1.5x stretch
+  - Dominant frequency preservation: 3-tone signal maintains frequency hierarchy at 4 ratios
+  - No new harmonics: pure sine doesn't introduce strong 2nd/3rd harmonics
+  - Band energy distribution: two-tone signal preserves relative energy ordering
+  - Transient attack: click at 0.5s appears at ~0.75s after 1.5x stretch
+  - Click train spacing: regular clicks maintain proportional intervals
+  - DJ transparency: small-ratio stretch preserves 3-tone spectral content
+  - Extreme stretch: 4x stretch retains fundamental frequency
+  - Compression: 0.5x preserves fundamental
+  - Stereo spectral independence: L=440Hz R=880Hz stay in correct channels
+  - Frequency sweep: no silent "holes" in chirp output
+- [x] Total: 205+ tests, all passing
 - [x] Zero clippy warnings
 
 ## TODO
