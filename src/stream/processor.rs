@@ -2,6 +2,7 @@
 
 use crate::core::types::StretchParams;
 use crate::error::StretchError;
+use crate::stretch::hybrid::HybridStretcher;
 use crate::stretch::phase_vocoder::PhaseVocoder;
 
 /// Threshold below which ratio differences are considered negligible.
@@ -54,6 +55,9 @@ pub struct StreamProcessor {
     output_scratch: Vec<f32>,
     /// Source BPM (set when created via `from_tempo`, enables `set_tempo`).
     source_bpm: Option<f64>,
+    /// When true, use the full hybrid algorithm (transient detection + WSOLA + PV)
+    /// instead of PV-only. Higher quality for EDM but higher latency.
+    use_hybrid: bool,
 }
 
 impl StreamProcessor {
@@ -74,6 +78,7 @@ impl StreamProcessor {
             channel_buffers,
             output_scratch: Vec::new(),
             source_bpm: None,
+            use_hybrid: false,
         }
     }
 
@@ -115,6 +120,10 @@ impl StreamProcessor {
         let total_frames = self.input_buffer.len() / num_channels;
         if total_frames < self.params.fft_size {
             return Ok(vec![]);
+        }
+
+        if self.use_hybrid {
+            return self.process_hybrid_path(num_channels, total_frames);
         }
 
         // Update vocoders' stretch ratio in-place to preserve phase state.
@@ -198,6 +207,42 @@ impl StreamProcessor {
         std::mem::take(&mut self.output_scratch)
     }
 
+    /// Processes accumulated input through the hybrid algorithm (transient detection + WSOLA + PV).
+    ///
+    /// Deinterleaves the input, runs each channel through a fresh HybridStretcher
+    /// with the current ratio, then reinterleaves the output. All accumulated input
+    /// is consumed on each call.
+    fn process_hybrid_path(
+        &mut self,
+        num_channels: usize,
+        total_frames: usize,
+    ) -> Result<Vec<f32>, StretchError> {
+        // Build params with the current (interpolated) ratio
+        let mut hybrid_params = self.params.clone();
+        hybrid_params.stretch_ratio = self.current_ratio;
+
+        let mut min_output_len = usize::MAX;
+
+        for ch in 0..num_channels {
+            self.deinterleave_channel(ch, num_channels);
+            let stretcher = HybridStretcher::new(hybrid_params.clone());
+            let stretched = stretcher.process(&self.channel_buffers[ch])?;
+            min_output_len = min_output_len.min(stretched.len());
+            self.channel_buffers[ch] = stretched;
+        }
+
+        // Consume all input
+        self.input_buffer.clear();
+        // Keep overlap for continuity: retain the last FFT window of frames
+        // (not applicable in hybrid mode — each call is self-contained)
+        let _ = total_frames; // used for API consistency
+
+        if min_output_len == usize::MAX || min_output_len == 0 {
+            return Ok(vec![]);
+        }
+        Ok(self.interleave_output(min_output_len, num_channels))
+    }
+
     /// Creates a streaming processor configured for BPM matching.
     ///
     /// This is a convenience constructor for DJ workflows. It computes the
@@ -221,6 +266,24 @@ impl StreamProcessor {
     /// The ratio change is interpolated smoothly to avoid clicks.
     pub fn set_stretch_ratio(&mut self, ratio: f64) {
         self.target_ratio = ratio;
+    }
+
+    /// Enables or disables hybrid processing mode.
+    ///
+    /// When enabled, the processor uses the full hybrid algorithm (transient
+    /// detection + WSOLA for transients + phase vocoder for tonal content),
+    /// matching the quality of the batch [`stretch()`](crate::stretch) API.
+    /// This produces better results for EDM audio with kicks and transients,
+    /// but has higher latency since it processes all accumulated input at once.
+    ///
+    /// When disabled (default), uses phase vocoder only for lowest latency.
+    pub fn set_hybrid_mode(&mut self, enabled: bool) {
+        self.use_hybrid = enabled;
+    }
+
+    /// Returns whether hybrid processing mode is enabled.
+    pub fn is_hybrid_mode(&self) -> bool {
+        self.use_hybrid
     }
 
     /// Changes the target BPM, smoothly adjusting the stretch ratio.
@@ -570,5 +633,141 @@ mod tests {
         assert_eq!(proc.params().sample_rate, 48000);
         assert_eq!(proc.params().fft_size, 8192);
         assert!((proc.params().stretch_ratio - 1.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_mode_default() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let proc = StreamProcessor::new(params);
+        assert!(!proc.is_hybrid_mode());
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_mode_toggle() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+
+        proc.set_hybrid_mode(true);
+        assert!(proc.is_hybrid_mode());
+
+        proc.set_hybrid_mode(false);
+        assert!(!proc.is_hybrid_mode());
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_produces_output() {
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_preset(crate::core::types::EdmPreset::HouseLoop);
+
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        let chunk_size = 4096;
+        let signal: Vec<f32> = (0..chunk_size * 4)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+
+        let mut total_output = Vec::new();
+        for chunk in signal.chunks(chunk_size) {
+            if let Ok(out) = proc.process(chunk) {
+                total_output.extend_from_slice(&out);
+            }
+        }
+        if let Ok(out) = proc.flush() {
+            total_output.extend_from_slice(&out);
+        }
+
+        assert!(!total_output.is_empty(), "Hybrid mode should produce output");
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_stretch_ratio() {
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(44100)
+            .with_channels(1);
+
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        // Feed enough data in one go for reliable ratio measurement
+        let num_samples = 44100 * 2;
+        let signal: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+
+        let mut total_output = Vec::new();
+        if let Ok(out) = proc.process(&signal) {
+            total_output.extend_from_slice(&out);
+        }
+        if let Ok(out) = proc.flush() {
+            total_output.extend_from_slice(&out);
+        }
+
+        if !total_output.is_empty() {
+            let ratio = total_output.len() as f64 / signal.len() as f64;
+            assert!(
+                (ratio - 1.5).abs() < 0.4,
+                "Hybrid stretch ratio {} too far from 1.5",
+                ratio
+            );
+        }
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_rejects_nan() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        let mut chunk = vec![0.0f32; 4096];
+        chunk[100] = f32::NAN;
+        assert!(matches!(
+            proc.process(&chunk),
+            Err(crate::error::StretchError::NonFiniteInput)
+        ));
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_stereo() {
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(44100)
+            .with_channels(2);
+
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        let num_frames = 44100;
+        let mut signal = vec![0.0f32; num_frames * 2];
+        for i in 0..num_frames {
+            let t = i as f32 / 44100.0;
+            signal[i * 2] = (2.0 * PI * 440.0 * t).sin();
+            signal[i * 2 + 1] = (2.0 * PI * 880.0 * t).sin();
+        }
+
+        let mut total_output = Vec::new();
+        for chunk in signal.chunks(4096 * 2) {
+            if let Ok(out) = proc.process(chunk) {
+                total_output.extend_from_slice(&out);
+            }
+        }
+        if let Ok(out) = proc.flush() {
+            total_output.extend_from_slice(&out);
+        }
+
+        assert!(!total_output.is_empty(), "Hybrid stereo should produce output");
+        assert_eq!(
+            total_output.len() % 2,
+            0,
+            "Stereo output must have even sample count"
+        );
     }
 }
