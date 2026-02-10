@@ -335,10 +335,10 @@ fn test_alternating_silence_and_tone() {
     let gap_len = (sample_rate as f64 * 0.3) as usize;
     let cycle = tone_len + gap_len;
 
-    for i in 0..num_samples {
+    for (i, sample) in input.iter_mut().enumerate().take(num_samples) {
         let pos_in_cycle = i % cycle;
         if pos_in_cycle < tone_len {
-            input[i] = 0.8 * (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin();
+            *sample = 0.8 * (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin();
         }
     }
 
