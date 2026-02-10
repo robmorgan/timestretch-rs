@@ -116,6 +116,16 @@ fn validate_input(input: &[f32]) -> Result<bool, StretchError> {
     Ok(true)
 }
 
+/// Extracts a mono signal from interleaved audio (takes the first channel).
+#[inline]
+fn extract_mono(samples: &[f32], num_channels: usize) -> Vec<f32> {
+    if num_channels <= 1 {
+        samples.to_vec()
+    } else {
+        samples.iter().step_by(num_channels).copied().collect()
+    }
+}
+
 /// Validates that a BPM value is positive, returning a descriptive error otherwise.
 #[inline]
 fn validate_bpm(bpm: f64, label: &str) -> Result<(), StretchError> {
@@ -235,10 +245,11 @@ pub fn pitch_shift(
     params: &StretchParams,
     pitch_factor: f64,
 ) -> Result<Vec<f32>, StretchError> {
-    if !(0.01..=100.0).contains(&pitch_factor) {
+    use stretch::params::{RATIO_MAX, RATIO_MIN};
+    if !(RATIO_MIN..=RATIO_MAX).contains(&pitch_factor) {
         return Err(StretchError::InvalidRatio(format!(
-            "Pitch factor must be between 0.01 and 100.0, got {}",
-            pitch_factor
+            "Pitch factor must be between {} and {}, got {}",
+            RATIO_MIN, RATIO_MAX, pitch_factor
         )));
     }
 
@@ -282,17 +293,7 @@ pub fn pitch_shift_buffer(
     params: &StretchParams,
     pitch_factor: f64,
 ) -> Result<AudioBuffer, StretchError> {
-    let mut effective_params = params.clone();
-    effective_params.sample_rate = buffer.sample_rate;
-    effective_params.channels = buffer.channels;
-
-    let output_data = pitch_shift(&buffer.data, &effective_params, pitch_factor)?;
-
-    Ok(AudioBuffer::new(
-        output_data,
-        buffer.sample_rate,
-        buffer.channels,
-    ))
+    process_buffer(buffer, params, |data, p| pitch_shift(data, p, pitch_factor))
 }
 
 /// Detects the BPM of a mono audio signal.
@@ -345,16 +346,7 @@ pub fn detect_beat_grid(samples: &[f32], sample_rate: u32) -> BeatGrid {
 /// For stereo buffers, uses the left channel for detection.
 /// Returns 0.0 if no tempo can be detected.
 pub fn detect_bpm_buffer(buffer: &AudioBuffer) -> f64 {
-    let mono: Vec<f32> = if buffer.channels.count() > 1 {
-        buffer
-            .data
-            .iter()
-            .step_by(buffer.channels.count())
-            .copied()
-            .collect()
-    } else {
-        buffer.data.clone()
-    };
+    let mono = extract_mono(&buffer.data, buffer.channels.count());
     detect_bpm(&mono, buffer.sample_rate)
 }
 
@@ -363,16 +355,7 @@ pub fn detect_bpm_buffer(buffer: &AudioBuffer) -> f64 {
 /// For stereo buffers, uses the left channel for detection.
 /// This is the buffer-based equivalent of [`detect_beat_grid`].
 pub fn detect_beat_grid_buffer(buffer: &AudioBuffer) -> BeatGrid {
-    let mono: Vec<f32> = if buffer.channels.count() > 1 {
-        buffer
-            .data
-            .iter()
-            .step_by(buffer.channels.count())
-            .copied()
-            .collect()
-    } else {
-        buffer.data.clone()
-    };
+    let mono = extract_mono(&buffer.data, buffer.channels.count());
     detect_beat_grid(&mono, buffer.sample_rate)
 }
 
@@ -447,15 +430,7 @@ pub fn stretch_to_bpm_auto(
     }
 
     // Extract mono signal for beat detection
-    let mono: Vec<f32> = if params.channels.count() > 1 {
-        input
-            .iter()
-            .step_by(params.channels.count())
-            .copied()
-            .collect()
-    } else {
-        input.to_vec()
-    };
+    let mono = extract_mono(input, params.channels.count());
 
     let beat_grid = analysis::beat::detect_beats(&mono, params.sample_rate);
 

@@ -206,6 +206,29 @@ pub enum EdmPreset {
     VocalChop,
 }
 
+impl EdmPreset {
+    /// Returns a human-readable description of this preset's characteristics.
+    pub fn description(self) -> &'static str {
+        match self {
+            EdmPreset::DjBeatmatch => {
+                "Small tempo adjustments (±1-8%). Maximum transparency, minimal artifacts."
+            }
+            EdmPreset::HouseLoop => {
+                "General purpose for house/techno loops. Balanced quality and performance."
+            }
+            EdmPreset::Halftime => {
+                "Halftime effect (2x stretch). Preserves kick punch and transient clarity."
+            }
+            EdmPreset::Ambient => {
+                "Extreme stretch (2x-4x) for ambient transitions. Smooth, artifact-free."
+            }
+            EdmPreset::VocalChop => {
+                "Optimized for vocal chops and one-shots. Preserves formant character."
+            }
+        }
+    }
+}
+
 /// Parameters for the time stretching algorithm.
 ///
 /// Use the builder methods to configure. A ratio >1.0 makes audio longer

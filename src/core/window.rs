@@ -86,6 +86,11 @@ fn kaiser_window(size: usize, beta: f64) -> Vec<f32> {
         .collect()
 }
 
+/// Maximum number of series terms for Bessel I0 convergence.
+const BESSEL_MAX_TERMS: usize = 30;
+/// Relative convergence threshold for Bessel I0 series.
+const BESSEL_CONVERGENCE: f64 = 1e-15;
+
 /// Zeroth-order modified Bessel function of the first kind.
 /// Computed via series expansion.
 #[inline]
@@ -93,10 +98,10 @@ fn bessel_i0(x: f64) -> f64 {
     let mut sum = 1.0;
     let mut term = 1.0;
     let x_half = x / 2.0;
-    for k in 1..30 {
+    for k in 1..BESSEL_MAX_TERMS {
         term *= (x_half / k as f64) * (x_half / k as f64);
         sum += term;
-        if term < 1e-15 * sum {
+        if term < BESSEL_CONVERGENCE * sum {
             break;
         }
     }

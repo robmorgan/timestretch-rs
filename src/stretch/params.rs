@@ -1,50 +1,30 @@
 //! Internal algorithm parameters derived from user-facing [`StretchParams`].
 
-use crate::core::types::{EdmPreset, StretchParams};
+use crate::core::types::StretchParams;
 
-/// Returns a description of the given preset's characteristics.
-pub fn preset_description(preset: EdmPreset) -> &'static str {
-    match preset {
-        EdmPreset::DjBeatmatch => {
-            "Small tempo adjustments (±1-8%). Maximum transparency, minimal artifacts."
-        }
-        EdmPreset::HouseLoop => {
-            "General purpose for house/techno loops. Balanced quality and performance."
-        }
-        EdmPreset::Halftime => {
-            "Halftime effect (2x stretch). Preserves kick punch and transient clarity."
-        }
-        EdmPreset::Ambient => {
-            "Extreme stretch (2x-4x) for ambient transitions. Smooth, artifact-free."
-        }
-        EdmPreset::VocalChop => {
-            "Optimized for vocal chops and one-shots. Preserves formant character."
-        }
-    }
-}
+/// Minimum valid stretch/pitch ratio.
+pub const RATIO_MIN: f64 = 0.01;
+/// Maximum valid stretch/pitch ratio.
+pub const RATIO_MAX: f64 = 100.0;
+/// Minimum valid FFT size.
+const FFT_SIZE_MIN: usize = 256;
+/// Valid sample rate range.
+const SAMPLE_RATE_MIN: u32 = 8000;
+const SAMPLE_RATE_MAX: u32 = 192000;
 
 /// Validates stretch parameters and returns an error message if invalid.
 pub fn validate_params(params: &StretchParams) -> Result<(), String> {
-    if params.stretch_ratio <= 0.0 {
+    if !(RATIO_MIN..=RATIO_MAX).contains(&params.stretch_ratio) {
         return Err(format!(
-            "Stretch ratio must be positive, got {}",
-            params.stretch_ratio
+            "Stretch ratio must be between {} and {}, got {}",
+            RATIO_MIN, RATIO_MAX, params.stretch_ratio
         ));
     }
-    if params.stretch_ratio > 100.0 {
+    if params.fft_size < FFT_SIZE_MIN {
         return Err(format!(
-            "Stretch ratio too large: {} (max 100.0)",
-            params.stretch_ratio
+            "FFT size too small: {} (min {})",
+            params.fft_size, FFT_SIZE_MIN
         ));
-    }
-    if params.stretch_ratio < 0.01 {
-        return Err(format!(
-            "Stretch ratio too small: {} (min 0.01)",
-            params.stretch_ratio
-        ));
-    }
-    if params.fft_size < 256 {
-        return Err(format!("FFT size too small: {} (min 256)", params.fft_size));
     }
     if !params.fft_size.is_power_of_two() {
         return Err(format!(
@@ -58,10 +38,10 @@ pub fn validate_params(params: &StretchParams) -> Result<(), String> {
             params.hop_size, params.fft_size
         ));
     }
-    if params.sample_rate < 8000 || params.sample_rate > 192000 {
+    if !(SAMPLE_RATE_MIN..=SAMPLE_RATE_MAX).contains(&params.sample_rate) {
         return Err(format!(
-            "Sample rate {} out of range (8000-192000)",
-            params.sample_rate
+            "Sample rate {} out of range ({}-{})",
+            params.sample_rate, SAMPLE_RATE_MIN, SAMPLE_RATE_MAX
         ));
     }
     Ok(())
@@ -70,6 +50,7 @@ pub fn validate_params(params: &StretchParams) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::EdmPreset;
 
     #[test]
     fn test_validate_params_valid() {
@@ -106,10 +87,10 @@ mod tests {
     #[test]
     fn test_preset_descriptions() {
         // Just verify all presets have descriptions
-        let _ = preset_description(EdmPreset::DjBeatmatch);
-        let _ = preset_description(EdmPreset::HouseLoop);
-        let _ = preset_description(EdmPreset::Halftime);
-        let _ = preset_description(EdmPreset::Ambient);
-        let _ = preset_description(EdmPreset::VocalChop);
+        let _ = EdmPreset::DjBeatmatch.description();
+        let _ = EdmPreset::HouseLoop.description();
+        let _ = EdmPreset::Halftime.description();
+        let _ = EdmPreset::Ambient.description();
+        let _ = EdmPreset::VocalChop.description();
     }
 }
