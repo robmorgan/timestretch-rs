@@ -345,6 +345,15 @@ pub struct StretchParams {
     /// segment boundaries to beat positions. This preserves the rhythmic
     /// groove in 4/4 EDM tracks. Enabled by default for EDM presets.
     pub beat_aware: bool,
+    /// Whether to split sub-bass into a separate band for independent processing.
+    ///
+    /// When enabled, audio below `sub_bass_cutoff` Hz is extracted and processed
+    /// exclusively through the phase vocoder with rigid phase locking, even during
+    /// transient segments. The remaining audio goes through the normal hybrid
+    /// algorithm (WSOLA for transients, PV for tonal). The two bands are summed
+    /// at the end. This prevents WSOLA from smearing sub-bass during kick drums.
+    /// Enabled by default for EDM presets.
+    pub band_split: bool,
 }
 
 /// Converts a duration in milliseconds to samples at the given sample rate.
@@ -388,6 +397,7 @@ impl StretchParams {
             wsola_segment_size: ms_to_samples(WSOLA_SEGMENT_MS, DEFAULT_SAMPLE_RATE),
             wsola_search_range: ms_to_samples(WSOLA_SEARCH_MS_SMALL, DEFAULT_SAMPLE_RATE),
             beat_aware: false,
+            band_split: false,
         }
     }
 
@@ -426,6 +436,7 @@ impl StretchParams {
     pub fn with_preset(mut self, preset: EdmPreset) -> Self {
         self.preset = Some(preset);
         self.beat_aware = true;
+        self.band_split = true;
         let cfg = preset.config();
         self.fft_size = cfg.fft_size;
         self.hop_size = cfg.hop_size;
@@ -477,6 +488,16 @@ impl StretchParams {
     /// segment boundaries to beat positions for better rhythmic preservation.
     pub fn with_beat_aware(mut self, enabled: bool) -> Self {
         self.beat_aware = enabled;
+        self
+    }
+
+    /// Enables or disables sub-bass band-split processing.
+    ///
+    /// When enabled, audio below `sub_bass_cutoff` Hz is separated and processed
+    /// exclusively through the phase vocoder, preventing WSOLA from smearing
+    /// bass during kick transients.
+    pub fn with_band_split(mut self, enabled: bool) -> Self {
+        self.band_split = enabled;
         self
     }
 

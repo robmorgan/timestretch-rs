@@ -1,11 +1,14 @@
 //! Hybrid stretcher combining WSOLA (transients) with phase vocoder (tonal content).
 
 use crate::analysis::beat::detect_beats;
+use crate::analysis::frequency::freq_to_bin;
 use crate::analysis::transient::detect_transients;
 use crate::core::types::StretchParams;
+use crate::core::window::{generate_window, WindowType};
 use crate::error::StretchError;
 use crate::stretch::phase_vocoder::PhaseVocoder;
 use crate::stretch::wsola::Wsola;
+use rustfft::{num_complex::Complex, FftPlanner};
 
 /// Crossfade duration in seconds between algorithm segments (5ms raised-cosine).
 const CROSSFADE_SECS: f64 = 0.005;
@@ -25,6 +28,10 @@ const TRANSIENT_MAX_HOP: usize = 512;
 /// Minimum input length (in samples) for beat detection to be worthwhile.
 /// Below this, beat detection is too unreliable to improve segmentation.
 const MIN_SAMPLES_FOR_BEAT_DETECTION: usize = 44100; // ~1 second at 44.1kHz
+/// FFT size used for sub-bass band splitting. Needs good low-frequency resolution.
+const BAND_SPLIT_FFT_SIZE: usize = 4096;
+/// Hop size for the band-splitting overlap-add filter (75% overlap).
+const BAND_SPLIT_HOP: usize = BAND_SPLIT_FFT_SIZE / 4;
 
 /// Transient-aware hybrid stretcher.
 ///
@@ -65,6 +72,59 @@ impl HybridStretcher {
             return wsola.process(input);
         }
 
+        // Band-split mode: separate sub-bass for independent PV processing
+        if self.params.band_split && input.len() >= BAND_SPLIT_FFT_SIZE {
+            return self.process_band_split(input);
+        }
+
+        self.process_hybrid(input)
+    }
+
+    /// Processes audio with sub-bass band splitting.
+    ///
+    /// Separates audio below `sub_bass_cutoff` Hz and processes it exclusively
+    /// through the phase vocoder with rigid phase locking. The remaining audio
+    /// goes through the normal hybrid algorithm. The two results are summed.
+    fn process_band_split(&self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
+        let (sub_bass, remainder) = separate_sub_bass(
+            input,
+            self.params.sub_bass_cutoff,
+            self.params.sample_rate,
+        );
+
+        // Process sub-bass exclusively through PV (rigid phase locking
+        // handles phase coherence for bins below cutoff)
+        let sub_bass_stretched = if sub_bass.len() >= self.params.fft_size {
+            let mut pv = PhaseVocoder::new(
+                self.params.fft_size,
+                self.params.hop_size,
+                self.params.stretch_ratio,
+                self.params.sample_rate,
+                self.params.sub_bass_cutoff,
+            );
+            pv.process(&sub_bass)?
+        } else {
+            let out_len = self.params.output_length(sub_bass.len()).max(1);
+            crate::core::resample::resample_linear(&sub_bass, out_len)
+        };
+
+        // Process remainder through normal hybrid (transient detection + PV/WSOLA)
+        let remainder_stretched = self.process_hybrid(&remainder)?;
+
+        // Sum the two bands, using the longer length (zero-pad the shorter)
+        let out_len = sub_bass_stretched.len().max(remainder_stretched.len());
+        let mut output = Vec::with_capacity(out_len);
+        for i in 0..out_len {
+            let sub = sub_bass_stretched.get(i).copied().unwrap_or(0.0);
+            let rem = remainder_stretched.get(i).copied().unwrap_or(0.0);
+            output.push(sub + rem);
+        }
+
+        Ok(output)
+    }
+
+    /// Core hybrid processing: transient detection + segmented WSOLA/PV.
+    fn process_hybrid(&self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
         // Step 1: Detect transients
         let transients = detect_transients(
             input,
@@ -214,6 +274,105 @@ impl HybridStretcher {
 
         segments
     }
+}
+
+/// Separates sub-bass from the remainder of the signal using FFT-based filtering.
+///
+/// Uses overlap-add with a Hann window to split the input into two bands:
+/// - Sub-bass: everything below `cutoff_hz`
+/// - Remainder: everything at or above `cutoff_hz`
+///
+/// Both outputs have the same length as the input.
+fn separate_sub_bass(input: &[f32], cutoff_hz: f32, sample_rate: u32) -> (Vec<f32>, Vec<f32>) {
+    let fft_size = BAND_SPLIT_FFT_SIZE;
+    let hop = BAND_SPLIT_HOP;
+    let cutoff_bin = freq_to_bin(cutoff_hz, fft_size, sample_rate);
+
+    if cutoff_bin == 0 || input.len() < fft_size {
+        // No sub-bass to separate, or input too short for FFT
+        return (vec![0.0; input.len()], input.to_vec());
+    }
+
+    let window = generate_window(WindowType::Hann, fft_size);
+    let mut planner = FftPlanner::new();
+    let fft_fwd = planner.plan_fft_forward(fft_size);
+    let fft_inv = planner.plan_fft_inverse(fft_size);
+    let norm = 1.0 / fft_size as f32;
+
+    let mut sub_bass = vec![0.0f32; input.len()];
+    let mut remainder = vec![0.0f32; input.len()];
+    let mut window_sum = vec![0.0f32; input.len()];
+
+    let num_frames = if input.len() <= fft_size {
+        1
+    } else {
+        (input.len() - fft_size) / hop + 1
+    };
+
+    let mut fft_buf = vec![Complex::new(0.0f32, 0.0); fft_size];
+    let mut fft_buf2 = vec![Complex::new(0.0f32, 0.0); fft_size];
+
+    for frame in 0..num_frames {
+        let pos = frame * hop;
+        let frame_end = (pos + fft_size).min(input.len());
+        let frame_len = frame_end - pos;
+
+        // Window and transform
+        for i in 0..fft_size {
+            fft_buf[i] = if i < frame_len {
+                Complex::new(input[pos + i] * window[i], 0.0)
+            } else {
+                Complex::new(0.0, 0.0)
+            };
+        }
+        fft_fwd.process(&mut fft_buf);
+
+        // Split into sub-bass and remainder in the frequency domain.
+        // For a real-valued signal, the FFT has conjugate symmetry:
+        //   bin 0 = DC, bins 1..N/2 = positive freqs,
+        //   bin N/2 = Nyquist, bins N/2+1..N-1 = negative freqs (mirror).
+        // We need to keep both positive and negative frequency bins consistent.
+        fft_buf2.copy_from_slice(&fft_buf);
+        let zero = Complex::new(0.0, 0.0);
+
+        // Sub-bass: keep bins 0..cutoff_bin and their mirrors, zero everything else
+        for bin in cutoff_bin..=fft_size / 2 {
+            fft_buf[bin] = zero;
+            if bin > 0 && bin < fft_size / 2 {
+                fft_buf[fft_size - bin] = zero;
+            }
+        }
+        // Remainder: keep bins cutoff_bin..N/2 and their mirrors, zero sub-bass
+        for bin in 0..cutoff_bin {
+            fft_buf2[bin] = zero;
+            if bin > 0 {
+                fft_buf2[fft_size - bin] = zero;
+            }
+        }
+
+        // Inverse FFT both
+        fft_inv.process(&mut fft_buf);
+        fft_inv.process(&mut fft_buf2);
+
+        // Overlap-add with synthesis window
+        for i in 0..frame_len {
+            let out_idx = pos + i;
+            sub_bass[out_idx] += fft_buf[i].re * norm * window[i];
+            remainder[out_idx] += fft_buf2[i].re * norm * window[i];
+            window_sum[out_idx] += window[i] * window[i];
+        }
+    }
+
+    // Normalize by window sum
+    let max_ws = window_sum.iter().cloned().fold(0.0f32, f32::max);
+    let min_ws = (max_ws * 0.1).max(1e-6);
+    for i in 0..input.len() {
+        let ws = window_sum[i].max(min_ws);
+        sub_bass[i] /= ws;
+        remainder[i] /= ws;
+    }
+
+    (sub_bass, remainder)
 }
 
 /// Merges transient onsets with beat grid positions, deduplicating nearby entries.
@@ -493,5 +652,314 @@ mod tests {
             .with_preset(EdmPreset::DjBeatmatch)
             .with_beat_aware(false);
         assert!(!params.beat_aware);
+    }
+
+    #[test]
+    fn test_band_split_flag_default() {
+        // Default: band_split should be false
+        let params = StretchParams::new(1.0);
+        assert!(!params.band_split);
+
+        // With preset: band_split should be true
+        let params = StretchParams::new(1.0).with_preset(EdmPreset::HouseLoop);
+        assert!(params.band_split);
+
+        // Can be overridden after preset
+        let params = StretchParams::new(1.0)
+            .with_preset(EdmPreset::HouseLoop)
+            .with_band_split(false);
+        assert!(!params.band_split);
+    }
+
+    #[test]
+    fn test_separate_sub_bass_preserves_energy() {
+        // A 60 Hz sine (sub-bass) should end up mostly in the sub-bass band
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * 60.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let (sub_bass, remainder) = separate_sub_bass(&input, 120.0, sample_rate);
+        assert_eq!(sub_bass.len(), input.len());
+        assert_eq!(remainder.len(), input.len());
+
+        let sub_rms =
+            (sub_bass.iter().map(|x| x * x).sum::<f32>() / sub_bass.len() as f32).sqrt();
+        let rem_rms =
+            (remainder.iter().map(|x| x * x).sum::<f32>() / remainder.len() as f32).sqrt();
+
+        // Sub-bass should have most of the energy for a 60 Hz signal
+        assert!(
+            sub_rms > rem_rms * 2.0,
+            "60 Hz signal should be in sub-bass band: sub_rms={}, rem_rms={}",
+            sub_rms,
+            rem_rms
+        );
+    }
+
+    #[test]
+    fn test_separate_sub_bass_passes_high_freq() {
+        // A 1000 Hz sine should end up mostly in the remainder band
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * 1000.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let (sub_bass, remainder) = separate_sub_bass(&input, 120.0, sample_rate);
+
+        let sub_rms =
+            (sub_bass.iter().map(|x| x * x).sum::<f32>() / sub_bass.len() as f32).sqrt();
+        let rem_rms =
+            (remainder.iter().map(|x| x * x).sum::<f32>() / remainder.len() as f32).sqrt();
+
+        // Remainder should have most of the energy for a 1000 Hz signal
+        assert!(
+            rem_rms > sub_rms * 2.0,
+            "1000 Hz signal should be in remainder band: sub_rms={}, rem_rms={}",
+            sub_rms,
+            rem_rms
+        );
+    }
+
+    #[test]
+    fn test_separate_sub_bass_reconstruction() {
+        // Sub-bass + remainder should approximately reconstruct the original.
+        // Hann-window overlap-add filtering introduces some leakage at the
+        // crossover, so we use a lenient SNR threshold.
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+        // Mix of sub-bass (60 Hz) and mid (1000 Hz)
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                0.5 * (2.0 * PI * 60.0 * t).sin() + 0.5 * (2.0 * PI * 1000.0 * t).sin()
+            })
+            .collect();
+
+        let (sub_bass, remainder) = separate_sub_bass(&input, 120.0, sample_rate);
+
+        // Reconstruct
+        let reconstructed: Vec<f32> = sub_bass
+            .iter()
+            .zip(remainder.iter())
+            .map(|(s, r)| s + r)
+            .collect();
+
+        // Check RMS of reconstruction vs input (energy preservation)
+        let start = BAND_SPLIT_FFT_SIZE;
+        let end = input.len() - BAND_SPLIT_FFT_SIZE;
+        let input_rms = (input[start..end].iter().map(|x| (*x as f64).powi(2)).sum::<f64>()
+            / (end - start) as f64)
+            .sqrt();
+        let recon_rms = (reconstructed[start..end]
+            .iter()
+            .map(|x| (*x as f64).powi(2))
+            .sum::<f64>()
+            / (end - start) as f64)
+            .sqrt();
+
+        let rms_ratio = recon_rms / input_rms;
+        assert!(
+            (0.7..=1.5).contains(&rms_ratio),
+            "Reconstruction RMS ratio should be near 1.0, got {:.3} (input={:.4}, recon={:.4})",
+            rms_ratio,
+            input_rms,
+            recon_rms
+        );
+    }
+
+    #[test]
+    fn test_band_split_stretch_produces_output() {
+        // Band-split stretch should produce valid output for a mixed signal
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                0.5 * (2.0 * PI * 60.0 * t).sin() + 0.5 * (2.0 * PI * 440.0 * t).sin()
+            })
+            .collect();
+
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_band_split(true);
+
+        let stretcher = HybridStretcher::new(params);
+        let output = stretcher.process(&input).unwrap();
+
+        assert!(!output.is_empty());
+        let len_ratio = output.len() as f64 / input.len() as f64;
+        assert!(
+            (len_ratio - 1.5).abs() < 0.4,
+            "Band-split stretch ratio {} too far from 1.5",
+            len_ratio
+        );
+
+        // Check no NaN/Inf in output
+        assert!(
+            output.iter().all(|s| s.is_finite()),
+            "Output must be all finite"
+        );
+    }
+
+    #[test]
+    fn test_band_split_vs_no_band_split_similar_length() {
+        // Both modes should produce similar output lengths
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let params_split = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_band_split(true);
+
+        let params_no_split = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_band_split(false);
+
+        let stretcher_split = HybridStretcher::new(params_split);
+        let stretcher_no_split = HybridStretcher::new(params_no_split);
+
+        let output_split = stretcher_split.process(&input).unwrap();
+        let output_no_split = stretcher_no_split.process(&input).unwrap();
+
+        let ratio_split = output_split.len() as f64 / input.len() as f64;
+        let ratio_no_split = output_no_split.len() as f64 / input.len() as f64;
+
+        // Both should be within 30% of 1.5
+        assert!(
+            (ratio_split - 1.5).abs() < 0.4,
+            "Band-split ratio {} too far from 1.5",
+            ratio_split
+        );
+        assert!(
+            (ratio_no_split - 1.5).abs() < 0.4,
+            "Non-split ratio {} too far from 1.5",
+            ratio_no_split
+        );
+    }
+
+    #[test]
+    fn test_band_split_compression() {
+        // Band-split should also work for compression (ratio < 1.0)
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                0.5 * (2.0 * PI * 60.0 * t).sin() + 0.5 * (2.0 * PI * 440.0 * t).sin()
+            })
+            .collect();
+
+        let params = StretchParams::new(0.75)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_band_split(true);
+
+        let stretcher = HybridStretcher::new(params);
+        let output = stretcher.process(&input).unwrap();
+
+        assert!(!output.is_empty());
+        assert!(output.iter().all(|s| s.is_finite()));
+        // Output should be shorter than input
+        assert!(
+            output.len() < input.len(),
+            "Compression should produce shorter output"
+        );
+    }
+
+    #[test]
+    fn test_band_split_with_preset() {
+        // EDM presets should enable band_split by default
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        for preset in [
+            EdmPreset::DjBeatmatch,
+            EdmPreset::HouseLoop,
+            EdmPreset::Halftime,
+            EdmPreset::Ambient,
+            EdmPreset::VocalChop,
+        ] {
+            let params = StretchParams::new(1.5)
+                .with_sample_rate(sample_rate)
+                .with_channels(1)
+                .with_preset(preset);
+
+            assert!(
+                params.band_split,
+                "Preset {:?} should enable band_split",
+                preset
+            );
+
+            let stretcher = HybridStretcher::new(params);
+            let output = stretcher.process(&input).unwrap();
+            assert!(!output.is_empty(), "Preset {:?} produced empty output", preset);
+            assert!(
+                output.iter().all(|s| s.is_finite()),
+                "Preset {:?} produced NaN/Inf",
+                preset
+            );
+        }
+    }
+
+    #[test]
+    fn test_band_split_short_input_fallback() {
+        // Input shorter than BAND_SPLIT_FFT_SIZE should skip band splitting
+        let sample_rate = 44100u32;
+        let num_samples = BAND_SPLIT_FFT_SIZE - 100;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_band_split(true);
+
+        let stretcher = HybridStretcher::new(params);
+        let output = stretcher.process(&input).unwrap();
+
+        // Should still produce valid output via hybrid path
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_separate_sub_bass_zero_cutoff() {
+        // With 0 Hz cutoff, all energy should go to remainder
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * 60.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let (sub_bass, remainder) = separate_sub_bass(&input, 0.0, sample_rate);
+
+        let sub_rms =
+            (sub_bass.iter().map(|x| x * x).sum::<f32>() / sub_bass.len() as f32).sqrt();
+        assert!(
+            sub_rms < 0.01,
+            "Zero cutoff should produce no sub-bass, got RMS={}",
+            sub_rms
+        );
+
+        let rem_rms =
+            (remainder.iter().map(|x| x * x).sum::<f32>() / remainder.len() as f32).sqrt();
+        assert!(
+            rem_rms > 0.1,
+            "Remainder should have the energy, got RMS={}",
+            rem_rms
+        );
     }
 }
