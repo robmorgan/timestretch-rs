@@ -659,6 +659,14 @@
 - [x] 15 new unit tests: split_at (mono, stereo, at 0, beyond end), repeat (mono, stereo, 0, 1, empty), mix (basic, different lengths, stereo, rate/channel mismatch, empty)
 - [x] All 774 tests passing, zero clippy warnings
 
+### Sixteenth pass (agent-5)
+- [x] Created `core::fft` module centralizing FFT-related constants shared across 5+ files
+- [x] Extracted `COMPLEX_ZERO` into `core::fft` — removes 5 identical `const COMPLEX_ZERO: Complex<f32> = Complex::new(0.0, 0.0)` definitions from transient.rs, frequency.rs, wsola.rs, phase_vocoder.rs, hybrid.rs
+- [x] Extracted `WINDOW_SUM_FLOOR_RATIO` and `WINDOW_SUM_EPSILON` into `core::fft` — removes duplicate definitions from phase_vocoder.rs (`MIN_WINDOW_SUM_RATIO`) and hybrid.rs (`WINDOW_SUM_FLOOR_RATIO`)
+- [x] Unified naming: `MIN_WINDOW_SUM_RATIO` in phase_vocoder.rs renamed to `WINDOW_SUM_FLOOR_RATIO` to match hybrid.rs convention
+- [x] Applied cargo fmt to tests/coverage_gaps.rs (formatting drift from other agents)
+- [x] All 311 unit tests passing, zero clippy warnings, cargo fmt clean
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
