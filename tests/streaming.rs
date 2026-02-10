@@ -1,5 +1,5 @@
 use std::f32::consts::PI;
-use timestretch::{stretch, EdmPreset, StreamProcessor, StretchParams};
+use timestretch::{stretch, EdmPreset, StreamProcessor, StretchParams, WindowType};
 
 fn sine_wave(freq: f32, sample_rate: u32, num_samples: usize) -> Vec<f32> {
     (0..num_samples)
@@ -570,4 +570,208 @@ fn test_streaming_from_tempo_slowdown() {
         "130→120 BPM should stretch, got ratio {}",
         output_ratio
     );
+}
+
+// ===================== WINDOW TYPE STREAMING TESTS =====================
+
+#[test]
+fn test_streaming_blackman_harris_produces_output() {
+    let sample_rate = 44100u32;
+    let signal = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
+
+    let params = StretchParams::new(1.5)
+        .with_sample_rate(sample_rate)
+        .with_channels(1)
+        .with_window_type(WindowType::BlackmanHarris);
+
+    let output = stream_stretch(&signal, params, 4096);
+    assert!(!output.is_empty(), "BH streaming should produce output");
+
+    let output_rms = rms(&output);
+    assert!(
+        output_rms > 0.1,
+        "BH streaming output should have energy, got RMS={}",
+        output_rms
+    );
+}
+
+#[test]
+fn test_streaming_kaiser_produces_output() {
+    let sample_rate = 44100u32;
+    let signal = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
+
+    let params = StretchParams::new(1.5)
+        .with_sample_rate(sample_rate)
+        .with_channels(1)
+        .with_window_type(WindowType::Kaiser(800));
+
+    let output = stream_stretch(&signal, params, 4096);
+    assert!(!output.is_empty(), "Kaiser streaming should produce output");
+
+    let output_rms = rms(&output);
+    assert!(
+        output_rms > 0.1,
+        "Kaiser streaming output should have energy, got RMS={}",
+        output_rms
+    );
+}
+
+#[test]
+fn test_streaming_different_windows_preserve_frequency() {
+    let sample_rate = 44100u32;
+    let freq = 440.0;
+    let signal = sine_wave(freq, sample_rate, sample_rate as usize * 2);
+
+    let windows = [
+        WindowType::Hann,
+        WindowType::BlackmanHarris,
+        WindowType::Kaiser(800),
+    ];
+
+    for &win in &windows {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_window_type(win);
+
+        let output = stream_stretch(&signal, params, 4096);
+        if output.len() < 4096 {
+            continue; // Not enough output to analyze
+        }
+
+        // Skip edge effects
+        let skip = 4096;
+        let end = output.len().saturating_sub(4096);
+        if end <= skip {
+            continue;
+        }
+        let trimmed = &output[skip..end];
+
+        let energy_440 = spectral_energy_at_freq(trimmed, sample_rate, freq);
+        let energy_880 = spectral_energy_at_freq(trimmed, sample_rate, freq * 2.0);
+
+        // 440 Hz should dominate over 880 Hz
+        assert!(
+            energy_440 > energy_880 * 2.0,
+            "Window {:?}: 440 Hz energy ({:.4}) should dominate over 880 Hz ({:.4})",
+            win,
+            energy_440,
+            energy_880
+        );
+    }
+}
+
+#[test]
+fn test_streaming_window_ratio_change() {
+    // Verify that window type persists through ratio changes
+    let sample_rate = 44100u32;
+    let signal = sine_wave(440.0, sample_rate, sample_rate as usize * 4);
+
+    let params = StretchParams::new(1.0)
+        .with_sample_rate(sample_rate)
+        .with_channels(1)
+        .with_window_type(WindowType::BlackmanHarris);
+
+    let mut processor = StreamProcessor::new(params);
+    let mut output = Vec::new();
+
+    // Process first half
+    for chunk in signal[..signal.len() / 2].chunks(4096) {
+        if let Ok(out) = processor.process(chunk) {
+            output.extend_from_slice(&out);
+        }
+    }
+
+    // Change ratio mid-stream
+    processor.set_stretch_ratio(1.05);
+
+    // Process second half
+    for chunk in signal[signal.len() / 2..].chunks(4096) {
+        if let Ok(out) = processor.process(chunk) {
+            output.extend_from_slice(&out);
+        }
+    }
+
+    if let Ok(remaining) = processor.flush() {
+        output.extend_from_slice(&remaining);
+    }
+
+    assert!(
+        !output.is_empty(),
+        "BH window with ratio change should produce output"
+    );
+
+    // Check for clicks (sudden jumps)
+    let mut max_diff = 0.0f32;
+    for i in 1..output.len() {
+        max_diff = max_diff.max((output[i] - output[i - 1]).abs());
+    }
+
+    assert!(
+        max_diff < 1.0,
+        "BH window ratio change should not produce clicks: max_diff={}",
+        max_diff
+    );
+}
+
+#[test]
+fn test_streaming_ambient_preset_uses_blackman_harris() {
+    let sample_rate = 44100u32;
+    let signal = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
+
+    let params = StretchParams::new(2.0)
+        .with_sample_rate(sample_rate)
+        .with_channels(1)
+        .with_preset(EdmPreset::Ambient);
+
+    // Verify the preset set Blackman-Harris
+    assert_eq!(params.window_type, WindowType::BlackmanHarris);
+
+    let output = stream_stretch(&signal, params, 4096);
+    assert!(
+        !output.is_empty(),
+        "Ambient preset streaming should produce output"
+    );
+
+    // Output should be approximately 2x longer
+    let ratio = output.len() as f64 / signal.len() as f64;
+    assert!(
+        (ratio - 2.0).abs() < 0.5,
+        "Ambient preset stream ratio {} too far from 2.0",
+        ratio
+    );
+}
+
+#[test]
+fn test_streaming_normalize_with_window() {
+    // Test that batch stretch with normalize produces consistent RMS
+    // regardless of window type
+    let sample_rate = 44100u32;
+    let num_samples = sample_rate as usize * 2;
+    let signal: Vec<f32> = (0..num_samples)
+        .map(|i| 0.7 * (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+        .collect();
+
+    let input_rms = rms(&signal);
+
+    let windows = [WindowType::Hann, WindowType::BlackmanHarris];
+
+    for &win in &windows {
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_window_type(win)
+            .with_normalize(true);
+
+        let output = stretch(&signal, &params).unwrap();
+        let output_rms = rms(&output);
+
+        assert!(
+            (output_rms - input_rms).abs() < input_rms * 0.1,
+            "Window {:?} with normalize: RMS mismatch input={:.4} output={:.4}",
+            win,
+            input_rms,
+            output_rms
+        );
+    }
 }

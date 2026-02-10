@@ -510,6 +510,15 @@
 - [x] Applied cargo fmt across codebase (also fixed pre-existing format drift from other agents)
 - [x] Zero clippy warnings on library code, cargo doc builds clean
 
+## Streaming Window Type Tests (agent-3)
+- [x] 6 new integration tests in `tests/streaming.rs` for window type coverage:
+  - Blackman-Harris streaming produces valid output with energy
+  - Kaiser streaming produces valid output with energy
+  - All window types preserve 440 Hz frequency content through streaming
+  - Blackman-Harris window persists through ratio changes without clicks
+  - Ambient preset streaming correctly uses Blackman-Harris
+  - Batch normalize + window type produces consistent RMS across window types
+
 ## CLI --window and --normalize flags (agent-3)
 - [x] Added `--window <hann|blackman-harris|bh|kaiser[:beta]>` flag to CLI
 - [x] Added `--normalize` / `-n` flag to CLI for RMS-matched output
