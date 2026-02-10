@@ -290,6 +290,13 @@
 - [x] Run with `cargo run --example generate_test_audio`
 - [x] Generated WAV files gitignored (`test_audio/.gitignore`)
 
+### Sixth pass (agent-5)
+- [x] Extracted `validate_input()` helper in lib.rs — deduplicates empty-check + NaN/Inf validation from `stretch()`, `pitch_shift()`, and `stretch_to_bpm_auto()` (net -9 lines)
+- [x] Extracted `validate_bpm()` helper in lib.rs — deduplicates BPM positivity checks from `stretch_to_bpm()` and `stretch_to_bpm_auto()` (net -8 lines)
+- [x] Added `#[inline]` hints to hot-path helpers: `deinterleave()`, `interleave()`, `validate_input()`, `validate_bpm()` (lib.rs), `overlap_add()` (wsola.rs), `snap_to_grid()` (beat.rs)
+- [x] Applied cargo fmt to fix formatting drift from other agents' code
+- [x] All 238 tests passing (98 unit + 126 integration + 14 doc), zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 

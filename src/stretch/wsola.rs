@@ -288,6 +288,7 @@ impl Wsola {
     }
 
     /// Overlap-adds a segment from input into output with raised-cosine crossfade.
+    #[inline]
     fn overlap_add(&self, input: &[f32], output: &mut [f32], input_pos: usize, output_pos: usize) {
         let segment_end = (input_pos + self.segment_size).min(input.len());
         let segment_len = segment_end - input_pos;

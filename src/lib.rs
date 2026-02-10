@@ -74,6 +74,7 @@ fn process_buffer(
 }
 
 /// Deinterleaves multi-channel audio into separate per-channel vectors.
+#[inline]
 fn deinterleave(input: &[f32], num_channels: usize) -> Vec<Vec<f32>> {
     (0..num_channels)
         .map(|ch| {
@@ -88,6 +89,7 @@ fn deinterleave(input: &[f32], num_channels: usize) -> Vec<Vec<f32>> {
 }
 
 /// Interleaves per-channel vectors into a single buffer, truncating to the shortest channel.
+#[inline]
 fn interleave(channels: &[Vec<f32>], num_channels: usize) -> Vec<f32> {
     let min_len = channels.iter().map(|c| c.len()).min().unwrap_or(0);
     let mut output = Vec::with_capacity(min_len * num_channels);
@@ -97,6 +99,33 @@ fn interleave(channels: &[Vec<f32>], num_channels: usize) -> Vec<f32> {
         }
     }
     output
+}
+
+/// Validates that input is non-empty and contains only finite samples.
+///
+/// Returns `Ok(false)` if input is empty (caller should return `Ok(vec![])`),
+/// `Ok(true)` if input is valid, or `Err` if it contains NaN/Inf.
+#[inline]
+fn validate_input(input: &[f32]) -> Result<bool, StretchError> {
+    if input.is_empty() {
+        return Ok(false);
+    }
+    if input.iter().any(|s| !s.is_finite()) {
+        return Err(StretchError::NonFiniteInput);
+    }
+    Ok(true)
+}
+
+/// Validates that a BPM value is positive, returning a descriptive error otherwise.
+#[inline]
+fn validate_bpm(bpm: f64, label: &str) -> Result<(), StretchError> {
+    if bpm <= 0.0 {
+        return Err(StretchError::BpmDetectionFailed(format!(
+            "{} BPM must be positive, got {}",
+            label, bpm
+        )));
+    }
+    Ok(())
 }
 
 /// Stretches audio samples by the given parameters.
@@ -125,16 +154,10 @@ fn interleave(channels: &[Vec<f32>], num_channels: usize) -> Vec<f32> {
 /// let output = timestretch::stretch(&input, &params).unwrap();
 /// ```
 pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, StretchError> {
-    // Validate parameters
     stretch::params::validate_params(params).map_err(StretchError::InvalidRatio)?;
 
-    if input.is_empty() {
+    if !validate_input(input)? {
         return Ok(vec![]);
-    }
-
-    // Reject non-finite samples (NaN/Inf) at the system boundary
-    if input.iter().any(|s| !s.is_finite()) {
-        return Err(StretchError::NonFiniteInput);
     }
 
     let num_channels = params.channels.count();
@@ -219,12 +242,8 @@ pub fn pitch_shift(
         )));
     }
 
-    if input.is_empty() {
+    if !validate_input(input)? {
         return Ok(vec![]);
-    }
-
-    if input.iter().any(|s| !s.is_finite()) {
-        return Err(StretchError::NonFiniteInput);
     }
 
     // Step 1: Time-stretch by 1/pitch_factor to compensate for the resampling
@@ -330,18 +349,8 @@ pub fn stretch_to_bpm(
     target_bpm: f64,
     params: &StretchParams,
 ) -> Result<Vec<f32>, StretchError> {
-    if source_bpm <= 0.0 {
-        return Err(StretchError::BpmDetectionFailed(format!(
-            "source BPM must be positive, got {}",
-            source_bpm
-        )));
-    }
-    if target_bpm <= 0.0 {
-        return Err(StretchError::BpmDetectionFailed(format!(
-            "target BPM must be positive, got {}",
-            target_bpm
-        )));
-    }
+    validate_bpm(source_bpm, "source")?;
+    validate_bpm(target_bpm, "target")?;
 
     let ratio = source_bpm / target_bpm;
     let mut adjusted_params = params.clone();
@@ -368,16 +377,11 @@ pub fn stretch_to_bpm_auto(
     target_bpm: f64,
     params: &StretchParams,
 ) -> Result<Vec<f32>, StretchError> {
-    if target_bpm <= 0.0 {
-        return Err(StretchError::BpmDetectionFailed(format!(
-            "target BPM must be positive, got {}",
-            target_bpm
-        )));
-    }
+    validate_bpm(target_bpm, "target")?;
 
     // Reject non-finite samples before expensive beat detection
-    if input.iter().any(|s| !s.is_finite()) {
-        return Err(StretchError::NonFiniteInput);
+    if !validate_input(input)? {
+        return Ok(vec![]);
     }
 
     // Extract mono signal for beat detection

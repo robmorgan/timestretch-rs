@@ -32,6 +32,7 @@ impl BeatGrid {
     }
 
     /// Snaps a sample position to the nearest beat grid position.
+    #[inline]
     pub fn snap_to_grid(&self, position: usize) -> usize {
         if self.beats.is_empty() {
             return position;
