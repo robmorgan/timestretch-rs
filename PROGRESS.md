@@ -584,6 +584,14 @@
 - [x] Zero `#[allow(...)]` annotations remaining in codebase
 - [x] All tests passing, zero clippy warnings, zero doc warnings
 
+### Fourteenth pass (agent-5)
+- [x] Replaced indexed `for i in 1..len` inter-onset interval loop with `.windows(2).map()` in `estimate_bpm()` (beat.rs)
+- [x] Replaced indexed FFT buffer fill loop with `zip` iterator in `compute_spectral_flux()` (transient.rs)
+- [x] Replaced indexed spectral flux accumulation loop with `zip` iterator over `fft_buffer`, `prev_magnitude`, `bin_weights` (transient.rs)
+- [x] Replaced indexed `for i in 0..flux.len()` loop with `enumerate` in `adaptive_threshold()` (transient.rs)
+- [x] Replaced indexed spectrum reconstruction loop with `zip` iterator over `fft_buffer`, `magnitudes`, `new_phases` in `reconstruct_spectrum()` (phase_vocoder.rs)
+- [x] All 284 unit tests passing, zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
