@@ -3,6 +3,9 @@
 use std::fmt;
 
 /// Errors that can occur during time stretching.
+///
+/// Implements [`std::error::Error`] and [`Display`](std::fmt::Display) for
+/// easy integration with error-handling crates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StretchError {
     /// Invalid audio format or parameters.

@@ -1,5 +1,46 @@
 #![forbid(unsafe_code)]
-#![doc = "Pure Rust audio time stretching library optimized for EDM."]
+//! Pure Rust audio time stretching library optimized for electronic dance music.
+//!
+//! `timestretch` changes the tempo of audio without altering its pitch, using a
+//! hybrid algorithm that combines WSOLA (for transients) with a phase vocoder
+//! (for tonal content). It ships with five EDM-tuned presets and a streaming API
+//! for real-time use.
+//!
+//! # Quick Start
+//!
+//! ```
+//! use timestretch::{StretchParams, EdmPreset};
+//!
+//! // 1 second of 440 Hz sine at 44.1 kHz
+//! let input: Vec<f32> = (0..44100)
+//!     .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
+//!     .collect();
+//!
+//! let params = StretchParams::new(1.5)
+//!     .with_sample_rate(44100)
+//!     .with_channels(1)
+//!     .with_preset(EdmPreset::HouseLoop);
+//!
+//! let output = timestretch::stretch(&input, &params).unwrap();
+//! assert!(output.len() > input.len()); // ~1.5x longer
+//! ```
+//!
+//! # Streaming
+//!
+//! For real-time use, feed audio in chunks via [`StreamProcessor`]:
+//!
+//! ```
+//! use timestretch::{StreamProcessor, StretchParams, EdmPreset};
+//!
+//! let params = StretchParams::new(1.0)
+//!     .with_preset(EdmPreset::DjBeatmatch)
+//!     .with_sample_rate(44100)
+//!     .with_channels(1);
+//!
+//! let mut processor = StreamProcessor::new(params);
+//! // processor.process(&chunk) for each audio buffer
+//! // processor.set_stretch_ratio(1.05) to change on the fly
+//! ```
 
 pub mod analysis;
 pub mod core;
@@ -17,11 +58,20 @@ pub use stream::StreamProcessor;
 /// This is the main entry point for one-shot (non-streaming) time stretching.
 /// For stereo input, provide interleaved L/R samples.
 ///
+/// # Errors
+///
+/// Returns [`StretchError::InvalidRatio`] if the stretch ratio is out of range
+/// (must be between 0.01 and 100.0).
+///
 /// # Example
-/// ```no_run
+///
+/// ```
 /// use timestretch::{StretchParams, EdmPreset};
 ///
-/// let input = vec![0.0f32; 44100]; // 1 second of silence
+/// let input: Vec<f32> = (0..44100)
+///     .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
+///     .collect();
+///
 /// let params = StretchParams::new(1.5)
 ///     .with_sample_rate(44100)
 ///     .with_channels(1)
@@ -73,7 +123,30 @@ pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, Stretc
     Ok(output)
 }
 
-/// Stretches an AudioBuffer and returns a new AudioBuffer.
+/// Stretches an [`AudioBuffer`] and returns a new `AudioBuffer`.
+///
+/// The sample rate and channel layout are taken from the input buffer,
+/// overriding whatever is set in `params`.
+///
+/// # Errors
+///
+/// Returns [`StretchError::InvalidRatio`] if the stretch ratio is out of range.
+///
+/// # Example
+///
+/// ```
+/// use timestretch::{AudioBuffer, StretchParams, EdmPreset};
+///
+/// let buffer = AudioBuffer::from_mono(
+///     (0..44100)
+///         .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
+///         .collect(),
+///     44100,
+/// );
+/// let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
+/// let output = timestretch::stretch_buffer(&buffer, &params).unwrap();
+/// assert_eq!(output.sample_rate, 44100);
+/// ```
 pub fn stretch_buffer(
     buffer: &AudioBuffer,
     params: &StretchParams,

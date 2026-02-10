@@ -153,6 +153,12 @@
 - [x] Total: 153 tests, all passing
 - [x] Zero clippy warnings
 
+## Documentation (agent-1)
+- [x] Merged and improved README (combined agent-1 and agent-3 versions)
+- [x] Added crate-level rustdoc with compilable examples (quick start + streaming)
+- [x] Added rustdoc examples to `stretch()`, `stretch_buffer()`, `AudioBuffer`, `StretchParams`, `EdmPreset`, `StreamProcessor`
+- [x] Added `# Errors` sections to public functions
+
 ## TODO
 - [ ] Test with real audio samples
 - [ ] SIMD-friendly inner loop layout

@@ -6,10 +6,30 @@ use crate::stretch::phase_vocoder::PhaseVocoder;
 
 /// Streaming chunk-based processor for real-time time stretching.
 ///
-/// Accumulates input samples in a ring buffer and processes them
+/// Accumulates input samples in an internal buffer and processes them
 /// using the phase vocoder when enough data is available.
 /// PhaseVocoder instances are persisted per channel to avoid
 /// expensive FFT planner recreation on each call.
+///
+/// # Example
+///
+/// ```
+/// use timestretch::{StreamProcessor, StretchParams, EdmPreset};
+///
+/// let params = StretchParams::new(1.0)
+///     .with_preset(EdmPreset::DjBeatmatch)
+///     .with_sample_rate(44100)
+///     .with_channels(1);
+///
+/// let mut processor = StreamProcessor::new(params);
+///
+/// // Feed a chunk of silence (in practice, real audio data)
+/// let chunk = vec![0.0f32; 4096];
+/// let _output = processor.process(&chunk).unwrap();
+///
+/// // Change ratio on the fly
+/// processor.set_stretch_ratio(1.05);
+/// ```
 pub struct StreamProcessor {
     params: StretchParams,
     input_buffer: Vec<f32>,

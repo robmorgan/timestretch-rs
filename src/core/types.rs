@@ -22,6 +22,22 @@ impl Channels {
 }
 
 /// An audio buffer holding interleaved sample data.
+///
+/// For stereo audio, samples are interleaved as `[L0, R0, L1, R1, ...]`.
+///
+/// # Example
+///
+/// ```
+/// use timestretch::{AudioBuffer, Channels};
+///
+/// let buf = AudioBuffer::from_mono(vec![0.0; 44100], 44100);
+/// assert_eq!(buf.num_frames(), 44100);
+/// assert!((buf.duration_secs() - 1.0).abs() < 1e-10);
+///
+/// let stereo = AudioBuffer::from_stereo(vec![0.0; 88200], 44100);
+/// assert_eq!(stereo.num_frames(), 44100);
+/// assert_eq!(stereo.channels, Channels::Stereo);
+/// ```
 #[derive(Debug, Clone)]
 pub struct AudioBuffer {
     /// Interleaved sample data.
@@ -106,6 +122,24 @@ impl AudioBuffer {
 }
 
 /// EDM-specific presets for time stretching.
+///
+/// Each preset tunes the FFT size, hop size, transient sensitivity, and
+/// WSOLA search range for a particular use case. Apply via
+/// [`StretchParams::with_preset`].
+///
+/// # Example
+///
+/// ```
+/// use timestretch::{StretchParams, EdmPreset};
+///
+/// // DJ beatmatching: minimal artifacts at small ratio changes
+/// let dj = StretchParams::new(128.0 / 126.0)
+///     .with_preset(EdmPreset::DjBeatmatch);
+///
+/// // Halftime: stretch to 2x for bass music
+/// let half = StretchParams::new(2.0)
+///     .with_preset(EdmPreset::Halftime);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdmPreset {
     /// Small tempo adjustments for DJ mixing (±1–8%). Prioritizes transparency.
@@ -121,6 +155,24 @@ pub enum EdmPreset {
 }
 
 /// Parameters for the time stretching algorithm.
+///
+/// Use the builder methods to configure. A ratio >1.0 makes audio longer
+/// (slower tempo), <1.0 makes it shorter (faster tempo).
+///
+/// # Example
+///
+/// ```
+/// use timestretch::{StretchParams, EdmPreset};
+///
+/// let params = StretchParams::new(1.5)
+///     .with_sample_rate(44100)
+///     .with_channels(2)
+///     .with_preset(EdmPreset::HouseLoop);
+///
+/// assert_eq!(params.stretch_ratio, 1.5);
+/// assert_eq!(params.sample_rate, 44100);
+/// assert_eq!(params.output_length(44100), 66150);
+/// ```
 #[derive(Debug, Clone)]
 pub struct StretchParams {
     /// Stretch ratio (>1.0 = slower/longer, <1.0 = faster/shorter).
