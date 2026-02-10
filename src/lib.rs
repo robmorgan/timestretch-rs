@@ -53,6 +53,25 @@ pub use core::types::{AudioBuffer, Channels, EdmPreset, Sample, StretchParams};
 pub use error::StretchError;
 pub use stream::StreamProcessor;
 
+/// Creates params adjusted for the given buffer's sample rate and channels,
+/// then wraps the processing result in a new AudioBuffer.
+fn process_buffer(
+    buffer: &AudioBuffer,
+    params: &StretchParams,
+    process_fn: impl FnOnce(&[f32], &StretchParams) -> Result<Vec<f32>, StretchError>,
+) -> Result<AudioBuffer, StretchError> {
+    let mut effective_params = params.clone();
+    effective_params.sample_rate = buffer.sample_rate;
+    effective_params.channels = buffer.channels;
+
+    let output_data = process_fn(&buffer.data, &effective_params)?;
+    Ok(AudioBuffer::new(
+        output_data,
+        buffer.sample_rate,
+        buffer.channels,
+    ))
+}
+
 /// Deinterleaves multi-channel audio into separate per-channel vectors.
 fn deinterleave(input: &[f32], num_channels: usize) -> Vec<Vec<f32>> {
     (0..num_channels)
@@ -146,17 +165,7 @@ pub fn stretch_buffer(
     buffer: &AudioBuffer,
     params: &StretchParams,
 ) -> Result<AudioBuffer, StretchError> {
-    let mut effective_params = params.clone();
-    effective_params.sample_rate = buffer.sample_rate;
-    effective_params.channels = buffer.channels;
-
-    let output_data = stretch(&buffer.data, &effective_params)?;
-
-    Ok(AudioBuffer::new(
-        output_data,
-        buffer.sample_rate,
-        buffer.channels,
-    ))
+    process_buffer(buffer, params, stretch)
 }
 
 /// Shifts the pitch of audio without changing its duration.
@@ -340,17 +349,9 @@ pub fn stretch_bpm_buffer(
     target_bpm: f64,
     params: &StretchParams,
 ) -> Result<AudioBuffer, StretchError> {
-    let mut effective_params = params.clone();
-    effective_params.sample_rate = buffer.sample_rate;
-    effective_params.channels = buffer.channels;
-
-    let output_data = stretch_to_bpm(&buffer.data, source_bpm, target_bpm, &effective_params)?;
-
-    Ok(AudioBuffer::new(
-        output_data,
-        buffer.sample_rate,
-        buffer.channels,
-    ))
+    process_buffer(buffer, params, |data, p| {
+        stretch_to_bpm(data, source_bpm, target_bpm, p)
+    })
 }
 
 /// Stretches an [`AudioBuffer`] to a target BPM, auto-detecting the source BPM.
@@ -366,17 +367,9 @@ pub fn stretch_bpm_buffer_auto(
     target_bpm: f64,
     params: &StretchParams,
 ) -> Result<AudioBuffer, StretchError> {
-    let mut effective_params = params.clone();
-    effective_params.sample_rate = buffer.sample_rate;
-    effective_params.channels = buffer.channels;
-
-    let output_data = stretch_to_bpm_auto(&buffer.data, target_bpm, &effective_params)?;
-
-    Ok(AudioBuffer::new(
-        output_data,
-        buffer.sample_rate,
-        buffer.channels,
-    ))
+    process_buffer(buffer, params, |data, p| {
+        stretch_to_bpm_auto(data, target_bpm, p)
+    })
 }
 
 /// Returns the stretch ratio needed to change from one BPM to another.
