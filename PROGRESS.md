@@ -639,6 +639,14 @@
 - [x] Total: 821 tests (311 unit + 483 integration + 27 doc), all passing
 - [x] Zero clippy warnings
 
+## DJ Mix Example (agent-3)
+- [x] New `examples/dj_mix.rs` — full DJ workflow example demonstrating:
+  - Two tracks at different sample rates (48kHz, 44.1kHz) and tempos (126, 130 BPM)
+  - Resample to common rate, stretch to target BPM (128) with DjBeatmatch preset
+  - Reverse cymbal build-up effect using `reverse()` + `fade_in()`
+  - Track splitting with `split_at()`, layering with `mix()`, crossfade transition
+  - Demonstrates all new AudioBuffer APIs in a realistic scenario
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
