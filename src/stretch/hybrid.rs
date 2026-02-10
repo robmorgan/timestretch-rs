@@ -350,12 +350,13 @@ fn window_and_transform(
     fft_buf: &mut [Complex<f32>],
     fft_fwd: &std::sync::Arc<dyn rustfft::Fft<f32>>,
 ) {
-    for (i, slot) in fft_buf.iter_mut().enumerate() {
-        *slot = if i < input_frame.len() {
-            Complex::new(input_frame[i] * window[i], 0.0)
-        } else {
-            Complex::new(0.0, 0.0)
-        };
+    let zero = Complex::new(0.0, 0.0);
+    let windowed = input_frame
+        .iter()
+        .zip(window.iter())
+        .map(|(&s, &w)| Complex::new(s * w, 0.0));
+    for (slot, val) in fft_buf.iter_mut().zip(windowed.chain(std::iter::repeat(zero))) {
+        *slot = val;
     }
     fft_fwd.process(fft_buf);
 }
