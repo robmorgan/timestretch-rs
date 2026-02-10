@@ -1,10 +1,8 @@
 //! WSOLA (Waveform Similarity Overlap-Add) time stretching.
 
+use crate::core::fft::COMPLEX_ZERO;
 use crate::error::StretchError;
 use rustfft::{num_complex::Complex, FftPlanner};
-
-/// Zero-valued complex number, used for FFT buffer initialization.
-const COMPLEX_ZERO: Complex<f32> = Complex::new(0.0, 0.0);
 
 /// Minimum energy threshold to avoid division by near-zero in correlation normalization.
 const ENERGY_EPSILON: f64 = 1e-12;

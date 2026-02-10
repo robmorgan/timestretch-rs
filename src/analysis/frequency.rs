@@ -2,8 +2,7 @@
 
 use rustfft::{num_complex::Complex, FftPlanner};
 
-/// Zero-valued complex number, used for FFT buffer initialization.
-const COMPLEX_ZERO: Complex<f32> = Complex::new(0.0, 0.0);
+use crate::core::fft::COMPLEX_ZERO;
 
 /// Result of splitting a spectrum into frequency bands: (sub_bass, low, mid, high).
 pub type BandSpectra = (

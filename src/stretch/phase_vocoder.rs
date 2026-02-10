@@ -3,16 +3,11 @@
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::f32::consts::PI;
 
+use crate::core::fft::{COMPLEX_ZERO, WINDOW_SUM_EPSILON, WINDOW_SUM_FLOOR_RATIO};
 use crate::core::window::{generate_window, WindowType};
 use crate::error::StretchError;
 
 const TWO_PI: f32 = 2.0 * PI;
-/// Zero-valued complex number, used for FFT buffer initialization.
-const COMPLEX_ZERO: Complex<f32> = Complex::new(0.0, 0.0);
-/// Minimum window sum to prevent amplification in low-overlap regions.
-const MIN_WINDOW_SUM_RATIO: f32 = 0.1;
-/// Absolute floor for window sum normalization.
-const WINDOW_SUM_EPSILON: f32 = 1e-6;
 /// Fraction of bins to pre-allocate for spectral peak detection (1/4 of bins).
 const PEAKS_CAPACITY_DIVISOR: usize = 4;
 
@@ -280,7 +275,7 @@ impl PhaseVocoder {
     /// low-overlap regions (occurs when synthesis hop > analysis hop).
     fn normalize_output(output: &mut [f32], window_sum: &[f32]) {
         let max_window_sum = window_sum.iter().copied().fold(0.0f32, f32::max);
-        let min_window_sum = (max_window_sum * MIN_WINDOW_SUM_RATIO).max(WINDOW_SUM_EPSILON);
+        let min_window_sum = (max_window_sum * WINDOW_SUM_FLOOR_RATIO).max(WINDOW_SUM_EPSILON);
         for (sample, &ws) in output.iter_mut().zip(window_sum.iter()) {
             *sample /= ws.max(min_window_sum);
         }
@@ -866,7 +861,7 @@ mod tests {
         PhaseVocoder::normalize_output(&mut output, &window_sum);
 
         // The clamped sample should NOT be amplified wildly
-        // min_window_sum = max(1.0) * MIN_WINDOW_SUM_RATIO = 0.1
+        // min_window_sum = max(1.0) * WINDOW_SUM_FLOOR_RATIO = 0.1
         // So output[5] = 1.0 / 0.1 = 10.0
         assert!(
             output[5] <= 11.0,

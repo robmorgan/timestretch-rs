@@ -3,15 +3,13 @@
 use crate::analysis::beat::detect_beats;
 use crate::analysis::frequency::freq_to_bin;
 use crate::analysis::transient::detect_transients;
+use crate::core::fft::{COMPLEX_ZERO, WINDOW_SUM_EPSILON, WINDOW_SUM_FLOOR_RATIO};
 use crate::core::types::StretchParams;
 use crate::core::window::{generate_window, WindowType};
 use crate::error::StretchError;
 use crate::stretch::phase_vocoder::PhaseVocoder;
 use crate::stretch::wsola::Wsola;
 use rustfft::{num_complex::Complex, FftPlanner};
-
-/// Zero-valued complex number, used for FFT buffer initialization.
-const COMPLEX_ZERO: Complex<f32> = Complex::new(0.0, 0.0);
 
 /// Crossfade duration in seconds between algorithm segments (5ms raised-cosine).
 const CROSSFADE_SECS: f64 = 0.005;
@@ -35,10 +33,6 @@ const MIN_SAMPLES_FOR_BEAT_DETECTION: usize = 44100; // ~1 second at 44.1kHz
 const BAND_SPLIT_FFT_SIZE: usize = 4096;
 /// Hop size for the band-splitting overlap-add filter (75% overlap).
 const BAND_SPLIT_HOP: usize = BAND_SPLIT_FFT_SIZE / 4;
-/// Minimum window sum to prevent amplification in low-overlap regions.
-const WINDOW_SUM_FLOOR_RATIO: f32 = 0.1;
-/// Absolute floor for window sum normalization.
-const WINDOW_SUM_EPSILON: f32 = 1e-6;
 /// Minimum distance (samples) between merged onset/beat positions.
 /// Positions closer than this are considered duplicates.
 const DEDUP_DISTANCE: usize = 512;
