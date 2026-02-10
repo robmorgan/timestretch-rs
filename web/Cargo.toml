@@ -1,0 +1,16 @@
+[package]
+name = "timestretch-web"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+timestretch = { path = ".." }
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true

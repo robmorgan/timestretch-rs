@@ -4,3 +4,5 @@ agent_logs/
 Cargo.lock
 *.wav
 *.raw
+web/pkg/
+web/target/

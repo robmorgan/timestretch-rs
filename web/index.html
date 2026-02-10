@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>timestretch-rs Web Demo</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>timestretch-rs</h1>
+      <p>Real-time audio time stretching in the browser via WebAssembly</p>
+    </header>
+
+    <!-- Drop zone -->
+    <div id="drop-zone">
+      <p>Drag &amp; drop an audio file here, or <span id="browse-link">browse</span></p>
+      <input type="file" id="file-input" accept="audio/*">
+    </div>
+
+    <!-- Info panel -->
+    <div id="info-panel" class="card hidden">
+      <div class="info-grid">
+        <div class="info-item">
+          <label>File</label>
+          <div class="value" id="info-name">—</div>
+        </div>
+        <div class="info-item">
+          <label>Duration</label>
+          <div class="value" id="info-duration">—</div>
+        </div>
+        <div class="info-item">
+          <label>Sample Rate</label>
+          <div class="value" id="info-samplerate">—</div>
+        </div>
+        <div class="info-item">
+          <label>Channels</label>
+          <div class="value" id="info-channels">—</div>
+        </div>
+        <div class="info-item">
+          <label>Detected BPM</label>
+          <div class="value" id="info-bpm">—</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Controls -->
+    <div id="controls-panel" class="card hidden">
+      <div class="control-group">
+        <label>
+          Stretch Ratio
+          <span class="val" id="stretch-val">1.00x</span>
+        </label>
+        <input type="range" id="stretch-slider" min="0.5" max="2.0" step="0.01" value="1.0">
+      </div>
+
+      <div class="control-group">
+        <label>
+          Pitch Shift
+          <span class="val" id="pitch-val">0 st</span>
+        </label>
+        <input type="range" id="pitch-slider" min="-12" max="12" step="1" value="0">
+      </div>
+
+      <div class="control-group">
+        <label>EDM Preset</label>
+        <select id="preset-select">
+          <option value="">None</option>
+          <option value="DjBeatmatch">DJ Beatmatch</option>
+          <option value="HouseLoop">House Loop</option>
+          <option value="Halftime">Halftime</option>
+          <option value="Ambient">Ambient</option>
+          <option value="VocalChop">Vocal Chop</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Transport -->
+    <div id="transport-panel" class="card hidden">
+      <div class="transport">
+        <button id="btn-play" disabled>Play</button>
+        <button id="btn-pause" disabled>Pause</button>
+        <button id="btn-stop" disabled>Stop</button>
+        <span class="position" id="position">0:00 / 0:00</span>
+      </div>
+    </div>
+
+    <!-- Waveform -->
+    <div id="waveform-panel" class="card hidden">
+      <canvas id="waveform" width="900" height="120"></canvas>
+    </div>
+
+    <!-- Status -->
+    <div id="status">Loading WASM module...</div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
