@@ -604,6 +604,25 @@
 - [x] Total: 630 tests, all passing
 - [x] Zero clippy warnings
 
+## DJ Workflow API & Creative Effects (agent-3)
+- [x] `AudioBuffer::reverse()` — frame-order reversal for creative DJ effects (reverse cymbals, tape-stop)
+  - Preserves channel pairing in stereo (L/R stay together)
+  - Double-reverse is identity
+- [x] `AudioBuffer::channel_count()` — convenience getter (returns 1 or 2)
+- [x] 12 new DJ workflow integration tests in `tests/dj_workflows.rs`:
+  - Resample+stretch pipeline (48kHz→44.1kHz then stretch)
+  - Stereo resample preserves channels
+  - Resample round-trip frequency accuracy (44.1k→48k→44.1k)
+  - Crossfade of two stretched tracks (DJ mixing)
+  - Stereo crossfade workflow
+  - Reverse+stretch creative effect
+  - Full DJ pipeline (resample→stretch→crossfade)
+  - Reverse cymbal build effect
+  - Slice+stretch+concatenate sample chopping
+  - channel_count preservation through operations
+- [x] 6 new unit tests: reverse (mono, stereo, empty, double), channel_count (mono, stereo)
+- [x] All 759 tests passing, zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
