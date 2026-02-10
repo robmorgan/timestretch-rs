@@ -382,6 +382,15 @@ impl<'a> Iterator for FrameIter<'a> {
 
 impl<'a> ExactSizeIterator for FrameIter<'a> {}
 
+impl<'a> IntoIterator for &'a AudioBuffer {
+    type Item = &'a [Sample];
+    type IntoIter = FrameIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.frames()
+    }
+}
+
 impl AudioBuffer {
     /// Returns an iterator over the frames of this buffer.
     ///
@@ -403,6 +412,75 @@ impl AudioBuffer {
             data: &self.data,
             channels: self.channels.count(),
             pos: 0,
+        }
+    }
+
+    /// Returns the peak absolute amplitude in the buffer.
+    ///
+    /// Returns 0.0 for an empty buffer.
+    #[inline]
+    pub fn peak(&self) -> f32 {
+        self.data.iter().map(|s| s.abs()).fold(0.0f32, f32::max)
+    }
+
+    /// Returns the root mean square (RMS) amplitude of the buffer.
+    ///
+    /// Returns 0.0 for an empty buffer. Computed in `f64` for precision.
+    pub fn rms(&self) -> f32 {
+        if self.data.is_empty() {
+            return 0.0;
+        }
+        let sum_sq: f64 = self.data.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        (sum_sq / self.data.len() as f64).sqrt() as f32
+    }
+
+    /// Applies a linear fade-in over the given number of frames.
+    ///
+    /// Gain ramps from 0.0 at frame 0 to 1.0 at `duration_frames`.
+    /// Frames beyond `duration_frames` are unmodified.
+    /// If `duration_frames` exceeds the buffer length, the entire buffer
+    /// is faded.
+    pub fn fade_in(&self, duration_frames: usize) -> Self {
+        let nc = self.channels.count();
+        let total_frames = self.num_frames();
+        let fade_frames = duration_frames.min(total_frames);
+        let mut data = self.data.clone();
+        for frame in 0..fade_frames {
+            let gain = frame as f32 / fade_frames as f32;
+            for ch in 0..nc {
+                data[frame * nc + ch] *= gain;
+            }
+        }
+        Self {
+            data,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        }
+    }
+
+    /// Applies a linear fade-out over the given number of frames.
+    ///
+    /// Gain ramps from 1.0 to 0.0 over the last `duration_frames` frames.
+    /// Frames before the fade region are unmodified.
+    /// If `duration_frames` exceeds the buffer length, the entire buffer
+    /// is faded.
+    pub fn fade_out(&self, duration_frames: usize) -> Self {
+        let nc = self.channels.count();
+        let total_frames = self.num_frames();
+        let fade_frames = duration_frames.min(total_frames);
+        let fade_start = total_frames - fade_frames;
+        let mut data = self.data.clone();
+        for frame in fade_start..total_frames {
+            let pos_in_fade = frame - fade_start;
+            let gain = 1.0 - pos_in_fade as f32 / fade_frames as f32;
+            for ch in 0..nc {
+                data[frame * nc + ch] *= gain;
+            }
+        }
+        Self {
+            data,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
         }
     }
 }
@@ -1227,5 +1305,140 @@ mod tests {
         let buf = AudioBuffer::from_stereo(vec![1.0, 2.0, 3.0, 4.0], 44100);
         let iter = buf.frames();
         assert_eq!(iter.len(), 2);
+    }
+
+    #[test]
+    fn test_audio_buffer_into_iterator() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 2.0, 3.0], 44100);
+        let mut count = 0;
+        for frame in &buf {
+            assert_eq!(frame.len(), 1);
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_audio_buffer_into_iterator_stereo() {
+        let buf = AudioBuffer::from_stereo(vec![1.0, 2.0, 3.0, 4.0], 44100);
+        let frames: Vec<&[f32]> = (&buf).into_iter().collect();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0], &[1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_audio_buffer_peak() {
+        let buf = AudioBuffer::from_mono(vec![0.25, -0.8, 0.5], 44100);
+        assert!((buf.peak() - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_audio_buffer_peak_empty() {
+        let buf = AudioBuffer::from_mono(vec![], 44100);
+        assert!((buf.peak() - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_audio_buffer_rms() {
+        // RMS of [1.0, -1.0] = sqrt((1 + 1) / 2) = 1.0
+        let buf = AudioBuffer::from_mono(vec![1.0, -1.0], 44100);
+        assert!((buf.rms() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_audio_buffer_rms_sine() {
+        // RMS of a sine wave is 1/sqrt(2) ≈ 0.7071
+        let n = 44100;
+        let data: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * i as f32 / n as f32).sin())
+            .collect();
+        let buf = AudioBuffer::from_mono(data, 44100);
+        let expected = 1.0 / 2.0f32.sqrt();
+        assert!(
+            (buf.rms() - expected).abs() < 0.01,
+            "Expected RMS ~{}, got {}",
+            expected,
+            buf.rms()
+        );
+    }
+
+    #[test]
+    fn test_audio_buffer_rms_empty() {
+        let buf = AudioBuffer::from_mono(vec![], 44100);
+        assert!((buf.rms() - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_audio_buffer_fade_in() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 1.0, 1.0, 1.0], 44100);
+        let faded = buf.fade_in(4);
+        // Frame 0: gain=0/4=0.0, frame 1: 1/4=0.25, frame 2: 2/4=0.5, frame 3: 3/4=0.75
+        assert!((faded.data[0] - 0.0).abs() < 1e-6);
+        assert!((faded.data[1] - 0.25).abs() < 1e-6);
+        assert!((faded.data[2] - 0.5).abs() < 1e-6);
+        assert!((faded.data[3] - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_audio_buffer_fade_in_partial() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 1.0, 1.0, 1.0], 44100);
+        let faded = buf.fade_in(2);
+        // Only first 2 frames affected: gain=0.0, 0.5. Rest unchanged.
+        assert!((faded.data[0] - 0.0).abs() < 1e-6);
+        assert!((faded.data[1] - 0.5).abs() < 1e-6);
+        assert!((faded.data[2] - 1.0).abs() < 1e-6);
+        assert!((faded.data[3] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_audio_buffer_fade_out() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 1.0, 1.0, 1.0], 44100);
+        let faded = buf.fade_out(4);
+        // Frame 0: gain=1.0, frame 1: 0.75, frame 2: 0.5, frame 3: 0.25
+        assert!((faded.data[0] - 1.0).abs() < 1e-6);
+        assert!((faded.data[1] - 0.75).abs() < 1e-6);
+        assert!((faded.data[2] - 0.5).abs() < 1e-6);
+        assert!((faded.data[3] - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_audio_buffer_fade_out_partial() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 1.0, 1.0, 1.0], 44100);
+        let faded = buf.fade_out(2);
+        // First 2 frames unmodified, last 2 faded
+        assert!((faded.data[0] - 1.0).abs() < 1e-6);
+        assert!((faded.data[1] - 1.0).abs() < 1e-6);
+        assert!((faded.data[2] - 1.0).abs() < 1e-6); // gain = 1 - 0/2 = 1.0
+        assert!((faded.data[3] - 0.5).abs() < 1e-6); // gain = 1 - 1/2 = 0.5
+    }
+
+    #[test]
+    fn test_audio_buffer_fade_stereo() {
+        let buf = AudioBuffer::from_stereo(vec![1.0, 1.0, 1.0, 1.0], 44100);
+        let faded = buf.fade_in(2);
+        // Frame 0 (both channels): gain = 0.0
+        assert!((faded.data[0] - 0.0).abs() < 1e-6);
+        assert!((faded.data[1] - 0.0).abs() < 1e-6);
+        // Frame 1 (both channels): gain = 0.5
+        assert!((faded.data[2] - 0.5).abs() < 1e-6);
+        assert!((faded.data[3] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_audio_buffer_fade_empty() {
+        let buf = AudioBuffer::from_mono(vec![], 44100);
+        let faded_in = buf.fade_in(100);
+        assert!(faded_in.is_empty());
+        let faded_out = buf.fade_out(100);
+        assert!(faded_out.is_empty());
+    }
+
+    #[test]
+    fn test_audio_buffer_fade_longer_than_buffer() {
+        // Fade duration exceeds buffer length — should fade the whole thing
+        let buf = AudioBuffer::from_mono(vec![1.0, 1.0], 44100);
+        let faded = buf.fade_in(100);
+        assert!((faded.data[0] - 0.0).abs() < 1e-6);
+        assert!((faded.data[1] - 0.5).abs() < 1e-6);
     }
 }

@@ -88,13 +88,16 @@ pub fn split_spectrum_into_bands(
     let mut high = vec![Complex::new(0.0f32, 0.0); spectrum.len()];
 
     // Assigns spectrum[idx] to the band determined by classify_bin(class_bin).
-    let mut assign = |class_bin: usize, idx: usize| {
-        match classify_bin(class_bin, sub_bass_bin, low_bin, mid_bin) {
-            Band::SubBass => sub_bass[idx] = spectrum[idx],
-            Band::Low => low[idx] = spectrum[idx],
-            Band::Mid => mid[idx] = spectrum[idx],
-            Band::High => high[idx] = spectrum[idx],
-        }
+    let mut assign = |class_bin: usize, idx: usize| match classify_bin(
+        class_bin,
+        sub_bass_bin,
+        low_bin,
+        mid_bin,
+    ) {
+        Band::SubBass => sub_bass[idx] = spectrum[idx],
+        Band::Low => low[idx] = spectrum[idx],
+        Band::Mid => mid[idx] = spectrum[idx],
+        Band::High => high[idx] = spectrum[idx],
     };
 
     for bin in 0..num_bins.min(spectrum.len()) {
