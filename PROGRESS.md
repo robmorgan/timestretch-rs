@@ -634,6 +634,7 @@
 - [x] Replaced `enumerate()+index` with idiomatic `zip` in `compute_band_energy()` (frequency.rs) and `analyze_frame()` (phase_vocoder.rs)
 - [x] Applied cargo fmt to fix formatting drift from other agents (beat.rs, transient.rs)
 - [x] All 311 tests passing, zero clippy warnings, cargo fmt clean
+
 ## Streaming-Batch Parity (agent-1)
 - [x] `AsMut<[f32]>` impl for AudioBuffer — enables in-place DSP processing
 - [x] `into_data()` method — named alternative to `Vec::<f32>::from(buffer)`
@@ -648,6 +649,15 @@
 - [x] 3 new unit tests: as_mut, into_data, into_data_empty
 - [x] Applied cargo fmt to beat.rs and transient.rs
 - [x] All tests passing, zero clippy/doc warnings
+
+## Sample Manipulation API (agent-3)
+- [x] `AudioBuffer::split_at(frame)` — split buffer into two at a given frame position
+- [x] `AudioBuffer::repeat(count)` — loop the buffer N times for sample looping
+- [x] `AudioBuffer::mix(other)` — sum two buffers sample-by-sample for sound layering
+  - Validates matching sample rate and channel layout
+  - Zero-pads shorter input to match longer
+- [x] 15 new unit tests: split_at (mono, stereo, at 0, beyond end), repeat (mono, stereo, 0, 1, empty), mix (basic, different lengths, stereo, rate/channel mismatch, empty)
+- [x] All 774 tests passing, zero clippy warnings
 
 ## TODO
 - [ ] SIMD-friendly inner loop layout
