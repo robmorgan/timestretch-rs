@@ -57,8 +57,7 @@ fn main() {
         .with_sample_rate(sample_rate)
         .with_channels(1);
 
-    let output = timestretch::stretch_to_bpm(&input, 120.0, 60.0, &params)
-        .expect("stretch failed");
+    let output = timestretch::stretch_to_bpm(&input, 120.0, 60.0, &params).expect("stretch failed");
 
     let output_duration = output.len() as f64 / sample_rate as f64;
     let actual_ratio = output.len() as f64 / input.len() as f64;

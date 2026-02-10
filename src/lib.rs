@@ -870,8 +870,7 @@ mod tests {
             for (i, sample) in audio[tone_start..tone_end].iter_mut().enumerate() {
                 let idx = tone_start + i;
                 *sample += 0.2
-                    * (2.0 * std::f32::consts::PI * 200.0 * idx as f32 / sample_rate as f32)
-                        .sin();
+                    * (2.0 * std::f32::consts::PI * 200.0 * idx as f32 / sample_rate as f32).sin();
             }
         }
 
