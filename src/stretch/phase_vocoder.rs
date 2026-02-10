@@ -7,6 +7,10 @@ use crate::core::window::{generate_window, WindowType};
 use crate::error::StretchError;
 
 const TWO_PI: f32 = 2.0 * PI;
+/// Minimum window sum to prevent amplification in low-overlap regions.
+const MIN_WINDOW_SUM_RATIO: f32 = 0.1;
+/// Absolute floor for window sum normalization.
+const WINDOW_SUM_EPSILON: f32 = 1e-6;
 
 /// Phase vocoder state for time stretching.
 pub struct PhaseVocoder {
@@ -142,42 +146,8 @@ impl PhaseVocoder {
             let analysis_pos = frame_idx * self.hop_analysis;
             let synthesis_pos = frame_idx * self.hop_synthesis;
 
-            // Analysis: window and FFT (reuse buffer)
-            let input_frame = &input[analysis_pos..analysis_pos + self.fft_size];
-            for (i, (&sample, &win)) in input_frame.iter().zip(self.window.iter()).enumerate() {
-                self.fft_buffer[i] = Complex::new(sample * win, 0.0);
-            }
-
-            fft_forward.process(&mut self.fft_buffer);
-
-            // Phase processing (reuse magnitude/phase buffers)
-            for bin in 0..num_bins {
-                let c = self.fft_buffer[bin];
-                self.magnitudes[bin] = c.norm();
-                let phase = c.arg();
-                self.analysis_phases[bin] = phase;
-
-                if bin < self.sub_bass_bin {
-                    // Sub-bass rigid phase locking: propagate the analysis phase
-                    // directly scaled by the hop ratio. This prevents phase
-                    // cancellation in the critical sub-bass region (< 120 Hz)
-                    // where EDM content must remain phase-coherent and mono-compatible.
-                    self.phase_accum[bin] += phase - self.prev_phase[bin];
-                    self.new_phases[bin] = self.phase_accum[bin];
-                } else {
-                    // Standard phase vocoder with deviation tracking
-                    let expected = self.expected_phase_advance[bin];
-                    let phase_diff = phase - self.prev_phase[bin];
-                    let deviation = wrap_phase(phase_diff - expected);
-
-                    // True frequency deviation, accumulate phase with synthesis hop
-                    let true_freq = expected + deviation;
-                    self.phase_accum[bin] += true_freq * hop_ratio;
-
-                    self.new_phases[bin] = self.phase_accum[bin];
-                }
-                self.prev_phase[bin] = phase;
-            }
+            self.analyze_frame(&input[analysis_pos..analysis_pos + self.fft_size], &fft_forward);
+            self.advance_phases(num_bins, hop_ratio);
 
             // Identity phase locking (Laroche & Dolson 1999): lock non-peak
             // bins to their nearest peak using the analysis phase relationship.
@@ -191,16 +161,13 @@ impl PhaseVocoder {
                 &mut self.peaks,
             );
 
-            // Reconstruct spectrum from magnitudes and phases, mirror for inverse FFT
             self.reconstruct_spectrum(num_bins);
-
-            // Inverse FFT
             fft_inverse.process(&mut self.fft_buffer);
 
             // Overlap-add with synthesis window
-            let out_end = (synthesis_pos + self.fft_size).min(output_len);
+            let frame_len = (synthesis_pos + self.fft_size).min(output_len) - synthesis_pos;
             #[allow(clippy::needless_range_loop)]
-            for i in 0..out_end - synthesis_pos {
+            for i in 0..frame_len {
                 let out_idx = synthesis_pos + i;
                 output[out_idx] += self.fft_buffer[i].re * norm * self.window[i];
                 window_sum[out_idx] += self.window[i] * self.window[i];
@@ -209,6 +176,45 @@ impl PhaseVocoder {
 
         Self::normalize_output(&mut output, &window_sum);
         Ok(output)
+    }
+
+    /// Windows the input frame and transforms to frequency domain.
+    fn analyze_frame(
+        &mut self,
+        input_frame: &[f32],
+        fft_forward: &std::sync::Arc<dyn rustfft::Fft<f32>>,
+    ) {
+        for (i, (&sample, &win)) in input_frame.iter().zip(self.window.iter()).enumerate() {
+            self.fft_buffer[i] = Complex::new(sample * win, 0.0);
+        }
+        fft_forward.process(&mut self.fft_buffer);
+    }
+
+    /// Extracts magnitudes and advances phase accumulators for each bin.
+    ///
+    /// Sub-bass bins (below `sub_bass_bin`) use rigid phase propagation to prevent
+    /// phase cancellation in the critical sub-bass region. All other bins use
+    /// standard phase vocoder deviation tracking.
+    fn advance_phases(&mut self, num_bins: usize, hop_ratio: f32) {
+        for bin in 0..num_bins {
+            let c = self.fft_buffer[bin];
+            self.magnitudes[bin] = c.norm();
+            let phase = c.arg();
+            self.analysis_phases[bin] = phase;
+
+            if bin < self.sub_bass_bin {
+                // Rigid phase propagation for sub-bass coherence
+                self.phase_accum[bin] += phase - self.prev_phase[bin];
+            } else {
+                // Standard deviation tracking with hop-ratio scaling
+                let expected = self.expected_phase_advance[bin];
+                let deviation = wrap_phase(phase - self.prev_phase[bin] - expected);
+                self.phase_accum[bin] += (expected + deviation) * hop_ratio;
+            }
+
+            self.new_phases[bin] = self.phase_accum[bin];
+            self.prev_phase[bin] = phase;
+        }
     }
 
     /// Reconstructs the complex spectrum from magnitudes and phases,
@@ -229,10 +235,10 @@ impl PhaseVocoder {
     /// low-overlap regions (occurs when synthesis hop > analysis hop).
     fn normalize_output(output: &mut [f32], window_sum: &[f32]) {
         let max_window_sum = window_sum.iter().cloned().fold(0.0f32, f32::max);
-        let min_window_sum = (max_window_sum * 0.1).max(1e-6);
+        let min_window_sum = (max_window_sum * MIN_WINDOW_SUM_RATIO).max(WINDOW_SUM_EPSILON);
         for (sample, &ws) in output.iter_mut().zip(window_sum.iter()) {
             let ws = ws.max(min_window_sum);
-            if ws > 1e-6 {
+            if ws > WINDOW_SUM_EPSILON {
                 *sample /= ws;
             }
         }

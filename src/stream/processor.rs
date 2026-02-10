@@ -4,6 +4,11 @@ use crate::core::types::StretchParams;
 use crate::error::StretchError;
 use crate::stretch::phase_vocoder::PhaseVocoder;
 
+/// Threshold below which ratio differences are considered negligible.
+const RATIO_SNAP_THRESHOLD: f64 = 0.0001;
+/// Smoothing factor for interpolating between current and target ratio.
+const RATIO_INTERPOLATION_ALPHA: f64 = 0.1;
+
 /// Streaming chunk-based processor for real-time time stretching.
 ///
 /// Accumulates input samples in an internal buffer and processes them
@@ -87,60 +92,72 @@ impl StreamProcessor {
     /// Returns stretched output samples. May return an empty slice if
     /// not enough input has accumulated yet.
     pub fn process(&mut self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
-        // Append input to buffer
         self.input_buffer.extend_from_slice(input);
         self.initialized = true;
-
-        // Smoothly interpolate ratio
         self.interpolate_ratio();
 
         let num_channels = self.params.channels.count();
         let min_input = self.params.fft_size * num_channels * 2;
 
-        // Process when we have enough data
         if self.input_buffer.len() < min_input {
             return Ok(vec![]);
         }
 
         let total_frames = self.input_buffer.len() / num_channels;
-
         if total_frames < self.params.fft_size {
             return Ok(vec![]);
         }
 
         // Update vocoders' stretch ratio in-place to preserve phase state.
         // Recreating vocoders would reset phase accumulators and cause clicks.
-        if (self.current_ratio - self.params.stretch_ratio).abs() > 0.0001 {
+        if (self.current_ratio - self.params.stretch_ratio).abs() > RATIO_SNAP_THRESHOLD {
             for voc in &mut self.vocoders {
                 voc.set_stretch_ratio(self.current_ratio);
             }
         }
 
-        // Process each channel using persistent vocoders and reusable buffers
+        // Deinterleave, process per-channel, collect min output length
+        let min_output_len = self.process_channels(num_channels)?;
+
+        // Drain consumed input samples
+        self.drain_consumed_input(total_frames, num_channels);
+
+        // Re-interleave channel outputs
+        if min_output_len == 0 {
+            return Ok(vec![]);
+        }
+        Ok(self.interleave_output(min_output_len, num_channels))
+    }
+
+    /// Deinterleaves input, stretches each channel, returns min output length across channels.
+    fn process_channels(&mut self, num_channels: usize) -> Result<usize, StretchError> {
         let mut min_output_len = usize::MAX;
 
         for ch in 0..num_channels {
-            // Deinterleave into reusable buffer
-            self.channel_buffers[ch].clear();
-            let mut idx = ch;
-            while idx < self.input_buffer.len() {
-                self.channel_buffers[ch].push(self.input_buffer[idx]);
-                idx += num_channels;
-            }
-
-            // Process with persistent phase vocoder
+            self.deinterleave_channel(ch, num_channels);
             let stretched = self.vocoders[ch].process(&self.channel_buffers[ch])?;
             min_output_len = min_output_len.min(stretched.len());
             self.channel_buffers[ch] = stretched;
         }
 
-        // Drain all processed input. The PV resets phase state per call,
-        // so re-processing overlap data would produce extra output.
-        // Keep only unprocessed remainder (samples that don't form a complete hop).
-        let frames_per_channel = total_frames;
+        Ok(if min_output_len == usize::MAX { 0 } else { min_output_len })
+    }
+
+    /// Extracts a single channel from the interleaved input buffer.
+    fn deinterleave_channel(&mut self, ch: usize, num_channels: usize) {
+        self.channel_buffers[ch].clear();
+        let mut idx = ch;
+        while idx < self.input_buffer.len() {
+            self.channel_buffers[ch].push(self.input_buffer[idx]);
+            idx += num_channels;
+        }
+    }
+
+    /// Drains consumed samples from the input buffer, keeping unprocessed remainder.
+    fn drain_consumed_input(&mut self, total_frames: usize, num_channels: usize) {
         let hop = self.params.hop_size;
-        let num_frames_processed = if frames_per_channel >= self.params.fft_size {
-            (frames_per_channel - self.params.fft_size) / hop + 1
+        let num_frames_processed = if total_frames >= self.params.fft_size {
+            (total_frames - self.params.fft_size) / hop + 1
         } else {
             0
         };
@@ -152,12 +169,10 @@ impl StreamProcessor {
         if samples_consumed > 0 && samples_consumed <= self.input_buffer.len() {
             self.input_buffer.drain(..samples_consumed);
         }
+    }
 
-        // Re-interleave output
-        if min_output_len == usize::MAX || min_output_len == 0 {
-            return Ok(vec![]);
-        }
-
+    /// Interleaves per-channel outputs into a single buffer.
+    fn interleave_output(&mut self, min_output_len: usize, num_channels: usize) -> Vec<f32> {
         self.output_scratch.clear();
         self.output_scratch.reserve(min_output_len * num_channels);
         for i in 0..min_output_len {
@@ -165,8 +180,7 @@ impl StreamProcessor {
                 self.output_scratch.push(self.channel_buffers[ch][i]);
             }
         }
-
-        Ok(std::mem::take(&mut self.output_scratch))
+        std::mem::take(&mut self.output_scratch)
     }
 
     /// Changes the stretch ratio for subsequent processing.
@@ -223,11 +237,9 @@ impl StreamProcessor {
 
     /// Smoothly interpolates between current and target ratio.
     fn interpolate_ratio(&mut self) {
-        let alpha = 0.1; // Smoothing factor
-        self.current_ratio += alpha * (self.target_ratio - self.current_ratio);
+        self.current_ratio += RATIO_INTERPOLATION_ALPHA * (self.target_ratio - self.current_ratio);
 
-        // Snap when close enough
-        if (self.current_ratio - self.target_ratio).abs() < 0.0001 {
+        if (self.current_ratio - self.target_ratio).abs() < RATIO_SNAP_THRESHOLD {
             self.current_ratio = self.target_ratio;
         }
     }

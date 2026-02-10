@@ -3,6 +3,13 @@
 use crate::error::StretchError;
 use rustfft::{num_complex::Complex, FftPlanner};
 
+/// Minimum energy threshold to avoid division by near-zero in correlation normalization.
+const ENERGY_EPSILON: f64 = 1e-12;
+/// Minimum number of candidates to justify FFT-based correlation over direct computation.
+const FFT_CANDIDATE_THRESHOLD: usize = 64;
+/// Minimum overlap length for FFT-based correlation to be worthwhile.
+const FFT_OVERLAP_THRESHOLD: usize = 32;
+
 /// WSOLA (Waveform Similarity Overlap-Add) time stretching.
 ///
 /// Preserves transient quality better than phase vocoder by operating
@@ -141,15 +148,8 @@ impl Wsola {
         let num_candidates = search_end - search_start + 1;
 
         // Use FFT-based correlation when search range is large enough to benefit
-        if num_candidates > 64 && overlap_len >= 32 {
-            self.find_best_position_fft(
-                input,
-                output,
-                search_start,
-                search_end,
-                output_pos,
-                overlap_len,
-            )
+        if num_candidates > FFT_CANDIDATE_THRESHOLD && overlap_len >= FFT_OVERLAP_THRESHOLD {
+            self.find_best_position_fft(input, output, search_start, search_end, output_pos, overlap_len)
         } else {
             self.find_best_position_direct(
                 input,
@@ -218,76 +218,61 @@ impl Wsola {
         }
         let search_signal = &input[search_start..actual_region_end];
 
-        // FFT size: next power of two >= search_signal length + overlap_len - 1
-        let conv_len = actual_region_len + overlap_len - 1;
+        // Compute raw cross-correlation via FFT
+        let corr_buf = self.fft_cross_correlate(ref_signal, search_signal);
+
+        // Compute reference energy (constant for all candidates)
+        let ref_energy: f64 = ref_signal.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        if ref_energy < ENERGY_EPSILON {
+            return search_start;
+        }
+
+        // Find best candidate using normalized correlation
+        let num_candidates = actual_region_len.saturating_sub(overlap_len) + 1;
+        let best_pos = find_best_candidate(
+            search_signal, &corr_buf, ref_energy, num_candidates, overlap_len, search_start,
+        );
+
+        // Clamp to valid range
+        best_pos.min(search_end)
+    }
+
+    /// Computes cross-correlation between two signals using FFT.
+    ///
+    /// Returns the raw (unnormalized) correlation buffer in the frequency domain.
+    fn fft_cross_correlate(
+        &mut self,
+        ref_signal: &[f32],
+        search_signal: &[f32],
+    ) -> Vec<Complex<f32>> {
+        let conv_len = search_signal.len() + ref_signal.len() - 1;
         let fft_size = conv_len.next_power_of_two();
 
         let fft_fwd = self.planner.plan_fft_forward(fft_size);
         let fft_inv = self.planner.plan_fft_inverse(fft_size);
 
-        // Prepare reference signal (time-reversed for cross-correlation)
+        // Zero-pad signals into FFT buffers
         let mut ref_buf = vec![Complex::new(0.0f32, 0.0); fft_size];
         for (i, &s) in ref_signal.iter().enumerate() {
             ref_buf[i] = Complex::new(s, 0.0);
         }
 
-        // Prepare search signal
         let mut search_buf = vec![Complex::new(0.0f32, 0.0); fft_size];
         for (i, &s) in search_signal.iter().enumerate() {
             search_buf[i] = Complex::new(s, 0.0);
         }
 
-        // Forward FFT both
+        // Forward FFT, multiply conj(Ref) * Search, inverse FFT
         fft_fwd.process(&mut ref_buf);
         fft_fwd.process(&mut search_buf);
 
-        // Cross-correlation in frequency domain: conj(Ref) * Search
         let mut corr_buf = vec![Complex::new(0.0f32, 0.0); fft_size];
         for i in 0..fft_size {
             corr_buf[i] = ref_buf[i].conj() * search_buf[i];
         }
 
-        // Inverse FFT
         fft_inv.process(&mut corr_buf);
-
-        // Normalize by FFT size
-        let norm = 1.0 / fft_size as f64;
-
-        // Compute reference energy (constant for all candidates)
-        let ref_energy: f64 = ref_signal.iter().map(|&s| (s as f64) * (s as f64)).sum();
-        if ref_energy < 1e-12 {
-            return search_start;
-        }
-
-        // Compute running energy of search signal windows using prefix sums
-        let num_candidates = actual_region_len.saturating_sub(overlap_len) + 1;
-        let mut prefix_sq = vec![0.0f64; actual_region_len + 1];
-        for i in 0..actual_region_len {
-            prefix_sq[i + 1] = prefix_sq[i] + (search_signal[i] as f64) * (search_signal[i] as f64);
-        }
-
-        // Find best normalized correlation
-        let mut best_pos = search_start;
-        let mut best_ncorr = f64::NEG_INFINITY;
-
-        for k in 0..num_candidates {
-            // Un-normalized cross-correlation at lag k
-            let raw_corr = corr_buf[k].re as f64 * norm;
-
-            // Energy of search window at offset k
-            let window_energy = prefix_sq[k + overlap_len] - prefix_sq[k];
-            let denom = (ref_energy * window_energy).sqrt();
-
-            let ncorr = if denom > 1e-12 { raw_corr / denom } else { 0.0 };
-
-            if ncorr > best_ncorr {
-                best_ncorr = ncorr;
-                best_pos = search_start + k;
-            }
-        }
-
-        // Clamp to valid range
-        best_pos.min(search_end)
+        corr_buf
     }
 
     /// Overlap-adds a segment from input into output with raised-cosine crossfade.
@@ -315,6 +300,45 @@ impl Wsola {
     }
 }
 
+/// Finds the best correlation candidate using prefix-sum energy normalization.
+///
+/// Scans `num_candidates` lag positions in `corr_buf`, normalizing each by
+/// the windowed energy of `search_signal` and the reference energy.
+fn find_best_candidate(
+    search_signal: &[f32],
+    corr_buf: &[Complex<f32>],
+    ref_energy: f64,
+    num_candidates: usize,
+    overlap_len: usize,
+    search_start: usize,
+) -> usize {
+    let norm = 1.0 / corr_buf.len() as f64;
+
+    // Running energy of search signal windows via prefix sums
+    let mut prefix_sq = vec![0.0f64; search_signal.len() + 1];
+    for i in 0..search_signal.len() {
+        prefix_sq[i + 1] = prefix_sq[i] + (search_signal[i] as f64) * (search_signal[i] as f64);
+    }
+
+    let mut best_pos = search_start;
+    let mut best_ncorr = f64::NEG_INFINITY;
+
+    for k in 0..num_candidates {
+        let raw_corr = corr_buf[k].re as f64 * norm;
+        let window_energy = prefix_sq[k + overlap_len] - prefix_sq[k];
+        let denom = (ref_energy * window_energy).sqrt();
+
+        let ncorr = if denom > ENERGY_EPSILON { raw_corr / denom } else { 0.0 };
+
+        if ncorr > best_ncorr {
+            best_ncorr = ncorr;
+            best_pos = search_start + k;
+        }
+    }
+
+    best_pos
+}
+
 /// Normalized cross-correlation between two signals.
 #[inline]
 fn normalized_cross_correlation(a: &[f32], b: &[f32]) -> f64 {
@@ -336,7 +360,7 @@ fn normalized_cross_correlation(a: &[f32], b: &[f32]) -> f64 {
     }
 
     let denom = (sum_a2 * sum_b2).sqrt();
-    if denom < 1e-12 {
+    if denom < ENERGY_EPSILON {
         return 0.0;
     }
 

@@ -160,6 +160,13 @@
 - [x] Added rustdoc examples to `stretch()`, `stretch_buffer()`, `AudioBuffer`, `StretchParams`, `EdmPreset`, `StreamProcessor`
 - [x] Added `# Errors` sections to public functions
 
+### Third pass (agent-5)
+- [x] Extracted `fft_cross_correlate()` and `find_best_candidate()` from `Wsola::find_best_position_fft()` (was 91 lines, now 47)
+- [x] Extracted `analyze_frame()` and `advance_phases()` from `PhaseVocoder::process()` (was 83 lines, now 38); includes sub-bass rigid phase locking and analysis phase tracking
+- [x] Extracted `process_channels()`, `deinterleave_channel()`, `drain_consumed_input()`, `interleave_output()` from `StreamProcessor::process()` (was 80 lines, now 28)
+- [x] Replaced magic numbers with named constants: `ENERGY_EPSILON`, `FFT_CANDIDATE_THRESHOLD`, `FFT_OVERLAP_THRESHOLD` (wsola.rs), `MIN_WINDOW_SUM_RATIO`, `WINDOW_SUM_EPSILON` (phase_vocoder.rs), `RATIO_SNAP_THRESHOLD`, `RATIO_INTERPOLATION_ALPHA` (processor.rs)
+- [x] All tests passing, zero clippy warnings
+
 ## TODO
 - [ ] Test with real audio samples
 - [ ] SIMD-friendly inner loop layout
