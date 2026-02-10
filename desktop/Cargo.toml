@@ -1,0 +1,19 @@
+[package]
+name = "timestretch-desktop"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+timestretch = { path = ".." }
+eframe = "0.31"
+cpal = "0.15"
+symphonia = { version = "0.5", features = ["mp3", "flac", "ogg", "wav", "pcm", "vorbis"] }
+rfd = "0.15"
+ringbuf = "0.4"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
