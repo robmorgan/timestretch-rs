@@ -453,6 +453,12 @@
 - [x] 14 new unit tests (IntoIterator, peak, RMS, fade in/out, stereo fades)
 - [x] All 190+ unit tests passing, zero clippy/doc warnings
 
+## API Polish & Documentation Examples (agent-1)
+- [x] `Channels::from_count(n)` — construct `Channels` from numeric count (1=Mono, 2=Stereo)
+- [x] Added runnable doc examples to: `slice`, `concatenate`, `peak`, `rms`, `fade_in`, `fade_out`, `from_count`
+- [x] 22 doc tests now passing (up from 14)
+- [x] 191 unit tests passing, zero clippy/doc warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
