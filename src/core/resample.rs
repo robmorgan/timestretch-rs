@@ -134,7 +134,7 @@ mod tests {
         assert_eq!(output.len(), 200);
         // Check output is bounded
         for &s in &output {
-            assert!(s >= -1.1 && s <= 1.1);
+            assert!((-1.1..=1.1).contains(&s));
         }
     }
 }

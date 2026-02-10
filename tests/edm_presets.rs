@@ -37,9 +37,9 @@ fn house_pattern(sample_rate: u32, beats: usize) -> Vec<f32> {
     }
 
     // Add background pad (220 Hz)
-    for i in 0..total_samples {
+    for (i, sample) in signal.iter_mut().enumerate().take(total_samples) {
         let t = i as f32 / sample_rate as f32;
-        signal[i] += 0.15 * (2.0 * std::f32::consts::PI * 220.0 * t).sin();
+        *sample += 0.15 * (2.0 * std::f32::consts::PI * 220.0 * t).sin();
     }
 
     signal

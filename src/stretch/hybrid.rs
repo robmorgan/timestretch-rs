@@ -263,8 +263,8 @@ mod tests {
         }
 
         // Add some tonal content
-        for i in 0..num_samples {
-            input[i] += 0.3 * (2.0 * PI * 200.0 * i as f32 / sample_rate as f32).sin();
+        for (i, sample) in input.iter_mut().enumerate().take(num_samples) {
+            *sample += 0.3 * (2.0 * PI * 200.0 * i as f32 / sample_rate as f32).sin();
         }
 
         let params = StretchParams::new(1.5)
@@ -294,6 +294,6 @@ mod tests {
         assert!((result.len() as i64 - 180).unsigned_abs() < 5);
         // Middle of crossfade should be between 0.5 and 1.0
         let mid = result[90];
-        assert!(mid >= 0.4 && mid <= 1.1, "Crossfade mid = {}", mid);
+        assert!((0.4..=1.1).contains(&mid), "Crossfade mid = {}", mid);
     }
 }

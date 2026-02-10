@@ -81,15 +81,12 @@ fn test_streaming_ratio_change() {
 
     let signal = sine_wave(440.0, sample_rate, sample_rate as usize * 4);
     let chunk_size = 4096;
-    let mut chunk_count = 0;
-
-    for chunk in signal.chunks(chunk_size) {
+    for (chunk_count, chunk) in signal.chunks(chunk_size).enumerate() {
         // Change ratio midway through
         if chunk_count == signal.len() / chunk_size / 2 {
             processor.set_stretch_ratio(1.05);
         }
         let _ = processor.process(chunk);
-        chunk_count += 1;
     }
 
     // Ratio should have changed

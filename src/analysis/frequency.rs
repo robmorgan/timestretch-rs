@@ -154,7 +154,7 @@ mod tests {
         assert_eq!(freq_to_bin(0.0, 4096, 44100), 0);
         let bin_1000 = freq_to_bin(1000.0, 4096, 44100);
         // 1000 / 10.77 ≈ 93
-        assert!(bin_1000 >= 92 && bin_1000 <= 94);
+        assert!((92..=94).contains(&bin_1000));
     }
 
     #[test]

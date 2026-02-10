@@ -38,6 +38,12 @@
 - [x] Total: 86 tests, all passing
 - [x] Zero clippy warnings
 
+## Agent-2 Contributions
+- [x] Fixed clippy warnings in library code (frequency.rs, resample.rs, hybrid.rs)
+- [x] Fixed clippy warnings in tests (streaming.rs, edm_presets.rs)
+- [x] Fixed clippy warnings in examples (dj_beatmatch.rs, realtime_stream.rs, sample_halftime.rs)
+- [x] Fixed example files to match current API (removed `.expect()` from non-Result returns)
+
 ## TODO
 - [ ] Write performance benchmarks
 - [ ] Optimize hot paths (SIMD-friendly layout, allocation avoidance in process loop)
