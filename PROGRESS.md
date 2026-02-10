@@ -403,7 +403,10 @@
       short input fallback, zero cutoff, flag defaults
 - [x] Reduced hot-path allocations: avoid `to_vec()` in merge_onsets_and_beats,
       avoid `clone()` for transient onsets when beat-aware is disabled
-- [x] Total: 288 tests, all passing
+- [x] 15 integration tests in tests/band_split.rs: EDM signal, sub-bass energy,
+      high-freq passthrough, DJ beatmatch, halftime, compression, stereo, 48kHz,
+      ambient extreme stretch, vocal chop, custom cutoff, pitch shift, builder toggling
+- [x] Total: 355 tests, all passing
 - [x] Zero clippy warnings
 
 ## AudioBuffer Utilities, Trait Impls & CLI Auto-BPM (agent-1)
