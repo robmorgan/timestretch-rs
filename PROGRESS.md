@@ -346,8 +346,10 @@
 - [x] `AudioBuffer::mix_to_mono()` — average all channels to mono
 - [x] `write_wav_24bit()` / `write_wav_file_24bit()` — 24-bit PCM WAV output (completes read/write symmetry)
 - [x] Fixed rustdoc ambiguity warning (`stretch` is both function and module)
-- [x] 14 new tests (8 unit + 6 integration: 24-bit WAV pipeline, mix_to_mono, L/R extraction)
-- [x] Zero clippy warnings, cargo fmt clean
+- [x] `stretch_wav_file(input, output, params)` — high-level WAV file stretch convenience
+- [x] `pitch_shift_wav_file(input, output, params, factor)` — high-level WAV file pitch shift convenience
+- [x] 17 new tests (11 unit + 6 integration: 24-bit WAV pipeline, mix_to_mono, L/R extraction, file API)
+- [x] Zero clippy warnings, cargo fmt clean, zero doc warnings
 
 ## TODO
 - [ ] SIMD-friendly inner loop layout
