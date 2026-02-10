@@ -359,6 +359,14 @@
 - [x] Removed dead guard `if mirror < spectrum.len()` in frequency.rs split_spectrum_into_bands() (always true when spectrum.len() == fft_size)
 - [x] All 126 unit tests passing, zero clippy warnings
 
+## CLI Enhancements (agent-1)
+- [x] `--from-bpm <f> --to-bpm <f>` for DJ BPM matching (auto-selects DjBeatmatch preset)
+- [x] `--pitch <f>` for pitch shifting (preserves audio duration)
+- [x] `--24bit` and `--float` output format flags (default remains 16-bit)
+- [x] Named flags (`--ratio`, `--preset`) alongside backward-compatible positional syntax
+- [x] Usage help with examples
+- [x] Tested with ratio, BPM, pitch, 24-bit, and legacy modes
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
