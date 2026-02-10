@@ -91,15 +91,11 @@ fn deinterleave(input: &[f32], num_channels: usize) -> Vec<Vec<f32>> {
 
 /// Interleaves per-channel vectors into a single buffer, truncating to the shortest channel.
 #[inline]
-fn interleave(channels: &[Vec<f32>], num_channels: usize) -> Vec<f32> {
+fn interleave(channels: &[Vec<f32>]) -> Vec<f32> {
     let min_len = channels.iter().map(|c| c.len()).min().unwrap_or(0);
-    let mut output = Vec::with_capacity(min_len * num_channels);
-    for i in 0..min_len {
-        for ch in channels {
-            output.push(ch[i]);
-        }
-    }
-    output
+    (0..min_len)
+        .flat_map(|i| channels.iter().map(move |ch| ch[i]))
+        .collect()
 }
 
 /// Validates that input is non-empty and contains only finite samples.
@@ -213,7 +209,7 @@ pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, Stretc
         channel_outputs.push(stretched);
     }
 
-    let mut output = interleave(&channel_outputs, num_channels);
+    let mut output = interleave(&channel_outputs);
 
     if params.normalize {
         normalize_rms(&mut output, input_rms);
@@ -324,7 +320,7 @@ pub fn pitch_shift(
         .map(|ch| core::resample::resample_cubic(ch, num_input_frames))
         .collect();
 
-    let mut output = interleave(&channel_outputs, num_channels);
+    let mut output = interleave(&channel_outputs);
 
     if params.normalize {
         normalize_rms(&mut output, input_rms);

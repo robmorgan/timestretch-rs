@@ -85,7 +85,7 @@ fn test_wav_no_fmt_chunk() {
     data.extend_from_slice(b"data");
     data.extend_from_slice(&4u32.to_le_bytes()); // 4 bytes of audio
     data.extend_from_slice(&[0u8; 4]); // audio data
-    // Pad to minimum header size
+                                       // Pad to minimum header size
     while data.len() < 44 {
         data.push(0);
     }
@@ -93,7 +93,11 @@ fn test_wav_no_fmt_chunk() {
     assert!(result.is_err());
     match result.unwrap_err() {
         StretchError::InvalidFormat(msg) => {
-            assert!(msg.contains("fmt") || msg.contains("No fmt"), "msg: {}", msg);
+            assert!(
+                msg.contains("fmt") || msg.contains("No fmt"),
+                "msg: {}",
+                msg
+            );
         }
         e => panic!("Expected InvalidFormat about fmt chunk, got {:?}", e),
     }
@@ -109,7 +113,7 @@ fn test_wav_fmt_chunk_too_short() {
     data.extend_from_slice(b"fmt ");
     data.extend_from_slice(&8u32.to_le_bytes()); // Only 8 bytes of fmt (needs 16)
     data.extend_from_slice(&[0u8; 8]); // 8 bytes of partial fmt data
-    // data chunk
+                                       // data chunk
     data.extend_from_slice(b"data");
     data.extend_from_slice(&4u32.to_le_bytes());
     data.extend_from_slice(&[0u8; 4]);
@@ -321,7 +325,10 @@ fn test_wav_truncated_data_chunk() {
     let result = read_wav(&data);
     // The parser uses fallback to available data, so this should succeed with fewer samples
     if let Ok(buf) = &result {
-        assert!(buf.data.len() <= 500, "Should have at most 500 samples from 1000 bytes claim");
+        assert!(
+            buf.data.len() <= 500,
+            "Should have at most 500 samples from 1000 bytes claim"
+        );
     }
     // Either way, no panic is the key requirement
 }

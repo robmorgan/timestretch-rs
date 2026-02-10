@@ -172,13 +172,12 @@ impl AudioBuffer {
             return self.clone();
         }
         let nc = self.channels.count();
-        let num_frames = self.num_frames();
-        let mut mono = Vec::with_capacity(num_frames);
         let inv = 1.0 / nc as f32;
-        for i in 0..num_frames {
-            let sum: f32 = (0..nc).map(|ch| self.data[i * nc + ch]).sum();
-            mono.push(sum * inv);
-        }
+        let mono = self
+            .data
+            .chunks_exact(nc)
+            .map(|frame| frame.iter().sum::<f32>() * inv)
+            .collect();
         Self {
             data: mono,
             sample_rate: self.sample_rate,
@@ -193,11 +192,7 @@ impl AudioBuffer {
         if self.channels == Channels::Stereo {
             return self.clone();
         }
-        let mut stereo = Vec::with_capacity(self.data.len() * 2);
-        for &s in &self.data {
-            stereo.push(s);
-            stereo.push(s);
-        }
+        let stereo = self.data.iter().flat_map(|&s| [s, s]).collect();
         Self {
             data: stereo,
             sample_rate: self.sample_rate,

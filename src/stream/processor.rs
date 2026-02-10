@@ -160,7 +160,11 @@ impl StreamProcessor {
     fn deinterleave_channel(&mut self, ch: usize, num_channels: usize) {
         self.channel_buffers[ch].clear();
         self.channel_buffers[ch].extend(
-            self.input_buffer.iter().skip(ch).step_by(num_channels).copied(),
+            self.input_buffer
+                .iter()
+                .skip(ch)
+                .step_by(num_channels)
+                .copied(),
         );
     }
 

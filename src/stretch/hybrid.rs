@@ -112,14 +112,17 @@ impl HybridStretcher {
         // Process remainder through normal hybrid (transient detection + PV/WSOLA)
         let remainder_stretched = self.process_hybrid(&remainder)?;
 
-        // Sum the two bands, using the longer length (zero-pad the shorter)
+        // Sum the two bands (zero-pad the shorter one to the longer length)
         let out_len = sub_bass_stretched.len().max(remainder_stretched.len());
-        let mut output = Vec::with_capacity(out_len);
-        for i in 0..out_len {
-            let sub = sub_bass_stretched.get(i).copied().unwrap_or(0.0);
-            let rem = remainder_stretched.get(i).copied().unwrap_or(0.0);
-            output.push(sub + rem);
-        }
+        let zeros = std::iter::repeat(0.0f32);
+        let output: Vec<f32> = sub_bass_stretched
+            .iter()
+            .copied()
+            .chain(zeros.clone())
+            .zip(remainder_stretched.iter().copied().chain(zeros))
+            .take(out_len)
+            .map(|(s, r)| s + r)
+            .collect();
 
         Ok(output)
     }
@@ -295,7 +298,6 @@ fn separate_sub_bass(input: &[f32], cutoff_hz: f32, sample_rate: u32) -> (Vec<f3
     let cutoff_bin = freq_to_bin(cutoff_hz, fft_size, sample_rate);
 
     if cutoff_bin == 0 || input.len() < fft_size {
-        // No sub-bass to separate, or input too short for FFT
         return (vec![0.0; input.len()], input.to_vec());
     }
 
@@ -323,40 +325,8 @@ fn separate_sub_bass(input: &[f32], cutoff_hz: f32, sample_rate: u32) -> (Vec<f3
         let frame_end = (pos + fft_size).min(input.len());
         let frame_len = frame_end - pos;
 
-        // Window and transform
-        for i in 0..fft_size {
-            fft_buf[i] = if i < frame_len {
-                Complex::new(input[pos + i] * window[i], 0.0)
-            } else {
-                Complex::new(0.0, 0.0)
-            };
-        }
-        fft_fwd.process(&mut fft_buf);
-
-        // Split into sub-bass and remainder in the frequency domain.
-        // For a real-valued signal, the FFT has conjugate symmetry:
-        //   bin 0 = DC, bins 1..N/2 = positive freqs,
-        //   bin N/2 = Nyquist, bins N/2+1..N-1 = negative freqs (mirror).
-        // We need to keep both positive and negative frequency bins consistent.
-        fft_buf2.copy_from_slice(&fft_buf);
-        let zero = Complex::new(0.0, 0.0);
-
-        // Sub-bass: keep bins 0..cutoff_bin and their mirrors, zero everything else
-        for bin in cutoff_bin..=fft_size / 2 {
-            fft_buf[bin] = zero;
-            if bin > 0 && bin < fft_size / 2 {
-                fft_buf[fft_size - bin] = zero;
-            }
-        }
-        // Remainder: keep bins cutoff_bin..N/2 and their mirrors, zero sub-bass
-        for bin in 0..cutoff_bin {
-            fft_buf2[bin] = zero;
-            if bin > 0 {
-                fft_buf2[fft_size - bin] = zero;
-            }
-        }
-
-        // Inverse FFT both
+        window_and_transform(&input[pos..frame_end], &window, &mut fft_buf, &fft_fwd);
+        split_bands(&mut fft_buf, &mut fft_buf2, fft_size, cutoff_bin);
         fft_inv.process(&mut fft_buf);
         fft_inv.process(&mut fft_buf2);
 
@@ -369,16 +339,70 @@ fn separate_sub_bass(input: &[f32], cutoff_hz: f32, sample_rate: u32) -> (Vec<f3
         }
     }
 
-    // Normalize by window sum
+    normalize_band_split(&mut sub_bass, &mut remainder, &window_sum);
+    (sub_bass, remainder)
+}
+
+/// Windows an input frame into the FFT buffer and transforms to frequency domain.
+fn window_and_transform(
+    input_frame: &[f32],
+    window: &[f32],
+    fft_buf: &mut [Complex<f32>],
+    fft_fwd: &std::sync::Arc<dyn rustfft::Fft<f32>>,
+) {
+    for (i, slot) in fft_buf.iter_mut().enumerate() {
+        *slot = if i < input_frame.len() {
+            Complex::new(input_frame[i] * window[i], 0.0)
+        } else {
+            Complex::new(0.0, 0.0)
+        };
+    }
+    fft_fwd.process(fft_buf);
+}
+
+/// Splits an FFT spectrum into sub-bass and remainder bands.
+///
+/// `fft_buf` is narrowed to sub-bass only (bins below `cutoff_bin`).
+/// `fft_buf2` receives the remainder (bins at or above `cutoff_bin`).
+/// Both respect conjugate symmetry for real-valued signals.
+fn split_bands(
+    fft_buf: &mut [Complex<f32>],
+    fft_buf2: &mut [Complex<f32>],
+    fft_size: usize,
+    cutoff_bin: usize,
+) {
+    fft_buf2.copy_from_slice(fft_buf);
+    let zero = Complex::new(0.0, 0.0);
+
+    // Sub-bass: keep bins 0..cutoff_bin and their mirrors, zero everything else
+    for bin in cutoff_bin..=fft_size / 2 {
+        fft_buf[bin] = zero;
+        if bin > 0 && bin < fft_size / 2 {
+            fft_buf[fft_size - bin] = zero;
+        }
+    }
+    // Remainder: keep bins cutoff_bin..N/2 and their mirrors, zero sub-bass
+    for bin in 0..cutoff_bin {
+        fft_buf2[bin] = zero;
+        if bin > 0 {
+            fft_buf2[fft_size - bin] = zero;
+        }
+    }
+}
+
+/// Normalizes two band-split output buffers by the accumulated window sum.
+fn normalize_band_split(sub_bass: &mut [f32], remainder: &mut [f32], window_sum: &[f32]) {
     let max_ws = window_sum.iter().copied().fold(0.0f32, f32::max);
     let min_ws = (max_ws * WINDOW_SUM_FLOOR_RATIO).max(WINDOW_SUM_EPSILON);
-    for ((&ws, sb), rem) in window_sum.iter().zip(sub_bass.iter_mut()).zip(remainder.iter_mut()) {
+    for ((&ws, sb), rem) in window_sum
+        .iter()
+        .zip(sub_bass.iter_mut())
+        .zip(remainder.iter_mut())
+    {
         let ws = ws.max(min_ws);
         *sb /= ws;
         *rem /= ws;
     }
-
-    (sub_bass, remainder)
 }
 
 /// Merges transient onsets with beat grid positions, deduplicating nearby entries.

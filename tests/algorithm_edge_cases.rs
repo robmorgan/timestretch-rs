@@ -86,7 +86,7 @@ fn test_apply_window_mismatched_lengths() {
     apply_window(&mut data, &window);
     assert!((data[0] - 1.0).abs() < 1e-6); // 2.0 * 0.5
     assert!((data[1] - 3.0).abs() < 1e-6); // 3.0 * 1.0
-    // Remaining samples unchanged
+                                           // Remaining samples unchanged
     assert!((data[2] - 4.0).abs() < 1e-6);
     assert!((data[3] - 5.0).abs() < 1e-6);
 
@@ -124,7 +124,12 @@ fn test_window_all_values_finite() {
             let w = generate_window(wt, size);
             assert_eq!(w.len(), size);
             for &v in &w {
-                assert!(v.is_finite(), "{:?} size {} produced non-finite value", wt, size);
+                assert!(
+                    v.is_finite(),
+                    "{:?} size {} produced non-finite value",
+                    wt,
+                    size
+                );
             }
         }
     }
@@ -234,7 +239,8 @@ fn test_band_energy_short_input() {
 
     // Input shorter than FFT size should return zeros
     let samples = vec![0.5; 100];
-    let (sub, low, mid, high) = compute_band_energy(&samples, 4096, 44100, &FrequencyBands::default());
+    let (sub, low, mid, high) =
+        compute_band_energy(&samples, 4096, 44100, &FrequencyBands::default());
     assert!(sub == 0.0 && low == 0.0 && mid == 0.0 && high == 0.0);
 }
 
@@ -246,9 +252,13 @@ fn test_band_energy_exactly_fft_size() {
     let samples: Vec<f32> = (0..fft_size)
         .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
         .collect();
-    let (sub, low, _mid, _high) = compute_band_energy(&samples, fft_size, 44100, &FrequencyBands::default());
+    let (sub, low, _mid, _high) =
+        compute_band_energy(&samples, fft_size, 44100, &FrequencyBands::default());
     // 440 Hz is in the "low" band (120-500 Hz)
-    assert!(low > sub, "440 Hz should have more low energy than sub-bass");
+    assert!(
+        low > sub,
+        "440 Hz should have more low energy than sub-bass"
+    );
 }
 
 #[test]
@@ -256,7 +266,8 @@ fn test_band_energy_silence() {
     use timestretch::analysis::frequency::{compute_band_energy, FrequencyBands};
 
     let samples = vec![0.0; 4096];
-    let (sub, low, mid, high) = compute_band_energy(&samples, 4096, 44100, &FrequencyBands::default());
+    let (sub, low, mid, high) =
+        compute_band_energy(&samples, 4096, 44100, &FrequencyBands::default());
     assert!(sub < 1e-10);
     assert!(low < 1e-10);
     assert!(mid < 1e-10);
@@ -265,7 +276,7 @@ fn test_band_energy_silence() {
 
 #[test]
 fn test_freq_to_bin_edge_cases() {
-    use timestretch::analysis::frequency::{freq_to_bin, bin_to_freq};
+    use timestretch::analysis::frequency::{bin_to_freq, freq_to_bin};
 
     // 0 Hz = bin 0
     assert_eq!(freq_to_bin(0.0, 4096, 44100), 0);
@@ -289,9 +300,9 @@ fn test_split_spectrum_custom_bands() {
     use timestretch::analysis::frequency::{split_spectrum_into_bands, FrequencyBands};
 
     let bands = FrequencyBands {
-        sub_bass: 60.0,   // Very low sub
-        low: 200.0,       // Narrow low
-        mid: 2000.0,      // Lower mid cutoff
+        sub_bass: 60.0, // Very low sub
+        low: 200.0,     // Narrow low
+        mid: 2000.0,    // Lower mid cutoff
     };
 
     // Create a spectrum with energy at specific bins
@@ -304,8 +315,14 @@ fn test_split_spectrum_custom_bands() {
 
     let (sub, low, _mid, _high) = split_spectrum_into_bands(&spectrum, fft_size, 44100, &bands);
     // 100 Hz should be in the low band (between 60 and 200)
-    assert!(low[bin_100].norm_sqr() > 0.5, "100 Hz should be in low band");
-    assert!(sub[bin_100].norm_sqr() < 1e-6, "100 Hz should not be in sub-bass");
+    assert!(
+        low[bin_100].norm_sqr() > 0.5,
+        "100 Hz should be in low band"
+    );
+    assert!(
+        sub[bin_100].norm_sqr() < 1e-6,
+        "100 Hz should not be in sub-bass"
+    );
 }
 
 // ===== Beat detection edge cases =====
@@ -315,7 +332,11 @@ fn test_beat_detection_very_short_audio() {
     // Less than one FFT frame
     let audio = vec![0.5f32; 100];
     let bpm = timestretch::detect_bpm(&audio, 44100);
-    assert!(bpm == 0.0, "Very short audio should return 0 BPM, got {}", bpm);
+    assert!(
+        bpm == 0.0,
+        "Very short audio should return 0 BPM, got {}",
+        bpm
+    );
 }
 
 #[test]
@@ -343,7 +364,11 @@ fn test_beat_detection_constant_dc() {
     // Constant signal (DC) should have no beats
     let audio = vec![0.5f32; 44100 * 4];
     let bpm = timestretch::detect_bpm(&audio, 44100);
-    assert!(bpm == 0.0, "DC signal should have no beats, got {} BPM", bpm);
+    assert!(
+        bpm == 0.0,
+        "DC signal should have no beats, got {} BPM",
+        bpm
+    );
 }
 
 #[test]
@@ -407,8 +432,7 @@ fn test_params_hop_size_equals_fft_size() {
 
 #[test]
 fn test_params_very_large_fft_size() {
-    let params = StretchParams::new(1.5)
-        .with_fft_size(16384);
+    let params = StretchParams::new(1.5).with_fft_size(16384);
     // Should be valid (power of 2 and >= 256)
     let input: Vec<f32> = (0..44100)
         .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
@@ -419,8 +443,7 @@ fn test_params_very_large_fft_size() {
 
 #[test]
 fn test_params_minimum_fft_size() {
-    let params = StretchParams::new(1.5)
-        .with_fft_size(256);
+    let params = StretchParams::new(1.5).with_fft_size(256);
     let input: Vec<f32> = (0..44100)
         .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
         .collect();
@@ -536,8 +559,8 @@ fn test_audio_buffer_channel_extraction_large() {
     let num_frames = 10000;
     let mut data = Vec::with_capacity(num_frames * 2);
     for i in 0..num_frames {
-        data.push(i as f32);        // L
-        data.push(-(i as f32));     // R
+        data.push(i as f32); // L
+        data.push(-(i as f32)); // R
     }
     let buf = AudioBuffer::from_stereo(data, 44100);
     let left = buf.left();

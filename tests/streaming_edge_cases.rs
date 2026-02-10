@@ -172,12 +172,8 @@ fn test_streaming_stereo_channel_separation() {
         .map(|&s| s * s)
         .sum::<f32>()
         / (output.len() / 2) as f32;
-    let left_rms: f32 = output
-        .iter()
-        .step_by(2)
-        .map(|&s| s * s)
-        .sum::<f32>()
-        / (output.len() / 2) as f32;
+    let left_rms: f32 =
+        output.iter().step_by(2).map(|&s| s * s).sum::<f32>() / (output.len() / 2) as f32;
 
     if output.len() > 100 {
         // Only check if we got meaningful output
@@ -296,23 +292,15 @@ fn test_streaming_latency_positive() {
     let latency = proc.latency_samples();
     assert!(latency > 0, "Latency should be positive, got {}", latency);
     // Latency should be related to FFT size
-    assert!(
-        latency <= 4096 * 4,
-        "Latency seems too high: {}",
-        latency
-    );
+    assert!(latency <= 4096 * 4, "Latency seems too high: {}", latency);
 }
 
 #[test]
 fn test_streaming_latency_varies_with_fft_size() {
-    let params_small = StretchParams::new(1.0)
-        .with_fft_size(256)
-        .with_channels(1);
+    let params_small = StretchParams::new(1.0).with_fft_size(256).with_channels(1);
     let proc_small = StreamProcessor::new(params_small);
 
-    let params_large = StretchParams::new(1.0)
-        .with_fft_size(8192)
-        .with_channels(1);
+    let params_large = StretchParams::new(1.0).with_fft_size(8192).with_channels(1);
     let proc_large = StreamProcessor::new(params_large);
 
     assert!(
@@ -395,11 +383,7 @@ fn test_streaming_all_presets() {
 
         let output = proc.process(&input).unwrap();
         for &s in &output {
-            assert!(
-                s.is_finite(),
-                "Non-finite output with preset {:?}",
-                preset
-            );
+            assert!(s.is_finite(), "Non-finite output with preset {:?}", preset);
         }
     }
 }
@@ -429,11 +413,7 @@ fn test_streaming_compression_various_ratios() {
 
         // All output should be finite
         for &s in &total_output {
-            assert!(
-                s.is_finite(),
-                "Non-finite at compression ratio {}",
-                ratio
-            );
+            assert!(s.is_finite(), "Non-finite at compression ratio {}", ratio);
         }
     }
 }
