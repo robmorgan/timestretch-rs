@@ -180,6 +180,14 @@
 - [x] Applied `cargo fmt` to fix formatting drift from recent refactors
 - [x] All 165 tests passing, zero clippy warnings, docs build clean
 
+### Fourth pass (agent-5)
+- [x] Added `ms_to_samples()` helper and `WSOLA_SEGMENT_MS`/`WSOLA_SEARCH_MS_*` constants to `types.rs`, replacing 6 inline `(sample_rate * seconds)` calculations in preset configuration
+- [x] Extracted 7 named constants in `hybrid.rs`: `CROSSFADE_SECS`, `TRANSIENT_REGION_SECS`, `MIN_SEGMENT_FOR_STRETCH`, `MIN_WSOLA_SEGMENT`, `MIN_WSOLA_SEARCH`, `TRANSIENT_MAX_FFT`, `TRANSIENT_MAX_HOP`
+- [x] Simplified `stretch_segment()` conditional chain from nested if-else-if to single `use_phase_vocoder` boolean (eliminates duplicate WSOLA branch)
+- [x] Extracted 3 named constants in `transient.rs`: `MEDIAN_WINDOW_FRAMES`, `MIN_ONSET_GAP_FRAMES`, `THRESHOLD_FLOOR`
+- [x] Extracted 5 named constants in `beat.rs`: `BEAT_FFT_SIZE`, `BEAT_HOP_SIZE`, `BEAT_SENSITIVITY`, `MIN_EDM_BPM`, `MAX_EDM_BPM`
+- [x] All 166 tests passing, zero clippy warnings
+
 ## TODO
 - [ ] Test with real audio samples
 - [ ] SIMD-friendly inner loop layout
