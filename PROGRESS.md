@@ -623,6 +623,14 @@
 - [x] 6 new unit tests: reverse (mono, stereo, empty, double), channel_count (mono, stereo)
 - [x] All 759 tests passing, zero clippy warnings
 
+### Fifteenth pass (agent-5)
+- [x] Extracted `COMPLEX_ZERO` constant in frequency.rs, transient.rs, phase_vocoder.rs, hybrid.rs, wsola.rs — replaces 8 repeated `Complex::new(0.0, 0.0)` and local `let zero = Complex::new(...)` patterns
+- [x] Moved `DEDUP_DISTANCE` from function-local const in `merge_onsets_and_beats()` to module-level constants in hybrid.rs (better organization with other constants)
+- [x] Extracted `trivial_window()` helper in window.rs — deduplicates identical size-0/size-1 early returns from `hann_window()`, `blackman_harris_window()`, `kaiser_window()`
+- [x] Replaced `enumerate()+index` with idiomatic `zip` in `compute_band_energy()` (frequency.rs) and `analyze_frame()` (phase_vocoder.rs)
+- [x] Applied cargo fmt to fix formatting drift from other agents (beat.rs, transient.rs)
+- [x] All 311 tests passing, zero clippy warnings, cargo fmt clean
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 

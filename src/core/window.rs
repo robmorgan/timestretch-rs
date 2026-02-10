@@ -28,14 +28,22 @@ pub fn generate_window(window_type: WindowType, size: usize) -> Vec<f32> {
     }
 }
 
+/// Returns `Some(trivial_window)` for degenerate sizes (0 or 1), or `None`
+/// to indicate the caller should compute the full window.
+#[inline]
+fn trivial_window(size: usize) -> Option<Vec<f32>> {
+    match size {
+        0 => Some(vec![]),
+        1 => Some(vec![1.0]),
+        _ => None,
+    }
+}
+
 /// Generates a Hann window.
 #[inline]
 fn hann_window(size: usize) -> Vec<f32> {
-    if size == 0 {
-        return vec![];
-    }
-    if size == 1 {
-        return vec![1.0];
+    if let Some(w) = trivial_window(size) {
+        return w;
     }
     let n = size as f64;
     (0..size)
@@ -49,11 +57,8 @@ fn hann_window(size: usize) -> Vec<f32> {
 /// Generates a Blackman-Harris window.
 #[inline]
 fn blackman_harris_window(size: usize) -> Vec<f32> {
-    if size == 0 {
-        return vec![];
-    }
-    if size == 1 {
-        return vec![1.0];
+    if let Some(w) = trivial_window(size) {
+        return w;
     }
     let n = size as f64;
     (0..size)
@@ -69,11 +74,8 @@ fn blackman_harris_window(size: usize) -> Vec<f32> {
 /// Generates a Kaiser window using the zeroth-order modified Bessel function.
 #[inline]
 fn kaiser_window(size: usize, beta: f64) -> Vec<f32> {
-    if size == 0 {
-        return vec![];
-    }
-    if size == 1 {
-        return vec![1.0];
+    if let Some(w) = trivial_window(size) {
+        return w;
     }
     let n = size as f64;
     let denom = bessel_i0(beta);

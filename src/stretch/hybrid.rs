@@ -10,6 +10,9 @@ use crate::stretch::phase_vocoder::PhaseVocoder;
 use crate::stretch::wsola::Wsola;
 use rustfft::{num_complex::Complex, FftPlanner};
 
+/// Zero-valued complex number, used for FFT buffer initialization.
+const COMPLEX_ZERO: Complex<f32> = Complex::new(0.0, 0.0);
+
 /// Crossfade duration in seconds between algorithm segments (5ms raised-cosine).
 const CROSSFADE_SECS: f64 = 0.005;
 /// Transient region duration in seconds (~10ms around each onset).
@@ -36,6 +39,9 @@ const BAND_SPLIT_HOP: usize = BAND_SPLIT_FFT_SIZE / 4;
 const WINDOW_SUM_FLOOR_RATIO: f32 = 0.1;
 /// Absolute floor for window sum normalization.
 const WINDOW_SUM_EPSILON: f32 = 1e-6;
+/// Minimum distance (samples) between merged onset/beat positions.
+/// Positions closer than this are considered duplicates.
+const DEDUP_DISTANCE: usize = 512;
 
 /// Transient-aware hybrid stretcher.
 ///
@@ -317,8 +323,8 @@ fn separate_sub_bass(input: &[f32], cutoff_hz: f32, sample_rate: u32) -> (Vec<f3
         (input.len() - fft_size) / hop + 1
     };
 
-    let mut fft_buf = vec![Complex::new(0.0f32, 0.0); fft_size];
-    let mut fft_buf2 = vec![Complex::new(0.0f32, 0.0); fft_size];
+    let mut fft_buf = vec![COMPLEX_ZERO; fft_size];
+    let mut fft_buf2 = vec![COMPLEX_ZERO; fft_size];
 
     for frame in 0..num_frames {
         let pos = frame * hop;
@@ -350,14 +356,13 @@ fn window_and_transform(
     fft_buf: &mut [Complex<f32>],
     fft_fwd: &std::sync::Arc<dyn rustfft::Fft<f32>>,
 ) {
-    let zero = Complex::new(0.0, 0.0);
     let windowed = input_frame
         .iter()
         .zip(window.iter())
         .map(|(&s, &w)| Complex::new(s * w, 0.0));
     for (slot, val) in fft_buf
         .iter_mut()
-        .zip(windowed.chain(std::iter::repeat(zero)))
+        .zip(windowed.chain(std::iter::repeat(COMPLEX_ZERO)))
     {
         *slot = val;
     }
@@ -376,20 +381,19 @@ fn split_bands(
     cutoff_bin: usize,
 ) {
     fft_buf2.copy_from_slice(fft_buf);
-    let zero = Complex::new(0.0, 0.0);
 
     // Sub-bass: keep bins 0..cutoff_bin and their mirrors, zero everything else
     for bin in cutoff_bin..=fft_size / 2 {
-        fft_buf[bin] = zero;
+        fft_buf[bin] = COMPLEX_ZERO;
         if bin > 0 && bin < fft_size / 2 {
-            fft_buf[fft_size - bin] = zero;
+            fft_buf[fft_size - bin] = COMPLEX_ZERO;
         }
     }
     // Remainder: keep bins cutoff_bin..N/2 and their mirrors, zero sub-bass
     for bin in 0..cutoff_bin {
-        fft_buf2[bin] = zero;
+        fft_buf2[bin] = COMPLEX_ZERO;
         if bin > 0 {
-            fft_buf2[fft_size - bin] = zero;
+            fft_buf2[fft_size - bin] = COMPLEX_ZERO;
         }
     }
 }
@@ -414,10 +418,6 @@ fn normalize_band_split(sub_bass: &mut [f32], remainder: &mut [f32], window_sum:
 /// Beat positions that fall within `DEDUP_DISTANCE` samples of an existing
 /// transient onset are dropped to avoid creating overly short segments.
 fn merge_onsets_and_beats(onsets: &[usize], beats: &[usize], input_len: usize) -> Vec<usize> {
-    /// Minimum distance (samples) between merged positions.
-    /// Positions closer than this are considered duplicates.
-    const DEDUP_DISTANCE: usize = 512;
-
     let mut merged: Vec<usize> = Vec::with_capacity(onsets.len() + beats.len());
     merged.extend_from_slice(onsets);
 

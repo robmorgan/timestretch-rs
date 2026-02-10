@@ -71,11 +71,7 @@ pub fn detect_beats(samples: &[f32], sample_rate: u32) -> BeatGrid {
     }
 
     // Compute inter-onset intervals
-    let intervals: Vec<usize> = transients
-        .onsets
-        .windows(2)
-        .map(|w| w[1] - w[0])
-        .collect();
+    let intervals: Vec<usize> = transients.onsets.windows(2).map(|w| w[1] - w[0]).collect();
 
     // Estimate BPM from median interval (robust to outliers)
     let bpm = estimate_bpm_from_intervals(&intervals, sample_rate);

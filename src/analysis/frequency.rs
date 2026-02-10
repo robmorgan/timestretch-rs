@@ -2,6 +2,9 @@
 
 use rustfft::{num_complex::Complex, FftPlanner};
 
+/// Zero-valued complex number, used for FFT buffer initialization.
+const COMPLEX_ZERO: Complex<f32> = Complex::new(0.0, 0.0);
+
 /// Result of splitting a spectrum into frequency bands: (sub_bass, low, mid, high).
 pub type BandSpectra = (
     Vec<Complex<f32>>,
@@ -82,10 +85,10 @@ pub fn split_spectrum_into_bands(
     let mid_bin = freq_to_bin(bands.mid, fft_size, sample_rate);
     let num_bins = fft_size / 2 + 1;
 
-    let mut sub_bass = vec![Complex::new(0.0f32, 0.0); spectrum.len()];
-    let mut low = vec![Complex::new(0.0f32, 0.0); spectrum.len()];
-    let mut mid = vec![Complex::new(0.0f32, 0.0); spectrum.len()];
-    let mut high = vec![Complex::new(0.0f32, 0.0); spectrum.len()];
+    let mut sub_bass = vec![COMPLEX_ZERO; spectrum.len()];
+    let mut low = vec![COMPLEX_ZERO; spectrum.len()];
+    let mut mid = vec![COMPLEX_ZERO; spectrum.len()];
+    let mut high = vec![COMPLEX_ZERO; spectrum.len()];
 
     // Assigns spectrum[idx] to the band determined by classify_bin(class_bin).
     let mut assign = |class_bin: usize, idx: usize| match classify_bin(
@@ -133,8 +136,8 @@ pub fn compute_band_energy(
 
     let mut buffer: Vec<Complex<f32>> = samples[..fft_size]
         .iter()
-        .enumerate()
-        .map(|(i, &s)| Complex::new(s * window[i], 0.0))
+        .zip(window.iter())
+        .map(|(&s, &w)| Complex::new(s * w, 0.0))
         .collect();
 
     fft.process(&mut buffer);

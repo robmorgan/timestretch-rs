@@ -3,6 +3,9 @@
 use crate::error::StretchError;
 use rustfft::{num_complex::Complex, FftPlanner};
 
+/// Zero-valued complex number, used for FFT buffer initialization.
+const COMPLEX_ZERO: Complex<f32> = Complex::new(0.0, 0.0);
+
 /// Minimum energy threshold to avoid division by near-zero in correlation normalization.
 const ENERGY_EPSILON: f64 = 1e-12;
 /// Minimum number of candidates to justify FFT-based correlation over direct computation.
@@ -294,24 +297,22 @@ impl Wsola {
         let fft_fwd = self.planner.plan_fft_forward(fft_size);
         let fft_inv = self.planner.plan_fft_inverse(fft_size);
 
-        let zero = Complex::new(0.0f32, 0.0);
-
         // Resize and fill reusable buffers (grow-only, never shrink)
-        self.fft_ref_buf.resize(fft_size, zero);
+        self.fft_ref_buf.resize(fft_size, COMPLEX_ZERO);
         for (i, slot) in self.fft_ref_buf.iter_mut().enumerate() {
             *slot = if i < ref_signal.len() {
                 Complex::new(ref_signal[i], 0.0)
             } else {
-                zero
+                COMPLEX_ZERO
             };
         }
 
-        self.fft_search_buf.resize(fft_size, zero);
+        self.fft_search_buf.resize(fft_size, COMPLEX_ZERO);
         for (i, slot) in self.fft_search_buf.iter_mut().enumerate() {
             *slot = if i < search_signal.len() {
                 Complex::new(search_signal[i], 0.0)
             } else {
-                zero
+                COMPLEX_ZERO
             };
         }
 
@@ -320,7 +321,7 @@ impl Wsola {
         fft_fwd.process(&mut self.fft_search_buf);
 
         // Multiply conj(Ref) * Search into corr_buf
-        self.fft_corr_buf.resize(fft_size, zero);
+        self.fft_corr_buf.resize(fft_size, COMPLEX_ZERO);
         for ((corr, r), s) in self
             .fft_corr_buf
             .iter_mut()

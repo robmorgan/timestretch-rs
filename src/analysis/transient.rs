@@ -2,6 +2,9 @@
 
 use rustfft::{num_complex::Complex, FftPlanner};
 
+/// Zero-valued complex number, used for FFT buffer initialization.
+const COMPLEX_ZERO: Complex<f32> = Complex::new(0.0, 0.0);
+
 /// Result of transient detection: sample positions of detected onsets.
 #[derive(Debug, Clone)]
 pub struct TransientMap {
@@ -34,12 +37,14 @@ fn compute_spectral_flux(
     let num_frames = (samples.len() - fft_size) / hop_size + 1;
     let mut prev_magnitude = vec![0.0f32; num_bins];
     let mut flux_values = Vec::with_capacity(num_frames);
-    let mut fft_buffer = vec![Complex::new(0.0f32, 0.0f32); fft_size];
+    let mut fft_buffer = vec![COMPLEX_ZERO; fft_size];
 
     for frame_idx in 0..num_frames {
         let start = frame_idx * hop_size;
 
-        for (buf, (&s, &w)) in fft_buffer.iter_mut().zip(samples[start..].iter().zip(window.iter()))
+        for (buf, (&s, &w)) in fft_buffer
+            .iter_mut()
+            .zip(samples[start..].iter().zip(window.iter()))
         {
             *buf = Complex::new(s * w, 0.0);
         }

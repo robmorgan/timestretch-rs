@@ -7,6 +7,8 @@ use crate::core::window::{generate_window, WindowType};
 use crate::error::StretchError;
 
 const TWO_PI: f32 = 2.0 * PI;
+/// Zero-valued complex number, used for FFT buffer initialization.
+const COMPLEX_ZERO: Complex<f32> = Complex::new(0.0, 0.0);
 /// Minimum window sum to prevent amplification in low-overlap regions.
 const MIN_WINDOW_SUM_RATIO: f32 = 0.1;
 /// Absolute floor for window sum normalization.
@@ -98,7 +100,7 @@ impl PhaseVocoder {
             prev_phase: vec![0.0; num_bins],
             planner: FftPlanner::new(),
             expected_phase_advance,
-            fft_buffer: vec![Complex::new(0.0, 0.0); fft_size],
+            fft_buffer: vec![COMPLEX_ZERO; fft_size],
             magnitudes: vec![0.0; num_bins],
             new_phases: vec![0.0; num_bins],
             peaks: Vec::with_capacity(num_bins / PEAKS_CAPACITY_DIVISOR),
@@ -222,8 +224,12 @@ impl PhaseVocoder {
         input_frame: &[f32],
         fft_forward: &std::sync::Arc<dyn rustfft::Fft<f32>>,
     ) {
-        for (i, (&sample, &win)) in input_frame.iter().zip(self.window.iter()).enumerate() {
-            self.fft_buffer[i] = Complex::new(sample * win, 0.0);
+        for (buf, (&sample, &win)) in self
+            .fft_buffer
+            .iter_mut()
+            .zip(input_frame.iter().zip(self.window.iter()))
+        {
+            *buf = Complex::new(sample * win, 0.0);
         }
         fft_forward.process(&mut self.fft_buffer);
     }
