@@ -203,7 +203,6 @@ fn test_identity_preserves_frequency_content() {
         );
 
         // Also check spectral energy is preserved at the target frequency
-        // (30% threshold accounts for PV windowing redistribution)
         let input_energy = spectral_energy_at_freq(&input, sample_rate, freq);
         let output_energy = spectral_energy_at_freq(&output, sample_rate, freq);
         assert!(
@@ -488,8 +487,6 @@ fn max_abs_error(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn test_identity_waveform_correlation() {
-    // Cross-correlation between input and identity-stretched output should be
-    // very high (close to 1.0), proving the waveform shape is preserved.
     let sample_rate = 44100u32;
     let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
 
@@ -516,7 +513,6 @@ fn test_identity_waveform_correlation() {
 
 #[test]
 fn test_identity_max_sample_error() {
-    // For identity stretch, the per-sample error should be bounded.
     let sample_rate = 44100u32;
     let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
 
@@ -533,8 +529,6 @@ fn test_identity_max_sample_error() {
             &input[margin..compare_len - margin],
             &output[margin..compare_len - margin],
         );
-        // Phase vocoder reconstruction should keep max error below 0.5
-        // (most samples will be much closer)
         assert!(
             max_err < 0.5,
             "Max sample error too high: {:.4} (expected < 0.5)",
@@ -545,7 +539,6 @@ fn test_identity_max_sample_error() {
 
 #[test]
 fn test_identity_silence_preservation() {
-    // Pure silence stretched by 1.0 should remain silence (or near-zero).
     let sample_rate = 44100u32;
     let input = vec![0.0f32; sample_rate as usize * 2];
 
@@ -572,11 +565,9 @@ fn test_identity_silence_preservation() {
 
 #[test]
 fn test_identity_peak_preservation() {
-    // The peak amplitude should be approximately preserved for identity stretch.
     let sample_rate = 44100u32;
     let num_samples = sample_rate as usize * 2;
 
-    // Use a signal with a clear peak structure (amplitude-modulated sine)
     let input: Vec<f32> = (0..num_samples)
         .map(|i| {
             let t = i as f32 / sample_rate as f32;
@@ -595,7 +586,6 @@ fn test_identity_peak_preservation() {
     let output = stretch(&input, &params).unwrap();
     let output_peak = output.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
 
-    // Peak should be within 50% of original (PV can slightly amplify or attenuate)
     let peak_ratio = output_peak / input_peak;
     assert!(
         (0.5..=1.5).contains(&peak_ratio),
@@ -608,13 +598,9 @@ fn test_identity_peak_preservation() {
 
 #[test]
 fn test_identity_no_spectral_coloring() {
-    // White noise identity-stretched should maintain roughly flat spectrum.
-    // We check that the energy ratio between low and high frequency bands
-    // doesn't change significantly.
     let sample_rate = 44100u32;
     let num_samples = sample_rate as usize * 2;
 
-    // Generate deterministic pseudo-noise using a simple LCG
     let mut seed: u32 = 12345;
     let input: Vec<f32> = (0..num_samples)
         .map(|_| {
@@ -623,7 +609,6 @@ fn test_identity_no_spectral_coloring() {
         })
         .collect();
 
-    // Measure energy in two frequency bands
     let low_freq = 200.0;
     let high_freq = 4000.0;
     let input_low = spectral_energy_at_freq(&input, sample_rate, low_freq);
@@ -638,7 +623,6 @@ fn test_identity_no_spectral_coloring() {
     let output_low = spectral_energy_at_freq(&output, sample_rate, low_freq);
     let output_high = spectral_energy_at_freq(&output, sample_rate, high_freq);
 
-    // The ratio between low and high energy should stay roughly constant
     if input_low > 1e-6 && input_high > 1e-6 && output_low > 1e-6 && output_high > 1e-6 {
         let input_ratio = input_low / input_high;
         let output_ratio = output_low / output_high;
@@ -655,7 +639,6 @@ fn test_identity_no_spectral_coloring() {
 
 #[test]
 fn test_identity_streaming_matches_batch() {
-    // Streaming with ratio 1.0 should produce output similar to batch.
     let sample_rate = 44100u32;
     let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
 
@@ -676,7 +659,6 @@ fn test_identity_streaming_matches_batch() {
     let remaining = processor.flush().unwrap();
     stream_output.extend_from_slice(&remaining);
 
-    // Both should produce roughly the same length
     let batch_ratio = batch_output.len() as f64 / input.len() as f64;
     let stream_ratio = stream_output.len() as f64 / input.len() as f64;
     assert!(
@@ -690,7 +672,6 @@ fn test_identity_streaming_matches_batch() {
         stream_ratio
     );
 
-    // Both should preserve the dominant frequency
     let batch_freq = dominant_freq_zcr(&batch_output, sample_rate);
     let stream_freq = dominant_freq_zcr(&stream_output, sample_rate);
     assert!(
@@ -707,7 +688,6 @@ fn test_identity_streaming_matches_batch() {
 
 #[test]
 fn test_identity_stereo_silence_channels() {
-    // Stereo signal with one silent channel: the silent channel should stay silent.
     let sample_rate = 44100u32;
     let num_frames = sample_rate as usize;
     let mut input = vec![0.0f32; num_frames * 2];
@@ -732,13 +712,11 @@ fn test_identity_stereo_silence_channels() {
     let left_rms = rms(&left);
     let right_rms = rms(&right);
 
-    // Left should have significant energy
     assert!(
         left_rms > 0.1,
         "Left channel lost energy: RMS = {:.4}",
         left_rms
     );
-    // Right should remain near-silent
     assert!(
         right_rms < 0.01,
         "Right silent channel leaked: RMS = {:.6}",
@@ -748,13 +726,11 @@ fn test_identity_stereo_silence_channels() {
 
 #[test]
 fn test_identity_click_timing_preservation() {
-    // Click train: verify that click positions are preserved after identity stretch.
     let sample_rate = 44100u32;
     let num_samples = sample_rate as usize * 2;
-    let click_interval = sample_rate as usize / 4; // 4 clicks per second
+    let click_interval = sample_rate as usize / 4;
     let mut input = vec![0.0f32; num_samples];
 
-    // Place clicks at known positions
     let mut click_positions = Vec::new();
     let mut pos = 0;
     while pos < num_samples {
@@ -773,21 +749,18 @@ fn test_identity_click_timing_preservation() {
 
     let output = stretch(&input, &params).unwrap();
 
-    // Find peaks in output (above 0.3 threshold)
     let mut output_peaks = Vec::new();
     for i in 1..output.len() - 1 {
         if output[i].abs() > 0.3
             && output[i].abs() >= output[i - 1].abs()
             && output[i].abs() >= output[i + 1].abs()
         {
-            // Avoid double-counting adjacent peaks
             if output_peaks.is_empty() || i - *output_peaks.last().unwrap() > 100 {
                 output_peaks.push(i);
             }
         }
     }
 
-    // Should detect at least half the original clicks
     assert!(
         output_peaks.len() >= click_positions.len() / 2,
         "Too few clicks detected: found {} of {} expected",
@@ -798,8 +771,6 @@ fn test_identity_click_timing_preservation() {
 
 #[test]
 fn test_identity_energy_per_segment() {
-    // Divide signal into segments and verify energy is preserved in each.
-    // This catches cases where total RMS is OK but energy is redistributed.
     let sample_rate = 44100u32;
     let num_samples = sample_rate as usize * 2;
     let input = sine_wave(440.0, sample_rate, num_samples);
@@ -812,7 +783,7 @@ fn test_identity_energy_per_segment() {
 
     let compare_len = input.len().min(output.len());
     let segment_size = 4096;
-    let margin = 8192; // skip edges
+    let margin = 8192;
 
     if compare_len > margin * 2 + segment_size {
         let mut max_ratio = 0.0f64;
