@@ -187,6 +187,9 @@
 - [x] Extracted 3 named constants in `transient.rs`: `MEDIAN_WINDOW_FRAMES`, `MIN_ONSET_GAP_FRAMES`, `THRESHOLD_FLOOR`
 - [x] Extracted 5 named constants in `beat.rs`: `BEAT_FFT_SIZE`, `BEAT_HOP_SIZE`, `BEAT_SENSITIVITY`, `MIN_EDM_BPM`, `MAX_EDM_BPM`
 - [x] Extracted shared `deinterleave()` and `interleave()` helpers in `lib.rs`, deduplicating identical channel processing in `stretch()` and `pitch_shift()` (net -23 lines)
+- [x] Extracted `process_buffer()` helper in `lib.rs`, deduplicating the params-override-and-wrap pattern across `stretch_buffer()`, `stretch_bpm_buffer()`, and `stretch_bpm_buffer_auto()` (net -7 lines)
+- [x] Extracted `Band` enum and `classify_bin()` helper in `frequency.rs`, deduplicating the if-elif band classification pattern used 3x in `split_spectrum_into_bands()` and 1x in `compute_band_energy()` (net -12 lines)
+- [x] Removed unused `snr_db()` function and `#[allow(dead_code)]` from `tests/quality.rs`
 - [x] All tests passing, zero clippy warnings
 
 ## BPM-Aware Stretch API (agent-3)
