@@ -263,25 +263,32 @@ impl Wsola {
         let fft_fwd = self.planner.plan_fft_forward(fft_size);
         let fft_inv = self.planner.plan_fft_inverse(fft_size);
 
-        // Zero-pad signals into FFT buffers
-        let mut ref_buf = vec![Complex::new(0.0f32, 0.0); fft_size];
-        for (i, &s) in ref_signal.iter().enumerate() {
-            ref_buf[i] = Complex::new(s, 0.0);
-        }
+        let zero = Complex::new(0.0f32, 0.0);
 
-        let mut search_buf = vec![Complex::new(0.0f32, 0.0); fft_size];
-        for (i, &s) in search_signal.iter().enumerate() {
-            search_buf[i] = Complex::new(s, 0.0);
-        }
+        // Zero-pad signals into FFT buffers
+        let mut ref_buf: Vec<Complex<f32>> = ref_signal
+            .iter()
+            .map(|&s| Complex::new(s, 0.0))
+            .chain(std::iter::repeat(zero))
+            .take(fft_size)
+            .collect();
+
+        let mut search_buf: Vec<Complex<f32>> = search_signal
+            .iter()
+            .map(|&s| Complex::new(s, 0.0))
+            .chain(std::iter::repeat(zero))
+            .take(fft_size)
+            .collect();
 
         // Forward FFT, multiply conj(Ref) * Search, inverse FFT
         fft_fwd.process(&mut ref_buf);
         fft_fwd.process(&mut search_buf);
 
-        let mut corr_buf = vec![Complex::new(0.0f32, 0.0); fft_size];
-        for i in 0..fft_size {
-            corr_buf[i] = ref_buf[i].conj() * search_buf[i];
-        }
+        let mut corr_buf: Vec<Complex<f32>> = ref_buf
+            .iter()
+            .zip(search_buf.iter())
+            .map(|(r, s)| r.conj() * s)
+            .collect();
 
         fft_inv.process(&mut corr_buf);
         corr_buf
@@ -328,9 +335,12 @@ fn find_best_candidate(
     let norm = 1.0 / corr_buf.len() as f64;
 
     // Running energy of search signal windows via prefix sums
-    let mut prefix_sq = vec![0.0f64; search_signal.len() + 1];
-    for i in 0..search_signal.len() {
-        prefix_sq[i + 1] = prefix_sq[i] + (search_signal[i] as f64) * (search_signal[i] as f64);
+    let mut prefix_sq = Vec::with_capacity(search_signal.len() + 1);
+    prefix_sq.push(0.0f64);
+    let mut accum = 0.0f64;
+    for &s in search_signal {
+        accum += (s as f64) * (s as f64);
+        prefix_sq.push(accum);
     }
 
     let mut best_pos = search_start;
@@ -359,22 +369,18 @@ fn find_best_candidate(
 /// Normalized cross-correlation between two signals.
 #[inline]
 fn normalized_cross_correlation(a: &[f32], b: &[f32]) -> f64 {
-    let len = a.len().min(b.len());
-    if len == 0 {
+    if a.is_empty() || b.is_empty() {
         return 0.0;
     }
 
-    let mut sum_ab = 0.0f64;
-    let mut sum_a2 = 0.0f64;
-    let mut sum_b2 = 0.0f64;
-
-    for i in 0..len {
-        let va = a[i] as f64;
-        let vb = b[i] as f64;
-        sum_ab += va * vb;
-        sum_a2 += va * va;
-        sum_b2 += vb * vb;
-    }
+    let (sum_ab, sum_a2, sum_b2) = a.iter().zip(b.iter()).fold(
+        (0.0f64, 0.0f64, 0.0f64),
+        |(ab, a2, b2), (&va, &vb)| {
+            let va = va as f64;
+            let vb = vb as f64;
+            (ab + va * vb, a2 + va * va, b2 + vb * vb)
+        },
+    );
 
     let denom = (sum_a2 * sum_b2).sqrt();
     if denom < ENERGY_EPSILON {
