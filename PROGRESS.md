@@ -481,6 +481,15 @@
 - [x] Fixed 2 pre-existing clippy warnings in tests/edm_presets.rs and tests/identity.rs
 - [x] Zero clippy warnings (`cargo clippy --all-targets -- -D warnings` clean)
 
+### Eleventh pass (agent-5)
+- [x] Named magic `0.1` window sum floor ratio in hybrid.rs as `WINDOW_SUM_FLOOR_RATIO` and `WINDOW_SUM_EPSILON` constants (matches phase_vocoder.rs naming)
+- [x] Replaced indexed loops with idiomatic `zip` iterators in `apply_window()` and `apply_window_copy()` (window.rs)
+- [x] Replaced manual while-loop deinterleave with `step_by` iterator in `StreamProcessor::deinterleave_channel()` (processor.rs)
+- [x] Replaced indexed normalization loop with `zip` in `separate_sub_bass()` (hybrid.rs)
+- [x] Used `.copied()` instead of `.cloned()` for f32 fold in hybrid.rs (idiomatic for Copy types)
+- [x] Removed dead `ws > WINDOW_SUM_EPSILON` guard in phase_vocoder `normalize_output()` — ws is already clamped above epsilon by `max()` on previous line
+- [x] All 190+ unit tests passing, zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
