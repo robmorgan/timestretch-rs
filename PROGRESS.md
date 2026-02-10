@@ -431,6 +431,17 @@
 - [x] Fixed clippy warnings in test files: `needless_range_loop` in edm_presets.rs, `collapsible_if` in identity.rs
 - [x] All 302+ tests passing, zero clippy warnings
 
+## Ergonomic API Traits & CLI Verbose (agent-1)
+- [x] `impl PartialEq for AudioBuffer` — compare data, sample rate, and channels
+- [x] `impl AsRef<[f32]> for AudioBuffer` — direct access to underlying sample slice
+- [x] `AudioBuffer::frames()` → `FrameIter` — iterate over frames (1 sample for mono, 2 for stereo)
+- [x] `FrameIter` implements `Iterator + ExactSizeIterator`
+- [x] `FrameIter` re-exported from `timestretch::FrameIter`
+- [x] CLI `--verbose`/`-v` flag — shows full parameter dump, processing time, realtime factor
+- [x] Applied cargo fmt to hybrid.rs (other agents' code)
+- [x] 9 new unit tests (PartialEq, AsRef, frames iterator, exact size)
+- [x] All 335+ tests passing, zero clippy warnings, zero doc warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
