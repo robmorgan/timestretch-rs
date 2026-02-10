@@ -601,6 +601,28 @@ pub fn stretch_to_bpm_wav_file(
     Ok(result)
 }
 
+/// Reads a WAV file, auto-detects its BPM, stretches to the target BPM, and writes the result.
+///
+/// The output is written as 32-bit float WAV. The sample rate and channel
+/// layout are read from the input file.
+///
+/// # Errors
+///
+/// Returns [`StretchError::IoError`] if the files cannot be read or written,
+/// [`StretchError::InvalidFormat`] if the input is not a valid WAV file,
+/// or [`StretchError::BpmDetectionFailed`] if no tempo can be detected.
+pub fn stretch_to_bpm_auto_wav_file(
+    input_path: &str,
+    output_path: &str,
+    target_bpm: f64,
+    params: &StretchParams,
+) -> Result<AudioBuffer, StretchError> {
+    let buffer = io::wav::read_wav_file(input_path)?;
+    let result = stretch_bpm_buffer_auto(&buffer, target_bpm, params)?;
+    io::wav::write_wav_file_float(output_path, &result)?;
+    Ok(result)
+}
+
 /// Reads a WAV file, pitch-shifts it, and writes the result to another WAV file.
 ///
 /// The output is written as 32-bit float WAV. The sample rate and channel

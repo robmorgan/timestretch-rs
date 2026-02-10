@@ -6,9 +6,7 @@
 // - From<AudioBuffer> for Vec<f32>, with_stretch_ratio(), Debug impls
 // - StretchParams::from_tempo() integration
 
-use timestretch::{
-    AudioBuffer, Channels, EdmPreset, StretchParams, StreamProcessor, WindowType,
-};
+use timestretch::{AudioBuffer, Channels, EdmPreset, StreamProcessor, StretchParams, WindowType};
 
 // ──────────────────────────────────────────────────────────────────
 // Test signal helpers
@@ -16,9 +14,7 @@ use timestretch::{
 
 fn sine_mono(freq: f32, sample_rate: u32, num_samples: usize) -> AudioBuffer {
     let data: Vec<f32> = (0..num_samples)
-        .map(|i| {
-            (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate as f32).sin()
-        })
+        .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate as f32).sin())
         .collect();
     AudioBuffer::from_mono(data, sample_rate)
 }
@@ -260,7 +256,7 @@ mod crossfade_workflows {
         let a = sine_mono(440.0, 44100, 100);
         let b = sine_mono(330.0, 44100, 100);
         let mixed = a.crossfade_into(&b, 500); // 500 > 100
-        // Should clamp to min(100, 100) = 100
+                                               // Should clamp to min(100, 100) = 100
         assert_eq!(mixed.num_frames(), 100); // 100 + 100 - 100
     }
 
@@ -345,9 +341,7 @@ mod wav_file_api {
     fn create_test_wav(path: &str, freq: f32, duration_secs: f64, sample_rate: u32) {
         let num_samples = (sample_rate as f64 * duration_secs) as usize;
         let data: Vec<f32> = (0..num_samples)
-            .map(|i| {
-                (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate as f32).sin()
-            })
+            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate as f32).sin())
             .collect();
         let buf = AudioBuffer::from_mono(data, sample_rate);
         timestretch::io::wav::write_wav_file_float(path, &buf).unwrap();
@@ -491,7 +485,9 @@ mod wav_file_api {
 
     #[test]
     fn wav_file_api_nonexistent_input() {
-        let params = StretchParams::new(1.5).with_sample_rate(44100).with_channels(1);
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(44100)
+            .with_channels(1);
         let result =
             timestretch::stretch_wav_file("/nonexistent/input.wav", "/tmp/output.wav", &params);
         assert!(result.is_err());
@@ -529,7 +525,10 @@ mod wav_file_api {
             )
             .unwrap();
 
-            assert!(result.num_frames() > 0, "Preset {preset} produced empty output");
+            assert!(
+                result.num_frames() > 0,
+                "Preset {preset} produced empty output"
+            );
             assert!(result.rms() > 0.01, "Preset {preset} produced silence");
         }
 
@@ -589,7 +588,11 @@ mod dj_streaming_workflow {
         // 128→126 = expansion
         assert!(!output.is_empty());
         // Output should be interleaved stereo (even sample count)
-        assert_eq!(output.len() % 2, 0, "Stereo output must have even sample count");
+        assert_eq!(
+            output.len() % 2,
+            0,
+            "Stereo output must have even sample count"
+        );
     }
 
     #[test]
@@ -621,18 +624,15 @@ mod dj_streaming_workflow {
 
         // Both parts should produce output
         assert!(!output_part1.is_empty(), "First part should produce output");
-        assert!(!output_part2.is_empty(), "Second part should produce output");
+        assert!(
+            !output_part2.is_empty(),
+            "Second part should produce output"
+        );
 
         // No NaN or Inf in output (click-free transitions)
-        let combined: Vec<f32> = output_part1
-            .into_iter()
-            .chain(output_part2)
-            .collect();
+        let combined: Vec<f32> = output_part1.into_iter().chain(output_part2).collect();
         for (i, &s) in combined.iter().enumerate() {
-            assert!(
-                s.is_finite(),
-                "Non-finite sample at index {i}: {s}"
-            );
+            assert!(s.is_finite(), "Non-finite sample at index {i}: {s}");
         }
     }
 
@@ -991,9 +991,7 @@ mod combined_workflows {
         let a = sine_mono(440.0, 44100, 44100);
         let b = AudioBuffer::from_mono(
             (0..44100)
-                .map(|i| {
-                    0.3 * (2.0 * std::f32::consts::PI * 330.0 * i as f32 / 44100.0).sin()
-                })
+                .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 330.0 * i as f32 / 44100.0).sin())
                 .collect(),
             44100,
         );
@@ -1035,14 +1033,21 @@ mod combined_workflows {
         let input = sine_mono(440.0, 44100, 44100);
 
         // Test with different window types via BPM stretch
-        let windows = [WindowType::Hann, WindowType::BlackmanHarris, WindowType::Kaiser(12)];
+        let windows = [
+            WindowType::Hann,
+            WindowType::BlackmanHarris,
+            WindowType::Kaiser(12),
+        ];
         for wt in &windows {
             let params = StretchParams::from_tempo(128.0, 126.0)
                 .with_sample_rate(44100)
                 .with_channels(1)
                 .with_window_type(*wt);
             let output = timestretch::stretch_buffer(&input, &params).unwrap();
-            assert!(output.num_frames() > 0, "Window {wt:?} produced empty output");
+            assert!(
+                output.num_frames() > 0,
+                "Window {wt:?} produced empty output"
+            );
             assert!(output.rms() > 0.01, "Window {wt:?} produced silence");
         }
     }
@@ -1142,7 +1147,7 @@ mod new_feature_edge_cases {
     #[test]
     fn resample_extreme_rates() {
         let buf = sine_mono(440.0, 44100, 4410); // 100ms
-        // Upsample to 96kHz
+                                                 // Upsample to 96kHz
         let up = buf.resample(96000);
         assert_eq!(up.sample_rate, 96000);
         let dur_diff = (buf.duration_secs() - up.duration_secs()).abs();
@@ -1221,7 +1226,10 @@ mod new_feature_edge_cases {
         proc.set_hybrid_mode(true);
         assert!(proc.is_hybrid_mode());
         proc.reset();
-        assert!(proc.is_hybrid_mode(), "Hybrid mode should persist across reset");
+        assert!(
+            proc.is_hybrid_mode(),
+            "Hybrid mode should persist across reset"
+        );
     }
 
     #[test]

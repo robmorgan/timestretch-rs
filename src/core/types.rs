@@ -906,6 +906,183 @@ impl AudioBuffer {
             channels: self.channels,
         }
     }
+
+    /// Creates a silent (all-zeros) mono buffer of the given duration.
+    ///
+    /// Useful for creating gaps, padding, or test signals.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let buf = AudioBuffer::silence(44100, 1.0); // 1 second of silence
+    /// assert_eq!(buf.num_frames(), 44100);
+    /// assert!(buf.peak() < 1e-10);
+    /// ```
+    pub fn silence(sample_rate: u32, duration_secs: f64) -> Self {
+        let num_samples = (sample_rate as f64 * duration_secs).round() as usize;
+        Self {
+            data: vec![0.0; num_samples],
+            sample_rate,
+            channels: Channels::Mono,
+        }
+    }
+
+    /// Creates a mono buffer containing a sine tone at the given frequency.
+    ///
+    /// Generates `duration_secs` of a sine wave at `freq_hz` with amplitude
+    /// `amplitude` (should be in the range 0.0–1.0). Useful for generating
+    /// test signals.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let buf = AudioBuffer::tone(440.0, 44100, 1.0, 0.8);
+    /// assert_eq!(buf.num_frames(), 44100);
+    /// assert!(buf.peak() <= 0.8 + 1e-6);
+    /// ```
+    pub fn tone(freq_hz: f64, sample_rate: u32, duration_secs: f64, amplitude: f32) -> Self {
+        let num_samples = (sample_rate as f64 * duration_secs).round() as usize;
+        let data: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                amplitude
+                    * (2.0 * std::f64::consts::PI * freq_hz * i as f64 / sample_rate as f64).sin()
+                        as f32
+            })
+            .collect();
+        Self {
+            data,
+            sample_rate,
+            channels: Channels::Mono,
+        }
+    }
+
+    /// Converts a mono buffer to stereo with a panning position.
+    ///
+    /// `pan` ranges from -1.0 (hard left) through 0.0 (center) to 1.0 (hard
+    /// right). Uses constant-power panning (sine/cosine law) to maintain
+    /// perceived loudness across the stereo field.
+    ///
+    /// For stereo input, this is a no-op and returns a clone.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pan` is outside the range `[-1.0, 1.0]`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let mono = AudioBuffer::from_mono(vec![1.0, 1.0], 44100);
+    /// let stereo = mono.pan(0.0); // center
+    /// assert!(stereo.is_stereo());
+    /// // Both channels should have equal amplitude at center pan
+    /// let (l, r) = (stereo.data[0], stereo.data[1]);
+    /// assert!((l - r).abs() < 1e-6);
+    /// ```
+    pub fn pan(&self, pan: f32) -> Self {
+        assert!(
+            (-1.0..=1.0).contains(&pan),
+            "pan must be in [-1.0, 1.0], got {}",
+            pan
+        );
+
+        if self.channels == Channels::Stereo {
+            return self.clone();
+        }
+
+        // Constant-power panning: L = cos(angle), R = sin(angle)
+        // where angle goes from 0 (hard left) to PI/2 (hard right)
+        let angle = (pan + 1.0) * 0.5 * std::f32::consts::FRAC_PI_2;
+        let gain_l = angle.cos();
+        let gain_r = angle.sin();
+
+        let mut data = Vec::with_capacity(self.data.len() * 2);
+        for &s in &self.data {
+            data.push(s * gain_l);
+            data.push(s * gain_r);
+        }
+
+        Self {
+            data,
+            sample_rate: self.sample_rate,
+            channels: Channels::Stereo,
+        }
+    }
+
+    /// Applies a gain envelope defined by time-value breakpoints.
+    ///
+    /// `breakpoints` is a slice of `(time_secs, gain_linear)` pairs, sorted
+    /// by time. Gain is linearly interpolated between breakpoints. Samples
+    /// before the first breakpoint use the first gain value; samples after
+    /// the last use the last gain value.
+    ///
+    /// This is useful for volume automation, ducking, and creative effects.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let buf = AudioBuffer::from_mono(vec![1.0; 44100], 44100);
+    /// // Fade from 1.0 to 0.0 over 1 second
+    /// let faded = buf.with_gain_envelope(&[(0.0, 1.0), (1.0, 0.0)]);
+    /// assert!(faded.data[0] > 0.99);
+    /// assert!(faded.data[44099].abs() < 0.01);
+    /// ```
+    pub fn with_gain_envelope(&self, breakpoints: &[(f64, f32)]) -> Self {
+        if breakpoints.is_empty() || self.data.is_empty() {
+            return self.clone();
+        }
+
+        let nc = self.channels.count();
+        let num_frames = self.num_frames();
+        let mut data = self.data.clone();
+
+        for frame in 0..num_frames {
+            let time = frame as f64 / self.sample_rate as f64;
+            let gain = interpolate_breakpoints(breakpoints, time);
+            for ch in 0..nc {
+                data[frame * nc + ch] *= gain;
+            }
+        }
+
+        Self {
+            data,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        }
+    }
+}
+
+/// Linearly interpolates a value from sorted `(time, value)` breakpoints.
+fn interpolate_breakpoints(breakpoints: &[(f64, f32)], time: f64) -> f32 {
+    if breakpoints.len() == 1 || time <= breakpoints[0].0 {
+        return breakpoints[0].1;
+    }
+    if time >= breakpoints[breakpoints.len() - 1].0 {
+        return breakpoints[breakpoints.len() - 1].1;
+    }
+
+    // Find the segment containing `time`
+    for i in 1..breakpoints.len() {
+        if time <= breakpoints[i].0 {
+            let (t0, v0) = breakpoints[i - 1];
+            let (t1, v1) = breakpoints[i];
+            let dt = t1 - t0;
+            if dt <= 0.0 {
+                return v1;
+            }
+            let frac = ((time - t0) / dt) as f32;
+            return v0 + frac * (v1 - v0);
+        }
+    }
+
+    breakpoints[breakpoints.len() - 1].1
 }
 
 /// EDM-specific presets for time stretching.
@@ -2401,5 +2578,217 @@ mod tests {
         let b = AudioBuffer::from_mono(vec![], 44100);
         let mixed = a.mix(&b);
         assert_eq!(mixed.data, vec![1.0]);
+    }
+
+    // --- silence() tests ---
+
+    #[test]
+    fn test_silence_basic() {
+        let buf = AudioBuffer::silence(44100, 1.0);
+        assert_eq!(buf.num_frames(), 44100);
+        assert_eq!(buf.sample_rate, 44100);
+        assert_eq!(buf.channels, Channels::Mono);
+        assert!(buf.peak() < 1e-10);
+    }
+
+    #[test]
+    fn test_silence_zero_duration() {
+        let buf = AudioBuffer::silence(44100, 0.0);
+        assert_eq!(buf.num_frames(), 0);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_silence_48khz() {
+        let buf = AudioBuffer::silence(48000, 0.5);
+        assert_eq!(buf.num_frames(), 24000);
+        assert_eq!(buf.sample_rate, 48000);
+    }
+
+    // --- tone() tests ---
+
+    #[test]
+    fn test_tone_basic() {
+        let buf = AudioBuffer::tone(440.0, 44100, 1.0, 0.8);
+        assert_eq!(buf.num_frames(), 44100);
+        assert_eq!(buf.sample_rate, 44100);
+        assert_eq!(buf.channels, Channels::Mono);
+        assert!(buf.peak() <= 0.8 + 1e-4);
+        assert!(buf.peak() > 0.7); // should be close to 0.8
+    }
+
+    #[test]
+    fn test_tone_zero_amplitude() {
+        let buf = AudioBuffer::tone(440.0, 44100, 1.0, 0.0);
+        assert!(buf.peak() < 1e-10);
+    }
+
+    #[test]
+    fn test_tone_frequency() {
+        // A 1 Hz tone at 100 samples/sec should complete exactly 1 cycle
+        let buf = AudioBuffer::tone(1.0, 100, 1.0, 1.0);
+        assert_eq!(buf.num_frames(), 100);
+        // At sample 0, sin(0) = 0; at sample 25, sin(PI/2) ≈ 1
+        assert!(buf.data[0].abs() < 0.01);
+        assert!((buf.data[25] - 1.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_tone_zero_duration() {
+        let buf = AudioBuffer::tone(440.0, 44100, 0.0, 1.0);
+        assert!(buf.is_empty());
+    }
+
+    // --- pan() tests ---
+
+    #[test]
+    fn test_pan_center() {
+        let mono = AudioBuffer::from_mono(vec![1.0, 1.0, 1.0], 44100);
+        let stereo = mono.pan(0.0);
+        assert!(stereo.is_stereo());
+        assert_eq!(stereo.num_frames(), 3);
+        // Center: both channels should be equal (cos(PI/4) = sin(PI/4))
+        for frame in stereo.frames() {
+            assert!(
+                (frame[0] - frame[1]).abs() < 1e-6,
+                "Center pan should give equal L/R"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pan_hard_left() {
+        let mono = AudioBuffer::from_mono(vec![1.0], 44100);
+        let stereo = mono.pan(-1.0);
+        // Hard left: angle = 0, cos(0)=1, sin(0)=0
+        assert!((stereo.data[0] - 1.0).abs() < 1e-6);
+        assert!(stereo.data[1].abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_pan_hard_right() {
+        let mono = AudioBuffer::from_mono(vec![1.0], 44100);
+        let stereo = mono.pan(1.0);
+        // Hard right: angle = PI/2, cos(PI/2)≈0, sin(PI/2)=1
+        assert!(stereo.data[0].abs() < 1e-6);
+        assert!((stereo.data[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_pan_stereo_noop() {
+        let stereo = AudioBuffer::from_stereo(vec![0.5, 0.7, 0.5, 0.7], 44100);
+        let panned = stereo.pan(0.5);
+        assert_eq!(panned.data, stereo.data);
+    }
+
+    #[test]
+    fn test_pan_constant_power() {
+        // Constant power: L^2 + R^2 should be approximately constant across pan positions
+        let mono = AudioBuffer::from_mono(vec![1.0], 44100);
+        let power_center = {
+            let s = mono.pan(0.0);
+            s.data[0] * s.data[0] + s.data[1] * s.data[1]
+        };
+        let power_left = {
+            let s = mono.pan(-1.0);
+            s.data[0] * s.data[0] + s.data[1] * s.data[1]
+        };
+        let power_right = {
+            let s = mono.pan(1.0);
+            s.data[0] * s.data[0] + s.data[1] * s.data[1]
+        };
+        assert!(
+            (power_center - power_left).abs() < 0.01,
+            "Constant power violated: center={}, left={}",
+            power_center,
+            power_left
+        );
+        assert!(
+            (power_center - power_right).abs() < 0.01,
+            "Constant power violated: center={}, right={}",
+            power_center,
+            power_right
+        );
+    }
+
+    #[test]
+    fn test_pan_empty() {
+        let mono = AudioBuffer::from_mono(vec![], 44100);
+        let stereo = mono.pan(0.0);
+        assert!(stereo.is_stereo());
+        assert!(stereo.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "pan must be in")]
+    fn test_pan_out_of_range() {
+        let mono = AudioBuffer::from_mono(vec![1.0], 44100);
+        mono.pan(1.5);
+    }
+
+    // --- with_gain_envelope() tests ---
+
+    #[test]
+    fn test_gain_envelope_fade_out() {
+        let buf = AudioBuffer::from_mono(vec![1.0; 100], 100); // 1 sec at 100 Hz
+        let faded = buf.with_gain_envelope(&[(0.0, 1.0), (1.0, 0.0)]);
+        // First sample should be ~1.0, last should be ~0.0
+        assert!((faded.data[0] - 1.0).abs() < 0.02);
+        assert!(faded.data[99].abs() < 0.02);
+        // Middle should be ~0.5
+        assert!((faded.data[50] - 0.5).abs() < 0.02);
+    }
+
+    #[test]
+    fn test_gain_envelope_fade_in() {
+        let buf = AudioBuffer::from_mono(vec![1.0; 100], 100);
+        let faded = buf.with_gain_envelope(&[(0.0, 0.0), (1.0, 1.0)]);
+        assert!(faded.data[0].abs() < 0.02);
+        assert!((faded.data[99] - 1.0).abs() < 0.02);
+    }
+
+    #[test]
+    fn test_gain_envelope_constant() {
+        let buf = AudioBuffer::from_mono(vec![1.0; 100], 100);
+        let scaled = buf.with_gain_envelope(&[(0.0, 0.5)]);
+        for &s in &scaled.data {
+            assert!((s - 0.5).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_gain_envelope_empty_breakpoints() {
+        let buf = AudioBuffer::from_mono(vec![1.0; 100], 100);
+        let same = buf.with_gain_envelope(&[]);
+        assert_eq!(same.data, buf.data);
+    }
+
+    #[test]
+    fn test_gain_envelope_empty_buffer() {
+        let buf = AudioBuffer::from_mono(vec![], 44100);
+        let same = buf.with_gain_envelope(&[(0.0, 1.0), (1.0, 0.0)]);
+        assert!(same.is_empty());
+    }
+
+    #[test]
+    fn test_gain_envelope_stereo() {
+        let buf = AudioBuffer::from_stereo(vec![1.0, 0.5, 1.0, 0.5], 2); // 2 frames at 2 Hz
+        let faded = buf.with_gain_envelope(&[(0.0, 1.0), (1.0, 0.0)]);
+        // Frame 0 (time=0.0): gain=1.0
+        assert!((faded.data[0] - 1.0).abs() < 1e-6); // L
+        assert!((faded.data[1] - 0.5).abs() < 1e-6); // R
+                                                     // Frame 1 (time=0.5): gain=0.5
+        assert!((faded.data[2] - 0.5).abs() < 1e-6); // L
+        assert!((faded.data[3] - 0.25).abs() < 1e-6); // R
+    }
+
+    #[test]
+    fn test_gain_envelope_multi_segment() {
+        let buf = AudioBuffer::from_mono(vec![1.0; 100], 100);
+        // V-shape: full -> silent -> full
+        let shaped = buf.with_gain_envelope(&[(0.0, 1.0), (0.5, 0.0), (1.0, 1.0)]);
+        assert!((shaped.data[0] - 1.0).abs() < 0.02);
+        assert!(shaped.data[50].abs() < 0.02);
+        assert!((shaped.data[99] - 1.0).abs() < 0.02);
     }
 }

@@ -662,6 +662,18 @@
   - Track splitting with `split_at()`, layering with `mix()`, crossfade transition
   - Demonstrates all new AudioBuffer APIs in a realistic scenario
 
+## API Completions & Factory Methods (agent-1)
+- [x] `stretch_to_bpm_auto_wav_file()` — auto-detect BPM from WAV, stretch to target, write output (completes WAV file API symmetry)
+- [x] `StreamProcessor::target_stretch_ratio()` — getter for the target ratio (what the interpolation is converging toward)
+- [x] `StreamProcessor::target_bpm()` — returns target BPM computed from source BPM and target ratio (requires `from_tempo`)
+- [x] `AudioBuffer::silence(sample_rate, duration_secs)` — factory for silent mono buffers (useful for padding, gaps, tests)
+- [x] `AudioBuffer::tone(freq_hz, sample_rate, duration_secs, amplitude)` — factory for mono sine tone test signals
+- [x] `AudioBuffer::pan(pan)` — mono-to-stereo with constant-power panning (-1.0 hard left, 0.0 center, 1.0 hard right)
+- [x] `AudioBuffer::with_gain_envelope(breakpoints)` — apply time-varying gain via linear-interpolated breakpoints (volume automation, ducking)
+- [x] 24 new unit tests: silence (3), tone (4), pan (7), with_gain_envelope (7), StreamProcessor getters (4)
+- [x] Applied cargo fmt to fix formatting drift from other agents' code
+- [x] All 923 tests passing (354 unit + 535 integration + 34 doc), zero clippy warnings, zero doc warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 

@@ -333,6 +333,18 @@ impl StreamProcessor {
         self.current_ratio
     }
 
+    /// Returns the target stretch ratio (what the ratio is interpolating toward).
+    pub fn target_stretch_ratio(&self) -> f64 {
+        self.target_ratio
+    }
+
+    /// Returns the current target BPM, if the processor was created with [`from_tempo`](Self::from_tempo).
+    ///
+    /// Computed from the source BPM and current target ratio.
+    pub fn target_bpm(&self) -> Option<f64> {
+        self.source_bpm.map(|src| src / self.target_ratio)
+    }
+
     /// Returns the minimum latency in samples.
     ///
     /// This is the number of input samples needed before any output is produced.
@@ -1102,6 +1114,53 @@ mod tests {
             total_output.len() % 2,
             0,
             "Stereo output must have even sample count"
+        );
+    }
+
+    #[test]
+    fn test_stream_processor_target_stretch_ratio() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+
+        let mut proc = StreamProcessor::new(params);
+        assert!((proc.target_stretch_ratio() - 1.0).abs() < 1e-6);
+
+        proc.set_stretch_ratio(1.5);
+        assert!((proc.target_stretch_ratio() - 1.5).abs() < 1e-6);
+        // Current ratio hasn't converged yet
+        assert!((proc.current_stretch_ratio() - 1.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_stream_processor_target_bpm_none() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let proc = StreamProcessor::new(params);
+        assert_eq!(proc.target_bpm(), None);
+    }
+
+    #[test]
+    fn test_stream_processor_target_bpm_from_tempo() {
+        let proc = StreamProcessor::from_tempo(126.0, 128.0, 44100, 1);
+        let target = proc.target_bpm().unwrap();
+        assert!(
+            (target - 128.0).abs() < 0.1,
+            "Expected target BPM ~128, got {}",
+            target
+        );
+    }
+
+    #[test]
+    fn test_stream_processor_target_bpm_after_set_tempo() {
+        let mut proc = StreamProcessor::from_tempo(126.0, 128.0, 44100, 1);
+        proc.set_tempo(130.0);
+        let target = proc.target_bpm().unwrap();
+        assert!(
+            (target - 130.0).abs() < 0.1,
+            "Expected target BPM ~130, got {}",
+            target
         );
     }
 }
