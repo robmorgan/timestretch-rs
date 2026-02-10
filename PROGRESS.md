@@ -327,6 +327,15 @@
 - [x] Total: 263 tests (111 unit + 138 integration + 14 doc), all passing
 - [x] Zero clippy warnings, cargo fmt clean
 
+### Seventh pass (agent-5)
+- [x] Moved `preset_description()` standalone function to `EdmPreset::description()` method (more idiomatic Rust)
+- [x] Extracted `RATIO_MIN`/`RATIO_MAX`/`FFT_SIZE_MIN`/`SAMPLE_RATE_MIN`/`SAMPLE_RATE_MAX` constants in params.rs — eliminates magic numbers in `validate_params()` and `pitch_shift()`
+- [x] Simplified `validate_params()` ratio validation from 3 separate if-checks to single `contains()` range check
+- [x] Extracted `BESSEL_MAX_TERMS`/`BESSEL_CONVERGENCE` constants in window.rs
+- [x] Extracted `extract_mono()` helper in lib.rs — deduplicates stereo-to-mono extraction in `detect_bpm_buffer()`, `detect_beat_grid_buffer()`, and `stretch_to_bpm_auto()`
+- [x] Deduplicated `pitch_shift_buffer()` via `process_buffer()` helper (was 10 lines, now 1-line delegation)
+- [x] All 263+ tests passing, zero clippy warnings, cargo fmt clean
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
