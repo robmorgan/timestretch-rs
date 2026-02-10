@@ -1,0 +1,19 @@
+[project]
+name = "timestretch-rs"
+description = ""
+
+[agents]
+count = 4
+model = "claude-opus-4-6"
+roles = ["developer", "developer", "tester", "refactorer"]
+
+[docker]
+image = "metamorph-agent:latest"
+extra_packages = []
+
+[testing]
+command = ""
+fast_command = ""
+
+[notifications]
+webhook_url = ""
