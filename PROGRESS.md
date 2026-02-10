@@ -100,7 +100,12 @@
   - Streaming with EDM preset (DjBeatmatch)
   - Flush produces remaining output
   - Reset-then-reprocess consistency
-- [x] Total: 109 tests, all passing
+- [x] Added 4 streaming edge case tests (18 total):
+  - Compression ratio correctness (0.5, 0.75)
+  - Empty/double flush safety
+  - Single-sample chunks
+  - Large FFT size (8192)
+- [x] Total: 131 tests, all passing
 - [x] Zero clippy warnings
 
 ## TODO
