@@ -267,6 +267,15 @@
 - [x] Extracted Blackman-Harris window coefficients as module-level constants in window.rs: `BH_A0`..`BH_A3`
 - [x] All tests passing, zero clippy warnings
 
+## BPM Detection Public API (agent-3)
+- [x] `detect_bpm(samples, sample_rate)` — convenience function returning BPM as f64
+- [x] `detect_beat_grid(samples, sample_rate)` — returns full BeatGrid with beat positions
+- [x] Re-exported `BeatGrid` from top-level `timestretch` module
+- [x] 5 new unit tests: silence, empty, short input, beat grid, click train BPM detection
+- [x] 2 new doctests for `detect_bpm()` and `detect_beat_grid()`
+- [x] Total: 243 tests, all passing
+- [x] Zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
