@@ -247,6 +247,177 @@ pub fn pitch_shift(
     Ok(output)
 }
 
+/// Stretches audio from one BPM to another.
+///
+/// Computes the stretch ratio as `source_bpm / target_bpm` and applies
+/// time stretching. For example, stretching from 126 BPM to 128 BPM
+/// produces a ratio of 126/128 ≈ 0.984 (slightly shorter/faster).
+///
+/// # Errors
+///
+/// Returns [`StretchError::BpmDetectionFailed`] if either BPM value is invalid,
+/// or [`StretchError::InvalidRatio`] if the computed ratio is out of range.
+///
+/// # Example
+///
+/// ```
+/// use timestretch::{StretchParams, EdmPreset};
+///
+/// let input: Vec<f32> = (0..88200)
+///     .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
+///     .collect();
+///
+/// let params = StretchParams::new(1.0) // ratio will be overridden
+///     .with_sample_rate(44100)
+///     .with_channels(1)
+///     .with_preset(EdmPreset::DjBeatmatch);
+///
+/// let output = timestretch::stretch_to_bpm(&input, 126.0, 128.0, &params).unwrap();
+/// // Output is slightly shorter (126/128 ≈ 0.984x)
+/// assert!(output.len() < input.len());
+/// ```
+pub fn stretch_to_bpm(
+    input: &[f32],
+    source_bpm: f64,
+    target_bpm: f64,
+    params: &StretchParams,
+) -> Result<Vec<f32>, StretchError> {
+    if source_bpm <= 0.0 {
+        return Err(StretchError::BpmDetectionFailed(format!(
+            "source BPM must be positive, got {}",
+            source_bpm
+        )));
+    }
+    if target_bpm <= 0.0 {
+        return Err(StretchError::BpmDetectionFailed(format!(
+            "target BPM must be positive, got {}",
+            target_bpm
+        )));
+    }
+
+    let ratio = source_bpm / target_bpm;
+    let mut adjusted_params = params.clone();
+    adjusted_params.stretch_ratio = ratio;
+
+    stretch(input, &adjusted_params)
+}
+
+/// Stretches audio to a target BPM, auto-detecting the source BPM.
+///
+/// Uses beat detection to estimate the current tempo, then computes the
+/// stretch ratio needed to reach `target_bpm`. Best suited for audio
+/// with a clear rhythmic pattern (kicks, hi-hats).
+///
+/// For mono input, pass samples directly. For stereo, pass interleaved
+/// L/R samples and set channels to 2 — BPM detection uses the left channel.
+///
+/// # Errors
+///
+/// Returns [`StretchError::BpmDetectionFailed`] if no tempo can be detected
+/// (e.g. the input is too short, contains only silence, or lacks rhythmic content).
+pub fn stretch_to_bpm_auto(
+    input: &[f32],
+    target_bpm: f64,
+    params: &StretchParams,
+) -> Result<Vec<f32>, StretchError> {
+    if target_bpm <= 0.0 {
+        return Err(StretchError::BpmDetectionFailed(format!(
+            "target BPM must be positive, got {}",
+            target_bpm
+        )));
+    }
+
+    // Extract mono signal for beat detection
+    let mono: Vec<f32> = if params.channels.count() > 1 {
+        input
+            .iter()
+            .step_by(params.channels.count())
+            .copied()
+            .collect()
+    } else {
+        input.to_vec()
+    };
+
+    let beat_grid = analysis::beat::detect_beats(&mono, params.sample_rate);
+
+    if beat_grid.bpm <= 0.0 {
+        return Err(StretchError::BpmDetectionFailed(
+            "could not detect BPM from input audio (too short or no rhythmic content)".to_string(),
+        ));
+    }
+
+    stretch_to_bpm(input, beat_grid.bpm, target_bpm, params)
+}
+
+/// Stretches an [`AudioBuffer`] from one BPM to another.
+///
+/// Convenience wrapper around [`stretch_to_bpm`] that takes and returns
+/// an `AudioBuffer`. Sample rate and channel layout are taken from the buffer.
+///
+/// # Errors
+///
+/// Returns [`StretchError::BpmDetectionFailed`] if either BPM value is invalid.
+pub fn stretch_bpm_buffer(
+    buffer: &AudioBuffer,
+    source_bpm: f64,
+    target_bpm: f64,
+    params: &StretchParams,
+) -> Result<AudioBuffer, StretchError> {
+    let mut effective_params = params.clone();
+    effective_params.sample_rate = buffer.sample_rate;
+    effective_params.channels = buffer.channels;
+
+    let output_data = stretch_to_bpm(&buffer.data, source_bpm, target_bpm, &effective_params)?;
+
+    Ok(AudioBuffer::new(
+        output_data,
+        buffer.sample_rate,
+        buffer.channels,
+    ))
+}
+
+/// Stretches an [`AudioBuffer`] to a target BPM, auto-detecting the source BPM.
+///
+/// Convenience wrapper around [`stretch_to_bpm_auto`] that takes and returns
+/// an `AudioBuffer`. Sample rate and channel layout are taken from the buffer.
+///
+/// # Errors
+///
+/// Returns [`StretchError::BpmDetectionFailed`] if no tempo can be detected.
+pub fn stretch_bpm_buffer_auto(
+    buffer: &AudioBuffer,
+    target_bpm: f64,
+    params: &StretchParams,
+) -> Result<AudioBuffer, StretchError> {
+    let mut effective_params = params.clone();
+    effective_params.sample_rate = buffer.sample_rate;
+    effective_params.channels = buffer.channels;
+
+    let output_data = stretch_to_bpm_auto(&buffer.data, target_bpm, &effective_params)?;
+
+    Ok(AudioBuffer::new(
+        output_data,
+        buffer.sample_rate,
+        buffer.channels,
+    ))
+}
+
+/// Returns the stretch ratio needed to change from one BPM to another.
+///
+/// This is a simple utility: `source_bpm / target_bpm`. Use it when you
+/// want to compute the ratio yourself before calling [`stretch`].
+///
+/// # Example
+///
+/// ```
+/// let ratio = timestretch::bpm_ratio(126.0, 128.0);
+/// assert!((ratio - 0.984375).abs() < 1e-6);
+/// ```
+#[inline]
+pub fn bpm_ratio(source_bpm: f64, target_bpm: f64) -> f64 {
+    source_bpm / target_bpm
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +568,166 @@ mod tests {
 
         let output = stretch(&input, &params).unwrap();
         assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_bpm_ratio() {
+        let ratio = bpm_ratio(126.0, 128.0);
+        assert!((ratio - 0.984375).abs() < 1e-6);
+
+        // Same BPM = ratio 1.0
+        assert!((bpm_ratio(120.0, 120.0) - 1.0).abs() < 1e-10);
+
+        // Double BPM = half length
+        assert!((bpm_ratio(120.0, 240.0) - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_stretch_to_bpm_basic() {
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_preset(EdmPreset::DjBeatmatch);
+
+        // 126 -> 128 BPM: should produce slightly shorter output
+        let output = stretch_to_bpm(&input, 126.0, 128.0, &params).unwrap();
+        let expected_ratio = 126.0 / 128.0;
+        let actual_ratio = output.len() as f64 / input.len() as f64;
+        assert!(
+            (actual_ratio - expected_ratio).abs() < 0.3,
+            "BPM stretch ratio: expected ~{:.3}, got {:.3}",
+            expected_ratio,
+            actual_ratio
+        );
+    }
+
+    #[test]
+    fn test_stretch_to_bpm_speedup() {
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(sample_rate)
+            .with_channels(1);
+
+        // 120 -> 150 BPM: significant speedup (ratio 0.8)
+        let output = stretch_to_bpm(&input, 120.0, 150.0, &params).unwrap();
+        assert!(output.len() < input.len(), "Should be shorter when speeding up");
+    }
+
+    #[test]
+    fn test_stretch_to_bpm_slowdown() {
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(sample_rate)
+            .with_channels(1);
+
+        // 120 -> 90 BPM: slow down (ratio 1.333)
+        let output = stretch_to_bpm(&input, 120.0, 90.0, &params).unwrap();
+        assert!(output.len() > input.len(), "Should be longer when slowing down");
+    }
+
+    #[test]
+    fn test_stretch_to_bpm_invalid_bpm() {
+        let params = StretchParams::new(1.0);
+        let input = vec![0.0f32; 44100];
+
+        // Zero source BPM
+        assert!(stretch_to_bpm(&input, 0.0, 128.0, &params).is_err());
+        // Negative source BPM
+        assert!(stretch_to_bpm(&input, -120.0, 128.0, &params).is_err());
+        // Zero target BPM
+        assert!(stretch_to_bpm(&input, 120.0, 0.0, &params).is_err());
+        // Negative target BPM
+        assert!(stretch_to_bpm(&input, 120.0, -128.0, &params).is_err());
+    }
+
+    #[test]
+    fn test_stretch_to_bpm_same_bpm() {
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(sample_rate)
+            .with_channels(1);
+
+        // Same BPM: ratio 1.0, output length ~ input length
+        let output = stretch_to_bpm(&input, 128.0, 128.0, &params).unwrap();
+        let len_ratio = output.len() as f64 / input.len() as f64;
+        assert!(
+            (len_ratio - 1.0).abs() < 0.1,
+            "Same BPM should preserve length, got ratio {}",
+            len_ratio
+        );
+    }
+
+    #[test]
+    fn test_stretch_to_bpm_empty() {
+        let params = StretchParams::new(1.0);
+        let output = stretch_to_bpm(&[], 120.0, 128.0, &params).unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_stretch_to_bpm_auto_silence() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+
+        // Silence has no beats, should return BpmDetectionFailed
+        let silence = vec![0.0f32; 44100 * 4];
+        let result = stretch_to_bpm_auto(&silence, 128.0, &params);
+        assert!(result.is_err());
+        match result {
+            Err(StretchError::BpmDetectionFailed(_)) => {} // expected
+            other => panic!("Expected BpmDetectionFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stretch_to_bpm_auto_invalid_target() {
+        let params = StretchParams::new(1.0).with_sample_rate(44100).with_channels(1);
+        let input = vec![0.0f32; 44100];
+
+        assert!(stretch_to_bpm_auto(&input, 0.0, &params).is_err());
+        assert!(stretch_to_bpm_auto(&input, -128.0, &params).is_err());
+    }
+
+    #[test]
+    fn test_stretch_bpm_buffer() {
+        let sample_rate = 44100u32;
+        let buffer = AudioBuffer::from_mono(
+            (0..sample_rate as usize * 2)
+                .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin())
+                .collect(),
+            sample_rate,
+        );
+
+        let params = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
+        let output = stretch_bpm_buffer(&buffer, 126.0, 128.0, &params).unwrap();
+        assert_eq!(output.sample_rate, sample_rate);
+        assert_eq!(output.channels, Channels::Mono);
+        assert!(output.data.len() < buffer.data.len()); // Speeding up
     }
 }

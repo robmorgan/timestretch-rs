@@ -188,6 +188,17 @@
 - [x] Extracted 5 named constants in `beat.rs`: `BEAT_FFT_SIZE`, `BEAT_HOP_SIZE`, `BEAT_SENSITIVITY`, `MIN_EDM_BPM`, `MAX_EDM_BPM`
 - [x] All 166 tests passing, zero clippy warnings
 
+## BPM-Aware Stretch API (agent-3)
+- [x] `stretch_to_bpm(input, source_bpm, target_bpm, params)` — stretch audio between known BPM values
+- [x] `stretch_to_bpm_auto(input, target_bpm, params)` — auto-detect source BPM via beat detection, then stretch
+- [x] `stretch_bpm_buffer()` and `stretch_bpm_buffer_auto()` — AudioBuffer convenience wrappers
+- [x] `bpm_ratio(source, target)` — utility to compute stretch ratio from BPM pair
+- [x] `BpmDetectionFailed` error variant for invalid BPM values and failed auto-detection
+- [x] 14 BPM integration tests: DJ beatmatch (126→128), slowdown (128→126), halftime (128→64), doubletime (128→256), stereo, all presets, buffer API, auto-detection with clicks, invalid BPMs, 48kHz
+- [x] 12 BPM unit tests: ratio utility, speedup, slowdown, same BPM identity, empty input, silence auto-detect, buffer API
+- [x] Total: 189 tests, all passing
+- [x] Zero clippy warnings
+
 ## TODO
 - [ ] Test with real audio samples
 - [ ] SIMD-friendly inner loop layout

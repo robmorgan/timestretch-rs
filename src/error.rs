@@ -16,6 +16,8 @@ pub enum StretchError {
     IoError(String),
     /// Input too short for the given parameters.
     InputTooShort { provided: usize, minimum: usize },
+    /// BPM detection failed.
+    BpmDetectionFailed(String),
 }
 
 impl fmt::Display for StretchError {
@@ -30,6 +32,9 @@ impl fmt::Display for StretchError {
                     "input too short: {} samples provided, {} required",
                     provided, minimum
                 )
+            }
+            StretchError::BpmDetectionFailed(msg) => {
+                write!(f, "BPM detection failed: {}", msg)
             }
         }
     }
