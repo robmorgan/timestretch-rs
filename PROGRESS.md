@@ -132,7 +132,8 @@
 - [x] Added `set_stretch_ratio()` to PhaseVocoder for in-place ratio updates without phase reset
 - [x] Fixed StreamProcessor to use `set_stretch_ratio()` instead of recreating vocoders on ratio change (prevents clicks)
 - [x] Added 4 new unit tests: sub-bass bin calculation, low-freq preservation, high-freq independence, click-free ratio changes
-- [x] Total: 145 tests, all passing
+- [x] Fixed identity phase locking bug: was a no-op (`phases[bin] = phases[peak] + phases[bin] - phases[peak]`); now correctly uses analysis phase relationships per Laroche & Dolson (1999)
+- [x] Total: 154 tests, all passing
 - [x] Zero clippy warnings on library code
 
 ## Documentation (agent-3)
