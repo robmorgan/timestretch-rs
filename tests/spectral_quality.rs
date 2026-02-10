@@ -103,11 +103,7 @@ fn test_spectral_multi_tone_preserved() {
     let energy_700 = dft_energy_at_freq(trimmed, 700.0, sample_rate); // Between the two, should be low
 
     // Both target frequencies should have significant energy
-    assert!(
-        energy_440 > 1e-6,
-        "440Hz energy too low: {:.8}",
-        energy_440
-    );
+    assert!(energy_440 > 1e-6, "440Hz energy too low: {:.8}", energy_440);
     assert!(
         energy_1000 > 1e-6,
         "1000Hz energy too low: {:.8}",
@@ -254,7 +250,7 @@ fn test_band_energy_distribution_preserved() {
         .map(|i| {
             let t = i as f32 / sample_rate as f32;
             0.6 * (TWO_PI * 440.0 * t).sin()   // dominant mid
-                + 0.4 * (TWO_PI * 2000.0 * t).sin()  // secondary high
+                + 0.4 * (TWO_PI * 2000.0 * t).sin() // secondary high
         })
         .collect();
 
