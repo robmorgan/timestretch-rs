@@ -634,6 +634,20 @@
 - [x] Replaced `enumerate()+index` with idiomatic `zip` in `compute_band_energy()` (frequency.rs) and `analyze_frame()` (phase_vocoder.rs)
 - [x] Applied cargo fmt to fix formatting drift from other agents (beat.rs, transient.rs)
 - [x] All 311 tests passing, zero clippy warnings, cargo fmt clean
+## Streaming-Batch Parity (agent-1)
+- [x] `AsMut<[f32]>` impl for AudioBuffer — enables in-place DSP processing
+- [x] `into_data()` method — named alternative to `Vec::<f32>::from(buffer)`
+- [x] 14 new integration tests in `tests/streaming_batch_parity.rs`:
+  - Length parity (expansion, compression, identity)
+  - RMS energy preservation across 5 ratios
+  - Frequency preservation (440 Hz, two-tone)
+  - Finiteness checks, stereo channel parity
+  - Hybrid streaming vs PV-only comparison
+  - Chunk size independence (1024/4096/16384)
+  - DJ beatmatch scenario, all 5 presets, 48kHz
+- [x] 3 new unit tests: as_mut, into_data, into_data_empty
+- [x] Applied cargo fmt to beat.rs and transient.rs
+- [x] All tests passing, zero clippy/doc warnings
 
 ## TODO
 - [ ] SIMD-friendly inner loop layout
