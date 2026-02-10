@@ -601,7 +601,11 @@
   - Was using `std::mem::take()` which gave away the buffer, losing the allocation each call
   - Now clones data from scratch buffer, keeping the allocation for reuse
 - [x] Updated `find_best_candidate()` to accept pre-computed prefix sums (avoids recomputation)
-- [x] Total: 630 tests, all passing
+- [x] Pre-allocated output buffer in WSOLA for `process()` reuse:
+  - `output_buf` taken from self, grown-only, zeroed, returned to self after use
+  - Eliminates 1 large `Vec<f32>` allocation per WSOLA `process()` call
+  - Uses `std::mem::take` pattern for borrow checker compatibility
+- [x] Total: 746 tests, all passing
 - [x] Zero clippy warnings
 
 ## DJ Workflow API & Creative Effects (agent-3)
