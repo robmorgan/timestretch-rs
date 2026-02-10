@@ -32,6 +32,8 @@ pub struct Wsola {
     fft_corr_buf: Vec<Complex<f32>>,
     /// Reusable prefix-sum buffer for energy normalization.
     prefix_sq_buf: Vec<f64>,
+    /// Reusable output buffer for overlap-add accumulation.
+    output_buf: Vec<f32>,
 }
 
 impl std::fmt::Debug for Wsola {
@@ -59,6 +61,7 @@ impl Wsola {
             fft_search_buf: Vec::new(),
             fft_corr_buf: Vec::new(),
             prefix_sq_buf: Vec::new(),
+            output_buf: Vec::new(),
         }
     }
 
@@ -101,9 +104,19 @@ impl Wsola {
         // Target output length based on stretch ratio
         let target_output_len = (input.len() as f64 * self.stretch_ratio).round() as usize;
 
-        // Estimate buffer size (add margin for search variations)
+        // Take the reusable buffer out of self to avoid borrow conflicts
+        // (find_best_position borrows &mut self while output is also needed)
+        let mut output = std::mem::take(&mut self.output_buf);
+
+        // Grow if needed, zero the portion we'll use; never shrink
         let estimated_output_len = target_output_len + self.segment_size * 2;
-        let mut output = vec![0.0f32; estimated_output_len];
+        if output.len() < estimated_output_len {
+            output.resize(estimated_output_len, 0.0);
+        } else {
+            for s in &mut output[..estimated_output_len] {
+                *s = 0.0;
+            }
+        }
 
         // Copy first segment
         let first_len = self.segment_size.min(input.len());
@@ -140,10 +153,11 @@ impl Wsola {
             output_pos_f += advance_output_f;
         }
 
-        // Trim output to target length for accurate ratio
+        // Return a copy of the result; put the buffer back for reuse
         let final_len = actual_output_len.min(target_output_len);
-        output.truncate(final_len);
-        Ok(output)
+        let result = output[..final_len].to_vec();
+        self.output_buf = output;
+        Ok(result)
     }
 
     /// Finds the best matching position within the search range using FFT-accelerated
