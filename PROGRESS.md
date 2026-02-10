@@ -125,6 +125,16 @@
   - FFT size variations (256, 8192)
 - [x] Total: 137 tests, all passing
 
+## Agent-2 Phase Locking & Streaming Fixes
+- [x] Implemented sub-bass phase locking in PhaseVocoder (bins below cutoff get rigid phase propagation instead of standard deviation tracking)
+- [x] Sub-bass bin index computed from cutoff frequency and sample rate at construction time
+- [x] Identity phase locking now only applies to bins above sub-bass range
+- [x] Added `set_stretch_ratio()` to PhaseVocoder for in-place ratio updates without phase reset
+- [x] Fixed StreamProcessor to use `set_stretch_ratio()` instead of recreating vocoders on ratio change (prevents clicks)
+- [x] Added 4 new unit tests: sub-bass bin calculation, low-freq preservation, high-freq independence, click-free ratio changes
+- [x] Total: 145 tests, all passing
+- [x] Zero clippy warnings on library code
+
 ## TODO
 - [ ] Test with real audio samples
 - [ ] SIMD-friendly inner loop layout
@@ -138,3 +148,5 @@
 - WSOLA cross-correlation uses FFT for search ranges > 64 candidates, direct computation otherwise
 - WSOLA output position tracked fractionally to prevent cumulative rounding drift at all stretch ratios
 - wrap_phase uses floor-based modulo instead of while loops (more predictable for large phase values)
+- Sub-bass bins (< 120 Hz by default) use rigid phase propagation to prevent phase cancellation — critical for EDM mono-bass compatibility
+- StreamProcessor ratio changes are now phase-continuous (no vocoder recreation), enabling smooth DJ pitch fader behavior
