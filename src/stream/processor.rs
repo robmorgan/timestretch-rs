@@ -50,6 +50,8 @@ pub struct StreamProcessor {
     channel_buffers: Vec<Vec<f32>>,
     /// Reusable interleaved output buffer.
     output_scratch: Vec<f32>,
+    /// Source BPM (set when created via `from_tempo`, enables `set_tempo`).
+    source_bpm: Option<f64>,
 }
 
 impl StreamProcessor {
@@ -69,6 +71,7 @@ impl StreamProcessor {
             vocoders,
             channel_buffers,
             output_scratch: Vec::new(),
+            source_bpm: None,
         }
     }
 
@@ -190,11 +193,54 @@ impl StreamProcessor {
         std::mem::take(&mut self.output_scratch)
     }
 
+    /// Creates a streaming processor configured for BPM matching.
+    ///
+    /// This is a convenience constructor for DJ workflows. It computes the
+    /// stretch ratio as `source_bpm / target_bpm` and applies the
+    /// [`EdmPreset::DjBeatmatch`](crate::EdmPreset::DjBeatmatch) preset.
+    ///
+    /// Use [`set_tempo`](Self::set_tempo) to smoothly change the target BPM
+    /// during playback.
+    pub fn from_tempo(source_bpm: f64, target_bpm: f64, sample_rate: u32, channels: u32) -> Self {
+        let params = StretchParams::from_tempo(source_bpm, target_bpm)
+            .with_sample_rate(sample_rate)
+            .with_channels(channels)
+            .with_preset(crate::EdmPreset::DjBeatmatch);
+        let mut proc = Self::new(params);
+        proc.source_bpm = Some(source_bpm);
+        proc
+    }
+
     /// Changes the stretch ratio for subsequent processing.
     ///
     /// The ratio change is interpolated smoothly to avoid clicks.
     pub fn set_stretch_ratio(&mut self, ratio: f64) {
         self.target_ratio = ratio;
+    }
+
+    /// Changes the target BPM, smoothly adjusting the stretch ratio.
+    ///
+    /// Requires that the processor was created with [`from_tempo`](Self::from_tempo)
+    /// so that the source BPM is known. Returns `false` if the source BPM is
+    /// unknown (processor was created with [`new`](Self::new)).
+    pub fn set_tempo(&mut self, target_bpm: f64) -> bool {
+        if let Some(source) = self.source_bpm {
+            if target_bpm > 0.0 {
+                self.set_stretch_ratio(source / target_bpm);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns the source BPM if the processor was created with [`from_tempo`](Self::from_tempo).
+    pub fn source_bpm(&self) -> Option<f64> {
+        self.source_bpm
+    }
+
+    /// Returns a reference to the current parameters.
+    pub fn params(&self) -> &StretchParams {
+        &self.params
     }
 
     /// Returns the current effective stretch ratio.
@@ -417,5 +463,107 @@ mod tests {
             proc.process(&chunk),
             Err(crate::error::StretchError::NonFiniteInput)
         ));
+    }
+
+    #[test]
+    fn test_stream_processor_from_tempo() {
+        let proc = StreamProcessor::from_tempo(126.0, 128.0, 44100, 1);
+        let expected_ratio = 126.0 / 128.0;
+        assert!(
+            (proc.current_stretch_ratio() - expected_ratio).abs() < 1e-6,
+            "Expected ratio {}, got {}",
+            expected_ratio,
+            proc.current_stretch_ratio()
+        );
+        assert_eq!(proc.source_bpm(), Some(126.0));
+        assert_eq!(proc.params().sample_rate, 44100);
+        assert_eq!(
+            proc.params().preset,
+            Some(crate::core::types::EdmPreset::DjBeatmatch)
+        );
+    }
+
+    #[test]
+    fn test_stream_processor_from_tempo_stereo() {
+        let proc = StreamProcessor::from_tempo(120.0, 130.0, 48000, 2);
+        let expected_ratio = 120.0 / 130.0;
+        assert!((proc.current_stretch_ratio() - expected_ratio).abs() < 1e-6);
+        assert_eq!(proc.params().channels, crate::core::types::Channels::Stereo);
+        assert_eq!(proc.params().sample_rate, 48000);
+    }
+
+    #[test]
+    fn test_stream_processor_set_tempo() {
+        let mut proc = StreamProcessor::from_tempo(126.0, 128.0, 44100, 1);
+
+        // Change target to 130 BPM
+        assert!(proc.set_tempo(130.0));
+        // After many interpolation steps, ratio should converge to 126/130
+        for _ in 0..200 {
+            proc.interpolate_ratio();
+        }
+        let expected = 126.0 / 130.0;
+        assert!(
+            (proc.current_stretch_ratio() - expected).abs() < 0.01,
+            "Expected ratio ~{}, got {}",
+            expected,
+            proc.current_stretch_ratio()
+        );
+    }
+
+    #[test]
+    fn test_stream_processor_set_tempo_no_source_bpm() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+
+        // set_tempo should fail when source_bpm is unknown
+        assert!(!proc.set_tempo(128.0));
+        assert_eq!(proc.source_bpm(), None);
+    }
+
+    #[test]
+    fn test_stream_processor_set_tempo_invalid() {
+        let mut proc = StreamProcessor::from_tempo(126.0, 128.0, 44100, 1);
+        // Zero or negative BPM should be rejected
+        assert!(!proc.set_tempo(0.0));
+        assert!(!proc.set_tempo(-100.0));
+    }
+
+    #[test]
+    fn test_stream_processor_from_tempo_produces_output() {
+        let mut proc = StreamProcessor::from_tempo(126.0, 128.0, 44100, 1);
+        let chunk_size = 4096;
+        let signal: Vec<f32> = (0..chunk_size * 4)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+
+        let mut total_output = Vec::new();
+        for chunk in signal.chunks(chunk_size) {
+            if let Ok(out) = proc.process(chunk) {
+                total_output.extend_from_slice(&out);
+            }
+        }
+        if let Ok(out) = proc.flush() {
+            total_output.extend_from_slice(&out);
+        }
+        assert!(
+            !total_output.is_empty(),
+            "Expected output from from_tempo processor"
+        );
+    }
+
+    #[test]
+    fn test_stream_processor_params_accessor() {
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(48000)
+            .with_channels(2)
+            .with_fft_size(8192);
+        let proc = StreamProcessor::new(params);
+
+        assert_eq!(proc.params().sample_rate, 48000);
+        assert_eq!(proc.params().fft_size, 8192);
+        assert!((proc.params().stretch_ratio - 1.5).abs() < 1e-10);
     }
 }

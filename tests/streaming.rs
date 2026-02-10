@@ -611,3 +611,143 @@ fn test_streaming_with_preset() {
         ratio
     );
 }
+
+#[test]
+fn test_streaming_from_tempo_dj_workflow() {
+    // Simulate a DJ matching a 126 BPM track to 128 BPM
+    let sample_rate = 44100u32;
+    let signal = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
+    let chunk_size = 4096;
+
+    let mut processor = StreamProcessor::from_tempo(126.0, 128.0, sample_rate, 1);
+
+    // Verify initial state
+    let expected_ratio = 126.0 / 128.0;
+    assert!(
+        (processor.current_stretch_ratio() - expected_ratio).abs() < 1e-6,
+        "Initial ratio should be {}, got {}",
+        expected_ratio,
+        processor.current_stretch_ratio()
+    );
+    assert_eq!(processor.source_bpm(), Some(126.0));
+    assert_eq!(processor.params().preset, Some(EdmPreset::DjBeatmatch));
+
+    // Process audio
+    let mut total_output = Vec::new();
+    for chunk in signal.chunks(chunk_size) {
+        total_output.extend_from_slice(&processor.process(chunk).unwrap());
+    }
+    total_output.extend_from_slice(&processor.flush().unwrap());
+
+    assert!(!total_output.is_empty(), "from_tempo should produce output");
+
+    // Output ratio should be close to 126/128 ≈ 0.984
+    // Phase vocoder output length has some variance, so allow generous tolerance
+    let output_ratio = total_output.len() as f64 / signal.len() as f64;
+    assert!(
+        (output_ratio - expected_ratio).abs() < 0.3,
+        "126→128 BPM: output ratio {} too far from expected {}",
+        output_ratio,
+        expected_ratio
+    );
+}
+
+#[test]
+fn test_streaming_from_tempo_stereo() {
+    let sample_rate = 44100u32;
+    let num_frames = sample_rate as usize;
+    let mut signal = vec![0.0f32; num_frames * 2];
+    for i in 0..num_frames {
+        let t = i as f32 / sample_rate as f32;
+        signal[i * 2] = (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+        signal[i * 2 + 1] = (2.0 * std::f32::consts::PI * 880.0 * t).sin();
+    }
+
+    let mut processor = StreamProcessor::from_tempo(120.0, 125.0, sample_rate, 2);
+
+    let mut total_output = Vec::new();
+    for chunk in signal.chunks(8192) {
+        total_output.extend_from_slice(&processor.process(chunk).unwrap());
+    }
+    total_output.extend_from_slice(&processor.flush().unwrap());
+
+    assert!(!total_output.is_empty());
+    assert_eq!(total_output.len() % 2, 0, "Stereo output must be even");
+}
+
+#[test]
+fn test_streaming_set_tempo_mid_stream() {
+    // Start at 126→128 BPM, then change target to 130 BPM mid-stream
+    let sample_rate = 44100u32;
+    let signal = sine_wave(440.0, sample_rate, sample_rate as usize * 4);
+    let chunk_size = 4096;
+
+    let mut processor = StreamProcessor::from_tempo(126.0, 128.0, sample_rate, 1);
+    let mut total_output = Vec::new();
+
+    let chunks: Vec<&[f32]> = signal.chunks(chunk_size).collect();
+    let mid = chunks.len() / 2;
+
+    // Process first half at 128 BPM target
+    for chunk in &chunks[..mid] {
+        total_output.extend_from_slice(&processor.process(chunk).unwrap());
+    }
+
+    // Change target to 130 BPM
+    assert!(processor.set_tempo(130.0));
+
+    // Process second half
+    for chunk in &chunks[mid..] {
+        total_output.extend_from_slice(&processor.process(chunk).unwrap());
+    }
+    total_output.extend_from_slice(&processor.flush().unwrap());
+
+    assert!(
+        !total_output.is_empty(),
+        "Should produce output across tempo change"
+    );
+
+    // Final ratio should approach 126/130
+    let target_ratio = 126.0 / 130.0;
+    assert!(
+        (processor.current_stretch_ratio() - target_ratio).abs() < 0.05,
+        "After set_tempo(130), ratio should be ~{}, got {}",
+        target_ratio,
+        processor.current_stretch_ratio()
+    );
+}
+
+#[test]
+fn test_streaming_set_tempo_without_source_returns_false() {
+    let params = StretchParams::new(1.0)
+        .with_sample_rate(44100)
+        .with_channels(1);
+    let mut processor = StreamProcessor::new(params);
+
+    // set_tempo requires from_tempo to have been used
+    assert!(!processor.set_tempo(128.0));
+}
+
+#[test]
+fn test_streaming_from_tempo_slowdown() {
+    // Slow down: 130 BPM → 120 BPM (ratio > 1.0, output longer)
+    let sample_rate = 44100u32;
+    let signal = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
+
+    let mut processor = StreamProcessor::from_tempo(130.0, 120.0, sample_rate, 1);
+
+    let mut total_output = Vec::new();
+    for chunk in signal.chunks(4096) {
+        total_output.extend_from_slice(&processor.process(chunk).unwrap());
+    }
+    total_output.extend_from_slice(&processor.flush().unwrap());
+
+    assert!(!total_output.is_empty());
+    // 130/120 ≈ 1.083 → output should be longer
+    let output_ratio = total_output.len() as f64 / signal.len() as f64;
+    assert!(
+        output_ratio > 1.0,
+        "130→120 BPM should stretch, got ratio {}",
+        output_ratio
+    );
+}

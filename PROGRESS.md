@@ -316,6 +316,17 @@
 - [x] Total: 252+ tests, all passing
 - [x] Zero clippy warnings
 
+## Streaming DJ API & detect_beat_grid_buffer (agent-1)
+- [x] `StreamProcessor::from_tempo(source_bpm, target_bpm, sample_rate, channels)` — convenience constructor for DJ workflow, auto-applies `DjBeatmatch` preset
+- [x] `StreamProcessor::set_tempo(target_bpm)` — smoothly change target BPM during playback (requires `from_tempo`)
+- [x] `StreamProcessor::source_bpm()` — returns source BPM if set via `from_tempo`
+- [x] `StreamProcessor::params()` — read-only access to current parameters
+- [x] `detect_beat_grid_buffer(buffer)` — AudioBuffer convenience wrapper for beat grid detection (handles stereo)
+- [x] 8 new unit tests: from_tempo, from_tempo_stereo, set_tempo, set_tempo_no_source, set_tempo_invalid, from_tempo_produces_output, params_accessor, detect_beat_grid_buffer mono/stereo
+- [x] 5 new streaming integration tests: from_tempo DJ workflow, from_tempo stereo, set_tempo mid-stream, set_tempo without source, from_tempo slowdown
+- [x] Total: 263 tests (111 unit + 138 integration + 14 doc), all passing
+- [x] Zero clippy warnings, cargo fmt clean
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 

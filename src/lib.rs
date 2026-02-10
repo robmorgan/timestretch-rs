@@ -346,11 +346,34 @@ pub fn detect_beat_grid(samples: &[f32], sample_rate: u32) -> BeatGrid {
 /// Returns 0.0 if no tempo can be detected.
 pub fn detect_bpm_buffer(buffer: &AudioBuffer) -> f64 {
     let mono: Vec<f32> = if buffer.channels.count() > 1 {
-        buffer.data.iter().step_by(buffer.channels.count()).copied().collect()
+        buffer
+            .data
+            .iter()
+            .step_by(buffer.channels.count())
+            .copied()
+            .collect()
     } else {
         buffer.data.clone()
     };
     detect_bpm(&mono, buffer.sample_rate)
+}
+
+/// Detects beats in an [`AudioBuffer`] and returns a [`BeatGrid`].
+///
+/// For stereo buffers, uses the left channel for detection.
+/// This is the buffer-based equivalent of [`detect_beat_grid`].
+pub fn detect_beat_grid_buffer(buffer: &AudioBuffer) -> BeatGrid {
+    let mono: Vec<f32> = if buffer.channels.count() > 1 {
+        buffer
+            .data
+            .iter()
+            .step_by(buffer.channels.count())
+            .copied()
+            .collect()
+    } else {
+        buffer.data.clone()
+    };
+    detect_beat_grid(&mono, buffer.sample_rate)
 }
 
 /// Stretches audio from one BPM to another.
@@ -1009,5 +1032,26 @@ mod tests {
         let buffer = AudioBuffer::new(data, 44100, Channels::Stereo);
         let bpm = detect_bpm_buffer(&buffer);
         assert!(bpm == 0.0, "Silence should return 0 BPM, got {}", bpm);
+    }
+
+    #[test]
+    fn test_detect_beat_grid_buffer_mono() {
+        let buffer = AudioBuffer::from_mono(vec![0.0f32; 44100 * 4], 44100);
+        let grid = detect_beat_grid_buffer(&buffer);
+        assert_eq!(grid.sample_rate, 44100);
+    }
+
+    #[test]
+    fn test_detect_beat_grid_buffer_stereo() {
+        let data = vec![0.0f32; 44100 * 4 * 2]; // 4 seconds stereo
+        let buffer = AudioBuffer::new(data, 44100, Channels::Stereo);
+        let grid = detect_beat_grid_buffer(&buffer);
+        assert_eq!(grid.sample_rate, 44100);
+        // Silence should yield 0 BPM
+        assert!(
+            grid.bpm == 0.0,
+            "Silence should return 0 BPM, got {}",
+            grid.bpm
+        );
     }
 }
