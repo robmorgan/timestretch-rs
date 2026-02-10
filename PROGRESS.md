@@ -599,6 +599,20 @@
 - [x] Applied cargo fmt to hybrid.rs, wsola.rs, hybrid_streaming tests
 - [x] All tests passing, zero clippy warnings, zero doc warnings
 
+## Sample Rate Conversion, DJ Crossfade & BPM Workflow (agent-3)
+- [x] `AudioBuffer::resample(target_sample_rate)` — cubic interpolation sample rate conversion (e.g., 44100→48000)
+  - Per-channel independent resampling for stereo
+  - Preserves duration (1s at 44.1kHz → 1s at 48kHz)
+  - Identity for same-rate input
+- [x] `AudioBuffer::crossfade_into(other, crossfade_frames)` — raised-cosine crossfade between buffers for DJ transitions
+  - Validates matching sample rate and channel layout
+  - Clamps crossfade to shorter buffer
+  - Energy-conserving raised-cosine curve (no boosting)
+- [x] `stretch_to_bpm_wav_file(input, output, source_bpm, target_bpm, params)` — WAV file BPM stretch convenience
+- [x] Applied cargo fmt across codebase (fixed pre-existing format drift in processor.rs, hybrid.rs, wsola.rs, hybrid_streaming.rs)
+- [x] 15 new tests: resample (same rate, empty, upsample, downsample, stereo, DC preservation), crossfade (basic, zero overlap, midpoint, stereo, clamp, rate/channel mismatch, energy conservation), stretch_to_bpm_wav_file
+- [x] All 622 tests passing (299 unit + 302 integration + 21 doc), zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 

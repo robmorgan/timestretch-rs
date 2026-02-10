@@ -577,6 +577,30 @@ pub fn stretch_wav_file(
     Ok(result)
 }
 
+/// Reads a WAV file, stretches it from one BPM to another, and writes the result.
+///
+/// The output is written as 32-bit float WAV. The sample rate and channel
+/// layout are read from the input file and passed through automatically.
+/// This is a convenience function combining WAV I/O with BPM-based stretching.
+///
+/// # Errors
+///
+/// Returns [`StretchError::IoError`] if the files cannot be read or written,
+/// [`StretchError::InvalidFormat`] if the input is not a valid WAV file,
+/// [`StretchError::BpmDetectionFailed`] if either BPM value is invalid.
+pub fn stretch_to_bpm_wav_file(
+    input_path: &str,
+    output_path: &str,
+    source_bpm: f64,
+    target_bpm: f64,
+    params: &StretchParams,
+) -> Result<AudioBuffer, StretchError> {
+    let buffer = io::wav::read_wav_file(input_path)?;
+    let result = stretch_bpm_buffer(&buffer, source_bpm, target_bpm, params)?;
+    io::wav::write_wav_file_float(output_path, &result)?;
+    Ok(result)
+}
+
 /// Reads a WAV file, pitch-shifts it, and writes the result to another WAV file.
 ///
 /// The output is written as 32-bit float WAV. The sample rate and channel
@@ -1229,6 +1253,36 @@ mod tests {
         let params = StretchParams::new(1.5);
         let result = stretch_wav_file("/nonexistent/path/input.wav", "/tmp/output.wav", &params);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stretch_to_bpm_wav_file() {
+        let input: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+        let buf = AudioBuffer::from_mono(input, 44100);
+        let dir = std::env::temp_dir();
+        let in_path = dir.join("timestretch_bpm_in.wav");
+        let out_path = dir.join("timestretch_bpm_out.wav");
+        io::wav::write_wav_file_float(in_path.to_str().unwrap(), &buf).unwrap();
+
+        let params = StretchParams::new(1.0).with_channels(1);
+        let result = stretch_to_bpm_wav_file(
+            in_path.to_str().unwrap(),
+            out_path.to_str().unwrap(),
+            126.0,
+            128.0,
+            &params,
+        )
+        .unwrap();
+
+        // Ratio should be 126/128 ≈ 0.984, so output slightly shorter
+        assert!(result.data.len() < 44100);
+        assert!(!result.is_empty());
+
+        // Verify output was written
+        let reloaded = io::wav::read_wav_file(out_path.to_str().unwrap()).unwrap();
+        assert_eq!(reloaded.data.len(), result.data.len());
     }
 
     #[test]

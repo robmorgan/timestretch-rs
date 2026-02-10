@@ -573,6 +573,153 @@ impl AudioBuffer {
             channels: self.channels,
         }
     }
+
+    /// Resamples the buffer to a different sample rate using cubic interpolation.
+    ///
+    /// Each channel is resampled independently. The output buffer has the same
+    /// duration but a different number of frames matching the new sample rate.
+    /// Returns a clone if the target rate equals the current rate.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let buf = AudioBuffer::from_mono(vec![0.0; 44100], 44100); // 1 second
+    /// let resampled = buf.resample(48000);
+    /// assert_eq!(resampled.sample_rate, 48000);
+    /// assert_eq!(resampled.num_frames(), 48000); // still 1 second
+    /// ```
+    pub fn resample(&self, target_sample_rate: u32) -> Self {
+        if target_sample_rate == self.sample_rate || self.data.is_empty() {
+            return Self {
+                data: self.data.clone(),
+                sample_rate: target_sample_rate,
+                channels: self.channels,
+            };
+        }
+
+        let nc = self.channels.count();
+        let src_frames = self.num_frames();
+        let target_frames = (src_frames as f64 * target_sample_rate as f64
+            / self.sample_rate as f64)
+            .round() as usize;
+
+        if target_frames == 0 {
+            return Self {
+                data: vec![],
+                sample_rate: target_sample_rate,
+                channels: self.channels,
+            };
+        }
+
+        // Resample each channel independently using cubic interpolation
+        let mut output = Vec::with_capacity(target_frames * nc);
+        for ch in 0..nc {
+            let channel_data: Vec<f32> = self.data.iter().skip(ch).step_by(nc).copied().collect();
+            let resampled = crate::core::resample::resample_cubic(&channel_data, target_frames);
+            // Interleave: store in scratch, will interleave below
+            if ch == 0 {
+                output.resize(target_frames * nc, 0.0);
+            }
+            for (i, &s) in resampled.iter().enumerate() {
+                output[i * nc + ch] = s;
+            }
+        }
+
+        Self {
+            data: output,
+            sample_rate: target_sample_rate,
+            channels: self.channels,
+        }
+    }
+
+    /// Creates a new buffer by crossfading the end of this buffer into the
+    /// start of another buffer.
+    ///
+    /// The crossfade uses a raised-cosine curve for smooth transitions,
+    /// which is the standard technique for gapless DJ transitions. Both
+    /// buffers must have the same sample rate and channel layout.
+    ///
+    /// The resulting buffer has length `self.num_frames() + other.num_frames() - crossfade_frames`.
+    /// If `crossfade_frames` exceeds either buffer's length, it is clamped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffers have different sample rates or channel layouts.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let a = AudioBuffer::from_mono(vec![1.0; 1000], 44100);
+    /// let b = AudioBuffer::from_mono(vec![0.5; 1000], 44100);
+    /// let mixed = a.crossfade_into(&b, 100);
+    /// assert_eq!(mixed.num_frames(), 1900); // 1000 + 1000 - 100
+    /// ```
+    pub fn crossfade_into(&self, other: &AudioBuffer, crossfade_frames: usize) -> Self {
+        assert_eq!(
+            self.sample_rate, other.sample_rate,
+            "sample rate mismatch: {} vs {}",
+            self.sample_rate, other.sample_rate
+        );
+        assert_eq!(
+            self.channels, other.channels,
+            "channel layout mismatch: {:?} vs {:?}",
+            self.channels, other.channels
+        );
+
+        let nc = self.channels.count();
+        let self_frames = self.num_frames();
+        let other_frames = other.num_frames();
+        let fade_frames = crossfade_frames.min(self_frames).min(other_frames);
+
+        if fade_frames == 0 {
+            // No overlap — just concatenate
+            let mut data = self.data.clone();
+            data.extend_from_slice(&other.data);
+            return Self {
+                data,
+                sample_rate: self.sample_rate,
+                channels: self.channels,
+            };
+        }
+
+        let non_fade_self = self_frames - fade_frames;
+        let total_frames = self_frames + other_frames - fade_frames;
+        let mut data = Vec::with_capacity(total_frames * nc);
+
+        // Copy non-overlapping part of self
+        data.extend_from_slice(&self.data[..non_fade_self * nc]);
+
+        // Crossfade region: raised-cosine blend
+        for i in 0..fade_frames {
+            let t = i as f32 / fade_frames as f32;
+            let fade_out = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
+            let fade_in = 1.0 - fade_out;
+
+            let self_frame = non_fade_self + i;
+            let other_frame = i;
+
+            for ch in 0..nc {
+                let s = self.data[self_frame * nc + ch] * fade_out
+                    + other.data[other_frame * nc + ch] * fade_in;
+                data.push(s);
+            }
+        }
+
+        // Copy remaining part of other
+        if fade_frames < other_frames {
+            data.extend_from_slice(&other.data[fade_frames * nc..]);
+        }
+
+        Self {
+            data,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        }
+    }
 }
 
 /// EDM-specific presets for time stretching.
@@ -1685,5 +1832,184 @@ mod tests {
         let iter = buf.frames();
         let debug_str = format!("{:?}", iter);
         assert!(debug_str.contains("FrameIter"));
+    }
+
+    // --- resample tests ---
+
+    #[test]
+    fn test_resample_same_rate() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 2.0, 3.0], 44100);
+        let resampled = buf.resample(44100);
+        assert_eq!(resampled.data, vec![1.0, 2.0, 3.0]);
+        assert_eq!(resampled.sample_rate, 44100);
+    }
+
+    #[test]
+    fn test_resample_empty() {
+        let buf = AudioBuffer::from_mono(vec![], 44100);
+        let resampled = buf.resample(48000);
+        assert!(resampled.is_empty());
+        assert_eq!(resampled.sample_rate, 48000);
+    }
+
+    #[test]
+    fn test_resample_mono_upsample() {
+        // 1 second at 44100 → 48000
+        let n = 44100;
+        let input: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+        let buf = AudioBuffer::from_mono(input, 44100);
+        let resampled = buf.resample(48000);
+
+        assert_eq!(resampled.sample_rate, 48000);
+        assert_eq!(resampled.num_frames(), 48000);
+        assert!(resampled.is_mono());
+
+        // Duration should be preserved (~1 second)
+        assert!((resampled.duration_secs() - 1.0).abs() < 0.01);
+
+        // Output should be bounded
+        assert!(resampled.data.iter().all(|s| s.abs() <= 1.1));
+    }
+
+    #[test]
+    fn test_resample_mono_downsample() {
+        // 1 second at 48000 → 44100
+        let n = 48000;
+        let input: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48000.0).sin())
+            .collect();
+        let buf = AudioBuffer::from_mono(input, 48000);
+        let resampled = buf.resample(44100);
+
+        assert_eq!(resampled.sample_rate, 44100);
+        assert_eq!(resampled.num_frames(), 44100);
+        assert!((resampled.duration_secs() - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_resample_stereo() {
+        // Stereo: each channel is a different frequency
+        let n = 44100;
+        let mut data = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let t = i as f32 / 44100.0;
+            data.push((2.0 * std::f32::consts::PI * 440.0 * t).sin()); // left: 440 Hz
+            data.push((2.0 * std::f32::consts::PI * 880.0 * t).sin()); // right: 880 Hz
+        }
+        let buf = AudioBuffer::from_stereo(data, 44100);
+        let resampled = buf.resample(48000);
+
+        assert_eq!(resampled.sample_rate, 48000);
+        assert_eq!(resampled.num_frames(), 48000);
+        assert!(resampled.is_stereo());
+        assert_eq!(resampled.total_samples(), 48000 * 2);
+    }
+
+    #[test]
+    fn test_resample_preserves_dc() {
+        // A constant signal should remain constant after resampling
+        let buf = AudioBuffer::from_mono(vec![0.5; 1000], 44100);
+        let resampled = buf.resample(48000);
+        // Middle samples should be very close to 0.5
+        let mid = resampled.num_frames() / 2;
+        assert!(
+            (resampled.data[mid] - 0.5).abs() < 0.01,
+            "DC signal should be preserved, got {}",
+            resampled.data[mid]
+        );
+    }
+
+    // --- crossfade_into tests ---
+
+    #[test]
+    fn test_crossfade_into_basic() {
+        let a = AudioBuffer::from_mono(vec![1.0; 1000], 44100);
+        let b = AudioBuffer::from_mono(vec![0.5; 1000], 44100);
+        let mixed = a.crossfade_into(&b, 100);
+
+        assert_eq!(mixed.num_frames(), 1900); // 1000 + 1000 - 100
+        assert_eq!(mixed.sample_rate, 44100);
+        assert!(mixed.is_mono());
+    }
+
+    #[test]
+    fn test_crossfade_into_zero_overlap() {
+        let a = AudioBuffer::from_mono(vec![1.0; 10], 44100);
+        let b = AudioBuffer::from_mono(vec![0.5; 10], 44100);
+        let mixed = a.crossfade_into(&b, 0);
+
+        assert_eq!(mixed.num_frames(), 20);
+        // First 10 should be 1.0, last 10 should be 0.5
+        assert!((mixed.data[0] - 1.0).abs() < 1e-6);
+        assert!((mixed.data[10] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_crossfade_into_midpoint() {
+        // At the midpoint of the crossfade, values should be ~average
+        let a = AudioBuffer::from_mono(vec![1.0; 100], 44100);
+        let b = AudioBuffer::from_mono(vec![0.0; 100], 44100);
+        let mixed = a.crossfade_into(&b, 50);
+
+        // Midpoint of crossfade is at frame 75 (non_fade=50, fade starts there, mid at +25)
+        let mid_idx = 50 + 25;
+        assert!(
+            (mixed.data[mid_idx] - 0.5).abs() < 0.05,
+            "Crossfade midpoint should be ~0.5, got {}",
+            mixed.data[mid_idx]
+        );
+    }
+
+    #[test]
+    fn test_crossfade_into_stereo() {
+        let a = AudioBuffer::from_stereo(vec![1.0; 200], 44100);
+        let b = AudioBuffer::from_stereo(vec![0.5; 200], 44100);
+        let mixed = a.crossfade_into(&b, 10);
+
+        // 100 frames each, 10 frame overlap → 190 frames
+        assert_eq!(mixed.num_frames(), 190);
+        assert!(mixed.is_stereo());
+    }
+
+    #[test]
+    fn test_crossfade_into_clamps_to_shorter() {
+        let a = AudioBuffer::from_mono(vec![1.0; 5], 44100);
+        let b = AudioBuffer::from_mono(vec![0.5; 100], 44100);
+        let mixed = a.crossfade_into(&b, 50);
+
+        // Crossfade clamped to min(50, 5, 100) = 5
+        assert_eq!(mixed.num_frames(), 100); // 5 + 100 - 5 = 100
+    }
+
+    #[test]
+    #[should_panic(expected = "sample rate mismatch")]
+    fn test_crossfade_into_mismatched_rate() {
+        let a = AudioBuffer::from_mono(vec![1.0; 10], 44100);
+        let b = AudioBuffer::from_mono(vec![0.5; 10], 48000);
+        a.crossfade_into(&b, 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "channel layout mismatch")]
+    fn test_crossfade_into_mismatched_channels() {
+        let a = AudioBuffer::from_mono(vec![1.0; 10], 44100);
+        let b = AudioBuffer::from_stereo(vec![0.5; 20], 44100);
+        a.crossfade_into(&b, 5);
+    }
+
+    #[test]
+    fn test_crossfade_into_energy_conservation() {
+        // Crossfading equal-amplitude signals should keep amplitude in range
+        let a = AudioBuffer::from_mono(vec![0.7; 1000], 44100);
+        let b = AudioBuffer::from_mono(vec![0.7; 1000], 44100);
+        let mixed = a.crossfade_into(&b, 200);
+
+        // All samples should be close to 0.7 (no boosting)
+        assert!(
+            mixed.data.iter().all(|&s| (s - 0.7).abs() < 0.01),
+            "Equal-amplitude crossfade should preserve level"
+        );
     }
 }
