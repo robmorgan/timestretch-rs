@@ -1,0 +1,29 @@
+[package]
+name = "timestretch"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust audio time stretching library optimized for EDM"
+license = "MIT"
+rust-version = "1.65"
+keywords = ["audio", "dsp", "time-stretching", "phase-vocoder", "edm"]
+categories = ["multimedia::audio", "algorithms"]
+readme = "README.md"
+
+[dependencies]
+rustfft = "6"
+
+[[bin]]
+name = "timestretch-cli"
+path = "src/cli.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "generate_test_audio"
+path = "test_audio/generate.rs"
+
+[features]
+cli = []
+
+[profile.release]
+opt-level = 3
+lto = true

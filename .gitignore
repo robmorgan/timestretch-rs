@@ -1,2 +1,6 @@
 .metamorph/
 agent_logs/
+/target
+Cargo.lock
+*.wav
+*.raw
