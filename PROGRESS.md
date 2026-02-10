@@ -518,6 +518,16 @@
 - [x] Added verbose output for window type and normalize settings
 - [x] 6 unit tests for window parsing (hann, blackman-harris, bh alias, kaiser default, kaiser:beta, kaiser fractional)
 
+### Twelfth pass (agent-5)
+- [x] Extracted `window_and_transform()`, `split_bands()`, `normalize_band_split()` from `separate_sub_bass()` in hybrid.rs (was 91 lines, now 48)
+- [x] Replaced indexed band summation loop with `zip+chain+map` iterator in hybrid.rs `process_band_split()`
+- [x] Idiomatic `chunks_exact(nc).map()` in `mix_to_mono()` and `flat_map(|&s| [s, s])` in `to_stereo()` (types.rs)
+- [x] Replaced indexed `interleave()` loop with `flat_map` iterator, removed unused `num_channels` parameter (lib.rs)
+- [x] Idiomatic `chunks_exact` iterators in WAV converters: `convert_pcm_16bit()`, `convert_pcm_24bit()`, `convert_ieee_float_32bit()` (wav.rs)
+- [x] Idiomatic `range+map+collect` in `compute_bin_weights()` (transient.rs)
+- [x] Removed dead `read_i16_le()` helper (wav.rs)
+- [x] All 529 tests passing (205 unit + 302 integration + 22 doc), zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
