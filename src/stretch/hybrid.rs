@@ -134,16 +134,21 @@ impl HybridStretcher {
             self.params.transient_sensitivity,
         );
 
-        // Step 1b: Optionally detect beat grid and merge with transient onsets
-        let onsets = if self.params.beat_aware && input.len() >= MIN_SAMPLES_FOR_BEAT_DETECTION {
+        // Step 1b: Optionally detect beat grid and merge with transient onsets.
+        // Use a reference to avoid cloning when beat-aware is disabled.
+        let merged;
+        let onsets: &[usize] = if self.params.beat_aware
+            && input.len() >= MIN_SAMPLES_FOR_BEAT_DETECTION
+        {
             let grid = detect_beats(input, self.params.sample_rate);
-            merge_onsets_and_beats(&transients.onsets, &grid.beats, input.len())
+            merged = merge_onsets_and_beats(&transients.onsets, &grid.beats, input.len());
+            &merged
         } else {
-            transients.onsets.clone()
+            &transients.onsets
         };
 
         // Step 2: Segment audio at transient/beat boundaries
-        let segments = self.segment_audio(input.len(), &onsets);
+        let segments = self.segment_audio(input.len(), onsets);
 
         // Step 3: Process each segment with appropriate algorithm
         // Reuse a single PV instance for tonal segments (avoids FFT planner recreation)
@@ -384,7 +389,8 @@ fn merge_onsets_and_beats(onsets: &[usize], beats: &[usize], input_len: usize) -
     /// Positions closer than this are considered duplicates.
     const DEDUP_DISTANCE: usize = 512;
 
-    let mut merged: Vec<usize> = onsets.to_vec();
+    let mut merged: Vec<usize> = Vec::with_capacity(onsets.len() + beats.len());
+    merged.extend_from_slice(onsets);
 
     // Add beat positions that aren't too close to existing transient onsets
     for &beat in beats {
