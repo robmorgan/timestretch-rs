@@ -13,6 +13,56 @@ pub struct TransientMap {
     pub hop_size: usize,
 }
 
+/// Computes the spectral flux for each frame of a mono audio signal.
+///
+/// Returns a vector of flux values, one per analysis frame. Flux is weighted
+/// by frequency band to emphasize the 2-8 kHz transient range.
+fn compute_spectral_flux(
+    samples: &[f32],
+    sample_rate: u32,
+    fft_size: usize,
+    hop_size: usize,
+) -> Vec<f32> {
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(fft_size);
+
+    let window = crate::core::window::generate_window(
+        crate::core::window::WindowType::Hann,
+        fft_size,
+    );
+
+    let bin_weights = compute_bin_weights(fft_size, sample_rate);
+    let num_bins = fft_size / 2 + 1;
+    let num_frames = (samples.len() - fft_size) / hop_size + 1;
+    let mut prev_magnitude = vec![0.0f32; num_bins];
+    let mut flux_values = Vec::with_capacity(num_frames);
+    let mut fft_buffer = vec![Complex::new(0.0f32, 0.0f32); fft_size];
+
+    for frame_idx in 0..num_frames {
+        let start = frame_idx * hop_size;
+
+        for i in 0..fft_size {
+            fft_buffer[i] = Complex::new(samples[start + i] * window[i], 0.0);
+        }
+
+        fft.process(&mut fft_buffer);
+
+        let mut flux = 0.0f32;
+        for bin in 0..num_bins {
+            let mag = fft_buffer[bin].norm();
+            let diff = mag - prev_magnitude[bin];
+            if diff > 0.0 {
+                flux += diff * bin_weights[bin];
+            }
+            prev_magnitude[bin] = mag;
+        }
+
+        flux_values.push(flux);
+    }
+
+    flux_values
+}
+
 /// Detects transients in a mono audio signal using spectral flux.
 ///
 /// Uses high-frequency weighted spectral flux with adaptive thresholding,
@@ -32,48 +82,7 @@ pub fn detect_transients(
         };
     }
 
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(fft_size);
-
-    let window = crate::core::window::generate_window(
-        crate::core::window::WindowType::Hann,
-        fft_size,
-    );
-
-    // Frequency bin weights: emphasize 2-8 kHz range for transient detection
-    let bin_weights = compute_bin_weights(fft_size, sample_rate);
-
-    let num_frames = (samples.len() - fft_size) / hop_size + 1;
-    let mut prev_magnitude = vec![0.0f32; fft_size / 2 + 1];
-    let mut flux_values = Vec::with_capacity(num_frames);
-    let mut fft_buffer = vec![Complex::new(0.0f32, 0.0f32); fft_size];
-
-    for frame_idx in 0..num_frames {
-        let start = frame_idx * hop_size;
-
-        // Window the frame
-        for i in 0..fft_size {
-            fft_buffer[i] = Complex::new(samples[start + i] * window[i], 0.0);
-        }
-
-        // FFT
-        fft.process(&mut fft_buffer);
-
-        // Compute weighted spectral flux (only positive differences)
-        let mut flux = 0.0f32;
-        for bin in 0..fft_size / 2 + 1 {
-            let mag = fft_buffer[bin].norm();
-            let diff = mag - prev_magnitude[bin];
-            if diff > 0.0 {
-                flux += diff * bin_weights[bin];
-            }
-            prev_magnitude[bin] = mag;
-        }
-
-        flux_values.push(flux);
-    }
-
-    // Adaptive thresholding
+    let flux_values = compute_spectral_flux(samples, sample_rate, fft_size, hop_size);
     let onsets = adaptive_threshold(&flux_values, sensitivity, hop_size);
 
     TransientMap {

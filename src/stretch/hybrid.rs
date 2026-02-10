@@ -99,8 +99,7 @@ impl HybridStretcher {
         pv: &mut PhaseVocoder,
     ) -> Vec<f32> {
         if seg_data.len() < 256 {
-            let out_len =
-                (seg_data.len() as f64 * self.params.stretch_ratio).round() as usize;
+            let out_len = self.params.output_length(seg_data.len());
             return crate::core::resample::resample_linear(seg_data, out_len.max(1));
         }
 
@@ -113,8 +112,7 @@ impl HybridStretcher {
         };
 
         result.unwrap_or_else(|_| {
-            let out_len =
-                (seg_data.len() as f64 * self.params.stretch_ratio).round() as usize;
+            let out_len = self.params.output_length(seg_data.len());
             crate::core::resample::resample_linear(seg_data, out_len.max(1))
         })
     }

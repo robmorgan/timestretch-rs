@@ -8,37 +8,38 @@ use std::io::{Read, Write};
 const WAV_FORMAT_PCM: u16 = 1;
 const WAV_FORMAT_IEEE_FLOAT: u16 = 3;
 
-/// Reads a WAV file from a byte slice.
-pub fn read_wav(data: &[u8]) -> Result<AudioBuffer, StretchError> {
-    let mut cursor = 0;
+/// Parsed WAV format and data chunk info.
+struct WavChunks<'a> {
+    format_code: u16,
+    num_channels: u16,
+    sample_rate: u32,
+    bits_per_sample: u16,
+    audio_data: &'a [u8],
+}
 
-    // RIFF header
+/// Validates the RIFF/WAVE header and returns the offset past it.
+fn validate_riff_header(data: &[u8]) -> Result<usize, StretchError> {
     if data.len() < 44 {
         return Err(StretchError::InvalidFormat(
             "WAV file too short".to_string(),
         ));
     }
-
-    let riff = &data[0..4];
-    if riff != b"RIFF" {
+    if &data[0..4] != b"RIFF" {
         return Err(StretchError::InvalidFormat(
             "Missing RIFF header".to_string(),
         ));
     }
-    cursor += 4;
-
-    let _file_size = read_u32_le(data, cursor);
-    cursor += 4;
-
-    let wave = &data[cursor..cursor + 4];
-    if wave != b"WAVE" {
+    if &data[8..12] != b"WAVE" {
         return Err(StretchError::InvalidFormat(
             "Missing WAVE identifier".to_string(),
         ));
     }
-    cursor += 4;
+    Ok(12)
+}
 
-    // Find fmt and data chunks
+/// Iterates WAV chunks to find fmt and data, returning parsed info.
+fn parse_wav_chunks(data: &[u8], start: usize) -> Result<WavChunks<'_>, StretchError> {
+    let mut cursor = start;
     let mut format_code: u16 = 0;
     let mut num_channels: u16 = 0;
     let mut sample_rate: u32 = 0;
@@ -64,7 +65,6 @@ pub fn read_wav(data: &[u8]) -> Result<AudioBuffer, StretchError> {
             bits_per_sample = read_u16_le(data, cursor + 14);
         } else if chunk_id == b"data" {
             if cursor + chunk_size > data.len() {
-                // Use whatever data is available
                 audio_data = &data[cursor..];
             } else {
                 audio_data = &data[cursor..cursor + chunk_size];
@@ -84,19 +84,22 @@ pub fn read_wav(data: &[u8]) -> Result<AudioBuffer, StretchError> {
         ));
     }
 
-    let channels = match num_channels {
-        1 => Channels::Mono,
-        2 => Channels::Stereo,
-        n => {
-            return Err(StretchError::InvalidFormat(format!(
-                "Unsupported channel count: {}",
-                n
-            )))
-        }
-    };
+    Ok(WavChunks {
+        format_code,
+        num_channels,
+        sample_rate,
+        bits_per_sample,
+        audio_data,
+    })
+}
 
-    // Convert audio data to f32 samples
-    let samples: Vec<Sample> = match (format_code, bits_per_sample) {
+/// Converts raw audio bytes to f32 samples based on format and bit depth.
+fn convert_samples(
+    audio_data: &[u8],
+    format_code: u16,
+    bits_per_sample: u16,
+) -> Result<Vec<Sample>, StretchError> {
+    match (format_code, bits_per_sample) {
         (WAV_FORMAT_PCM, 16) => {
             let num_samples = audio_data.len() / 2;
             let mut result = Vec::with_capacity(num_samples);
@@ -104,7 +107,7 @@ pub fn read_wav(data: &[u8]) -> Result<AudioBuffer, StretchError> {
                 let raw = read_i16_le(audio_data, i * 2);
                 result.push(raw as f32 / 32768.0);
             }
-            result
+            Ok(result)
         }
         (WAV_FORMAT_PCM, 24) => {
             let num_samples = audio_data.len() / 3;
@@ -122,7 +125,7 @@ pub fn read_wav(data: &[u8]) -> Result<AudioBuffer, StretchError> {
                 };
                 result.push(raw as f32 / 8388608.0);
             }
-            result
+            Ok(result)
         }
         (WAV_FORMAT_IEEE_FLOAT, 32) => {
             let num_samples = audio_data.len() / 4;
@@ -136,26 +139,46 @@ pub fn read_wav(data: &[u8]) -> Result<AudioBuffer, StretchError> {
                 ];
                 result.push(f32::from_le_bytes(bytes));
             }
-            result
+            Ok(result)
         }
-        (fmt, bits) => {
+        (fmt, bits) => Err(StretchError::InvalidFormat(format!(
+            "Unsupported WAV format: code={}, bits={}",
+            fmt, bits
+        ))),
+    }
+}
+
+/// Reads a WAV file from a byte slice.
+pub fn read_wav(data: &[u8]) -> Result<AudioBuffer, StretchError> {
+    let cursor = validate_riff_header(data)?;
+    let chunks = parse_wav_chunks(data, cursor)?;
+
+    let channels = match chunks.num_channels {
+        1 => Channels::Mono,
+        2 => Channels::Stereo,
+        n => {
             return Err(StretchError::InvalidFormat(format!(
-                "Unsupported WAV format: code={}, bits={}",
-                fmt, bits
+                "Unsupported channel count: {}",
+                n
             )))
         }
     };
 
-    Ok(AudioBuffer::new(samples, sample_rate, channels))
+    let samples = convert_samples(chunks.audio_data, chunks.format_code, chunks.bits_per_sample)?;
+    Ok(AudioBuffer::new(samples, chunks.sample_rate, channels))
+}
+
+/// Creates an I/O error with the file path prepended to the message.
+fn io_error(path: &str, err: std::io::Error) -> StretchError {
+    StretchError::IoError(format!("{}: {}", path, err))
 }
 
 /// Reads a WAV file from disk.
 pub fn read_wav_file(path: &str) -> Result<AudioBuffer, StretchError> {
-    let mut file =
-        std::fs::File::open(path).map_err(|e| StretchError::IoError(format!("{}: {}", path, e)))?;
+    let mut file = std::fs::File::open(path).map_err(|e| io_error(path, e))?;
     let mut data = Vec::new();
     file.read_to_end(&mut data)
-        .map_err(|e| StretchError::IoError(format!("{}: {}", path, e)))?;
+        .map_err(|e| io_error(path, e))?;
     read_wav(&data)
 }
 
@@ -224,24 +247,21 @@ pub fn write_wav_float(buffer: &AudioBuffer) -> Vec<u8> {
     out
 }
 
+/// Writes WAV data to disk.
+fn write_wav_file(path: &str, data: &[u8]) -> Result<(), StretchError> {
+    let mut file = std::fs::File::create(path).map_err(|e| io_error(path, e))?;
+    file.write_all(data).map_err(|e| io_error(path, e))?;
+    Ok(())
+}
+
 /// Writes a WAV file to disk (16-bit PCM).
 pub fn write_wav_file_16bit(path: &str, buffer: &AudioBuffer) -> Result<(), StretchError> {
-    let data = write_wav_16bit(buffer);
-    let mut file = std::fs::File::create(path)
-        .map_err(|e| StretchError::IoError(format!("{}: {}", path, e)))?;
-    file.write_all(&data)
-        .map_err(|e| StretchError::IoError(format!("{}: {}", path, e)))?;
-    Ok(())
+    write_wav_file(path, &write_wav_16bit(buffer))
 }
 
 /// Writes a WAV file to disk (32-bit float).
 pub fn write_wav_file_float(path: &str, buffer: &AudioBuffer) -> Result<(), StretchError> {
-    let data = write_wav_float(buffer);
-    let mut file = std::fs::File::create(path)
-        .map_err(|e| StretchError::IoError(format!("{}: {}", path, e)))?;
-    file.write_all(&data)
-        .map_err(|e| StretchError::IoError(format!("{}: {}", path, e)))?;
-    Ok(())
+    write_wav_file(path, &write_wav_float(buffer))
 }
 
 #[inline]

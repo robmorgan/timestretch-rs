@@ -162,7 +162,17 @@ impl StretchParams {
         }
     }
 
+    /// Computes the expected output length for a given input length.
+    #[inline]
+    pub fn output_length(&self, input_len: usize) -> usize {
+        (input_len as f64 * self.stretch_ratio).round() as usize
+    }
+
     /// Sets the sample rate.
+    ///
+    /// Note: this also recalculates WSOLA segment size (~20ms) and search range
+    /// (~10ms) for the new sample rate. Call `with_wsola_segment_size()` or
+    /// `with_wsola_search_range()` after this method to override those values.
     pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
         self.sample_rate = sample_rate;
         // Adjust WSOLA params for sample rate
@@ -181,7 +191,9 @@ impl StretchParams {
         self
     }
 
-    /// Sets the EDM preset, overriding relevant parameters.
+    /// Sets the EDM preset, overriding FFT size, hop size, transient sensitivity,
+    /// and WSOLA search range. Call this before other builder methods if you want
+    /// to customize individual parameters after applying a preset.
     pub fn with_preset(mut self, preset: EdmPreset) -> Self {
         self.preset = Some(preset);
         match preset {

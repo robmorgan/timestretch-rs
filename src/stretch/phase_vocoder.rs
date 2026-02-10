@@ -18,9 +18,6 @@ pub struct PhaseVocoder {
     phase_accum: Vec<f32>,
     /// Previous analysis phase.
     prev_phase: Vec<f32>,
-    /// Sub-bass cutoff bin for phase locking (reserved for future per-band processing).
-    #[allow(dead_code)]
-    sub_bass_bin: usize,
     /// FFT planner (cached).
     planner: FftPlanner<f32>,
     /// Pre-computed expected phase advance per bin.
@@ -41,14 +38,12 @@ impl PhaseVocoder {
         fft_size: usize,
         hop_analysis: usize,
         stretch_ratio: f64,
-        sample_rate: u32,
-        sub_bass_cutoff: f32,
+        _sample_rate: u32,
+        _sub_bass_cutoff: f32,
     ) -> Self {
         let hop_synthesis = (hop_analysis as f64 * stretch_ratio).round() as usize;
         let window = generate_window(WindowType::Hann, fft_size);
         let num_bins = fft_size / 2 + 1;
-        let sub_bass_bin =
-            (sub_bass_cutoff * fft_size as f32 / sample_rate as f32).round() as usize;
 
         let expected_phase_advance: Vec<f32> = (0..num_bins)
             .map(|bin| TWO_PI * bin as f32 * hop_analysis as f32 / fft_size as f32)
@@ -61,7 +56,6 @@ impl PhaseVocoder {
             window,
             phase_accum: vec![0.0; num_bins],
             prev_phase: vec![0.0; num_bins],
-            sub_bass_bin: sub_bass_bin.min(num_bins),
             planner: FftPlanner::new(),
             expected_phase_advance,
             fft_buffer: vec![Complex::new(0.0, 0.0); fft_size],
