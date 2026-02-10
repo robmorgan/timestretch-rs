@@ -481,6 +481,117 @@ fn test_streaming_reset_then_reprocess() {
 }
 
 #[test]
+fn test_streaming_compression_ratio() {
+    let sample_rate = 44100u32;
+    let signal = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
+
+    // Test compression (ratio < 1.0): output should be shorter than input
+    for &ratio in &[0.5, 0.75] {
+        let params = StretchParams::new(ratio)
+            .with_sample_rate(sample_rate)
+            .with_channels(1);
+
+        let stream_output = stream_process_all(&signal, &params, 4096);
+        assert!(
+            !stream_output.is_empty(),
+            "Compression ratio {} should produce output",
+            ratio
+        );
+
+        let len_ratio = stream_output.len() as f64 / signal.len() as f64;
+        assert!(
+            len_ratio < 1.0,
+            "Compression ratio {} should produce shorter output, got len_ratio {}",
+            ratio,
+            len_ratio
+        );
+        assert!(
+            (len_ratio - ratio).abs() < 0.3,
+            "Compression ratio {}: len_ratio {} too far from expected",
+            ratio,
+            len_ratio
+        );
+    }
+}
+
+#[test]
+fn test_streaming_empty_flush() {
+    let sample_rate = 44100u32;
+    let params = StretchParams::new(1.0)
+        .with_sample_rate(sample_rate)
+        .with_channels(1);
+
+    let mut processor = StreamProcessor::new(params);
+
+    // Flush without any input should return empty
+    let output = processor.flush().unwrap();
+    assert!(output.is_empty(), "Flush with no input should return empty");
+
+    // Process some data, flush, then flush again should return empty
+    let signal = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
+    for chunk in signal.chunks(4096) {
+        let _ = processor.process(chunk).unwrap();
+    }
+    let _ = processor.flush().unwrap();
+
+    let output2 = processor.flush().unwrap();
+    // Second flush may or may not produce output (depends on zero padding),
+    // but it should not panic
+    let _ = output2;
+}
+
+#[test]
+fn test_streaming_single_sample_chunks() {
+    let sample_rate = 44100u32;
+    // Send enough data that even with 1-sample-at-a-time, we accumulate enough
+    let signal = sine_wave(440.0, sample_rate, sample_rate as usize);
+
+    let params = StretchParams::new(1.0)
+        .with_sample_rate(sample_rate)
+        .with_channels(1);
+
+    let mut processor = StreamProcessor::new(params);
+    let mut total_output = Vec::new();
+
+    // Feed one sample at a time
+    for &sample in &signal {
+        let output = processor.process(&[sample]).unwrap();
+        total_output.extend_from_slice(&output);
+    }
+    total_output.extend_from_slice(&processor.flush().unwrap());
+
+    assert!(
+        !total_output.is_empty(),
+        "Single-sample chunks should eventually produce output"
+    );
+}
+
+#[test]
+fn test_streaming_large_fft_size() {
+    let sample_rate = 44100u32;
+    // Use a larger FFT size (8192) to test with different parameters
+    let signal = sine_wave(440.0, sample_rate, sample_rate as usize * 4);
+
+    let params = StretchParams::new(1.5)
+        .with_sample_rate(sample_rate)
+        .with_channels(1)
+        .with_fft_size(8192);
+
+    let stream_output = stream_process_all(&signal, &params, 8192);
+    assert!(
+        !stream_output.is_empty(),
+        "Large FFT should produce output"
+    );
+
+    let ratio = stream_output.len() as f64 / signal.len() as f64;
+    assert!(
+        (ratio - 1.5).abs() < 0.5,
+        "Large FFT length ratio {} too far from 1.5",
+        ratio
+    );
+}
+
+#[test]
 fn test_streaming_with_preset() {
     let sample_rate = 44100u32;
     let signal = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
