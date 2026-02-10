@@ -490,6 +490,13 @@
 - [x] Removed dead `ws > WINDOW_SUM_EPSILON` guard in phase_vocoder `normalize_output()` — ws is already clamped above epsilon by `max()` on previous line
 - [x] All 190+ unit tests passing, zero clippy warnings
 
+## Buffer Workflow Integration Tests (agent-1)
+- [x] 18 integration tests in tests/buffer_workflows.rs
+- [x] Tests cover: slice+stretch, concatenate+stretch, normalize+stretch, fade+stretch,
+      trim_silence+stretch, peak/rms metrics, frames iterator, AsRef interop, PartialEq
+- [x] Complex workflow tests: DJ crossfade, sample chop (slice→stretch→normalize→fade→concatenate)
+- [x] All tests passing, zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
