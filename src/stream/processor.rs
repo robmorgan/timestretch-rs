@@ -88,9 +88,12 @@ impl StreamProcessor {
             return Ok(vec![]);
         }
 
-        // Recreate vocoders if ratio has changed
+        // Update vocoders' stretch ratio in-place to preserve phase state.
+        // Recreating vocoders would reset phase accumulators and cause clicks.
         if (self.current_ratio - self.params.stretch_ratio).abs() > 0.0001 {
-            self.vocoders = Self::create_vocoders(&self.params, self.current_ratio);
+            for voc in &mut self.vocoders {
+                voc.set_stretch_ratio(self.current_ratio);
+            }
         }
 
         // Process each channel using persistent vocoders and reusable buffers
@@ -285,5 +288,65 @@ mod tests {
         proc.reset();
 
         assert!((proc.current_stretch_ratio() - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_stream_processor_ratio_change_no_clicks() {
+        // Feed a sine wave, change ratio mid-stream, and verify no
+        // sudden spikes (clicks) in the output at the ratio transition.
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+
+        let mut proc = StreamProcessor::new(params);
+        let chunk_size = 4096 * 2;
+        let signal: Vec<f32> = (0..chunk_size * 6)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+
+        let mut all_output = Vec::new();
+
+        // Process first half at ratio 1.0
+        for chunk in signal[..chunk_size * 3].chunks(chunk_size) {
+            if let Ok(out) = proc.process(chunk) {
+                all_output.extend_from_slice(&out);
+            }
+        }
+
+        // Change ratio to 1.05 (DJ pitch adjustment)
+        proc.set_stretch_ratio(1.05);
+        // Force interpolation to converge
+        for _ in 0..50 {
+            proc.interpolate_ratio();
+        }
+
+        // Process second half
+        for chunk in signal[chunk_size * 3..].chunks(chunk_size) {
+            if let Ok(out) = proc.process(chunk) {
+                all_output.extend_from_slice(&out);
+            }
+        }
+
+        if all_output.len() < 100 {
+            return; // Not enough output to analyze
+        }
+
+        // Check for clicks: a click would appear as a sudden jump between
+        // consecutive samples that far exceeds normal sine wave behavior.
+        // Normal sine at 440 Hz changes by max ~0.06 per sample at 44100 Hz.
+        let mut max_diff = 0.0f32;
+        for i in 1..all_output.len() {
+            let diff = (all_output[i] - all_output[i - 1]).abs();
+            max_diff = max_diff.max(diff);
+        }
+
+        // A sine wave at 440 Hz has max sample-to-sample diff of about
+        // 2*pi*440/44100 ≈ 0.063. Allow up to 0.5 for phase vocoder artifacts,
+        // but clicks would show as 1.0+ jumps.
+        assert!(
+            max_diff < 0.8,
+            "Detected likely click artifact: max sample diff = {} (expected < 0.8)",
+            max_diff
+        );
     }
 }

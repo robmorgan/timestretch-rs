@@ -1,4 +1,4 @@
-//! Phase vocoder time stretching with identity phase locking.
+//! Phase vocoder time stretching with identity phase locking and sub-bass phase locking.
 
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::f32::consts::PI;
@@ -97,6 +97,16 @@ impl PhaseVocoder {
     #[inline]
     pub fn sub_bass_bin(&self) -> usize {
         self.sub_bass_bin
+    }
+
+    /// Updates the stretch ratio without resetting phase state.
+    ///
+    /// This recalculates the synthesis hop size from the new ratio while
+    /// preserving all accumulated phase information. Use this for smooth
+    /// real-time ratio changes that avoid clicks and discontinuities.
+    #[inline]
+    pub fn set_stretch_ratio(&mut self, stretch_ratio: f64) {
+        self.hop_synthesis = (self.hop_analysis as f64 * stretch_ratio).round() as usize;
     }
 
     /// Stretches a mono audio signal using phase vocoder with identity phase locking.
