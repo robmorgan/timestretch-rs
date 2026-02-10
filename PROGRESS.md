@@ -79,10 +79,23 @@
 - [x] Total: 100 tests, all passing
 - [x] Zero clippy warnings
 
+## Streaming Fix & Equivalence Tests (agent-3)
+- [x] Fixed StreamProcessor overlap handling: drain processed input correctly instead of re-processing overlap, which caused output to be ~2x expected length
+- [x] Added 8 new streaming tests (14 total, was 6):
+  - Streaming vs batch output length comparison (multiple ratios: 0.75, 1.0, 1.25, 1.5, 2.0)
+  - Streaming vs batch RMS energy preservation
+  - Streaming vs batch frequency content preservation (440Hz DFT check)
+  - Chunk size consistency (512, 4096, 16384 produce similar RMS)
+  - Stereo streaming vs batch equivalence (channel separation verified)
+  - Streaming with EDM preset (DjBeatmatch)
+  - Flush produces remaining output
+  - Reset-then-reprocess consistency
+- [x] Total: 109 tests, all passing
+- [x] Zero clippy warnings
+
 ## TODO
 - [ ] Test with real audio samples
 - [ ] SIMD-friendly inner loop layout
-- [ ] Further streaming optimization (overlap handling between chunks)
 - [ ] Improve documentation (rustdoc, README examples)
 
 ## Notes
