@@ -442,6 +442,17 @@
 - [x] 9 new unit tests (PartialEq, AsRef, frames iterator, exact size)
 - [x] All 335+ tests passing, zero clippy warnings, zero doc warnings
 
+## Audio Analysis, Fades & IntoIterator (agent-1)
+- [x] `impl IntoIterator for &AudioBuffer` — enables `for frame in &buf` syntax
+- [x] `AudioBuffer::peak()` — peak absolute amplitude
+- [x] `AudioBuffer::rms()` — root mean square amplitude (f64 precision)
+- [x] `AudioBuffer::fade_in(duration_frames)` — linear fade-in
+- [x] `AudioBuffer::fade_out(duration_frames)` — linear fade-out
+- [x] Both fades work correctly with mono and stereo, handle edge cases
+- [x] Applied cargo fmt to frequency.rs (other agents' code)
+- [x] 14 new unit tests (IntoIterator, peak, RMS, fade in/out, stereo fades)
+- [x] All 190+ unit tests passing, zero clippy/doc warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
