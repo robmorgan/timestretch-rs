@@ -557,6 +557,16 @@
 - [x] Total: 550+ tests, all passing
 - [x] Zero clippy warnings
 
+## Algorithm Internals Tests (agent-4)
+- [x] 87 new unit tests covering previously untested internal functions
+- [x] Phase vocoder (18 tests): identity_phase_lock (no peaks, single peak, multiple peaks, early returns), normalize_output (uniform/low/zero window sum), wrap_phase boundaries, set_stretch_ratio, sub_bass_bin clamping, conjugate symmetry, buffer reuse
+- [x] WSOLA (18 tests): normalized_cross_correlation edge cases (zero energy, orthogonal, empty, mismatched), FFT cross-correlation (self-correlation, shifted signal), find_best_candidate (identical signals, zero-energy search), FFT vs direct threshold boundary, overlap_add (crossfade linearity, bounds clamping, truncation), invalid ratio error
+- [x] Transient detection (13 tests): bin_weights all 5 bands verified + 48kHz, adaptive_threshold (empty, below threshold, single spike, sensitivity, min gap, separated spikes), spectral_flux (silence, tone onset, impulse)
+- [x] Beat detection (14 tests): beat_interval_samples, snap_to_grid edge cases (empty, before/after/equidistant/exact), estimate_bpm octave normalization (halving, doubling, in-range, outlier), quantize_to_grid edge cases
+- [x] Hybrid stretcher (24 tests): segment_audio (no onsets, single onset, onset at 0, near end, overlapping), crossfade (empty, single, zero, oversized, raised-cosine midpoint, three segments), merge dedup boundary (511 vs 512), sub_bass short input fallback, very short segment fallback
+- [x] Total: 580 tests (278 unit + 302 integration), all passing
+- [x] Zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
