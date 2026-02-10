@@ -1,6 +1,7 @@
 //! WSOLA (Waveform Similarity Overlap-Add) time stretching.
 
 use crate::error::StretchError;
+use rustfft::{num_complex::Complex, FftPlanner};
 
 /// WSOLA (Waveform Similarity Overlap-Add) time stretching.
 ///
@@ -12,6 +13,7 @@ pub struct Wsola {
     overlap_size: usize,
     search_range: usize,
     stretch_ratio: f64,
+    planner: FftPlanner<f32>,
 }
 
 impl Wsola {
@@ -23,6 +25,7 @@ impl Wsola {
             overlap_size,
             search_range,
             stretch_ratio,
+            planner: FftPlanner::new(),
         }
     }
 
@@ -45,7 +48,7 @@ impl Wsola {
     }
 
     /// Stretches a mono audio signal using WSOLA.
-    pub fn process(&self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
+    pub fn process(&mut self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
         if input.len() < self.segment_size {
             return Err(StretchError::InputTooShort {
                 provided: input.len(),
@@ -54,9 +57,9 @@ impl Wsola {
         }
 
         let advance_input = self.segment_size - self.overlap_size;
-        let advance_output = (advance_input as f64 * self.stretch_ratio).round() as usize;
+        let advance_output_f = advance_input as f64 * self.stretch_ratio;
 
-        if advance_output == 0 {
+        if advance_output_f < 1.0 {
             return Err(StretchError::InvalidRatio(
                 "Stretch ratio too small for segment size".to_string(),
             ));
@@ -74,11 +77,19 @@ impl Wsola {
         output[..first_len].copy_from_slice(&input[..first_len]);
 
         let mut input_pos: f64 = advance_input as f64;
-        let mut output_pos = advance_output;
+        // Track output position fractionally to avoid cumulative rounding error
+        let mut output_pos_f: f64 = advance_output_f;
         let mut actual_output_len = first_len;
 
         while (input_pos as usize) + self.segment_size <= input.len() {
             let nominal_pos = input_pos as usize;
+            let output_pos = output_pos_f.round() as usize;
+
+            // Ensure we have room in the output buffer
+            let needed = output_pos + self.segment_size;
+            if needed > output.len() {
+                output.resize(needed, 0.0);
+            }
 
             // Search for best matching position around nominal position
             let best_pos = self.find_best_position(
@@ -89,19 +100,17 @@ impl Wsola {
             );
 
             // Overlap-add with cross-fade
-            if output_pos + self.segment_size <= output.len() {
-                self.overlap_add(
-                    input,
-                    &mut output,
-                    best_pos,
-                    output_pos,
-                );
-                actual_output_len =
-                    (output_pos + self.segment_size).max(actual_output_len);
-            }
+            self.overlap_add(
+                input,
+                &mut output,
+                best_pos,
+                output_pos,
+            );
+            actual_output_len =
+                (output_pos + self.segment_size).max(actual_output_len);
 
             input_pos += advance_input as f64;
-            output_pos += advance_output;
+            output_pos_f += advance_output_f;
         }
 
         // Trim output to target length for better ratio accuracy
@@ -110,9 +119,11 @@ impl Wsola {
         Ok(output)
     }
 
-    /// Finds the best matching position within the search range.
+    /// Finds the best matching position within the search range using FFT-accelerated
+    /// cross-correlation for large search ranges, falling back to direct computation
+    /// for small ranges.
     fn find_best_position(
-        &self,
+        &mut self,
         input: &[f32],
         output: &[f32],
         nominal_pos: usize,
@@ -126,14 +137,33 @@ impl Wsola {
             return nominal_pos.min(input.len().saturating_sub(self.segment_size));
         }
 
-        let mut best_pos = nominal_pos;
-        let mut best_corr = f64::NEG_INFINITY;
-
-        // Compare the overlap region of the candidate against what's already in output
         let overlap_len = self.overlap_size.min(output.len().saturating_sub(output_pos));
         if overlap_len == 0 {
             return nominal_pos;
         }
+
+        let num_candidates = search_end - search_start + 1;
+
+        // Use FFT-based correlation when search range is large enough to benefit
+        if num_candidates > 64 && overlap_len >= 32 {
+            self.find_best_position_fft(input, output, search_start, search_end, output_pos, overlap_len)
+        } else {
+            self.find_best_position_direct(input, output, search_start, search_end, output_pos, overlap_len)
+        }
+    }
+
+    /// Direct time-domain cross-correlation search (used for small search ranges).
+    fn find_best_position_direct(
+        &self,
+        input: &[f32],
+        output: &[f32],
+        search_start: usize,
+        search_end: usize,
+        output_pos: usize,
+        overlap_len: usize,
+    ) -> usize {
+        let mut best_pos = search_start;
+        let mut best_corr = f64::NEG_INFINITY;
 
         for pos in search_start..=search_end {
             if pos + overlap_len > input.len() {
@@ -152,6 +182,102 @@ impl Wsola {
         }
 
         best_pos
+    }
+
+    /// FFT-accelerated cross-correlation search.
+    ///
+    /// Computes cross-correlation between the output overlap region (reference)
+    /// and all candidate positions in the input search region simultaneously.
+    fn find_best_position_fft(
+        &mut self,
+        input: &[f32],
+        output: &[f32],
+        search_start: usize,
+        search_end: usize,
+        output_pos: usize,
+        overlap_len: usize,
+    ) -> usize {
+        let ref_signal = &output[output_pos..output_pos + overlap_len];
+        let search_region_len = search_end - search_start + overlap_len;
+
+        // Clamp to available input
+        let actual_region_end = (search_start + search_region_len).min(input.len());
+        let actual_region_len = actual_region_end - search_start;
+        if actual_region_len < overlap_len {
+            return search_start;
+        }
+        let search_signal = &input[search_start..actual_region_end];
+
+        // FFT size: next power of two >= search_signal length + overlap_len - 1
+        let conv_len = actual_region_len + overlap_len - 1;
+        let fft_size = conv_len.next_power_of_two();
+
+        let fft_fwd = self.planner.plan_fft_forward(fft_size);
+        let fft_inv = self.planner.plan_fft_inverse(fft_size);
+
+        // Prepare reference signal (time-reversed for cross-correlation)
+        let mut ref_buf = vec![Complex::new(0.0f32, 0.0); fft_size];
+        for (i, &s) in ref_signal.iter().enumerate() {
+            ref_buf[i] = Complex::new(s, 0.0);
+        }
+
+        // Prepare search signal
+        let mut search_buf = vec![Complex::new(0.0f32, 0.0); fft_size];
+        for (i, &s) in search_signal.iter().enumerate() {
+            search_buf[i] = Complex::new(s, 0.0);
+        }
+
+        // Forward FFT both
+        fft_fwd.process(&mut ref_buf);
+        fft_fwd.process(&mut search_buf);
+
+        // Cross-correlation in frequency domain: conj(Ref) * Search
+        let mut corr_buf = vec![Complex::new(0.0f32, 0.0); fft_size];
+        for i in 0..fft_size {
+            corr_buf[i] = ref_buf[i].conj() * search_buf[i];
+        }
+
+        // Inverse FFT
+        fft_inv.process(&mut corr_buf);
+
+        // Normalize by FFT size
+        let norm = 1.0 / fft_size as f64;
+
+        // Compute reference energy (constant for all candidates)
+        let ref_energy: f64 = ref_signal.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        if ref_energy < 1e-12 {
+            return search_start;
+        }
+
+        // Compute running energy of search signal windows using prefix sums
+        let num_candidates = actual_region_len.saturating_sub(overlap_len) + 1;
+        let mut prefix_sq = vec![0.0f64; actual_region_len + 1];
+        for i in 0..actual_region_len {
+            prefix_sq[i + 1] = prefix_sq[i] + (search_signal[i] as f64) * (search_signal[i] as f64);
+        }
+
+        // Find best normalized correlation
+        let mut best_pos = search_start;
+        let mut best_ncorr = f64::NEG_INFINITY;
+
+        for k in 0..num_candidates {
+            // Un-normalized cross-correlation at lag k
+            let raw_corr = corr_buf[k].re as f64 * norm;
+
+            // Energy of search window at offset k
+            let window_energy = prefix_sq[k + overlap_len] - prefix_sq[k];
+            let denom = (ref_energy * window_energy).sqrt();
+
+            let ncorr = if denom > 1e-12 { raw_corr / denom } else { 0.0 };
+
+            if ncorr > best_ncorr {
+                best_ncorr = ncorr;
+                best_pos = search_start + k;
+            }
+        }
+
+        // Clamp to valid range
+        best_pos.min(search_end)
     }
 
     /// Overlap-adds a segment from input into output with raised-cosine crossfade.
@@ -229,13 +355,13 @@ mod tests {
             .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
             .collect();
 
-        let wsola = Wsola::new(segment_size, search_range, 1.0);
+        let mut wsola = Wsola::new(segment_size, search_range, 1.0);
         let output = wsola.process(&input).unwrap();
 
         // Length should be approximately the same
         let len_ratio = output.len() as f64 / input.len() as f64;
         assert!(
-            (len_ratio - 1.0).abs() < 0.15,
+            (len_ratio - 1.0).abs() < 0.05,
             "Length ratio {} too far from 1.0",
             len_ratio
         );
@@ -251,12 +377,12 @@ mod tests {
             .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
             .collect();
 
-        let wsola = Wsola::new(segment_size, search_range, 2.0);
+        let mut wsola = Wsola::new(segment_size, search_range, 2.0);
         let output = wsola.process(&input).unwrap();
 
         let len_ratio = output.len() as f64 / input.len() as f64;
         assert!(
-            (len_ratio - 2.0).abs() < 0.3,
+            (len_ratio - 2.0).abs() < 0.1,
             "Length ratio {} too far from 2.0",
             len_ratio
         );
@@ -273,25 +399,82 @@ mod tests {
             .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
             .collect();
 
-        let wsola = Wsola::new(segment_size, search_range, 0.75);
+        let mut wsola = Wsola::new(segment_size, search_range, 0.75);
         let output = wsola.process(&input).unwrap();
 
         let len_ratio = output.len() as f64 / input.len() as f64;
         assert!(
-            (len_ratio - 0.75).abs() < 0.15,
+            (len_ratio - 0.75).abs() < 0.1,
             "Length ratio {} too far from 0.75",
             len_ratio
         );
 
-        // Test 0.5 ratio with accuracy check
-        let wsola_half = Wsola::new(segment_size, search_range, 0.5);
+        // Test 0.5 ratio with tighter tolerance
+        let mut wsola_half = Wsola::new(segment_size, search_range, 0.5);
         let output_half = wsola_half.process(&input).unwrap();
         let half_ratio = output_half.len() as f64 / input.len() as f64;
         assert!(
             (half_ratio - 0.5).abs() < 0.1,
-            "Half ratio {} too far from 0.5",
+            "Half compression ratio {} too far from 0.5",
             half_ratio
         );
+    }
+
+    #[test]
+    fn test_wsola_extreme_compression() {
+        let sample_rate = 44100;
+        let segment_size = 882;
+        let search_range = 441;
+
+        // 3 seconds for stable measurement
+        let input: Vec<f32> = (0..sample_rate * 3)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        // Test ratio 0.33 (3x speedup)
+        let mut wsola = Wsola::new(segment_size, search_range, 0.33);
+        let output = wsola.process(&input).unwrap();
+        let ratio = output.len() as f64 / input.len() as f64;
+        assert!(
+            (ratio - 0.33).abs() < 0.1,
+            "Compression ratio {} too far from 0.33",
+            ratio
+        );
+
+        // Test ratio 0.25 (4x speedup)
+        let mut wsola = Wsola::new(segment_size, search_range, 0.25);
+        let output = wsola.process(&input).unwrap();
+        let ratio = output.len() as f64 / input.len() as f64;
+        assert!(
+            (ratio - 0.25).abs() < 0.1,
+            "Compression ratio {} too far from 0.25",
+            ratio
+        );
+    }
+
+    #[test]
+    fn test_wsola_dj_ratios() {
+        let sample_rate = 44100;
+        let segment_size = 882;
+        let search_range = 441;
+
+        // 2 seconds of audio
+        let input: Vec<f32> = (0..sample_rate * 2)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        // DJ-typical ratios: ±1-8%
+        for &ratio in &[0.92, 0.96, 1.02, 1.04, 1.08] {
+            let mut wsola = Wsola::new(segment_size, search_range, ratio);
+            let output = wsola.process(&input).unwrap();
+            let actual_ratio = output.len() as f64 / input.len() as f64;
+            assert!(
+                (actual_ratio - ratio).abs() < 0.05,
+                "DJ ratio {}: actual {} too far from target",
+                ratio,
+                actual_ratio
+            );
+        }
     }
 
     #[test]
@@ -306,7 +489,7 @@ mod tests {
 
         // Test ratios from 0.25 to 0.5
         for &ratio in &[0.5, 0.4, 0.3, 0.25] {
-            let wsola = Wsola::new(segment_size, search_range, ratio);
+            let mut wsola = Wsola::new(segment_size, search_range, ratio);
             let output = wsola.process(&input).unwrap();
             let actual_ratio = output.len() as f64 / input.len() as f64;
             assert!(
@@ -320,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_wsola_input_too_short() {
-        let wsola = Wsola::new(882, 441, 1.0);
+        let mut wsola = Wsola::new(882, 441, 1.0);
         let result = wsola.process(&[0.0; 100]);
         assert!(result.is_err());
     }

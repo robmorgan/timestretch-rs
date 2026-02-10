@@ -37,7 +37,7 @@ impl HybridStretcher {
         let min_size = self.params.fft_size.max(self.params.wsola_segment_size);
         if input.len() < min_size {
             // Fall back to WSOLA for very short input
-            let wsola = Wsola::new(
+            let mut wsola = Wsola::new(
                 input.len().min(self.params.wsola_segment_size),
                 self.params.wsola_search_range.min(input.len() / 4),
                 self.params.stretch_ratio,
@@ -123,7 +123,7 @@ impl HybridStretcher {
     fn stretch_with_wsola(&self, seg_data: &[f32]) -> Result<Vec<f32>, StretchError> {
         let seg_size = self.params.wsola_segment_size.min(seg_data.len() / 2).max(64);
         let search = self.params.wsola_search_range.min(seg_size / 2).max(16);
-        let wsola = Wsola::new(seg_size, search, self.params.stretch_ratio);
+        let mut wsola = Wsola::new(seg_size, search, self.params.stretch_ratio);
         wsola.process(seg_data)
     }
 
