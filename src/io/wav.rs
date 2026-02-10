@@ -266,37 +266,43 @@ fn init_wav_buffer(buffer: &AudioBuffer, format_code: u16, bits_per_sample: u16)
     out
 }
 
-/// Writes an audio buffer as a WAV file (16-bit PCM).
-pub fn write_wav_16bit(buffer: &AudioBuffer) -> Vec<u8> {
-    let mut out = init_wav_buffer(buffer, WAV_FORMAT_PCM, 16);
+/// Encodes all samples in `buffer` using `encode_sample` and appends them to the WAV output.
+fn encode_wav_samples(
+    buffer: &AudioBuffer,
+    format_code: u16,
+    bits_per_sample: u16,
+    mut encode_sample: impl FnMut(&mut Vec<u8>, f32),
+) -> Vec<u8> {
+    let mut out = init_wav_buffer(buffer, format_code, bits_per_sample);
     for &sample in &buffer.data {
-        let clamped = sample.clamp(-1.0, 1.0);
-        let raw = (clamped * PCM_16BIT_MAX_OUT) as i16;
-        out.extend_from_slice(&raw.to_le_bytes());
+        encode_sample(&mut out, sample);
     }
     out
+}
+
+/// Writes an audio buffer as a WAV file (16-bit PCM).
+pub fn write_wav_16bit(buffer: &AudioBuffer) -> Vec<u8> {
+    encode_wav_samples(buffer, WAV_FORMAT_PCM, 16, |out, sample| {
+        let raw = (sample.clamp(-1.0, 1.0) * PCM_16BIT_MAX_OUT) as i16;
+        out.extend_from_slice(&raw.to_le_bytes());
+    })
 }
 
 /// Writes an audio buffer as a WAV file (24-bit PCM).
 pub fn write_wav_24bit(buffer: &AudioBuffer) -> Vec<u8> {
-    let mut out = init_wav_buffer(buffer, WAV_FORMAT_PCM, 24);
-    for &sample in &buffer.data {
-        let clamped = sample.clamp(-1.0, 1.0);
-        let raw = (clamped * PCM_24BIT_MAX_OUT) as i32;
+    encode_wav_samples(buffer, WAV_FORMAT_PCM, 24, |out, sample| {
+        let raw = (sample.clamp(-1.0, 1.0) * PCM_24BIT_MAX_OUT) as i32;
         out.push(raw as u8);
         out.push((raw >> 8) as u8);
         out.push((raw >> 16) as u8);
-    }
-    out
+    })
 }
 
 /// Writes an audio buffer as a WAV file (32-bit float).
 pub fn write_wav_float(buffer: &AudioBuffer) -> Vec<u8> {
-    let mut out = init_wav_buffer(buffer, WAV_FORMAT_IEEE_FLOAT, 32);
-    for &sample in &buffer.data {
+    encode_wav_samples(buffer, WAV_FORMAT_IEEE_FLOAT, 32, |out, sample| {
         out.extend_from_slice(&sample.to_le_bytes());
-    }
-    out
+    })
 }
 
 /// Writes WAV data to disk.

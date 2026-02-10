@@ -422,6 +422,12 @@
 - [x] 24 new unit tests (slice, concatenate, normalize, apply_gain, trim_silence, Display, Default)
 - [x] All 316+ tests passing, zero clippy warnings, zero doc warnings
 
+### Tenth pass (agent-5)
+- [x] Extracted `encode_wav_samples()` helper in wav.rs — deduplicates init+loop+return pattern from `write_wav_16bit()`, `write_wav_24bit()`, `write_wav_float()` (each caller now a 3-line closure delegation)
+- [x] Extracted `assign` closure in frequency.rs `split_spectrum_into_bands()` — deduplicates the identical classify-and-assign pattern from positive and negative frequency loops
+- [x] Fixed clippy warnings in test files: `needless_range_loop` in edm_presets.rs, `collapsible_if` in identity.rs
+- [x] All 302+ tests passing, zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
