@@ -121,6 +121,13 @@ fn compute_bin_weights(fft_size: usize, sample_rate: u32) -> Vec<f32> {
     weights
 }
 
+/// Number of frames in the local median window for adaptive thresholding.
+const MEDIAN_WINDOW_FRAMES: usize = 11;
+/// Minimum gap between detected onsets in frames (~50ms at typical hop sizes).
+const MIN_ONSET_GAP_FRAMES: usize = 4;
+/// Floor added to threshold to avoid false positives in near-silence.
+const THRESHOLD_FLOOR: f32 = 0.01;
+
 /// Adaptive thresholding for onset detection.
 /// Uses a sliding median with multiplicative threshold.
 fn adaptive_threshold(flux: &[f32], sensitivity: f32, hop_size: usize) -> Vec<usize> {
@@ -128,16 +135,14 @@ fn adaptive_threshold(flux: &[f32], sensitivity: f32, hop_size: usize) -> Vec<us
         return vec![];
     }
 
-    let median_window = 11; // Frames for local median
-    let half_window = median_window / 2;
+    let half_window = MEDIAN_WINDOW_FRAMES / 2;
     // Higher sensitivity = lower threshold = more detections
     let threshold_multiplier = 1.0 + (1.0 - sensitivity) * 4.0;
-    let min_onset_gap_frames = 4; // Minimum gap between onsets (~50ms at typical hop sizes)
 
     let mut onsets = Vec::new();
     let mut last_onset: Option<usize> = None;
     // Reusable sort buffer to avoid per-frame allocation
-    let mut local = Vec::with_capacity(median_window);
+    let mut local = Vec::with_capacity(MEDIAN_WINDOW_FRAMES);
 
     for i in 0..flux.len() {
         // Compute local median
@@ -148,12 +153,12 @@ fn adaptive_threshold(flux: &[f32], sensitivity: f32, hop_size: usize) -> Vec<us
         local.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = local[local.len() / 2];
 
-        let threshold = median * threshold_multiplier + 0.01;
+        let threshold = median * threshold_multiplier + THRESHOLD_FLOOR;
 
         if flux[i] > threshold {
             // Check minimum gap
             if let Some(last) = last_onset {
-                if i - last < min_onset_gap_frames {
+                if i - last < MIN_ONSET_GAP_FRAMES {
                     continue;
                 }
             }

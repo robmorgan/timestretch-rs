@@ -2,6 +2,17 @@
 
 use crate::analysis::transient::detect_transients;
 
+/// FFT size for beat detection (balances frequency resolution and speed).
+const BEAT_FFT_SIZE: usize = 2048;
+/// Hop size for beat detection analysis frames.
+const BEAT_HOP_SIZE: usize = 512;
+/// Transient sensitivity for kick detection (lower = fewer false positives).
+const BEAT_SENSITIVITY: f32 = 0.4;
+/// Minimum EDM BPM for octave normalization.
+const MIN_EDM_BPM: f64 = 100.0;
+/// Maximum EDM BPM for octave normalization.
+const MAX_EDM_BPM: f64 = 160.0;
+
 /// Beat grid information for a 4/4 track.
 #[derive(Debug, Clone)]
 pub struct BeatGrid {
@@ -42,11 +53,13 @@ impl BeatGrid {
 ///
 /// Optimized for 4/4 EDM (house/techno) with expected BPM range 100-160.
 pub fn detect_beats(samples: &[f32], sample_rate: u32) -> BeatGrid {
-    let fft_size = 2048;
-    let hop_size = 512;
-
-    // Use transient detection focused on low frequencies (kicks)
-    let transients = detect_transients(samples, sample_rate, fft_size, hop_size, 0.4);
+    let transients = detect_transients(
+        samples,
+        sample_rate,
+        BEAT_FFT_SIZE,
+        BEAT_HOP_SIZE,
+        BEAT_SENSITIVITY,
+    );
 
     if transients.onsets.len() < 2 {
         return BeatGrid {
@@ -88,12 +101,12 @@ fn estimate_bpm_from_intervals(intervals: &[usize], sample_rate: u32) -> f64 {
 
     let raw_bpm = 60.0 * sample_rate as f64 / median_interval as f64;
 
-    // Snap to reasonable EDM BPM range (100-160)
+    // Snap to reasonable EDM BPM range
     let mut bpm = raw_bpm;
-    while bpm > 160.0 {
+    while bpm > MAX_EDM_BPM {
         bpm /= 2.0;
     }
-    while bpm < 100.0 && bpm > 0.0 {
+    while bpm < MIN_EDM_BPM && bpm > 0.0 {
         bpm *= 2.0;
     }
 

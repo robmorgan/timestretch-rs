@@ -6,6 +6,22 @@ use crate::error::StretchError;
 use crate::stretch::phase_vocoder::PhaseVocoder;
 use crate::stretch::wsola::Wsola;
 
+/// Crossfade duration in seconds between algorithm segments (5ms raised-cosine).
+const CROSSFADE_SECS: f64 = 0.005;
+/// Transient region duration in seconds (~10ms around each onset).
+const TRANSIENT_REGION_SECS: f64 = 0.010;
+/// Minimum segment length (samples) to use phase vocoder or WSOLA; shorter segments
+/// fall back to linear resampling.
+const MIN_SEGMENT_FOR_STRETCH: usize = 256;
+/// Minimum WSOLA segment size (samples) when clamping for short segments.
+const MIN_WSOLA_SEGMENT: usize = 64;
+/// Minimum WSOLA search range (samples) when clamping for short segments.
+const MIN_WSOLA_SEARCH: usize = 16;
+/// Maximum FFT size for transient detection (smaller = faster, less frequency resolution).
+const TRANSIENT_MAX_FFT: usize = 2048;
+/// Maximum hop size for transient detection.
+const TRANSIENT_MAX_HOP: usize = 512;
+
 /// Transient-aware hybrid stretcher.
 ///
 /// Uses WSOLA for transient regions (kicks, snares, hats) and phase vocoder
@@ -49,8 +65,8 @@ impl HybridStretcher {
         let transients = detect_transients(
             input,
             self.params.sample_rate,
-            self.params.fft_size.min(2048), // Use smaller FFT for transient detection
-            self.params.hop_size.min(512),
+            self.params.fft_size.min(TRANSIENT_MAX_FFT),
+            self.params.hop_size.min(TRANSIENT_MAX_HOP),
             self.params.transient_sensitivity,
         );
 
@@ -80,7 +96,7 @@ impl HybridStretcher {
             return Ok(output_segments.into_iter().next().unwrap_or_default());
         }
 
-        let crossfade_samples = (self.params.sample_rate as f64 * 0.005) as usize; // 5ms crossfade
+        let crossfade_samples = (self.params.sample_rate as f64 * CROSSFADE_SECS) as usize;
         let output = concatenate_with_crossfade(&output_segments, crossfade_samples);
 
         Ok(output)
@@ -88,23 +104,23 @@ impl HybridStretcher {
 
     /// Stretches a single segment using the appropriate algorithm.
     ///
-    /// Transient segments use WSOLA to preserve attack characteristics.
-    /// Tonal segments use the phase vocoder for smooth stretching.
-    /// Very short segments fall back to linear resampling.
+    /// - Very short segments (<256 samples) fall back to linear resampling
+    /// - Tonal segments long enough for FFT use the phase vocoder
+    /// - Everything else (transients, short tonal) uses WSOLA
+    /// - On error, falls back to linear resampling
     fn stretch_segment(
         &self,
         seg_data: &[f32],
         is_transient: bool,
         pv: &mut PhaseVocoder,
     ) -> Vec<f32> {
-        if seg_data.len() < 256 {
+        if seg_data.len() < MIN_SEGMENT_FOR_STRETCH {
             let out_len = self.params.output_length(seg_data.len());
             return crate::core::resample::resample_linear(seg_data, out_len.max(1));
         }
 
-        let result = if is_transient {
-            self.stretch_with_wsola(seg_data)
-        } else if seg_data.len() >= self.params.fft_size {
+        let use_phase_vocoder = !is_transient && seg_data.len() >= self.params.fft_size;
+        let result = if use_phase_vocoder {
             pv.process(seg_data)
         } else {
             self.stretch_with_wsola(seg_data)
@@ -122,8 +138,8 @@ impl HybridStretcher {
             .params
             .wsola_segment_size
             .min(seg_data.len() / 2)
-            .max(64);
-        let search = self.params.wsola_search_range.min(seg_size / 2).max(16);
+            .max(MIN_WSOLA_SEGMENT);
+        let search = self.params.wsola_search_range.min(seg_size / 2).max(MIN_WSOLA_SEARCH);
         let mut wsola = Wsola::new(seg_size, search, self.params.stretch_ratio);
         wsola.process(seg_data)
     }
@@ -139,8 +155,7 @@ impl HybridStretcher {
         }
 
         let mut segments = Vec::new();
-        // Transient region size: ~10ms around each onset
-        let transient_size = (self.params.sample_rate as f64 * 0.010) as usize;
+        let transient_size = (self.params.sample_rate as f64 * TRANSIENT_REGION_SECS) as usize;
 
         let mut pos = 0;
 

@@ -197,6 +197,21 @@ pub struct StretchParams {
     pub wsola_search_range: usize,
 }
 
+/// Converts a duration in milliseconds to samples at the given sample rate.
+#[inline]
+fn ms_to_samples(ms: f64, sample_rate: u32) -> usize {
+    (sample_rate as f64 * ms / 1000.0) as usize
+}
+
+/// Default WSOLA segment duration (~20ms) for transient-friendly segmentation.
+const WSOLA_SEGMENT_MS: f64 = 20.0;
+/// Default WSOLA search range (~10ms) for small stretch ratios.
+const WSOLA_SEARCH_MS_SMALL: f64 = 10.0;
+/// Medium WSOLA search range (~15ms) for moderate stretching.
+const WSOLA_SEARCH_MS_MEDIUM: f64 = 15.0;
+/// Large WSOLA search range (~30ms) for extreme stretch ratios.
+const WSOLA_SEARCH_MS_LARGE: f64 = 30.0;
+
 impl StretchParams {
     /// Creates new stretch params with the given ratio.
     pub fn new(stretch_ratio: f64) -> Self {
@@ -209,8 +224,8 @@ impl StretchParams {
             preset: None,
             transient_sensitivity: 0.5,
             sub_bass_cutoff: 120.0,
-            wsola_segment_size: 882, // ~20ms at 44100
-            wsola_search_range: 441, // ~10ms at 44100
+            wsola_segment_size: ms_to_samples(WSOLA_SEGMENT_MS, 44100),
+            wsola_search_range: ms_to_samples(WSOLA_SEARCH_MS_SMALL, 44100),
         }
     }
 
@@ -228,8 +243,8 @@ impl StretchParams {
     pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
         self.sample_rate = sample_rate;
         // Adjust WSOLA params for sample rate
-        self.wsola_segment_size = (sample_rate as f64 * 0.02) as usize;
-        self.wsola_search_range = (sample_rate as f64 * 0.01) as usize;
+        self.wsola_segment_size = ms_to_samples(WSOLA_SEGMENT_MS, sample_rate);
+        self.wsola_search_range = ms_to_samples(WSOLA_SEARCH_MS_SMALL, sample_rate);
         self
     }
 
@@ -253,31 +268,36 @@ impl StretchParams {
                 self.fft_size = 4096;
                 self.hop_size = 1024;
                 self.transient_sensitivity = 0.3;
-                self.wsola_search_range = (self.sample_rate as f64 * 0.01) as usize;
+                self.wsola_search_range =
+                    ms_to_samples(WSOLA_SEARCH_MS_SMALL, self.sample_rate);
             }
             EdmPreset::HouseLoop => {
                 self.fft_size = 4096;
                 self.hop_size = 1024;
                 self.transient_sensitivity = 0.5;
-                self.wsola_search_range = (self.sample_rate as f64 * 0.015) as usize;
+                self.wsola_search_range =
+                    ms_to_samples(WSOLA_SEARCH_MS_MEDIUM, self.sample_rate);
             }
             EdmPreset::Halftime => {
                 self.fft_size = 4096;
                 self.hop_size = 512;
                 self.transient_sensitivity = 0.7;
-                self.wsola_search_range = (self.sample_rate as f64 * 0.03) as usize;
+                self.wsola_search_range =
+                    ms_to_samples(WSOLA_SEARCH_MS_LARGE, self.sample_rate);
             }
             EdmPreset::Ambient => {
                 self.fft_size = 8192;
                 self.hop_size = 2048;
                 self.transient_sensitivity = 0.2;
-                self.wsola_search_range = (self.sample_rate as f64 * 0.03) as usize;
+                self.wsola_search_range =
+                    ms_to_samples(WSOLA_SEARCH_MS_LARGE, self.sample_rate);
             }
             EdmPreset::VocalChop => {
                 self.fft_size = 2048;
                 self.hop_size = 512;
                 self.transient_sensitivity = 0.6;
-                self.wsola_search_range = (self.sample_rate as f64 * 0.015) as usize;
+                self.wsola_search_range =
+                    ms_to_samples(WSOLA_SEARCH_MS_MEDIUM, self.sample_rate);
             }
         }
         self
