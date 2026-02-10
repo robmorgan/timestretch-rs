@@ -116,12 +116,11 @@ impl StreamProcessor {
         // Keep only unprocessed remainder (samples that don't form a complete hop).
         let frames_per_channel = total_frames;
         let hop = self.params.hop_size;
-        let num_frames_processed =
-            if frames_per_channel >= self.params.fft_size {
-                (frames_per_channel - self.params.fft_size) / hop + 1
-            } else {
-                0
-            };
+        let num_frames_processed = if frames_per_channel >= self.params.fft_size {
+            (frames_per_channel - self.params.fft_size) / hop + 1
+        } else {
+            0
+        };
         let samples_consumed = if num_frames_processed > 0 {
             ((num_frames_processed - 1) * hop + self.params.fft_size) * num_channels
         } else {

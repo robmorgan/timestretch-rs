@@ -97,22 +97,11 @@ impl Wsola {
             }
 
             // Search for best matching position around nominal position
-            let best_pos = self.find_best_position(
-                input,
-                &output,
-                nominal_pos,
-                output_pos,
-            );
+            let best_pos = self.find_best_position(input, &output, nominal_pos, output_pos);
 
             // Overlap-add with cross-fade
-            self.overlap_add(
-                input,
-                &mut output,
-                best_pos,
-                output_pos,
-            );
-            actual_output_len =
-                (output_pos + self.segment_size).max(actual_output_len);
+            self.overlap_add(input, &mut output, best_pos, output_pos);
+            actual_output_len = (output_pos + self.segment_size).max(actual_output_len);
 
             input_pos += advance_input as f64;
             output_pos_f += advance_output_f;
@@ -135,14 +124,16 @@ impl Wsola {
         output_pos: usize,
     ) -> usize {
         let search_start = nominal_pos.saturating_sub(self.search_range);
-        let search_end = (nominal_pos + self.search_range)
-            .min(input.len().saturating_sub(self.segment_size));
+        let search_end =
+            (nominal_pos + self.search_range).min(input.len().saturating_sub(self.segment_size));
 
         if search_start >= search_end {
             return nominal_pos.min(input.len().saturating_sub(self.segment_size));
         }
 
-        let overlap_len = self.overlap_size.min(output.len().saturating_sub(output_pos));
+        let overlap_len = self
+            .overlap_size
+            .min(output.len().saturating_sub(output_pos));
         if overlap_len == 0 {
             return nominal_pos;
         }
@@ -151,9 +142,23 @@ impl Wsola {
 
         // Use FFT-based correlation when search range is large enough to benefit
         if num_candidates > 64 && overlap_len >= 32 {
-            self.find_best_position_fft(input, output, search_start, search_end, output_pos, overlap_len)
+            self.find_best_position_fft(
+                input,
+                output,
+                search_start,
+                search_end,
+                output_pos,
+                overlap_len,
+            )
         } else {
-            self.find_best_position_direct(input, output, search_start, search_end, output_pos, overlap_len)
+            self.find_best_position_direct(
+                input,
+                output,
+                search_start,
+                search_end,
+                output_pos,
+                overlap_len,
+            )
         }
     }
 
@@ -286,13 +291,7 @@ impl Wsola {
     }
 
     /// Overlap-adds a segment from input into output with raised-cosine crossfade.
-    fn overlap_add(
-        &self,
-        input: &[f32],
-        output: &mut [f32],
-        input_pos: usize,
-        output_pos: usize,
-    ) {
+    fn overlap_add(&self, input: &[f32], output: &mut [f32], input_pos: usize, output_pos: usize) {
         let segment_end = (input_pos + self.segment_size).min(input.len());
         let segment_len = segment_end - input_pos;
 
@@ -518,10 +517,18 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0, 4.0];
         let b = vec![1.0, 2.0, 3.0, 4.0];
         let c = normalized_cross_correlation(&a, &b);
-        assert!((c - 1.0).abs() < 1e-6, "Self-correlation should be 1.0, got {}", c);
+        assert!(
+            (c - 1.0).abs() < 1e-6,
+            "Self-correlation should be 1.0, got {}",
+            c
+        );
 
         let neg: Vec<f32> = a.iter().map(|x| -x).collect();
         let c_neg = normalized_cross_correlation(&a, &neg);
-        assert!((c_neg - (-1.0)).abs() < 1e-6, "Negated correlation should be -1.0, got {}", c_neg);
+        assert!(
+            (c_neg - (-1.0)).abs() < 1e-6,
+            "Negated correlation should be -1.0, got {}",
+            c_neg
+        );
     }
 }

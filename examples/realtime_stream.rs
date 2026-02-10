@@ -20,7 +20,8 @@ fn main() {
     let mut processor = StreamProcessor::new(params);
 
     println!("Real-time Streaming Demo");
-    println!("Latency: {} samples ({:.1}ms)",
+    println!(
+        "Latency: {} samples ({:.1}ms)",
         processor.latency_samples(),
         processor.latency_secs() * 1000.0
     );
@@ -30,8 +31,7 @@ fn main() {
     let input: Vec<f32> = (0..total_samples)
         .map(|i| {
             let t = i as f32 / sample_rate as f32;
-            0.5 * (2.0 * PI * 440.0 * t).sin()
-                + 0.3 * (2.0 * PI * 660.0 * t).sin()
+            0.5 * (2.0 * PI * 440.0 * t).sin() + 0.3 * (2.0 * PI * 660.0 * t).sin()
         })
         .collect();
 
@@ -58,8 +58,16 @@ fn main() {
     let remaining = processor.flush().expect("flush failed");
     total_output_samples += remaining.len();
 
-    println!("Input:  {} samples ({:.2}s)", total_samples, total_samples as f64 / sample_rate as f64);
-    println!("Output: {} samples ({:.2}s)", total_output_samples, total_output_samples as f64 / sample_rate as f64);
+    println!(
+        "Input:  {} samples ({:.2}s)",
+        total_samples,
+        total_samples as f64 / sample_rate as f64
+    );
+    println!(
+        "Output: {} samples ({:.2}s)",
+        total_output_samples,
+        total_output_samples as f64 / sample_rate as f64
+    );
     println!("Final ratio: {:.4}", current_ratio);
     println!("Chunks processed: {}", chunk_count);
 }

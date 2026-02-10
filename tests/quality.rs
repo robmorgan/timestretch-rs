@@ -2,9 +2,7 @@ use timestretch::{stretch, EdmPreset, StretchParams};
 
 fn sine_wave(freq: f32, sample_rate: u32, num_samples: usize) -> Vec<f32> {
     (0..num_samples)
-        .map(|i| {
-            (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate as f32).sin()
-        })
+        .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate as f32).sin())
         .collect()
 }
 

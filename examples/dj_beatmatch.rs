@@ -59,8 +59,5 @@ fn main() {
     println!("Input:  {} samples ({:.2}s)", input.len(), duration_secs);
     println!("Output: {} samples ({:.2}s)", output.len(), output_duration);
     println!("Actual ratio: {:.4}", actual_ratio);
-    println!(
-        "Effective BPM: {:.1}",
-        original_bpm * actual_ratio
-    );
+    println!("Effective BPM: {:.1}", original_bpm * actual_ratio);
 }

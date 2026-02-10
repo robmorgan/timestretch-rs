@@ -41,10 +41,7 @@ impl BeatGrid {
 /// Detects beats in a mono audio signal and estimates BPM.
 ///
 /// Optimized for 4/4 EDM (house/techno) with expected BPM range 100-160.
-pub fn detect_beats(
-    samples: &[f32],
-    sample_rate: u32,
-) -> BeatGrid {
+pub fn detect_beats(samples: &[f32], sample_rate: u32) -> BeatGrid {
     let fft_size = 2048;
     let hop_size = 512;
 

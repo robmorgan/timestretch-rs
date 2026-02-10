@@ -26,10 +26,8 @@ fn compute_spectral_flux(
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(fft_size);
 
-    let window = crate::core::window::generate_window(
-        crate::core::window::WindowType::Hann,
-        fft_size,
-    );
+    let window =
+        crate::core::window::generate_window(crate::core::window::WindowType::Hann, fft_size);
 
     let bin_weights = compute_bin_weights(fft_size, sample_rate);
     let num_bins = fft_size / 2 + 1;

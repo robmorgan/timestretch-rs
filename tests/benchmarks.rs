@@ -116,7 +116,8 @@ fn bench_stretch(
     }
     let elapsed = start.elapsed();
     let avg_ms = elapsed.as_secs_f64() * 1000.0 / iterations as f64;
-    let input_duration = input.len() as f64 / params.channels.count() as f64 / params.sample_rate as f64;
+    let input_duration =
+        input.len() as f64 / params.channels.count() as f64 / params.sample_rate as f64;
     let process_secs = avg_ms / 1000.0;
     let realtime_factor = input_duration / process_secs;
 

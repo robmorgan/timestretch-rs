@@ -1,10 +1,8 @@
-use timestretch::{EdmPreset, StretchParams, StreamProcessor};
+use timestretch::{EdmPreset, StreamProcessor, StretchParams};
 
 fn sine_wave(freq: f32, sample_rate: u32, num_samples: usize) -> Vec<f32> {
     (0..num_samples)
-        .map(|i| {
-            (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate as f32).sin()
-        })
+        .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate as f32).sin())
         .collect()
 }
 
@@ -30,10 +28,7 @@ fn test_streaming_produces_output() {
     let remaining = processor.flush().unwrap();
     total_output.extend_from_slice(&remaining);
 
-    assert!(
-        !total_output.is_empty(),
-        "Streaming should produce output"
-    );
+    assert!(!total_output.is_empty(), "Streaming should produce output");
 }
 
 #[test]
@@ -66,7 +61,11 @@ fn test_streaming_stereo() {
 
     // Output should maintain stereo interleaving
     if !total_output.is_empty() {
-        assert_eq!(total_output.len() % 2, 0, "Stereo output should have even length");
+        assert_eq!(
+            total_output.len() % 2,
+            0,
+            "Stereo output should have even length"
+        );
     }
 }
 
@@ -578,10 +577,7 @@ fn test_streaming_large_fft_size() {
         .with_fft_size(8192);
 
     let stream_output = stream_process_all(&signal, &params, 8192);
-    assert!(
-        !stream_output.is_empty(),
-        "Large FFT should produce output"
-    );
+    assert!(!stream_output.is_empty(), "Large FFT should produce output");
 
     let ratio = stream_output.len() as f64 / signal.len() as f64;
     assert!(
@@ -602,7 +598,10 @@ fn test_streaming_with_preset() {
         .with_preset(EdmPreset::DjBeatmatch);
 
     let stream_output = stream_process_all(&signal, &params, 4096);
-    assert!(!stream_output.is_empty(), "DJ preset streaming should produce output");
+    assert!(
+        !stream_output.is_empty(),
+        "DJ preset streaming should produce output"
+    );
 
     // For ratio ~1.0, output length should be very close to input
     let ratio = stream_output.len() as f64 / signal.len() as f64;

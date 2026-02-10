@@ -198,8 +198,7 @@ impl PhaseVocoder {
     /// then mirrors negative frequencies for inverse FFT.
     fn reconstruct_spectrum(&mut self, num_bins: usize) {
         for bin in 0..num_bins {
-            self.fft_buffer[bin] =
-                Complex::from_polar(self.magnitudes[bin], self.new_phases[bin]);
+            self.fft_buffer[bin] = Complex::from_polar(self.magnitudes[bin], self.new_phases[bin]);
         }
         for bin in 1..num_bins - 1 {
             let mirror = self.fft_size - bin;
@@ -319,8 +318,7 @@ mod tests {
 
         // Check that the output contains a similar frequency
         // (RMS should be similar)
-        let input_rms: f32 =
-            (input.iter().map(|x| x * x).sum::<f32>() / input.len() as f32).sqrt();
+        let input_rms: f32 = (input.iter().map(|x| x * x).sum::<f32>() / input.len() as f32).sqrt();
         let output_rms: f32 =
             (output.iter().map(|x| x * x).sum::<f32>() / output.len() as f32).sqrt();
 

@@ -164,7 +164,11 @@ pub fn read_wav(data: &[u8]) -> Result<AudioBuffer, StretchError> {
         }
     };
 
-    let samples = convert_samples(chunks.audio_data, chunks.format_code, chunks.bits_per_sample)?;
+    let samples = convert_samples(
+        chunks.audio_data,
+        chunks.format_code,
+        chunks.bits_per_sample,
+    )?;
     Ok(AudioBuffer::new(samples, chunks.sample_rate, channels))
 }
 
@@ -177,8 +181,7 @@ fn io_error(path: &str, err: std::io::Error) -> StretchError {
 pub fn read_wav_file(path: &str) -> Result<AudioBuffer, StretchError> {
     let mut file = std::fs::File::open(path).map_err(|e| io_error(path, e))?;
     let mut data = Vec::new();
-    file.read_to_end(&mut data)
-        .map_err(|e| io_error(path, e))?;
+    file.read_to_end(&mut data).map_err(|e| io_error(path, e))?;
     read_wav(&data)
 }
 
@@ -221,7 +224,14 @@ pub fn write_wav_16bit(buffer: &AudioBuffer) -> Vec<u8> {
     let data_size = (buffer.data.len() * 2) as u32;
 
     let mut out = Vec::with_capacity(44 + data_size as usize);
-    write_wav_header(&mut out, WAV_FORMAT_PCM, num_channels, buffer.sample_rate, 16, data_size);
+    write_wav_header(
+        &mut out,
+        WAV_FORMAT_PCM,
+        num_channels,
+        buffer.sample_rate,
+        16,
+        data_size,
+    );
 
     for &sample in &buffer.data {
         let clamped = sample.clamp(-1.0, 1.0);
@@ -238,7 +248,14 @@ pub fn write_wav_float(buffer: &AudioBuffer) -> Vec<u8> {
     let data_size = (buffer.data.len() * 4) as u32;
 
     let mut out = Vec::with_capacity(44 + data_size as usize);
-    write_wav_header(&mut out, WAV_FORMAT_IEEE_FLOAT, num_channels, buffer.sample_rate, 32, data_size);
+    write_wav_header(
+        &mut out,
+        WAV_FORMAT_IEEE_FLOAT,
+        num_channels,
+        buffer.sample_rate,
+        32,
+        data_size,
+    );
 
     for &sample in &buffer.data {
         out.extend_from_slice(&sample.to_le_bytes());
@@ -290,10 +307,7 @@ mod tests {
 
     #[test]
     fn test_wav_roundtrip_16bit() {
-        let original = AudioBuffer::from_mono(
-            vec![0.0, 0.5, -0.5, 1.0, -1.0],
-            44100,
-        );
+        let original = AudioBuffer::from_mono(vec![0.0, 0.5, -0.5, 1.0, -1.0], 44100);
         let wav_data = write_wav_16bit(&original);
         let decoded = read_wav(&wav_data).unwrap();
         assert_eq!(decoded.sample_rate, 44100);
@@ -313,10 +327,7 @@ mod tests {
 
     #[test]
     fn test_wav_roundtrip_float() {
-        let original = AudioBuffer::from_stereo(
-            vec![0.1, -0.2, 0.3, -0.4, 0.5, -0.6],
-            48000,
-        );
+        let original = AudioBuffer::from_stereo(vec![0.1, -0.2, 0.3, -0.4, 0.5, -0.6], 48000);
         let wav_data = write_wav_float(&original);
         let decoded = read_wav(&wav_data).unwrap();
         assert_eq!(decoded.sample_rate, 48000);

@@ -80,8 +80,7 @@ impl HybridStretcher {
             return Ok(output_segments.into_iter().next().unwrap_or_default());
         }
 
-        let crossfade_samples =
-            (self.params.sample_rate as f64 * 0.005) as usize; // 5ms crossfade
+        let crossfade_samples = (self.params.sample_rate as f64 * 0.005) as usize; // 5ms crossfade
         let output = concatenate_with_crossfade(&output_segments, crossfade_samples);
 
         Ok(output)
@@ -119,7 +118,11 @@ impl HybridStretcher {
 
     /// Stretches a segment using WSOLA with clamped parameters.
     fn stretch_with_wsola(&self, seg_data: &[f32]) -> Result<Vec<f32>, StretchError> {
-        let seg_size = self.params.wsola_segment_size.min(seg_data.len() / 2).max(64);
+        let seg_size = self
+            .params
+            .wsola_segment_size
+            .min(seg_data.len() / 2)
+            .max(64);
         let search = self.params.wsola_search_range.min(seg_size / 2).max(16);
         let mut wsola = Wsola::new(seg_size, search, self.params.stretch_ratio);
         wsola.process(seg_data)
@@ -137,8 +140,7 @@ impl HybridStretcher {
 
         let mut segments = Vec::new();
         // Transient region size: ~10ms around each onset
-        let transient_size =
-            (self.params.sample_rate as f64 * 0.010) as usize;
+        let transient_size = (self.params.sample_rate as f64 * 0.010) as usize;
 
         let mut pos = 0;
 

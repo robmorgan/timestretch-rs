@@ -3,7 +3,12 @@
 use rustfft::{num_complex::Complex, FftPlanner};
 
 /// Result of splitting a spectrum into frequency bands: (sub_bass, low, mid, high).
-pub type BandSpectra = (Vec<Complex<f32>>, Vec<Complex<f32>>, Vec<Complex<f32>>, Vec<Complex<f32>>);
+pub type BandSpectra = (
+    Vec<Complex<f32>>,
+    Vec<Complex<f32>>,
+    Vec<Complex<f32>>,
+    Vec<Complex<f32>>,
+);
 
 /// Frequency band boundaries for EDM processing.
 #[derive(Debug, Clone, Copy)]
@@ -106,10 +111,8 @@ pub fn compute_band_energy(
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(fft_size);
 
-    let window = crate::core::window::generate_window(
-        crate::core::window::WindowType::Hann,
-        fft_size,
-    );
+    let window =
+        crate::core::window::generate_window(crate::core::window::WindowType::Hann, fft_size);
 
     let mut buffer: Vec<Complex<f32>> = samples[..fft_size]
         .iter()
@@ -171,19 +174,21 @@ mod tests {
         let sample_rate = 44100u32;
         let fft_size = 4096;
         let samples: Vec<f32> = (0..fft_size)
-            .map(|i| {
-                (2.0 * std::f32::consts::PI * 100.0 * i as f32 / sample_rate as f32).sin()
-            })
+            .map(|i| (2.0 * std::f32::consts::PI * 100.0 * i as f32 / sample_rate as f32).sin())
             .collect();
 
         let bands = FrequencyBands::default();
-        let (sub_e, low_e, mid_e, high_e) = compute_band_energy(&samples, fft_size, sample_rate, &bands);
+        let (sub_e, low_e, mid_e, high_e) =
+            compute_band_energy(&samples, fft_size, sample_rate, &bands);
 
         // Most energy should be in sub-bass
         assert!(
             sub_e > low_e + mid_e + high_e,
             "Sub-bass energy {} should dominate (low={}, mid={}, high={})",
-            sub_e, low_e, mid_e, high_e
+            sub_e,
+            low_e,
+            mid_e,
+            high_e
         );
     }
 
@@ -193,19 +198,21 @@ mod tests {
         let sample_rate = 44100u32;
         let fft_size = 4096;
         let samples: Vec<f32> = (0..fft_size)
-            .map(|i| {
-                (2.0 * std::f32::consts::PI * 5000.0 * i as f32 / sample_rate as f32).sin()
-            })
+            .map(|i| (2.0 * std::f32::consts::PI * 5000.0 * i as f32 / sample_rate as f32).sin())
             .collect();
 
         let bands = FrequencyBands::default();
-        let (sub_e, low_e, mid_e, high_e) = compute_band_energy(&samples, fft_size, sample_rate, &bands);
+        let (sub_e, low_e, mid_e, high_e) =
+            compute_band_energy(&samples, fft_size, sample_rate, &bands);
 
         // Most energy should be in high band (5000 Hz > 4000 Hz)
         assert!(
             high_e > sub_e + low_e + mid_e,
             "High energy {} should dominate (sub={}, low={}, mid={})",
-            high_e, sub_e, low_e, mid_e
+            high_e,
+            sub_e,
+            low_e,
+            mid_e
         );
     }
 }

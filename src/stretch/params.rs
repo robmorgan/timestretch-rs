@@ -44,10 +44,7 @@ pub fn validate_params(params: &StretchParams) -> Result<(), String> {
         ));
     }
     if params.fft_size < 256 {
-        return Err(format!(
-            "FFT size too small: {} (min 256)",
-            params.fft_size
-        ));
+        return Err(format!("FFT size too small: {} (min 256)", params.fft_size));
     }
     if !params.fft_size.is_power_of_two() {
         return Err(format!(

@@ -39,7 +39,10 @@ fn compute_snr_db(reference: &[f32], test: &[f32]) -> f64 {
     if len == 0 {
         return 0.0;
     }
-    let signal_power: f64 = reference[..len].iter().map(|x| (*x as f64) * (*x as f64)).sum();
+    let signal_power: f64 = reference[..len]
+        .iter()
+        .map(|x| (*x as f64) * (*x as f64))
+        .sum();
     let noise_power: f64 = reference[..len]
         .iter()
         .zip(test[..len].iter())
@@ -232,11 +235,7 @@ fn test_identity_snr() {
             &input[margin..compare_len - margin],
             &output[margin..compare_len - margin],
         );
-        assert!(
-            snr > 10.0,
-            "Identity SNR too low: {:.1} dB",
-            snr
-        );
+        assert!(snr > 10.0, "Identity SNR too low: {:.1} dB", snr);
     }
 }
 

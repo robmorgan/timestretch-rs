@@ -12,10 +12,7 @@ pub enum StretchError {
     /// I/O error.
     IoError(String),
     /// Input too short for the given parameters.
-    InputTooShort {
-        provided: usize,
-        minimum: usize,
-    },
+    InputTooShort { provided: usize, minimum: usize },
 }
 
 impl fmt::Display for StretchError {

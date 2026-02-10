@@ -30,8 +30,7 @@ pub use stream::StreamProcessor;
 /// ```
 pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, StretchError> {
     // Validate parameters
-    stretch::params::validate_params(params)
-        .map_err(StretchError::InvalidRatio)?;
+    stretch::params::validate_params(params).map_err(StretchError::InvalidRatio)?;
 
     if input.is_empty() {
         return Ok(vec![]);
@@ -110,9 +109,7 @@ mod tests {
         let num_samples = (sample_rate as f64 * duration) as usize;
 
         let input: Vec<f32> = (0..num_samples)
-            .map(|i| {
-                (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin()
-            })
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin())
             .collect();
 
         let params = StretchParams::new(1.5)
@@ -180,9 +177,7 @@ mod tests {
         let num_samples = sample_rate as usize * 2;
 
         let input: Vec<f32> = (0..num_samples)
-            .map(|i| {
-                (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin()
-            })
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin())
             .collect();
 
         // Small ratio change: 126 BPM -> 128 BPM

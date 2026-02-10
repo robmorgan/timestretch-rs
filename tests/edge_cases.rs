@@ -237,9 +237,7 @@ fn test_silence_input() {
 fn test_dc_offset_input() {
     let sample_rate = 44100u32;
     let input: Vec<f32> = (0..sample_rate as usize * 2)
-        .map(|i| {
-            0.5 + 0.3 * (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin()
-        })
+        .map(|i| 0.5 + 0.3 * (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
         .collect();
 
     let params = StretchParams::new(1.5)
@@ -352,11 +350,7 @@ fn test_alternating_silence_and_tone() {
     assert!(!output.is_empty());
 
     let ratio = output.len() as f64 / input.len() as f64;
-    assert!(
-        (ratio - 1.5).abs() < 0.5,
-        "Gapped signal ratio: {}",
-        ratio
-    );
+    assert!((ratio - 1.5).abs() < 0.5, "Gapped signal ratio: {}", ratio);
 }
 
 // --- Preset compression tests (from agent-2) ---

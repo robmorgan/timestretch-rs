@@ -45,7 +45,11 @@ fn main() {
     }
 
     println!("Halftime Effect Demo");
-    println!("Input:  {} samples ({:.2}s at 120 BPM)", input.len(), duration_secs);
+    println!(
+        "Input:  {} samples ({:.2}s at 120 BPM)",
+        input.len(),
+        duration_secs
+    );
 
     // Apply halftime (2x stretch) using the Halftime preset
     let params = StretchParams::new(2.0)
@@ -58,16 +62,18 @@ fn main() {
     let output_duration = output.len() as f64 / sample_rate as f64;
     let actual_ratio = output.len() as f64 / input.len() as f64;
 
-    println!("Output: {} samples ({:.2}s at ~60 BPM)", output.len(), output_duration);
+    println!(
+        "Output: {} samples ({:.2}s at ~60 BPM)",
+        output.len(),
+        output_duration
+    );
     println!("Actual ratio: {:.3}", actual_ratio);
 
     // Compute RMS to verify energy preservation
-    let input_rms = (input.iter().map(|s| (*s as f64).powi(2)).sum::<f64>()
-        / input.len() as f64)
-        .sqrt();
-    let output_rms = (output.iter().map(|s| (*s as f64).powi(2)).sum::<f64>()
-        / output.len() as f64)
-        .sqrt();
+    let input_rms =
+        (input.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / input.len() as f64).sqrt();
+    let output_rms =
+        (output.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / output.len() as f64).sqrt();
 
     println!("Input RMS:  {:.4}", input_rms);
     println!("Output RMS: {:.4}", output_rms);
