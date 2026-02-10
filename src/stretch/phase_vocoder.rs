@@ -647,4 +647,390 @@ mod tests {
             diff
         );
     }
+
+    // --- identity_phase_lock internals ---
+
+    #[test]
+    fn test_identity_phase_lock_no_peaks() {
+        // Flat magnitude spectrum: no local maxima → no peaks → phases unchanged
+        let num_bins = 16;
+        let magnitudes = vec![1.0f32; num_bins]; // all equal, no peaks
+        let analysis_phases: Vec<f32> = (0..num_bins).map(|i| i as f32 * 0.1).collect();
+        let mut synthesis_phases: Vec<f32> = (0..num_bins).map(|i| i as f32 * 0.2).collect();
+        let original_phases = synthesis_phases.clone();
+        let mut peaks = Vec::new();
+
+        identity_phase_lock(
+            &magnitudes,
+            &analysis_phases,
+            &mut synthesis_phases,
+            num_bins,
+            0,
+            &mut peaks,
+        );
+
+        // With no peaks found, phases should remain unchanged
+        assert_eq!(synthesis_phases, original_phases);
+    }
+
+    #[test]
+    fn test_identity_phase_lock_single_peak() {
+        // Single peak at bin 5; all non-peak bins should be locked to it
+        let num_bins = 16;
+        let mut magnitudes = vec![0.1f32; num_bins];
+        magnitudes[5] = 1.0; // peak at bin 5
+        let analysis_phases: Vec<f32> = (0..num_bins).map(|i| i as f32 * 0.3).collect();
+        let mut synthesis_phases: Vec<f32> = (0..num_bins).map(|i| i as f32 * 0.5).collect();
+        let mut peaks = Vec::new();
+
+        identity_phase_lock(
+            &magnitudes,
+            &analysis_phases,
+            &mut synthesis_phases,
+            num_bins,
+            0, // start_bin = 0
+            &mut peaks,
+        );
+
+        // Peak at bin 5 should keep its phase
+        // Non-peak bins should be: synth[peak] + (analysis[bin] - analysis[peak])
+        let peak_synth = 5.0 * 0.5; // original synthesis phase of peak
+        for bin in 1..num_bins - 1 {
+            if bin == 5 {
+                // Peak bin keeps its phase
+                assert!(
+                    (synthesis_phases[bin] - peak_synth).abs() < 1e-6,
+                    "Peak bin should keep its phase"
+                );
+            } else {
+                let expected = peak_synth + (analysis_phases[bin] - analysis_phases[5]);
+                assert!(
+                    (synthesis_phases[bin] - expected).abs() < 1e-6,
+                    "Bin {} should be locked to peak: got {}, expected {}",
+                    bin,
+                    synthesis_phases[bin],
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_identity_phase_lock_start_bin_above_num_bins() {
+        // start_bin >= num_bins: early return, no changes
+        let num_bins = 8;
+        let magnitudes = vec![0.0f32; num_bins];
+        let analysis_phases = vec![0.0f32; num_bins];
+        let mut synthesis_phases = vec![1.0f32; num_bins];
+        let original = synthesis_phases.clone();
+        let mut peaks = Vec::new();
+
+        identity_phase_lock(
+            &magnitudes,
+            &analysis_phases,
+            &mut synthesis_phases,
+            num_bins,
+            num_bins, // start_bin == num_bins → early return
+            &mut peaks,
+        );
+
+        assert_eq!(synthesis_phases, original);
+    }
+
+    #[test]
+    fn test_identity_phase_lock_num_bins_less_than_3() {
+        // num_bins < 3: early return
+        let magnitudes = vec![1.0f32; 2];
+        let analysis_phases = vec![0.0f32; 2];
+        let mut synthesis_phases = vec![0.5f32; 2];
+        let original = synthesis_phases.clone();
+        let mut peaks = Vec::new();
+
+        identity_phase_lock(
+            &magnitudes,
+            &analysis_phases,
+            &mut synthesis_phases,
+            2,
+            0,
+            &mut peaks,
+        );
+
+        assert_eq!(synthesis_phases, original);
+    }
+
+    #[test]
+    fn test_identity_phase_lock_sub_bass_region_skipped() {
+        // Peaks exist only below start_bin → no peaks found above sub-bass
+        let num_bins = 16;
+        let mut magnitudes = vec![0.1f32; num_bins];
+        magnitudes[2] = 1.0; // peak below start_bin=5
+        let analysis_phases = vec![0.0f32; num_bins];
+        let mut synthesis_phases: Vec<f32> = (0..num_bins).map(|i| i as f32).collect();
+        let original = synthesis_phases.clone();
+        let mut peaks = Vec::new();
+
+        identity_phase_lock(
+            &magnitudes,
+            &analysis_phases,
+            &mut synthesis_phases,
+            num_bins,
+            5, // start_bin=5, peak at bin 2 is below
+            &mut peaks,
+        );
+
+        // No peaks above start_bin → no changes
+        assert_eq!(synthesis_phases, original);
+    }
+
+    #[test]
+    fn test_identity_phase_lock_multiple_peaks() {
+        // Two peaks: bins should lock to nearest peak
+        let num_bins = 16;
+        let mut magnitudes = vec![0.1f32; num_bins];
+        magnitudes[3] = 1.0; // peak at bin 3
+        magnitudes[10] = 0.8; // peak at bin 10
+        let analysis_phases: Vec<f32> = (0..num_bins).map(|i| i as f32 * 0.1).collect();
+        let mut synthesis_phases: Vec<f32> = (0..num_bins).map(|i| i as f32 * 0.2).collect();
+        let mut peaks = Vec::new();
+
+        identity_phase_lock(
+            &magnitudes,
+            &analysis_phases,
+            &mut synthesis_phases,
+            num_bins,
+            1, // start_bin=1
+            &mut peaks,
+        );
+
+        // Bin 1 is closest to peak at bin 3
+        let expected_1 = 3.0 * 0.2 + (1.0 * 0.1 - 3.0 * 0.1);
+        assert!(
+            (synthesis_phases[1] - expected_1).abs() < 1e-5,
+            "Bin 1 should lock to peak 3"
+        );
+
+        // Bin 12 is closest to peak at bin 10
+        let expected_12 = 10.0 * 0.2 + (12.0 * 0.1 - 10.0 * 0.1);
+        assert!(
+            (synthesis_phases[12] - expected_12).abs() < 1e-5,
+            "Bin 12 should lock to peak 10"
+        );
+    }
+
+    // --- normalize_output internals ---
+
+    #[test]
+    fn test_normalize_output_uniform_window_sum() {
+        // When window_sum is uniform, output should be divided by that value
+        let mut output = vec![2.0f32; 10];
+        let window_sum = vec![2.0f32; 10];
+        PhaseVocoder::normalize_output(&mut output, &window_sum);
+        for &s in &output {
+            assert!((s - 1.0).abs() < 1e-6, "Expected 1.0, got {}", s);
+        }
+    }
+
+    #[test]
+    fn test_normalize_output_low_window_sum_clamped() {
+        // Very small window sums should be clamped to min_window_sum
+        // to prevent amplification
+        let mut output = vec![1.0f32; 10];
+        let mut window_sum = vec![1.0f32; 10];
+        // One sample has near-zero window sum (low-overlap region)
+        window_sum[5] = 1e-10;
+        PhaseVocoder::normalize_output(&mut output, &window_sum);
+
+        // The clamped sample should NOT be amplified wildly
+        // min_window_sum = max(1.0) * MIN_WINDOW_SUM_RATIO = 0.1
+        // So output[5] = 1.0 / 0.1 = 10.0
+        assert!(
+            output[5] <= 11.0,
+            "Low window sum should be clamped, got {}",
+            output[5]
+        );
+        // Normal samples should be ~1.0
+        assert!((output[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_normalize_output_all_zero_window_sum() {
+        // All-zero window sum: should use WINDOW_SUM_EPSILON floor
+        let mut output = vec![1.0f32; 5];
+        let window_sum = vec![0.0f32; 5];
+        PhaseVocoder::normalize_output(&mut output, &window_sum);
+        // Each sample = 1.0 / WINDOW_SUM_EPSILON
+        for &s in &output {
+            assert!(s.is_finite(), "Output should be finite, got {}", s);
+        }
+    }
+
+    // --- wrap_phase edge cases ---
+
+    #[test]
+    fn test_wrap_phase_exact_boundaries() {
+        // Exactly PI should wrap to -PI (or very close)
+        let result = wrap_phase(PI);
+        assert!(
+            (result - (-PI)).abs() < 1e-5 || (result - PI).abs() < 1e-5,
+            "wrap_phase(PI) = {} should be near ±PI",
+            result
+        );
+
+        // Exactly -PI
+        let result = wrap_phase(-PI);
+        assert!(
+            (result - (-PI)).abs() < 1e-5 || (result - PI).abs() < 1e-5,
+            "wrap_phase(-PI) = {} should be near ±PI",
+            result
+        );
+
+        // Exactly 0
+        assert!((wrap_phase(0.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_wrap_phase_very_large_values() {
+        // Very large positive and negative values
+        let result = wrap_phase(1000.0 * PI);
+        assert!(
+            (-PI..=PI).contains(&result),
+            "wrap_phase(1000*PI) = {} should be in [-PI, PI]",
+            result
+        );
+
+        let result = wrap_phase(-999.0 * PI);
+        assert!(
+            (-PI..=PI).contains(&result),
+            "wrap_phase(-999*PI) = {} should be in [-PI, PI]",
+            result
+        );
+    }
+
+    // --- set_stretch_ratio ---
+
+    #[test]
+    fn test_set_stretch_ratio_updates_hop_synthesis() {
+        let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
+        assert_eq!(pv.hop_synthesis(), 1024); // 1024 * 1.0 = 1024
+
+        pv.set_stretch_ratio(2.0);
+        assert_eq!(pv.hop_synthesis(), 2048); // 1024 * 2.0 = 2048
+
+        pv.set_stretch_ratio(0.5);
+        assert_eq!(pv.hop_synthesis(), 512); // 1024 * 0.5 = 512
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_preserves_phase_state() {
+        // Process some audio, then change ratio and process more.
+        // Phase should be continuous (no reset).
+        let fft_size = 4096;
+        let hop = 1024;
+        let sample_rate = 44100u32;
+        let num_samples = fft_size * 4;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let mut pv = PhaseVocoder::new(fft_size, hop, 1.0, sample_rate, 120.0);
+        let output1 = pv.process(&input).unwrap();
+        assert!(!output1.is_empty());
+
+        // Change ratio and process again — should work without error
+        pv.set_stretch_ratio(1.5);
+        let output2 = pv.process(&input).unwrap();
+        assert!(!output2.is_empty());
+        assert!(output2.len() > output1.len()); // 1.5x should be longer
+    }
+
+    // --- sub_bass_bin edge cases ---
+
+    #[test]
+    fn test_sub_bass_bin_clamped_to_num_bins() {
+        // Very high cutoff: sub_bass_bin should be clamped to num_bins
+        let pv = PhaseVocoder::new(256, 64, 1.0, 44100, 30000.0);
+        let num_bins = 256 / 2 + 1;
+        assert!(
+            pv.sub_bass_bin() <= num_bins,
+            "sub_bass_bin {} should be <= num_bins {}",
+            pv.sub_bass_bin(),
+            num_bins
+        );
+    }
+
+    #[test]
+    fn test_sub_bass_all_bins_rigid() {
+        // With cutoff >= Nyquist, all bins should use rigid locking.
+        // This should still produce valid output (no crash).
+        let fft_size = 512;
+        let hop = 128;
+        let sample_rate = 44100u32;
+        let num_samples = fft_size * 4;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        // Cutoff at Nyquist: all bins are "sub-bass" → all rigid locking
+        let mut pv = PhaseVocoder::new(fft_size, hop, 1.5, sample_rate, 22050.0);
+        let output = pv.process(&input).unwrap();
+        assert!(!output.is_empty());
+        assert!(output.iter().all(|s| s.is_finite()));
+    }
+
+    // --- reconstruct_spectrum conjugate symmetry ---
+
+    #[test]
+    fn test_reconstruct_spectrum_produces_real_output() {
+        // After reconstruct_spectrum + inverse FFT, output should be real-valued
+        // (imaginary parts near zero). This verifies conjugate symmetry is correct.
+        let fft_size = 256;
+        let hop = 64;
+        let sample_rate = 44100u32;
+        let num_samples = fft_size * 4;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let mut pv = PhaseVocoder::new(fft_size, hop, 1.0, sample_rate, 120.0);
+        let output = pv.process(&input).unwrap();
+
+        // If conjugate symmetry is wrong, we'd get complex residues causing
+        // large imaginary parts. The output being finite and reasonable is evidence.
+        assert!(output.iter().all(|s| s.is_finite()));
+        let rms = (output.iter().map(|x| x * x).sum::<f32>() / output.len() as f32).sqrt();
+        assert!(
+            rms > 0.01,
+            "Output should have significant energy, got RMS={}",
+            rms
+        );
+    }
+
+    // --- PV reuse (buffers grow but don't shrink) ---
+
+    #[test]
+    fn test_phase_vocoder_reuse_across_different_lengths() {
+        let fft_size = 1024;
+        let hop = 256;
+        let sample_rate = 44100u32;
+
+        let mut pv = PhaseVocoder::new(fft_size, hop, 1.0, sample_rate, 120.0);
+
+        // Process a long signal
+        let long_input: Vec<f32> = (0..fft_size * 8)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+        let output1 = pv.process(&long_input).unwrap();
+        assert!(!output1.is_empty());
+
+        // Process a shorter signal — buffers should still work (they don't shrink)
+        let short_input: Vec<f32> = (0..fft_size * 2)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+        let output2 = pv.process(&short_input).unwrap();
+        assert!(!output2.is_empty());
+        assert!(output2.len() < output1.len());
+    }
 }

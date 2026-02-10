@@ -572,4 +572,300 @@ mod tests {
             c_neg
         );
     }
+
+    // --- normalized_cross_correlation edge cases ---
+
+    #[test]
+    fn test_ncc_zero_energy_signals() {
+        // Both zero → denom < ENERGY_EPSILON → returns 0.0
+        let a = vec![0.0f32; 8];
+        let b = vec![0.0f32; 8];
+        assert!((normalized_cross_correlation(&a, &b)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_ncc_one_zero_one_nonzero() {
+        // One signal zero, one non-zero → denom < ENERGY_EPSILON → 0.0
+        let a = vec![0.0f32; 4];
+        let b = vec![1.0, 2.0, 3.0, 4.0];
+        assert!((normalized_cross_correlation(&a, &b)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_ncc_orthogonal_signals() {
+        // Sine and cosine over one period are orthogonal
+        let n = 128;
+        let a: Vec<f32> = (0..n)
+            .map(|i| (2.0 * PI * i as f32 / n as f32).sin())
+            .collect();
+        let b: Vec<f32> = (0..n)
+            .map(|i| (2.0 * PI * i as f32 / n as f32).cos())
+            .collect();
+        let c = normalized_cross_correlation(&a, &b);
+        assert!(
+            c.abs() < 0.1,
+            "Orthogonal signals should have near-zero correlation, got {}",
+            c
+        );
+    }
+
+    #[test]
+    fn test_ncc_empty_input() {
+        let c = normalized_cross_correlation(&[], &[]);
+        assert!((c).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_ncc_mismatched_lengths() {
+        // Uses min of two lengths
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![1.0, 2.0];
+        let c = normalized_cross_correlation(&a, &b);
+        // Should correlate [1.0,2.0] with [1.0,2.0] = 1.0
+        assert!(
+            (c - 1.0).abs() < 1e-6,
+            "Truncated correlation should be 1.0, got {}",
+            c
+        );
+    }
+
+    // --- FFT cross-correlation ---
+
+    #[test]
+    fn test_fft_cross_correlate_self_correlation() {
+        // Self-correlation via FFT should have max at lag 0
+        let mut wsola = Wsola::new(100, 50, 1.0);
+        let signal: Vec<f32> = (0..64)
+            .map(|i| (2.0 * PI * 4.0 * i as f32 / 64.0).sin())
+            .collect();
+
+        let corr = wsola.fft_cross_correlate(&signal, &signal);
+        // Lag 0 should have the highest real value
+        let max_lag = corr
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.re.partial_cmp(&b.1.re).unwrap())
+            .unwrap()
+            .0;
+        assert_eq!(max_lag, 0, "Self-correlation peak should be at lag 0");
+    }
+
+    #[test]
+    fn test_fft_cross_correlate_shifted_signal() {
+        // Shift signal by known amount; peak should appear at that lag
+        let mut wsola = Wsola::new(100, 50, 1.0);
+        let n = 128;
+        let shift = 10;
+        let ref_sig: Vec<f32> = (0..64)
+            .map(|i| (2.0 * PI * 3.0 * i as f32 / 64.0).sin())
+            .collect();
+        // Search signal: ref_sig shifted right by `shift` samples
+        let mut search = vec![0.0f32; n];
+        for (i, &v) in ref_sig.iter().enumerate() {
+            if i + shift < n {
+                search[i + shift] = v;
+            }
+        }
+
+        let corr = wsola.fft_cross_correlate(&ref_sig, &search);
+        let norm = 1.0 / corr.len() as f32;
+        // Peak should be at or near `shift`
+        let best_lag = (0..corr.len())
+            .max_by(|&a, &b| {
+                (corr[a].re * norm)
+                    .partial_cmp(&(corr[b].re * norm))
+                    .unwrap()
+            })
+            .unwrap();
+        assert!(
+            (best_lag as i64 - shift as i64).unsigned_abs() <= 2,
+            "Expected peak near lag {}, got {}",
+            shift,
+            best_lag
+        );
+    }
+
+    // --- find_best_candidate ---
+
+    #[test]
+    fn test_find_best_candidate_identical_signals() {
+        // When search_signal starts with ref, best candidate should be at position 0
+        let ref_signal = vec![1.0f32, 0.5, -0.3, 0.8];
+        let overlap_len = ref_signal.len();
+        // Build a search_signal that starts with ref_signal
+        let mut search_signal = ref_signal.clone();
+        search_signal.extend_from_slice(&[0.0; 8]); // padding
+
+        let mut wsola = Wsola::new(100, 50, 1.0);
+        let corr = wsola.fft_cross_correlate(&ref_signal, &search_signal);
+        let ref_energy: f64 = ref_signal.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        let num_candidates = search_signal.len() - overlap_len + 1;
+
+        let best = find_best_candidate(
+            &search_signal,
+            &corr,
+            ref_energy,
+            num_candidates,
+            overlap_len,
+            0, // search_start
+        );
+
+        assert_eq!(
+            best, 0,
+            "Best candidate should be at position 0 (exact match)"
+        );
+    }
+
+    #[test]
+    fn test_find_best_candidate_zero_energy_search() {
+        // All zero search signal → all ncorr = 0.0 → first candidate
+        let ref_signal = vec![1.0f32, 2.0, 3.0];
+        let search_signal = vec![0.0f32; 16];
+        let overlap_len = ref_signal.len();
+
+        let mut wsola = Wsola::new(100, 50, 1.0);
+        let corr = wsola.fft_cross_correlate(&ref_signal, &search_signal);
+        let ref_energy: f64 = ref_signal.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        let num_candidates = search_signal.len() - overlap_len + 1;
+
+        let best = find_best_candidate(
+            &search_signal,
+            &corr,
+            ref_energy,
+            num_candidates,
+            overlap_len,
+            100, // search_start=100
+        );
+
+        // With all zero energy, ncorr=0.0 for all candidates. First one wins.
+        assert_eq!(best, 100);
+    }
+
+    // --- FFT vs direct threshold boundary ---
+
+    #[test]
+    fn test_wsola_fft_threshold_boundary() {
+        // Create a scenario that exercises the FFT path by using a large search range.
+        // FFT_CANDIDATE_THRESHOLD=64, so search_range > 32 should produce >64 candidates.
+        let sample_rate = 44100usize;
+        let segment_size = 882;
+        // search_range = 400: nominal_pos ± 400 → ~800 candidates (> 64 threshold)
+        let search_range = 400;
+
+        let input: Vec<f32> = (0..sample_rate * 2)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let mut wsola = Wsola::new(segment_size, search_range, 1.5);
+        let output = wsola.process(&input).unwrap();
+
+        // Should produce valid stretched output using the FFT path
+        assert!(!output.is_empty());
+        assert!(output.iter().all(|s| s.is_finite()));
+        let ratio = output.len() as f64 / input.len() as f64;
+        assert!(
+            (ratio - 1.5).abs() < 0.1,
+            "Large search range ratio {} too far from 1.5",
+            ratio
+        );
+    }
+
+    #[test]
+    fn test_wsola_direct_path_small_search_range() {
+        // Small search_range → fewer than FFT_CANDIDATE_THRESHOLD candidates → direct path
+        let sample_rate = 44100usize;
+        let segment_size = 882;
+        let search_range = 20; // ~40 candidates (< 64 threshold)
+
+        let input: Vec<f32> = (0..sample_rate * 2)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let mut wsola = Wsola::new(segment_size, search_range, 1.5);
+        let output = wsola.process(&input).unwrap();
+
+        assert!(!output.is_empty());
+        assert!(output.iter().all(|s| s.is_finite()));
+        let ratio = output.len() as f64 / input.len() as f64;
+        assert!(
+            (ratio - 1.5).abs() < 0.15,
+            "Small search range ratio {} too far from 1.5",
+            ratio
+        );
+    }
+
+    // --- overlap_add crossfade ---
+
+    #[test]
+    fn test_overlap_add_crossfade_linearity() {
+        // Verify the overlap region uses a linear crossfade
+        let segment_size = 100;
+        let overlap_size = 50;
+        let wsola = Wsola::new(segment_size, 10, 1.0);
+
+        // Pre-fill output with 1.0
+        let mut output = vec![1.0f32; 200];
+        // Input segment is all 0.0
+        let input = vec![0.0f32; 200];
+
+        wsola.overlap_add(&input, &mut output, 0, 50);
+
+        // In the overlap region (output[50..100]):
+        //   fade_in = i/50, fade_out = 1 - i/50
+        //   output = 1.0 * fade_out + 0.0 * fade_in = 1 - i/50
+        for i in 0..overlap_size {
+            let expected = 1.0 - i as f32 / overlap_size as f32;
+            assert!(
+                (output[50 + i] - expected).abs() < 1e-5,
+                "Overlap sample {}: expected {}, got {}",
+                i,
+                expected,
+                output[50 + i]
+            );
+        }
+
+        // After overlap (output[100..150]), should be the input (0.0)
+        for i in overlap_size..segment_size {
+            assert!(
+                (output[50 + i] - 0.0).abs() < 1e-5,
+                "Post-overlap sample {}: expected 0.0, got {}",
+                i,
+                output[50 + i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_overlap_add_out_of_bounds_clamping() {
+        // Segment extends beyond output buffer — should not panic
+        let wsola = Wsola::new(100, 10, 1.0);
+        let input = vec![0.5f32; 200];
+        let mut output = vec![0.0f32; 60]; // Only 60 samples available
+        wsola.overlap_add(&input, &mut output, 0, 10);
+        // Should write up to output[59] without panicking
+        assert!(output.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn test_overlap_add_input_truncated() {
+        // Input shorter than segment_size — should handle gracefully
+        let wsola = Wsola::new(100, 10, 1.0);
+        let input = vec![0.5f32; 30]; // Only 30 samples
+        let mut output = vec![0.0f32; 100];
+        wsola.overlap_add(&input, &mut output, 0, 0);
+        // Only first 30 samples should be written
+        assert!((output[0] - 0.0).abs() < 1e-5); // fade_in at i=0 → 0*0.5 = 0
+        assert!(output.iter().all(|s| s.is_finite()));
+    }
+
+    // --- WSOLA ratio too small ---
+
+    #[test]
+    fn test_wsola_ratio_too_small_for_segment() {
+        // stretch_ratio so small that advance_output < 1.0 → InvalidRatio error
+        let mut wsola = Wsola::new(882, 441, 0.001);
+        let input = vec![0.0f32; 4410];
+        let result = wsola.process(&input);
+        assert!(result.is_err(), "Extremely small ratio should return error");
+    }
 }

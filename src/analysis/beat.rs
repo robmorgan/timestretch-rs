@@ -171,4 +171,179 @@ mod tests {
         assert_eq!(grid[1], 22050);
         assert_eq!(grid[2], 44100);
     }
+
+    // --- beat_interval_samples ---
+
+    #[test]
+    fn test_beat_interval_samples_120bpm() {
+        let grid = BeatGrid {
+            beats: vec![0],
+            bpm: 120.0,
+            sample_rate: 44100,
+        };
+        // 60 * 44100 / 120 = 22050
+        assert!((grid.beat_interval_samples() - 22050.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_beat_interval_samples_128bpm_48khz() {
+        let grid = BeatGrid {
+            beats: vec![0],
+            bpm: 128.0,
+            sample_rate: 48000,
+        };
+        // 60 * 48000 / 128 = 22500
+        assert!((grid.beat_interval_samples() - 22500.0).abs() < 1.0);
+    }
+
+    // --- snap_to_grid edge cases ---
+
+    #[test]
+    fn test_snap_to_grid_empty_beats() {
+        let grid = BeatGrid {
+            beats: vec![],
+            bpm: 120.0,
+            sample_rate: 44100,
+        };
+        // Empty grid → return position unchanged
+        assert_eq!(grid.snap_to_grid(1000), 1000);
+    }
+
+    #[test]
+    fn test_snap_to_grid_before_first_beat() {
+        let grid = BeatGrid {
+            beats: vec![1000, 2000, 3000],
+            bpm: 120.0,
+            sample_rate: 44100,
+        };
+        // Position before any beat → snaps to first beat
+        assert_eq!(grid.snap_to_grid(500), 1000);
+    }
+
+    #[test]
+    fn test_snap_to_grid_after_last_beat() {
+        let grid = BeatGrid {
+            beats: vec![1000, 2000, 3000],
+            bpm: 120.0,
+            sample_rate: 44100,
+        };
+        // Position after all beats → snaps to last beat
+        assert_eq!(grid.snap_to_grid(10000), 3000);
+    }
+
+    #[test]
+    fn test_snap_to_grid_equidistant() {
+        let grid = BeatGrid {
+            beats: vec![0, 100, 200],
+            bpm: 120.0,
+            sample_rate: 44100,
+        };
+        // Position exactly between beats 0 and 100 → snaps to first one found
+        // (50 is equidistant from 0 and 100; algorithm picks first as min_dist tie)
+        let result = grid.snap_to_grid(50);
+        assert!(
+            result == 0 || result == 100,
+            "Should snap to 0 or 100, got {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_snap_to_grid_exact_beat() {
+        let grid = BeatGrid {
+            beats: vec![0, 22050, 44100],
+            bpm: 120.0,
+            sample_rate: 44100,
+        };
+        assert_eq!(grid.snap_to_grid(22050), 22050);
+    }
+
+    // --- estimate_bpm_from_intervals ---
+
+    #[test]
+    fn test_estimate_bpm_halving_high_bpm() {
+        // Raw BPM 320 → should halve to 160 (within MAX_EDM_BPM)
+        // 320 BPM at 44100 Hz = 60*44100/320 = 8268.75 samples
+        let intervals = vec![8269, 8269, 8269];
+        let bpm = estimate_bpm_from_intervals(&intervals, 44100);
+        assert!(
+            (bpm - 160.0).abs() < 2.0,
+            "320 BPM should halve to ~160, got {}",
+            bpm
+        );
+    }
+
+    #[test]
+    fn test_estimate_bpm_doubling_low_bpm() {
+        // Raw BPM 50 → should double to 100 (at MIN_EDM_BPM)
+        // 50 BPM at 44100 Hz = 60*44100/50 = 52920 samples
+        let intervals = vec![52920, 52920, 52920];
+        let bpm = estimate_bpm_from_intervals(&intervals, 44100);
+        assert!(
+            (bpm - 100.0).abs() < 2.0,
+            "50 BPM should double to ~100, got {}",
+            bpm
+        );
+    }
+
+    #[test]
+    fn test_estimate_bpm_already_in_range() {
+        // 128 BPM should stay as-is (within 100-160 range)
+        let interval = (60.0 * 44100.0 / 128.0) as usize;
+        let intervals = vec![interval, interval, interval];
+        let bpm = estimate_bpm_from_intervals(&intervals, 44100);
+        assert!(
+            (bpm - 128.0).abs() < 2.0,
+            "128 BPM should stay ~128, got {}",
+            bpm
+        );
+    }
+
+    #[test]
+    fn test_estimate_bpm_outlier_robustness() {
+        // Median should be robust to one outlier
+        // 4 intervals at 120 BPM, 1 outlier
+        let normal = (60.0 * 44100.0 / 120.0) as usize; // 22050
+        let outlier = normal / 3; // very short interval
+        let intervals = vec![normal, normal, outlier, normal, normal];
+        let bpm = estimate_bpm_from_intervals(&intervals, 44100);
+        // Median of sorted = [outlier, 22050, 22050, 22050, 22050] → median = 22050
+        assert!(
+            (bpm - 120.0).abs() < 2.0,
+            "BPM should be robust to outlier, got {}",
+            bpm
+        );
+    }
+
+    // --- quantize_to_grid edge cases ---
+
+    #[test]
+    fn test_quantize_to_grid_empty_onsets() {
+        let result = quantize_to_grid(&[], 22050);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_quantize_to_grid_zero_interval() {
+        // beat_interval == 0 → return onsets as-is
+        let onsets = vec![100, 200, 300];
+        let result = quantize_to_grid(&onsets, 0);
+        assert_eq!(result, onsets);
+    }
+
+    #[test]
+    fn test_quantize_to_grid_single_onset() {
+        let result = quantize_to_grid(&[5000], 22050);
+        // Grid starts at 5000, extends by beat_interval
+        assert_eq!(result, vec![5000]);
+    }
+
+    #[test]
+    fn test_quantize_to_grid_extension() {
+        // Grid should extend up to last + interval/2
+        let onsets = vec![0, 44100];
+        let result = quantize_to_grid(&onsets, 22050);
+        // Grid: 0, 22050, 44100 (44100 <= 44100 + 22050/2 = 55125)
+        assert_eq!(result, vec![0, 22050, 44100]);
+    }
 }

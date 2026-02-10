@@ -997,4 +997,225 @@ mod tests {
             rem_rms
         );
     }
+
+    // --- segment_audio internals ---
+
+    #[test]
+    fn test_segment_audio_no_onsets() {
+        let params = StretchParams::new(1.5).with_sample_rate(44100);
+        let stretcher = HybridStretcher::new(params);
+        let segments = stretcher.segment_audio(44100, &[]);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].start, 0);
+        assert_eq!(segments[0].end, 44100);
+        assert!(!segments[0].is_transient);
+    }
+
+    #[test]
+    fn test_segment_audio_single_onset() {
+        let params = StretchParams::new(1.5).with_sample_rate(44100);
+        let stretcher = HybridStretcher::new(params);
+        let input_len = 44100;
+        let onset = 10000;
+        let segments = stretcher.segment_audio(input_len, &[onset]);
+
+        // Should have: tonal [0, onset), transient [onset, onset+transient_size), tonal [onset+transient_size, end)
+        assert!(segments.len() >= 2, "Should have at least 2 segments");
+        assert_eq!(segments[0].start, 0);
+        assert_eq!(segments[0].end, onset);
+        assert!(!segments[0].is_transient);
+
+        assert_eq!(segments[1].start, onset);
+        assert!(segments[1].is_transient);
+    }
+
+    #[test]
+    fn test_segment_audio_onset_at_zero() {
+        // Onset at position 0: onset <= pos (0 <= 0) so it's skipped.
+        // Entire input becomes a single tonal segment.
+        let params = StretchParams::new(1.5).with_sample_rate(44100);
+        let stretcher = HybridStretcher::new(params);
+        let segments = stretcher.segment_audio(44100, &[0]);
+
+        assert_eq!(segments.len(), 1);
+        assert!(!segments[0].is_transient);
+        assert_eq!(segments[0].start, 0);
+        assert_eq!(segments[0].end, 44100);
+    }
+
+    #[test]
+    fn test_segment_audio_onset_near_end() {
+        // Onset near end of input: transient region clamped to input_len
+        let params = StretchParams::new(1.5).with_sample_rate(44100);
+        let stretcher = HybridStretcher::new(params);
+        let input_len = 44100;
+        let onset = 44090; // Very near end
+        let segments = stretcher.segment_audio(input_len, &[onset]);
+
+        // Last transient segment should be clamped to input_len
+        let last_transient = segments.iter().find(|s| s.is_transient).unwrap();
+        assert!(last_transient.end <= input_len);
+    }
+
+    #[test]
+    fn test_segment_audio_overlapping_onsets() {
+        // Two onsets where second falls within transient region of first
+        let params = StretchParams::new(1.5).with_sample_rate(44100);
+        let stretcher = HybridStretcher::new(params);
+        let transient_size = (44100.0 * TRANSIENT_REGION_SECS) as usize; // ~441
+        let onset1 = 10000;
+        let onset2 = onset1 + transient_size / 2; // Within transient region of onset1
+
+        let segments = stretcher.segment_audio(44100, &[onset1, onset2]);
+
+        // Second onset should be skipped (onset2 <= pos after first transient)
+        let transient_count = segments.iter().filter(|s| s.is_transient).count();
+        // Should have 1 or 2 transient segments depending on overlap
+        assert!(
+            transient_count >= 1,
+            "Should have at least 1 transient segment"
+        );
+    }
+
+    // --- concatenate_with_crossfade edge cases ---
+
+    #[test]
+    fn test_crossfade_empty_segments() {
+        let result = concatenate_with_crossfade(&[], 20);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_crossfade_single_segment() {
+        let seg = vec![1.0, 2.0, 3.0];
+        let result = concatenate_with_crossfade(std::slice::from_ref(&seg), 20);
+        assert_eq!(result, seg);
+    }
+
+    #[test]
+    fn test_crossfade_zero_length() {
+        // crossfade_len=0 → no overlap, just concatenation
+        let a = vec![1.0; 10];
+        let b = vec![2.0; 10];
+        let result = concatenate_with_crossfade(&[a, b], 0);
+        assert_eq!(result.len(), 20);
+        assert!((result[0] - 1.0).abs() < 1e-6);
+        assert!((result[10] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_crossfade_larger_than_segment() {
+        // crossfade_len > segment length → clamped to min of output.len() and segment.len()
+        let a = vec![1.0; 5];
+        let b = vec![0.5; 5];
+        let result = concatenate_with_crossfade(&[a, b], 100);
+        // Crossfade len clamped to min(5, 5) = 5
+        // Total length = 5 (output from a) - 5 (overlap) + 5 (b) = 5
+        assert!(
+            result.len() >= 5,
+            "Output should have at least 5 samples, got {}",
+            result.len()
+        );
+        assert!(result.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn test_crossfade_raised_cosine_midpoint() {
+        // At midpoint (t=0.5), raised cosine should be ~0.5 for both fade_in and fade_out
+        let a = vec![1.0; 100];
+        let b = vec![0.0; 100];
+        let crossfade_len = 50;
+        let result = concatenate_with_crossfade(&[a, b], crossfade_len);
+
+        // Crossfade starts at output[100-50]=output[50]
+        // At midpoint i=25: t=0.5, fade_out = 0.5*(1+cos(0.5*PI)) ≈ 0.5, fade_in ≈ 0.5
+        // output = 1.0 * 0.5 + 0.0 * 0.5 = 0.5
+        let mid_idx = 50 + 25;
+        assert!(
+            (result[mid_idx] - 0.5).abs() < 0.05,
+            "Midpoint of crossfade should be ~0.5, got {}",
+            result[mid_idx]
+        );
+    }
+
+    #[test]
+    fn test_crossfade_three_segments() {
+        let a = vec![1.0; 100];
+        let b = vec![0.5; 100];
+        let c = vec![0.0; 100];
+        let crossfade_len = 20;
+        let result = concatenate_with_crossfade(&[a, b, c], crossfade_len);
+        // Total ≈ 300 - 2*20 = 260
+        assert!(
+            (result.len() as i64 - 260).unsigned_abs() < 5,
+            "Three segments should produce ~260 samples, got {}",
+            result.len()
+        );
+    }
+
+    // --- merge_onsets_and_beats: dedup distance boundary ---
+
+    #[test]
+    fn test_merge_dedup_distance_exactly_512() {
+        // Beat exactly 512 samples from onset → just barely too close, should be deduped
+        let onsets = vec![1000];
+        let beats = vec![1512]; // exactly 512 away
+        let result = merge_onsets_and_beats(&onsets, &beats, 44100);
+        // DEDUP_DISTANCE = 512, condition is dist < 512, so 512 is NOT too close
+        assert_eq!(result, vec![1000, 1512]);
+    }
+
+    #[test]
+    fn test_merge_dedup_distance_511() {
+        // Beat 511 samples from onset → too close, should be deduped
+        let onsets = vec![1000];
+        let beats = vec![1511]; // 511 away (< 512)
+        let result = merge_onsets_and_beats(&onsets, &beats, 44100);
+        assert_eq!(result, vec![1000]); // beat deduped
+    }
+
+    // --- separate_sub_bass: short input fallback ---
+
+    #[test]
+    fn test_separate_sub_bass_short_input() {
+        // Input shorter than BAND_SPLIT_FFT_SIZE → sub_bass is zeros, remainder is input
+        let input = vec![0.5f32; 100];
+        let (sub, rem) = separate_sub_bass(&input, 120.0, 44100);
+        assert_eq!(sub.len(), 100);
+        assert_eq!(rem.len(), 100);
+        // Sub should be all zeros
+        assert!(sub.iter().all(|&s| s.abs() < 1e-10));
+        // Remainder should equal input
+        for (i, (&r, &inp)) in rem.iter().zip(input.iter()).enumerate() {
+            assert!(
+                (r - inp).abs() < 1e-6,
+                "Sample {}: remainder {} != input {}",
+                i,
+                r,
+                inp
+            );
+        }
+    }
+
+    // --- stretch_segment fallback paths ---
+
+    #[test]
+    fn test_hybrid_very_short_segment_fallback() {
+        // Input shorter than MIN_SEGMENT_FOR_STRETCH → linear resampling fallback
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_band_split(false);
+        let stretcher = HybridStretcher::new(params);
+
+        // 200 samples < MIN_SEGMENT_FOR_STRETCH=256 → falls back to WSOLA first,
+        // but if it's a single segment it goes through stretch_segment
+        let input: Vec<f32> = (0..200)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+
+        let output = stretcher.process(&input).unwrap();
+        assert!(!output.is_empty());
+        assert!(output.iter().all(|s| s.is_finite()));
+    }
 }
