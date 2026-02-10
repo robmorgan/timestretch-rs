@@ -21,6 +21,14 @@ pub struct Wsola {
     search_range: usize,
     stretch_ratio: f64,
     planner: FftPlanner<f32>,
+    /// Reusable FFT buffer for reference signal in cross-correlation.
+    fft_ref_buf: Vec<Complex<f32>>,
+    /// Reusable FFT buffer for search signal in cross-correlation.
+    fft_search_buf: Vec<Complex<f32>>,
+    /// Reusable FFT buffer for correlation result.
+    fft_corr_buf: Vec<Complex<f32>>,
+    /// Reusable prefix-sum buffer for energy normalization.
+    prefix_sq_buf: Vec<f64>,
 }
 
 impl std::fmt::Debug for Wsola {
@@ -44,6 +52,10 @@ impl Wsola {
             search_range,
             stretch_ratio,
             planner: FftPlanner::new(),
+            fft_ref_buf: Vec::new(),
+            fft_search_buf: Vec::new(),
+            fft_corr_buf: Vec::new(),
+            prefix_sq_buf: Vec::new(),
         }
     }
 
@@ -236,8 +248,8 @@ impl Wsola {
         }
         let search_signal = &input[search_start..actual_region_end];
 
-        // Compute raw cross-correlation via FFT
-        let corr_buf = self.fft_cross_correlate(ref_signal, search_signal);
+        // Compute raw cross-correlation via FFT (results stored in self.fft_corr_buf)
+        self.fft_cross_correlate(ref_signal, search_signal);
 
         // Compute reference energy (constant for all candidates)
         let ref_energy: f64 = ref_signal.iter().map(|&s| (s as f64) * (s as f64)).sum();
@@ -247,9 +259,20 @@ impl Wsola {
 
         // Find best candidate using normalized correlation
         let num_candidates = actual_region_len.saturating_sub(overlap_len) + 1;
+
+        // Reuse prefix_sq_buf for energy normalization
+        self.prefix_sq_buf.clear();
+        self.prefix_sq_buf.reserve(search_signal.len() + 1);
+        self.prefix_sq_buf.push(0.0f64);
+        let mut accum = 0.0f64;
+        for &s in search_signal {
+            accum += (s as f64) * (s as f64);
+            self.prefix_sq_buf.push(accum);
+        }
+
         let best_pos = find_best_candidate(
-            search_signal,
-            &corr_buf,
+            &self.prefix_sq_buf,
+            &self.fft_corr_buf,
             ref_energy,
             num_candidates,
             overlap_len,
@@ -262,12 +285,9 @@ impl Wsola {
 
     /// Computes cross-correlation between two signals using FFT.
     ///
-    /// Returns the raw (unnormalized) correlation buffer in the frequency domain.
-    fn fft_cross_correlate(
-        &mut self,
-        ref_signal: &[f32],
-        search_signal: &[f32],
-    ) -> Vec<Complex<f32>> {
+    /// Uses pre-allocated buffers that grow as needed but never shrink,
+    /// eliminating per-call heap allocations in the hot path.
+    fn fft_cross_correlate(&mut self, ref_signal: &[f32], search_signal: &[f32]) {
         let conv_len = search_signal.len() + ref_signal.len() - 1;
         let fft_size = conv_len.next_power_of_two();
 
@@ -276,33 +296,42 @@ impl Wsola {
 
         let zero = Complex::new(0.0f32, 0.0);
 
-        // Zero-pad signals into FFT buffers
-        let mut ref_buf: Vec<Complex<f32>> = ref_signal
-            .iter()
-            .map(|&s| Complex::new(s, 0.0))
-            .chain(std::iter::repeat(zero))
-            .take(fft_size)
-            .collect();
+        // Resize and fill reusable buffers (grow-only, never shrink)
+        self.fft_ref_buf.resize(fft_size, zero);
+        for (i, slot) in self.fft_ref_buf.iter_mut().enumerate() {
+            *slot = if i < ref_signal.len() {
+                Complex::new(ref_signal[i], 0.0)
+            } else {
+                zero
+            };
+        }
 
-        let mut search_buf: Vec<Complex<f32>> = search_signal
-            .iter()
-            .map(|&s| Complex::new(s, 0.0))
-            .chain(std::iter::repeat(zero))
-            .take(fft_size)
-            .collect();
+        self.fft_search_buf.resize(fft_size, zero);
+        for (i, slot) in self.fft_search_buf.iter_mut().enumerate() {
+            *slot = if i < search_signal.len() {
+                Complex::new(search_signal[i], 0.0)
+            } else {
+                zero
+            };
+        }
 
-        // Forward FFT, multiply conj(Ref) * Search, inverse FFT
-        fft_fwd.process(&mut ref_buf);
-        fft_fwd.process(&mut search_buf);
+        // Forward FFT
+        fft_fwd.process(&mut self.fft_ref_buf);
+        fft_fwd.process(&mut self.fft_search_buf);
 
-        let mut corr_buf: Vec<Complex<f32>> = ref_buf
-            .iter()
-            .zip(search_buf.iter())
-            .map(|(r, s)| r.conj() * s)
-            .collect();
+        // Multiply conj(Ref) * Search into corr_buf
+        self.fft_corr_buf.resize(fft_size, zero);
+        for ((corr, r), s) in self
+            .fft_corr_buf
+            .iter_mut()
+            .zip(self.fft_ref_buf.iter())
+            .zip(self.fft_search_buf.iter())
+        {
+            *corr = r.conj() * s;
+        }
 
-        fft_inv.process(&mut corr_buf);
-        corr_buf
+        // Inverse FFT in-place
+        fft_inv.process(&mut self.fft_corr_buf);
     }
 
     /// Overlap-adds a segment from input into output with raised-cosine crossfade.
@@ -334,9 +363,9 @@ impl Wsola {
 /// Finds the best correlation candidate using prefix-sum energy normalization.
 ///
 /// Scans `num_candidates` lag positions in `corr_buf`, normalizing each by
-/// the windowed energy of `search_signal` and the reference energy.
+/// the windowed energy (via pre-computed `prefix_sq`) and the reference energy.
 fn find_best_candidate(
-    search_signal: &[f32],
+    prefix_sq: &[f64],
     corr_buf: &[Complex<f32>],
     ref_energy: f64,
     num_candidates: usize,
@@ -344,15 +373,6 @@ fn find_best_candidate(
     search_start: usize,
 ) -> usize {
     let norm = 1.0 / corr_buf.len() as f64;
-
-    // Running energy of search signal windows via prefix sums
-    let mut prefix_sq = Vec::with_capacity(search_signal.len() + 1);
-    prefix_sq.push(0.0f64);
-    let mut accum = 0.0f64;
-    for &s in search_signal {
-        accum += (s as f64) * (s as f64);
-        prefix_sq.push(accum);
-    }
 
     let mut best_pos = search_start;
     let mut best_ncorr = f64::NEG_INFINITY;
@@ -656,9 +676,10 @@ mod tests {
             .map(|i| (2.0 * PI * 4.0 * i as f32 / 64.0).sin())
             .collect();
 
-        let corr = wsola.fft_cross_correlate(&signal, &signal);
+        wsola.fft_cross_correlate(&signal, &signal);
         // Lag 0 should have the highest real value
-        let max_lag = corr
+        let max_lag = wsola
+            .fft_corr_buf
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.re.partial_cmp(&b.1.re).unwrap())
@@ -684,13 +705,13 @@ mod tests {
             }
         }
 
-        let corr = wsola.fft_cross_correlate(&ref_sig, &search);
-        let norm = 1.0 / corr.len() as f32;
+        wsola.fft_cross_correlate(&ref_sig, &search);
+        let norm = 1.0 / wsola.fft_corr_buf.len() as f32;
         // Peak should be at or near `shift`
-        let best_lag = (0..corr.len())
+        let best_lag = (0..wsola.fft_corr_buf.len())
             .max_by(|&a, &b| {
-                (corr[a].re * norm)
-                    .partial_cmp(&(corr[b].re * norm))
+                (wsola.fft_corr_buf[a].re * norm)
+                    .partial_cmp(&(wsola.fft_corr_buf[b].re * norm))
                     .unwrap()
             })
             .unwrap();
@@ -704,6 +725,18 @@ mod tests {
 
     // --- find_best_candidate ---
 
+    /// Helper to compute prefix sum of squared values for energy normalization.
+    fn compute_prefix_sq(signal: &[f32]) -> Vec<f64> {
+        let mut prefix_sq = Vec::with_capacity(signal.len() + 1);
+        prefix_sq.push(0.0f64);
+        let mut accum = 0.0f64;
+        for &s in signal {
+            accum += (s as f64) * (s as f64);
+            prefix_sq.push(accum);
+        }
+        prefix_sq
+    }
+
     #[test]
     fn test_find_best_candidate_identical_signals() {
         // When search_signal starts with ref, best candidate should be at position 0
@@ -714,13 +747,14 @@ mod tests {
         search_signal.extend_from_slice(&[0.0; 8]); // padding
 
         let mut wsola = Wsola::new(100, 50, 1.0);
-        let corr = wsola.fft_cross_correlate(&ref_signal, &search_signal);
+        wsola.fft_cross_correlate(&ref_signal, &search_signal);
         let ref_energy: f64 = ref_signal.iter().map(|&s| (s as f64) * (s as f64)).sum();
         let num_candidates = search_signal.len() - overlap_len + 1;
+        let prefix_sq = compute_prefix_sq(&search_signal);
 
         let best = find_best_candidate(
-            &search_signal,
-            &corr,
+            &prefix_sq,
+            &wsola.fft_corr_buf,
             ref_energy,
             num_candidates,
             overlap_len,
@@ -741,13 +775,14 @@ mod tests {
         let overlap_len = ref_signal.len();
 
         let mut wsola = Wsola::new(100, 50, 1.0);
-        let corr = wsola.fft_cross_correlate(&ref_signal, &search_signal);
+        wsola.fft_cross_correlate(&ref_signal, &search_signal);
         let ref_energy: f64 = ref_signal.iter().map(|&s| (s as f64) * (s as f64)).sum();
         let num_candidates = search_signal.len() - overlap_len + 1;
+        let prefix_sq = compute_prefix_sq(&search_signal);
 
         let best = find_best_candidate(
-            &search_signal,
-            &corr,
+            &prefix_sq,
+            &wsola.fft_corr_buf,
             ref_energy,
             num_candidates,
             overlap_len,

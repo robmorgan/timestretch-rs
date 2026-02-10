@@ -209,15 +209,19 @@ impl StreamProcessor {
     }
 
     /// Interleaves per-channel outputs into a single buffer.
+    ///
+    /// Returns a copy of the interleaved data; the scratch buffer stays
+    /// allocated for reuse on the next call.
     fn interleave_output(&mut self, min_output_len: usize, num_channels: usize) -> Vec<f32> {
+        let total = min_output_len * num_channels;
         self.output_scratch.clear();
-        self.output_scratch.reserve(min_output_len * num_channels);
+        self.output_scratch.reserve(total);
         for i in 0..min_output_len {
             for ch in 0..num_channels {
                 self.output_scratch.push(self.channel_buffers[ch][i]);
             }
         }
-        std::mem::take(&mut self.output_scratch)
+        self.output_scratch.clone()
     }
 
     /// Processes accumulated input through the hybrid algorithm (transient detection + WSOLA + PV).
