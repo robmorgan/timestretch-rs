@@ -1,5 +1,6 @@
 //! Hybrid stretcher combining WSOLA (transients) with phase vocoder (tonal content).
 
+use crate::analysis::beat::detect_beats;
 use crate::analysis::transient::detect_transients;
 use crate::core::types::StretchParams;
 use crate::error::StretchError;
@@ -21,6 +22,9 @@ const MIN_WSOLA_SEARCH: usize = 16;
 const TRANSIENT_MAX_FFT: usize = 2048;
 /// Maximum hop size for transient detection.
 const TRANSIENT_MAX_HOP: usize = 512;
+/// Minimum input length (in samples) for beat detection to be worthwhile.
+/// Below this, beat detection is too unreliable to improve segmentation.
+const MIN_SAMPLES_FOR_BEAT_DETECTION: usize = 44100; // ~1 second at 44.1kHz
 
 /// Transient-aware hybrid stretcher.
 ///
@@ -70,8 +74,16 @@ impl HybridStretcher {
             self.params.transient_sensitivity,
         );
 
-        // Step 2: Segment audio at transient boundaries
-        let segments = self.segment_audio(input.len(), &transients.onsets);
+        // Step 1b: Optionally detect beat grid and merge with transient onsets
+        let onsets = if self.params.beat_aware && input.len() >= MIN_SAMPLES_FOR_BEAT_DETECTION {
+            let grid = detect_beats(input, self.params.sample_rate);
+            merge_onsets_and_beats(&transients.onsets, &grid.beats, input.len())
+        } else {
+            transients.onsets.clone()
+        };
+
+        // Step 2: Segment audio at transient/beat boundaries
+        let segments = self.segment_audio(input.len(), &onsets);
 
         // Step 3: Process each segment with appropriate algorithm
         // Reuse a single PV instance for tonal segments (avoids FFT planner recreation)
@@ -204,6 +216,35 @@ impl HybridStretcher {
     }
 }
 
+/// Merges transient onsets with beat grid positions, deduplicating nearby entries.
+///
+/// Beat positions that fall within `DEDUP_DISTANCE` samples of an existing
+/// transient onset are dropped to avoid creating overly short segments.
+fn merge_onsets_and_beats(onsets: &[usize], beats: &[usize], input_len: usize) -> Vec<usize> {
+    /// Minimum distance (samples) between merged positions.
+    /// Positions closer than this are considered duplicates.
+    const DEDUP_DISTANCE: usize = 512;
+
+    let mut merged: Vec<usize> = onsets.to_vec();
+
+    // Add beat positions that aren't too close to existing transient onsets
+    for &beat in beats {
+        if beat >= input_len {
+            continue;
+        }
+        let too_close = merged.iter().any(|&pos| {
+            let dist = pos.abs_diff(beat);
+            dist < DEDUP_DISTANCE
+        });
+        if !too_close {
+            merged.push(beat);
+        }
+    }
+
+    merged.sort_unstable();
+    merged
+}
+
 /// Concatenates segments with raised-cosine crossfade.
 fn concatenate_with_crossfade(segments: &[Vec<f32>], crossfade_len: usize) -> Vec<f32> {
     match segments.len() {
@@ -321,5 +362,136 @@ mod tests {
         // Middle of crossfade should be between 0.5 and 1.0
         let mid = result[90];
         assert!((0.4..=1.1).contains(&mid), "Crossfade mid = {}", mid);
+    }
+
+    #[test]
+    fn test_merge_onsets_and_beats_empty() {
+        let result = merge_onsets_and_beats(&[], &[], 44100);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_merge_onsets_and_beats_no_overlap() {
+        let onsets = vec![1000, 5000];
+        let beats = vec![10000, 20000];
+        let result = merge_onsets_and_beats(&onsets, &beats, 44100);
+        assert_eq!(result, vec![1000, 5000, 10000, 20000]);
+    }
+
+    #[test]
+    fn test_merge_onsets_and_beats_dedup_close() {
+        // Beat at 1100 is within 512 samples of onset at 1000 — should be deduped
+        let onsets = vec![1000, 5000];
+        let beats = vec![1100, 20000];
+        let result = merge_onsets_and_beats(&onsets, &beats, 44100);
+        assert_eq!(result, vec![1000, 5000, 20000]);
+    }
+
+    #[test]
+    fn test_merge_onsets_and_beats_out_of_bounds() {
+        // Beat at 50000 exceeds input_len of 44100 — should be dropped
+        let onsets = vec![1000];
+        let beats = vec![50000];
+        let result = merge_onsets_and_beats(&onsets, &beats, 44100);
+        assert_eq!(result, vec![1000]);
+    }
+
+    #[test]
+    fn test_beat_aware_stretcher_with_kicks() {
+        // Generate a 2-second signal with regular kicks (120 BPM = every 0.5s)
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+        let mut input = vec![0.0f32; num_samples];
+        let beat_interval = sample_rate as usize / 2; // 0.5 seconds
+
+        // Add kick-like transients at beat positions
+        for beat in 0..4 {
+            let pos = beat * beat_interval;
+            for j in 0..20.min(num_samples - pos) {
+                input[pos + j] = if j < 5 { 0.9 } else { -0.4 };
+            }
+        }
+
+        // Add tonal content between kicks
+        for (i, sample) in input.iter_mut().enumerate() {
+            *sample += 0.3 * (2.0 * PI * 200.0 * i as f32 / sample_rate as f32).sin();
+        }
+
+        // Beat-aware mode (enabled by preset)
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_preset(EdmPreset::HouseLoop);
+        assert!(params.beat_aware);
+
+        let stretcher = HybridStretcher::new(params);
+        let output_aware = stretcher.process(&input).unwrap();
+
+        // Non-beat-aware mode
+        let params_no_beat = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_beat_aware(false);
+
+        let stretcher_no_beat = HybridStretcher::new(params_no_beat);
+        let output_no_beat = stretcher_no_beat.process(&input).unwrap();
+
+        // Both should produce valid output
+        assert!(!output_aware.is_empty());
+        assert!(!output_no_beat.is_empty());
+
+        // Both should have reasonable length ratios
+        let ratio_aware = output_aware.len() as f64 / input.len() as f64;
+        let ratio_no_beat = output_no_beat.len() as f64 / input.len() as f64;
+        assert!(
+            (ratio_aware - 1.5).abs() < 0.4,
+            "Beat-aware ratio {} too far from 1.5",
+            ratio_aware
+        );
+        assert!(
+            (ratio_no_beat - 1.5).abs() < 0.4,
+            "Non-beat-aware ratio {} too far from 1.5",
+            ratio_no_beat
+        );
+    }
+
+    #[test]
+    fn test_beat_aware_disabled_for_short_input() {
+        // For input shorter than MIN_SAMPLES_FOR_BEAT_DETECTION, beat detection
+        // should be skipped even with beat_aware enabled.
+        let sample_rate = 44100u32;
+        let num_samples = 20000; // Less than 44100 (1 second threshold)
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_beat_aware(true);
+
+        let stretcher = HybridStretcher::new(params);
+        let output = stretcher.process(&input).unwrap();
+
+        // Should still produce valid output without crashing
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_beat_aware_flag_default() {
+        // Default: beat_aware should be false
+        let params = StretchParams::new(1.0);
+        assert!(!params.beat_aware);
+
+        // With preset: beat_aware should be true
+        let params = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
+        assert!(params.beat_aware);
+
+        // Can be overridden after preset
+        let params = StretchParams::new(1.0)
+            .with_preset(EdmPreset::DjBeatmatch)
+            .with_beat_aware(false);
+        assert!(!params.beat_aware);
     }
 }

@@ -195,6 +195,12 @@ pub struct StretchParams {
     pub wsola_segment_size: usize,
     /// WSOLA search range in samples.
     pub wsola_search_range: usize,
+    /// Whether to use beat-grid-aware segmentation.
+    ///
+    /// When enabled, the hybrid stretcher detects the beat grid and aligns
+    /// segment boundaries to beat positions. This preserves the rhythmic
+    /// groove in 4/4 EDM tracks. Enabled by default for EDM presets.
+    pub beat_aware: bool,
 }
 
 /// Converts a duration in milliseconds to samples at the given sample rate.
@@ -226,6 +232,7 @@ impl StretchParams {
             sub_bass_cutoff: 120.0,
             wsola_segment_size: ms_to_samples(WSOLA_SEGMENT_MS, 44100),
             wsola_search_range: ms_to_samples(WSOLA_SEARCH_MS_SMALL, 44100),
+            beat_aware: false,
         }
     }
 
@@ -263,6 +270,7 @@ impl StretchParams {
     /// to customize individual parameters after applying a preset.
     pub fn with_preset(mut self, preset: EdmPreset) -> Self {
         self.preset = Some(preset);
+        self.beat_aware = true;
         match preset {
             EdmPreset::DjBeatmatch => {
                 self.fft_size = 4096;
@@ -332,6 +340,15 @@ impl StretchParams {
     /// Sets the WSOLA search range in samples.
     pub fn with_wsola_search_range(mut self, range: usize) -> Self {
         self.wsola_search_range = range;
+        self
+    }
+
+    /// Enables or disables beat-aware segmentation.
+    ///
+    /// When enabled, the hybrid stretcher detects the beat grid and aligns
+    /// segment boundaries to beat positions for better rhythmic preservation.
+    pub fn with_beat_aware(mut self, enabled: bool) -> Self {
+        self.beat_aware = enabled;
         self
     }
 
