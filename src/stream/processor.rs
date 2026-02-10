@@ -60,6 +60,19 @@ pub struct StreamProcessor {
     use_hybrid: bool,
 }
 
+impl std::fmt::Debug for StreamProcessor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamProcessor")
+            .field("params", &self.params)
+            .field("current_ratio", &self.current_ratio)
+            .field("target_ratio", &self.target_ratio)
+            .field("initialized", &self.initialized)
+            .field("source_bpm", &self.source_bpm)
+            .field("input_buffer_len", &self.input_buffer.len())
+            .finish()
+    }
+}
+
 impl StreamProcessor {
     /// Creates a new streaming processor.
     pub fn new(params: StretchParams) -> Self {

@@ -466,6 +466,33 @@ pub fn stretch_to_bpm(
 ///
 /// Returns [`StretchError::BpmDetectionFailed`] if no tempo can be detected
 /// (e.g. the input is too short, contains only silence, or lacks rhythmic content).
+///
+/// # Example
+///
+/// ```
+/// use timestretch::{StretchParams, EdmPreset};
+///
+/// // Generate a click train at ~120 BPM for auto-detection
+/// let sample_rate = 44100u32;
+/// let beat_interval = (60.0 * sample_rate as f64 / 120.0) as usize;
+/// let mut audio = vec![0.0f32; sample_rate as usize * 4];
+/// for pos in (0..audio.len()).step_by(beat_interval) {
+///     for j in 0..20.min(audio.len() - pos) {
+///         audio[pos + j] = if j < 5 { 0.9 } else { -0.4 };
+///     }
+/// }
+///
+/// let params = StretchParams::new(1.0)
+///     .with_sample_rate(sample_rate)
+///     .with_channels(1)
+///     .with_preset(EdmPreset::DjBeatmatch);
+///
+/// // Auto-detect BPM and stretch to 128 BPM
+/// match timestretch::stretch_to_bpm_auto(&audio, 128.0, &params) {
+///     Ok(output) => println!("Stretched {} -> {} samples", audio.len(), output.len()),
+///     Err(e) => println!("BPM detection failed: {}", e),
+/// }
+/// ```
 pub fn stretch_to_bpm_auto(
     input: &[f32],
     target_bpm: f64,
@@ -590,6 +617,21 @@ pub fn bpm_ratio(source_bpm: f64, target_bpm: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Compile-time assertions that key public types are Send + Sync.
+    // This is critical for real-time audio where processing often runs
+    // on a dedicated thread.
+    const _: () = {
+        fn assert_send_sync<T: Send + Sync>() {}
+        fn check() {
+            assert_send_sync::<AudioBuffer>();
+            assert_send_sync::<StretchParams>();
+            assert_send_sync::<StreamProcessor>();
+            assert_send_sync::<StretchError>();
+            assert_send_sync::<BeatGrid>();
+        }
+        let _ = check;
+    };
 
     #[test]
     fn test_stretch_empty() {

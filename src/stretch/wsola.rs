@@ -23,6 +23,17 @@ pub struct Wsola {
     planner: FftPlanner<f32>,
 }
 
+impl std::fmt::Debug for Wsola {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Wsola")
+            .field("segment_size", &self.segment_size)
+            .field("overlap_size", &self.overlap_size)
+            .field("search_range", &self.search_range)
+            .field("stretch_ratio", &self.stretch_ratio)
+            .finish()
+    }
+}
+
 impl Wsola {
     /// Creates a new WSOLA processor.
     pub fn new(segment_size: usize, search_range: usize, stretch_ratio: f64) -> Self {

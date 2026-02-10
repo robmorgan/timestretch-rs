@@ -199,11 +199,15 @@ impl PhaseVocoder {
 
             // Overlap-add with synthesis window
             let frame_len = (synthesis_pos + self.fft_size).min(output_len) - synthesis_pos;
-            #[allow(clippy::needless_range_loop)]
-            for i in 0..frame_len {
-                let out_idx = synthesis_pos + i;
-                self.output_buf[out_idx] += self.fft_buffer[i].re * norm * self.window[i];
-                self.window_sum_buf[out_idx] += self.window[i] * self.window[i];
+            let out_slice = &mut self.output_buf[synthesis_pos..synthesis_pos + frame_len];
+            let ws_slice = &mut self.window_sum_buf[synthesis_pos..synthesis_pos + frame_len];
+            for ((out, ws), (fft, &w)) in out_slice.iter_mut().zip(ws_slice.iter_mut()).zip(
+                self.fft_buffer[..frame_len]
+                    .iter()
+                    .zip(&self.window[..frame_len]),
+            ) {
+                *out += fft.re * norm * w;
+                *ws += w * w;
             }
         }
 
@@ -270,6 +274,17 @@ impl PhaseVocoder {
         for (sample, &ws) in output.iter_mut().zip(window_sum.iter()) {
             *sample /= ws.max(min_window_sum);
         }
+    }
+}
+
+impl std::fmt::Debug for PhaseVocoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhaseVocoder")
+            .field("fft_size", &self.fft_size)
+            .field("hop_analysis", &self.hop_analysis)
+            .field("hop_synthesis", &self.hop_synthesis)
+            .field("sub_bass_bin", &self.sub_bass_bin)
+            .finish()
     }
 }
 

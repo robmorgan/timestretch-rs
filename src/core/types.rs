@@ -394,6 +394,7 @@ impl AsRef<[Sample]> for AudioBuffer {
 ///
 /// Each item is a slice of samples for one frame: a single `&[f32]` for mono,
 /// or `&[f32; 2]` (as a slice) for stereo.
+#[derive(Debug)]
 pub struct FrameIter<'a> {
     data: &'a [Sample],
     channels: usize,
