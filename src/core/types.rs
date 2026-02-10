@@ -19,6 +19,27 @@ impl Channels {
             Channels::Stereo => 2,
         }
     }
+
+    /// Creates a `Channels` from a numeric count.
+    ///
+    /// Returns `Mono` for 1, `Stereo` for 2, and `None` for other values.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::Channels;
+    ///
+    /// assert_eq!(Channels::from_count(1), Some(Channels::Mono));
+    /// assert_eq!(Channels::from_count(2), Some(Channels::Stereo));
+    /// assert_eq!(Channels::from_count(5), None);
+    /// ```
+    pub fn from_count(count: usize) -> Option<Self> {
+        match count {
+            1 => Some(Channels::Mono),
+            2 => Some(Channels::Stereo),
+            _ => None,
+        }
+    }
 }
 
 /// An audio buffer holding interleaved sample data.
@@ -196,6 +217,16 @@ impl AudioBuffer {
     /// # Panics
     ///
     /// Panics if `start_frame` is beyond the buffer length.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let buf = AudioBuffer::from_mono(vec![0.0, 0.1, 0.2, 0.3, 0.4], 44100);
+    /// let sub = buf.slice(1, 3);
+    /// assert_eq!(sub.data, vec![0.1, 0.2, 0.3]);
+    /// ```
     pub fn slice(&self, start_frame: usize, num_frames: usize) -> Self {
         let total_frames = self.num_frames();
         assert!(
@@ -222,6 +253,17 @@ impl AudioBuffer {
     /// # Panics
     ///
     /// Panics if the buffers have mismatched sample rates or channel layouts.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let a = AudioBuffer::from_mono(vec![1.0, 2.0], 44100);
+    /// let b = AudioBuffer::from_mono(vec![3.0, 4.0], 44100);
+    /// let combined = AudioBuffer::concatenate(&[&a, &b]);
+    /// assert_eq!(combined.data, vec![1.0, 2.0, 3.0, 4.0]);
+    /// ```
     pub fn concatenate(buffers: &[&AudioBuffer]) -> Self {
         if buffers.is_empty() {
             return Self {
@@ -418,6 +460,15 @@ impl AudioBuffer {
     /// Returns the peak absolute amplitude in the buffer.
     ///
     /// Returns 0.0 for an empty buffer.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let buf = AudioBuffer::from_mono(vec![0.25, -0.8, 0.5], 44100);
+    /// assert!((buf.peak() - 0.8).abs() < 1e-6);
+    /// ```
     #[inline]
     pub fn peak(&self) -> f32 {
         self.data.iter().map(|s| s.abs()).fold(0.0f32, f32::max)
@@ -426,6 +477,15 @@ impl AudioBuffer {
     /// Returns the root mean square (RMS) amplitude of the buffer.
     ///
     /// Returns 0.0 for an empty buffer. Computed in `f64` for precision.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let buf = AudioBuffer::from_mono(vec![1.0, -1.0], 44100);
+    /// assert!((buf.rms() - 1.0).abs() < 1e-6);
+    /// ```
     pub fn rms(&self) -> f32 {
         if self.data.is_empty() {
             return 0.0;
@@ -440,6 +500,17 @@ impl AudioBuffer {
     /// Frames beyond `duration_frames` are unmodified.
     /// If `duration_frames` exceeds the buffer length, the entire buffer
     /// is faded.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let buf = AudioBuffer::from_mono(vec![1.0; 100], 44100);
+    /// let faded = buf.fade_in(50);
+    /// assert!((faded.data[0] - 0.0).abs() < 1e-6);     // start: silence
+    /// assert!((faded.data[99] - 1.0).abs() < 1e-6);     // end: full volume
+    /// ```
     pub fn fade_in(&self, duration_frames: usize) -> Self {
         let nc = self.channels.count();
         let total_frames = self.num_frames();
@@ -464,6 +535,17 @@ impl AudioBuffer {
     /// Frames before the fade region are unmodified.
     /// If `duration_frames` exceeds the buffer length, the entire buffer
     /// is faded.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let buf = AudioBuffer::from_mono(vec![1.0; 100], 44100);
+    /// let faded = buf.fade_out(50);
+    /// assert!((faded.data[0] - 1.0).abs() < 1e-6);      // start: full volume
+    /// assert!(faded.data[99].abs() < 0.05);               // end: near silence
+    /// ```
     pub fn fade_out(&self, duration_frames: usize) -> Self {
         let nc = self.channels.count();
         let total_frames = self.num_frames();
@@ -851,6 +933,15 @@ mod tests {
     fn test_channels_count() {
         assert_eq!(Channels::Mono.count(), 1);
         assert_eq!(Channels::Stereo.count(), 2);
+    }
+
+    #[test]
+    fn test_channels_from_count() {
+        assert_eq!(Channels::from_count(1), Some(Channels::Mono));
+        assert_eq!(Channels::from_count(2), Some(Channels::Stereo));
+        assert_eq!(Channels::from_count(0), None);
+        assert_eq!(Channels::from_count(3), None);
+        assert_eq!(Channels::from_count(6), None);
     }
 
     #[test]
