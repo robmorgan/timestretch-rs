@@ -44,10 +44,11 @@ impl Wsola {
             ));
         }
 
-        // Estimate output length
-        let num_segments =
-            (input.len() as f64 / advance_input as f64 * self.stretch_ratio) as usize + 1;
-        let estimated_output_len = num_segments * advance_output + self.segment_size;
+        // Target output length based on stretch ratio
+        let target_output_len = (input.len() as f64 * self.stretch_ratio).round() as usize;
+
+        // Estimate buffer size (add margin for search variations)
+        let estimated_output_len = target_output_len + self.segment_size * 2;
         let mut output = vec![0.0f32; estimated_output_len];
 
         // Copy first segment
@@ -85,7 +86,9 @@ impl Wsola {
             output_pos += advance_output;
         }
 
-        output.truncate(actual_output_len);
+        // Trim output to target length for better ratio accuracy
+        let final_len = actual_output_len.min(target_output_len + self.overlap_size);
+        output.truncate(final_len);
         Ok(output)
     }
 
@@ -257,22 +260,44 @@ mod tests {
 
         let len_ratio = output.len() as f64 / input.len() as f64;
         assert!(
-            (len_ratio - 0.75).abs() < 0.3,
+            (len_ratio - 0.75).abs() < 0.15,
             "Length ratio {} too far from 0.75",
             len_ratio
         );
 
-        // Also test 0.5 ratio - just verify it produces output
+        // Test 0.5 ratio with accuracy check
         let wsola_half = Wsola::new(segment_size, search_range, 0.5);
         let output_half = wsola_half.process(&input).unwrap();
+        let half_ratio = output_half.len() as f64 / input.len() as f64;
         assert!(
-            !output_half.is_empty(),
-            "Compression should produce output"
+            (half_ratio - 0.5).abs() < 0.1,
+            "Half ratio {} too far from 0.5",
+            half_ratio
         );
-        assert!(
-            output_half.len() < input.len(),
-            "Compressed output should be shorter than input"
-        );
+    }
+
+    #[test]
+    fn test_wsola_extreme_compress() {
+        let sample_rate = 44100;
+        let segment_size = 882;
+        let search_range = 441;
+
+        let input: Vec<f32> = (0..sample_rate * 4)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        // Test ratios from 0.25 to 0.5
+        for &ratio in &[0.5, 0.4, 0.3, 0.25] {
+            let wsola = Wsola::new(segment_size, search_range, ratio);
+            let output = wsola.process(&input).unwrap();
+            let actual_ratio = output.len() as f64 / input.len() as f64;
+            assert!(
+                (actual_ratio - ratio).abs() < 0.1,
+                "Ratio {}: actual {:.3} too far from target",
+                ratio,
+                actual_ratio
+            );
+        }
     }
 
     #[test]
