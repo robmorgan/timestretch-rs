@@ -1057,6 +1057,96 @@ impl AudioBuffer {
             channels: self.channels,
         }
     }
+
+    /// Removes DC offset from the audio by subtracting the mean of each channel.
+    ///
+    /// DC offset is a common problem in recorded audio where the waveform is
+    /// shifted away from zero. This method centers each channel independently.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let buf = AudioBuffer::from_mono(vec![1.5, 1.6, 1.4, 1.5], 44100);
+    /// let centered = buf.remove_dc();
+    /// let mean: f32 = centered.data.iter().sum::<f32>() / centered.data.len() as f32;
+    /// assert!(mean.abs() < 1e-6);
+    /// ```
+    pub fn remove_dc(&self) -> Self {
+        if self.data.is_empty() {
+            return self.clone();
+        }
+
+        let nc = self.channels.count();
+        let num_frames = self.num_frames();
+        let mut data = self.data.clone();
+
+        for ch in 0..nc {
+            // Compute mean for this channel using f64 for precision
+            let sum: f64 = self
+                .data
+                .iter()
+                .skip(ch)
+                .step_by(nc)
+                .map(|&s| s as f64)
+                .sum();
+            let mean = (sum / num_frames as f64) as f32;
+
+            // Subtract mean from this channel
+            for frame in 0..num_frames {
+                data[frame * nc + ch] -= mean;
+            }
+        }
+
+        Self {
+            data,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        }
+    }
+
+    /// Applies a window function to the buffer, sample by sample.
+    ///
+    /// The window is scaled to the buffer length (each channel is windowed
+    /// identically). This is useful for spectral analysis, granular synthesis,
+    /// and creating smooth fade shapes.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::{AudioBuffer, WindowType};
+    ///
+    /// let buf = AudioBuffer::from_mono(vec![1.0; 100], 44100);
+    /// let windowed = buf.apply_window(WindowType::Hann);
+    /// // First and last samples should be near zero (Hann window)
+    /// assert!(windowed.data[0].abs() < 0.01);
+    /// assert!(windowed.data[99].abs() < 0.01);
+    /// // Middle should be close to 1.0
+    /// assert!((windowed.data[50] - 1.0).abs() < 0.1);
+    /// ```
+    pub fn apply_window(&self, window_type: crate::core::window::WindowType) -> Self {
+        if self.data.is_empty() {
+            return self.clone();
+        }
+
+        let num_frames = self.num_frames();
+        let window = crate::core::window::generate_window(window_type, num_frames);
+        let nc = self.channels.count();
+        let mut data = self.data.clone();
+
+        for frame in 0..num_frames {
+            for ch in 0..nc {
+                data[frame * nc + ch] *= window[frame];
+            }
+        }
+
+        Self {
+            data,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        }
+    }
 }
 
 /// Linearly interpolates a value from sorted `(time, value)` breakpoints.
@@ -2790,5 +2880,97 @@ mod tests {
         assert!((shaped.data[0] - 1.0).abs() < 0.02);
         assert!(shaped.data[50].abs() < 0.02);
         assert!((shaped.data[99] - 1.0).abs() < 0.02);
+    }
+
+    // --- remove_dc() tests ---
+
+    #[test]
+    fn test_remove_dc_basic() {
+        let buf = AudioBuffer::from_mono(vec![1.5, 1.6, 1.4, 1.5], 44100);
+        let centered = buf.remove_dc();
+        let mean: f64 = centered.data.iter().map(|&s| s as f64).sum::<f64>()
+            / centered.data.len() as f64;
+        assert!(
+            mean.abs() < 1e-5,
+            "DC should be removed, got mean={}",
+            mean
+        );
+    }
+
+    #[test]
+    fn test_remove_dc_zero_mean() {
+        // Already centered signal should be unchanged
+        let data = vec![1.0, -1.0, 1.0, -1.0];
+        let buf = AudioBuffer::from_mono(data.clone(), 44100);
+        let centered = buf.remove_dc();
+        for (a, b) in centered.data.iter().zip(data.iter()) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_remove_dc_stereo() {
+        // L channel has DC offset of 1.0, R channel has DC offset of -0.5
+        let buf = AudioBuffer::from_stereo(vec![1.0, -0.5, 1.0, -0.5, 1.0, -0.5], 44100);
+        let centered = buf.remove_dc();
+        // Both channels should now be centered
+        let left: Vec<f32> = centered.data.iter().step_by(2).copied().collect();
+        let right: Vec<f32> = centered.data.iter().skip(1).step_by(2).copied().collect();
+        let l_mean: f64 = left.iter().map(|&s| s as f64).sum::<f64>() / left.len() as f64;
+        let r_mean: f64 = right.iter().map(|&s| s as f64).sum::<f64>() / right.len() as f64;
+        assert!(l_mean.abs() < 1e-5, "L DC should be removed, got {}", l_mean);
+        assert!(r_mean.abs() < 1e-5, "R DC should be removed, got {}", r_mean);
+    }
+
+    #[test]
+    fn test_remove_dc_empty() {
+        let buf = AudioBuffer::from_mono(vec![], 44100);
+        let centered = buf.remove_dc();
+        assert!(centered.is_empty());
+    }
+
+    // --- apply_window() tests ---
+
+    #[test]
+    fn test_apply_window_hann() {
+        let buf = AudioBuffer::from_mono(vec![1.0; 100], 44100);
+        let windowed = buf.apply_window(crate::core::window::WindowType::Hann);
+        // First and last should be near zero
+        assert!(windowed.data[0].abs() < 0.01);
+        assert!(windowed.data[99].abs() < 0.01);
+        // Middle should be close to 1.0
+        assert!((windowed.data[50] - 1.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_apply_window_stereo() {
+        let buf = AudioBuffer::from_stereo(vec![1.0, 0.5, 1.0, 0.5, 1.0, 0.5], 44100);
+        let windowed = buf.apply_window(crate::core::window::WindowType::Hann);
+        // Both channels should be windowed identically (proportionally)
+        for frame in windowed.frames() {
+            if frame[0].abs() > 1e-6 {
+                let ratio = frame[1] / frame[0];
+                assert!(
+                    (ratio - 0.5).abs() < 0.01,
+                    "L/R ratio should be preserved"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_apply_window_empty() {
+        let buf = AudioBuffer::from_mono(vec![], 44100);
+        let windowed = buf.apply_window(crate::core::window::WindowType::Hann);
+        assert!(windowed.is_empty());
+    }
+
+    #[test]
+    fn test_apply_window_preserves_metadata() {
+        let buf = AudioBuffer::from_mono(vec![1.0; 100], 48000);
+        let windowed = buf.apply_window(crate::core::window::WindowType::BlackmanHarris);
+        assert_eq!(windowed.sample_rate, 48000);
+        assert_eq!(windowed.channels, Channels::Mono);
+        assert_eq!(windowed.num_frames(), 100);
     }
 }
