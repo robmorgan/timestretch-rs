@@ -407,6 +407,80 @@ fn test_streaming_vs_batch_stereo_equivalence() {
 }
 
 #[test]
+fn test_streaming_flush_produces_remaining_output() {
+    let sample_rate = 44100u32;
+    // Send exactly 1.5x the minimum required (fft_size * 2 = 8192).
+    // First process call consumes most data, flush should handle the rest.
+    let signal = sine_wave(440.0, sample_rate, 12288);
+
+    let params = StretchParams::new(1.0)
+        .with_sample_rate(sample_rate)
+        .with_channels(1);
+
+    let mut processor = StreamProcessor::new(params);
+
+    // Process in one big chunk
+    let output1 = processor.process(&signal).unwrap();
+
+    // Flush remaining buffered data
+    let output2 = processor.flush().unwrap();
+
+    let total_len = output1.len() + output2.len();
+    assert!(total_len > 0, "Should produce output after process + flush");
+
+    // Total output should be roughly proportional to input
+    let ratio = total_len as f64 / signal.len() as f64;
+    assert!(
+        (ratio - 1.0).abs() < 0.5,
+        "Process+flush output ratio {} too far from 1.0",
+        ratio
+    );
+}
+
+#[test]
+fn test_streaming_reset_then_reprocess() {
+    let sample_rate = 44100u32;
+    let signal = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
+
+    let params = StretchParams::new(1.0)
+        .with_sample_rate(sample_rate)
+        .with_channels(1);
+
+    let mut processor = StreamProcessor::new(params);
+
+    // First pass
+    let mut output1 = Vec::new();
+    for chunk in signal.chunks(4096) {
+        output1.extend_from_slice(&processor.process(chunk).unwrap());
+    }
+    output1.extend_from_slice(&processor.flush().unwrap());
+
+    // Reset
+    processor.reset();
+
+    // Second pass with same data should produce similar output
+    let mut output2 = Vec::new();
+    for chunk in signal.chunks(4096) {
+        output2.extend_from_slice(&processor.process(chunk).unwrap());
+    }
+    output2.extend_from_slice(&processor.flush().unwrap());
+
+    // Both passes should produce output
+    assert!(!output1.is_empty(), "First pass empty");
+    assert!(!output2.is_empty(), "Second pass empty");
+
+    // Output lengths should be similar (same input, same params)
+    let len_diff = (output1.len() as f64 - output2.len() as f64).abs();
+    let avg_len = (output1.len() + output2.len()) as f64 / 2.0;
+    assert!(
+        len_diff / avg_len < 0.1,
+        "After reset, output lengths should match: {} vs {}",
+        output1.len(),
+        output2.len()
+    );
+}
+
+#[test]
 fn test_streaming_with_preset() {
     let sample_rate = 44100u32;
     let signal = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
