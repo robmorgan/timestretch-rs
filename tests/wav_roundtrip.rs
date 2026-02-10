@@ -5,7 +5,7 @@
 //! mono and stereo layouts, and various stretch ratios.
 
 use std::f32::consts::PI;
-use timestretch::io::wav::{read_wav, write_wav_16bit, write_wav_float};
+use timestretch::io::wav::{read_wav, write_wav_16bit, write_wav_24bit, write_wav_float};
 use timestretch::{stretch_buffer, AudioBuffer, Channels, EdmPreset, StretchParams};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -354,6 +354,143 @@ fn test_wav_double_stretch_pipeline() {
         "Double stretch final length ratio {} too far from 1.0",
         len_ratio
     );
+}
+
+// ── 24-bit WAV round-trip tests ─────────────────────────────────────────────
+
+#[test]
+fn test_wav_24bit_roundtrip_mono_identity() {
+    let original = sine_mono(440.0, 44100, 1.0);
+    let wav_bytes = write_wav_24bit(&original);
+    let decoded = read_wav(&wav_bytes).unwrap();
+
+    assert_eq!(decoded.sample_rate, original.sample_rate);
+    assert_eq!(decoded.channels, Channels::Mono);
+    assert_eq!(decoded.data.len(), original.data.len());
+
+    // 24-bit quantization error: max ~1/8388608 ≈ 1.2e-7
+    let max_err = original
+        .data
+        .iter()
+        .zip(decoded.data.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_err < 0.0001, "Max 24-bit round-trip error: {}", max_err);
+}
+
+#[test]
+fn test_wav_24bit_roundtrip_stereo() {
+    let original = sine_stereo(440.0, 880.0, 48000, 1.0);
+    let wav_bytes = write_wav_24bit(&original);
+    let decoded = read_wav(&wav_bytes).unwrap();
+
+    assert_eq!(decoded.sample_rate, 48000);
+    assert_eq!(decoded.channels, Channels::Stereo);
+    assert_eq!(decoded.data.len(), original.data.len());
+
+    let max_err = original
+        .data
+        .iter()
+        .zip(decoded.data.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_err < 0.0001,
+        "Max 24-bit stereo round-trip error: {}",
+        max_err
+    );
+}
+
+#[test]
+fn test_wav_stretch_24bit_mono() {
+    let original = sine_mono(440.0, 44100, 2.0);
+    let wav_bytes = write_wav_24bit(&original);
+    let decoded = read_wav(&wav_bytes).unwrap();
+
+    let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
+    let stretched = stretch_buffer(&decoded, &params).unwrap();
+
+    assert_eq!(stretched.sample_rate, 44100);
+    assert_no_nan_inf(&stretched.data, "24bit mono stretch");
+
+    let len_ratio = stretched.data.len() as f64 / decoded.data.len() as f64;
+    assert!(
+        (len_ratio - 1.5).abs() < 0.3,
+        "24-bit stretch length ratio {} too far from 1.5",
+        len_ratio
+    );
+}
+
+#[test]
+fn test_wav_24bit_vs_float_stretch_consistency() {
+    let original = sine_mono(220.0, 44100, 1.0);
+
+    // Stretch through 24-bit pipeline
+    let wav_24 = write_wav_24bit(&original);
+    let dec_24 = read_wav(&wav_24).unwrap();
+    let params = StretchParams::new(1.25).with_preset(EdmPreset::HouseLoop);
+    let stretched_24 = stretch_buffer(&dec_24, &params).unwrap();
+
+    // Stretch through float pipeline
+    let wav_f = write_wav_float(&original);
+    let dec_f = read_wav(&wav_f).unwrap();
+    let stretched_f = stretch_buffer(&dec_f, &params).unwrap();
+
+    // 24-bit should be nearly identical to float
+    let rms_24 = rms(&stretched_24.data);
+    let rms_f = rms(&stretched_f.data);
+    let rms_diff = (rms_24 - rms_f).abs() / rms_f.max(1e-10);
+    assert!(
+        rms_diff < 0.05,
+        "24-bit vs float RMS diverged: 24bit={}, float={}, diff={}",
+        rms_24,
+        rms_f,
+        rms_diff
+    );
+}
+
+// ── Mix-to-mono integration tests ───────────────────────────────────────────
+
+#[test]
+fn test_mix_to_mono_then_stretch() {
+    let stereo = sine_stereo(440.0, 880.0, 44100, 1.0);
+    let mono = stereo.mix_to_mono();
+
+    assert!(mono.is_mono());
+    assert_eq!(mono.num_frames(), stereo.num_frames());
+
+    let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
+    let stretched = stretch_buffer(&mono, &params).unwrap();
+
+    assert!(stretched.is_mono());
+    assert_no_nan_inf(&stretched.data, "mix_to_mono stretch");
+    assert!(!stretched.is_empty());
+}
+
+#[test]
+fn test_stereo_left_right_extraction_and_stretch() {
+    let stereo = sine_stereo(440.0, 880.0, 44100, 1.0);
+    let left = stereo.left();
+    let right = stereo.right();
+
+    assert_eq!(left.len(), stereo.num_frames());
+    assert_eq!(right.len(), stereo.num_frames());
+
+    // Left and right should be different signals
+    let diff: f32 = left
+        .iter()
+        .zip(right.iter())
+        .map(|(l, r)| (l - r).abs())
+        .sum::<f32>()
+        / left.len() as f32;
+    assert!(diff > 0.1, "L/R should differ, avg diff = {}", diff);
+
+    // Stretch left channel alone
+    let left_buf = AudioBuffer::from_mono(left, 44100);
+    let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
+    let stretched = stretch_buffer(&left_buf, &params).unwrap();
+    assert_no_nan_inf(&stretched.data, "left channel stretch");
+    assert!(!stretched.is_empty());
 }
 
 // ── WAV write-then-read preserves stretch output ────────────────────────────

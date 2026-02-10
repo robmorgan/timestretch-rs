@@ -336,6 +336,16 @@
 - [x] Deduplicated `pitch_shift_buffer()` via `process_buffer()` helper (was 10 lines, now 1-line delegation)
 - [x] All 263+ tests passing, zero clippy warnings, cargo fmt clean
 
+## AudioBuffer API & WAV Enhancements (agent-3)
+- [x] `AudioBuffer::is_empty()` — returns true if buffer has no samples
+- [x] `AudioBuffer::is_mono()` / `is_stereo()` — channel layout predicates
+- [x] `AudioBuffer::left()` / `right()` — extract L/R channel samples (mono returns all samples for both)
+- [x] `AudioBuffer::mix_to_mono()` — average all channels to mono
+- [x] `write_wav_24bit()` / `write_wav_file_24bit()` — 24-bit PCM WAV output (completes read/write symmetry)
+- [x] Fixed rustdoc ambiguity warning (`stretch` is both function and module)
+- [x] 14 new tests (8 unit + 6 integration: 24-bit WAV pipeline, mix_to_mono, L/R extraction)
+- [x] Zero clippy warnings, cargo fmt clean
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
