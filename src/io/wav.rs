@@ -116,49 +116,35 @@ fn parse_wav_chunks(data: &[u8], start: usize) -> Result<WavChunks<'_>, StretchE
 
 /// Converts 16-bit PCM audio bytes to f32 samples.
 fn convert_pcm_16bit(audio_data: &[u8]) -> Vec<Sample> {
-    let num_samples = audio_data.len() / 2;
-    let mut result = Vec::with_capacity(num_samples);
-    for i in 0..num_samples {
-        let raw = read_i16_le(audio_data, i * 2);
-        result.push(raw as f32 / PCM_16BIT_SCALE);
-    }
-    result
+    audio_data
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / PCM_16BIT_SCALE)
+        .collect()
 }
 
 /// Converts 24-bit PCM audio bytes to f32 samples.
 fn convert_pcm_24bit(audio_data: &[u8]) -> Vec<Sample> {
-    let num_samples = audio_data.len() / 3;
-    let mut result = Vec::with_capacity(num_samples);
-    for i in 0..num_samples {
-        let offset = i * 3;
-        let raw = (audio_data[offset] as i32)
-            | ((audio_data[offset + 1] as i32) << 8)
-            | ((audio_data[offset + 2] as i32) << 16);
-        // Sign extend from 24-bit to 32-bit
-        let raw = if raw & PCM_24BIT_SIGN_BIT != 0 {
-            raw | !PCM_24BIT_MASK
-        } else {
-            raw
-        };
-        result.push(raw as f32 / PCM_24BIT_SCALE);
-    }
-    result
+    audio_data
+        .chunks_exact(3)
+        .map(|b| {
+            let raw = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
+            // Sign extend from 24-bit to 32-bit
+            let raw = if raw & PCM_24BIT_SIGN_BIT != 0 {
+                raw | !PCM_24BIT_MASK
+            } else {
+                raw
+            };
+            raw as f32 / PCM_24BIT_SCALE
+        })
+        .collect()
 }
 
 /// Converts 32-bit IEEE float audio bytes to f32 samples.
 fn convert_ieee_float_32bit(audio_data: &[u8]) -> Vec<Sample> {
-    let num_samples = audio_data.len() / 4;
-    let mut result = Vec::with_capacity(num_samples);
-    for i in 0..num_samples {
-        let bytes = [
-            audio_data[i * 4],
-            audio_data[i * 4 + 1],
-            audio_data[i * 4 + 2],
-            audio_data[i * 4 + 3],
-        ];
-        result.push(f32::from_le_bytes(bytes));
-    }
-    result
+    audio_data
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
 }
 
 /// Converts raw audio bytes to f32 samples based on format and bit depth.
@@ -340,11 +326,6 @@ fn read_u32_le(data: &[u8], offset: usize) -> u32 {
         data[offset + 2],
         data[offset + 3],
     ])
-}
-
-#[inline]
-fn read_i16_le(data: &[u8], offset: usize) -> i16 {
-    i16::from_le_bytes([data[offset], data[offset + 1]])
 }
 
 #[cfg(test)]

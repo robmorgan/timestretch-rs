@@ -113,25 +113,23 @@ const WEIGHT_VERY_HIGH: f32 = 0.8;
 fn compute_bin_weights(fft_size: usize, sample_rate: u32) -> Vec<f32> {
     let num_bins = fft_size / 2 + 1;
     let bin_freq = sample_rate as f32 / fft_size as f32;
-    let mut weights = Vec::with_capacity(num_bins);
 
-    for bin in 0..num_bins {
-        let freq = bin as f32 * bin_freq;
-        let weight = if freq < BAND_SUB_BASS_LIMIT {
-            WEIGHT_SUB_BASS
-        } else if freq < BAND_BASS_MID_LIMIT {
-            WEIGHT_BASS_MID
-        } else if freq < BAND_MID_LIMIT {
-            WEIGHT_MID
-        } else if freq < BAND_HIGH_MID_LIMIT {
-            WEIGHT_HIGH_MID
-        } else {
-            WEIGHT_VERY_HIGH
-        };
-        weights.push(weight);
-    }
-
-    weights
+    (0..num_bins)
+        .map(|bin| {
+            let freq = bin as f32 * bin_freq;
+            if freq < BAND_SUB_BASS_LIMIT {
+                WEIGHT_SUB_BASS
+            } else if freq < BAND_BASS_MID_LIMIT {
+                WEIGHT_BASS_MID
+            } else if freq < BAND_MID_LIMIT {
+                WEIGHT_MID
+            } else if freq < BAND_HIGH_MID_LIMIT {
+                WEIGHT_HIGH_MID
+            } else {
+                WEIGHT_VERY_HIGH
+            }
+        })
+        .collect()
 }
 
 /// Number of frames in the local median window for adaptive thresholding.
