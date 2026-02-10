@@ -508,7 +508,7 @@ pub fn stretch_bpm_buffer_auto(
 /// Returns the stretch ratio needed to change from one BPM to another.
 ///
 /// This is a simple utility: `source_bpm / target_bpm`. Use it when you
-/// want to compute the ratio yourself before calling [`stretch`].
+/// want to compute the ratio yourself before calling [`stretch()`].
 ///
 /// # Example
 ///

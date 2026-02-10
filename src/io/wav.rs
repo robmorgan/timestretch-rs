@@ -266,6 +266,35 @@ pub fn write_wav_16bit(buffer: &AudioBuffer) -> Vec<u8> {
     out
 }
 
+/// Maximum representable value for 24-bit PCM output (8388607, not 8388608, to avoid clipping).
+const PCM_24BIT_MAX_OUT: f32 = 8388607.0;
+
+/// Writes an audio buffer as a WAV file (24-bit PCM).
+pub fn write_wav_24bit(buffer: &AudioBuffer) -> Vec<u8> {
+    let num_channels = buffer.channels.count() as u16;
+    let data_size = (buffer.data.len() * 3) as u32;
+
+    let mut out = Vec::with_capacity(44 + data_size as usize);
+    write_wav_header(
+        &mut out,
+        WAV_FORMAT_PCM,
+        num_channels,
+        buffer.sample_rate,
+        24,
+        data_size,
+    );
+
+    for &sample in &buffer.data {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let raw = (clamped * PCM_24BIT_MAX_OUT) as i32;
+        out.push(raw as u8);
+        out.push((raw >> 8) as u8);
+        out.push((raw >> 16) as u8);
+    }
+
+    out
+}
+
 /// Writes an audio buffer as a WAV file (32-bit float).
 pub fn write_wav_float(buffer: &AudioBuffer) -> Vec<u8> {
     let num_channels = buffer.channels.count() as u16;
@@ -298,6 +327,11 @@ fn write_wav_file(path: &str, data: &[u8]) -> Result<(), StretchError> {
 /// Writes a WAV file to disk (16-bit PCM).
 pub fn write_wav_file_16bit(path: &str, buffer: &AudioBuffer) -> Result<(), StretchError> {
     write_wav_file(path, &write_wav_16bit(buffer))
+}
+
+/// Writes a WAV file to disk (24-bit PCM).
+pub fn write_wav_file_24bit(path: &str, buffer: &AudioBuffer) -> Result<(), StretchError> {
+    write_wav_file(path, &write_wav_24bit(buffer))
 }
 
 /// Writes a WAV file to disk (32-bit float).
@@ -360,6 +394,46 @@ mod tests {
         for i in 0..6 {
             assert!(
                 (decoded.data[i] - original.data[i]).abs() < 1e-6,
+                "sample {}: {} vs {}",
+                i,
+                decoded.data[i],
+                original.data[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_wav_roundtrip_24bit() {
+        let original = AudioBuffer::from_mono(vec![0.0, 0.5, -0.5, 1.0, -1.0], 44100);
+        let wav_data = write_wav_24bit(&original);
+        let decoded = read_wav(&wav_data).unwrap();
+        assert_eq!(decoded.sample_rate, 44100);
+        assert_eq!(decoded.channels, Channels::Mono);
+        assert_eq!(decoded.data.len(), 5);
+        // 24-bit has very small quantization error
+        for i in 0..5 {
+            assert!(
+                (decoded.data[i] - original.data[i]).abs() < 0.0001,
+                "sample {}: {} vs {}",
+                i,
+                decoded.data[i],
+                original.data[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_wav_24bit_stereo() {
+        let data = vec![0.25, -0.25, 0.5, -0.5, 0.75, -0.75];
+        let original = AudioBuffer::from_stereo(data, 48000);
+        let wav_data = write_wav_24bit(&original);
+        let decoded = read_wav(&wav_data).unwrap();
+        assert_eq!(decoded.channels, Channels::Stereo);
+        assert_eq!(decoded.sample_rate, 48000);
+        assert_eq!(decoded.num_frames(), 3);
+        for i in 0..6 {
+            assert!(
+                (decoded.data[i] - original.data[i]).abs() < 0.0001,
                 "sample {}: {} vs {}",
                 i,
                 decoded.data[i],

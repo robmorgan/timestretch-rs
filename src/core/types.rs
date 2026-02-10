@@ -98,6 +98,58 @@ impl AudioBuffer {
         }
     }
 
+    /// Returns `true` if the buffer contains no samples.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Returns `true` if this is a mono buffer.
+    #[inline]
+    pub fn is_mono(&self) -> bool {
+        self.channels == Channels::Mono
+    }
+
+    /// Returns `true` if this is a stereo buffer.
+    #[inline]
+    pub fn is_stereo(&self) -> bool {
+        self.channels == Channels::Stereo
+    }
+
+    /// Returns the left channel samples. For mono, returns all samples.
+    pub fn left(&self) -> Vec<Sample> {
+        self.channel(0)
+    }
+
+    /// Returns the right channel samples. For mono, returns all samples.
+    pub fn right(&self) -> Vec<Sample> {
+        if self.channels == Channels::Mono {
+            self.data.clone()
+        } else {
+            self.channel(1)
+        }
+    }
+
+    /// Mixes all channels down to a mono buffer by averaging.
+    pub fn mix_to_mono(&self) -> Self {
+        if self.channels == Channels::Mono {
+            return self.clone();
+        }
+        let nc = self.channels.count();
+        let num_frames = self.num_frames();
+        let mut mono = Vec::with_capacity(num_frames);
+        let inv = 1.0 / nc as f32;
+        for i in 0..num_frames {
+            let sum: f32 = (0..nc).map(|ch| self.data[i * nc + ch]).sum();
+            mono.push(sum * inv);
+        }
+        Self {
+            data: mono,
+            sample_rate: self.sample_rate,
+            channels: Channels::Mono,
+        }
+    }
+
     /// Interleaves separate channel vectors into a single buffer.
     pub fn from_channels(channels_data: &[Vec<Sample>], sample_rate: u32) -> Self {
         let nc = channels_data.len();
@@ -459,5 +511,61 @@ mod tests {
         let buf = AudioBuffer::from_channels(&[left, right], 44100);
         assert_eq!(buf.data, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
         assert_eq!(buf.channels, Channels::Stereo);
+    }
+
+    #[test]
+    fn test_audio_buffer_is_empty() {
+        let empty = AudioBuffer::from_mono(vec![], 44100);
+        assert!(empty.is_empty());
+
+        let non_empty = AudioBuffer::from_mono(vec![0.5], 44100);
+        assert!(!non_empty.is_empty());
+    }
+
+    #[test]
+    fn test_audio_buffer_is_mono_stereo() {
+        let mono = AudioBuffer::from_mono(vec![0.0; 100], 44100);
+        assert!(mono.is_mono());
+        assert!(!mono.is_stereo());
+
+        let stereo = AudioBuffer::from_stereo(vec![0.0; 200], 44100);
+        assert!(stereo.is_stereo());
+        assert!(!stereo.is_mono());
+    }
+
+    #[test]
+    fn test_audio_buffer_left_right_stereo() {
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let buf = AudioBuffer::from_stereo(data, 44100);
+        assert_eq!(buf.left(), vec![1.0, 3.0, 5.0]);
+        assert_eq!(buf.right(), vec![2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn test_audio_buffer_left_right_mono() {
+        let data = vec![1.0, 2.0, 3.0];
+        let buf = AudioBuffer::from_mono(data, 44100);
+        assert_eq!(buf.left(), vec![1.0, 2.0, 3.0]);
+        assert_eq!(buf.right(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_audio_buffer_mix_to_mono() {
+        let data = vec![1.0, 0.0, 0.5, 0.5, 0.0, 1.0];
+        let buf = AudioBuffer::from_stereo(data, 44100);
+        let mono = buf.mix_to_mono();
+        assert!(mono.is_mono());
+        assert_eq!(mono.num_frames(), 3);
+        assert!((mono.data[0] - 0.5).abs() < 1e-6);
+        assert!((mono.data[1] - 0.5).abs() < 1e-6);
+        assert!((mono.data[2] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_audio_buffer_mix_to_mono_identity() {
+        let data = vec![1.0, 2.0, 3.0];
+        let buf = AudioBuffer::from_mono(data.clone(), 44100);
+        let mono = buf.mix_to_mono();
+        assert_eq!(mono.data, data);
     }
 }
