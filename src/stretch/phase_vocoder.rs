@@ -38,6 +38,10 @@ pub struct PhaseVocoder {
     analysis_phases: Vec<f32>,
     /// Bin index at or below which sub-bass phase locking is applied.
     sub_bass_bin: usize,
+    /// Reusable output buffer (avoids allocation per process() call).
+    output_buf: Vec<f32>,
+    /// Reusable window sum buffer (avoids allocation per process() call).
+    window_sum_buf: Vec<f32>,
 }
 
 impl PhaseVocoder {
@@ -79,6 +83,8 @@ impl PhaseVocoder {
             peaks: Vec::with_capacity(num_bins / 4),
             analysis_phases: vec![0.0; num_bins],
             sub_bass_bin,
+            output_buf: Vec::new(),
+            window_sum_buf: Vec::new(),
         }
     }
 
@@ -129,8 +135,11 @@ impl PhaseVocoder {
         let num_frames = (input.len() - self.fft_size) / self.hop_analysis + 1;
         let output_len = (num_frames - 1) * self.hop_synthesis + self.fft_size;
 
-        let mut output = vec![0.0f32; output_len];
-        let mut window_sum = vec![0.0f32; output_len];
+        // Reuse pre-allocated buffers, growing if needed (never shrinks).
+        self.output_buf.resize(output_len, 0.0);
+        self.output_buf.iter_mut().for_each(|x| *x = 0.0);
+        self.window_sum_buf.resize(output_len, 0.0);
+        self.window_sum_buf.iter_mut().for_each(|x| *x = 0.0);
 
         let fft_forward = self.planner.plan_fft_forward(self.fft_size);
         let fft_inverse = self.planner.plan_fft_inverse(self.fft_size);
@@ -172,13 +181,14 @@ impl PhaseVocoder {
             #[allow(clippy::needless_range_loop)]
             for i in 0..frame_len {
                 let out_idx = synthesis_pos + i;
-                output[out_idx] += self.fft_buffer[i].re * norm * self.window[i];
-                window_sum[out_idx] += self.window[i] * self.window[i];
+                self.output_buf[out_idx] += self.fft_buffer[i].re * norm * self.window[i];
+                self.window_sum_buf[out_idx] += self.window[i] * self.window[i];
             }
         }
 
-        Self::normalize_output(&mut output, &window_sum);
-        Ok(output)
+        Self::normalize_output(&mut self.output_buf, &self.window_sum_buf);
+        // Return a copy of the output; the buffers stay allocated for reuse.
+        Ok(self.output_buf[..output_len].to_vec())
     }
 
     /// Windows the input frame and transforms to frequency domain.
