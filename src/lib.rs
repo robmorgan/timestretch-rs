@@ -480,6 +480,48 @@ pub fn stretch_bpm_buffer_auto(
     })
 }
 
+/// Reads a WAV file, stretches it, and writes the result to another WAV file.
+///
+/// The output is written as 32-bit float WAV. The sample rate and channel
+/// layout are read from the input file and passed through automatically.
+///
+/// # Errors
+///
+/// Returns [`StretchError::IoError`] if the files cannot be read or written,
+/// [`StretchError::InvalidFormat`] if the input is not a valid WAV file,
+/// or [`StretchError::InvalidRatio`] if the stretch ratio is out of range.
+pub fn stretch_wav_file(
+    input_path: &str,
+    output_path: &str,
+    params: &StretchParams,
+) -> Result<AudioBuffer, StretchError> {
+    let buffer = io::wav::read_wav_file(input_path)?;
+    let result = stretch_buffer(&buffer, params)?;
+    io::wav::write_wav_file_float(output_path, &result)?;
+    Ok(result)
+}
+
+/// Reads a WAV file, pitch-shifts it, and writes the result to another WAV file.
+///
+/// The output is written as 32-bit float WAV. The sample rate and channel
+/// layout are read from the input file.
+///
+/// # Errors
+///
+/// Returns [`StretchError::IoError`] if the files cannot be read or written,
+/// or [`StretchError::InvalidRatio`] if the pitch factor is out of range.
+pub fn pitch_shift_wav_file(
+    input_path: &str,
+    output_path: &str,
+    params: &StretchParams,
+    pitch_factor: f64,
+) -> Result<AudioBuffer, StretchError> {
+    let buffer = io::wav::read_wav_file(input_path)?;
+    let result = pitch_shift_buffer(&buffer, params, pitch_factor)?;
+    io::wav::write_wav_file_float(output_path, &result)?;
+    Ok(result)
+}
+
 /// Returns the stretch ratio needed to change from one BPM to another.
 ///
 /// This is a simple utility: `source_bpm / target_bpm`. Use it when you
@@ -1028,5 +1070,73 @@ mod tests {
             "Silence should return 0 BPM, got {}",
             grid.bpm
         );
+    }
+
+    #[test]
+    fn test_stretch_wav_file() {
+        // Create a temp WAV file
+        let input: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+        let buf = AudioBuffer::from_mono(input, 44100);
+        let dir = std::env::temp_dir();
+        let in_path = dir.join("timestretch_test_in.wav");
+        let out_path = dir.join("timestretch_test_out.wav");
+        io::wav::write_wav_file_float(in_path.to_str().unwrap(), &buf).unwrap();
+
+        let params = StretchParams::new(1.5).with_channels(1);
+        let result = stretch_wav_file(
+            in_path.to_str().unwrap(),
+            out_path.to_str().unwrap(),
+            &params,
+        )
+        .unwrap();
+
+        assert!(!result.is_empty());
+        assert_eq!(result.channels, Channels::Mono);
+
+        // Verify the output file was written
+        let reloaded = io::wav::read_wav_file(out_path.to_str().unwrap()).unwrap();
+        assert_eq!(reloaded.data.len(), result.data.len());
+
+        // Clean up
+        let _ = std::fs::remove_file(&in_path);
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    #[test]
+    fn test_pitch_shift_wav_file() {
+        let input: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+        let buf = AudioBuffer::from_mono(input, 44100);
+        let dir = std::env::temp_dir();
+        let in_path = dir.join("timestretch_pitch_in.wav");
+        let out_path = dir.join("timestretch_pitch_out.wav");
+        io::wav::write_wav_file_float(in_path.to_str().unwrap(), &buf).unwrap();
+
+        let params = StretchParams::new(1.0).with_channels(1);
+        let result = pitch_shift_wav_file(
+            in_path.to_str().unwrap(),
+            out_path.to_str().unwrap(),
+            &params,
+            1.5,
+        )
+        .unwrap();
+
+        assert!(!result.is_empty());
+        // Pitch shift preserves length
+        assert_eq!(result.data.len(), buf.data.len());
+
+        // Clean up
+        let _ = std::fs::remove_file(&in_path);
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    #[test]
+    fn test_stretch_wav_file_missing_input() {
+        let params = StretchParams::new(1.5);
+        let result = stretch_wav_file("/nonexistent/path/input.wav", "/tmp/output.wav", &params);
+        assert!(result.is_err());
     }
 }
