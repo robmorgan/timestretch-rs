@@ -1,0 +1,21 @@
+[package]
+name = "timestretch"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust audio time stretching library optimized for EDM"
+license = "MIT"
+
+[dependencies]
+rustfft = "6"
+
+[[bin]]
+name = "timestretch-cli"
+path = "src/cli.rs"
+required-features = ["cli"]
+
+[features]
+cli = []
+
+[profile.release]
+opt-level = 3
+lto = true
