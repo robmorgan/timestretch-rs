@@ -268,36 +268,31 @@ impl StretchParams {
                 self.fft_size = 4096;
                 self.hop_size = 1024;
                 self.transient_sensitivity = 0.3;
-                self.wsola_search_range =
-                    ms_to_samples(WSOLA_SEARCH_MS_SMALL, self.sample_rate);
+                self.wsola_search_range = ms_to_samples(WSOLA_SEARCH_MS_SMALL, self.sample_rate);
             }
             EdmPreset::HouseLoop => {
                 self.fft_size = 4096;
                 self.hop_size = 1024;
                 self.transient_sensitivity = 0.5;
-                self.wsola_search_range =
-                    ms_to_samples(WSOLA_SEARCH_MS_MEDIUM, self.sample_rate);
+                self.wsola_search_range = ms_to_samples(WSOLA_SEARCH_MS_MEDIUM, self.sample_rate);
             }
             EdmPreset::Halftime => {
                 self.fft_size = 4096;
                 self.hop_size = 512;
                 self.transient_sensitivity = 0.7;
-                self.wsola_search_range =
-                    ms_to_samples(WSOLA_SEARCH_MS_LARGE, self.sample_rate);
+                self.wsola_search_range = ms_to_samples(WSOLA_SEARCH_MS_LARGE, self.sample_rate);
             }
             EdmPreset::Ambient => {
                 self.fft_size = 8192;
                 self.hop_size = 2048;
                 self.transient_sensitivity = 0.2;
-                self.wsola_search_range =
-                    ms_to_samples(WSOLA_SEARCH_MS_LARGE, self.sample_rate);
+                self.wsola_search_range = ms_to_samples(WSOLA_SEARCH_MS_LARGE, self.sample_rate);
             }
             EdmPreset::VocalChop => {
                 self.fft_size = 2048;
                 self.hop_size = 512;
                 self.transient_sensitivity = 0.6;
-                self.wsola_search_range =
-                    ms_to_samples(WSOLA_SEARCH_MS_MEDIUM, self.sample_rate);
+                self.wsola_search_range = ms_to_samples(WSOLA_SEARCH_MS_MEDIUM, self.sample_rate);
             }
         }
         self

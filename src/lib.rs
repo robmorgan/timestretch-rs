@@ -75,7 +75,14 @@ fn process_buffer(
 /// Deinterleaves multi-channel audio into separate per-channel vectors.
 fn deinterleave(input: &[f32], num_channels: usize) -> Vec<Vec<f32>> {
     (0..num_channels)
-        .map(|ch| input.iter().skip(ch).step_by(num_channels).copied().collect())
+        .map(|ch| {
+            input
+                .iter()
+                .skip(ch)
+                .step_by(num_channels)
+                .copied()
+                .collect()
+        })
         .collect()
 }
 
@@ -593,7 +600,10 @@ mod tests {
 
         // 120 -> 150 BPM: significant speedup (ratio 0.8)
         let output = stretch_to_bpm(&input, 120.0, 150.0, &params).unwrap();
-        assert!(output.len() < input.len(), "Should be shorter when speeding up");
+        assert!(
+            output.len() < input.len(),
+            "Should be shorter when speeding up"
+        );
     }
 
     #[test]
@@ -611,7 +621,10 @@ mod tests {
 
         // 120 -> 90 BPM: slow down (ratio 1.333)
         let output = stretch_to_bpm(&input, 120.0, 90.0, &params).unwrap();
-        assert!(output.len() > input.len(), "Should be longer when slowing down");
+        assert!(
+            output.len() > input.len(),
+            "Should be longer when slowing down"
+        );
     }
 
     #[test]
@@ -677,7 +690,9 @@ mod tests {
 
     #[test]
     fn test_stretch_to_bpm_auto_invalid_target() {
-        let params = StretchParams::new(1.0).with_sample_rate(44100).with_channels(1);
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
         let input = vec![0.0f32; 44100];
 
         assert!(stretch_to_bpm_auto(&input, 0.0, &params).is_err());

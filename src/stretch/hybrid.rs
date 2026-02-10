@@ -139,7 +139,11 @@ impl HybridStretcher {
             .wsola_segment_size
             .min(seg_data.len() / 2)
             .max(MIN_WSOLA_SEGMENT);
-        let search = self.params.wsola_search_range.min(seg_size / 2).max(MIN_WSOLA_SEARCH);
+        let search = self
+            .params
+            .wsola_search_range
+            .min(seg_size / 2)
+            .max(MIN_WSOLA_SEARCH);
         let mut wsola = Wsola::new(seg_size, search, self.params.stretch_ratio);
         wsola.process(seg_data)
     }
