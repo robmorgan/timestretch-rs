@@ -237,6 +237,22 @@
 - [x] Total: 205+ tests, all passing
 - [x] Zero clippy warnings
 
+## Pitch Shift Integration Tests (agent-1)
+- [x] 14 new integration tests in `tests/pitch_shift.rs`:
+  - Length preservation across multiple pitch factors (mono and stereo)
+  - Frequency shift verification: octave up (440→880Hz) and octave down (880→440Hz)
+  - Identity test (pitch factor 1.0 preserves frequency content)
+  - Small DJ-style adjustments (±2%)
+  - Stereo channel independence
+  - Extreme factors (4.0x up, 0.25x down)
+  - No clipping across all factors
+  - Silence preservation
+  - All 5 EDM presets compatibility
+  - 48kHz sample rate
+  - NaN/Inf sweep across 10 pitch factors
+- [x] Total: 206 tests (197 integration/unit + 9 doc-tests), all passing
+- [x] Zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
