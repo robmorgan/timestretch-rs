@@ -784,6 +784,128 @@ impl AudioBuffer {
     pub fn channel_count(&self) -> usize {
         self.channels.count()
     }
+
+    /// Splits the buffer into two at the given frame position.
+    ///
+    /// Returns `(left, right)` where `left` contains frames `[0, frame)` and
+    /// `right` contains frames `[frame, end)`. If `frame` exceeds the number
+    /// of frames, `right` will be empty.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let buf = AudioBuffer::from_mono(vec![1.0, 2.0, 3.0, 4.0], 44100);
+    /// let (left, right) = buf.split_at(2);
+    /// assert_eq!(left.data, vec![1.0, 2.0]);
+    /// assert_eq!(right.data, vec![3.0, 4.0]);
+    /// ```
+    pub fn split_at(&self, frame: usize) -> (Self, Self) {
+        let nc = self.channels.count();
+        let total_frames = self.num_frames();
+        let split = frame.min(total_frames);
+        let left = Self {
+            data: self.data[..split * nc].to_vec(),
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        };
+        let right = Self {
+            data: self.data[split * nc..].to_vec(),
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        };
+        (left, right)
+    }
+
+    /// Repeats (loops) the buffer `count` times.
+    ///
+    /// Returns a new buffer containing the audio data repeated `count` times.
+    /// Returns an empty buffer if `count` is 0.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let buf = AudioBuffer::from_mono(vec![1.0, 2.0], 44100);
+    /// let looped = buf.repeat(3);
+    /// assert_eq!(looped.data, vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+    /// ```
+    pub fn repeat(&self, count: usize) -> Self {
+        if count == 0 || self.data.is_empty() {
+            return Self {
+                data: vec![],
+                sample_rate: self.sample_rate,
+                channels: self.channels,
+            };
+        }
+        let mut data = Vec::with_capacity(self.data.len() * count);
+        for _ in 0..count {
+            data.extend_from_slice(&self.data);
+        }
+        Self {
+            data,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        }
+    }
+
+    /// Mixes (sums) this buffer with another, sample by sample.
+    ///
+    /// Both buffers must have the same sample rate and channel layout.
+    /// The output length equals the longer of the two inputs; the shorter
+    /// input is zero-padded. No clipping is applied — use
+    /// [`normalize`](Self::normalize) or [`apply_gain`](Self::apply_gain)
+    /// if the result exceeds ±1.0.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffers have different sample rates or channel layouts.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let a = AudioBuffer::from_mono(vec![0.5, 0.5], 44100);
+    /// let b = AudioBuffer::from_mono(vec![0.3, 0.3], 44100);
+    /// let mixed = a.mix(&b);
+    /// assert!((mixed.data[0] - 0.8).abs() < 1e-6);
+    /// ```
+    pub fn mix(&self, other: &AudioBuffer) -> Self {
+        assert_eq!(
+            self.sample_rate, other.sample_rate,
+            "sample rate mismatch: {} vs {}",
+            self.sample_rate, other.sample_rate
+        );
+        assert_eq!(
+            self.channels, other.channels,
+            "channel layout mismatch: {:?} vs {:?}",
+            self.channels, other.channels
+        );
+
+        let len = self.data.len().max(other.data.len());
+        let mut data = vec![0.0f32; len];
+        for (i, d) in data.iter_mut().enumerate() {
+            let a = if i < self.data.len() {
+                self.data[i]
+            } else {
+                0.0
+            };
+            let b = if i < other.data.len() {
+                other.data[i]
+            } else {
+                0.0
+            };
+            *d = a + b;
+        }
+        Self {
+            data,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        }
+    }
 }
 
 /// EDM-specific presets for time stretching.
@@ -2149,5 +2271,135 @@ mod tests {
     fn test_audio_buffer_into_data_empty() {
         let buf = AudioBuffer::from_mono(vec![], 44100);
         assert!(buf.into_data().is_empty());
+    }
+
+    // --- split_at tests ---
+
+    #[test]
+    fn test_split_at_mono() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 2.0, 3.0, 4.0], 44100);
+        let (left, right) = buf.split_at(2);
+        assert_eq!(left.data, vec![1.0, 2.0]);
+        assert_eq!(right.data, vec![3.0, 4.0]);
+        assert_eq!(left.sample_rate, 44100);
+        assert_eq!(right.sample_rate, 44100);
+    }
+
+    #[test]
+    fn test_split_at_stereo() {
+        let buf = AudioBuffer::from_stereo(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 44100);
+        let (left, right) = buf.split_at(1);
+        assert_eq!(left.data, vec![1.0, 2.0]);
+        assert_eq!(right.data, vec![3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_split_at_zero() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 2.0], 44100);
+        let (left, right) = buf.split_at(0);
+        assert!(left.is_empty());
+        assert_eq!(right.data, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_split_at_end() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 2.0], 44100);
+        let (left, right) = buf.split_at(100); // beyond end
+        assert_eq!(left.data, vec![1.0, 2.0]);
+        assert!(right.is_empty());
+    }
+
+    // --- repeat tests ---
+
+    #[test]
+    fn test_repeat_mono() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 2.0], 44100);
+        let looped = buf.repeat(3);
+        assert_eq!(looped.data, vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+        assert_eq!(looped.num_frames(), 6);
+    }
+
+    #[test]
+    fn test_repeat_stereo() {
+        let buf = AudioBuffer::from_stereo(vec![1.0, 2.0, 3.0, 4.0], 44100);
+        let looped = buf.repeat(2);
+        assert_eq!(looped.data, vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(looped.num_frames(), 4);
+    }
+
+    #[test]
+    fn test_repeat_zero() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 2.0], 44100);
+        let looped = buf.repeat(0);
+        assert!(looped.is_empty());
+    }
+
+    #[test]
+    fn test_repeat_one() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 2.0], 44100);
+        let looped = buf.repeat(1);
+        assert_eq!(looped.data, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_repeat_empty() {
+        let buf = AudioBuffer::from_mono(vec![], 44100);
+        let looped = buf.repeat(5);
+        assert!(looped.is_empty());
+    }
+
+    // --- mix tests ---
+
+    #[test]
+    fn test_mix_basic() {
+        let a = AudioBuffer::from_mono(vec![0.5, 0.5], 44100);
+        let b = AudioBuffer::from_mono(vec![0.3, 0.3], 44100);
+        let mixed = a.mix(&b);
+        assert!((mixed.data[0] - 0.8).abs() < 1e-6);
+        assert!((mixed.data[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_mix_different_lengths() {
+        let a = AudioBuffer::from_mono(vec![1.0, 1.0, 1.0], 44100);
+        let b = AudioBuffer::from_mono(vec![0.5], 44100);
+        let mixed = a.mix(&b);
+        assert_eq!(mixed.num_frames(), 3);
+        assert!((mixed.data[0] - 1.5).abs() < 1e-6);
+        assert!((mixed.data[1] - 1.0).abs() < 1e-6);
+        assert!((mixed.data[2] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_mix_stereo() {
+        let a = AudioBuffer::from_stereo(vec![0.5, 0.3, 0.5, 0.3], 44100);
+        let b = AudioBuffer::from_stereo(vec![0.1, 0.2, 0.1, 0.2], 44100);
+        let mixed = a.mix(&b);
+        assert!((mixed.data[0] - 0.6).abs() < 1e-6); // L
+        assert!((mixed.data[1] - 0.5).abs() < 1e-6); // R
+    }
+
+    #[test]
+    #[should_panic(expected = "sample rate mismatch")]
+    fn test_mix_mismatched_rate() {
+        let a = AudioBuffer::from_mono(vec![0.5], 44100);
+        let b = AudioBuffer::from_mono(vec![0.5], 48000);
+        a.mix(&b);
+    }
+
+    #[test]
+    #[should_panic(expected = "channel layout mismatch")]
+    fn test_mix_mismatched_channels() {
+        let a = AudioBuffer::from_mono(vec![0.5], 44100);
+        let b = AudioBuffer::from_stereo(vec![0.5, 0.5], 44100);
+        a.mix(&b);
+    }
+
+    #[test]
+    fn test_mix_empty() {
+        let a = AudioBuffer::from_mono(vec![1.0], 44100);
+        let b = AudioBuffer::from_mono(vec![], 44100);
+        let mixed = a.mix(&b);
+        assert_eq!(mixed.data, vec![1.0]);
     }
 }
