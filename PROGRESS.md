@@ -368,6 +368,16 @@
 - [x] Removed dead guard `if mirror < spectrum.len()` in frequency.rs split_spectrum_into_bands() (always true when spectrum.len() == fft_size)
 - [x] All 126 unit tests passing, zero clippy warnings
 
+### Ninth pass (agent-5)
+- [x] Extracted `DEFAULT_SAMPLE_RATE`, `DEFAULT_FFT_SIZE`, `DEFAULT_HOP_SIZE`, `DEFAULT_TRANSIENT_SENSITIVITY`, `DEFAULT_SUB_BASS_CUTOFF` constants in types.rs — eliminates 5 magic numbers in `StretchParams::new()`
+- [x] Extracted `PresetConfig` struct and `EdmPreset::config()` method — replaces 5-arm match with data-driven dispatch in `with_preset()` (net -20 lines)
+- [x] Extracted `LATENCY_FFT_MULTIPLIER` constant in processor.rs — replaces 3 occurrences of magic `* 2`
+- [x] Extracted `PEAKS_CAPACITY_DIVISOR` constant in phase_vocoder.rs — documents why peaks buffer is allocated at 1/4 of bins
+- [x] Extracted `WAV_HEADER_WRITE_SIZE` and `WAV_RIFF_OVERHEAD` constants in wav.rs — replaces magic `44` and `36` in header writing
+- [x] Used `WAV_FMT_MIN_SIZE` for fmt chunk size write (was inline `16u32`)
+- [x] Moved `PCM_24BIT_MAX_OUT` to top of wav.rs with other PCM constants (better organization)
+- [x] All 291 tests passing (133 unit + 144 integration + 14 doc), zero clippy warnings
+
 ## CLI Enhancements (agent-1)
 - [x] `--from-bpm <f> --to-bpm <f>` for DJ BPM matching (auto-selects DjBeatmatch preset)
 - [x] `--pitch <f>` for pitch shifting (preserves audio duration)
