@@ -720,6 +720,54 @@ impl AudioBuffer {
             channels: self.channels,
         }
     }
+
+    /// Reverses the audio in this buffer, frame by frame.
+    ///
+    /// For stereo audio, each frame's channels stay in order (L, R) — only
+    /// the frame ordering is reversed. This is useful for creative DJ effects
+    /// like reverse cymbal builds and tape-stop simulations.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let buf = AudioBuffer::from_mono(vec![1.0, 2.0, 3.0], 44100);
+    /// let rev = buf.reverse();
+    /// assert_eq!(rev.data, vec![3.0, 2.0, 1.0]);
+    /// ```
+    pub fn reverse(&self) -> Self {
+        let nc = self.channels.count();
+        let num_frames = self.num_frames();
+        let mut data = Vec::with_capacity(self.data.len());
+        for frame in (0..num_frames).rev() {
+            let start = frame * nc;
+            data.extend_from_slice(&self.data[start..start + nc]);
+        }
+        Self {
+            data,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        }
+    }
+
+    /// Returns the number of audio channels (1 for mono, 2 for stereo).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let mono = AudioBuffer::from_mono(vec![0.0; 100], 44100);
+    /// assert_eq!(mono.channel_count(), 1);
+    ///
+    /// let stereo = AudioBuffer::from_stereo(vec![0.0; 200], 44100);
+    /// assert_eq!(stereo.channel_count(), 2);
+    /// ```
+    #[inline]
+    pub fn channel_count(&self) -> usize {
+        self.channels.count()
+    }
 }
 
 /// EDM-specific presets for time stretching.
@@ -2011,5 +2059,55 @@ mod tests {
             mixed.data.iter().all(|&s| (s - 0.7).abs() < 0.01),
             "Equal-amplitude crossfade should preserve level"
         );
+    }
+
+    // --- reverse tests ---
+
+    #[test]
+    fn test_reverse_mono() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 2.0, 3.0, 4.0], 44100);
+        let rev = buf.reverse();
+        assert_eq!(rev.data, vec![4.0, 3.0, 2.0, 1.0]);
+        assert_eq!(rev.sample_rate, 44100);
+        assert!(rev.is_mono());
+    }
+
+    #[test]
+    fn test_reverse_stereo() {
+        // Stereo: frames are [L1, R1, L2, R2, L3, R3]
+        let buf = AudioBuffer::from_stereo(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 44100);
+        let rev = buf.reverse();
+        // Reversed frame order: [L3, R3, L2, R2, L1, R1]
+        assert_eq!(rev.data, vec![5.0, 6.0, 3.0, 4.0, 1.0, 2.0]);
+        assert!(rev.is_stereo());
+    }
+
+    #[test]
+    fn test_reverse_empty() {
+        let buf = AudioBuffer::from_mono(vec![], 44100);
+        let rev = buf.reverse();
+        assert!(rev.is_empty());
+    }
+
+    #[test]
+    fn test_reverse_double_is_identity() {
+        let data = vec![0.1, 0.5, -0.3, 0.8, 0.0];
+        let buf = AudioBuffer::from_mono(data.clone(), 44100);
+        let double_rev = buf.reverse().reverse();
+        assert_eq!(double_rev.data, data);
+    }
+
+    // --- channel_count tests ---
+
+    #[test]
+    fn test_channel_count_mono() {
+        let buf = AudioBuffer::from_mono(vec![0.0; 10], 44100);
+        assert_eq!(buf.channel_count(), 1);
+    }
+
+    #[test]
+    fn test_channel_count_stereo() {
+        let buf = AudioBuffer::from_stereo(vec![0.0; 20], 44100);
+        assert_eq!(buf.channel_count(), 2);
     }
 }
