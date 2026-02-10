@@ -159,16 +159,18 @@ pub fn read_wav_file(path: &str) -> Result<AudioBuffer, StretchError> {
     read_wav(&data)
 }
 
-/// Writes an audio buffer as a WAV file (16-bit PCM).
-pub fn write_wav_16bit(buffer: &AudioBuffer) -> Vec<u8> {
-    let num_channels = buffer.channels.count() as u16;
-    let bits_per_sample: u16 = 16;
-    let byte_rate = buffer.sample_rate * num_channels as u32 * (bits_per_sample as u32 / 8);
+/// Writes RIFF/WAVE header and fmt+data chunk headers to a buffer.
+fn write_wav_header(
+    out: &mut Vec<u8>,
+    format_code: u16,
+    num_channels: u16,
+    sample_rate: u32,
+    bits_per_sample: u16,
+    data_size: u32,
+) {
+    let byte_rate = sample_rate * num_channels as u32 * (bits_per_sample as u32 / 8);
     let block_align = num_channels * (bits_per_sample / 8);
-    let data_size = (buffer.data.len() * 2) as u32;
     let file_size = 36 + data_size;
-
-    let mut out = Vec::with_capacity(file_size as usize + 8);
 
     // RIFF header
     out.extend_from_slice(b"RIFF");
@@ -177,10 +179,10 @@ pub fn write_wav_16bit(buffer: &AudioBuffer) -> Vec<u8> {
 
     // fmt chunk
     out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes()); // chunk size
-    out.extend_from_slice(&WAV_FORMAT_PCM.to_le_bytes());
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&format_code.to_le_bytes());
     out.extend_from_slice(&num_channels.to_le_bytes());
-    out.extend_from_slice(&buffer.sample_rate.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
     out.extend_from_slice(&byte_rate.to_le_bytes());
     out.extend_from_slice(&block_align.to_le_bytes());
     out.extend_from_slice(&bits_per_sample.to_le_bytes());
@@ -188,6 +190,15 @@ pub fn write_wav_16bit(buffer: &AudioBuffer) -> Vec<u8> {
     // data chunk
     out.extend_from_slice(b"data");
     out.extend_from_slice(&data_size.to_le_bytes());
+}
+
+/// Writes an audio buffer as a WAV file (16-bit PCM).
+pub fn write_wav_16bit(buffer: &AudioBuffer) -> Vec<u8> {
+    let num_channels = buffer.channels.count() as u16;
+    let data_size = (buffer.data.len() * 2) as u32;
+
+    let mut out = Vec::with_capacity(44 + data_size as usize);
+    write_wav_header(&mut out, WAV_FORMAT_PCM, num_channels, buffer.sample_rate, 16, data_size);
 
     for &sample in &buffer.data {
         let clamped = sample.clamp(-1.0, 1.0);
@@ -201,32 +212,10 @@ pub fn write_wav_16bit(buffer: &AudioBuffer) -> Vec<u8> {
 /// Writes an audio buffer as a WAV file (32-bit float).
 pub fn write_wav_float(buffer: &AudioBuffer) -> Vec<u8> {
     let num_channels = buffer.channels.count() as u16;
-    let bits_per_sample: u16 = 32;
-    let byte_rate = buffer.sample_rate * num_channels as u32 * (bits_per_sample as u32 / 8);
-    let block_align = num_channels * (bits_per_sample / 8);
     let data_size = (buffer.data.len() * 4) as u32;
-    let file_size = 36 + data_size;
 
-    let mut out = Vec::with_capacity(file_size as usize + 8);
-
-    // RIFF header
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&file_size.to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-
-    // fmt chunk
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes());
-    out.extend_from_slice(&WAV_FORMAT_IEEE_FLOAT.to_le_bytes());
-    out.extend_from_slice(&num_channels.to_le_bytes());
-    out.extend_from_slice(&buffer.sample_rate.to_le_bytes());
-    out.extend_from_slice(&byte_rate.to_le_bytes());
-    out.extend_from_slice(&block_align.to_le_bytes());
-    out.extend_from_slice(&bits_per_sample.to_le_bytes());
-
-    // data chunk
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data_size.to_le_bytes());
+    let mut out = Vec::with_capacity(44 + data_size as usize);
+    write_wav_header(&mut out, WAV_FORMAT_IEEE_FLOAT, num_channels, buffer.sample_rate, 32, data_size);
 
     for &sample in &buffer.data {
         out.extend_from_slice(&sample.to_le_bytes());

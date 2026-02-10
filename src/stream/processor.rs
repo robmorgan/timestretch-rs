@@ -32,19 +32,7 @@ impl StreamProcessor {
     pub fn new(params: StretchParams) -> Self {
         let ratio = params.stretch_ratio;
         let num_channels = params.channels.count();
-
-        let vocoders = (0..num_channels)
-            .map(|_| {
-                PhaseVocoder::new(
-                    params.fft_size,
-                    params.hop_size,
-                    ratio,
-                    params.sample_rate,
-                    params.sub_bass_cutoff,
-                )
-            })
-            .collect();
-
+        let vocoders = Self::create_vocoders(&params, ratio);
         let channel_buffers = (0..num_channels).map(|_| Vec::new()).collect();
 
         Self {
@@ -57,6 +45,21 @@ impl StreamProcessor {
             channel_buffers,
             output_scratch: Vec::new(),
         }
+    }
+
+    /// Creates PhaseVocoder instances for each channel.
+    fn create_vocoders(params: &StretchParams, ratio: f64) -> Vec<PhaseVocoder> {
+        (0..params.channels.count())
+            .map(|_| {
+                PhaseVocoder::new(
+                    params.fft_size,
+                    params.hop_size,
+                    ratio,
+                    params.sample_rate,
+                    params.sub_bass_cutoff,
+                )
+            })
+            .collect()
     }
 
     /// Processes a chunk of interleaved audio samples.
@@ -87,17 +90,7 @@ impl StreamProcessor {
 
         // Recreate vocoders if ratio has changed
         if (self.current_ratio - self.params.stretch_ratio).abs() > 0.0001 {
-            self.vocoders = (0..num_channels)
-                .map(|_| {
-                    PhaseVocoder::new(
-                        self.params.fft_size,
-                        self.params.hop_size,
-                        self.current_ratio,
-                        self.params.sample_rate,
-                        self.params.sub_bass_cutoff,
-                    )
-                })
-                .collect();
+            self.vocoders = Self::create_vocoders(&self.params, self.current_ratio);
         }
 
         // Process each channel using persistent vocoders and reusable buffers
@@ -174,18 +167,7 @@ impl StreamProcessor {
         self.initialized = false;
 
         // Recreate vocoders with original ratio
-        let num_channels = self.params.channels.count();
-        self.vocoders = (0..num_channels)
-            .map(|_| {
-                PhaseVocoder::new(
-                    self.params.fft_size,
-                    self.params.hop_size,
-                    self.params.stretch_ratio,
-                    self.params.sample_rate,
-                    self.params.sub_bass_cutoff,
-                )
-            })
-            .collect();
+        self.vocoders = Self::create_vocoders(&self.params, self.params.stretch_ratio);
     }
 
     /// Flushes remaining buffered samples.

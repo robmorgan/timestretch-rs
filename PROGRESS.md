@@ -52,7 +52,10 @@
 - [x] Added getter methods to `PhaseVocoder` (`fft_size()`, `hop_analysis()`, `hop_synthesis()`)
 - [x] Added getter methods to `Wsola` (`segment_size()`, `search_range()`, `stretch_ratio()`)
 - [x] Removed unused `ProcessingError` variant from `StretchError`
-- [x] All 93 tests passing, zero clippy warnings
+- [x] Extracted `write_wav_header()` helper to eliminate WAV writer duplication (wav.rs)
+- [x] Extracted `create_vocoders()` helper to eliminate 3x duplicated PhaseVocoder init (processor.rs)
+- [x] Simplified redundant guard in `segment_audio()` (hybrid.rs)
+- [x] All 66 unit tests passing, zero clippy warnings
 
 ## Completed — Performance Optimization (agent-3)
 - [x] Comprehensive benchmarks: PV mono/stereo, EDM presets, FFT sizes, streaming, signal scaling

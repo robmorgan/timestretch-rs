@@ -150,15 +150,13 @@ impl HybridStretcher {
             }
 
             // Tonal region before this onset
-            if onset > pos {
-                let tonal_end = onset.min(input_len);
-                if tonal_end > pos {
-                    segments.push(Segment {
-                        start: pos,
-                        end: tonal_end,
-                        is_transient: false,
-                    });
-                }
+            let tonal_end = onset.min(input_len);
+            if tonal_end > pos {
+                segments.push(Segment {
+                    start: pos,
+                    end: tonal_end,
+                    is_transient: false,
+                });
             }
 
             // Transient region
