@@ -3,7 +3,7 @@
 use std::fmt;
 
 /// Errors that can occur during time stretching.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StretchError {
     /// Invalid audio format or parameters.
     InvalidFormat(String),

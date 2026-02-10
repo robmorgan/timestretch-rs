@@ -108,10 +108,28 @@
 - [x] Total: 131 tests, all passing
 - [x] Zero clippy warnings
 
+## Agent-1 Contributions
+- [x] Fixed WSOLA compression ratio accuracy: added early loop termination for compression and removed `overlap_size` padding from output trimming
+- [x] Added `Clone`, `PartialEq`, `Eq` derives to `StretchError` for better ergonomics
+- [x] Merged and expanded edge case tests (combined with agent-2's tests):
+  - Extreme compression (0.25x) and stretch (4.0x, 10.0x)
+  - Silence input, DC offset input, impulse input
+  - Very short input (50 and 100 samples), single sample input
+  - Parameter boundary validation (min/max ratios, invalid ratios)
+  - WSOLA compression accuracy across multiple ratios
+  - NaN/Inf output detection across all ratios
+  - Stereo channel independence and mono/stereo consistency
+  - Frequency edge cases (20 Hz sub-bass, 15 kHz near-Nyquist)
+  - All EDM presets with compression
+  - Alternating silence/tone patterns
+  - FFT size variations (256, 8192)
+- [x] Total: 137 tests, all passing
+
 ## TODO
 - [ ] Test with real audio samples
 - [ ] SIMD-friendly inner loop layout
 - [ ] Improve documentation (rustdoc, README examples)
+- [ ] More comprehensive identity test (bit-exact where possible)
 
 ## Notes
 - Hann window used for all PV processing (works well for EDM kicks)

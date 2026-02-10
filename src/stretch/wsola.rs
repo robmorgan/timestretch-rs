@@ -82,6 +82,11 @@ impl Wsola {
         let mut actual_output_len = first_len;
 
         while (input_pos as usize) + self.segment_size <= input.len() {
+            // For compression (ratio < 1.0), stop once we've produced enough output
+            if actual_output_len >= target_output_len {
+                break;
+            }
+
             let nominal_pos = input_pos as usize;
             let output_pos = output_pos_f.round() as usize;
 
@@ -113,8 +118,8 @@ impl Wsola {
             output_pos_f += advance_output_f;
         }
 
-        // Trim output to target length for better ratio accuracy
-        let final_len = actual_output_len.min(target_output_len + self.overlap_size);
+        // Trim output to target length for accurate ratio
+        let final_len = actual_output_len.min(target_output_len);
         output.truncate(final_len);
         Ok(output)
     }

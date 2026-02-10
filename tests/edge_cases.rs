@@ -7,15 +7,22 @@ fn sine_wave(freq: f32, sample_rate: u32, num_samples: usize) -> Vec<f32> {
         .collect()
 }
 
+fn rms(signal: &[f32]) -> f32 {
+    if signal.is_empty() {
+        return 0.0;
+    }
+    (signal.iter().map(|x| x * x).sum::<f32>() / signal.len() as f32).sqrt()
+}
+
+// --- Boundary input size tests (from agent-2) ---
+
 #[test]
 fn test_minimum_input_size() {
-    // Test with input just barely large enough for processing
     let sample_rate = 44100u32;
     let params = StretchParams::new(1.5)
         .with_sample_rate(sample_rate)
         .with_channels(1);
 
-    // FFT size is 4096 by default, so input must be at least that
     let input = sine_wave(440.0, sample_rate, 4096);
     let result = stretch(&input, &params);
     assert!(result.is_ok(), "Should process input of exactly FFT size");
@@ -29,7 +36,6 @@ fn test_input_slightly_above_minimum() {
         .with_sample_rate(sample_rate)
         .with_channels(1);
 
-    // FFT size + 1
     let input = sine_wave(440.0, sample_rate, 4097);
     let result = stretch(&input, &params);
     assert!(result.is_ok());
@@ -37,8 +43,48 @@ fn test_input_slightly_above_minimum() {
 }
 
 #[test]
+fn test_very_short_input() {
+    let sample_rate = 44100;
+
+    // 100 samples - shorter than FFT size, should fall back gracefully
+    let input = sine_wave(440.0, sample_rate, 100);
+    let params = StretchParams::new(1.5)
+        .with_sample_rate(sample_rate)
+        .with_channels(1);
+
+    let output = stretch(&input, &params).unwrap();
+    assert!(!output.is_empty(), "100-sample input should produce output");
+
+    // 50 samples
+    let input_tiny = sine_wave(440.0, sample_rate, 50);
+    let output_tiny = stretch(&input_tiny, &params).unwrap();
+    assert!(
+        !output_tiny.is_empty(),
+        "50-sample input should produce output"
+    );
+}
+
+#[test]
+fn test_single_sample_input() {
+    let params = StretchParams::new(1.5)
+        .with_sample_rate(44100)
+        .with_channels(1);
+
+    let result = stretch(&[0.5], &params);
+    match result {
+        Ok(output) => {
+            assert!(output.len() <= 10, "Single sample output shouldn't be huge");
+        }
+        Err(_) => {
+            // Also acceptable - input too short
+        }
+    }
+}
+
+// --- Near-unity ratio tests (from agent-2) ---
+
+#[test]
 fn test_stretch_ratio_near_one() {
-    // Ratios very close to 1.0 should still work correctly
     let sample_rate = 44100u32;
     let input = sine_wave(440.0, sample_rate, sample_rate as usize);
 
@@ -58,11 +104,32 @@ fn test_stretch_ratio_near_one() {
     }
 }
 
+// --- Extreme ratio tests (combined) ---
+
 #[test]
-fn test_extreme_stretch_ratio() {
-    // Large stretch ratios (4x)
+fn test_extreme_compression_025x() {
+    let sample_rate = 44100;
+    let input = sine_wave(440.0, sample_rate, sample_rate as usize * 4);
+
+    let params = StretchParams::new(0.25)
+        .with_sample_rate(sample_rate)
+        .with_channels(1);
+
+    let output = stretch(&input, &params).unwrap();
+    assert!(!output.is_empty());
+
+    let actual_ratio = output.len() as f64 / input.len() as f64;
+    assert!(
+        (actual_ratio - 0.25).abs() < 0.15,
+        "0.25x ratio: actual {:.3} too far from 0.25",
+        actual_ratio
+    );
+}
+
+#[test]
+fn test_extreme_stretch_4x() {
     let sample_rate = 44100u32;
-    let input = sine_wave(440.0, sample_rate, sample_rate as usize);
+    let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
 
     let params = StretchParams::new(4.0)
         .with_sample_rate(sample_rate)
@@ -72,58 +139,84 @@ fn test_extreme_stretch_ratio() {
     let output = stretch(&input, &params).unwrap();
     assert!(!output.is_empty());
 
-    let ratio = output.len() as f64 / input.len() as f64;
+    let actual_ratio = output.len() as f64 / input.len() as f64;
     assert!(
-        ratio > 2.0,
-        "4x stretch should produce significantly longer output, got {}",
-        ratio
+        actual_ratio > 2.0,
+        "4x stretch should produce significantly longer output, got {:.3}",
+        actual_ratio
     );
 }
 
 #[test]
-fn test_extreme_compression_ratio() {
-    // Small stretch ratios (0.25 = 4x speedup)
-    let sample_rate = 44100u32;
-    let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
+fn test_parameter_boundary_ratio_min() {
+    let sample_rate = 44100;
+    let input = sine_wave(440.0, sample_rate, sample_rate as usize * 4);
 
-    let params = StretchParams::new(0.25)
+    let params = StretchParams::new(0.02)
+        .with_sample_rate(sample_rate)
+        .with_channels(1);
+
+    let result = stretch(&input, &params);
+    match result {
+        Ok(output) => {
+            assert!(output.len() < input.len(), "0.02x should compress heavily");
+        }
+        Err(_) => {
+            // Acceptable for extreme ratios
+        }
+    }
+}
+
+#[test]
+fn test_parameter_boundary_ratio_max() {
+    let sample_rate = 44100;
+    let input = sine_wave(440.0, sample_rate, sample_rate as usize);
+
+    let params = StretchParams::new(10.0)
         .with_sample_rate(sample_rate)
         .with_channels(1);
 
     let output = stretch(&input, &params).unwrap();
     assert!(!output.is_empty());
+
+    let actual_ratio = output.len() as f64 / input.len() as f64;
     assert!(
-        output.len() < input.len(),
-        "0.25x should produce shorter output"
+        actual_ratio > 5.0,
+        "10x stretch produced only {:.1}x output",
+        actual_ratio
     );
 }
 
+// --- Invalid ratio tests ---
+
 #[test]
-fn test_dc_offset_signal() {
-    // Signal with a DC offset (not centered at zero)
-    let sample_rate = 44100u32;
-    let num_samples = sample_rate as usize;
-    let input: Vec<f32> = (0..num_samples)
-        .map(|i| 0.5 + 0.3 * (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
-        .collect();
-
-    let params = StretchParams::new(1.5)
-        .with_sample_rate(sample_rate)
-        .with_channels(1);
-
-    let output = stretch(&input, &params).unwrap();
-    assert!(!output.is_empty());
-
-    // Output should not clip excessively
-    let max = output.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-    assert!(max < 3.0, "DC offset signal clipped: max={}", max);
+fn test_invalid_ratio_zero() {
+    let params = StretchParams::new(0.0);
+    let result = stretch(&[0.0; 44100], &params);
+    assert!(result.is_err(), "Zero ratio should be rejected");
 }
+
+#[test]
+fn test_invalid_ratio_negative() {
+    let params = StretchParams::new(-1.0);
+    let result = stretch(&[0.0; 44100], &params);
+    assert!(result.is_err(), "Negative ratio should be rejected");
+}
+
+#[test]
+fn test_invalid_ratio_too_large() {
+    let mut params = StretchParams::new(1.0);
+    params.stretch_ratio = 200.0;
+    let result = stretch(&[0.0; 44100], &params);
+    assert!(result.is_err(), "200x ratio should be rejected");
+}
+
+// --- Signal type tests ---
 
 #[test]
 fn test_silence_input() {
-    // All-zero input should produce all-zero (or near-zero) output
     let sample_rate = 44100u32;
-    let input = vec![0.0f32; sample_rate as usize];
+    let input = vec![0.0f32; sample_rate as usize * 2];
 
     let params = StretchParams::new(1.5)
         .with_sample_rate(sample_rate)
@@ -141,8 +234,63 @@ fn test_silence_input() {
 }
 
 #[test]
+fn test_dc_offset_input() {
+    let sample_rate = 44100u32;
+    let input: Vec<f32> = (0..sample_rate as usize * 2)
+        .map(|i| {
+            0.5 + 0.3 * (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin()
+        })
+        .collect();
+
+    let params = StretchParams::new(1.5)
+        .with_sample_rate(sample_rate)
+        .with_channels(1);
+
+    let output = stretch(&input, &params).unwrap();
+    assert!(!output.is_empty());
+
+    // DC offset should be roughly preserved
+    let input_mean = input.iter().sum::<f32>() / input.len() as f32;
+    let output_mean = output.iter().sum::<f32>() / output.len() as f32;
+    assert!(
+        (output_mean - input_mean).abs() < 0.3,
+        "DC offset diverged: input mean={:.3}, output mean={:.3}",
+        input_mean,
+        output_mean
+    );
+
+    // Output should not clip excessively
+    let max = output.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    assert!(max < 3.0, "DC offset signal clipped: max={}", max);
+}
+
+#[test]
+fn test_impulse_input() {
+    let sample_rate = 44100u32;
+    let mut input = vec![0.0f32; sample_rate as usize * 2];
+    input[sample_rate as usize / 2] = 1.0;
+
+    let params = StretchParams::new(1.5)
+        .with_sample_rate(sample_rate)
+        .with_channels(1);
+
+    let output = stretch(&input, &params).unwrap();
+    assert!(!output.is_empty());
+
+    let max_sample = output.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    assert!(
+        max_sample < 5.0,
+        "Impulse input caused excessive gain: max={}",
+        max_sample
+    );
+    // Impulse should be preserved
+    assert!(max_sample > 0.01, "Impulse was completely lost in stretch");
+}
+
+// --- Frequency edge tests (from agent-2) ---
+
+#[test]
 fn test_very_low_frequency() {
-    // 20 Hz sub-bass (near the edge of audibility)
     let sample_rate = 44100u32;
     let input = sine_wave(20.0, sample_rate, sample_rate as usize * 2);
 
@@ -154,11 +302,8 @@ fn test_very_low_frequency() {
     let output = stretch(&input, &params).unwrap();
     assert!(!output.is_empty());
 
-    // RMS should be reasonable
-    let input_rms: f32 =
-        (input.iter().map(|x| x * x).sum::<f32>() / input.len() as f32).sqrt();
-    let output_rms: f32 =
-        (output.iter().map(|x| x * x).sum::<f32>() / output.len() as f32).sqrt();
+    let input_rms = rms(&input);
+    let output_rms = rms(&output);
     assert!(
         (output_rms - input_rms).abs() < input_rms * 0.6,
         "20 Hz RMS: input={}, output={}",
@@ -169,7 +314,6 @@ fn test_very_low_frequency() {
 
 #[test]
 fn test_very_high_frequency() {
-    // 15 kHz (near Nyquist for some signals)
     let sample_rate = 44100u32;
     let input = sine_wave(15000.0, sample_rate, sample_rate as usize);
 
@@ -181,34 +325,14 @@ fn test_very_high_frequency() {
     assert!(!output.is_empty());
 }
 
-#[test]
-fn test_impulse_signal() {
-    // Single impulse (Dirac-like) — tests transient handling
-    let sample_rate = 44100u32;
-    let num_samples = sample_rate as usize;
-    let mut input = vec![0.0f32; num_samples];
-    input[num_samples / 2] = 1.0; // Single sample impulse in the middle
-
-    let params = StretchParams::new(2.0)
-        .with_sample_rate(sample_rate)
-        .with_channels(1);
-
-    let output = stretch(&input, &params).unwrap();
-    assert!(!output.is_empty());
-
-    // Output should contain some non-zero samples (the impulse should be preserved)
-    let max = output.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-    assert!(max > 0.01, "Impulse was completely lost in stretch");
-}
+// --- Pattern tests (from agent-2) ---
 
 #[test]
 fn test_alternating_silence_and_tone() {
-    // Signal with gaps (silence between tone bursts)
     let sample_rate = 44100u32;
     let num_samples = sample_rate as usize * 2;
     let mut input = vec![0.0f32; num_samples];
 
-    // 200ms tone, 300ms silence, repeated
     let tone_len = (sample_rate as f64 * 0.2) as usize;
     let gap_len = (sample_rate as f64 * 0.3) as usize;
     let cycle = tone_len + gap_len;
@@ -227,7 +351,6 @@ fn test_alternating_silence_and_tone() {
     let output = stretch(&input, &params).unwrap();
     assert!(!output.is_empty());
 
-    // Output length should be approximately 1.5x
     let ratio = output.len() as f64 / input.len() as f64;
     assert!(
         (ratio - 1.5).abs() < 0.5,
@@ -236,9 +359,10 @@ fn test_alternating_silence_and_tone() {
     );
 }
 
+// --- Preset compression tests (from agent-2) ---
+
 #[test]
 fn test_all_presets_with_compression() {
-    // Ensure all presets work with compression (not just stretching)
     let sample_rate = 44100u32;
     let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
 
@@ -270,10 +394,40 @@ fn test_all_presets_with_compression() {
     }
 }
 
+// --- Stereo tests ---
+
+#[test]
+fn test_stereo_channel_independence() {
+    let sample_rate = 44100;
+    let num_frames = sample_rate as usize;
+    let mut input = vec![0.0f32; num_frames * 2];
+
+    for i in 0..num_frames {
+        let t = i as f32 / sample_rate as f32;
+        input[i * 2] = (2.0 * PI * 440.0 * t).sin();
+        input[i * 2 + 1] = 0.0;
+    }
+
+    let params = StretchParams::new(1.5)
+        .with_sample_rate(sample_rate)
+        .with_channels(2);
+
+    let output = stretch(&input, &params).unwrap();
+    assert_eq!(output.len() % 2, 0, "Stereo output must have even length");
+
+    let right_rms: f32 = {
+        let right: Vec<f32> = output.iter().skip(1).step_by(2).copied().collect();
+        rms(&right)
+    };
+    assert!(
+        right_rms < 0.05,
+        "Silent right channel leaked signal: RMS={}",
+        right_rms
+    );
+}
+
 #[test]
 fn test_stereo_mono_consistency() {
-    // Mono processing of a single-channel signal should produce similar results
-    // whether processed as mono or as a duplicate-stereo signal
     let sample_rate = 44100u32;
     let input_mono = sine_wave(440.0, sample_rate, sample_rate as usize);
 
@@ -283,7 +437,6 @@ fn test_stereo_mono_consistency() {
 
     let output_mono = stretch(&input_mono, &params_mono).unwrap();
 
-    // Create stereo with identical channels
     let mut input_stereo = Vec::with_capacity(input_mono.len() * 2);
     for &s in &input_mono {
         input_stereo.push(s);
@@ -296,24 +449,21 @@ fn test_stereo_mono_consistency() {
 
     let output_stereo = stretch(&input_stereo, &params_stereo).unwrap();
 
-    // Extract left channel
     let left: Vec<f32> = output_stereo.iter().step_by(2).copied().collect();
 
-    // Both should produce similar length output
-    let mono_len = output_mono.len();
-    let stereo_left_len = left.len();
-    let ratio = mono_len as f64 / stereo_left_len as f64;
+    let ratio = output_mono.len() as f64 / left.len() as f64;
     assert!(
         (ratio - 1.0).abs() < 0.2,
         "Mono vs stereo-left length mismatch: mono={}, stereo-left={}",
-        mono_len,
-        stereo_left_len
+        output_mono.len(),
+        left.len()
     );
 }
 
+// --- FFT size tests (from agent-2) ---
+
 #[test]
 fn test_small_fft_size() {
-    // Test with a smaller FFT size (256)
     let sample_rate = 44100u32;
     let input = sine_wave(440.0, sample_rate, sample_rate as usize);
 
@@ -328,7 +478,6 @@ fn test_small_fft_size() {
 
 #[test]
 fn test_large_fft_size() {
-    // Test with a larger FFT size (8192) for better frequency resolution
     let sample_rate = 44100u32;
     let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
 
@@ -339,4 +488,52 @@ fn test_large_fft_size() {
 
     let output = stretch(&input, &params).unwrap();
     assert!(!output.is_empty());
+}
+
+// --- Quality verification tests (from agent-1) ---
+
+#[test]
+fn test_wsola_compression_accuracy() {
+    let sample_rate = 44100;
+    let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
+
+    for &ratio in &[0.5, 0.6, 0.75, 0.8, 0.9] {
+        let params = StretchParams::new(ratio)
+            .with_sample_rate(sample_rate)
+            .with_channels(1);
+
+        let output = stretch(&input, &params).unwrap();
+        let actual_ratio = output.len() as f64 / input.len() as f64;
+
+        assert!(
+            (actual_ratio - ratio).abs() < ratio * 0.35,
+            "Compression ratio {}: actual {:.3}, error {:.1}%",
+            ratio,
+            actual_ratio,
+            (actual_ratio - ratio).abs() / ratio * 100.0
+        );
+    }
+}
+
+#[test]
+fn test_no_nan_or_inf_in_output() {
+    let sample_rate = 44100;
+    let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
+
+    for &ratio in &[0.5, 0.75, 1.0, 1.5, 2.0, 3.0] {
+        let params = StretchParams::new(ratio)
+            .with_sample_rate(sample_rate)
+            .with_channels(1);
+
+        let output = stretch(&input, &params).unwrap();
+
+        for (i, &sample) in output.iter().enumerate() {
+            assert!(
+                sample.is_finite(),
+                "NaN/Inf at sample {} with ratio {}",
+                i,
+                ratio
+            );
+        }
+    }
 }
