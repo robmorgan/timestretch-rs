@@ -29,13 +29,14 @@
 - [x] CLI binary (behind `cli` feature flag)
 
 ## Completed — Phase 5: Testing (agent-3)
-- [x] 64 unit tests across all modules
-- [x] 4 identity tests (mono, stereo, 48kHz, all presets)
+- [x] 65 unit tests across all modules (64 original + 1 new WSOLA extreme compression)
+- [x] 11 identity tests (mono, stereo, 48kHz, all presets, frequency, SNR, sub-bass, near-unity, DC, clicks)
 - [x] 5 quality tests (RMS preservation, length proportionality, clipping, DJ quality, sub-bass)
 - [x] 6 EDM preset integration tests
 - [x] 6 streaming tests (basic, stereo, ratio change, reset, small chunks, latency)
+- [x] 6 benchmark tests
 - [x] 1 doc-test
-- [x] Total: 86 tests, all passing
+- [x] Total: 100 tests, all passing
 - [x] Zero clippy warnings
 
 ## Agent-2 Contributions
@@ -53,15 +54,33 @@
 - [x] Removed unused `ProcessingError` variant from `StretchError`
 - [x] All 93 tests passing, zero clippy warnings
 
+## Completed — Performance Optimization (agent-3)
+- [x] Comprehensive benchmarks: PV mono/stereo, EDM presets, FFT sizes, streaming, signal scaling
+- [x] PhaseVocoder: reuse FFT/magnitude/phase buffers, pre-compute phase advance, efficient wrap_phase
+- [x] StreamProcessor: persistent per-channel PhaseVocoder instances, reusable deinterleave buffers
+- [x] HybridStretcher: reuse single PV instance across tonal segments, fast path for single segment
+- [x] Transient detector: reusable sort buffer in adaptive_threshold
+- [x] Result: **5-7x speedup** across all processing paths
+  - PV mono: 161ms → 28ms (176x realtime vs 31x before)
+  - PV stereo: 321ms → 54ms (93x realtime vs 16x before)
+  - Streaming: 436ms → 59ms (169x realtime vs 23x before)
+- [x] Fixed WSOLA compression accuracy for ratio < 0.5 (trim to target length)
+- [x] Added extreme compression tests (ratios 0.25-0.5)
+
+## Completed — Comprehensive Identity Tests (agent-3)
+- [x] 11 identity tests (was 4): frequency preservation, SNR, sub-bass coherence, near-unity ratios, DC offset, click timing
+- [x] Total: 100 tests, all passing
+- [x] Zero clippy warnings
+
 ## TODO
-- [ ] Write performance benchmarks
-- [ ] Optimize hot paths (SIMD-friendly layout, allocation avoidance in process loop)
-- [ ] More comprehensive identity test (bit-exact where possible)
 - [ ] Test with real audio samples
-- [ ] Improve WSOLA compression ratio accuracy (currently undershoots for ratio < 0.5)
+- [ ] FFT-accelerated WSOLA cross-correlation (currently time-domain)
+- [ ] SIMD-friendly inner loop layout
+- [ ] Further streaming optimization (overlap handling between chunks)
 
 ## Notes
 - Hann window used for all PV processing (works well for EDM kicks)
 - Phase vocoder window-sum normalization clamped to prevent amplification in low-overlap regions
 - For very short segments, hybrid falls back to linear resampling
 - WSOLA cross-correlation is time-domain (not FFT-accelerated yet)
+- wrap_phase uses floor-based modulo instead of while loops (more predictable for large phase values)
