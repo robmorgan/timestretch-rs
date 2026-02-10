@@ -611,7 +611,12 @@
   - Appends stretched audio directly into caller-provided buffer
   - Eliminates final `Vec<f32>` clone on every process() call
   - 7 new tests: equivalence with process(), stereo, NaN, count, append, flush, hybrid
-- [x] Total: 791 tests, all passing
+- [x] Zero-copy batch API (`stretch_into`):
+  - `stretch_into(input: &[f32], params: &StretchParams, output: &mut Vec<f32>) -> Result<usize>`
+  - Appends stretched audio into caller-provided buffer, returns sample count
+  - Handles normalization on appended region only
+  - 7 new tests: equivalence with stretch(), empty, append, invalid ratio, stereo, normalize, NaN
+- [x] Total: 900+ tests, all passing
 - [x] Zero clippy warnings
 
 ## DJ Workflow API & Creative Effects (agent-3)
