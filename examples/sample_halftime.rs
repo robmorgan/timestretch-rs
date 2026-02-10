@@ -51,13 +51,14 @@ fn main() {
         duration_secs
     );
 
-    // Apply halftime (2x stretch) using the Halftime preset
-    let params = StretchParams::new(2.0)
+    // Apply halftime (120 BPM -> 60 BPM) using the Halftime preset
+    let params = StretchParams::new(1.0)
         .with_preset(EdmPreset::Halftime)
         .with_sample_rate(sample_rate)
         .with_channels(1);
 
-    let output = timestretch::stretch(&input, &params).expect("stretch failed");
+    let output = timestretch::stretch_to_bpm(&input, 120.0, 60.0, &params)
+        .expect("stretch failed");
 
     let output_duration = output.len() as f64 / sample_rate as f64;
     let actual_ratio = output.len() as f64 / input.len() as f64;

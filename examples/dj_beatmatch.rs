@@ -1,7 +1,7 @@
 //! DJ beatmatching example.
 //!
-//! Demonstrates stretching a track from 126 BPM to 128 BPM,
-//! a common operation in DJ mixing software.
+//! Demonstrates stretching a track from 126 BPM to 128 BPM using
+//! the BPM-aware API, a common operation in DJ mixing software.
 //!
 //! Run with: cargo run --example dj_beatmatch
 
@@ -12,10 +12,9 @@ fn main() {
     let sample_rate = 44100u32;
     let original_bpm = 126.0;
     let target_bpm = 128.0;
-    let stretch_ratio = target_bpm / original_bpm;
 
     println!("DJ Beatmatch: {} BPM -> {} BPM", original_bpm, target_bpm);
-    println!("Stretch ratio: {:.4}", stretch_ratio);
+    println!("Stretch ratio: {:.4}", timestretch::bpm_ratio(original_bpm, target_bpm));
 
     // Generate a simple house-style pattern
     let duration_secs = 4.0;
@@ -45,13 +44,14 @@ fn main() {
         *sample += 0.15 * (2.0 * PI * 200.0 * t).sin();
     }
 
-    // Stretch using DjBeatmatch preset
-    let params = StretchParams::new(stretch_ratio)
+    // Stretch using BPM-aware API with DjBeatmatch preset
+    let params = StretchParams::new(1.0) // ratio computed from BPM values
         .with_preset(EdmPreset::DjBeatmatch)
         .with_sample_rate(sample_rate)
         .with_channels(1);
 
-    let output = timestretch::stretch(&input, &params).expect("stretch failed");
+    let output = timestretch::stretch_to_bpm(&input, original_bpm, target_bpm, &params)
+        .expect("stretch failed");
 
     let output_duration = output.len() as f64 / sample_rate as f64;
     let actual_ratio = output.len() as f64 / input.len() as f64;
@@ -59,5 +59,8 @@ fn main() {
     println!("Input:  {} samples ({:.2}s)", input.len(), duration_secs);
     println!("Output: {} samples ({:.2}s)", output.len(), output_duration);
     println!("Actual ratio: {:.4}", actual_ratio);
-    println!("Effective BPM: {:.1}", original_bpm * actual_ratio);
+    println!(
+        "Effective BPM: {:.1}",
+        original_bpm / actual_ratio
+    );
 }
