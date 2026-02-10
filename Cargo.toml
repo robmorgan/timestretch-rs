@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Pure Rust audio time stretching library optimized for EDM"
 license = "MIT"
+rust-version = "1.65"
 
 [dependencies]
 rustfft = "6"

@@ -169,6 +169,17 @@
 - [x] Replaced magic numbers with named constants: `ENERGY_EPSILON`, `FFT_CANDIDATE_THRESHOLD`, `FFT_OVERLAP_THRESHOLD` (wsola.rs), `MIN_WINDOW_SUM_RATIO`, `WINDOW_SUM_EPSILON` (phase_vocoder.rs), `RATIO_SNAP_THRESHOLD`, `RATIO_INTERPOLATION_ALPHA` (processor.rs)
 - [x] All tests passing, zero clippy warnings
 
+## CI/CD Pipeline (agent-1)
+- [x] GitHub Actions workflow: `.github/workflows/ci.yml`
+  - Test job: runs `cargo test --all-targets` on ubuntu, macOS, windows + MSRV (1.65)
+  - Clippy job: `cargo clippy --all-targets -- -D warnings`
+  - Format job: `cargo fmt --all --check`
+  - Documentation job: `cargo doc --no-deps` with `-D warnings`
+- [x] Added `rust-version = "1.65"` MSRV to Cargo.toml
+- [x] Fixed MSRV incompatibility: replaced `is_multiple_of()` (1.87+) with `% 2 != 0` in wav.rs
+- [x] Applied `cargo fmt` to fix formatting drift from recent refactors
+- [x] All 165 tests passing, zero clippy warnings, docs build clean
+
 ## TODO
 - [ ] Test with real audio samples
 - [ ] SIMD-friendly inner loop layout

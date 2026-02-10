@@ -73,7 +73,7 @@ fn parse_wav_chunks(data: &[u8], start: usize) -> Result<WavChunks<'_>, StretchE
 
         cursor += chunk_size;
         // WAV chunks are word-aligned
-        if !chunk_size.is_multiple_of(2) {
+        if chunk_size % 2 != 0 {
             cursor += 1;
         }
     }
