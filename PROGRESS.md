@@ -260,6 +260,13 @@
 - [x] Added 5 new tests: `from_tempo` unit test, NaN rejection, Inf rejection, pitch_shift NaN rejection, from_tempo integration
 - [x] All 162 tests passing, zero clippy warnings
 
+### Fifth pass (agent-5)
+- [x] Extracted `convert_pcm_16bit()`, `convert_pcm_24bit()`, `convert_ieee_float_32bit()` from `convert_samples()` in wav.rs (was 53 lines, now 10-line dispatch)
+- [x] Extracted PCM scaling constants in wav.rs: `PCM_16BIT_SCALE`, `PCM_16BIT_MAX_OUT`, `PCM_24BIT_SCALE`, `PCM_24BIT_SIGN_BIT`, `PCM_24BIT_MASK`, `WAV_MIN_HEADER_SIZE`, `WAV_FMT_MIN_SIZE`
+- [x] Extracted frequency band weight constants in transient.rs: `WEIGHT_SUB_BASS`, `WEIGHT_BASS_MID`, `WEIGHT_MID`, `WEIGHT_HIGH_MID`, `WEIGHT_VERY_HIGH` and band boundary constants
+- [x] Extracted Blackman-Harris window coefficients as module-level constants in window.rs: `BH_A0`..`BH_A3`
+- [x] All tests passing, zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
