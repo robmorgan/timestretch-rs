@@ -186,7 +186,8 @@
 - [x] Simplified `stretch_segment()` conditional chain from nested if-else-if to single `use_phase_vocoder` boolean (eliminates duplicate WSOLA branch)
 - [x] Extracted 3 named constants in `transient.rs`: `MEDIAN_WINDOW_FRAMES`, `MIN_ONSET_GAP_FRAMES`, `THRESHOLD_FLOOR`
 - [x] Extracted 5 named constants in `beat.rs`: `BEAT_FFT_SIZE`, `BEAT_HOP_SIZE`, `BEAT_SENSITIVITY`, `MIN_EDM_BPM`, `MAX_EDM_BPM`
-- [x] All 166 tests passing, zero clippy warnings
+- [x] Extracted shared `deinterleave()` and `interleave()` helpers in `lib.rs`, deduplicating identical channel processing in `stretch()` and `pitch_shift()` (net -23 lines)
+- [x] All tests passing, zero clippy warnings
 
 ## BPM-Aware Stretch API (agent-3)
 - [x] `stretch_to_bpm(input, source_bpm, target_bpm, params)` — stretch audio between known BPM values
