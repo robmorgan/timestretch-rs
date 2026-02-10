@@ -11,8 +11,6 @@ pub enum StretchError {
     InvalidRatio(String),
     /// I/O error.
     IoError(String),
-    /// Internal processing error.
-    ProcessingError(String),
     /// Input too short for the given parameters.
     InputTooShort {
         provided: usize,
@@ -26,7 +24,6 @@ impl fmt::Display for StretchError {
             StretchError::InvalidFormat(msg) => write!(f, "invalid format: {}", msg),
             StretchError::InvalidRatio(msg) => write!(f, "invalid stretch ratio: {}", msg),
             StretchError::IoError(msg) => write!(f, "I/O error: {}", msg),
-            StretchError::ProcessingError(msg) => write!(f, "processing error: {}", msg),
             StretchError::InputTooShort { provided, minimum } => {
                 write!(
                     f,

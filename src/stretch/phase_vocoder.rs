@@ -71,6 +71,24 @@ impl PhaseVocoder {
         }
     }
 
+    /// Returns the FFT size.
+    #[inline]
+    pub fn fft_size(&self) -> usize {
+        self.fft_size
+    }
+
+    /// Returns the analysis hop size.
+    #[inline]
+    pub fn hop_analysis(&self) -> usize {
+        self.hop_analysis
+    }
+
+    /// Returns the synthesis hop size.
+    #[inline]
+    pub fn hop_synthesis(&self) -> usize {
+        self.hop_synthesis
+    }
+
     /// Stretches a mono audio signal using phase vocoder with identity phase locking.
     pub fn process(&mut self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
         if input.len() < self.fft_size {
@@ -136,24 +154,13 @@ impl PhaseVocoder {
                 &mut self.peaks,
             );
 
-            // Reconstruct spectrum
-            for bin in 0..num_bins {
-                self.fft_buffer[bin] =
-                    Complex::from_polar(self.magnitudes[bin], self.new_phases[bin]);
-            }
-
-            // Mirror for inverse FFT
-            for bin in 1..num_bins - 1 {
-                let mirror = self.fft_size - bin;
-                if mirror < self.fft_size {
-                    self.fft_buffer[mirror] = self.fft_buffer[bin].conj();
-                }
-            }
+            // Reconstruct spectrum from magnitudes and phases, mirror for inverse FFT
+            self.reconstruct_spectrum(num_bins);
 
             // Inverse FFT
             fft_inverse.process(&mut self.fft_buffer);
 
-            // Normalize and overlap-add
+            // Overlap-add with synthesis window
             let out_end = (synthesis_pos + self.fft_size).min(output_len);
             #[allow(clippy::needless_range_loop)]
             for i in 0..out_end - synthesis_pos {
@@ -163,18 +170,36 @@ impl PhaseVocoder {
             }
         }
 
-        // Normalize by window sum, clamping to prevent amplification in
-        // low-overlap regions (occurs when synthesis hop > analysis hop)
-        let max_window_sum = window_sum.iter().cloned().fold(0.0f32, f32::max);
-        let min_window_sum = (max_window_sum * 0.1).max(1e-6);
-        for i in 0..output_len {
-            let ws = window_sum[i].max(min_window_sum);
-            if ws > 1e-6 {
-                output[i] /= ws;
+        Self::normalize_output(&mut output, &window_sum);
+        Ok(output)
+    }
+
+    /// Reconstructs the complex spectrum from magnitudes and phases,
+    /// then mirrors negative frequencies for inverse FFT.
+    fn reconstruct_spectrum(&mut self, num_bins: usize) {
+        for bin in 0..num_bins {
+            self.fft_buffer[bin] =
+                Complex::from_polar(self.magnitudes[bin], self.new_phases[bin]);
+        }
+        for bin in 1..num_bins - 1 {
+            let mirror = self.fft_size - bin;
+            if mirror < self.fft_size {
+                self.fft_buffer[mirror] = self.fft_buffer[bin].conj();
             }
         }
+    }
 
-        Ok(output)
+    /// Normalizes output by window sum, clamping to prevent amplification in
+    /// low-overlap regions (occurs when synthesis hop > analysis hop).
+    fn normalize_output(output: &mut [f32], window_sum: &[f32]) {
+        let max_window_sum = window_sum.iter().cloned().fold(0.0f32, f32::max);
+        let min_window_sum = (max_window_sum * 0.1).max(1e-6);
+        for (sample, &ws) in output.iter_mut().zip(window_sum.iter()) {
+            let ws = ws.max(min_window_sum);
+            if ws > 1e-6 {
+                *sample /= ws;
+            }
+        }
     }
 }
 

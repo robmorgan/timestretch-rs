@@ -26,6 +26,24 @@ impl Wsola {
         }
     }
 
+    /// Returns the segment size in samples.
+    #[inline]
+    pub fn segment_size(&self) -> usize {
+        self.segment_size
+    }
+
+    /// Returns the search range in samples.
+    #[inline]
+    pub fn search_range(&self) -> usize {
+        self.search_range
+    }
+
+    /// Returns the stretch ratio.
+    #[inline]
+    pub fn stretch_ratio(&self) -> f64 {
+        self.stretch_ratio
+    }
+
     /// Stretches a mono audio signal using WSOLA.
     pub fn process(&self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
         if input.len() < self.segment_size {

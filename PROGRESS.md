@@ -44,6 +44,15 @@
 - [x] Fixed clippy warnings in examples (dj_beatmatch.rs, realtime_stream.rs, sample_halftime.rs)
 - [x] Fixed example files to match current API (removed `.expect()` from non-Result returns)
 
+## Agent-5 Refactoring
+- [x] Added builder methods to `StretchParams`: `with_sub_bass_cutoff()`, `with_wsola_segment_size()`, `with_wsola_search_range()`
+- [x] Extracted `reconstruct_spectrum()` and `normalize_output()` from `PhaseVocoder::process()` (was 104 lines)
+- [x] Extracted `stretch_segment()` and `stretch_with_wsola()` from `HybridStretcher::process()` (was 88 lines)
+- [x] Added getter methods to `PhaseVocoder` (`fft_size()`, `hop_analysis()`, `hop_synthesis()`)
+- [x] Added getter methods to `Wsola` (`segment_size()`, `search_range()`, `stretch_ratio()`)
+- [x] Removed unused `ProcessingError` variant from `StretchError`
+- [x] All 93 tests passing, zero clippy warnings
+
 ## TODO
 - [ ] Write performance benchmarks
 - [ ] Optimize hot paths (SIMD-friendly layout, allocation avoidance in process loop)

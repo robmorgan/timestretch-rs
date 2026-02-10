@@ -237,6 +237,24 @@ impl StretchParams {
         self.transient_sensitivity = sensitivity;
         self
     }
+
+    /// Sets the sub-bass phase lock cutoff frequency in Hz.
+    pub fn with_sub_bass_cutoff(mut self, cutoff_hz: f32) -> Self {
+        self.sub_bass_cutoff = cutoff_hz;
+        self
+    }
+
+    /// Sets the WSOLA segment size in samples.
+    pub fn with_wsola_segment_size(mut self, size: usize) -> Self {
+        self.wsola_segment_size = size;
+        self
+    }
+
+    /// Sets the WSOLA search range in samples.
+    pub fn with_wsola_search_range(mut self, range: usize) -> Self {
+        self.wsola_search_range = range;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +307,17 @@ mod tests {
         assert_eq!(params.channels, Channels::Stereo);
         assert_eq!(params.preset, Some(EdmPreset::HouseLoop));
         assert_eq!(params.fft_size, 4096);
+    }
+
+    #[test]
+    fn test_stretch_params_builder_advanced() {
+        let params = StretchParams::new(1.5)
+            .with_sub_bass_cutoff(100.0)
+            .with_wsola_segment_size(512)
+            .with_wsola_search_range(256);
+        assert!((params.sub_bass_cutoff - 100.0).abs() < f32::EPSILON);
+        assert_eq!(params.wsola_segment_size, 512);
+        assert_eq!(params.wsola_search_range, 256);
     }
 
     #[test]

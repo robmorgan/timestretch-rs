@@ -70,46 +70,8 @@ impl HybridStretcher {
 
         for segment in &segments {
             let seg_data = &input[segment.start..segment.end];
-
-            if seg_data.len() < 256 {
-                // Very short segment: just resample
-                let out_len =
-                    (seg_data.len() as f64 * self.params.stretch_ratio).round() as usize;
-                let stretched = crate::core::resample::resample_linear(seg_data, out_len.max(1));
-                output_segments.push(stretched);
-                continue;
-            }
-
-            let result = if segment.is_transient {
-                // Use WSOLA for transients (preserves attack)
-                let seg_size = self.params.wsola_segment_size.min(seg_data.len() / 2).max(64);
-                let search = self.params.wsola_search_range.min(seg_size / 2).max(16);
-                let wsola = Wsola::new(seg_size, search, self.params.stretch_ratio);
-                wsola.process(seg_data)
-            } else {
-                // Use phase vocoder for tonal content
-                if seg_data.len() >= self.params.fft_size {
-                    pv.process(seg_data)
-                } else {
-                    // Segment too short for PV, fall back to WSOLA
-                    let seg_size = seg_data.len().min(self.params.wsola_segment_size).max(64);
-                    let search = self.params.wsola_search_range.min(seg_size / 2).max(16);
-                    let wsola = Wsola::new(seg_size, search, self.params.stretch_ratio);
-                    wsola.process(seg_data)
-                }
-            };
-
-            match result {
-                Ok(stretched) => output_segments.push(stretched),
-                Err(_) => {
-                    // Fallback: simple time-domain stretch
-                    let out_len =
-                        (seg_data.len() as f64 * self.params.stretch_ratio).round() as usize;
-                    let stretched =
-                        crate::core::resample::resample_linear(seg_data, out_len.max(1));
-                    output_segments.push(stretched);
-                }
-            }
+            let stretched = self.stretch_segment(seg_data, segment.is_transient, &mut pv);
+            output_segments.push(stretched);
         }
 
         // Step 4: Concatenate with crossfades
@@ -123,6 +85,46 @@ impl HybridStretcher {
         let output = concatenate_with_crossfade(&output_segments, crossfade_samples);
 
         Ok(output)
+    }
+
+    /// Stretches a single segment using the appropriate algorithm.
+    ///
+    /// Transient segments use WSOLA to preserve attack characteristics.
+    /// Tonal segments use the phase vocoder for smooth stretching.
+    /// Very short segments fall back to linear resampling.
+    fn stretch_segment(
+        &self,
+        seg_data: &[f32],
+        is_transient: bool,
+        pv: &mut PhaseVocoder,
+    ) -> Vec<f32> {
+        if seg_data.len() < 256 {
+            let out_len =
+                (seg_data.len() as f64 * self.params.stretch_ratio).round() as usize;
+            return crate::core::resample::resample_linear(seg_data, out_len.max(1));
+        }
+
+        let result = if is_transient {
+            self.stretch_with_wsola(seg_data)
+        } else if seg_data.len() >= self.params.fft_size {
+            pv.process(seg_data)
+        } else {
+            self.stretch_with_wsola(seg_data)
+        };
+
+        result.unwrap_or_else(|_| {
+            let out_len =
+                (seg_data.len() as f64 * self.params.stretch_ratio).round() as usize;
+            crate::core::resample::resample_linear(seg_data, out_len.max(1))
+        })
+    }
+
+    /// Stretches a segment using WSOLA with clamped parameters.
+    fn stretch_with_wsola(&self, seg_data: &[f32]) -> Result<Vec<f32>, StretchError> {
+        let seg_size = self.params.wsola_segment_size.min(seg_data.len() / 2).max(64);
+        let search = self.params.wsola_search_range.min(seg_size / 2).max(16);
+        let wsola = Wsola::new(seg_size, search, self.params.stretch_ratio);
+        wsola.process(seg_data)
     }
 
     /// Segments audio into transient and tonal regions.
