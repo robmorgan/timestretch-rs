@@ -351,6 +351,14 @@
 - [x] 17 new tests (11 unit + 6 integration: 24-bit WAV pipeline, mix_to_mono, L/R extraction, file API)
 - [x] Zero clippy warnings, cargo fmt clean, zero doc warnings
 
+### Eighth pass (agent-5)
+- [x] Extracted `init_wav_buffer()` helper in wav.rs — deduplicates header setup from `write_wav_16bit()`, `write_wav_24bit()`, `write_wav_float()` (net -26 lines)
+- [x] Replaced verbose `iter_mut().for_each(|x| *x = 0.0)` with idiomatic `fill(0.0)` in PhaseVocoder::process() (4 occurrences)
+- [x] Replaced `.cloned()` with `.copied()` for f32 iteration in normalize_output()
+- [x] Removed dead guard `if mirror < self.fft_size` in PhaseVocoder::reconstruct_spectrum() (always true since mirror = fft_size - bin, bin >= 1)
+- [x] Removed dead guard `if mirror < spectrum.len()` in frequency.rs split_spectrum_into_bands() (always true when spectrum.len() == fft_size)
+- [x] All 126 unit tests passing, zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
