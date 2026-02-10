@@ -324,7 +324,10 @@
 - [x] `detect_beat_grid_buffer(buffer)` — AudioBuffer convenience wrapper for beat grid detection (handles stereo)
 - [x] 8 new unit tests: from_tempo, from_tempo_stereo, set_tempo, set_tempo_no_source, set_tempo_invalid, from_tempo_produces_output, params_accessor, detect_beat_grid_buffer mono/stereo
 - [x] 5 new streaming integration tests: from_tempo DJ workflow, from_tempo stereo, set_tempo mid-stream, set_tempo without source, from_tempo slowdown
-- [x] Total: 263 tests (111 unit + 138 integration + 14 doc), all passing
+- [x] Updated `realtime_stream` example to showcase `from_tempo()` + `set_tempo()` (3-part demo: BPM matching, live tempo fader, manual ratio)
+- [x] Fixed rustdoc ambiguous link warning on `bpm_ratio` (`stretch` → `stretch()`)
+- [x] `cargo doc --no-deps` now builds with zero warnings
+- [x] Total: 270 tests (118 unit + 138 integration + 14 doc), all passing
 - [x] Zero clippy warnings, cargo fmt clean
 
 ### Seventh pass (agent-5)
