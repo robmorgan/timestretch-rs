@@ -158,11 +158,9 @@ impl StreamProcessor {
     /// Extracts a single channel from the interleaved input buffer.
     fn deinterleave_channel(&mut self, ch: usize, num_channels: usize) {
         self.channel_buffers[ch].clear();
-        let mut idx = ch;
-        while idx < self.input_buffer.len() {
-            self.channel_buffers[ch].push(self.input_buffer[idx]);
-            idx += num_channels;
-        }
+        self.channel_buffers[ch].extend(
+            self.input_buffer.iter().skip(ch).step_by(num_channels).copied(),
+        );
     }
 
     /// Drains consumed samples from the input buffer, keeping unprocessed remainder.

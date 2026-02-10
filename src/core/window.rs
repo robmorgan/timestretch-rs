@@ -111,21 +111,18 @@ fn bessel_i0(x: f64) -> f64 {
 /// Applies a window function to a slice in-place.
 #[inline]
 pub fn apply_window(data: &mut [f32], window: &[f32]) {
-    let len = data.len().min(window.len());
-    for i in 0..len {
-        data[i] *= window[i];
+    for (sample, &w) in data.iter_mut().zip(window.iter()) {
+        *sample *= w;
     }
 }
 
 /// Applies a window function and returns a new vector.
 #[inline]
 pub fn apply_window_copy(data: &[f32], window: &[f32]) -> Vec<f32> {
-    let len = data.len().min(window.len());
-    let mut result = vec![0.0; len];
-    for i in 0..len {
-        result[i] = data[i] * window[i];
-    }
-    result
+    data.iter()
+        .zip(window.iter())
+        .map(|(&d, &w)| d * w)
+        .collect()
 }
 
 #[cfg(test)]

@@ -32,6 +32,10 @@ const MIN_SAMPLES_FOR_BEAT_DETECTION: usize = 44100; // ~1 second at 44.1kHz
 const BAND_SPLIT_FFT_SIZE: usize = 4096;
 /// Hop size for the band-splitting overlap-add filter (75% overlap).
 const BAND_SPLIT_HOP: usize = BAND_SPLIT_FFT_SIZE / 4;
+/// Minimum window sum to prevent amplification in low-overlap regions.
+const WINDOW_SUM_FLOOR_RATIO: f32 = 0.1;
+/// Absolute floor for window sum normalization.
+const WINDOW_SUM_EPSILON: f32 = 1e-6;
 
 /// Transient-aware hybrid stretcher.
 ///
@@ -365,12 +369,12 @@ fn separate_sub_bass(input: &[f32], cutoff_hz: f32, sample_rate: u32) -> (Vec<f3
     }
 
     // Normalize by window sum
-    let max_ws = window_sum.iter().cloned().fold(0.0f32, f32::max);
-    let min_ws = (max_ws * 0.1).max(1e-6);
-    for i in 0..input.len() {
-        let ws = window_sum[i].max(min_ws);
-        sub_bass[i] /= ws;
-        remainder[i] /= ws;
+    let max_ws = window_sum.iter().copied().fold(0.0f32, f32::max);
+    let min_ws = (max_ws * WINDOW_SUM_FLOOR_RATIO).max(WINDOW_SUM_EPSILON);
+    for ((&ws, sb), rem) in window_sum.iter().zip(sub_bass.iter_mut()).zip(remainder.iter_mut()) {
+        let ws = ws.max(min_ws);
+        *sb /= ws;
+        *rem /= ws;
     }
 
     (sub_bass, remainder)

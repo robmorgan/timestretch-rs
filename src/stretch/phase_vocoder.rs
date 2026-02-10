@@ -249,10 +249,7 @@ impl PhaseVocoder {
         let max_window_sum = window_sum.iter().copied().fold(0.0f32, f32::max);
         let min_window_sum = (max_window_sum * MIN_WINDOW_SUM_RATIO).max(WINDOW_SUM_EPSILON);
         for (sample, &ws) in output.iter_mut().zip(window_sum.iter()) {
-            let ws = ws.max(min_window_sum);
-            if ws > WINDOW_SUM_EPSILON {
-                *sample /= ws;
-            }
+            *sample /= ws.max(min_window_sum);
         }
     }
 }
