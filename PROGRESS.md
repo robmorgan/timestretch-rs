@@ -406,6 +406,22 @@
 - [x] Total: 288 tests, all passing
 - [x] Zero clippy warnings
 
+## AudioBuffer Utilities, Trait Impls & CLI Auto-BPM (agent-1)
+- [x] `AudioBuffer::slice(start_frame, num_frames)` — extract sub-region by frame range
+- [x] `AudioBuffer::concatenate(buffers)` — join multiple buffers (validates sample rate/channels match)
+- [x] `AudioBuffer::normalize(target_peak)` — scale peak to target amplitude
+- [x] `AudioBuffer::apply_gain(gain_db)` — apply dB gain (positive amplifies, negative attenuates)
+- [x] `AudioBuffer::trim_silence(threshold)` — remove leading/trailing silence (works for mono and stereo)
+- [x] `impl Display for AudioBuffer` — e.g. `AudioBuffer(44100 frames, 44100Hz, Mono, 1.000s)`
+- [x] `impl Display for StretchParams` — e.g. `StretchParams(ratio=1.5000, 48000Hz, Stereo, preset=DjBeatmatch, fft=4096, hop=1024)`
+- [x] `impl Display for EdmPreset` — variant name as string
+- [x] `impl Default for StretchParams` — ratio 1.0, stereo, 44100 Hz
+- [x] CLI `--auto-bpm` flag — auto-detect source BPM from input WAV, use with `--to-bpm`
+- [x] Fixed clippy warnings in edm_presets.rs and identity.rs (from other agents' code)
+- [x] Applied cargo fmt across all modified files
+- [x] 24 new unit tests (slice, concatenate, normalize, apply_gain, trim_silence, Display, Default)
+- [x] All 316+ tests passing, zero clippy warnings, zero doc warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
