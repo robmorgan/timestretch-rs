@@ -453,11 +453,33 @@
 - [x] 14 new unit tests (IntoIterator, peak, RMS, fade in/out, stereo fades)
 - [x] All 190+ unit tests passing, zero clippy/doc warnings
 
-## API Polish & Documentation Examples (agent-1)
-- [x] `Channels::from_count(n)` — construct `Channels` from numeric count (1=Mono, 2=Stereo)
-- [x] Added runnable doc examples to: `slice`, `concatenate`, `peak`, `rms`, `fade_in`, `fade_out`, `from_count`
-- [x] 22 doc tests now passing (up from 14)
-- [x] 191 unit tests passing, zero clippy/doc warnings
+## Comprehensive Error Path & Edge Case Tests (agent-4)
+- [x] 41 WAV I/O error path tests in `tests/wav_error_paths.rs`:
+  - RIFF/WAVE header validation (empty, truncated, missing magic, wrong identifiers)
+  - Unsupported format rejection (8-bit PCM, 32-bit PCM, ADPCM, A-law, mu-law, IEEE float 16/24-bit)
+  - Channel count validation (0 channels, 6 channels)
+  - Truncated/empty data chunks, incomplete samples (16/24/32-bit)
+  - WAV write/read round-trip for all formats (16-bit, 24-bit, float) with quantization accuracy checks
+  - Clipping/boundary values, negative 24-bit values, 48kHz preservation
+  - Unknown/odd-sized chunks between fmt and data
+  - File I/O error paths (nonexistent read, invalid write directory)
+  - StretchError display, Clone, Eq, From<io::Error>, std::error::Error
+- [x] 49 algorithm edge case tests in `tests/algorithm_edge_cases.rs`:
+  - Window functions: size 2, size 3, Kaiser beta=0 (rectangle), high beta, all window types finite
+  - Resample: single sample, 2/3/4 sample cubic fallback, output length 0/1, extreme upsample
+  - Frequency analysis: short/silence/FFT-size input, freq_to_bin edge cases, custom band config
+  - Beat detection: very short, DC constant, white noise, empty grid snap, interval calculation
+  - Parameter validation: exact boundary ratios (0.01, 100.0), hop=fft, large/min FFT, output_length calc
+  - Multi-stage: stretch→compress round-trip, 5 successive small stretches, pathological inputs (step function, saturated, inverted-phase stereo)
+  - Builder API: all methods combined, preset overrides, beat_aware toggle
+- [x] 20 streaming edge case tests in `tests/streaming_edge_cases.rs`:
+  - Rapid ratio changes, multiple tempo changes, set_tempo without from_tempo, invalid BPM
+  - Empty chunks, single-sample repeated, very large chunk, stereo channel separation
+  - Flush behavior: normal, double, without input
+  - Reset-and-reprocess consistency, latency reporting, NaN/Inf rejection
+  - All presets streaming, various compression ratios
+- [x] Fixed 2 pre-existing clippy warnings in tests/edm_presets.rs and tests/identity.rs
+- [x] Zero clippy warnings (`cargo clippy --all-targets -- -D warnings` clean)
 
 ## TODO
 - [ ] SIMD-friendly inner loop layout
