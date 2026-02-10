@@ -86,11 +86,8 @@ impl HybridStretcher {
     /// through the phase vocoder with rigid phase locking. The remaining audio
     /// goes through the normal hybrid algorithm. The two results are summed.
     fn process_band_split(&self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
-        let (sub_bass, remainder) = separate_sub_bass(
-            input,
-            self.params.sub_bass_cutoff,
-            self.params.sample_rate,
-        );
+        let (sub_bass, remainder) =
+            separate_sub_bass(input, self.params.sub_bass_cutoff, self.params.sample_rate);
 
         // Process sub-bass exclusively through PV (rigid phase locking
         // handles phase coherence for bins below cutoff)
@@ -137,15 +134,14 @@ impl HybridStretcher {
         // Step 1b: Optionally detect beat grid and merge with transient onsets.
         // Use a reference to avoid cloning when beat-aware is disabled.
         let merged;
-        let onsets: &[usize] = if self.params.beat_aware
-            && input.len() >= MIN_SAMPLES_FOR_BEAT_DETECTION
-        {
-            let grid = detect_beats(input, self.params.sample_rate);
-            merged = merge_onsets_and_beats(&transients.onsets, &grid.beats, input.len());
-            &merged
-        } else {
-            &transients.onsets
-        };
+        let onsets: &[usize] =
+            if self.params.beat_aware && input.len() >= MIN_SAMPLES_FOR_BEAT_DETECTION {
+                let grid = detect_beats(input, self.params.sample_rate);
+                merged = merge_onsets_and_beats(&transients.onsets, &grid.beats, input.len());
+                &merged
+            } else {
+                &transients.onsets
+            };
 
         // Step 2: Segment audio at transient/beat boundaries
         let segments = self.segment_audio(input.len(), onsets);
@@ -690,8 +686,7 @@ mod tests {
         assert_eq!(sub_bass.len(), input.len());
         assert_eq!(remainder.len(), input.len());
 
-        let sub_rms =
-            (sub_bass.iter().map(|x| x * x).sum::<f32>() / sub_bass.len() as f32).sqrt();
+        let sub_rms = (sub_bass.iter().map(|x| x * x).sum::<f32>() / sub_bass.len() as f32).sqrt();
         let rem_rms =
             (remainder.iter().map(|x| x * x).sum::<f32>() / remainder.len() as f32).sqrt();
 
@@ -715,8 +710,7 @@ mod tests {
 
         let (sub_bass, remainder) = separate_sub_bass(&input, 120.0, sample_rate);
 
-        let sub_rms =
-            (sub_bass.iter().map(|x| x * x).sum::<f32>() / sub_bass.len() as f32).sqrt();
+        let sub_rms = (sub_bass.iter().map(|x| x * x).sum::<f32>() / sub_bass.len() as f32).sqrt();
         let rem_rms =
             (remainder.iter().map(|x| x * x).sum::<f32>() / remainder.len() as f32).sqrt();
 
@@ -756,7 +750,10 @@ mod tests {
         // Check RMS of reconstruction vs input (energy preservation)
         let start = BAND_SPLIT_FFT_SIZE;
         let end = input.len() - BAND_SPLIT_FFT_SIZE;
-        let input_rms = (input[start..end].iter().map(|x| (*x as f64).powi(2)).sum::<f64>()
+        let input_rms = (input[start..end]
+            .iter()
+            .map(|x| (*x as f64).powi(2))
+            .sum::<f64>()
             / (end - start) as f64)
             .sqrt();
         let recon_rms = (reconstructed[start..end]
@@ -910,7 +907,11 @@ mod tests {
 
             let stretcher = HybridStretcher::new(params);
             let output = stretcher.process(&input).unwrap();
-            assert!(!output.is_empty(), "Preset {:?} produced empty output", preset);
+            assert!(
+                !output.is_empty(),
+                "Preset {:?} produced empty output",
+                preset
+            );
             assert!(
                 output.iter().all(|s| s.is_finite()),
                 "Preset {:?} produced NaN/Inf",
@@ -952,8 +953,7 @@ mod tests {
 
         let (sub_bass, remainder) = separate_sub_bass(&input, 0.0, sample_rate);
 
-        let sub_rms =
-            (sub_bass.iter().map(|x| x * x).sum::<f32>() / sub_bass.len() as f32).sqrt();
+        let sub_rms = (sub_bass.iter().map(|x| x * x).sum::<f32>() / sub_bass.len() as f32).sqrt();
         assert!(
             sub_rms < 0.01,
             "Zero cutoff should produce no sub-bass, got RMS={}",

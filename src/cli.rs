@@ -20,6 +20,7 @@ fn main() {
     let mut preset: Option<EdmPreset> = None;
     let mut format_24bit = false;
     let mut format_float = false;
+    let mut verbose = false;
 
     let mut i = 3;
     while i < args.len() {
@@ -47,6 +48,7 @@ fn main() {
             }
             "--24bit" => format_24bit = true,
             "--float" => format_float = true,
+            "--verbose" | "-v" => verbose = true,
             // Legacy positional: ratio [preset]
             other => {
                 if ratio.is_none() {
@@ -125,6 +127,20 @@ fn main() {
         params = params.with_preset(p);
     }
 
+    if verbose {
+        eprintln!("Parameters: {}", params);
+        eprintln!(
+            "  Transient sensitivity: {:.2}",
+            params.transient_sensitivity
+        );
+        eprintln!("  Sub-bass cutoff: {:.0} Hz", params.sub_bass_cutoff);
+        eprintln!("  WSOLA segment: {} samples", params.wsola_segment_size);
+        eprintln!("  WSOLA search: {} samples", params.wsola_search_range);
+        eprintln!("  Beat-aware: {}", params.beat_aware);
+    }
+
+    let start = std::time::Instant::now();
+
     // Process
     let output = if let Some(pf) = pitch_factor {
         eprintln!("Pitch shift factor: {:.4}", pf);
@@ -145,12 +161,28 @@ fn main() {
         }
     };
 
+    let elapsed = start.elapsed();
+
     eprintln!(
         "Output: {} frames, {:.2}s (ratio: {:.4})",
         output.num_frames(),
         output.duration_secs(),
         output.num_frames() as f64 / buffer.num_frames() as f64
     );
+
+    if verbose {
+        let input_duration = buffer.duration_secs();
+        let processing_secs = elapsed.as_secs_f64();
+        let realtime_factor = if processing_secs > 0.0 {
+            input_duration / processing_secs
+        } else {
+            f64::INFINITY
+        };
+        eprintln!(
+            "Processing time: {:.3}s ({:.1}x realtime)",
+            processing_secs, realtime_factor
+        );
+    }
 
     // Write output
     let write_result = if format_float {
@@ -182,6 +214,7 @@ fn print_usage() {
     eprintln!("  --preset <name>   dj, house, halftime, ambient, vocal");
     eprintln!("  --24bit           Write 24-bit PCM output (default: 16-bit)");
     eprintln!("  --float           Write 32-bit float output");
+    eprintln!("  --verbose, -v     Show detailed processing parameters and timing");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  timestretch-cli in.wav out.wav --ratio 1.5");

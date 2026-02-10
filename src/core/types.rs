@@ -335,6 +335,78 @@ impl AudioBuffer {
     }
 }
 
+impl PartialEq for AudioBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.sample_rate == other.sample_rate
+            && self.channels == other.channels
+            && self.data == other.data
+    }
+}
+
+/// Provides direct access to the underlying sample slice.
+impl AsRef<[Sample]> for AudioBuffer {
+    #[inline]
+    fn as_ref(&self) -> &[Sample] {
+        &self.data
+    }
+}
+
+/// An iterator over frames of an [`AudioBuffer`].
+///
+/// Each item is a slice of samples for one frame: a single `&[f32]` for mono,
+/// or `&[f32; 2]` (as a slice) for stereo.
+pub struct FrameIter<'a> {
+    data: &'a [Sample],
+    channels: usize,
+    pos: usize,
+}
+
+impl<'a> Iterator for FrameIter<'a> {
+    type Item = &'a [Sample];
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos + self.channels > self.data.len() {
+            return None;
+        }
+        let frame = &self.data[self.pos..self.pos + self.channels];
+        self.pos += self.channels;
+        Some(frame)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = (self.data.len() - self.pos) / self.channels;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a> ExactSizeIterator for FrameIter<'a> {}
+
+impl AudioBuffer {
+    /// Returns an iterator over the frames of this buffer.
+    ///
+    /// Each frame is a slice of samples: 1 sample for mono, 2 for stereo.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::AudioBuffer;
+    ///
+    /// let buf = AudioBuffer::from_stereo(vec![1.0, 2.0, 3.0, 4.0], 44100);
+    /// let frames: Vec<&[f32]> = buf.frames().collect();
+    /// assert_eq!(frames.len(), 2);
+    /// assert_eq!(frames[0], &[1.0, 2.0]);
+    /// assert_eq!(frames[1], &[3.0, 4.0]);
+    /// ```
+    pub fn frames(&self) -> FrameIter<'_> {
+        FrameIter {
+            data: &self.data,
+            channels: self.channels.count(),
+            pos: 0,
+        }
+    }
+}
+
 /// EDM-specific presets for time stretching.
 ///
 /// Each preset tunes the FFT size, hop size, transient sensitivity, and
@@ -1086,5 +1158,74 @@ mod tests {
         assert!(s.contains("44100Hz"));
         assert!(s.contains("Mono"));
         assert!(s.contains("1.000s"));
+    }
+
+    #[test]
+    fn test_audio_buffer_partial_eq() {
+        let a = AudioBuffer::from_mono(vec![1.0, 2.0, 3.0], 44100);
+        let b = AudioBuffer::from_mono(vec![1.0, 2.0, 3.0], 44100);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_audio_buffer_partial_eq_different_data() {
+        let a = AudioBuffer::from_mono(vec![1.0, 2.0, 3.0], 44100);
+        let b = AudioBuffer::from_mono(vec![1.0, 2.0, 4.0], 44100);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_audio_buffer_partial_eq_different_rate() {
+        let a = AudioBuffer::from_mono(vec![1.0, 2.0], 44100);
+        let b = AudioBuffer::from_mono(vec![1.0, 2.0], 48000);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_audio_buffer_partial_eq_different_channels() {
+        let a = AudioBuffer::from_mono(vec![1.0, 2.0], 44100);
+        let b = AudioBuffer::from_stereo(vec![1.0, 2.0], 44100);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_audio_buffer_as_ref() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 2.0, 3.0], 44100);
+        let slice: &[f32] = buf.as_ref();
+        assert_eq!(slice, &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_audio_buffer_frames_mono() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 2.0, 3.0], 44100);
+        let frames: Vec<&[f32]> = buf.frames().collect();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0], &[1.0]);
+        assert_eq!(frames[1], &[2.0]);
+        assert_eq!(frames[2], &[3.0]);
+    }
+
+    #[test]
+    fn test_audio_buffer_frames_stereo() {
+        let buf = AudioBuffer::from_stereo(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 44100);
+        let frames: Vec<&[f32]> = buf.frames().collect();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0], &[1.0, 2.0]);
+        assert_eq!(frames[1], &[3.0, 4.0]);
+        assert_eq!(frames[2], &[5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_audio_buffer_frames_empty() {
+        let buf = AudioBuffer::from_mono(vec![], 44100);
+        let frames: Vec<&[f32]> = buf.frames().collect();
+        assert_eq!(frames.len(), 0);
+    }
+
+    #[test]
+    fn test_audio_buffer_frames_exact_size() {
+        let buf = AudioBuffer::from_stereo(vec![1.0, 2.0, 3.0, 4.0], 44100);
+        let iter = buf.frames();
+        assert_eq!(iter.len(), 2);
     }
 }

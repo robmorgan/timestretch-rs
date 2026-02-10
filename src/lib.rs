@@ -50,7 +50,7 @@ pub mod stream;
 pub mod stretch;
 
 pub use analysis::beat::BeatGrid;
-pub use core::types::{AudioBuffer, Channels, EdmPreset, Sample, StretchParams};
+pub use core::types::{AudioBuffer, Channels, EdmPreset, FrameIter, Sample, StretchParams};
 pub use error::StretchError;
 pub use stream::StreamProcessor;
 
