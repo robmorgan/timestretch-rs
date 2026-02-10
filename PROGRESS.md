@@ -574,6 +574,16 @@
 - [x] Replaced indexed conditional loop in `window_and_transform()` with `zip+chain` iterator (hybrid.rs)
 - [x] All 284 unit tests passing, zero clippy warnings
 
+## API Quality Polish (agent-1)
+- [x] Removed `#[allow(clippy::needless_range_loop)]` in PhaseVocoder — converted overlap-add loop to zip-based iterators
+- [x] Manual `Debug` impl for `PhaseVocoder`, `Wsola`, `StreamProcessor` (FftPlanner doesn't derive Debug)
+- [x] `#[derive(Debug)]` for `FrameIter`
+- [x] Compile-time `Send + Sync` assertions for `AudioBuffer`, `StretchParams`, `StreamProcessor`, `StretchError`, `BeatGrid` — critical for multi-threaded real-time audio
+- [x] Doc example for `stretch_to_bpm_auto()` (was the only public function missing one)
+- [x] Applied cargo fmt to fix formatting drift across tests and hybrid.rs
+- [x] Zero `#[allow(...)]` annotations remaining in codebase
+- [x] All tests passing, zero clippy warnings, zero doc warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
