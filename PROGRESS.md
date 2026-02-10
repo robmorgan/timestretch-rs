@@ -386,6 +386,26 @@
 - [x] Usage help with examples
 - [x] Tested with ratio, BPM, pitch, 24-bit, and legacy modes
 
+## Agent-2: Sub-Bass Band-Split Processing (Task 17)
+- [x] Implemented `separate_sub_bass()` FFT-based band-splitting filter in hybrid.rs
+  - Overlap-add with Hann window, 4096 FFT, 75% overlap
+  - Correctly handles conjugate-symmetric negative frequency mirroring
+- [x] Added `band_split` field to `StretchParams` (default false, enabled by all EDM presets)
+- [x] Added `with_band_split()` builder method
+- [x] Added `process_band_split()` to `HybridStretcher`:
+  - Separates sub-bass below cutoff (default 120 Hz) via FFT filtering
+  - Sub-bass processed exclusively through PV with rigid phase locking
+  - Remainder processed through normal hybrid (WSOLA for transients, PV for tonal)
+  - Results summed (longer output zero-padded to match)
+  - Prevents WSOLA from smearing sub-bass during kick drum transients
+- [x] 10 new unit tests: energy preservation, high-freq passthrough, reconstruction,
+      band-split stretch output, split vs no-split length, compression, all presets,
+      short input fallback, zero cutoff, flag defaults
+- [x] Reduced hot-path allocations: avoid `to_vec()` in merge_onsets_and_beats,
+      avoid `clone()` for transient onsets when beat-aware is disabled
+- [x] Total: 288 tests, all passing
+- [x] Zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
@@ -398,3 +418,5 @@
 - wrap_phase uses floor-based modulo instead of while loops (more predictable for large phase values)
 - Sub-bass bins (< 120 Hz by default) use rigid phase propagation to prevent phase cancellation — critical for EDM mono-bass compatibility
 - StreamProcessor ratio changes are now phase-continuous (no vocoder recreation), enabling smooth DJ pitch fader behavior
+- Sub-bass band splitting (when enabled via `band_split`) separates sub-bass before stretch processing, preventing WSOLA from smearing bass during kick transients
+- Band splitting uses Hann-window overlap-add FFT filter (4096-point, 75% overlap) with correct conjugate-symmetric negative frequency handling
