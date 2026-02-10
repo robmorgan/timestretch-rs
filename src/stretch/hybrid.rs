@@ -58,7 +58,15 @@ impl HybridStretcher {
         let segments = self.segment_audio(input.len(), &transients.onsets);
 
         // Step 3: Process each segment with appropriate algorithm
-        let mut output_segments: Vec<Vec<f32>> = Vec::new();
+        // Reuse a single PV instance for tonal segments (avoids FFT planner recreation)
+        let mut pv = PhaseVocoder::new(
+            self.params.fft_size,
+            self.params.hop_size,
+            self.params.stretch_ratio,
+            self.params.sample_rate,
+            self.params.sub_bass_cutoff,
+        );
+        let mut output_segments: Vec<Vec<f32>> = Vec::with_capacity(segments.len());
 
         for segment in &segments {
             let seg_data = &input[segment.start..segment.end];
@@ -81,13 +89,6 @@ impl HybridStretcher {
             } else {
                 // Use phase vocoder for tonal content
                 if seg_data.len() >= self.params.fft_size {
-                    let mut pv = PhaseVocoder::new(
-                        self.params.fft_size,
-                        self.params.hop_size,
-                        self.params.stretch_ratio,
-                        self.params.sample_rate,
-                        self.params.sub_bass_cutoff,
-                    );
                     pv.process(seg_data)
                 } else {
                     // Segment too short for PV, fall back to WSOLA
@@ -112,6 +113,11 @@ impl HybridStretcher {
         }
 
         // Step 4: Concatenate with crossfades
+        // Single segment fast path avoids crossfade overhead
+        if output_segments.len() == 1 {
+            return Ok(output_segments.into_iter().next().unwrap_or_default());
+        }
+
         let crossfade_samples =
             (self.params.sample_rate as f64 * 0.005) as usize; // 5ms crossfade
         let output = concatenate_with_crossfade(&output_segments, crossfade_samples);
@@ -181,11 +187,10 @@ impl HybridStretcher {
 
 /// Concatenates segments with raised-cosine crossfade.
 fn concatenate_with_crossfade(segments: &[Vec<f32>], crossfade_len: usize) -> Vec<f32> {
-    if segments.is_empty() {
-        return vec![];
-    }
-    if segments.len() == 1 {
-        return segments[0].clone();
+    match segments.len() {
+        0 => return vec![],
+        1 => return segments[0].clone(),
+        _ => {}
     }
 
     // Estimate total length

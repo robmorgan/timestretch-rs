@@ -129,12 +129,15 @@ fn adaptive_threshold(flux: &[f32], sensitivity: f32, hop_size: usize) -> Vec<us
 
     let mut onsets = Vec::new();
     let mut last_onset: Option<usize> = None;
+    // Reusable sort buffer to avoid per-frame allocation
+    let mut local = Vec::with_capacity(median_window);
 
     for i in 0..flux.len() {
         // Compute local median
         let start = i.saturating_sub(half_window);
         let end = (i + half_window + 1).min(flux.len());
-        let mut local: Vec<f32> = flux[start..end].to_vec();
+        local.clear();
+        local.extend_from_slice(&flux[start..end]);
         local.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = local[local.len() / 2];
 
