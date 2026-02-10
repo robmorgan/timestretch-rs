@@ -111,11 +111,24 @@ impl StreamProcessor {
             self.channel_buffers[ch] = stretched;
         }
 
-        // Clear input buffer (keep a small overlap for continuity)
-        let keep = self.params.fft_size * num_channels;
-        if self.input_buffer.len() > keep {
-            let drain_to = self.input_buffer.len() - keep;
-            self.input_buffer.drain(..drain_to);
+        // Drain all processed input. The PV resets phase state per call,
+        // so re-processing overlap data would produce extra output.
+        // Keep only unprocessed remainder (samples that don't form a complete hop).
+        let frames_per_channel = total_frames;
+        let hop = self.params.hop_size;
+        let num_frames_processed =
+            if frames_per_channel >= self.params.fft_size {
+                (frames_per_channel - self.params.fft_size) / hop + 1
+            } else {
+                0
+            };
+        let samples_consumed = if num_frames_processed > 0 {
+            ((num_frames_processed - 1) * hop + self.params.fft_size) * num_channels
+        } else {
+            0
+        };
+        if samples_consumed > 0 && samples_consumed <= self.input_buffer.len() {
+            self.input_buffer.drain(..samples_consumed);
         }
 
         // Re-interleave output
