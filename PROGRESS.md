@@ -589,6 +589,21 @@
 - [x] Total: 700 tests (284 unit + 93 coverage_gaps + 323 other integration), all passing
 - [x] Zero clippy warnings
 
+## Agent-2: Hot-Path Allocation Elimination
+- [x] Pre-allocated FFT buffers in Wsola struct (`fft_ref_buf`, `fft_search_buf`, `fft_corr_buf`):
+  - Eliminates 3 `Vec<Complex<f32>>` heap allocations per `fft_cross_correlate()` call
+  - Buffers grow as needed but never shrink (amortized zero-allocation)
+  - `fft_cross_correlate()` now writes results to `self.fft_corr_buf` instead of returning a Vec
+- [x] Pre-allocated `prefix_sq_buf` in Wsola struct:
+  - Eliminates 1 `Vec<f64>` allocation per FFT-path search in `find_best_candidate()`
+  - Prefix-sum energy buffer reused across all search iterations
+- [x] Fixed `StreamProcessor::interleave_output()` to preserve scratch buffer allocation:
+  - Was using `std::mem::take()` which gave away the buffer, losing the allocation each call
+  - Now clones data from scratch buffer, keeping the allocation for reuse
+- [x] Updated `find_best_candidate()` to accept pre-computed prefix sums (avoids recomputation)
+- [x] Total: 630 tests, all passing
+- [x] Zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
