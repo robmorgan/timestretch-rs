@@ -258,8 +258,12 @@ impl PhaseVocoder {
     /// Reconstructs the complex spectrum from magnitudes and phases,
     /// then mirrors negative frequencies for inverse FFT.
     fn reconstruct_spectrum(&mut self, num_bins: usize) {
-        for bin in 0..num_bins {
-            self.fft_buffer[bin] = Complex::from_polar(self.magnitudes[bin], self.new_phases[bin]);
+        for ((buf, &mag), &phase) in self.fft_buffer[..num_bins]
+            .iter_mut()
+            .zip(self.magnitudes[..num_bins].iter())
+            .zip(self.new_phases[..num_bins].iter())
+        {
+            *buf = Complex::from_polar(mag, phase);
         }
         for bin in 1..num_bins - 1 {
             self.fft_buffer[self.fft_size - bin] = self.fft_buffer[bin].conj();

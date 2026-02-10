@@ -39,20 +39,25 @@ fn compute_spectral_flux(
     for frame_idx in 0..num_frames {
         let start = frame_idx * hop_size;
 
-        for i in 0..fft_size {
-            fft_buffer[i] = Complex::new(samples[start + i] * window[i], 0.0);
+        for (buf, (&s, &w)) in fft_buffer.iter_mut().zip(samples[start..].iter().zip(window.iter()))
+        {
+            *buf = Complex::new(s * w, 0.0);
         }
 
         fft.process(&mut fft_buffer);
 
         let mut flux = 0.0f32;
-        for bin in 0..num_bins {
-            let mag = fft_buffer[bin].norm();
-            let diff = mag - prev_magnitude[bin];
+        for ((&c, prev), &weight) in fft_buffer[..num_bins]
+            .iter()
+            .zip(prev_magnitude.iter_mut())
+            .zip(bin_weights[..num_bins].iter())
+        {
+            let mag = c.norm();
+            let diff = mag - *prev;
             if diff > 0.0 {
-                flux += diff * bin_weights[bin];
+                flux += diff * weight;
             }
-            prev_magnitude[bin] = mag;
+            *prev = mag;
         }
 
         flux_values.push(flux);
@@ -155,7 +160,7 @@ fn adaptive_threshold(flux: &[f32], sensitivity: f32, hop_size: usize) -> Vec<us
     // Reusable sort buffer to avoid per-frame allocation
     let mut local = Vec::with_capacity(MEDIAN_WINDOW_FRAMES);
 
-    for i in 0..flux.len() {
+    for (i, &flux_val) in flux.iter().enumerate() {
         // Compute local median
         let start = i.saturating_sub(half_window);
         let end = (i + half_window + 1).min(flux.len());
@@ -166,7 +171,7 @@ fn adaptive_threshold(flux: &[f32], sensitivity: f32, hop_size: usize) -> Vec<us
 
         let threshold = median * threshold_multiplier + THRESHOLD_FLOOR;
 
-        if flux[i] > threshold {
+        if flux_val > threshold {
             // Check minimum gap
             if let Some(last) = last_onset {
                 if i - last < MIN_ONSET_GAP_FRAMES {
