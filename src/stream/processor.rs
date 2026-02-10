@@ -92,6 +92,9 @@ impl StreamProcessor {
     /// Returns stretched output samples. May return an empty slice if
     /// not enough input has accumulated yet.
     pub fn process(&mut self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
+        if input.iter().any(|s| !s.is_finite()) {
+            return Err(StretchError::NonFiniteInput);
+        }
         self.input_buffer.extend_from_slice(input);
         self.initialized = true;
         self.interpolate_ratio();
@@ -384,5 +387,35 @@ mod tests {
             "Detected likely click artifact: max sample diff = {} (expected < 0.8)",
             max_diff
         );
+    }
+
+    #[test]
+    fn test_stream_processor_rejects_nan() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+
+        let mut proc = StreamProcessor::new(params);
+        let mut chunk = vec![0.0f32; 4096];
+        chunk[100] = f32::NAN;
+        assert!(matches!(
+            proc.process(&chunk),
+            Err(crate::error::StretchError::NonFiniteInput)
+        ));
+    }
+
+    #[test]
+    fn test_stream_processor_rejects_infinity() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+
+        let mut proc = StreamProcessor::new(params);
+        let mut chunk = vec![0.0f32; 4096];
+        chunk[50] = f32::INFINITY;
+        assert!(matches!(
+            proc.process(&chunk),
+            Err(crate::error::StretchError::NonFiniteInput)
+        ));
     }
 }
