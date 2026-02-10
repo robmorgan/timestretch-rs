@@ -384,14 +384,14 @@ fn normalized_cross_correlation(a: &[f32], b: &[f32]) -> f64 {
         return 0.0;
     }
 
-    let (sum_ab, sum_a2, sum_b2) = a.iter().zip(b.iter()).fold(
-        (0.0f64, 0.0f64, 0.0f64),
-        |(ab, a2, b2), (&va, &vb)| {
-            let va = va as f64;
-            let vb = vb as f64;
-            (ab + va * vb, a2 + va * va, b2 + vb * vb)
-        },
-    );
+    let (sum_ab, sum_a2, sum_b2) =
+        a.iter()
+            .zip(b.iter())
+            .fold((0.0f64, 0.0f64, 0.0f64), |(ab, a2, b2), (&va, &vb)| {
+                let va = va as f64;
+                let vb = vb as f64;
+                (ab + va * vb, a2 + va * va, b2 + vb * vb)
+            });
 
     let denom = (sum_a2 * sum_b2).sqrt();
     if denom < ENERGY_EPSILON {

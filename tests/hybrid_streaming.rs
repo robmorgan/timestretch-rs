@@ -376,7 +376,11 @@ fn test_hybrid_streaming_edm_stereo() {
     for i in 0..num_frames {
         stereo[i * 2] = mono[i];
         // Right channel: slight offset simulates stereo field
-        let offset = if i + 10 < num_frames { mono[i + 10] } else { 0.0 };
+        let offset = if i + 10 < num_frames {
+            mono[i + 10]
+        } else {
+            0.0
+        };
         stereo[i * 2 + 1] = offset;
     }
 
@@ -469,7 +473,10 @@ fn test_hybrid_streaming_ratio_change() {
         output.extend_from_slice(&out);
     }
 
-    assert!(!output.is_empty(), "Ratio change should still produce output");
+    assert!(
+        !output.is_empty(),
+        "Ratio change should still produce output"
+    );
     assert!(
         output.iter().all(|s| s.is_finite()),
         "Output after ratio change must be finite"
@@ -493,7 +500,10 @@ fn test_hybrid_streaming_reset() {
 
     // Reset and verify hybrid mode persists
     processor.reset();
-    assert!(processor.is_hybrid_mode(), "Hybrid mode should persist after reset");
+    assert!(
+        processor.is_hybrid_mode(),
+        "Hybrid mode should persist after reset"
+    );
 
     // Process again after reset
     let mut output = Vec::new();

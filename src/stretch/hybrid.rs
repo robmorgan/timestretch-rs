@@ -355,7 +355,10 @@ fn window_and_transform(
         .iter()
         .zip(window.iter())
         .map(|(&s, &w)| Complex::new(s * w, 0.0));
-    for (slot, val) in fft_buf.iter_mut().zip(windowed.chain(std::iter::repeat(zero))) {
+    for (slot, val) in fft_buf
+        .iter_mut()
+        .zip(windowed.chain(std::iter::repeat(zero)))
+    {
         *slot = val;
     }
     fft_fwd.process(fft_buf);
