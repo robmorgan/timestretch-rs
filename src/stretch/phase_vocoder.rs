@@ -30,6 +30,8 @@ pub struct PhaseVocoder {
     new_phases: Vec<f32>,
     /// Reusable peaks buffer for identity phase locking.
     peaks: Vec<usize>,
+    /// Current frame's analysis phases (for identity phase locking).
+    analysis_phases: Vec<f32>,
     /// Bin index at or below which sub-bass phase locking is applied.
     sub_bass_bin: usize,
 }
@@ -71,6 +73,7 @@ impl PhaseVocoder {
             magnitudes: vec![0.0; num_bins],
             new_phases: vec![0.0; num_bins],
             peaks: Vec::with_capacity(num_bins / 4),
+            analysis_phases: vec![0.0; num_bins],
             sub_bass_bin,
         }
     }
@@ -152,6 +155,7 @@ impl PhaseVocoder {
                 let c = self.fft_buffer[bin];
                 self.magnitudes[bin] = c.norm();
                 let phase = c.arg();
+                self.analysis_phases[bin] = phase;
 
                 if bin < self.sub_bass_bin {
                     // Sub-bass rigid phase locking: propagate the analysis phase
@@ -175,9 +179,12 @@ impl PhaseVocoder {
                 self.prev_phase[bin] = phase;
             }
 
-            // Identity phase locking for tonal coherence (only above sub-bass)
+            // Identity phase locking (Laroche & Dolson 1999): lock non-peak
+            // bins to their nearest peak using the analysis phase relationship.
+            // Only applies above the sub-bass region.
             identity_phase_lock(
                 &self.magnitudes,
+                &self.analysis_phases,
                 &mut self.new_phases,
                 num_bins,
                 self.sub_bass_bin,
@@ -239,14 +246,17 @@ fn wrap_phase(phase: f32) -> f32 {
     p - (p / TWO_PI).floor() * TWO_PI - PI
 }
 
-/// Identity phase locking: locks phase of non-peak bins to nearest peak.
+/// Identity phase locking (Laroche & Dolson 1999).
 ///
-/// This reduces phasing artifacts on tonal content by ensuring that
-/// non-peak bins maintain their phase relationship to the nearest spectral peak.
+/// For non-peak bins, sets the synthesis phase to preserve the phase
+/// relationship from the original analysis spectrum relative to the
+/// nearest spectral peak. This reduces phasing artifacts on tonal content.
+///
 /// Bins below `start_bin` are skipped (they use rigid sub-bass phase locking).
 fn identity_phase_lock(
     magnitudes: &[f32],
-    phases: &mut [f32],
+    analysis_phases: &[f32],
+    synthesis_phases: &mut [f32],
     num_bins: usize,
     start_bin: usize,
     peaks: &mut Vec<usize>,
@@ -268,7 +278,10 @@ fn identity_phase_lock(
         return;
     }
 
-    // For each non-peak bin above sub-bass, lock phase to nearest peak
+    // For each non-peak bin above sub-bass, lock phase to nearest peak.
+    // The synthesis phase for a non-peak bin becomes:
+    //   synth[peak] + (analysis[bin] - analysis[peak])
+    // This preserves the original spectral phase relationships around peaks.
     let mut peak_idx = 0;
     for bin in start_bin..num_bins {
         // Advance to nearest peak
@@ -281,9 +294,8 @@ fn identity_phase_lock(
 
         let nearest_peak = peaks[peak_idx];
         if bin != nearest_peak {
-            // Lock phase: maintain the phase difference from the original spectrum
-            let phase_diff = phases[bin] - phases[nearest_peak];
-            phases[bin] = phases[nearest_peak] + phase_diff;
+            let analysis_diff = analysis_phases[bin] - analysis_phases[nearest_peak];
+            synthesis_phases[bin] = synthesis_phases[nearest_peak] + analysis_diff;
         }
     }
 }
