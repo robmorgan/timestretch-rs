@@ -152,12 +152,13 @@ impl HybridStretcher {
 
         // Step 3: Process each segment with appropriate algorithm
         // Reuse a single PV instance for tonal segments (avoids FFT planner recreation)
-        let mut pv = PhaseVocoder::new(
+        let mut pv = PhaseVocoder::with_window(
             self.params.fft_size,
             self.params.hop_size,
             self.params.stretch_ratio,
             self.params.sample_rate,
             self.params.sub_bass_cutoff,
+            self.params.window_type,
         );
         let mut output_segments: Vec<Vec<f32>> = Vec::with_capacity(segments.len());
 

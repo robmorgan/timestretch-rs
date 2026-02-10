@@ -497,11 +497,24 @@
 - [x] Complex workflow tests: DJ crossfade, sample chop (slice→stretch→normalize→fade→concatenate)
 - [x] All tests passing, zero clippy warnings
 
+## Window Type Selection & RMS Normalization (agent-3)
+- [x] Added `window_type` field to `StretchParams` with `with_window_type()` builder method
+- [x] Re-exported `WindowType` from top-level crate (`pub use core::window::WindowType`)
+- [x] Added `PhaseVocoder::with_window()` constructor accepting a `WindowType`
+- [x] Propagated window type through `HybridStretcher` and `StreamProcessor`
+- [x] Updated `PresetConfig` to include `window_type` — Ambient preset uses Blackman-Harris, others use Hann
+- [x] Added `normalize` field to `StretchParams` with `with_normalize()` builder method
+- [x] Implemented RMS normalization in `stretch()` and `pitch_shift()` — scales output to match input RMS
+- [x] Added `compute_rms()` and `normalize_rms()` helper functions (uses f64 accumulation for precision)
+- [x] 14 new tests: window type builder, default window, preset window selection, preset override, normalize flag, RMS preservation (stretch/compress/pitch shift), silence normalization, Blackman-Harris/Kaiser PV processing, different-windows-different-output
+- [x] Applied cargo fmt across codebase (also fixed pre-existing format drift from other agents)
+- [x] Zero clippy warnings on library code, cargo doc builds clean
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
 ## Notes
-- Hann window used for all PV processing (works well for EDM kicks)
+- Phase vocoder window type is now configurable (Hann, Blackman-Harris, Kaiser) — Hann is default
 - Phase vocoder window-sum normalization clamped to prevent amplification in low-overlap regions
 - For very short segments, hybrid falls back to linear resampling
 - WSOLA cross-correlation uses FFT for search ranges > 64 candidates, direct computation otherwise

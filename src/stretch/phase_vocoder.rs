@@ -55,8 +55,27 @@ impl PhaseVocoder {
         sample_rate: u32,
         sub_bass_cutoff: f32,
     ) -> Self {
+        Self::with_window(
+            fft_size,
+            hop_analysis,
+            stretch_ratio,
+            sample_rate,
+            sub_bass_cutoff,
+            WindowType::Hann,
+        )
+    }
+
+    /// Creates a new phase vocoder with a specific window function.
+    pub fn with_window(
+        fft_size: usize,
+        hop_analysis: usize,
+        stretch_ratio: f64,
+        sample_rate: u32,
+        sub_bass_cutoff: f32,
+        window_type: WindowType,
+    ) -> Self {
         let hop_synthesis = (hop_analysis as f64 * stretch_ratio).round() as usize;
-        let window = generate_window(WindowType::Hann, fft_size);
+        let window = generate_window(window_type, fft_size);
         let num_bins = fft_size / 2 + 1;
 
         let expected_phase_advance: Vec<f32> = (0..num_bins)
@@ -521,6 +540,111 @@ mod tests {
             "1000 Hz signal should be similar with/without sub-bass locking: {} vs {}",
             rms_with,
             rms_without
+        );
+    }
+
+    #[test]
+    fn test_phase_vocoder_with_blackman_harris() {
+        let sample_rate = 44100;
+        let fft_size = 4096;
+        let hop = fft_size / 4;
+        let num_samples = fft_size * 4;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let mut pv = PhaseVocoder::with_window(
+            fft_size,
+            hop,
+            1.5,
+            sample_rate,
+            120.0,
+            WindowType::BlackmanHarris,
+        );
+        let output = pv.process(&input).unwrap();
+
+        // Should produce valid stretched output
+        assert!(!output.is_empty());
+        let len_ratio = output.len() as f64 / input.len() as f64;
+        assert!(
+            (len_ratio - 1.5).abs() < 0.3,
+            "BH window length ratio {} too far from 1.5",
+            len_ratio
+        );
+    }
+
+    #[test]
+    fn test_phase_vocoder_with_kaiser() {
+        let sample_rate = 44100;
+        let fft_size = 4096;
+        let hop = fft_size / 4;
+        let num_samples = fft_size * 4;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let mut pv = PhaseVocoder::with_window(
+            fft_size,
+            hop,
+            1.5,
+            sample_rate,
+            120.0,
+            WindowType::Kaiser(800),
+        );
+        let output = pv.process(&input).unwrap();
+
+        assert!(!output.is_empty());
+        let len_ratio = output.len() as f64 / input.len() as f64;
+        assert!(
+            (len_ratio - 1.5).abs() < 0.3,
+            "Kaiser window length ratio {} too far from 1.5",
+            len_ratio
+        );
+    }
+
+    #[test]
+    fn test_phase_vocoder_different_windows_produce_different_output() {
+        let sample_rate = 44100;
+        let fft_size = 4096;
+        let hop = fft_size / 4;
+        let num_samples = fft_size * 4;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let mut pv_hann =
+            PhaseVocoder::with_window(fft_size, hop, 1.5, sample_rate, 120.0, WindowType::Hann);
+        let output_hann = pv_hann.process(&input).unwrap();
+
+        let mut pv_bh = PhaseVocoder::with_window(
+            fft_size,
+            hop,
+            1.5,
+            sample_rate,
+            120.0,
+            WindowType::BlackmanHarris,
+        );
+        let output_bh = pv_bh.process(&input).unwrap();
+
+        // Both should produce valid output of similar length
+        assert!(!output_hann.is_empty());
+        assert!(!output_bh.is_empty());
+
+        // Outputs should differ (different windows produce different spectral characteristics)
+        let min_len = output_hann.len().min(output_bh.len());
+        let diff: f32 = output_hann[..min_len]
+            .iter()
+            .zip(&output_bh[..min_len])
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / min_len as f32;
+        assert!(
+            diff > 1e-6,
+            "Different windows should produce different output, avg diff = {}",
+            diff
         );
     }
 }

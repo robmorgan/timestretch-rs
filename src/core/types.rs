@@ -1,5 +1,7 @@
 //! Core types shared across the crate: samples, buffers, parameters, and errors.
 
+use crate::core::window::WindowType;
+
 /// A single audio sample (32-bit float, range -1.0 to 1.0).
 pub type Sample = f32;
 
@@ -606,6 +608,7 @@ struct PresetConfig {
     hop_size: usize,
     transient_sensitivity: f32,
     wsola_search_ms: f64,
+    window_type: WindowType,
 }
 
 impl EdmPreset {
@@ -638,30 +641,35 @@ impl EdmPreset {
                 hop_size: 1024,
                 transient_sensitivity: 0.3,
                 wsola_search_ms: WSOLA_SEARCH_MS_SMALL,
+                window_type: WindowType::Hann,
             },
             EdmPreset::HouseLoop => PresetConfig {
                 fft_size: 4096,
                 hop_size: 1024,
                 transient_sensitivity: 0.5,
                 wsola_search_ms: WSOLA_SEARCH_MS_MEDIUM,
+                window_type: WindowType::Hann,
             },
             EdmPreset::Halftime => PresetConfig {
                 fft_size: 4096,
                 hop_size: 512,
                 transient_sensitivity: 0.7,
                 wsola_search_ms: WSOLA_SEARCH_MS_LARGE,
+                window_type: WindowType::Hann,
             },
             EdmPreset::Ambient => PresetConfig {
                 fft_size: 8192,
                 hop_size: 2048,
                 transient_sensitivity: 0.2,
                 wsola_search_ms: WSOLA_SEARCH_MS_LARGE,
+                window_type: WindowType::BlackmanHarris,
             },
             EdmPreset::VocalChop => PresetConfig {
                 fft_size: 2048,
                 hop_size: 512,
                 transient_sensitivity: 0.6,
                 wsola_search_ms: WSOLA_SEARCH_MS_MEDIUM,
+                window_type: WindowType::Hann,
             },
         }
     }
@@ -735,6 +743,19 @@ pub struct StretchParams {
     /// at the end. This prevents WSOLA from smearing sub-bass during kick drums.
     /// Enabled by default for EDM presets.
     pub band_split: bool,
+    /// Window function for the phase vocoder.
+    ///
+    /// Different windows trade off frequency resolution, sidelobe suppression,
+    /// and transient smearing. Defaults to Hann, which is a good general choice.
+    /// Blackman-Harris offers better sidelobe suppression for tonal content;
+    /// Kaiser provides a tunable trade-off via its beta parameter.
+    pub window_type: WindowType,
+    /// Whether to normalize output RMS to match input RMS.
+    ///
+    /// When enabled, the output amplitude is scaled so that its RMS energy
+    /// matches the input. This prevents level changes during time stretching,
+    /// which is important for DJ workflows and consistent loudness.
+    pub normalize: bool,
 }
 
 /// Converts a duration in milliseconds to samples at the given sample rate.
@@ -800,6 +821,8 @@ impl StretchParams {
             wsola_search_range: ms_to_samples(WSOLA_SEARCH_MS_SMALL, DEFAULT_SAMPLE_RATE),
             beat_aware: false,
             band_split: false,
+            window_type: WindowType::Hann,
+            normalize: false,
         }
     }
 
@@ -844,6 +867,7 @@ impl StretchParams {
         self.hop_size = cfg.hop_size;
         self.transient_sensitivity = cfg.transient_sensitivity;
         self.wsola_search_range = ms_to_samples(cfg.wsola_search_ms, self.sample_rate);
+        self.window_type = cfg.window_type;
         self
     }
 
@@ -900,6 +924,26 @@ impl StretchParams {
     /// bass during kick transients.
     pub fn with_band_split(mut self, enabled: bool) -> Self {
         self.band_split = enabled;
+        self
+    }
+
+    /// Sets the window function for the phase vocoder.
+    ///
+    /// - [`WindowType::Hann`] (default) — good general-purpose choice
+    /// - [`WindowType::BlackmanHarris`] — better sidelobe suppression for tonal content
+    /// - `WindowType::Kaiser(beta)` — tunable: higher beta means narrower mainlobe
+    pub fn with_window_type(mut self, window_type: WindowType) -> Self {
+        self.window_type = window_type;
+        self
+    }
+
+    /// Enables or disables output RMS normalization.
+    ///
+    /// When enabled, the output is scaled so its RMS matches the input RMS.
+    /// This prevents level changes during time stretching. Useful for DJ
+    /// workflows and consistent loudness across different stretch ratios.
+    pub fn with_normalize(mut self, enabled: bool) -> Self {
+        self.normalize = enabled;
         self
     }
 
@@ -1531,5 +1575,51 @@ mod tests {
         let faded = buf.fade_in(100);
         assert!((faded.data[0] - 0.0).abs() < 1e-6);
         assert!((faded.data[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_with_window_type() {
+        let params = StretchParams::new(1.5).with_window_type(WindowType::BlackmanHarris);
+        assert_eq!(params.window_type, WindowType::BlackmanHarris);
+
+        let params = StretchParams::new(1.0).with_window_type(WindowType::Kaiser(800));
+        assert_eq!(params.window_type, WindowType::Kaiser(800));
+    }
+
+    #[test]
+    fn test_window_type_default_is_hann() {
+        let params = StretchParams::new(1.0);
+        assert_eq!(params.window_type, WindowType::Hann);
+    }
+
+    #[test]
+    fn test_preset_sets_window_type() {
+        // Ambient preset should use Blackman-Harris
+        let params = StretchParams::new(2.0).with_preset(EdmPreset::Ambient);
+        assert_eq!(params.window_type, WindowType::BlackmanHarris);
+
+        // Other presets should use Hann
+        let params = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
+        assert_eq!(params.window_type, WindowType::Hann);
+
+        let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
+        assert_eq!(params.window_type, WindowType::Hann);
+    }
+
+    #[test]
+    fn test_preset_window_can_be_overridden() {
+        let params = StretchParams::new(2.0)
+            .with_preset(EdmPreset::Ambient)
+            .with_window_type(WindowType::Hann);
+        assert_eq!(params.window_type, WindowType::Hann);
+    }
+
+    #[test]
+    fn test_with_normalize() {
+        let params = StretchParams::new(1.5).with_normalize(true);
+        assert!(params.normalize);
+
+        let params = StretchParams::new(1.5);
+        assert!(!params.normalize);
     }
 }

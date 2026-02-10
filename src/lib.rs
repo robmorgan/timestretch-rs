@@ -51,6 +51,7 @@ pub mod stretch;
 
 pub use analysis::beat::BeatGrid;
 pub use core::types::{AudioBuffer, Channels, EdmPreset, FrameIter, Sample, StretchParams};
+pub use core::window::WindowType;
 pub use error::StretchError;
 pub use stream::StreamProcessor;
 
@@ -126,6 +127,32 @@ fn extract_mono(samples: &[f32], num_channels: usize) -> Vec<f32> {
     }
 }
 
+/// Minimum RMS threshold to avoid division by zero during normalization.
+const NORMALIZE_RMS_FLOOR: f32 = 1e-8;
+
+/// Computes the RMS (root mean square) of a signal.
+#[inline]
+fn compute_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    (sum_sq / samples.len() as f64).sqrt() as f32
+}
+
+/// Scales output so its RMS matches `target_rms`, if the output has sufficient energy.
+#[inline]
+fn normalize_rms(output: &mut [f32], target_rms: f32) {
+    let output_rms = compute_rms(output);
+    if output_rms < NORMALIZE_RMS_FLOOR || target_rms < NORMALIZE_RMS_FLOOR {
+        return;
+    }
+    let gain = target_rms / output_rms;
+    for s in output.iter_mut() {
+        *s *= gain;
+    }
+}
+
 /// Validates that a BPM value is positive, returning a descriptive error otherwise.
 #[inline]
 fn validate_bpm(bpm: f64, label: &str) -> Result<(), StretchError> {
@@ -173,6 +200,12 @@ pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, Stretc
     let num_channels = params.channels.count();
     let channels = deinterleave(input, num_channels);
 
+    let input_rms = if params.normalize {
+        compute_rms(input)
+    } else {
+        0.0
+    };
+
     let mut channel_outputs: Vec<Vec<f32>> = Vec::with_capacity(num_channels);
     for channel_data in &channels {
         let stretcher = stretch::hybrid::HybridStretcher::new(params.clone());
@@ -180,7 +213,13 @@ pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, Stretc
         channel_outputs.push(stretched);
     }
 
-    Ok(interleave(&channel_outputs, num_channels))
+    let mut output = interleave(&channel_outputs, num_channels);
+
+    if params.normalize {
+        normalize_rms(&mut output, input_rms);
+    }
+
+    Ok(output)
 }
 
 /// Stretches an [`AudioBuffer`] and returns a new `AudioBuffer`.
@@ -257,10 +296,18 @@ pub fn pitch_shift(
         return Ok(vec![]);
     }
 
+    let input_rms = if params.normalize {
+        compute_rms(input)
+    } else {
+        0.0
+    };
+
     // Step 1: Time-stretch by 1/pitch_factor to compensate for the resampling
+    // Disable normalization for the inner stretch — we normalize the final result.
     let stretch_ratio = 1.0 / pitch_factor;
     let mut stretch_params = params.clone();
     stretch_params.stretch_ratio = stretch_ratio;
+    stretch_params.normalize = false;
     let stretched = stretch(input, &stretch_params)?;
 
     if stretched.is_empty() {
@@ -277,7 +324,13 @@ pub fn pitch_shift(
         .map(|ch| core::resample::resample_cubic(ch, num_input_frames))
         .collect();
 
-    Ok(interleave(&channel_outputs, num_channels))
+    let mut output = interleave(&channel_outputs, num_channels);
+
+    if params.normalize {
+        normalize_rms(&mut output, input_rms);
+    }
+
+    Ok(output)
 }
 
 /// Shifts the pitch of an [`AudioBuffer`] without changing its duration.
@@ -1138,5 +1191,158 @@ mod tests {
         let params = StretchParams::new(1.5);
         let result = stretch_wav_file("/nonexistent/path/input.wav", "/tmp/output.wav", &params);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_normalize_preserves_rms() {
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                0.8 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin()
+            })
+            .collect();
+
+        let input_rms = compute_rms(&input);
+
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_normalize(true);
+
+        let output = stretch(&input, &params).unwrap();
+        let output_rms = compute_rms(&output);
+
+        // With normalization, output RMS should be very close to input RMS
+        assert!(
+            (output_rms - input_rms).abs() < input_rms * 0.05,
+            "Normalized RMS mismatch: input={:.4}, output={:.4}",
+            input_rms,
+            output_rms
+        );
+    }
+
+    #[test]
+    fn test_normalize_off_by_default() {
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                0.8 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin()
+            })
+            .collect();
+
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(1);
+
+        // Without normalization, stretch should still work
+        let output = stretch(&input, &params).unwrap();
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_with_silence() {
+        // Normalization should not amplify silence
+        let silence = vec![0.0f32; 44100];
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_normalize(true);
+
+        let output = stretch(&silence, &params).unwrap();
+        let max_val = output.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        assert!(
+            max_val < 1e-4,
+            "Normalized silence should stay silent, got max={}",
+            max_val
+        );
+    }
+
+    #[test]
+    fn test_normalize_with_compression() {
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                0.6 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin()
+            })
+            .collect();
+
+        let input_rms = compute_rms(&input);
+
+        // Compression (ratio < 1.0)
+        let params = StretchParams::new(0.75)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_normalize(true);
+
+        let output = stretch(&input, &params).unwrap();
+        let output_rms = compute_rms(&output);
+
+        assert!(
+            (output_rms - input_rms).abs() < input_rms * 0.1,
+            "Normalized compression RMS mismatch: input={:.4}, output={:.4}",
+            input_rms,
+            output_rms
+        );
+    }
+
+    #[test]
+    fn test_stretch_with_window_type() {
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        // Stretch with Blackman-Harris window
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_window_type(core::window::WindowType::BlackmanHarris);
+
+        let output = stretch(&input, &params).unwrap();
+        assert!(!output.is_empty());
+
+        let len_ratio = output.len() as f64 / input.len() as f64;
+        assert!(
+            (len_ratio - 1.5).abs() < 0.5,
+            "BH stretch ratio {} too far from 1.5",
+            len_ratio
+        );
+    }
+
+    #[test]
+    fn test_pitch_shift_with_normalize() {
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                0.7 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin()
+            })
+            .collect();
+
+        let input_rms = compute_rms(&input);
+
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_normalize(true);
+
+        let output = pitch_shift(&input, &params, 1.5).unwrap();
+        let output_rms = compute_rms(&output);
+
+        assert!(
+            (output_rms - input_rms).abs() < input_rms * 0.1,
+            "Normalized pitch shift RMS mismatch: input={:.4}, output={:.4}",
+            input_rms,
+            output_rms
+        );
     }
 }

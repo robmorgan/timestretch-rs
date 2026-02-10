@@ -81,12 +81,13 @@ impl StreamProcessor {
     fn create_vocoders(params: &StretchParams, ratio: f64) -> Vec<PhaseVocoder> {
         (0..params.channels.count())
             .map(|_| {
-                PhaseVocoder::new(
+                PhaseVocoder::with_window(
                     params.fft_size,
                     params.hop_size,
                     ratio,
                     params.sample_rate,
                     params.sub_bass_cutoff,
+                    params.window_type,
                 )
             })
             .collect()
