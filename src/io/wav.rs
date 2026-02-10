@@ -1,3 +1,5 @@
+//! WAV file reading and writing (16-bit PCM, 32-bit PCM, 32-bit IEEE float).
+
 use crate::core::types::{AudioBuffer, Channels, Sample};
 use crate::error::StretchError;
 use std::io::{Read, Write};

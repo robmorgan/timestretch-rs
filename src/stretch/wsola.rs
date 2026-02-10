@@ -1,3 +1,5 @@
+//! WSOLA (Waveform Similarity Overlap-Add) time stretching.
+
 use crate::error::StretchError;
 
 /// WSOLA (Waveform Similarity Overlap-Add) time stretching.

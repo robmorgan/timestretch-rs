@@ -1,3 +1,8 @@
+//! Window functions for spectral analysis.
+//!
+//! Provides Hann, Blackman-Harris, and Kaiser-Bessel windows used by the
+//! phase vocoder and transient detector.
+
 use std::f64::consts::PI;
 
 /// Window function types.
@@ -60,6 +65,7 @@ fn blackman_harris_window(size: usize) -> Vec<f32> {
 }
 
 /// Generates a Kaiser window using the zeroth-order modified Bessel function.
+#[inline]
 fn kaiser_window(size: usize, beta: f64) -> Vec<f32> {
     if size == 0 {
         return vec![];
@@ -80,6 +86,7 @@ fn kaiser_window(size: usize, beta: f64) -> Vec<f32> {
 
 /// Zeroth-order modified Bessel function of the first kind.
 /// Computed via series expansion.
+#[inline]
 fn bessel_i0(x: f64) -> f64 {
     let mut sum = 1.0;
     let mut term = 1.0;

@@ -1,3 +1,5 @@
+//! Phase vocoder time stretching with identity phase locking.
+
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::f32::consts::PI;
 

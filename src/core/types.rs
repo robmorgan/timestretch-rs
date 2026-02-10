@@ -1,3 +1,5 @@
+//! Core types shared across the crate: samples, buffers, parameters, and errors.
+
 /// A single audio sample (32-bit float, range -1.0 to 1.0).
 pub type Sample = f32;
 
@@ -221,6 +223,12 @@ impl StretchParams {
     pub fn with_fft_size(mut self, fft_size: usize) -> Self {
         self.fft_size = fft_size;
         self.hop_size = fft_size / 4;
+        self
+    }
+
+    /// Sets the hop size (analysis step) directly, overriding the default `fft_size / 4`.
+    pub fn with_hop_size(mut self, hop_size: usize) -> Self {
+        self.hop_size = hop_size;
         self
     }
 

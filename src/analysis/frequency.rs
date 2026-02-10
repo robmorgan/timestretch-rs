@@ -1,3 +1,5 @@
+//! Frequency-domain analysis: spectral centroid, band splitting, and energy.
+
 use rustfft::{num_complex::Complex, FftPlanner};
 
 /// Result of splitting a spectrum into frequency bands: (sub_bass, low, mid, high).

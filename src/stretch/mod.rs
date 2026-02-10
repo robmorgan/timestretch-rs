@@ -1,3 +1,5 @@
+//! Time stretching algorithms: phase vocoder, WSOLA, and the hybrid combiner.
+
 pub mod hybrid;
 pub mod params;
 pub mod phase_vocoder;

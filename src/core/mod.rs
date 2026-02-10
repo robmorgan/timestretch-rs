@@ -1,3 +1,5 @@
+//! Core types, window functions, and resampling utilities.
+
 pub mod resample;
 pub mod types;
 pub mod window;

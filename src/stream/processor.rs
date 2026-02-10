@@ -1,3 +1,5 @@
+//! Real-time streaming time-stretch processor.
+
 use crate::core::types::StretchParams;
 use crate::error::StretchError;
 use crate::stretch::phase_vocoder::PhaseVocoder;

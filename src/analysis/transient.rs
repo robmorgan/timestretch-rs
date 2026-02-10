@@ -1,3 +1,5 @@
+//! Spectral-flux transient detection with adaptive thresholding.
+
 use rustfft::{num_complex::Complex, FftPlanner};
 
 /// Result of transient detection: sample positions of detected onsets.

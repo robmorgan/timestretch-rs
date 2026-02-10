@@ -1,3 +1,5 @@
+//! Internal algorithm parameters derived from user-facing [`StretchParams`].
+
 use crate::core::types::{EdmPreset, StretchParams};
 
 /// Returns a description of the given preset's characteristics.

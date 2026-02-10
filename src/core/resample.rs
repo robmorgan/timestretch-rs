@@ -1,3 +1,5 @@
+//! Sample-rate conversion via linear and cubic interpolation.
+
 /// Linear interpolation resampling.
 ///
 /// Resamples a mono audio signal by the given ratio (output_len / input_len).

@@ -1,3 +1,5 @@
+//! Beat detection and grid snapping for 4/4 EDM patterns.
+
 use crate::analysis::transient::detect_transients;
 
 /// Beat grid information for a 4/4 track.

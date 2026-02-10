@@ -1,3 +1,5 @@
+//! Hybrid stretcher combining WSOLA (transients) with phase vocoder (tonal content).
+
 use crate::analysis::transient::detect_transients;
 use crate::core::types::StretchParams;
 use crate::error::StretchError;

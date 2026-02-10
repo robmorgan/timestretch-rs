@@ -1,3 +1,5 @@
+//! Error types for the timestretch crate.
+
 use std::fmt;
 
 /// Errors that can occur during time stretching.
@@ -37,3 +39,9 @@ impl fmt::Display for StretchError {
 }
 
 impl std::error::Error for StretchError {}
+
+impl From<std::io::Error> for StretchError {
+    fn from(err: std::io::Error) -> Self {
+        StretchError::IoError(err.to_string())
+    }
+}
