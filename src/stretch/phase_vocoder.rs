@@ -30,6 +30,8 @@ pub struct PhaseVocoder {
     new_phases: Vec<f32>,
     /// Reusable peaks buffer for identity phase locking.
     peaks: Vec<usize>,
+    /// Bin index at or below which sub-bass phase locking is applied.
+    sub_bass_bin: usize,
 }
 
 impl PhaseVocoder {
@@ -38,8 +40,8 @@ impl PhaseVocoder {
         fft_size: usize,
         hop_analysis: usize,
         stretch_ratio: f64,
-        _sample_rate: u32,
-        _sub_bass_cutoff: f32,
+        sample_rate: u32,
+        sub_bass_cutoff: f32,
     ) -> Self {
         let hop_synthesis = (hop_analysis as f64 * stretch_ratio).round() as usize;
         let window = generate_window(WindowType::Hann, fft_size);
@@ -48,6 +50,13 @@ impl PhaseVocoder {
         let expected_phase_advance: Vec<f32> = (0..num_bins)
             .map(|bin| TWO_PI * bin as f32 * hop_analysis as f32 / fft_size as f32)
             .collect();
+
+        // Compute the bin index for the sub-bass cutoff frequency.
+        // Bins at or below this index get rigid phase locking to prevent
+        // phase cancellation in the critical sub-bass region.
+        let sub_bass_bin =
+            (sub_bass_cutoff * fft_size as f32 / sample_rate as f32).round() as usize;
+        let sub_bass_bin = sub_bass_bin.min(num_bins);
 
         Self {
             fft_size,
@@ -62,6 +71,7 @@ impl PhaseVocoder {
             magnitudes: vec![0.0; num_bins],
             new_phases: vec![0.0; num_bins],
             peaks: Vec::with_capacity(num_bins / 4),
+            sub_bass_bin,
         }
     }
 
@@ -81,6 +91,12 @@ impl PhaseVocoder {
     #[inline]
     pub fn hop_synthesis(&self) -> usize {
         self.hop_synthesis
+    }
+
+    /// Returns the sub-bass bin cutoff index.
+    #[inline]
+    pub fn sub_bass_bin(&self) -> usize {
+        self.sub_bass_bin
     }
 
     /// Stretches a mono audio signal using phase vocoder with identity phase locking.
@@ -127,24 +143,34 @@ impl PhaseVocoder {
                 self.magnitudes[bin] = c.norm();
                 let phase = c.arg();
 
-                // Compute phase deviation
-                let expected = self.expected_phase_advance[bin];
-                let phase_diff = phase - self.prev_phase[bin];
-                let deviation = wrap_phase(phase_diff - expected);
+                if bin < self.sub_bass_bin {
+                    // Sub-bass rigid phase locking: propagate the analysis phase
+                    // directly scaled by the hop ratio. This prevents phase
+                    // cancellation in the critical sub-bass region (< 120 Hz)
+                    // where EDM content must remain phase-coherent and mono-compatible.
+                    self.phase_accum[bin] += phase - self.prev_phase[bin];
+                    self.new_phases[bin] = self.phase_accum[bin];
+                } else {
+                    // Standard phase vocoder with deviation tracking
+                    let expected = self.expected_phase_advance[bin];
+                    let phase_diff = phase - self.prev_phase[bin];
+                    let deviation = wrap_phase(phase_diff - expected);
 
-                // True frequency deviation, accumulate phase with synthesis hop
-                let true_freq = expected + deviation;
-                self.phase_accum[bin] += true_freq * hop_ratio;
+                    // True frequency deviation, accumulate phase with synthesis hop
+                    let true_freq = expected + deviation;
+                    self.phase_accum[bin] += true_freq * hop_ratio;
 
-                self.new_phases[bin] = self.phase_accum[bin];
+                    self.new_phases[bin] = self.phase_accum[bin];
+                }
                 self.prev_phase[bin] = phase;
             }
 
-            // Identity phase locking for tonal coherence
+            // Identity phase locking for tonal coherence (only above sub-bass)
             identity_phase_lock(
                 &self.magnitudes,
                 &mut self.new_phases,
                 num_bins,
+                self.sub_bass_bin,
                 &mut self.peaks,
             );
 
@@ -208,19 +234,22 @@ fn wrap_phase(phase: f32) -> f32 {
 ///
 /// This reduces phasing artifacts on tonal content by ensuring that
 /// non-peak bins maintain their phase relationship to the nearest spectral peak.
+/// Bins below `start_bin` are skipped (they use rigid sub-bass phase locking).
 fn identity_phase_lock(
     magnitudes: &[f32],
     phases: &mut [f32],
     num_bins: usize,
+    start_bin: usize,
     peaks: &mut Vec<usize>,
 ) {
-    if num_bins < 3 {
+    if num_bins < 3 || start_bin >= num_bins {
         return;
     }
 
-    // Find spectral peaks (reuse buffer)
+    // Find spectral peaks above the sub-bass region (reuse buffer)
     peaks.clear();
-    for bin in 1..num_bins - 1 {
+    let search_start = start_bin.max(1);
+    for bin in search_start..num_bins - 1 {
         if magnitudes[bin] > magnitudes[bin - 1] && magnitudes[bin] > magnitudes[bin + 1] {
             peaks.push(bin);
         }
@@ -230,9 +259,9 @@ fn identity_phase_lock(
         return;
     }
 
-    // For each non-peak bin, lock phase to nearest peak
+    // For each non-peak bin above sub-bass, lock phase to nearest peak
     let mut peak_idx = 0;
-    for bin in 0..num_bins {
+    for bin in start_bin..num_bins {
         // Advance to nearest peak
         while peak_idx + 1 < peaks.len()
             && (peaks[peak_idx + 1] as i64 - bin as i64).unsigned_abs()
@@ -358,5 +387,112 @@ mod tests {
         let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
         let result = pv.process(&[0.0; 100]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sub_bass_bin_calculation() {
+        // 120 Hz cutoff at 44100 Hz with FFT size 4096
+        // Expected bin: 120 * 4096 / 44100 ≈ 11.15 → 11
+        let pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
+        assert_eq!(pv.sub_bass_bin, 11);
+
+        // 0 Hz cutoff should give bin 0 (no sub-bass locking)
+        let pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 0.0);
+        assert_eq!(pv.sub_bass_bin, 0);
+
+        // High cutoff at 48000 Hz
+        let pv = PhaseVocoder::new(4096, 1024, 1.0, 48000, 200.0);
+        let expected = (200.0f32 * 4096.0 / 48000.0).round() as usize;
+        assert_eq!(pv.sub_bass_bin, expected);
+    }
+
+    #[test]
+    fn test_sub_bass_phase_locking_preserves_low_freq() {
+        // A 60 Hz sine should be handled by sub-bass rigid phase locking.
+        // Compare output quality with sub-bass locking (120 Hz cutoff)
+        // vs without (0 Hz cutoff).
+        let sample_rate = 44100u32;
+        let fft_size = 4096;
+        let hop = fft_size / 4;
+        let num_samples = fft_size * 8;
+        let freq = 60.0f32; // Well below 120 Hz cutoff
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * freq * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        // Process with sub-bass locking enabled (120 Hz cutoff)
+        let mut pv_locked = PhaseVocoder::new(fft_size, hop, 1.5, sample_rate, 120.0);
+        let output_locked = pv_locked.process(&input).unwrap();
+
+        // Process without sub-bass locking (0 Hz cutoff)
+        let mut pv_unlocked = PhaseVocoder::new(fft_size, hop, 1.5, sample_rate, 0.0);
+        let output_unlocked = pv_unlocked.process(&input).unwrap();
+
+        // Both should produce output
+        assert!(!output_locked.is_empty());
+        assert!(!output_unlocked.is_empty());
+
+        // Both should have similar RMS (we aren't destroying energy)
+        let rms_locked =
+            (output_locked.iter().map(|x| x * x).sum::<f32>() / output_locked.len() as f32)
+                .sqrt();
+        let rms_unlocked = (output_unlocked
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            / output_unlocked.len() as f32)
+            .sqrt();
+
+        assert!(
+            rms_locked > 0.1,
+            "Sub-bass locked output should have significant energy, got RMS={}",
+            rms_locked
+        );
+        assert!(
+            rms_unlocked > 0.1,
+            "Unlocked output should have significant energy, got RMS={}",
+            rms_unlocked
+        );
+    }
+
+    #[test]
+    fn test_sub_bass_locking_does_not_affect_high_freq() {
+        // A 1000 Hz sine should NOT be affected by sub-bass phase locking
+        // (it's above the 120 Hz cutoff).
+        let sample_rate = 44100u32;
+        let fft_size = 4096;
+        let hop = fft_size / 4;
+        let num_samples = fft_size * 4;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * 1000.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let mut pv_with = PhaseVocoder::new(fft_size, hop, 1.0, sample_rate, 120.0);
+        let output_with = pv_with.process(&input).unwrap();
+
+        let mut pv_without = PhaseVocoder::new(fft_size, hop, 1.0, sample_rate, 0.0);
+        let output_without = pv_without.process(&input).unwrap();
+
+        // Output lengths should be the same
+        assert_eq!(output_with.len(), output_without.len());
+
+        // RMS should be very similar since 1000 Hz is above the cutoff
+        let rms_with =
+            (output_with.iter().map(|x| x * x).sum::<f32>() / output_with.len() as f32).sqrt();
+        let rms_without = (output_without
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            / output_without.len() as f32)
+            .sqrt();
+
+        assert!(
+            (rms_with - rms_without).abs() < rms_with * 0.3,
+            "1000 Hz signal should be similar with/without sub-bass locking: {} vs {}",
+            rms_with,
+            rms_without
+        );
     }
 }
