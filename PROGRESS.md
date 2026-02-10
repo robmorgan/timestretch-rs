@@ -302,6 +302,18 @@
 - [x] `detect_bpm_buffer(buffer)` — BPM detection from AudioBuffer (handles stereo by extracting left channel)
 - [x] 4 new unit tests: pitch_shift_buffer mono/stereo, detect_bpm_buffer silence/stereo
 - [x] Total: 249+ tests, all passing
+
+## Agent-2: Performance & Beat-Aware Segmentation
+- [x] Pre-allocated output/window_sum buffers in PhaseVocoder — eliminates 2 Vec allocations per `process()` call; buffers grow as needed but never shrink
+- [x] Integrated beat-aware segmentation into HybridStretcher (Task 14):
+  - Beat grid positions merged with transient onsets for segment boundaries
+  - Nearby positions (<512 samples apart) deduplicated to avoid micro-segments
+  - Short inputs (<1s) skip beat detection to avoid unreliable results
+  - Enabled by default for all EDM presets (`beat_aware` field on StretchParams)
+  - Added `with_beat_aware()` builder method for manual control
+- [x] Added 7 new unit tests: merge logic (empty, no overlap, dedup, bounds), beat-aware integration, short-input safety, flag defaults
+- [x] Fixed clippy warning (needless_range_loop → abs_diff)
+- [x] Total: 252+ tests, all passing
 - [x] Zero clippy warnings
 
 ## TODO
