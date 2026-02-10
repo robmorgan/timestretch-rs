@@ -253,6 +253,13 @@
 - [x] Total: 206 tests (197 integration/unit + 9 doc-tests), all passing
 - [x] Zero clippy warnings
 
+## Agent-2: API Improvements
+- [x] Added `StretchParams::from_tempo(source_bpm, target_bpm)` convenience constructor for DJ workflow
+- [x] Added `StretchError::NonFiniteInput` variant and NaN/Inf input validation in `stretch()` and `pitch_shift()`
+- [x] Added Cargo.toml metadata: `keywords`, `categories`, `readme`
+- [x] Added 5 new tests: `from_tempo` unit test, NaN rejection, Inf rejection, pitch_shift NaN rejection, from_tempo integration
+- [x] All 162 tests passing, zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 

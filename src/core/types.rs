@@ -334,6 +334,27 @@ impl StretchParams {
         self.wsola_search_range = range;
         self
     }
+
+    /// Creates stretch params from source and target BPM values.
+    ///
+    /// This is a convenience method for DJ workflows where you know the
+    /// current and desired tempo. The stretch ratio is computed as
+    /// `source_bpm / target_bpm` (stretching audio from a faster track
+    /// makes it longer, from a slower track makes it shorter).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::{StretchParams, EdmPreset};
+    ///
+    /// // Match a 126 BPM track to 128 BPM
+    /// let params = StretchParams::from_tempo(126.0, 128.0)
+    ///     .with_preset(EdmPreset::DjBeatmatch);
+    /// assert!((params.stretch_ratio - 126.0 / 128.0).abs() < 1e-10);
+    /// ```
+    pub fn from_tempo(source_bpm: f64, target_bpm: f64) -> Self {
+        Self::new(source_bpm / target_bpm)
+    }
 }
 
 #[cfg(test)]
@@ -397,6 +418,21 @@ mod tests {
         assert!((params.sub_bass_cutoff - 100.0).abs() < f32::EPSILON);
         assert_eq!(params.wsola_segment_size, 512);
         assert_eq!(params.wsola_search_range, 256);
+    }
+
+    #[test]
+    fn test_from_tempo() {
+        // 126 BPM → 128 BPM: ratio should be 126/128
+        let params = StretchParams::from_tempo(126.0, 128.0);
+        assert!((params.stretch_ratio - 126.0 / 128.0).abs() < 1e-10);
+
+        // Same BPM → ratio 1.0
+        let params = StretchParams::from_tempo(120.0, 120.0);
+        assert!((params.stretch_ratio - 1.0).abs() < 1e-10);
+
+        // 120 BPM → 90 BPM: ratio should be 120/90 ≈ 1.333
+        let params = StretchParams::from_tempo(120.0, 90.0);
+        assert!((params.stretch_ratio - 120.0 / 90.0).abs() < 1e-10);
     }
 
     #[test]

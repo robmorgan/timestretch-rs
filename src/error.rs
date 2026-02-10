@@ -18,6 +18,8 @@ pub enum StretchError {
     InputTooShort { provided: usize, minimum: usize },
     /// BPM detection failed.
     BpmDetectionFailed(String),
+    /// Input contains non-finite samples (NaN or infinity).
+    NonFiniteInput,
 }
 
 impl fmt::Display for StretchError {
@@ -35,6 +37,9 @@ impl fmt::Display for StretchError {
             }
             StretchError::BpmDetectionFailed(msg) => {
                 write!(f, "BPM detection failed: {}", msg)
+            }
+            StretchError::NonFiniteInput => {
+                write!(f, "input contains non-finite samples (NaN or infinity)")
             }
         }
     }

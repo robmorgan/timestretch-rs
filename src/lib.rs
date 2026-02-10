@@ -131,6 +131,11 @@ pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, Stretc
         return Ok(vec![]);
     }
 
+    // Reject non-finite samples (NaN/Inf) at the system boundary
+    if input.iter().any(|s| !s.is_finite()) {
+        return Err(StretchError::NonFiniteInput);
+    }
+
     let num_channels = params.channels.count();
     let channels = deinterleave(input, num_channels);
 
@@ -215,6 +220,10 @@ pub fn pitch_shift(
 
     if input.is_empty() {
         return Ok(vec![]);
+    }
+
+    if input.iter().any(|s| !s.is_finite()) {
+        return Err(StretchError::NonFiniteInput);
     }
 
     // Step 1: Time-stretch by 1/pitch_factor to compensate for the resampling
@@ -704,7 +713,9 @@ mod tests {
         let sample_rate = 44100u32;
         let buffer = AudioBuffer::from_mono(
             (0..sample_rate as usize * 2)
-                .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin())
+                .map(|i| {
+                    (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin()
+                })
                 .collect(),
             sample_rate,
         );
@@ -714,5 +725,58 @@ mod tests {
         assert_eq!(output.sample_rate, sample_rate);
         assert_eq!(output.channels, Channels::Mono);
         assert!(output.data.len() < buffer.data.len()); // Speeding up
+    }
+
+    #[test]
+    fn test_stretch_rejects_nan() {
+        let mut input = vec![0.0f32; 44100];
+        input[1000] = f32::NAN;
+        let params = StretchParams::new(1.5).with_channels(1);
+        assert!(matches!(
+            stretch(&input, &params),
+            Err(StretchError::NonFiniteInput)
+        ));
+    }
+
+    #[test]
+    fn test_stretch_rejects_infinity() {
+        let mut input = vec![0.0f32; 44100];
+        input[500] = f32::INFINITY;
+        let params = StretchParams::new(1.5).with_channels(1);
+        assert!(matches!(
+            stretch(&input, &params),
+            Err(StretchError::NonFiniteInput)
+        ));
+
+        input[500] = f32::NEG_INFINITY;
+        assert!(matches!(
+            stretch(&input, &params),
+            Err(StretchError::NonFiniteInput)
+        ));
+    }
+
+    #[test]
+    fn test_pitch_shift_rejects_nan() {
+        let mut input = vec![0.0f32; 44100];
+        input[100] = f32::NAN;
+        let params = StretchParams::new(1.0).with_channels(1);
+        assert!(matches!(
+            pitch_shift(&input, &params, 1.5),
+            Err(StretchError::NonFiniteInput)
+        ));
+    }
+
+    #[test]
+    fn test_from_tempo_stretch() {
+        // Verify from_tempo integrates with stretch()
+        let input: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+        let params = StretchParams::from_tempo(126.0, 128.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let output = stretch(&input, &params).unwrap();
+        // Compressing: output should be shorter than input
+        assert!(output.len() < input.len());
     }
 }
