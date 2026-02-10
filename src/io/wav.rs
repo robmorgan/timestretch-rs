@@ -242,27 +242,32 @@ fn write_wav_header(
     out.extend_from_slice(&data_size.to_le_bytes());
 }
 
-/// Writes an audio buffer as a WAV file (16-bit PCM).
-pub fn write_wav_16bit(buffer: &AudioBuffer) -> Vec<u8> {
+/// Allocates a WAV output buffer with the header already written.
+fn init_wav_buffer(buffer: &AudioBuffer, format_code: u16, bits_per_sample: u16) -> Vec<u8> {
     let num_channels = buffer.channels.count() as u16;
-    let data_size = (buffer.data.len() * 2) as u32;
+    let bytes_per_sample = bits_per_sample as usize / 8;
+    let data_size = (buffer.data.len() * bytes_per_sample) as u32;
 
     let mut out = Vec::with_capacity(44 + data_size as usize);
     write_wav_header(
         &mut out,
-        WAV_FORMAT_PCM,
+        format_code,
         num_channels,
         buffer.sample_rate,
-        16,
+        bits_per_sample,
         data_size,
     );
+    out
+}
 
+/// Writes an audio buffer as a WAV file (16-bit PCM).
+pub fn write_wav_16bit(buffer: &AudioBuffer) -> Vec<u8> {
+    let mut out = init_wav_buffer(buffer, WAV_FORMAT_PCM, 16);
     for &sample in &buffer.data {
         let clamped = sample.clamp(-1.0, 1.0);
         let raw = (clamped * PCM_16BIT_MAX_OUT) as i16;
         out.extend_from_slice(&raw.to_le_bytes());
     }
-
     out
 }
 
@@ -271,19 +276,7 @@ const PCM_24BIT_MAX_OUT: f32 = 8388607.0;
 
 /// Writes an audio buffer as a WAV file (24-bit PCM).
 pub fn write_wav_24bit(buffer: &AudioBuffer) -> Vec<u8> {
-    let num_channels = buffer.channels.count() as u16;
-    let data_size = (buffer.data.len() * 3) as u32;
-
-    let mut out = Vec::with_capacity(44 + data_size as usize);
-    write_wav_header(
-        &mut out,
-        WAV_FORMAT_PCM,
-        num_channels,
-        buffer.sample_rate,
-        24,
-        data_size,
-    );
-
+    let mut out = init_wav_buffer(buffer, WAV_FORMAT_PCM, 24);
     for &sample in &buffer.data {
         let clamped = sample.clamp(-1.0, 1.0);
         let raw = (clamped * PCM_24BIT_MAX_OUT) as i32;
@@ -291,29 +284,15 @@ pub fn write_wav_24bit(buffer: &AudioBuffer) -> Vec<u8> {
         out.push((raw >> 8) as u8);
         out.push((raw >> 16) as u8);
     }
-
     out
 }
 
 /// Writes an audio buffer as a WAV file (32-bit float).
 pub fn write_wav_float(buffer: &AudioBuffer) -> Vec<u8> {
-    let num_channels = buffer.channels.count() as u16;
-    let data_size = (buffer.data.len() * 4) as u32;
-
-    let mut out = Vec::with_capacity(44 + data_size as usize);
-    write_wav_header(
-        &mut out,
-        WAV_FORMAT_IEEE_FLOAT,
-        num_channels,
-        buffer.sample_rate,
-        32,
-        data_size,
-    );
-
+    let mut out = init_wav_buffer(buffer, WAV_FORMAT_IEEE_FLOAT, 32);
     for &sample in &buffer.data {
         out.extend_from_slice(&sample.to_le_bytes());
     }
-
     out
 }
 

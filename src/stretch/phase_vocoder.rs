@@ -137,16 +137,16 @@ impl PhaseVocoder {
 
         // Reuse pre-allocated buffers, growing if needed (never shrinks).
         self.output_buf.resize(output_len, 0.0);
-        self.output_buf.iter_mut().for_each(|x| *x = 0.0);
+        self.output_buf.fill(0.0);
         self.window_sum_buf.resize(output_len, 0.0);
-        self.window_sum_buf.iter_mut().for_each(|x| *x = 0.0);
+        self.window_sum_buf.fill(0.0);
 
         let fft_forward = self.planner.plan_fft_forward(self.fft_size);
         let fft_inverse = self.planner.plan_fft_inverse(self.fft_size);
 
         // Reset phase state without reallocating
-        self.phase_accum.iter_mut().for_each(|x| *x = 0.0);
-        self.prev_phase.iter_mut().for_each(|x| *x = 0.0);
+        self.phase_accum.fill(0.0);
+        self.prev_phase.fill(0.0);
 
         let hop_ratio = self.hop_synthesis as f32 / self.hop_analysis as f32;
         let norm = 1.0 / self.fft_size as f32;
@@ -237,17 +237,14 @@ impl PhaseVocoder {
             self.fft_buffer[bin] = Complex::from_polar(self.magnitudes[bin], self.new_phases[bin]);
         }
         for bin in 1..num_bins - 1 {
-            let mirror = self.fft_size - bin;
-            if mirror < self.fft_size {
-                self.fft_buffer[mirror] = self.fft_buffer[bin].conj();
-            }
+            self.fft_buffer[self.fft_size - bin] = self.fft_buffer[bin].conj();
         }
     }
 
     /// Normalizes output by window sum, clamping to prevent amplification in
     /// low-overlap regions (occurs when synthesis hop > analysis hop).
     fn normalize_output(output: &mut [f32], window_sum: &[f32]) {
-        let max_window_sum = window_sum.iter().cloned().fold(0.0f32, f32::max);
+        let max_window_sum = window_sum.iter().copied().fold(0.0f32, f32::max);
         let min_window_sum = (max_window_sum * MIN_WINDOW_SUM_RATIO).max(WINDOW_SUM_EPSILON);
         for (sample, &ws) in output.iter_mut().zip(window_sum.iter()) {
             let ws = ws.max(min_window_sum);

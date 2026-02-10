@@ -100,13 +100,11 @@ pub fn split_spectrum_into_bands(
     if spectrum.len() == fft_size {
         for bin in 1..num_bins - 1 {
             let mirror = fft_size - bin;
-            if mirror < spectrum.len() {
-                match classify_bin(bin, sub_bass_bin, low_bin, mid_bin) {
-                    Band::SubBass => sub_bass[mirror] = spectrum[mirror],
-                    Band::Low => low[mirror] = spectrum[mirror],
-                    Band::Mid => mid[mirror] = spectrum[mirror],
-                    Band::High => high[mirror] = spectrum[mirror],
-                }
+            match classify_bin(bin, sub_bass_bin, low_bin, mid_bin) {
+                Band::SubBass => sub_bass[mirror] = spectrum[mirror],
+                Band::Low => low[mirror] = spectrum[mirror],
+                Band::Mid => mid[mirror] = spectrum[mirror],
+                Band::High => high[mirror] = spectrum[mirror],
             }
         }
     }
