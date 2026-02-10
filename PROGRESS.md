@@ -591,6 +591,13 @@
 - [x] Replaced indexed `for i in 0..flux.len()` loop with `enumerate` in `adaptive_threshold()` (transient.rs)
 - [x] Replaced indexed spectrum reconstruction loop with `zip` iterator over `fft_buffer`, `magnitudes`, `new_phases` in `reconstruct_spectrum()` (phase_vocoder.rs)
 - [x] All 284 unit tests passing, zero clippy warnings
+## Ergonomic Conversions (agent-1)
+- [x] `From<AudioBuffer> for Vec<f32>` — zero-cost data extraction via `.into()`
+- [x] `with_stretch_ratio()` builder method on StretchParams — completes builder pattern (all 15 fields now have builder methods)
+- [x] Fixed rustdoc ambiguous link warning on `set_hybrid_mode` docs
+- [x] 7 new unit tests: with_stretch_ratio, From conversions (mono/stereo), Debug impls (AudioBuffer, StretchParams, FrameIter)
+- [x] Applied cargo fmt to hybrid.rs, wsola.rs, hybrid_streaming tests
+- [x] All tests passing, zero clippy warnings, zero doc warnings
 
 ## TODO
 - [ ] SIMD-friendly inner loop layout
