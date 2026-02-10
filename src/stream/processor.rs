@@ -357,6 +357,95 @@ impl StreamProcessor {
         self.vocoders = Self::create_vocoders(&self.params, self.params.stretch_ratio);
     }
 
+    /// Processes a chunk of interleaved audio, writing output into `output`.
+    ///
+    /// This is the zero-copy variant of [`process`](Self::process). Instead of
+    /// returning a new `Vec`, it appends stretched samples to the caller-provided
+    /// buffer. This eliminates one heap allocation per call and is ideal for
+    /// real-time audio engines with pre-allocated ring buffers.
+    ///
+    /// Returns the number of samples written to `output`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use timestretch::{StreamProcessor, StretchParams, EdmPreset};
+    ///
+    /// let params = StretchParams::new(1.0)
+    ///     .with_preset(EdmPreset::DjBeatmatch)
+    ///     .with_sample_rate(44100)
+    ///     .with_channels(1);
+    ///
+    /// let mut processor = StreamProcessor::new(params);
+    /// let mut output_buf = Vec::with_capacity(8192);
+    ///
+    /// let chunk = vec![0.0f32; 4096];
+    /// let n = processor.process_into(&chunk, &mut output_buf).unwrap();
+    /// // output_buf now contains `n` stretched samples (may be 0 until enough input accumulates)
+    /// ```
+    pub fn process_into(
+        &mut self,
+        input: &[f32],
+        output: &mut Vec<f32>,
+    ) -> Result<usize, StretchError> {
+        if input.iter().any(|s| !s.is_finite()) {
+            return Err(StretchError::NonFiniteInput);
+        }
+        self.input_buffer.extend_from_slice(input);
+        self.initialized = true;
+        self.interpolate_ratio();
+
+        let num_channels = self.params.channels.count();
+        let min_input = self.params.fft_size * num_channels * LATENCY_FFT_MULTIPLIER;
+
+        if self.input_buffer.len() < min_input {
+            return Ok(0);
+        }
+
+        let total_frames = self.input_buffer.len() / num_channels;
+        if total_frames < self.params.fft_size {
+            return Ok(0);
+        }
+
+        if self.use_hybrid {
+            return self.process_hybrid_into(num_channels, total_frames, output);
+        }
+
+        if (self.current_ratio - self.params.stretch_ratio).abs() > RATIO_SNAP_THRESHOLD {
+            for voc in &mut self.vocoders {
+                voc.set_stretch_ratio(self.current_ratio);
+            }
+        }
+
+        let min_output_len = self.process_channels(num_channels)?;
+        self.drain_consumed_input(total_frames, num_channels);
+
+        if min_output_len == 0 {
+            return Ok(0);
+        }
+
+        let written = self.interleave_into(min_output_len, num_channels, output);
+        Ok(written)
+    }
+
+    /// Flushes remaining buffered samples into a caller-provided buffer.
+    ///
+    /// Zero-copy variant of [`flush`](Self::flush). Returns the number of
+    /// samples written to `output`.
+    pub fn flush_into(&mut self, output: &mut Vec<f32>) -> Result<usize, StretchError> {
+        if self.input_buffer.is_empty() {
+            return Ok(0);
+        }
+
+        let nc = self.params.channels.count();
+        let min_size = self.params.fft_size * nc * LATENCY_FFT_MULTIPLIER;
+        while self.input_buffer.len() < min_size {
+            self.input_buffer.push(0.0);
+        }
+
+        self.process_into(&[], output)
+    }
+
     /// Flushes remaining buffered samples.
     pub fn flush(&mut self) -> Result<Vec<f32>, StretchError> {
         if self.input_buffer.is_empty() {
@@ -371,6 +460,55 @@ impl StreamProcessor {
         }
 
         self.process(&[])
+    }
+
+    /// Interleaves per-channel outputs directly into a caller-provided buffer.
+    ///
+    /// Returns the number of samples written.
+    fn interleave_into(
+        &self,
+        min_output_len: usize,
+        num_channels: usize,
+        output: &mut Vec<f32>,
+    ) -> usize {
+        let total = min_output_len * num_channels;
+        output.reserve(total);
+        for i in 0..min_output_len {
+            for ch in 0..num_channels {
+                output.push(self.channel_buffers[ch][i]);
+            }
+        }
+        total
+    }
+
+    /// Processes accumulated input through hybrid algorithm, writing into caller buffer.
+    fn process_hybrid_into(
+        &mut self,
+        num_channels: usize,
+        total_frames: usize,
+        output: &mut Vec<f32>,
+    ) -> Result<usize, StretchError> {
+        let mut hybrid_params = self.params.clone();
+        hybrid_params.stretch_ratio = self.current_ratio;
+
+        let mut min_output_len = usize::MAX;
+
+        for ch in 0..num_channels {
+            self.deinterleave_channel(ch, num_channels);
+            let stretcher = HybridStretcher::new(hybrid_params.clone());
+            let stretched = stretcher.process(&self.channel_buffers[ch])?;
+            min_output_len = min_output_len.min(stretched.len());
+            self.channel_buffers[ch] = stretched;
+        }
+
+        self.input_buffer.clear();
+        let _ = total_frames;
+
+        if min_output_len == usize::MAX || min_output_len == 0 {
+            return Ok(0);
+        }
+
+        Ok(self.interleave_into(min_output_len, num_channels, output))
     }
 
     /// Smoothly interpolates between current and target ratio.
@@ -754,6 +892,179 @@ mod tests {
             proc.process(&chunk),
             Err(crate::error::StretchError::NonFiniteInput)
         ));
+    }
+
+    // --- process_into tests ---
+
+    #[test]
+    fn test_process_into_matches_process() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+
+        let chunk_size = 4096;
+        let signal: Vec<f32> = (0..chunk_size * 4)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+
+        // Run with process()
+        let mut proc1 = StreamProcessor::new(params.clone());
+        let mut output1 = Vec::new();
+        for chunk in signal.chunks(chunk_size) {
+            if let Ok(out) = proc1.process(chunk) {
+                output1.extend_from_slice(&out);
+            }
+        }
+        if let Ok(out) = proc1.flush() {
+            output1.extend_from_slice(&out);
+        }
+
+        // Run with process_into()
+        let mut proc2 = StreamProcessor::new(params);
+        let mut output2 = Vec::new();
+        for chunk in signal.chunks(chunk_size) {
+            proc2.process_into(chunk, &mut output2).unwrap();
+        }
+        proc2.flush_into(&mut output2).unwrap();
+
+        assert_eq!(
+            output1.len(),
+            output2.len(),
+            "process and process_into should produce same length"
+        );
+        for (i, (a, b)) in output1.iter().zip(output2.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "Mismatch at sample {}: {} vs {}",
+                i,
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn test_process_into_stereo() {
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(44100)
+            .with_channels(2);
+
+        let num_frames = 44100;
+        let mut signal = vec![0.0f32; num_frames * 2];
+        for i in 0..num_frames {
+            let t = i as f32 / 44100.0;
+            signal[i * 2] = (2.0 * PI * 440.0 * t).sin();
+            signal[i * 2 + 1] = (2.0 * PI * 880.0 * t).sin();
+        }
+
+        let mut proc = StreamProcessor::new(params);
+        let mut output = Vec::new();
+        for chunk in signal.chunks(4096 * 2) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        proc.flush_into(&mut output).unwrap();
+
+        assert!(!output.is_empty(), "Should produce output");
+        assert_eq!(output.len() % 2, 0, "Stereo output must have even count");
+    }
+
+    #[test]
+    fn test_process_into_rejects_nan() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+
+        let mut proc = StreamProcessor::new(params);
+        let mut chunk = vec![0.0f32; 4096];
+        chunk[100] = f32::NAN;
+        let mut output = Vec::new();
+        assert!(matches!(
+            proc.process_into(&chunk, &mut output),
+            Err(crate::error::StretchError::NonFiniteInput)
+        ));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_process_into_returns_count() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+
+        let mut proc = StreamProcessor::new(params);
+        let mut output = Vec::new();
+
+        // First small chunk: not enough data yet
+        let small = vec![0.0f32; 1024];
+        let n = proc.process_into(&small, &mut output).unwrap();
+        assert_eq!(n, 0);
+        assert!(output.is_empty());
+
+        // Large chunk: should produce output
+        let big: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+        let n = proc.process_into(&big, &mut output).unwrap();
+        assert_eq!(n, output.len());
+        assert!(n > 0);
+    }
+
+    #[test]
+    fn test_process_into_appends() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+
+        let mut proc = StreamProcessor::new(params);
+        let mut output = vec![42.0f32]; // pre-existing data
+
+        let signal: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+
+        proc.process_into(&signal, &mut output).unwrap();
+
+        // First sample should still be our sentinel value
+        assert!(
+            (output[0] - 42.0).abs() < 1e-6,
+            "process_into should append, not overwrite"
+        );
+    }
+
+    #[test]
+    fn test_flush_into_empty() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+
+        let mut proc = StreamProcessor::new(params);
+        let mut output = Vec::new();
+        let n = proc.flush_into(&mut output).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_process_into_hybrid_mode() {
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_preset(crate::core::types::EdmPreset::HouseLoop);
+
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        let signal: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+
+        let mut output = Vec::new();
+        proc.process_into(&signal, &mut output).unwrap();
+        proc.flush_into(&mut output).unwrap();
+
+        assert!(
+            !output.is_empty(),
+            "Hybrid process_into should produce output"
+        );
     }
 
     #[test]
