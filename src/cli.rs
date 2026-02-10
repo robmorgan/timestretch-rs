@@ -1,4 +1,4 @@
-use timestretch::{EdmPreset, StretchParams};
+use timestretch::{EdmPreset, StretchParams, WindowType};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -21,6 +21,8 @@ fn main() {
     let mut format_24bit = false;
     let mut format_float = false;
     let mut verbose = false;
+    let mut window_type: Option<WindowType> = None;
+    let mut normalize = false;
 
     let mut i = 3;
     while i < args.len() {
@@ -49,6 +51,11 @@ fn main() {
             "--24bit" => format_24bit = true,
             "--float" => format_float = true,
             "--verbose" | "-v" => verbose = true,
+            "--normalize" | "-n" => normalize = true,
+            "--window" | "-w" => {
+                i += 1;
+                window_type = Some(parse_window(&args, i));
+            }
             // Legacy positional: ratio [preset]
             other => {
                 if ratio.is_none() {
@@ -127,6 +134,14 @@ fn main() {
         params = params.with_preset(p);
     }
 
+    if let Some(w) = window_type {
+        params = params.with_window_type(w);
+    }
+
+    if normalize {
+        params = params.with_normalize(true);
+    }
+
     if verbose {
         eprintln!("Parameters: {}", params);
         eprintln!(
@@ -137,6 +152,8 @@ fn main() {
         eprintln!("  WSOLA segment: {} samples", params.wsola_segment_size);
         eprintln!("  WSOLA search: {} samples", params.wsola_search_range);
         eprintln!("  Beat-aware: {}", params.beat_aware);
+        eprintln!("  Window: {:?}", params.window_type);
+        eprintln!("  Normalize: {}", params.normalize);
     }
 
     let start = std::time::Instant::now();
@@ -212,6 +229,8 @@ fn print_usage() {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --preset <name>   dj, house, halftime, ambient, vocal");
+    eprintln!("  --window <type>   hann (default), blackman-harris, kaiser:<beta>");
+    eprintln!("  --normalize, -n   Match output RMS to input (consistent loudness)");
     eprintln!("  --24bit           Write 24-bit PCM output (default: 16-bit)");
     eprintln!("  --float           Write 32-bit float output");
     eprintln!("  --verbose, -v     Show detailed processing parameters and timing");
@@ -221,6 +240,7 @@ fn print_usage() {
     eprintln!("  timestretch-cli in.wav out.wav --from-bpm 126 --to-bpm 128");
     eprintln!("  timestretch-cli in.wav out.wav --auto-bpm --to-bpm 128");
     eprintln!("  timestretch-cli in.wav out.wav --pitch 0.5 --preset vocal");
+    eprintln!("  timestretch-cli in.wav out.wav --ratio 2.0 --window blackman-harris --normalize");
     eprintln!("  timestretch-cli in.wav out.wav 1.5 house");
 }
 
@@ -246,6 +266,42 @@ fn parse_preset(args: &[String], idx: usize) -> EdmPreset {
     parse_preset_str(&args[idx])
 }
 
+fn parse_window(args: &[String], idx: usize) -> WindowType {
+    if idx >= args.len() {
+        eprintln!("ERROR: --window requires a value (hann, blackman-harris, kaiser:<beta>)");
+        std::process::exit(1);
+    }
+    parse_window_str(&args[idx])
+}
+
+fn parse_window_str(s: &str) -> WindowType {
+    match s {
+        "hann" => WindowType::Hann,
+        "blackman-harris" | "bh" => WindowType::BlackmanHarris,
+        other if other.starts_with("kaiser:") => {
+            let beta_str = &other["kaiser:".len()..];
+            match beta_str.parse::<f64>() {
+                Ok(beta) if beta >= 0.0 => WindowType::Kaiser((beta * 100.0).round() as u32),
+                _ => {
+                    eprintln!(
+                        "ERROR: Invalid Kaiser beta: '{}' (expected positive number)",
+                        beta_str
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        "kaiser" => WindowType::Kaiser(800), // default beta=8.0
+        other => {
+            eprintln!(
+                "ERROR: Unknown window type '{}' (use hann, blackman-harris, or kaiser:<beta>)",
+                other
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 fn parse_preset_str(s: &str) -> EdmPreset {
     match s {
         "dj" => EdmPreset::DjBeatmatch,
@@ -257,5 +313,43 @@ fn parse_preset_str(s: &str) -> EdmPreset {
             eprintln!("WARNING: Unknown preset '{}', using HouseLoop", other);
             EdmPreset::HouseLoop
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_window_hann() {
+        assert_eq!(parse_window_str("hann"), WindowType::Hann);
+    }
+
+    #[test]
+    fn test_parse_window_blackman_harris() {
+        assert_eq!(
+            parse_window_str("blackman-harris"),
+            WindowType::BlackmanHarris
+        );
+    }
+
+    #[test]
+    fn test_parse_window_blackman_harris_short() {
+        assert_eq!(parse_window_str("bh"), WindowType::BlackmanHarris);
+    }
+
+    #[test]
+    fn test_parse_window_kaiser_default() {
+        assert_eq!(parse_window_str("kaiser"), WindowType::Kaiser(800));
+    }
+
+    #[test]
+    fn test_parse_window_kaiser_with_beta() {
+        assert_eq!(parse_window_str("kaiser:12"), WindowType::Kaiser(1200));
+    }
+
+    #[test]
+    fn test_parse_window_kaiser_fractional_beta() {
+        assert_eq!(parse_window_str("kaiser:5.5"), WindowType::Kaiser(550));
     }
 }

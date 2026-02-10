@@ -510,6 +510,14 @@
 - [x] Applied cargo fmt across codebase (also fixed pre-existing format drift from other agents)
 - [x] Zero clippy warnings on library code, cargo doc builds clean
 
+## CLI --window and --normalize flags (agent-3)
+- [x] Added `--window <hann|blackman-harris|bh|kaiser[:beta]>` flag to CLI
+- [x] Added `--normalize` / `-n` flag to CLI for RMS-matched output
+- [x] Added `-w` short flag for `--window`
+- [x] Updated help text with examples
+- [x] Added verbose output for window type and normalize settings
+- [x] 6 unit tests for window parsing (hann, blackman-harris, bh alias, kaiser default, kaiser:beta, kaiser fractional)
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
