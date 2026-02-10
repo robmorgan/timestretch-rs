@@ -218,6 +218,82 @@ pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, Stretc
     Ok(output)
 }
 
+/// Stretches audio samples, appending the result to a caller-provided buffer.
+///
+/// This is the zero-copy variant of [`stretch`]. Instead of returning a new
+/// `Vec`, it appends stretched samples to `output`. This is useful for
+/// avoiding heap allocations when the caller already has a pre-allocated buffer.
+///
+/// Returns the number of samples appended to `output`.
+///
+/// # Errors
+///
+/// Returns [`StretchError::InvalidRatio`] if the stretch ratio is out of range.
+///
+/// # Example
+///
+/// ```
+/// use timestretch::{StretchParams, EdmPreset};
+///
+/// let input: Vec<f32> = (0..44100)
+///     .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
+///     .collect();
+///
+/// let params = StretchParams::new(1.5)
+///     .with_sample_rate(44100)
+///     .with_channels(1)
+///     .with_preset(EdmPreset::HouseLoop);
+///
+/// let mut output = Vec::with_capacity(66150); // pre-allocate for ~1.5x
+/// let n = timestretch::stretch_into(&input, &params, &mut output).unwrap();
+/// assert!(n > 0);
+/// assert_eq!(n, output.len());
+/// ```
+pub fn stretch_into(
+    input: &[f32],
+    params: &StretchParams,
+    output: &mut Vec<f32>,
+) -> Result<usize, StretchError> {
+    stretch::params::validate_params(params).map_err(StretchError::InvalidRatio)?;
+
+    if !validate_input(input)? {
+        return Ok(0);
+    }
+
+    let num_channels = params.channels.count();
+    let channels = deinterleave(input, num_channels);
+
+    let input_rms = if params.normalize {
+        compute_rms(input)
+    } else {
+        0.0
+    };
+
+    let mut channel_outputs: Vec<Vec<f32>> = Vec::with_capacity(num_channels);
+    for channel_data in &channels {
+        let stretcher = stretch::hybrid::HybridStretcher::new(params.clone());
+        let stretched = stretcher.process(channel_data)?;
+        channel_outputs.push(stretched);
+    }
+
+    let min_len = channel_outputs.iter().map(|c| c.len()).min().unwrap_or(0);
+    let total = min_len * num_channels;
+
+    output.reserve(total);
+    let start = output.len();
+    for i in 0..min_len {
+        for ch in &channel_outputs {
+            output.push(ch[i]);
+        }
+    }
+
+    if params.normalize {
+        normalize_rms(&mut output[start..], input_rms);
+    }
+
+    Ok(total)
+}
+
 /// Stretches an [`AudioBuffer`] and returns a new `AudioBuffer`.
 ///
 /// The sample rate and channel layout are taken from the input buffer,
@@ -1458,5 +1534,136 @@ mod tests {
             input_rms,
             output_rms
         );
+    }
+
+    // --- stretch_into tests ---
+
+    #[test]
+    fn test_stretch_into_matches_stretch() {
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(1);
+
+        let output1 = stretch(&input, &params).unwrap();
+
+        let mut output2 = Vec::new();
+        let n = stretch_into(&input, &params, &mut output2).unwrap();
+
+        assert_eq!(n, output2.len());
+        assert_eq!(output1.len(), output2.len());
+        for (i, (a, b)) in output1.iter().zip(output2.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "Mismatch at sample {}: {} vs {}",
+                i,
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn test_stretch_into_empty() {
+        let params = StretchParams::new(1.5);
+        let mut output = Vec::new();
+        let n = stretch_into(&[], &params, &mut output).unwrap();
+        assert_eq!(n, 0);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_stretch_into_appends() {
+        let input: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(44100)
+            .with_channels(1);
+
+        let mut output = vec![99.0f32; 3]; // pre-existing data
+        let n = stretch_into(&input, &params, &mut output).unwrap();
+
+        // First 3 samples should be our sentinel values
+        assert!((output[0] - 99.0).abs() < 1e-6);
+        assert!((output[1] - 99.0).abs() < 1e-6);
+        assert!((output[2] - 99.0).abs() < 1e-6);
+        assert_eq!(output.len(), 3 + n);
+    }
+
+    #[test]
+    fn test_stretch_into_invalid_ratio() {
+        let params = StretchParams::new(0.0);
+        let mut output = Vec::new();
+        assert!(stretch_into(&[0.0; 44100], &params, &mut output).is_err());
+    }
+
+    #[test]
+    fn test_stretch_into_stereo() {
+        let sample_rate = 44100u32;
+        let num_frames = 44100;
+        let mut input = vec![0.0f32; num_frames * 2];
+        for i in 0..num_frames {
+            let t = i as f32 / sample_rate as f32;
+            input[i * 2] = (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+            input[i * 2 + 1] = (2.0 * std::f32::consts::PI * 880.0 * t).sin();
+        }
+
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(2);
+
+        let mut output = Vec::new();
+        let n = stretch_into(&input, &params, &mut output).unwrap();
+        assert!(n > 0);
+        assert_eq!(n % 2, 0, "Stereo output must have even sample count");
+    }
+
+    #[test]
+    fn test_stretch_into_with_normalize() {
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                0.8 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin()
+            })
+            .collect();
+
+        let input_rms = compute_rms(&input);
+
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_normalize(true);
+
+        let mut output = Vec::new();
+        stretch_into(&input, &params, &mut output).unwrap();
+        let output_rms = compute_rms(&output);
+
+        assert!(
+            (output_rms - input_rms).abs() < input_rms * 0.05,
+            "Normalized stretch_into RMS mismatch: input={:.4}, output={:.4}",
+            input_rms,
+            output_rms
+        );
+    }
+
+    #[test]
+    fn test_stretch_into_rejects_nan() {
+        let mut input = vec![0.0f32; 44100];
+        input[1000] = f32::NAN;
+        let params = StretchParams::new(1.5).with_channels(1);
+        let mut output = Vec::new();
+        assert!(matches!(
+            stretch_into(&input, &params, &mut output),
+            Err(StretchError::NonFiniteInput)
+        ));
+        assert!(output.is_empty());
     }
 }
