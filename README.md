@@ -98,6 +98,34 @@ let output = timestretch::stretch_buffer(&buffer, &params).unwrap();
 println!("Duration: {:.2}s -> {:.2}s", buffer.duration_secs(), output.duration_secs());
 ```
 
+### Pitch Shifting
+
+```rust
+use timestretch::StretchParams;
+
+let params = StretchParams::new(1.0)
+    .with_sample_rate(44100)
+    .with_channels(1);
+
+// Shift up one octave (2x frequency), preserving duration
+let output = timestretch::pitch_shift(&input, &params, 2.0).unwrap();
+assert_eq!(output.len(), input.len());
+```
+
+### BPM-Based Stretching
+
+```rust
+use timestretch::{StretchParams, EdmPreset};
+
+let params = StretchParams::new(1.0) // ratio computed automatically
+    .with_sample_rate(44100)
+    .with_channels(2)
+    .with_preset(EdmPreset::DjBeatmatch);
+
+// Stretch a 126 BPM track to 128 BPM
+let output = timestretch::stretch_to_bpm(&input, &params, 126.0, 128.0).unwrap();
+```
+
 ### WAV File I/O
 
 ```rust
@@ -111,8 +139,13 @@ let params = timestretch::StretchParams::new(2.0)
     .with_preset(timestretch::EdmPreset::Halftime);
 let output = timestretch::stretch_buffer(&buffer, &params).unwrap();
 
-// Write the result
-wav::write_wav_file_16bit("output.wav", &output).unwrap();
+// Write the result (16-bit, 24-bit, or float)
+wav::write_wav_file_16bit("output_16.wav", &output).unwrap();
+wav::write_wav_file_24bit("output_24.wav", &output).unwrap();
+wav::write_wav_file_float("output_32.wav", &output).unwrap();
+
+// Or use the one-liner convenience API
+timestretch::stretch_wav_file("input.wav", "output.wav", &params).unwrap();
 ```
 
 ## EDM Presets
@@ -191,10 +224,25 @@ heap allocations.
 
 ### Functions
 
-- **`stretch(&[f32], &StretchParams) -> Result<Vec<f32>>`** — one-shot stretch
-  of raw sample data
-- **`stretch_buffer(&AudioBuffer, &StretchParams) -> Result<AudioBuffer>`** —
-  one-shot stretch of an `AudioBuffer`
+**Time stretching:**
+- `stretch(&[f32], &StretchParams)` — stretch raw sample data
+- `stretch_buffer(&AudioBuffer, &StretchParams)` — stretch an `AudioBuffer`
+- `stretch_to_bpm(&[f32], &StretchParams, source_bpm, target_bpm)` — BPM-based stretch
+- `stretch_to_bpm_auto(&[f32], &StretchParams, target_bpm)` — auto-detect BPM and stretch
+
+**Pitch shifting:**
+- `pitch_shift(&[f32], &StretchParams, factor)` — shift pitch without changing duration
+- `pitch_shift_buffer(&AudioBuffer, &StretchParams, factor)` — pitch shift an `AudioBuffer`
+
+**BPM detection:**
+- `detect_bpm(&[f32], sample_rate)` — detect tempo from raw samples
+- `detect_bpm_buffer(&AudioBuffer)` — detect tempo from an `AudioBuffer`
+- `detect_beat_grid(&[f32], sample_rate)` — detect beat grid positions
+- `bpm_ratio(source_bpm, target_bpm)` — compute stretch ratio for BPM change
+
+**WAV file convenience:**
+- `stretch_wav_file(input, output, &StretchParams)` — read, stretch, and write a WAV file
+- `pitch_shift_wav_file(input, output, &StretchParams, factor)` — read, pitch-shift, and write
 
 See the [API documentation](https://docs.rs/timestretch) for full details.
 
@@ -203,10 +251,11 @@ See the [API documentation](https://docs.rs/timestretch) for full details.
 Run the included examples:
 
 ```sh
-cargo run --example basic_stretch
-cargo run --example dj_beatmatch
-cargo run --example sample_halftime
-cargo run --example realtime_stream
+cargo run --example basic_stretch      # Simple time stretch
+cargo run --example dj_beatmatch       # 126 → 128 BPM tempo sync
+cargo run --example sample_halftime    # 2x halftime effect
+cargo run --example pitch_shift        # Pitch shifting demo
+cargo run --example realtime_stream    # Streaming API demo
 ```
 
 ## Audio Format
