@@ -61,6 +61,16 @@
 - [x] Simplified redundant guard in `segment_audio()` (hybrid.rs)
 - [x] All 66 unit tests passing, zero clippy warnings
 
+### Second pass (agent-5)
+- [x] Split `read_wav()` into `validate_riff_header()`, `parse_wav_chunks()`, `convert_samples()`
+- [x] Extracted `io_error()` helper to deduplicate 6 identical WAV I/O error formatting calls
+- [x] Deduplicated `write_wav_file_16bit`/`write_wav_file_float` via shared `write_wav_file()`
+- [x] Extracted `compute_spectral_flux()` from `detect_transients()` (was 64 lines, now 24)
+- [x] Added `StretchParams::output_length()` helper, used in hybrid stretcher (eliminates 2 duplicated calculations)
+- [x] Added doc comments for `with_preset()` and `with_sample_rate()` documenting override behavior
+- [x] Removed unused `sub_bass_bin` field and `#[allow(dead_code)]` from `PhaseVocoder`
+- [x] All 68 unit tests passing, zero clippy warnings
+
 ## Completed — Performance Optimization (agent-3)
 - [x] Comprehensive benchmarks: PV mono/stereo, EDM presets, FFT sizes, streaming, signal scaling
 - [x] PhaseVocoder: reuse FFT/magnitude/phase buffers, pre-compute phase advance, efficient wrap_phase
