@@ -53,6 +53,25 @@ pub use core::types::{AudioBuffer, Channels, EdmPreset, Sample, StretchParams};
 pub use error::StretchError;
 pub use stream::StreamProcessor;
 
+/// Deinterleaves multi-channel audio into separate per-channel vectors.
+fn deinterleave(input: &[f32], num_channels: usize) -> Vec<Vec<f32>> {
+    (0..num_channels)
+        .map(|ch| input.iter().skip(ch).step_by(num_channels).copied().collect())
+        .collect()
+}
+
+/// Interleaves per-channel vectors into a single buffer, truncating to the shortest channel.
+fn interleave(channels: &[Vec<f32>], num_channels: usize) -> Vec<f32> {
+    let min_len = channels.iter().map(|c| c.len()).min().unwrap_or(0);
+    let mut output = Vec::with_capacity(min_len * num_channels);
+    for i in 0..min_len {
+        for ch in channels {
+            output.push(ch[i]);
+        }
+    }
+    output
+}
+
 /// Stretches audio samples by the given parameters.
 ///
 /// This is the main entry point for one-shot (non-streaming) time stretching.
@@ -87,40 +106,16 @@ pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, Stretc
     }
 
     let num_channels = params.channels.count();
+    let channels = deinterleave(input, num_channels);
 
-    // Process each channel separately
-    let mut channel_outputs: Vec<Vec<f32>> = Vec::new();
-
-    for ch in 0..num_channels {
-        // Deinterleave
-        let channel_data: Vec<f32> = input
-            .iter()
-            .skip(ch)
-            .step_by(num_channels)
-            .copied()
-            .collect();
-
-        // Use hybrid stretcher
+    let mut channel_outputs: Vec<Vec<f32>> = Vec::with_capacity(num_channels);
+    for channel_data in &channels {
         let stretcher = stretch::hybrid::HybridStretcher::new(params.clone());
-        let stretched = stretcher.process(&channel_data)?;
+        let stretched = stretcher.process(channel_data)?;
         channel_outputs.push(stretched);
     }
 
-    // Re-interleave
-    if channel_outputs.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let min_len = channel_outputs.iter().map(|c| c.len()).min().unwrap_or(0);
-    let mut output = Vec::with_capacity(min_len * num_channels);
-
-    for i in 0..min_len {
-        for ch_out in &channel_outputs {
-            output.push(ch_out[i]);
-        }
-    }
-
-    Ok(output)
+    Ok(interleave(&channel_outputs, num_channels))
 }
 
 /// Stretches an [`AudioBuffer`] and returns a new `AudioBuffer`.
@@ -219,32 +214,14 @@ pub fn pitch_shift(
     // Step 2: Resample each channel to original length using cubic interpolation
     let num_channels = params.channels.count();
     let num_input_frames = input.len() / num_channels;
+    let channels = deinterleave(&stretched, num_channels);
 
-    let mut channel_outputs: Vec<Vec<f32>> = Vec::with_capacity(num_channels);
-    for ch in 0..num_channels {
-        let channel_data: Vec<f32> = stretched
-            .iter()
-            .skip(ch)
-            .step_by(num_channels)
-            .copied()
-            .collect();
-        let resampled = core::resample::resample_cubic(&channel_data, num_input_frames);
-        channel_outputs.push(resampled);
-    }
+    let channel_outputs: Vec<Vec<f32>> = channels
+        .iter()
+        .map(|ch| core::resample::resample_cubic(ch, num_input_frames))
+        .collect();
 
-    // Re-interleave
-    let mut output = Vec::with_capacity(num_input_frames * num_channels);
-    for i in 0..num_input_frames {
-        for ch_out in &channel_outputs {
-            if i < ch_out.len() {
-                output.push(ch_out[i]);
-            } else {
-                output.push(0.0);
-            }
-        }
-    }
-
-    Ok(output)
+    Ok(interleave(&channel_outputs, num_channels))
 }
 
 /// Stretches audio from one BPM to another.
