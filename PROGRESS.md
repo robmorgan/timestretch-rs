@@ -642,7 +642,16 @@
   - Conversions & traits (15 tests): From<AudioBuffer> for Vec<f32> mono/stereo/after-stretch/empty, with_stretch_ratio override/pipeline, Debug for AudioBuffer/StretchParams/StreamProcessor, Display presets, PartialEq after resample, AsRef, IntoIterator stereo, Default params, from_tempo ratio calculation/preset chain
   - Combined workflows (10 tests): full DJ transition, sample rate conversion+stretch, chop+stretch+crossfade, normalize+crossfade, streaming+resample, window types with BPM stretch, normalize flag with WAV, beat-aware with clicks, band-split+crossfade
   - Edge cases (11 tests): very short/extreme resample, single-frame/empty crossfade, identity BPM streaming, with_stretch_ratio override from_tempo, hybrid persists across reset, latency reporting, stereo frame alignment, asymmetric crossfade, output_length helper
-- [x] Total: 821 tests (311 unit + 483 integration + 27 doc), all passing
+- [x] 57 new integration tests in `tests/new_features_2.rs` covering additional new APIs:
+  - AudioBuffer::split_at() (9 tests): middle/beginning/end/beyond-end split, stereo, data preservation, recombine equals original, split+stretch both halves, empty buffer
+  - AudioBuffer::repeat() (9 tests): twice/once/zero/stereo/empty/large count, sample rate preservation, repeat+stretch workflow, RMS preservation
+  - AudioBuffer::mix() (10 tests): two sines, inverse cancellation, mix with silence, different lengths zero-pad, stereo, mismatched rate/channels panics, mix+stretch, commutativity, self-doubling
+  - AudioBuffer::into_data() (5 tests): mono/stereo/empty, after stretch, vs From<> conversion equivalence
+  - AsMut<[Sample]> (5 tests): modify samples, manual gain, zero-out, stereo channel modification, as_mut+stretch workflow
+  - StreamProcessor::process_into()/flush_into() (9 tests): basic, accumulates, matches process() output, flush basic/empty, stereo, NaN rejection, ratio change, pre-allocated buffer
+  - Streaming-batch parity (4 tests): expansion/compression length matching, RMS matching, stereo parity
+  - Combined workflows (6 tests): split+stretch+recombine, repeat+mix layering, as_mut+normalize+split, into_data for external processing, process_into+split+mix, repeat+crossfade DJ loop
+- [x] Total: 878 tests (311 unit + 540 integration + 27 doc), all passing
 - [x] Zero clippy warnings
 
 ## DJ Mix Example (agent-3)
