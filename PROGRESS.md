@@ -44,6 +44,10 @@
 - [x] Fixed clippy warnings in tests (streaming.rs, edm_presets.rs)
 - [x] Fixed clippy warnings in examples (dj_beatmatch.rs, realtime_stream.rs, sample_halftime.rs)
 - [x] Fixed example files to match current API (removed `.expect()` from non-Result returns)
+- [x] Fixed WSOLA compression ratio accuracy (fractional output position tracking)
+- [x] Implemented FFT-accelerated cross-correlation for WSOLA (auto-selects FFT vs direct based on search range)
+- [x] Added comprehensive identity tests (merged with agent-3's tests: frequency, SNR, multi-freq, transients, stereo, sub-bass, DC offset)
+- [x] Added 15 edge case tests (boundary inputs, extreme ratios, silence, impulse, DC offset, all presets with compression)
 
 ## Agent-5 Refactoring
 - [x] Added builder methods to `StretchParams`: `with_sub_bass_cutoff()`, `with_wsola_segment_size()`, `with_wsola_search_range()`
@@ -77,13 +81,14 @@
 
 ## TODO
 - [ ] Test with real audio samples
-- [ ] FFT-accelerated WSOLA cross-correlation (currently time-domain)
 - [ ] SIMD-friendly inner loop layout
 - [ ] Further streaming optimization (overlap handling between chunks)
+- [ ] Improve documentation (rustdoc, README examples)
 
 ## Notes
 - Hann window used for all PV processing (works well for EDM kicks)
 - Phase vocoder window-sum normalization clamped to prevent amplification in low-overlap regions
 - For very short segments, hybrid falls back to linear resampling
-- WSOLA cross-correlation is time-domain (not FFT-accelerated yet)
+- WSOLA cross-correlation uses FFT for search ranges > 64 candidates, direct computation otherwise
+- WSOLA output position tracked fractionally to prevent cumulative rounding drift at all stretch ratios
 - wrap_phase uses floor-based modulo instead of while loops (more predictable for large phase values)
