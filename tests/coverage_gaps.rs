@@ -9,7 +9,7 @@
 // - StreamProcessor (flush, reset, hybrid mode switching, rapid ratio changes)
 // - Preset configurations (window types, band_split, beat_aware)
 
-use timestretch::{AudioBuffer, Channels, EdmPreset, StretchParams, StreamProcessor, WindowType};
+use timestretch::{AudioBuffer, Channels, EdmPreset, StreamProcessor, StretchParams, WindowType};
 
 // ========================
 // lib.rs helper tests
@@ -51,10 +51,7 @@ mod lib_helpers {
         let right_rms: f64 =
             right.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / right.len() as f64;
         assert!(left_rms.sqrt() > 0.01, "Left channel should have energy");
-        assert!(
-            right_rms.sqrt() > 0.01,
-            "Right channel should have energy"
-        );
+        assert!(right_rms.sqrt() > 0.01, "Right channel should have energy");
     }
 
     #[test]
@@ -126,8 +123,7 @@ mod lib_helpers {
         let epsilon = 1e-10;
         let input: Vec<f32> = (0..44100)
             .map(|i| {
-                epsilon as f32
-                    * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin()
+                epsilon as f32 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin()
             })
             .collect();
         let params = StretchParams::new(1.5)
@@ -356,7 +352,10 @@ mod params_boundaries {
         params.hop_size = 75;
         let input = vec![0.0f32; 44100];
         let result = timestretch::stretch(&input, &params);
-        assert!(result.is_err(), "non-power-of-two fft_size should be rejected");
+        assert!(
+            result.is_err(),
+            "non-power-of-two fft_size should be rejected"
+        );
     }
 
     #[test]
@@ -732,8 +731,7 @@ mod audio_buffer_edges {
 
     #[test]
     fn frames_iterator_stereo() {
-        let buf =
-            AudioBuffer::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 44100, Channels::Stereo);
+        let buf = AudioBuffer::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 44100, Channels::Stereo);
         let frames: Vec<&[f32]> = buf.frames().collect();
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[0], &[1.0, 2.0]);
@@ -1236,10 +1234,7 @@ mod normalize_edge_cases {
     #[test]
     fn normalize_with_dc_offset() {
         let input: Vec<f32> = (0..88200)
-            .map(|i| {
-                0.5 + 0.3
-                    * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin()
-            })
+            .map(|i| 0.5 + 0.3 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
             .collect();
         let params = StretchParams::new(1.5)
             .with_sample_rate(44100)
@@ -1261,11 +1256,8 @@ mod normalize_edge_cases {
             input[i * 2 + 1] = 0.4 * (2.0 * std::f32::consts::PI * 880.0 * t).sin();
         }
 
-        let input_rms: f64 = input
-            .iter()
-            .map(|&s| (s as f64) * (s as f64))
-            .sum::<f64>()
-            / input.len() as f64;
+        let input_rms: f64 =
+            input.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / input.len() as f64;
         let input_rms = input_rms.sqrt();
 
         let params = StretchParams::new(1.5)
@@ -1274,11 +1266,8 @@ mod normalize_edge_cases {
             .with_normalize(true);
         let output = timestretch::stretch(&input, &params).unwrap();
 
-        let output_rms: f64 = output
-            .iter()
-            .map(|&s| (s as f64) * (s as f64))
-            .sum::<f64>()
-            / output.len() as f64;
+        let output_rms: f64 =
+            output.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / output.len() as f64;
         let output_rms = output_rms.sqrt();
 
         assert!(
