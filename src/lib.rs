@@ -269,6 +269,32 @@ pub fn pitch_shift(
     Ok(interleave(&channel_outputs, num_channels))
 }
 
+/// Shifts the pitch of an [`AudioBuffer`] without changing its duration.
+///
+/// Convenience wrapper around [`pitch_shift`] that takes and returns
+/// an `AudioBuffer`. Sample rate and channel layout are taken from the buffer.
+///
+/// # Errors
+///
+/// Returns [`StretchError::InvalidRatio`] if the pitch factor is out of range.
+pub fn pitch_shift_buffer(
+    buffer: &AudioBuffer,
+    params: &StretchParams,
+    pitch_factor: f64,
+) -> Result<AudioBuffer, StretchError> {
+    let mut effective_params = params.clone();
+    effective_params.sample_rate = buffer.sample_rate;
+    effective_params.channels = buffer.channels;
+
+    let output_data = pitch_shift(&buffer.data, &effective_params, pitch_factor)?;
+
+    Ok(AudioBuffer::new(
+        output_data,
+        buffer.sample_rate,
+        buffer.channels,
+    ))
+}
+
 /// Detects the BPM of a mono audio signal.
 ///
 /// Uses transient detection and inter-onset interval analysis optimized
@@ -312,6 +338,19 @@ pub fn detect_bpm(samples: &[f32], sample_rate: u32) -> f64 {
 /// ```
 pub fn detect_beat_grid(samples: &[f32], sample_rate: u32) -> BeatGrid {
     analysis::beat::detect_beats(samples, sample_rate)
+}
+
+/// Detects the BPM of an [`AudioBuffer`].
+///
+/// For stereo buffers, uses the left channel for detection.
+/// Returns 0.0 if no tempo can be detected.
+pub fn detect_bpm_buffer(buffer: &AudioBuffer) -> f64 {
+    let mono: Vec<f32> = if buffer.channels.count() > 1 {
+        buffer.data.iter().step_by(buffer.channels.count()).copied().collect()
+    } else {
+        buffer.data.clone()
+    };
+    detect_bpm(&mono, buffer.sample_rate)
 }
 
 /// Stretches audio from one BPM to another.
@@ -919,5 +958,56 @@ mod tests {
                 bpm
             );
         }
+    }
+
+    #[test]
+    fn test_pitch_shift_buffer() {
+        let buffer = AudioBuffer::from_mono(
+            (0..44100)
+                .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
+                .collect(),
+            44100,
+        );
+
+        let params = StretchParams::new(1.0);
+        let output = pitch_shift_buffer(&buffer, &params, 1.5).unwrap();
+        assert_eq!(output.sample_rate, 44100);
+        assert_eq!(output.channels, Channels::Mono);
+        // Pitch shift preserves length
+        assert_eq!(output.data.len(), buffer.data.len());
+    }
+
+    #[test]
+    fn test_pitch_shift_buffer_stereo() {
+        let sample_rate = 44100u32;
+        let num_frames = 44100;
+        let mut data = vec![0.0f32; num_frames * 2];
+        for i in 0..num_frames {
+            let t = i as f32 / sample_rate as f32;
+            data[i * 2] = (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+            data[i * 2 + 1] = (2.0 * std::f32::consts::PI * 880.0 * t).sin();
+        }
+
+        let buffer = AudioBuffer::new(data, sample_rate, Channels::Stereo);
+        let params = StretchParams::new(1.0);
+        let output = pitch_shift_buffer(&buffer, &params, 0.8).unwrap();
+        assert_eq!(output.data.len(), buffer.data.len());
+        assert_eq!(output.channels, Channels::Stereo);
+    }
+
+    #[test]
+    fn test_detect_bpm_buffer_silence() {
+        let buffer = AudioBuffer::from_mono(vec![0.0f32; 44100 * 4], 44100);
+        let bpm = detect_bpm_buffer(&buffer);
+        assert!(bpm == 0.0, "Silence should return 0 BPM, got {}", bpm);
+    }
+
+    #[test]
+    fn test_detect_bpm_buffer_stereo() {
+        // Stereo buffer with silence should return 0 BPM and not crash
+        let data = vec![0.0f32; 44100 * 4 * 2]; // 4 seconds stereo
+        let buffer = AudioBuffer::new(data, 44100, Channels::Stereo);
+        let bpm = detect_bpm_buffer(&buffer);
+        assert!(bpm == 0.0, "Silence should return 0 BPM, got {}", bpm);
     }
 }

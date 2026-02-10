@@ -297,6 +297,13 @@
 - [x] Applied cargo fmt to fix formatting drift from other agents' code
 - [x] All 238 tests passing (98 unit + 126 integration + 14 doc), zero clippy warnings
 
+## API Wrappers (agent-3)
+- [x] `pitch_shift_buffer(buffer, params, pitch_factor)` — AudioBuffer convenience wrapper for pitch shifting
+- [x] `detect_bpm_buffer(buffer)` — BPM detection from AudioBuffer (handles stereo by extracting left channel)
+- [x] 4 new unit tests: pitch_shift_buffer mono/stereo, detect_bpm_buffer silence/stereo
+- [x] Total: 249+ tests, all passing
+- [x] Zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
