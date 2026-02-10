@@ -149,7 +149,14 @@ impl Wsola {
 
         // Use FFT-based correlation when search range is large enough to benefit
         if num_candidates > FFT_CANDIDATE_THRESHOLD && overlap_len >= FFT_OVERLAP_THRESHOLD {
-            self.find_best_position_fft(input, output, search_start, search_end, output_pos, overlap_len)
+            self.find_best_position_fft(
+                input,
+                output,
+                search_start,
+                search_end,
+                output_pos,
+                overlap_len,
+            )
         } else {
             self.find_best_position_direct(
                 input,
@@ -230,7 +237,12 @@ impl Wsola {
         // Find best candidate using normalized correlation
         let num_candidates = actual_region_len.saturating_sub(overlap_len) + 1;
         let best_pos = find_best_candidate(
-            search_signal, &corr_buf, ref_energy, num_candidates, overlap_len, search_start,
+            search_signal,
+            &corr_buf,
+            ref_energy,
+            num_candidates,
+            overlap_len,
+            search_start,
         );
 
         // Clamp to valid range
@@ -328,7 +340,11 @@ fn find_best_candidate(
         let window_energy = prefix_sq[k + overlap_len] - prefix_sq[k];
         let denom = (ref_energy * window_energy).sqrt();
 
-        let ncorr = if denom > ENERGY_EPSILON { raw_corr / denom } else { 0.0 };
+        let ncorr = if denom > ENERGY_EPSILON {
+            raw_corr / denom
+        } else {
+            0.0
+        };
 
         if ncorr > best_ncorr {
             best_ncorr = ncorr;

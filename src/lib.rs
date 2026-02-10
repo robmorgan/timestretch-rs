@@ -332,9 +332,7 @@ mod tests {
         let sample_rate = 44100u32;
         let num_samples = sample_rate as usize * 2;
         let input: Vec<f32> = (0..num_samples)
-            .map(|i| {
-                (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin()
-            })
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin())
             .collect();
 
         let params = StretchParams::new(1.0)

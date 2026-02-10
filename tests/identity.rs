@@ -715,7 +715,7 @@ fn test_identity_stereo_silence_channels() {
     for i in 0..num_frames {
         let t = i as f32 / sample_rate as f32;
         input[i * 2] = (2.0 * PI * 440.0 * t).sin(); // L: sine
-        // R: silence (already 0.0)
+                                                     // R: silence (already 0.0)
     }
 
     let params = StretchParams::new(1.0)

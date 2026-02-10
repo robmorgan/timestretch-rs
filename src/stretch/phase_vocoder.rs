@@ -146,7 +146,10 @@ impl PhaseVocoder {
             let analysis_pos = frame_idx * self.hop_analysis;
             let synthesis_pos = frame_idx * self.hop_synthesis;
 
-            self.analyze_frame(&input[analysis_pos..analysis_pos + self.fft_size], &fft_forward);
+            self.analyze_frame(
+                &input[analysis_pos..analysis_pos + self.fft_size],
+                &fft_forward,
+            );
             self.advance_phases(num_bins, hop_ratio);
 
             // Identity phase locking (Laroche & Dolson 1999): lock non-peak
@@ -461,12 +464,8 @@ mod tests {
 
         // Both should have similar RMS (we aren't destroying energy)
         let rms_locked =
-            (output_locked.iter().map(|x| x * x).sum::<f32>() / output_locked.len() as f32)
-                .sqrt();
-        let rms_unlocked = (output_unlocked
-            .iter()
-            .map(|x| x * x)
-            .sum::<f32>()
+            (output_locked.iter().map(|x| x * x).sum::<f32>() / output_locked.len() as f32).sqrt();
+        let rms_unlocked = (output_unlocked.iter().map(|x| x * x).sum::<f32>()
             / output_unlocked.len() as f32)
             .sqrt();
 
@@ -507,10 +506,7 @@ mod tests {
         // RMS should be very similar since 1000 Hz is above the cutoff
         let rms_with =
             (output_with.iter().map(|x| x * x).sum::<f32>() / output_with.len() as f32).sqrt();
-        let rms_without = (output_without
-            .iter()
-            .map(|x| x * x)
-            .sum::<f32>()
+        let rms_without = (output_without.iter().map(|x| x * x).sum::<f32>()
             / output_without.len() as f32)
             .sqrt();
 

@@ -140,7 +140,11 @@ impl StreamProcessor {
             self.channel_buffers[ch] = stretched;
         }
 
-        Ok(if min_output_len == usize::MAX { 0 } else { min_output_len })
+        Ok(if min_output_len == usize::MAX {
+            0
+        } else {
+            min_output_len
+        })
     }
 
     /// Extracts a single channel from the interleaved input buffer.
