@@ -90,6 +90,24 @@ pub fn detect_transients(
     }
 }
 
+// Frequency band boundaries for transient weighting (Hz).
+const BAND_SUB_BASS_LIMIT: f32 = 100.0;
+const BAND_BASS_MID_LIMIT: f32 = 500.0;
+const BAND_MID_LIMIT: f32 = 2000.0;
+const BAND_HIGH_MID_LIMIT: f32 = 8000.0;
+
+// Spectral flux weights per frequency band.
+/// Sub-bass (<100 Hz): low weight — little transient content.
+const WEIGHT_SUB_BASS: f32 = 0.3;
+/// Bass/low-mid (100–500 Hz): moderate weight — kick body.
+const WEIGHT_BASS_MID: f32 = 0.6;
+/// Mid (500–2000 Hz): moderate weight.
+const WEIGHT_MID: f32 = 0.8;
+/// High-mid (2–8 kHz): highest weight — hi-hats, snare attacks.
+const WEIGHT_HIGH_MID: f32 = 1.5;
+/// Very high (>8 kHz): moderate weight — noise content.
+const WEIGHT_VERY_HIGH: f32 = 0.8;
+
 /// Computes frequency bin weights for transient detection.
 /// Emphasizes the 2-8 kHz range where hi-hats and snare attacks live.
 fn compute_bin_weights(fft_size: usize, sample_rate: u32) -> Vec<f32> {
@@ -99,21 +117,16 @@ fn compute_bin_weights(fft_size: usize, sample_rate: u32) -> Vec<f32> {
 
     for bin in 0..num_bins {
         let freq = bin as f32 * bin_freq;
-        let weight = if freq < 100.0 {
-            // Sub-bass: low weight for transient detection
-            0.3
-        } else if freq < 500.0 {
-            // Bass/low-mid: moderate weight (kick body)
-            0.6
-        } else if freq < 2000.0 {
-            // Mid: moderate weight
-            0.8
-        } else if freq < 8000.0 {
-            // High-mid: highest weight (transient content)
-            1.5
+        let weight = if freq < BAND_SUB_BASS_LIMIT {
+            WEIGHT_SUB_BASS
+        } else if freq < BAND_BASS_MID_LIMIT {
+            WEIGHT_BASS_MID
+        } else if freq < BAND_MID_LIMIT {
+            WEIGHT_MID
+        } else if freq < BAND_HIGH_MID_LIMIT {
+            WEIGHT_HIGH_MID
         } else {
-            // Very high: moderate (noise)
-            0.8
+            WEIGHT_VERY_HIGH
         };
         weights.push(weight);
     }

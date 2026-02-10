@@ -8,6 +8,21 @@ use std::io::{Read, Write};
 const WAV_FORMAT_PCM: u16 = 1;
 const WAV_FORMAT_IEEE_FLOAT: u16 = 3;
 
+/// Scaling factor for converting 16-bit PCM samples to/from f32.
+const PCM_16BIT_SCALE: f32 = 32768.0;
+/// Maximum representable value for 16-bit PCM output (32767, not 32768, to avoid clipping).
+const PCM_16BIT_MAX_OUT: f32 = 32767.0;
+/// Scaling factor for converting 24-bit PCM samples to f32.
+const PCM_24BIT_SCALE: f32 = 8388608.0;
+/// Sign bit mask for 24-bit PCM sign extension.
+const PCM_24BIT_SIGN_BIT: i32 = 0x800000;
+/// Bitmask for 24-bit PCM values.
+const PCM_24BIT_MASK: i32 = 0xFFFFFF;
+/// Minimum size for a valid WAV file (RIFF + fmt + data headers).
+const WAV_MIN_HEADER_SIZE: usize = 44;
+/// Size of the fmt chunk's fixed fields.
+const WAV_FMT_MIN_SIZE: usize = 16;
+
 /// Parsed WAV format and data chunk info.
 struct WavChunks<'a> {
     format_code: u16,
@@ -19,7 +34,7 @@ struct WavChunks<'a> {
 
 /// Validates the RIFF/WAVE header and returns the offset past it.
 fn validate_riff_header(data: &[u8]) -> Result<usize, StretchError> {
-    if data.len() < 44 {
+    if data.len() < WAV_MIN_HEADER_SIZE {
         return Err(StretchError::InvalidFormat(
             "WAV file too short".to_string(),
         ));
@@ -53,7 +68,7 @@ fn parse_wav_chunks(data: &[u8], start: usize) -> Result<WavChunks<'_>, StretchE
         cursor += 4;
 
         if chunk_id == b"fmt " {
-            if cursor + 16 > data.len() {
+            if cursor + WAV_FMT_MIN_SIZE > data.len() {
                 return Err(StretchError::InvalidFormat(
                     "fmt chunk too short".to_string(),
                 ));
@@ -93,6 +108,53 @@ fn parse_wav_chunks(data: &[u8], start: usize) -> Result<WavChunks<'_>, StretchE
     })
 }
 
+/// Converts 16-bit PCM audio bytes to f32 samples.
+fn convert_pcm_16bit(audio_data: &[u8]) -> Vec<Sample> {
+    let num_samples = audio_data.len() / 2;
+    let mut result = Vec::with_capacity(num_samples);
+    for i in 0..num_samples {
+        let raw = read_i16_le(audio_data, i * 2);
+        result.push(raw as f32 / PCM_16BIT_SCALE);
+    }
+    result
+}
+
+/// Converts 24-bit PCM audio bytes to f32 samples.
+fn convert_pcm_24bit(audio_data: &[u8]) -> Vec<Sample> {
+    let num_samples = audio_data.len() / 3;
+    let mut result = Vec::with_capacity(num_samples);
+    for i in 0..num_samples {
+        let offset = i * 3;
+        let raw = (audio_data[offset] as i32)
+            | ((audio_data[offset + 1] as i32) << 8)
+            | ((audio_data[offset + 2] as i32) << 16);
+        // Sign extend from 24-bit to 32-bit
+        let raw = if raw & PCM_24BIT_SIGN_BIT != 0 {
+            raw | !PCM_24BIT_MASK
+        } else {
+            raw
+        };
+        result.push(raw as f32 / PCM_24BIT_SCALE);
+    }
+    result
+}
+
+/// Converts 32-bit IEEE float audio bytes to f32 samples.
+fn convert_ieee_float_32bit(audio_data: &[u8]) -> Vec<Sample> {
+    let num_samples = audio_data.len() / 4;
+    let mut result = Vec::with_capacity(num_samples);
+    for i in 0..num_samples {
+        let bytes = [
+            audio_data[i * 4],
+            audio_data[i * 4 + 1],
+            audio_data[i * 4 + 2],
+            audio_data[i * 4 + 3],
+        ];
+        result.push(f32::from_le_bytes(bytes));
+    }
+    result
+}
+
 /// Converts raw audio bytes to f32 samples based on format and bit depth.
 fn convert_samples(
     audio_data: &[u8],
@@ -100,47 +162,9 @@ fn convert_samples(
     bits_per_sample: u16,
 ) -> Result<Vec<Sample>, StretchError> {
     match (format_code, bits_per_sample) {
-        (WAV_FORMAT_PCM, 16) => {
-            let num_samples = audio_data.len() / 2;
-            let mut result = Vec::with_capacity(num_samples);
-            for i in 0..num_samples {
-                let raw = read_i16_le(audio_data, i * 2);
-                result.push(raw as f32 / 32768.0);
-            }
-            Ok(result)
-        }
-        (WAV_FORMAT_PCM, 24) => {
-            let num_samples = audio_data.len() / 3;
-            let mut result = Vec::with_capacity(num_samples);
-            for i in 0..num_samples {
-                let offset = i * 3;
-                let raw = (audio_data[offset] as i32)
-                    | ((audio_data[offset + 1] as i32) << 8)
-                    | ((audio_data[offset + 2] as i32) << 16);
-                // Sign extend
-                let raw = if raw & 0x800000 != 0 {
-                    raw | !0xFFFFFF
-                } else {
-                    raw
-                };
-                result.push(raw as f32 / 8388608.0);
-            }
-            Ok(result)
-        }
-        (WAV_FORMAT_IEEE_FLOAT, 32) => {
-            let num_samples = audio_data.len() / 4;
-            let mut result = Vec::with_capacity(num_samples);
-            for i in 0..num_samples {
-                let bytes = [
-                    audio_data[i * 4],
-                    audio_data[i * 4 + 1],
-                    audio_data[i * 4 + 2],
-                    audio_data[i * 4 + 3],
-                ];
-                result.push(f32::from_le_bytes(bytes));
-            }
-            Ok(result)
-        }
+        (WAV_FORMAT_PCM, 16) => Ok(convert_pcm_16bit(audio_data)),
+        (WAV_FORMAT_PCM, 24) => Ok(convert_pcm_24bit(audio_data)),
+        (WAV_FORMAT_IEEE_FLOAT, 32) => Ok(convert_ieee_float_32bit(audio_data)),
         (fmt, bits) => Err(StretchError::InvalidFormat(format!(
             "Unsupported WAV format: code={}, bits={}",
             fmt, bits
@@ -235,7 +259,7 @@ pub fn write_wav_16bit(buffer: &AudioBuffer) -> Vec<u8> {
 
     for &sample in &buffer.data {
         let clamped = sample.clamp(-1.0, 1.0);
-        let raw = (clamped * 32767.0) as i16;
+        let raw = (clamped * PCM_16BIT_MAX_OUT) as i16;
         out.extend_from_slice(&raw.to_le_bytes());
     }
 

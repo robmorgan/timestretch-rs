@@ -5,6 +5,12 @@
 
 use std::f64::consts::PI;
 
+/// Blackman-Harris window coefficients (4-term).
+const BH_A0: f64 = 0.35875;
+const BH_A1: f64 = 0.48829;
+const BH_A2: f64 = 0.14128;
+const BH_A3: f64 = 0.01168;
+
 /// Window function types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowType {
@@ -50,15 +56,11 @@ fn blackman_harris_window(size: usize) -> Vec<f32> {
         return vec![1.0];
     }
     let n = size as f64;
-    let a0 = 0.35875;
-    let a1 = 0.48829;
-    let a2 = 0.14128;
-    let a3 = 0.01168;
     (0..size)
         .map(|i| {
             let x = i as f64 / (n - 1.0);
-            let w = a0 - a1 * (2.0 * PI * x).cos() + a2 * (4.0 * PI * x).cos()
-                - a3 * (6.0 * PI * x).cos();
+            let w = BH_A0 - BH_A1 * (2.0 * PI * x).cos() + BH_A2 * (4.0 * PI * x).cos()
+                - BH_A3 * (6.0 * PI * x).cos();
             w as f32
         })
         .collect()
