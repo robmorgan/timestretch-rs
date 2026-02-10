@@ -329,6 +329,11 @@ pub fn stretch_to_bpm_auto(
         )));
     }
 
+    // Reject non-finite samples before expensive beat detection
+    if input.iter().any(|s| !s.is_finite()) {
+        return Err(StretchError::NonFiniteInput);
+    }
+
     // Extract mono signal for beat detection
     let mono: Vec<f32> = if params.channels.count() > 1 {
         input
