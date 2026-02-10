@@ -567,6 +567,13 @@
 - [x] Total: 580 tests (278 unit + 302 integration), all passing
 - [x] Zero clippy warnings
 
+### Thirteenth pass (agent-5)
+- [x] Replaced 3 indexed loops in `fft_cross_correlate()` with idiomatic `map+chain+take` for zero-padded FFT buffers and `zip+map` for spectral multiply (wsola.rs)
+- [x] Replaced indexed loop in `normalized_cross_correlation()` with `zip+fold` accumulator pattern (wsola.rs)
+- [x] Replaced indexed prefix-sum loop in `find_best_candidate()` with idiomatic `push` accumulator (wsola.rs)
+- [x] Replaced indexed conditional loop in `window_and_transform()` with `zip+chain` iterator (hybrid.rs)
+- [x] All 284 unit tests passing, zero clippy warnings
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
