@@ -4,6 +4,8 @@ use std::f32::consts::PI;
 use crate::core::window::{generate_window, WindowType};
 use crate::error::StretchError;
 
+const TWO_PI: f32 = 2.0 * PI;
+
 /// Phase vocoder state for time stretching.
 pub struct PhaseVocoder {
     fft_size: usize,
@@ -14,10 +16,21 @@ pub struct PhaseVocoder {
     phase_accum: Vec<f32>,
     /// Previous analysis phase.
     prev_phase: Vec<f32>,
-    /// Sub-bass cutoff bin for phase locking.
+    /// Sub-bass cutoff bin for phase locking (reserved for future per-band processing).
+    #[allow(dead_code)]
     sub_bass_bin: usize,
     /// FFT planner (cached).
     planner: FftPlanner<f32>,
+    /// Pre-computed expected phase advance per bin.
+    expected_phase_advance: Vec<f32>,
+    /// Reusable FFT buffer.
+    fft_buffer: Vec<Complex<f32>>,
+    /// Reusable magnitude buffer.
+    magnitudes: Vec<f32>,
+    /// Reusable phase buffer.
+    new_phases: Vec<f32>,
+    /// Reusable peaks buffer for identity phase locking.
+    peaks: Vec<usize>,
 }
 
 impl PhaseVocoder {
@@ -35,6 +48,10 @@ impl PhaseVocoder {
         let sub_bass_bin =
             (sub_bass_cutoff * fft_size as f32 / sample_rate as f32).round() as usize;
 
+        let expected_phase_advance: Vec<f32> = (0..num_bins)
+            .map(|bin| TWO_PI * bin as f32 * hop_analysis as f32 / fft_size as f32)
+            .collect();
+
         Self {
             fft_size,
             hop_analysis,
@@ -44,6 +61,11 @@ impl PhaseVocoder {
             prev_phase: vec![0.0; num_bins],
             sub_bass_bin: sub_bass_bin.min(num_bins),
             planner: FftPlanner::new(),
+            expected_phase_advance,
+            fft_buffer: vec![Complex::new(0.0, 0.0); fft_size],
+            magnitudes: vec![0.0; num_bins],
+            new_phases: vec![0.0; num_bins],
+            peaks: Vec::with_capacity(num_bins / 4),
         }
     }
 
@@ -66,85 +88,76 @@ impl PhaseVocoder {
         let fft_forward = self.planner.plan_fft_forward(self.fft_size);
         let fft_inverse = self.planner.plan_fft_inverse(self.fft_size);
 
-        // Reset phase state
-        self.phase_accum = vec![0.0; num_bins];
-        self.prev_phase = vec![0.0; num_bins];
+        // Reset phase state without reallocating
+        self.phase_accum.iter_mut().for_each(|x| *x = 0.0);
+        self.prev_phase.iter_mut().for_each(|x| *x = 0.0);
 
-        let expected_phase_advance: Vec<f32> = (0..num_bins)
-            .map(|bin| 2.0 * PI * bin as f32 * self.hop_analysis as f32 / self.fft_size as f32)
-            .collect();
+        let hop_ratio = self.hop_synthesis as f32 / self.hop_analysis as f32;
+        let norm = 1.0 / self.fft_size as f32;
 
         for frame_idx in 0..num_frames {
             let analysis_pos = frame_idx * self.hop_analysis;
             let synthesis_pos = frame_idx * self.hop_synthesis;
 
-            // Analysis: window and FFT
-            let mut fft_buffer: Vec<Complex<f32>> = (0..self.fft_size)
-                .map(|i| Complex::new(input[analysis_pos + i] * self.window[i], 0.0))
-                .collect();
+            // Analysis: window and FFT (reuse buffer)
+            let input_frame = &input[analysis_pos..analysis_pos + self.fft_size];
+            for (i, (&sample, &win)) in input_frame.iter().zip(self.window.iter()).enumerate() {
+                self.fft_buffer[i] = Complex::new(sample * win, 0.0);
+            }
 
-            fft_forward.process(&mut fft_buffer);
+            fft_forward.process(&mut self.fft_buffer);
 
-            // Phase processing
-            let mut magnitudes = vec![0.0f32; num_bins];
-            let mut new_phases = vec![0.0f32; num_bins];
-
+            // Phase processing (reuse magnitude/phase buffers)
             for bin in 0..num_bins {
-                magnitudes[bin] = fft_buffer[bin].norm();
-                let phase = fft_buffer[bin].arg();
+                let c = self.fft_buffer[bin];
+                self.magnitudes[bin] = c.norm();
+                let phase = c.arg();
 
                 // Compute phase deviation
-                let expected = expected_phase_advance[bin];
+                let expected = self.expected_phase_advance[bin];
                 let phase_diff = phase - self.prev_phase[bin];
                 let deviation = wrap_phase(phase_diff - expected);
 
-                // True frequency deviation
+                // True frequency deviation, accumulate phase with synthesis hop
                 let true_freq = expected + deviation;
+                self.phase_accum[bin] += true_freq * hop_ratio;
 
-                // Accumulate phase with synthesis hop
-                let phase_advance =
-                    true_freq * self.hop_synthesis as f32 / self.hop_analysis as f32;
-
-                if bin < self.sub_bass_bin {
-                    // Sub-bass phase locking: maintain original phase relationships
-                    self.phase_accum[bin] += phase_advance;
-                } else {
-                    self.phase_accum[bin] += phase_advance;
-                }
-
-                new_phases[bin] = self.phase_accum[bin];
+                self.new_phases[bin] = self.phase_accum[bin];
                 self.prev_phase[bin] = phase;
             }
 
             // Identity phase locking for tonal coherence
-            identity_phase_lock(&magnitudes, &mut new_phases, num_bins);
+            identity_phase_lock(
+                &self.magnitudes,
+                &mut self.new_phases,
+                num_bins,
+                &mut self.peaks,
+            );
 
             // Reconstruct spectrum
             for bin in 0..num_bins {
-                fft_buffer[bin] =
-                    Complex::from_polar(magnitudes[bin], new_phases[bin]);
+                self.fft_buffer[bin] =
+                    Complex::from_polar(self.magnitudes[bin], self.new_phases[bin]);
             }
 
             // Mirror for inverse FFT
             for bin in 1..num_bins - 1 {
                 let mirror = self.fft_size - bin;
                 if mirror < self.fft_size {
-                    fft_buffer[mirror] = fft_buffer[bin].conj();
+                    self.fft_buffer[mirror] = self.fft_buffer[bin].conj();
                 }
             }
 
             // Inverse FFT
-            fft_inverse.process(&mut fft_buffer);
+            fft_inverse.process(&mut self.fft_buffer);
 
             // Normalize and overlap-add
-            let norm = 1.0 / self.fft_size as f32;
+            let out_end = (synthesis_pos + self.fft_size).min(output_len);
             #[allow(clippy::needless_range_loop)]
-            for i in 0..self.fft_size {
+            for i in 0..out_end - synthesis_pos {
                 let out_idx = synthesis_pos + i;
-                if out_idx < output_len {
-                    output[out_idx] += fft_buffer[i].re * norm * self.window[i];
-                    window_sum[out_idx] += self.window[i] * self.window[i];
-                }
+                output[out_idx] += self.fft_buffer[i].re * norm * self.window[i];
+                window_sum[out_idx] += self.window[i] * self.window[i];
             }
         }
 
@@ -163,30 +176,29 @@ impl PhaseVocoder {
     }
 }
 
-/// Wraps a phase value to [-PI, PI].
+/// Wraps a phase value to [-PI, PI] using efficient modulo arithmetic.
 #[inline]
 fn wrap_phase(phase: f32) -> f32 {
-    let mut p = phase;
-    while p > PI {
-        p -= 2.0 * PI;
-    }
-    while p < -PI {
-        p += 2.0 * PI;
-    }
-    p
+    let p = phase + PI;
+    p - (p / TWO_PI).floor() * TWO_PI - PI
 }
 
 /// Identity phase locking: locks phase of non-peak bins to nearest peak.
 ///
 /// This reduces phasing artifacts on tonal content by ensuring that
 /// non-peak bins maintain their phase relationship to the nearest spectral peak.
-fn identity_phase_lock(magnitudes: &[f32], phases: &mut [f32], num_bins: usize) {
+fn identity_phase_lock(
+    magnitudes: &[f32],
+    phases: &mut [f32],
+    num_bins: usize,
+    peaks: &mut Vec<usize>,
+) {
     if num_bins < 3 {
         return;
     }
 
-    // Find spectral peaks
-    let mut peaks = Vec::new();
+    // Find spectral peaks (reuse buffer)
+    peaks.clear();
     for bin in 1..num_bins - 1 {
         if magnitudes[bin] > magnitudes[bin - 1] && magnitudes[bin] > magnitudes[bin + 1] {
             peaks.push(bin);
@@ -226,6 +238,9 @@ mod tests {
         assert!((wrap_phase(0.0) - 0.0).abs() < 1e-6);
         assert!((wrap_phase(PI + 0.1) - (-PI + 0.1)).abs() < 1e-5);
         assert!((wrap_phase(-PI - 0.1) - (PI - 0.1)).abs() < 1e-5);
+        // Test larger values
+        assert!((wrap_phase(10.0 * PI + 0.5) - wrap_phase(0.5)).abs() < 1e-4);
+        assert!((wrap_phase(-10.0 * PI - 0.5) - wrap_phase(-0.5)).abs() < 1e-4);
     }
 
     #[test]
