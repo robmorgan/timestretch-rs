@@ -226,7 +226,7 @@ impl AudioBuffer {
         if buffers.is_empty() {
             return Self {
                 data: vec![],
-                sample_rate: 44100,
+                sample_rate: DEFAULT_SAMPLE_RATE,
                 channels: Channels::Mono,
             };
         }
