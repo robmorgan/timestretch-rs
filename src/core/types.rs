@@ -150,6 +150,31 @@ impl AudioBuffer {
         }
     }
 
+    /// Converts a mono buffer to stereo by duplicating the signal to both channels.
+    ///
+    /// If the buffer is already stereo, returns a clone.
+    pub fn to_stereo(&self) -> Self {
+        if self.channels == Channels::Stereo {
+            return self.clone();
+        }
+        let mut stereo = Vec::with_capacity(self.data.len() * 2);
+        for &s in &self.data {
+            stereo.push(s);
+            stereo.push(s);
+        }
+        Self {
+            data: stereo,
+            sample_rate: self.sample_rate,
+            channels: Channels::Stereo,
+        }
+    }
+
+    /// Returns the total number of samples (frames * channels).
+    #[inline]
+    pub fn total_samples(&self) -> usize {
+        self.data.len()
+    }
+
     /// Interleaves separate channel vectors into a single buffer.
     pub fn from_channels(channels_data: &[Vec<Sample>], sample_rate: u32) -> Self {
         let nc = channels_data.len();
@@ -590,5 +615,43 @@ mod tests {
         let buf = AudioBuffer::from_mono(data.clone(), 44100);
         let mono = buf.mix_to_mono();
         assert_eq!(mono.data, data);
+    }
+
+    #[test]
+    fn test_audio_buffer_to_stereo() {
+        let data = vec![1.0, 2.0, 3.0];
+        let mono = AudioBuffer::from_mono(data, 44100);
+        let stereo = mono.to_stereo();
+        assert!(stereo.is_stereo());
+        assert_eq!(stereo.num_frames(), 3);
+        assert_eq!(stereo.data, vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn test_audio_buffer_to_stereo_identity() {
+        let data = vec![1.0, 2.0, 3.0, 4.0];
+        let stereo = AudioBuffer::from_stereo(data.clone(), 44100);
+        let result = stereo.to_stereo();
+        assert_eq!(result.data, data);
+    }
+
+    #[test]
+    fn test_audio_buffer_mono_stereo_roundtrip() {
+        let data = vec![1.0, 2.0, 3.0];
+        let mono = AudioBuffer::from_mono(data.clone(), 44100);
+        let stereo = mono.to_stereo();
+        let back = stereo.mix_to_mono();
+        assert!(back.is_mono());
+        assert_eq!(back.data, data);
+    }
+
+    #[test]
+    fn test_audio_buffer_total_samples() {
+        let mono = AudioBuffer::from_mono(vec![0.0; 100], 44100);
+        assert_eq!(mono.total_samples(), 100);
+
+        let stereo = AudioBuffer::from_stereo(vec![0.0; 200], 44100);
+        assert_eq!(stereo.total_samples(), 200);
+        assert_eq!(stereo.num_frames(), 100);
     }
 }

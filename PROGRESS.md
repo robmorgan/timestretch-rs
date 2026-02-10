@@ -348,8 +348,10 @@
 - [x] Fixed rustdoc ambiguity warning (`stretch` is both function and module)
 - [x] `stretch_wav_file(input, output, params)` — high-level WAV file stretch convenience
 - [x] `pitch_shift_wav_file(input, output, params, factor)` — high-level WAV file pitch shift convenience
-- [x] 17 new tests (11 unit + 6 integration: 24-bit WAV pipeline, mix_to_mono, L/R extraction, file API)
-- [x] Zero clippy warnings, cargo fmt clean, zero doc warnings
+- [x] `AudioBuffer::to_stereo()` — mono-to-stereo conversion (duplicates signal to both channels)
+- [x] `AudioBuffer::total_samples()` — total sample count (frames * channels)
+- [x] Updated README with full API reference, pitch shifting and BPM examples
+- [x] 21 new tests total, zero clippy warnings, cargo fmt clean, zero doc warnings
 
 ### Eighth pass (agent-5)
 - [x] Extracted `init_wav_buffer()` helper in wav.rs — deduplicates header setup from `write_wav_16bit()`, `write_wav_24bit()`, `write_wav_float()` (net -26 lines)
