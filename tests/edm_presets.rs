@@ -49,10 +49,10 @@ fn generate_edm_loop(sample_rate: u32, bpm: f64, duration_secs: f64) -> Vec<f32>
     let hihat_interval = samples_per_beat / 2;
 
     let mut samples = vec![0.0f32; total_samples];
-    for i in 0..total_samples {
+    for (i, sample) in samples.iter_mut().enumerate().take(total_samples) {
         let t = i as f32 / sample_rate as f32;
-        samples[i] += (2.0 * std::f32::consts::PI * 55.0 * t).sin() * 0.2;
-        samples[i] += (2.0 * std::f32::consts::PI * 220.0 * t).sin() * 0.15;
+        *sample += (2.0 * std::f32::consts::PI * 55.0 * t).sin() * 0.2;
+        *sample += (2.0 * std::f32::consts::PI * 220.0 * t).sin() * 0.15;
     }
 
     let mut pos = 0;

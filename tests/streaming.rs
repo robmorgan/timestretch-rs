@@ -272,7 +272,10 @@ fn test_streaming_small_chunks() {
         .with_channels(1);
 
     let output = stream_stretch(&input, params, 256);
-    assert!(!output.is_empty(), "Small chunks should still produce output");
+    assert!(
+        !output.is_empty(),
+        "Small chunks should still produce output"
+    );
 }
 
 // ===================== STEREO STREAMING TESTS =====================
@@ -375,10 +378,7 @@ fn test_streaming_empty_flush() {
 
     // Double flush
     let flushed2 = processor.flush().unwrap();
-    assert!(
-        flushed2.is_empty(),
-        "Double flush should give empty output"
-    );
+    assert!(flushed2.is_empty(), "Double flush should give empty output");
 }
 
 #[test]
@@ -406,7 +406,10 @@ fn test_streaming_large_fft_size() {
         .with_fft_size(8192);
 
     let output = stream_stretch(&input, params, 4096);
-    assert!(!output.is_empty(), "Large FFT streaming should produce output");
+    assert!(
+        !output.is_empty(),
+        "Large FFT streaming should produce output"
+    );
 }
 
 // ===================== LATENCY REPORTING =====================

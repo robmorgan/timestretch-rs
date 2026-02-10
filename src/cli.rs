@@ -15,6 +15,7 @@ fn main() {
     let mut ratio: Option<f64> = None;
     let mut from_bpm: Option<f64> = None;
     let mut to_bpm: Option<f64> = None;
+    let mut auto_bpm = false;
     let mut pitch_factor: Option<f64> = None;
     let mut preset: Option<EdmPreset> = None;
     let mut format_24bit = false;
@@ -35,6 +36,7 @@ fn main() {
                 i += 1;
                 to_bpm = Some(parse_f64(&args, i, "to-bpm"));
             }
+            "--auto-bpm" => auto_bpm = true,
             "--pitch" | "-p" => {
                 i += 1;
                 pitch_factor = Some(parse_f64(&args, i, "pitch"));
@@ -65,27 +67,6 @@ fn main() {
         i += 1;
     }
 
-    // Determine stretch ratio
-    let stretch_ratio = if let (Some(from), Some(to)) = (from_bpm, to_bpm) {
-        if from <= 0.0 || to <= 0.0 {
-            eprintln!("ERROR: BPM values must be positive");
-            std::process::exit(1);
-        }
-        eprintln!("BPM: {} -> {} (ratio: {:.4})", from, to, from / to);
-        if preset.is_none() {
-            preset = Some(EdmPreset::DjBeatmatch);
-        }
-        from / to
-    } else if let Some(r) = ratio {
-        r
-    } else if pitch_factor.is_some() {
-        1.0
-    } else {
-        eprintln!("ERROR: Must specify --ratio, --from-bpm/--to-bpm, or --pitch");
-        print_usage();
-        std::process::exit(1);
-    };
-
     // Read input
     let buffer = match timestretch::io::wav::read_wav_file(input_path) {
         Ok(b) => b,
@@ -102,6 +83,38 @@ fn main() {
         buffer.channels,
         buffer.duration_secs()
     );
+
+    // Handle --auto-bpm: detect source BPM from input
+    if auto_bpm && from_bpm.is_none() {
+        let detected = timestretch::detect_bpm_buffer(&buffer);
+        if detected <= 0.0 {
+            eprintln!("ERROR: Could not auto-detect BPM from input audio");
+            std::process::exit(1);
+        }
+        eprintln!("Auto-detected BPM: {:.1}", detected);
+        from_bpm = Some(detected);
+    }
+
+    // Determine stretch ratio
+    let stretch_ratio = if let (Some(from), Some(to)) = (from_bpm, to_bpm) {
+        if from <= 0.0 || to <= 0.0 {
+            eprintln!("ERROR: BPM values must be positive");
+            std::process::exit(1);
+        }
+        eprintln!("BPM: {:.1} -> {:.1} (ratio: {:.4})", from, to, from / to);
+        if preset.is_none() {
+            preset = Some(EdmPreset::DjBeatmatch);
+        }
+        from / to
+    } else if let Some(r) = ratio {
+        r
+    } else if pitch_factor.is_some() {
+        1.0
+    } else {
+        eprintln!("ERROR: Must specify --ratio, --from-bpm/--to-bpm, or --pitch");
+        print_usage();
+        std::process::exit(1);
+    };
 
     // Configure params
     let mut params = StretchParams::new(stretch_ratio)
@@ -162,6 +175,7 @@ fn print_usage() {
     eprintln!("Modes:");
     eprintln!("  --ratio <f>                   Stretch ratio (1.5 = 50% slower)");
     eprintln!("  --from-bpm <f> --to-bpm <f>   BPM matching (auto-selects DJ preset)");
+    eprintln!("  --auto-bpm --to-bpm <f>       Auto-detect source BPM, match to target");
     eprintln!("  --pitch <f>                   Pitch shift (2.0 = up one octave)");
     eprintln!();
     eprintln!("Options:");
@@ -172,6 +186,7 @@ fn print_usage() {
     eprintln!("Examples:");
     eprintln!("  timestretch-cli in.wav out.wav --ratio 1.5");
     eprintln!("  timestretch-cli in.wav out.wav --from-bpm 126 --to-bpm 128");
+    eprintln!("  timestretch-cli in.wav out.wav --auto-bpm --to-bpm 128");
     eprintln!("  timestretch-cli in.wav out.wav --pitch 0.5 --preset vocal");
     eprintln!("  timestretch-cli in.wav out.wav 1.5 house");
 }

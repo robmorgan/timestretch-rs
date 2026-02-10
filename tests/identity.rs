@@ -754,10 +754,9 @@ fn test_identity_click_timing_preservation() {
         if output[i].abs() > 0.3
             && output[i].abs() >= output[i - 1].abs()
             && output[i].abs() >= output[i + 1].abs()
+            && (output_peaks.is_empty() || i - *output_peaks.last().unwrap() > 100)
         {
-            if output_peaks.is_empty() || i - *output_peaks.last().unwrap() > 100 {
-                output_peaks.push(i);
-            }
+            output_peaks.push(i);
         }
     }
 

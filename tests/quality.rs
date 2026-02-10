@@ -347,7 +347,10 @@ fn test_mixed_signal_stretch() {
         .with_channels(1);
     let output = timestretch::stretch(&input, &params).unwrap();
 
-    assert!(!output.is_empty(), "Mixed signal stretch should produce output");
+    assert!(
+        !output.is_empty(),
+        "Mixed signal stretch should produce output"
+    );
 
     let max = output.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs()));
     assert!(max > 0.01 && max < 3.0, "Output range check: max={max}");
@@ -401,8 +404,7 @@ fn test_multiple_frequencies_preserved() {
 
     assert!(!output.is_empty());
 
-    let rms_val: f64 = (output.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>()
-        / output.len() as f64)
-        .sqrt();
+    let rms_val: f64 =
+        (output.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / output.len() as f64).sqrt();
     assert!(rms_val > 0.01, "RMS should be non-trivial: {rms_val}");
 }

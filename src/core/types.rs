@@ -48,6 +48,19 @@ pub struct AudioBuffer {
     pub channels: Channels,
 }
 
+impl std::fmt::Display for AudioBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "AudioBuffer({} frames, {}Hz, {:?}, {:.3}s)",
+            self.num_frames(),
+            self.sample_rate,
+            self.channels,
+            self.duration_secs()
+        )
+    }
+}
+
 impl AudioBuffer {
     /// Creates a new audio buffer.
     pub fn new(data: Vec<Sample>, sample_rate: u32, channels: Channels) -> Self {
@@ -175,6 +188,130 @@ impl AudioBuffer {
         self.data.len()
     }
 
+    /// Extracts a sub-region of the buffer by frame range.
+    ///
+    /// Returns a new buffer containing frames from `start_frame` to
+    /// `start_frame + num_frames` (or the end if fewer frames remain).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `start_frame` is beyond the buffer length.
+    pub fn slice(&self, start_frame: usize, num_frames: usize) -> Self {
+        let total_frames = self.num_frames();
+        assert!(
+            start_frame <= total_frames,
+            "start_frame {} exceeds buffer length {}",
+            start_frame,
+            total_frames
+        );
+        let end_frame = (start_frame + num_frames).min(total_frames);
+        let nc = self.channels.count();
+        let start_idx = start_frame * nc;
+        let end_idx = end_frame * nc;
+        Self {
+            data: self.data[start_idx..end_idx].to_vec(),
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        }
+    }
+
+    /// Concatenates multiple buffers into a single buffer.
+    ///
+    /// All buffers must have the same sample rate and channel layout.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffers have mismatched sample rates or channel layouts.
+    pub fn concatenate(buffers: &[&AudioBuffer]) -> Self {
+        if buffers.is_empty() {
+            return Self {
+                data: vec![],
+                sample_rate: 44100,
+                channels: Channels::Mono,
+            };
+        }
+        let sample_rate = buffers[0].sample_rate;
+        let channels = buffers[0].channels;
+        let total_len: usize = buffers.iter().map(|b| b.data.len()).sum();
+        let mut data = Vec::with_capacity(total_len);
+        for buf in buffers {
+            assert_eq!(
+                buf.sample_rate, sample_rate,
+                "sample rate mismatch: {} vs {}",
+                buf.sample_rate, sample_rate
+            );
+            assert_eq!(
+                buf.channels, channels,
+                "channel layout mismatch: {:?} vs {:?}",
+                buf.channels, channels
+            );
+            data.extend_from_slice(&buf.data);
+        }
+        Self {
+            data,
+            sample_rate,
+            channels,
+        }
+    }
+
+    /// Normalizes the buffer so the peak amplitude equals `target_peak`.
+    ///
+    /// If the buffer is silent (all zeros), returns a clone unchanged.
+    /// `target_peak` is typically 1.0 for full-scale normalization.
+    pub fn normalize(&self, target_peak: f32) -> Self {
+        let current_peak = self.data.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        if current_peak == 0.0 {
+            return self.clone();
+        }
+        let gain = target_peak / current_peak;
+        Self {
+            data: self.data.iter().map(|s| s * gain).collect(),
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        }
+    }
+
+    /// Applies a gain in decibels to the entire buffer.
+    ///
+    /// Positive values amplify, negative values attenuate.
+    /// For example, `gain_db = -6.0` halves the amplitude.
+    pub fn apply_gain(&self, gain_db: f32) -> Self {
+        let linear = 10.0f32.powf(gain_db / 20.0);
+        Self {
+            data: self.data.iter().map(|s| s * linear).collect(),
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        }
+    }
+
+    /// Removes leading and trailing silence from the buffer.
+    ///
+    /// Samples with absolute value below `threshold` are considered silence.
+    /// Returns a new buffer with silence trimmed from both ends.
+    pub fn trim_silence(&self, threshold: f32) -> Self {
+        let nc = self.channels.count();
+        let total_frames = self.num_frames();
+        if total_frames == 0 {
+            return self.clone();
+        }
+
+        // Find first non-silent frame
+        let first = (0..total_frames)
+            .find(|&frame| (0..nc).any(|ch| self.data[frame * nc + ch].abs() >= threshold));
+        let first = match first {
+            Some(f) => f,
+            None => return Self::new(vec![], self.sample_rate, self.channels),
+        };
+
+        // Find last non-silent frame
+        let last = (0..total_frames)
+            .rev()
+            .find(|&frame| (0..nc).any(|ch| self.data[frame * nc + ch].abs() >= threshold))
+            .unwrap(); // safe: first exists so last must too
+
+        self.slice(first, last - first + 1)
+    }
+
     /// Interleaves separate channel vectors into a single buffer.
     pub fn from_channels(channels_data: &[Vec<Sample>], sample_rate: u32) -> Self {
         let nc = channels_data.len();
@@ -298,6 +435,18 @@ impl EdmPreset {
     }
 }
 
+impl std::fmt::Display for EdmPreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EdmPreset::DjBeatmatch => write!(f, "DjBeatmatch"),
+            EdmPreset::HouseLoop => write!(f, "HouseLoop"),
+            EdmPreset::Halftime => write!(f, "Halftime"),
+            EdmPreset::Ambient => write!(f, "Ambient"),
+            EdmPreset::VocalChop => write!(f, "VocalChop"),
+        }
+    }
+}
+
 /// Parameters for the time stretching algorithm.
 ///
 /// Use the builder methods to configure. A ratio >1.0 makes audio longer
@@ -381,6 +530,27 @@ const WSOLA_SEARCH_MS_SMALL: f64 = 10.0;
 const WSOLA_SEARCH_MS_MEDIUM: f64 = 15.0;
 /// Large WSOLA search range (~30ms) for extreme stretch ratios.
 const WSOLA_SEARCH_MS_LARGE: f64 = 30.0;
+
+impl Default for StretchParams {
+    /// Returns default parameters with ratio 1.0 (identity), stereo, 44100 Hz.
+    fn default() -> Self {
+        Self::new(1.0)
+    }
+}
+
+impl std::fmt::Display for StretchParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "StretchParams(ratio={:.4}, {}Hz, {:?}",
+            self.stretch_ratio, self.sample_rate, self.channels
+        )?;
+        if let Some(preset) = &self.preset {
+            write!(f, ", preset={}", preset)?;
+        }
+        write!(f, ", fft={}, hop={})", self.fft_size, self.hop_size)
+    }
+}
 
 impl StretchParams {
     /// Creates new stretch params with the given ratio.
@@ -702,5 +872,219 @@ mod tests {
         let stereo = AudioBuffer::from_stereo(vec![0.0; 200], 44100);
         assert_eq!(stereo.total_samples(), 200);
         assert_eq!(stereo.num_frames(), 100);
+    }
+
+    #[test]
+    fn test_audio_buffer_slice_mono() {
+        let data: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        let buf = AudioBuffer::from_mono(data, 44100);
+
+        let sliced = buf.slice(2, 5);
+        assert_eq!(sliced.num_frames(), 5);
+        assert_eq!(sliced.data, vec![2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(sliced.sample_rate, 44100);
+        assert!(sliced.is_mono());
+    }
+
+    #[test]
+    fn test_audio_buffer_slice_stereo() {
+        // Stereo: [L0,R0, L1,R1, L2,R2, L3,R3]
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let buf = AudioBuffer::from_stereo(data, 44100);
+
+        let sliced = buf.slice(1, 2);
+        assert_eq!(sliced.num_frames(), 2);
+        assert_eq!(sliced.data, vec![3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_audio_buffer_slice_clamp() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 2.0, 3.0], 44100);
+        // Request more frames than available — should clamp
+        let sliced = buf.slice(1, 100);
+        assert_eq!(sliced.num_frames(), 2);
+        assert_eq!(sliced.data, vec![2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_audio_buffer_slice_empty() {
+        let buf = AudioBuffer::from_mono(vec![1.0, 2.0, 3.0], 44100);
+        let sliced = buf.slice(1, 0);
+        assert_eq!(sliced.num_frames(), 0);
+        assert!(sliced.is_empty());
+    }
+
+    #[test]
+    fn test_audio_buffer_concatenate() {
+        let a = AudioBuffer::from_mono(vec![1.0, 2.0], 44100);
+        let b = AudioBuffer::from_mono(vec![3.0, 4.0, 5.0], 44100);
+        let c = AudioBuffer::concatenate(&[&a, &b]);
+        assert_eq!(c.data, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(c.num_frames(), 5);
+        assert_eq!(c.sample_rate, 44100);
+    }
+
+    #[test]
+    fn test_audio_buffer_concatenate_stereo() {
+        let a = AudioBuffer::from_stereo(vec![1.0, 2.0, 3.0, 4.0], 48000);
+        let b = AudioBuffer::from_stereo(vec![5.0, 6.0], 48000);
+        let c = AudioBuffer::concatenate(&[&a, &b]);
+        assert_eq!(c.data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(c.num_frames(), 3);
+        assert_eq!(c.sample_rate, 48000);
+        assert!(c.is_stereo());
+    }
+
+    #[test]
+    fn test_audio_buffer_concatenate_empty() {
+        let result = AudioBuffer::concatenate(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "sample rate mismatch")]
+    fn test_audio_buffer_concatenate_mismatched_rate() {
+        let a = AudioBuffer::from_mono(vec![1.0], 44100);
+        let b = AudioBuffer::from_mono(vec![2.0], 48000);
+        AudioBuffer::concatenate(&[&a, &b]);
+    }
+
+    #[test]
+    #[should_panic(expected = "channel layout mismatch")]
+    fn test_audio_buffer_concatenate_mismatched_channels() {
+        let a = AudioBuffer::from_mono(vec![1.0], 44100);
+        let b = AudioBuffer::from_stereo(vec![2.0, 3.0], 44100);
+        AudioBuffer::concatenate(&[&a, &b]);
+    }
+
+    #[test]
+    fn test_audio_buffer_normalize() {
+        let buf = AudioBuffer::from_mono(vec![0.25, -0.5, 0.1], 44100);
+        let norm = buf.normalize(1.0);
+        // Peak was 0.5, so gain = 2.0
+        assert!((norm.data[0] - 0.5).abs() < 1e-6);
+        assert!((norm.data[1] - (-1.0)).abs() < 1e-6);
+        assert!((norm.data[2] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_audio_buffer_normalize_silence() {
+        let buf = AudioBuffer::from_mono(vec![0.0, 0.0, 0.0], 44100);
+        let norm = buf.normalize(1.0);
+        assert_eq!(norm.data, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_audio_buffer_normalize_half_scale() {
+        let buf = AudioBuffer::from_mono(vec![0.5, -1.0, 0.25], 44100);
+        let norm = buf.normalize(0.5);
+        // Peak was 1.0, gain = 0.5
+        assert!((norm.data[0] - 0.25).abs() < 1e-6);
+        assert!((norm.data[1] - (-0.5)).abs() < 1e-6);
+        assert!((norm.data[2] - 0.125).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_audio_buffer_apply_gain() {
+        let buf = AudioBuffer::from_mono(vec![0.5, -0.5], 44100);
+        // -6 dB ≈ 0.5 linear
+        let quieter = buf.apply_gain(-6.0206);
+        assert!((quieter.data[0] - 0.25).abs() < 0.01);
+        assert!((quieter.data[1] - (-0.25)).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_audio_buffer_apply_gain_zero() {
+        let buf = AudioBuffer::from_mono(vec![0.5, -0.5], 44100);
+        let same = buf.apply_gain(0.0);
+        assert!((same.data[0] - 0.5).abs() < 1e-6);
+        assert!((same.data[1] - (-0.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_audio_buffer_trim_silence() {
+        let data = vec![0.0, 0.0, 0.5, 0.8, -0.3, 0.0, 0.0];
+        let buf = AudioBuffer::from_mono(data, 44100);
+        let trimmed = buf.trim_silence(0.01);
+        assert_eq!(trimmed.data, vec![0.5, 0.8, -0.3]);
+    }
+
+    #[test]
+    fn test_audio_buffer_trim_silence_stereo() {
+        // [0,0, 0,0, L,R, L,R, 0,0]
+        let data = vec![0.0, 0.0, 0.0, 0.0, 0.5, 0.3, 0.2, 0.8, 0.0, 0.0];
+        let buf = AudioBuffer::from_stereo(data, 44100);
+        let trimmed = buf.trim_silence(0.01);
+        assert_eq!(trimmed.num_frames(), 2);
+        assert_eq!(trimmed.data, vec![0.5, 0.3, 0.2, 0.8]);
+    }
+
+    #[test]
+    fn test_audio_buffer_trim_silence_all_silent() {
+        let buf = AudioBuffer::from_mono(vec![0.0, 0.0, 0.0], 44100);
+        let trimmed = buf.trim_silence(0.01);
+        assert!(trimmed.is_empty());
+    }
+
+    #[test]
+    fn test_audio_buffer_trim_silence_empty() {
+        let buf = AudioBuffer::from_mono(vec![], 44100);
+        let trimmed = buf.trim_silence(0.01);
+        assert!(trimmed.is_empty());
+    }
+
+    #[test]
+    fn test_audio_buffer_trim_silence_no_trim_needed() {
+        let data = vec![0.5, 0.8, -0.3];
+        let buf = AudioBuffer::from_mono(data.clone(), 44100);
+        let trimmed = buf.trim_silence(0.01);
+        assert_eq!(trimmed.data, data);
+    }
+
+    #[test]
+    fn test_stretch_params_default() {
+        let params = StretchParams::default();
+        assert!((params.stretch_ratio - 1.0).abs() < 1e-10);
+        assert_eq!(params.sample_rate, 44100);
+        assert_eq!(params.channels, Channels::Stereo);
+        assert_eq!(params.fft_size, 4096);
+    }
+
+    #[test]
+    fn test_stretch_params_display() {
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(48000)
+            .with_preset(EdmPreset::DjBeatmatch);
+        let s = format!("{}", params);
+        assert!(s.contains("1.5000"));
+        assert!(s.contains("48000"));
+        assert!(s.contains("DjBeatmatch"));
+    }
+
+    #[test]
+    fn test_stretch_params_display_no_preset() {
+        let params = StretchParams::new(1.0);
+        let s = format!("{}", params);
+        assert!(s.contains("1.0000"));
+        assert!(!s.contains("preset="));
+    }
+
+    #[test]
+    fn test_edm_preset_display() {
+        assert_eq!(format!("{}", EdmPreset::DjBeatmatch), "DjBeatmatch");
+        assert_eq!(format!("{}", EdmPreset::HouseLoop), "HouseLoop");
+        assert_eq!(format!("{}", EdmPreset::Halftime), "Halftime");
+        assert_eq!(format!("{}", EdmPreset::Ambient), "Ambient");
+        assert_eq!(format!("{}", EdmPreset::VocalChop), "VocalChop");
+    }
+
+    #[test]
+    fn test_audio_buffer_display() {
+        let buf = AudioBuffer::from_mono(vec![0.0; 44100], 44100);
+        let s = format!("{}", buf);
+        assert!(s.contains("44100 frames"));
+        assert!(s.contains("44100Hz"));
+        assert!(s.contains("Mono"));
+        assert!(s.contains("1.000s"));
     }
 }
