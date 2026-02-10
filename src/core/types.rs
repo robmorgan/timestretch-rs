@@ -116,6 +116,14 @@ impl AudioBuffer {
         self.data.iter().skip(ch).step_by(nc).copied().collect()
     }
 
+    /// Consumes the buffer and returns the raw sample data.
+    ///
+    /// This is the named equivalent of `Vec::<f32>::from(buffer)`.
+    #[inline]
+    pub fn into_data(self) -> Vec<Sample> {
+        self.data
+    }
+
     /// Creates a mono buffer from a single channel of data.
     pub fn from_mono(data: Vec<Sample>, sample_rate: u32) -> Self {
         Self {
@@ -387,6 +395,14 @@ impl AsRef<[Sample]> for AudioBuffer {
     #[inline]
     fn as_ref(&self) -> &[Sample] {
         &self.data
+    }
+}
+
+/// Provides mutable access to the underlying sample slice for in-place processing.
+impl AsMut<[Sample]> for AudioBuffer {
+    #[inline]
+    fn as_mut(&mut self) -> &mut [Sample] {
+        &mut self.data
     }
 }
 
@@ -2109,5 +2125,29 @@ mod tests {
     fn test_channel_count_stereo() {
         let buf = AudioBuffer::from_stereo(vec![0.0; 20], 44100);
         assert_eq!(buf.channel_count(), 2);
+    }
+
+    #[test]
+    fn test_audio_buffer_as_mut() {
+        let mut buf = AudioBuffer::from_mono(vec![1.0, 2.0, 3.0], 44100);
+        let slice: &mut [f32] = buf.as_mut();
+        slice[0] = 10.0;
+        slice[2] = 30.0;
+        assert_eq!(buf.data[0], 10.0);
+        assert_eq!(buf.data[1], 2.0);
+        assert_eq!(buf.data[2], 30.0);
+    }
+
+    #[test]
+    fn test_audio_buffer_into_data() {
+        let data = vec![1.0, 2.0, 3.0, 4.0];
+        let buf = AudioBuffer::from_stereo(data.clone(), 44100);
+        assert_eq!(buf.into_data(), data);
+    }
+
+    #[test]
+    fn test_audio_buffer_into_data_empty() {
+        let buf = AudioBuffer::from_mono(vec![], 44100);
+        assert!(buf.into_data().is_empty());
     }
 }
