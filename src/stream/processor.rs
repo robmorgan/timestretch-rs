@@ -6,29 +6,54 @@ use crate::stretch::phase_vocoder::PhaseVocoder;
 ///
 /// Accumulates input samples in a ring buffer and processes them
 /// using the phase vocoder when enough data is available.
+/// PhaseVocoder instances are persisted per channel to avoid
+/// expensive FFT planner recreation on each call.
 pub struct StreamProcessor {
     params: StretchParams,
     input_buffer: Vec<f32>,
-    output_buffer: Vec<f32>,
     /// Current stretch ratio (can be changed on the fly).
     current_ratio: f64,
     /// Target stretch ratio (for smooth interpolation).
     target_ratio: f64,
     /// Whether the processor has been initialized.
     initialized: bool,
+    /// Persistent PhaseVocoder instances, one per channel.
+    vocoders: Vec<PhaseVocoder>,
+    /// Reusable per-channel deinterleave buffers.
+    channel_buffers: Vec<Vec<f32>>,
+    /// Reusable interleaved output buffer.
+    output_scratch: Vec<f32>,
 }
 
 impl StreamProcessor {
     /// Creates a new streaming processor.
     pub fn new(params: StretchParams) -> Self {
         let ratio = params.stretch_ratio;
+        let num_channels = params.channels.count();
+
+        let vocoders = (0..num_channels)
+            .map(|_| {
+                PhaseVocoder::new(
+                    params.fft_size,
+                    params.hop_size,
+                    ratio,
+                    params.sample_rate,
+                    params.sub_bass_cutoff,
+                )
+            })
+            .collect();
+
+        let channel_buffers = (0..num_channels).map(|_| Vec::new()).collect();
+
         Self {
             params,
             input_buffer: Vec::new(),
-            output_buffer: Vec::new(),
             current_ratio: ratio,
             target_ratio: ratio,
             initialized: false,
+            vocoders,
+            channel_buffers,
+            output_scratch: Vec::new(),
         }
     }
 
@@ -44,73 +69,74 @@ impl StreamProcessor {
         // Smoothly interpolate ratio
         self.interpolate_ratio();
 
-        let nc = self.params.channels.count();
-        let min_input = self.params.fft_size * nc * 2;
+        let num_channels = self.params.channels.count();
+        let min_input = self.params.fft_size * num_channels * 2;
 
         // Process when we have enough data
         if self.input_buffer.len() < min_input {
             return Ok(vec![]);
         }
 
-        // Process each channel separately
-        let num_channels = self.params.channels.count();
         let total_frames = self.input_buffer.len() / num_channels;
 
         if total_frames < self.params.fft_size {
             return Ok(vec![]);
         }
 
-        let mut channel_outputs: Vec<Vec<f32>> = Vec::new();
+        // Recreate vocoders if ratio has changed
+        if (self.current_ratio - self.params.stretch_ratio).abs() > 0.0001 {
+            self.vocoders = (0..num_channels)
+                .map(|_| {
+                    PhaseVocoder::new(
+                        self.params.fft_size,
+                        self.params.hop_size,
+                        self.current_ratio,
+                        self.params.sample_rate,
+                        self.params.sub_bass_cutoff,
+                    )
+                })
+                .collect();
+        }
+
+        // Process each channel using persistent vocoders and reusable buffers
+        let mut min_output_len = usize::MAX;
 
         for ch in 0..num_channels {
-            // Deinterleave
-            let channel_data: Vec<f32> = self.input_buffer
-                .iter()
-                .skip(ch)
-                .step_by(num_channels)
-                .copied()
-                .collect();
-
-            // Process with phase vocoder
-            let mut pv = PhaseVocoder::new(
-                self.params.fft_size,
-                self.params.hop_size,
-                self.current_ratio,
-                self.params.sample_rate,
-                self.params.sub_bass_cutoff,
-            );
-
-            match pv.process(&channel_data) {
-                Ok(stretched) => channel_outputs.push(stretched),
-                Err(e) => return Err(e),
+            // Deinterleave into reusable buffer
+            self.channel_buffers[ch].clear();
+            let mut idx = ch;
+            while idx < self.input_buffer.len() {
+                self.channel_buffers[ch].push(self.input_buffer[idx]);
+                idx += num_channels;
             }
+
+            // Process with persistent phase vocoder
+            let stretched = self.vocoders[ch].process(&self.channel_buffers[ch])?;
+            min_output_len = min_output_len.min(stretched.len());
+            self.channel_buffers[ch] = stretched;
         }
 
         // Clear input buffer (keep a small overlap for continuity)
-        let keep = self.params.fft_size * nc;
+        let keep = self.params.fft_size * num_channels;
         if self.input_buffer.len() > keep {
             let drain_to = self.input_buffer.len() - keep;
             self.input_buffer.drain(..drain_to);
         }
 
         // Re-interleave output
-        if channel_outputs.is_empty() {
+        if min_output_len == usize::MAX || min_output_len == 0 {
             return Ok(vec![]);
         }
 
-        let min_len = channel_outputs.iter().map(|c| c.len()).min().unwrap_or(0);
-        let mut output = Vec::with_capacity(min_len * num_channels);
-
-        for i in 0..min_len {
-            for ch_out in &channel_outputs {
-                output.push(ch_out[i]);
+        self.output_scratch.clear();
+        self.output_scratch.reserve(min_output_len * num_channels);
+        for i in 0..min_output_len {
+            for ch in 0..num_channels {
+                self.output_scratch.push(self.channel_buffers[ch][i]);
             }
         }
 
-        // Append to output buffer and drain
-        self.output_buffer.extend_from_slice(&output);
-        let result = std::mem::take(&mut self.output_buffer);
-        Ok(result)
+        Ok(std::mem::take(&mut self.output_scratch))
     }
 
     /// Changes the stretch ratio for subsequent processing.
@@ -140,10 +166,24 @@ impl StreamProcessor {
     /// Resets the processor state.
     pub fn reset(&mut self) {
         self.input_buffer.clear();
-        self.output_buffer.clear();
+        self.output_scratch.clear();
         self.current_ratio = self.params.stretch_ratio;
         self.target_ratio = self.params.stretch_ratio;
         self.initialized = false;
+
+        // Recreate vocoders with original ratio
+        let num_channels = self.params.channels.count();
+        self.vocoders = (0..num_channels)
+            .map(|_| {
+                PhaseVocoder::new(
+                    self.params.fft_size,
+                    self.params.hop_size,
+                    self.params.stretch_ratio,
+                    self.params.sample_rate,
+                    self.params.sub_bass_cutoff,
+                )
+            })
+            .collect();
     }
 
     /// Flushes remaining buffered samples.
