@@ -14,6 +14,8 @@ const PCM_16BIT_SCALE: f32 = 32768.0;
 const PCM_16BIT_MAX_OUT: f32 = 32767.0;
 /// Scaling factor for converting 24-bit PCM samples to f32.
 const PCM_24BIT_SCALE: f32 = 8388608.0;
+/// Maximum representable value for 24-bit PCM output (8388607, not 8388608, to avoid clipping).
+const PCM_24BIT_MAX_OUT: f32 = 8388607.0;
 /// Sign bit mask for 24-bit PCM sign extension.
 const PCM_24BIT_SIGN_BIT: i32 = 0x800000;
 /// Bitmask for 24-bit PCM values.
@@ -22,6 +24,10 @@ const PCM_24BIT_MASK: i32 = 0xFFFFFF;
 const WAV_MIN_HEADER_SIZE: usize = 44;
 /// Size of the fmt chunk's fixed fields.
 const WAV_FMT_MIN_SIZE: usize = 16;
+/// Size of RIFF/WAVE + fmt + data chunk headers (before audio data).
+const WAV_HEADER_WRITE_SIZE: usize = 44;
+/// Byte offset from data start to RIFF file size field (RIFF header + fmt + data headers, minus 8 for RIFF chunk preamble).
+const WAV_RIFF_OVERHEAD: u32 = 36;
 
 /// Parsed WAV format and data chunk info.
 struct WavChunks<'a> {
@@ -220,7 +226,7 @@ fn write_wav_header(
 ) {
     let byte_rate = sample_rate * num_channels as u32 * (bits_per_sample as u32 / 8);
     let block_align = num_channels * (bits_per_sample / 8);
-    let file_size = 36 + data_size;
+    let file_size = WAV_RIFF_OVERHEAD + data_size;
 
     // RIFF header
     out.extend_from_slice(b"RIFF");
@@ -229,7 +235,7 @@ fn write_wav_header(
 
     // fmt chunk
     out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&(WAV_FMT_MIN_SIZE as u32).to_le_bytes());
     out.extend_from_slice(&format_code.to_le_bytes());
     out.extend_from_slice(&num_channels.to_le_bytes());
     out.extend_from_slice(&sample_rate.to_le_bytes());
@@ -248,7 +254,7 @@ fn init_wav_buffer(buffer: &AudioBuffer, format_code: u16, bits_per_sample: u16)
     let bytes_per_sample = bits_per_sample as usize / 8;
     let data_size = (buffer.data.len() * bytes_per_sample) as u32;
 
-    let mut out = Vec::with_capacity(44 + data_size as usize);
+    let mut out = Vec::with_capacity(WAV_HEADER_WRITE_SIZE + data_size as usize);
     write_wav_header(
         &mut out,
         format_code,
@@ -270,9 +276,6 @@ pub fn write_wav_16bit(buffer: &AudioBuffer) -> Vec<u8> {
     }
     out
 }
-
-/// Maximum representable value for 24-bit PCM output (8388607, not 8388608, to avoid clipping).
-const PCM_24BIT_MAX_OUT: f32 = 8388607.0;
 
 /// Writes an audio buffer as a WAV file (24-bit PCM).
 pub fn write_wav_24bit(buffer: &AudioBuffer) -> Vec<u8> {

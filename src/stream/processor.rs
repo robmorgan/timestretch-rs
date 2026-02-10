@@ -8,6 +8,8 @@ use crate::stretch::phase_vocoder::PhaseVocoder;
 const RATIO_SNAP_THRESHOLD: f64 = 0.0001;
 /// Smoothing factor for interpolating between current and target ratio.
 const RATIO_INTERPOLATION_ALPHA: f64 = 0.1;
+/// Multiplier for FFT size to determine minimum input and latency (2x FFT).
+const LATENCY_FFT_MULTIPLIER: usize = 2;
 
 /// Streaming chunk-based processor for real-time time stretching.
 ///
@@ -103,7 +105,7 @@ impl StreamProcessor {
         self.interpolate_ratio();
 
         let num_channels = self.params.channels.count();
-        let min_input = self.params.fft_size * num_channels * 2;
+        let min_input = self.params.fft_size * num_channels * LATENCY_FFT_MULTIPLIER;
 
         if self.input_buffer.len() < min_input {
             return Ok(vec![]);
@@ -252,7 +254,7 @@ impl StreamProcessor {
     ///
     /// This is the number of input samples needed before any output is produced.
     pub fn latency_samples(&self) -> usize {
-        self.params.fft_size * 2
+        self.params.fft_size * LATENCY_FFT_MULTIPLIER
     }
 
     /// Returns the minimum latency in seconds.
@@ -280,7 +282,7 @@ impl StreamProcessor {
 
         // Pad input to minimum size and process
         let nc = self.params.channels.count();
-        let min_size = self.params.fft_size * nc * 2;
+        let min_size = self.params.fft_size * nc * LATENCY_FFT_MULTIPLIER;
         while self.input_buffer.len() < min_size {
             self.input_buffer.push(0.0);
         }

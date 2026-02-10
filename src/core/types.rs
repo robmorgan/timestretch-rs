@@ -231,6 +231,14 @@ pub enum EdmPreset {
     VocalChop,
 }
 
+/// Internal configuration values for an EDM preset.
+struct PresetConfig {
+    fft_size: usize,
+    hop_size: usize,
+    transient_sensitivity: f32,
+    wsola_search_ms: f64,
+}
+
 impl EdmPreset {
     /// Returns a human-readable description of this preset's characteristics.
     pub fn description(self) -> &'static str {
@@ -250,6 +258,42 @@ impl EdmPreset {
             EdmPreset::VocalChop => {
                 "Optimized for vocal chops and one-shots. Preserves formant character."
             }
+        }
+    }
+
+    /// Returns the internal parameter configuration for this preset.
+    fn config(self) -> PresetConfig {
+        match self {
+            EdmPreset::DjBeatmatch => PresetConfig {
+                fft_size: 4096,
+                hop_size: 1024,
+                transient_sensitivity: 0.3,
+                wsola_search_ms: WSOLA_SEARCH_MS_SMALL,
+            },
+            EdmPreset::HouseLoop => PresetConfig {
+                fft_size: 4096,
+                hop_size: 1024,
+                transient_sensitivity: 0.5,
+                wsola_search_ms: WSOLA_SEARCH_MS_MEDIUM,
+            },
+            EdmPreset::Halftime => PresetConfig {
+                fft_size: 4096,
+                hop_size: 512,
+                transient_sensitivity: 0.7,
+                wsola_search_ms: WSOLA_SEARCH_MS_LARGE,
+            },
+            EdmPreset::Ambient => PresetConfig {
+                fft_size: 8192,
+                hop_size: 2048,
+                transient_sensitivity: 0.2,
+                wsola_search_ms: WSOLA_SEARCH_MS_LARGE,
+            },
+            EdmPreset::VocalChop => PresetConfig {
+                fft_size: 2048,
+                hop_size: 512,
+                transient_sensitivity: 0.6,
+                wsola_search_ms: WSOLA_SEARCH_MS_MEDIUM,
+            },
         }
     }
 }
@@ -309,6 +353,17 @@ fn ms_to_samples(ms: f64, sample_rate: u32) -> usize {
     (sample_rate as f64 * ms / 1000.0) as usize
 }
 
+/// Default sample rate (44.1 kHz CD quality).
+const DEFAULT_SAMPLE_RATE: u32 = 44100;
+/// Default FFT size for phase vocoder (good frequency resolution for bass).
+const DEFAULT_FFT_SIZE: usize = 4096;
+/// Default hop size (FFT/4 = 75% overlap).
+const DEFAULT_HOP_SIZE: usize = 1024;
+/// Default transient detection sensitivity (0.0–1.0).
+const DEFAULT_TRANSIENT_SENSITIVITY: f32 = 0.5;
+/// Default sub-bass phase lock cutoff in Hz.
+const DEFAULT_SUB_BASS_CUTOFF: f32 = 120.0;
+
 /// Default WSOLA segment duration (~20ms) for transient-friendly segmentation.
 const WSOLA_SEGMENT_MS: f64 = 20.0;
 /// Default WSOLA search range (~10ms) for small stretch ratios.
@@ -323,15 +378,15 @@ impl StretchParams {
     pub fn new(stretch_ratio: f64) -> Self {
         Self {
             stretch_ratio,
-            sample_rate: 44100,
+            sample_rate: DEFAULT_SAMPLE_RATE,
             channels: Channels::Stereo,
-            fft_size: 4096,
-            hop_size: 1024,
+            fft_size: DEFAULT_FFT_SIZE,
+            hop_size: DEFAULT_HOP_SIZE,
             preset: None,
-            transient_sensitivity: 0.5,
-            sub_bass_cutoff: 120.0,
-            wsola_segment_size: ms_to_samples(WSOLA_SEGMENT_MS, 44100),
-            wsola_search_range: ms_to_samples(WSOLA_SEARCH_MS_SMALL, 44100),
+            transient_sensitivity: DEFAULT_TRANSIENT_SENSITIVITY,
+            sub_bass_cutoff: DEFAULT_SUB_BASS_CUTOFF,
+            wsola_segment_size: ms_to_samples(WSOLA_SEGMENT_MS, DEFAULT_SAMPLE_RATE),
+            wsola_search_range: ms_to_samples(WSOLA_SEARCH_MS_SMALL, DEFAULT_SAMPLE_RATE),
             beat_aware: false,
         }
     }
@@ -371,38 +426,11 @@ impl StretchParams {
     pub fn with_preset(mut self, preset: EdmPreset) -> Self {
         self.preset = Some(preset);
         self.beat_aware = true;
-        match preset {
-            EdmPreset::DjBeatmatch => {
-                self.fft_size = 4096;
-                self.hop_size = 1024;
-                self.transient_sensitivity = 0.3;
-                self.wsola_search_range = ms_to_samples(WSOLA_SEARCH_MS_SMALL, self.sample_rate);
-            }
-            EdmPreset::HouseLoop => {
-                self.fft_size = 4096;
-                self.hop_size = 1024;
-                self.transient_sensitivity = 0.5;
-                self.wsola_search_range = ms_to_samples(WSOLA_SEARCH_MS_MEDIUM, self.sample_rate);
-            }
-            EdmPreset::Halftime => {
-                self.fft_size = 4096;
-                self.hop_size = 512;
-                self.transient_sensitivity = 0.7;
-                self.wsola_search_range = ms_to_samples(WSOLA_SEARCH_MS_LARGE, self.sample_rate);
-            }
-            EdmPreset::Ambient => {
-                self.fft_size = 8192;
-                self.hop_size = 2048;
-                self.transient_sensitivity = 0.2;
-                self.wsola_search_range = ms_to_samples(WSOLA_SEARCH_MS_LARGE, self.sample_rate);
-            }
-            EdmPreset::VocalChop => {
-                self.fft_size = 2048;
-                self.hop_size = 512;
-                self.transient_sensitivity = 0.6;
-                self.wsola_search_range = ms_to_samples(WSOLA_SEARCH_MS_MEDIUM, self.sample_rate);
-            }
-        }
+        let cfg = preset.config();
+        self.fft_size = cfg.fft_size;
+        self.hop_size = cfg.hop_size;
+        self.transient_sensitivity = cfg.transient_sensitivity;
+        self.wsola_search_range = ms_to_samples(cfg.wsola_search_ms, self.sample_rate);
         self
     }
 

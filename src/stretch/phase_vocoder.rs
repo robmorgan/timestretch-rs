@@ -11,6 +11,8 @@ const TWO_PI: f32 = 2.0 * PI;
 const MIN_WINDOW_SUM_RATIO: f32 = 0.1;
 /// Absolute floor for window sum normalization.
 const WINDOW_SUM_EPSILON: f32 = 1e-6;
+/// Fraction of bins to pre-allocate for spectral peak detection (1/4 of bins).
+const PEAKS_CAPACITY_DIVISOR: usize = 4;
 
 /// Phase vocoder state for time stretching.
 pub struct PhaseVocoder {
@@ -80,7 +82,7 @@ impl PhaseVocoder {
             fft_buffer: vec![Complex::new(0.0, 0.0); fft_size],
             magnitudes: vec![0.0; num_bins],
             new_phases: vec![0.0; num_bins],
-            peaks: Vec::with_capacity(num_bins / 4),
+            peaks: Vec::with_capacity(num_bins / PEAKS_CAPACITY_DIVISOR),
             analysis_phases: vec![0.0; num_bins],
             sub_bass_bin,
             output_buf: Vec::new(),
