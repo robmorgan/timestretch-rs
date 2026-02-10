@@ -605,7 +605,13 @@
   - `output_buf` taken from self, grown-only, zeroed, returned to self after use
   - Eliminates 1 large `Vec<f32>` allocation per WSOLA `process()` call
   - Uses `std::mem::take` pattern for borrow checker compatibility
-- [x] Total: 746 tests, all passing
+- [x] Zero-copy streaming API (`process_into` / `flush_into`):
+  - `process_into(&mut self, input: &[f32], output: &mut Vec<f32>) -> Result<usize>`
+  - `flush_into(&mut self, output: &mut Vec<f32>) -> Result<usize>`
+  - Appends stretched audio directly into caller-provided buffer
+  - Eliminates final `Vec<f32>` clone on every process() call
+  - 7 new tests: equivalence with process(), stereo, NaN, count, append, flush, hybrid
+- [x] Total: 791 tests, all passing
 - [x] Zero clippy warnings
 
 ## DJ Workflow API & Creative Effects (agent-3)
