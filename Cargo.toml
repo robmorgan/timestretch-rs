@@ -17,6 +17,10 @@ name = "timestretch-cli"
 path = "src/cli.rs"
 required-features = ["cli"]
 
+[[example]]
+name = "generate_test_audio"
+path = "test_audio/generate.rs"
+
 [features]
 cli = []
 

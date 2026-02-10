@@ -834,11 +834,7 @@ mod tests {
         // Silence should return 0 BPM
         let silence = vec![0.0f32; 44100 * 4];
         let bpm = detect_bpm(&silence, 44100);
-        assert!(
-            bpm == 0.0,
-            "Silence should return 0 BPM, got {}",
-            bpm
-        );
+        assert!(bpm == 0.0, "Silence should return 0 BPM, got {}", bpm);
     }
 
     #[test]
@@ -871,8 +867,11 @@ mod tests {
             // Add tone between clicks for transient detector
             let tone_start = pos + 20;
             let tone_end = (pos + beat_interval / 2).min(num_samples);
-            for i in tone_start..tone_end {
-                audio[i] += 0.2 * (2.0 * std::f32::consts::PI * 200.0 * i as f32 / sample_rate as f32).sin();
+            for (i, sample) in audio[tone_start..tone_end].iter_mut().enumerate() {
+                let idx = tone_start + i;
+                *sample += 0.2
+                    * (2.0 * std::f32::consts::PI * 200.0 * idx as f32 / sample_rate as f32)
+                        .sin();
             }
         }
 
@@ -903,7 +902,8 @@ mod tests {
 
         // Add background tone
         for (i, sample) in audio.iter_mut().enumerate() {
-            *sample += 0.15 * (2.0 * std::f32::consts::PI * 300.0 * i as f32 / sample_rate as f32).sin();
+            *sample +=
+                0.15 * (2.0 * std::f32::consts::PI * 300.0 * i as f32 / sample_rate as f32).sin();
         }
 
         let bpm = detect_bpm(&audio, sample_rate);

@@ -277,6 +277,19 @@
 - [x] Total: 243 tests, all passing
 - [x] Zero clippy warnings
 
+## Test Signal Generator (agent-1)
+- [x] `test_audio/generate.rs` example binary — generates 8 WAV test files:
+  - `sine_440hz.wav` — 2s mono 440 Hz sine
+  - `sine_60hz.wav` — 2s mono 60 Hz sub-bass
+  - `sine_stereo.wav` — 2s stereo (L=440Hz, R=880Hz)
+  - `click_train_128bpm.wav` — 4s click train at 128 BPM
+  - `kick_pattern_128bpm.wav` — 4s 808-style EDM kick at 128 BPM
+  - `white_noise.wav` — 2s deterministic pseudo-random noise
+  - `sweep_20_20k.wav` — 4s logarithmic frequency sweep 20Hz–20kHz
+  - `edm_mix.wav` — 4s layered kick + sub-bass + hi-hat pattern
+- [x] Run with `cargo run --example generate_test_audio`
+- [x] Generated WAV files gitignored (`test_audio/.gitignore`)
+
 ## TODO
 - [ ] SIMD-friendly inner loop layout
 
