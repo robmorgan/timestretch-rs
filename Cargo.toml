@@ -24,6 +24,11 @@ path = "test_audio/generate.rs"
 [features]
 cli = []
 
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+
 [profile.release]
 opt-level = 3
 lto = true

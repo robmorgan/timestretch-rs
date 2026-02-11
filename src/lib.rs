@@ -130,7 +130,7 @@ const NORMALIZE_RMS_FLOOR: f32 = 1e-8;
 
 /// Computes the RMS (root mean square) of a signal.
 #[inline]
-fn compute_rms(samples: &[f32]) -> f32 {
+pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }

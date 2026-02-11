@@ -1,0 +1,29 @@
+# Reference Audio Benchmark Manifest
+#
+# Each [[track]] entry describes an original audio file and one or more
+# professionally time-stretched reference files. The benchmark runner loads
+# these, processes the original with each EDM preset, and compares the output
+# against the professional references using spectral and temporal metrics.
+#
+# Audio files are NOT checked into git (see .gitignore). Place them under
+# benchmarks/audio/ as described in benchmarks/README.md.
+
+# --- Example track entry (uncomment and adjust for your files) ---
+#
+# [[track]]
+# id = "deep-house-loop-01"
+# description = "4-bar deep house loop, 124 BPM, stereo"
+# original = "originals/deep-house-loop-01.wav"
+# bpm = 124.0
+#
+#   [[track.reference]]
+#   file = "references/deep-house-loop-01_128bpm_ableton.wav"
+#   target_bpm = 128.0
+#   software = "Ableton Live 11"
+#   algorithm = "Complex Pro"
+#
+#   [[track.reference]]
+#   file = "references/deep-house-loop-01_128bpm_serato.wav"
+#   target_bpm = 128.0
+#   software = "Serato DJ Pro"
+#   algorithm = "Default"
