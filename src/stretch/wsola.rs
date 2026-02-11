@@ -356,9 +356,10 @@ impl Wsola {
         let overlap_len = self.overlap_size.min(len);
         let inv_overlap = 1.0 / self.overlap_size as f32;
 
-        // Crossfade region: branch-free linear fade
+        // Crossfade region: raised-cosine fade for smoother transitions
         for i in 0..overlap_len {
-            let fade_in = i as f32 * inv_overlap;
+            let t = i as f32 * inv_overlap;
+            let fade_in = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
             let fade_out = 1.0 - fade_in;
             output[output_pos + i] =
                 output[output_pos + i] * fade_out + input[input_pos + i] * fade_in;
@@ -860,8 +861,8 @@ mod tests {
     // --- overlap_add crossfade ---
 
     #[test]
-    fn test_overlap_add_crossfade_linearity() {
-        // Verify the overlap region uses a linear crossfade
+    fn test_overlap_add_crossfade_raised_cosine() {
+        // Verify the overlap region uses a raised-cosine crossfade
         let segment_size = 100;
         let overlap_size = 50;
         let wsola = Wsola::new(segment_size, 10, 1.0);
@@ -874,10 +875,14 @@ mod tests {
         wsola.overlap_add(&input, &mut output, 0, 50);
 
         // In the overlap region (output[50..100]):
-        //   fade_in = i/50, fade_out = 1 - i/50
-        //   output = 1.0 * fade_out + 0.0 * fade_in = 1 - i/50
+        //   t = i/50
+        //   fade_in = 0.5 * (1 - cos(PI * t))
+        //   fade_out = 1 - fade_in
+        //   output = 1.0 * fade_out + 0.0 * fade_in = fade_out
         for i in 0..overlap_size {
-            let expected = 1.0 - i as f32 / overlap_size as f32;
+            let t = i as f32 / overlap_size as f32;
+            let fade_in = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
+            let expected = 1.0 - fade_in;
             assert!(
                 (output[50 + i] - expected).abs() < 1e-5,
                 "Overlap sample {}: expected {}, got {}",

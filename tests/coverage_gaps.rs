@@ -866,7 +866,7 @@ mod stream_processor_edges {
             .with_channels(1);
         let mut proc = StreamProcessor::new(params);
 
-        let signal: Vec<f32> = (0..4096)
+        let signal: Vec<f32> = (0..16384)
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
             .collect();
         let _ = proc.process(&signal).unwrap();
@@ -1073,22 +1073,20 @@ mod preset_configs {
     }
 
     #[test]
-    fn non_ambient_presets_use_hann() {
-        let presets = [
-            EdmPreset::DjBeatmatch,
-            EdmPreset::HouseLoop,
-            EdmPreset::Halftime,
-            EdmPreset::VocalChop,
-        ];
-        for preset in &presets {
-            let params = StretchParams::new(1.5).with_preset(*preset);
-            assert_eq!(
-                params.window_type,
-                WindowType::Hann,
-                "Preset {:?} should use Hann",
-                preset
-            );
-        }
+    fn presets_use_expected_windows() {
+        // DjBeatmatch and VocalChop use Kaiser windows
+        let params = StretchParams::new(1.5).with_preset(EdmPreset::DjBeatmatch);
+        assert_eq!(params.window_type, WindowType::Kaiser(800));
+
+        let params = StretchParams::new(1.5).with_preset(EdmPreset::VocalChop);
+        assert_eq!(params.window_type, WindowType::Kaiser(600));
+
+        // HouseLoop and Halftime use Blackman-Harris
+        let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
+        assert_eq!(params.window_type, WindowType::BlackmanHarris);
+
+        let params = StretchParams::new(1.5).with_preset(EdmPreset::Halftime);
+        assert_eq!(params.window_type, WindowType::BlackmanHarris);
     }
 
     #[test]

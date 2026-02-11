@@ -96,12 +96,16 @@ impl HybridStretcher {
         // Process sub-bass exclusively through PV (rigid phase locking
         // handles phase coherence for bins below cutoff)
         let sub_bass_stretched = if sub_bass.len() >= self.params.fft_size {
-            let mut pv = PhaseVocoder::new(
+            let mut pv = PhaseVocoder::with_all_options(
                 self.params.fft_size,
                 self.params.hop_size,
                 self.params.stretch_ratio,
                 self.params.sample_rate,
                 self.params.sub_bass_cutoff,
+                self.params.window_type,
+                self.params.phase_locking_mode,
+                self.params.envelope_preservation,
+                self.params.envelope_order,
             );
             pv.process(&sub_bass)?
         } else {
@@ -155,13 +159,14 @@ impl HybridStretcher {
 
         // Step 3: Process each segment with appropriate algorithm
         // Reuse a single PV instance for tonal segments (avoids FFT planner recreation)
-        let mut pv = PhaseVocoder::with_window(
+        let mut pv = PhaseVocoder::with_options(
             self.params.fft_size,
             self.params.hop_size,
             self.params.stretch_ratio,
             self.params.sample_rate,
             self.params.sub_bass_cutoff,
             self.params.window_type,
+            self.params.phase_locking_mode,
         );
         let mut output_segments: Vec<Vec<f32>> = Vec::with_capacity(segments.len());
 
@@ -169,6 +174,12 @@ impl HybridStretcher {
             let seg_data = &input[segment.start..segment.end];
             let stretched = self.stretch_segment(seg_data, segment.is_transient, &mut pv);
             output_segments.push(stretched);
+
+            // Reset PV phase state after transient segments so stale phase
+            // from the previous tonal region doesn't contaminate the next one.
+            if segment.is_transient {
+                pv.reset_phase_state();
+            }
         }
 
         // Step 4: Concatenate with crossfades
@@ -363,10 +374,17 @@ fn window_and_transform(
     fft_fwd.process(fft_buf);
 }
 
+/// Width of the raised-cosine crossover transition band in bins.
+const CROSSOVER_TRANSITION_BINS: usize = 5;
+
 /// Splits an FFT spectrum into sub-bass and remainder bands.
 ///
-/// `fft_buf` is narrowed to sub-bass only (bins below `cutoff_bin`).
-/// `fft_buf2` receives the remainder (bins at or above `cutoff_bin`).
+/// Uses a raised-cosine transition band around `cutoff_bin` to avoid
+/// ringing artifacts from a brick-wall filter. The transition spans
+/// `CROSSOVER_TRANSITION_BINS` bins on each side of the cutoff.
+///
+/// `fft_buf` is narrowed to sub-bass only (bins below cutoff).
+/// `fft_buf2` receives the remainder (bins at or above cutoff).
 /// Both respect conjugate symmetry for real-valued signals.
 fn split_bands(
     fft_buf: &mut [Complex<f32>],
@@ -375,19 +393,31 @@ fn split_bands(
     cutoff_bin: usize,
 ) {
     fft_buf2.copy_from_slice(fft_buf);
+    let half = fft_size / 2;
+    let width = CROSSOVER_TRANSITION_BINS;
+    let trans_start = cutoff_bin.saturating_sub(width);
+    let trans_end = (cutoff_bin + width).min(half);
 
-    // Sub-bass: keep bins 0..cutoff_bin and their mirrors, zero everything else
-    for bin in cutoff_bin..=fft_size / 2 {
-        fft_buf[bin] = COMPLEX_ZERO;
-        if bin > 0 && bin < fft_size / 2 {
-            fft_buf[fft_size - bin] = COMPLEX_ZERO;
-        }
-    }
-    // Remainder: keep bins cutoff_bin..N/2 and their mirrors, zero sub-bass
-    for bin in 0..cutoff_bin {
-        fft_buf2[bin] = COMPLEX_ZERO;
-        if bin > 0 {
-            fft_buf2[fft_size - bin] = COMPLEX_ZERO;
+    for bin in 0..=half {
+        let sub_gain = if bin <= trans_start {
+            1.0f32
+        } else if bin >= trans_end {
+            0.0
+        } else {
+            // Raised-cosine taper from 1 -> 0 across transition band
+            let t = (bin - trans_start) as f32 / (trans_end - trans_start) as f32;
+            0.5 * (1.0 + (std::f32::consts::PI * t).cos())
+        };
+        let rem_gain = 1.0 - sub_gain;
+
+        // Apply gains to positive-frequency bin
+        fft_buf[bin] = fft_buf[bin] * sub_gain;
+        fft_buf2[bin] = fft_buf2[bin] * rem_gain;
+
+        // Mirror for negative-frequency bin (conjugate symmetry)
+        if bin > 0 && bin < half {
+            fft_buf[fft_size - bin] = fft_buf[fft_size - bin] * sub_gain;
+            fft_buf2[fft_size - bin] = fft_buf2[fft_size - bin] * rem_gain;
         }
     }
 }

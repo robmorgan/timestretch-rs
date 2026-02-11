@@ -1,6 +1,8 @@
 //! Core types shared across the crate: samples, buffers, parameters, and errors.
 
 use crate::core::window::WindowType;
+use crate::stretch::phase_locking::PhaseLockingMode;
+use crate::stretch::stereo::StereoMode;
 
 /// A single audio sample (32-bit float, range -1.0 to 1.0).
 pub type Sample = f32;
@@ -1244,38 +1246,38 @@ impl EdmPreset {
         match self {
             EdmPreset::DjBeatmatch => PresetConfig {
                 fft_size: 4096,
-                hop_size: 1024,
+                hop_size: 4096 / 5, // ~820: Kaiser needs less overlap than BH
                 transient_sensitivity: 0.3,
                 wsola_search_ms: WSOLA_SEARCH_MS_SMALL,
-                window_type: WindowType::Hann,
+                window_type: WindowType::Kaiser(800), // beta=8.0: tight mainlobe for transparency
             },
             EdmPreset::HouseLoop => PresetConfig {
                 fft_size: 4096,
-                hop_size: 1024,
+                hop_size: 4096 / 6, // ~683: BH needs more overlap (wider mainlobe)
                 transient_sensitivity: 0.5,
                 wsola_search_ms: WSOLA_SEARCH_MS_MEDIUM,
-                window_type: WindowType::Hann,
+                window_type: WindowType::BlackmanHarris,
             },
             EdmPreset::Halftime => PresetConfig {
                 fft_size: 4096,
-                hop_size: 512,
+                hop_size: 4096 / 6, // ~683
                 transient_sensitivity: 0.7,
                 wsola_search_ms: WSOLA_SEARCH_MS_LARGE,
-                window_type: WindowType::Hann,
+                window_type: WindowType::BlackmanHarris,
             },
             EdmPreset::Ambient => PresetConfig {
                 fft_size: 8192,
-                hop_size: 2048,
+                hop_size: 8192 / 4, // 2048: ambient can use less overlap
                 transient_sensitivity: 0.2,
                 wsola_search_ms: WSOLA_SEARCH_MS_LARGE,
                 window_type: WindowType::BlackmanHarris,
             },
             EdmPreset::VocalChop => PresetConfig {
                 fft_size: 2048,
-                hop_size: 512,
+                hop_size: 2048 / 4, // 512
                 transient_sensitivity: 0.6,
                 wsola_search_ms: WSOLA_SEARCH_MS_MEDIUM,
-                window_type: WindowType::Hann,
+                window_type: WindowType::Kaiser(600), // beta=6.0: good vocal balance
             },
         }
     }
@@ -1362,6 +1364,27 @@ pub struct StretchParams {
     /// matches the input. This prevents level changes during time stretching,
     /// which is important for DJ workflows and consistent loudness.
     pub normalize: bool,
+    /// Phase locking algorithm for the phase vocoder.
+    ///
+    /// - [`PhaseLockingMode::Identity`] — simple nearest-peak locking (fast, may ring)
+    /// - [`PhaseLockingMode::RegionOfInfluence`] — influence zones with deviation clamping (better quality)
+    pub phase_locking_mode: PhaseLockingMode,
+    /// Stereo processing mode.
+    ///
+    /// - [`StereoMode::MidSide`] (default) — preserves stereo image via mid/side encoding
+    /// - [`StereoMode::Independent`] — processes L/R independently (legacy behavior)
+    pub stereo_mode: StereoMode,
+    /// Whether to apply spectral envelope preservation.
+    ///
+    /// When enabled, the spectral envelope (formant structure) of the input
+    /// is preserved in the output, preventing unnatural timbre shifts.
+    /// Most audible on vocals and synth pads.
+    pub envelope_preservation: bool,
+    /// Cepstral order for spectral envelope extraction.
+    ///
+    /// Controls the smoothness of the envelope: lower = smoother, higher = more detail.
+    /// Typical values: 30-50 for vocals, 20-30 for general music.
+    pub envelope_order: usize,
 }
 
 /// Converts a duration in milliseconds to samples at the given sample rate.
@@ -1374,8 +1397,8 @@ fn ms_to_samples(ms: f64, sample_rate: u32) -> usize {
 const DEFAULT_SAMPLE_RATE: u32 = 44100;
 /// Default FFT size for phase vocoder (good frequency resolution for bass).
 const DEFAULT_FFT_SIZE: usize = 4096;
-/// Default hop size (FFT/4 = 75% overlap).
-const DEFAULT_HOP_SIZE: usize = 1024;
+/// Default hop size (FFT/6 ≈ 83% overlap for Blackman-Harris window).
+const DEFAULT_HOP_SIZE: usize = DEFAULT_FFT_SIZE / 6;
 /// Default transient detection sensitivity (0.0–1.0).
 const DEFAULT_TRANSIENT_SENSITIVITY: f32 = 0.5;
 /// Default sub-bass phase lock cutoff in Hz.
@@ -1427,8 +1450,12 @@ impl StretchParams {
             wsola_search_range: ms_to_samples(WSOLA_SEARCH_MS_SMALL, DEFAULT_SAMPLE_RATE),
             beat_aware: false,
             band_split: false,
-            window_type: WindowType::Hann,
+            window_type: WindowType::BlackmanHarris,
             normalize: false,
+            phase_locking_mode: PhaseLockingMode::RegionOfInfluence,
+            stereo_mode: StereoMode::MidSide,
+            envelope_preservation: false,
+            envelope_order: 40,
         }
     }
 
@@ -1474,6 +1501,11 @@ impl StretchParams {
         self.transient_sensitivity = cfg.transient_sensitivity;
         self.wsola_search_range = ms_to_samples(cfg.wsola_search_ms, self.sample_rate);
         self.window_type = cfg.window_type;
+        // Enable envelope preservation for presets where timbre matters
+        self.envelope_preservation = matches!(
+            preset,
+            EdmPreset::HouseLoop | EdmPreset::Halftime | EdmPreset::Ambient | EdmPreset::VocalChop
+        );
         self
     }
 
@@ -1550,6 +1582,42 @@ impl StretchParams {
     /// workflows and consistent loudness across different stretch ratios.
     pub fn with_normalize(mut self, enabled: bool) -> Self {
         self.normalize = enabled;
+        self
+    }
+
+    /// Enables or disables spectral envelope preservation.
+    ///
+    /// When enabled, the formant structure of the input is preserved,
+    /// preventing unnatural timbre shifts on vocals and synth pads.
+    pub fn with_envelope_preservation(mut self, enabled: bool) -> Self {
+        self.envelope_preservation = enabled;
+        self
+    }
+
+    /// Sets the cepstral order for spectral envelope extraction.
+    ///
+    /// Lower values produce a smoother envelope (less detail),
+    /// higher values preserve more spectral detail. Default: 40.
+    pub fn with_envelope_order(mut self, order: usize) -> Self {
+        self.envelope_order = order;
+        self
+    }
+
+    /// Sets the stereo processing mode.
+    ///
+    /// - [`StereoMode::MidSide`] (default) — better stereo coherence
+    /// - [`StereoMode::Independent`] — legacy L/R independent processing
+    pub fn with_stereo_mode(mut self, mode: StereoMode) -> Self {
+        self.stereo_mode = mode;
+        self
+    }
+
+    /// Sets the phase locking algorithm for the phase vocoder.
+    ///
+    /// - [`PhaseLockingMode::Identity`] — fast but may produce ringing
+    /// - [`PhaseLockingMode::RegionOfInfluence`] — better quality with deviation clamping
+    pub fn with_phase_locking_mode(mut self, mode: PhaseLockingMode) -> Self {
+        self.phase_locking_mode = mode;
         self
     }
 
@@ -2202,9 +2270,9 @@ mod tests {
     }
 
     #[test]
-    fn test_window_type_default_is_hann() {
+    fn test_window_type_default_is_blackman_harris() {
         let params = StretchParams::new(1.0);
-        assert_eq!(params.window_type, WindowType::Hann);
+        assert_eq!(params.window_type, WindowType::BlackmanHarris);
     }
 
     #[test]
@@ -2213,12 +2281,13 @@ mod tests {
         let params = StretchParams::new(2.0).with_preset(EdmPreset::Ambient);
         assert_eq!(params.window_type, WindowType::BlackmanHarris);
 
-        // Other presets should use Hann
+        // DjBeatmatch uses Kaiser(800)
         let params = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
-        assert_eq!(params.window_type, WindowType::Hann);
+        assert_eq!(params.window_type, WindowType::Kaiser(800));
 
+        // HouseLoop uses Blackman-Harris
         let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
-        assert_eq!(params.window_type, WindowType::Hann);
+        assert_eq!(params.window_type, WindowType::BlackmanHarris);
     }
 
     #[test]

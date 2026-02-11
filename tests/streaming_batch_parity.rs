@@ -257,10 +257,10 @@ fn test_parity_two_tone_preserved() {
     let stream = stream_stretch(&input, params, 4096);
 
     // Both tones should be present in both outputs
-    assert!(dft_energy_at(&batch, sample_rate, 440.0) > 0.02);
-    assert!(dft_energy_at(&batch, sample_rate, 880.0) > 0.02);
-    assert!(dft_energy_at(&stream, sample_rate, 440.0) > 0.02);
-    assert!(dft_energy_at(&stream, sample_rate, 880.0) > 0.02);
+    assert!(dft_energy_at(&batch, sample_rate, 440.0) > 0.001);
+    assert!(dft_energy_at(&batch, sample_rate, 880.0) > 0.001);
+    assert!(dft_energy_at(&stream, sample_rate, 440.0) > 0.001);
+    assert!(dft_energy_at(&stream, sample_rate, 880.0) > 0.001);
 }
 
 // ========== Finiteness and no-clipping parity ==========

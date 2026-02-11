@@ -54,6 +54,8 @@ pub use core::types::{AudioBuffer, Channels, EdmPreset, FrameIter, Sample, Stret
 pub use core::window::WindowType;
 pub use error::StretchError;
 pub use stream::StreamProcessor;
+pub use stretch::phase_locking::PhaseLockingMode;
+pub use stretch::stereo::StereoMode;
 
 /// Creates params adjusted for the given buffer's sample rate and channels,
 /// then wraps the processing result in a new AudioBuffer.
@@ -202,12 +204,21 @@ pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, Stretc
         0.0
     };
 
-    let mut channel_outputs: Vec<Vec<f32>> = Vec::with_capacity(num_channels);
-    for channel_data in &channels {
-        let stretcher = stretch::hybrid::HybridStretcher::new(params.clone());
-        let stretched = stretcher.process(channel_data)?;
-        channel_outputs.push(stretched);
-    }
+    let channel_outputs = if num_channels == 2
+        && params.stereo_mode == stretch::stereo::StereoMode::MidSide
+    {
+        let (left, right) =
+            stretch::stereo::stretch_mid_side(&channels[0], &channels[1], params)?;
+        vec![left, right]
+    } else {
+        let mut outs: Vec<Vec<f32>> = Vec::with_capacity(num_channels);
+        for channel_data in &channels {
+            let stretcher = stretch::hybrid::HybridStretcher::new(params.clone());
+            let stretched = stretcher.process(channel_data)?;
+            outs.push(stretched);
+        }
+        outs
+    };
 
     let mut output = interleave(&channel_outputs);
 
@@ -269,12 +280,21 @@ pub fn stretch_into(
         0.0
     };
 
-    let mut channel_outputs: Vec<Vec<f32>> = Vec::with_capacity(num_channels);
-    for channel_data in &channels {
-        let stretcher = stretch::hybrid::HybridStretcher::new(params.clone());
-        let stretched = stretcher.process(channel_data)?;
-        channel_outputs.push(stretched);
-    }
+    let channel_outputs = if num_channels == 2
+        && params.stereo_mode == stretch::stereo::StereoMode::MidSide
+    {
+        let (left, right) =
+            stretch::stereo::stretch_mid_side(&channels[0], &channels[1], params)?;
+        vec![left, right]
+    } else {
+        let mut outs: Vec<Vec<f32>> = Vec::with_capacity(num_channels);
+        for channel_data in &channels {
+            let stretcher = stretch::hybrid::HybridStretcher::new(params.clone());
+            let stretched = stretcher.process(channel_data)?;
+            outs.push(stretched);
+        }
+        outs
+    };
 
     let min_len = channel_outputs.iter().map(|c| c.len()).min().unwrap_or(0);
     let total = min_len * num_channels;
@@ -386,14 +406,14 @@ pub fn pitch_shift(
         return Ok(vec![]);
     }
 
-    // Step 2: Resample each channel to original length using cubic interpolation
+    // Step 2: Resample each channel to original length using windowed-sinc interpolation
     let num_channels = params.channels.count();
     let num_input_frames = input.len() / num_channels;
     let channels = deinterleave(&stretched, num_channels);
 
     let channel_outputs: Vec<Vec<f32>> = channels
         .iter()
-        .map(|ch| core::resample::resample_cubic(ch, num_input_frames))
+        .map(|ch| core::resample::resample_sinc_default(ch, num_input_frames))
         .collect();
 
     let mut output = interleave(&channel_outputs);

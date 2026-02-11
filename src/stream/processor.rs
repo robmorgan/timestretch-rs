@@ -99,13 +99,16 @@ impl StreamProcessor {
     fn create_vocoders(params: &StretchParams, ratio: f64) -> Vec<PhaseVocoder> {
         (0..params.channels.count())
             .map(|_| {
-                PhaseVocoder::with_window(
+                PhaseVocoder::with_all_options(
                     params.fft_size,
                     params.hop_size,
                     ratio,
                     params.sample_rate,
                     params.sub_bass_cutoff,
                     params.window_type,
+                    params.phase_locking_mode,
+                    params.envelope_preservation,
+                    params.envelope_order,
                 )
             })
             .collect()
@@ -455,7 +458,10 @@ impl StreamProcessor {
             self.input_buffer.push(0.0);
         }
 
-        self.process_into(&[], output)
+        let result = self.process_into(&[], output);
+        // Clear any leftover samples to prevent infinite flush loops
+        self.input_buffer.clear();
+        result
     }
 
     /// Flushes remaining buffered samples.
@@ -471,7 +477,10 @@ impl StreamProcessor {
             self.input_buffer.push(0.0);
         }
 
-        self.process(&[])
+        let result = self.process(&[]);
+        // Clear any leftover samples to prevent infinite flush loops
+        self.input_buffer.clear();
+        result
     }
 
     /// Interleaves per-channel outputs directly into a caller-provided buffer.

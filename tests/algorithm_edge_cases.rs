@@ -466,21 +466,21 @@ fn test_params_output_length_calculation() {
 
 #[test]
 fn test_preset_overrides_fft_and_hop() {
-    // DjBeatmatch preset
+    // DjBeatmatch preset: Kaiser(800), hop = fft_size/5
     let params = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
     assert_eq!(params.fft_size, 4096);
-    assert_eq!(params.hop_size, 1024);
+    assert_eq!(params.hop_size, 4096 / 5);
     assert!(params.beat_aware); // Presets enable beat_aware
 
-    // Ambient preset has different FFT
+    // Ambient preset: BH, hop = fft_size/4
     let params = StretchParams::new(1.0).with_preset(EdmPreset::Ambient);
     assert_eq!(params.fft_size, 8192);
-    assert_eq!(params.hop_size, 2048);
+    assert_eq!(params.hop_size, 8192 / 4);
 
-    // VocalChop preset
+    // VocalChop preset: Kaiser(600), hop = fft_size/4
     let params = StretchParams::new(1.0).with_preset(EdmPreset::VocalChop);
     assert_eq!(params.fft_size, 2048);
-    assert_eq!(params.hop_size, 512);
+    assert_eq!(params.hop_size, 2048 / 4);
 }
 
 #[test]

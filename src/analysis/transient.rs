@@ -1,15 +1,28 @@
 //! Spectral-flux transient detection with adaptive thresholding.
+//!
+//! Combines spectral flux (frequency-domain onset measure) with an energy
+//! envelope detector (time-domain onset measure) for more robust transient
+//! detection. Uses mean + stddev adaptive thresholding instead of sliding
+//! median for better handling of varying signal dynamics.
 
 use rustfft::{num_complex::Complex, FftPlanner};
 
 use crate::core::fft::COMPLEX_ZERO;
+
+/// Weight of spectral flux in the combined onset detection function.
+const FLUX_WEIGHT: f32 = 0.6;
+/// Weight of onset energy envelope in the combined onset detection function.
+const ENERGY_WEIGHT: f32 = 0.4;
+/// Smoothing coefficient for the onset energy envelope (one-pole lowpass).
+/// Higher values = slower response. 0.9 gives ~10-frame smoothing.
+const ENERGY_SMOOTH_ALPHA: f32 = 0.9;
 
 /// Result of transient detection: sample positions of detected onsets.
 #[derive(Debug, Clone)]
 pub struct TransientMap {
     /// Sample positions of detected transient onsets.
     pub onsets: Vec<usize>,
-    /// Spectral flux values at each analysis frame (for debugging/visualization).
+    /// Combined detection function values at each analysis frame.
     pub flux: Vec<f32>,
     /// Hop size used for analysis.
     pub hop_size: usize,
@@ -70,10 +83,86 @@ fn compute_spectral_flux(
     flux_values
 }
 
-/// Detects transients in a mono audio signal using spectral flux.
+/// Computes the onset energy envelope for each analysis frame.
 ///
-/// Uses high-frequency weighted spectral flux with adaptive thresholding,
-/// tuned for EDM transient detection (kicks, snares, hi-hats).
+/// For each frame, computes the RMS energy, then takes the half-wave rectified
+/// first difference (energy increase only) and smooths it with a one-pole
+/// lowpass filter. This captures broadband energy onsets that spectral flux
+/// might miss (e.g., low-frequency kicks).
+fn compute_onset_energy(samples: &[f32], fft_size: usize, hop_size: usize) -> Vec<f32> {
+    let num_frames = (samples.len() - fft_size) / hop_size + 1;
+    let mut energies = Vec::with_capacity(num_frames);
+    let inv_fft = 1.0 / fft_size as f32;
+
+    // Compute RMS energy per frame
+    for frame_idx in 0..num_frames {
+        let start = frame_idx * hop_size;
+        let end = start + fft_size;
+        let rms: f32 = samples[start..end]
+            .iter()
+            .map(|&s| s * s)
+            .sum::<f32>()
+            * inv_fft;
+        energies.push(rms.sqrt());
+    }
+
+    // Half-wave rectified first difference + smoothing
+    let mut envelope = Vec::with_capacity(num_frames);
+    let mut smoothed = 0.0f32;
+
+    for i in 0..num_frames {
+        let diff = if i > 0 {
+            (energies[i] - energies[i - 1]).max(0.0)
+        } else {
+            energies[0]
+        };
+        smoothed = ENERGY_SMOOTH_ALPHA * smoothed + (1.0 - ENERGY_SMOOTH_ALPHA) * diff;
+        envelope.push(smoothed);
+    }
+
+    envelope
+}
+
+/// Minimum energy envelope max to be considered meaningful.
+/// Below this, the energy channel is zeroed to prevent noise amplification.
+const ENERGY_GATE_THRESHOLD: f32 = 0.01;
+
+/// Combines spectral flux and onset energy envelope into a single detection function.
+///
+/// Both signals are normalized to [0, 1] by their respective maxima before
+/// weighting, so neither dominates regardless of absolute scale. The energy
+/// channel is gated: if its maximum is below `ENERGY_GATE_THRESHOLD`, it is
+/// excluded to prevent noise from being amplified during normalization.
+fn combine_detection_functions(flux: &[f32], energy: &[f32]) -> Vec<f32> {
+    let max_flux = flux.iter().copied().fold(0.0f32, f32::max);
+    let max_energy = energy.iter().copied().fold(0.0f32, f32::max);
+
+    let flux_norm = if max_flux > 1e-10 { max_flux } else { 1.0 };
+
+    // Gate the energy channel: if peak energy is too low, the signal has no
+    // meaningful transients in the time domain and normalizing would amplify noise.
+    let use_energy = max_energy > ENERGY_GATE_THRESHOLD;
+    let energy_norm = if use_energy { max_energy } else { 1.0 };
+
+    flux.iter()
+        .zip(energy.iter())
+        .map(|(&f, &e)| {
+            let e_contrib = if use_energy {
+                ENERGY_WEIGHT * (e / energy_norm)
+            } else {
+                0.0
+            };
+            FLUX_WEIGHT * (f / flux_norm) + e_contrib
+        })
+        .collect()
+}
+
+/// Detects transients in a mono audio signal using combined spectral flux
+/// and onset energy envelope.
+///
+/// Uses high-frequency weighted spectral flux combined with a time-domain
+/// onset energy detector, with mean+stddev adaptive thresholding tuned for
+/// EDM transient detection (kicks, snares, hi-hats).
 pub fn detect_transients(
     samples: &[f32],
     sample_rate: u32,
@@ -90,11 +179,13 @@ pub fn detect_transients(
     }
 
     let flux_values = compute_spectral_flux(samples, sample_rate, fft_size, hop_size);
-    let onsets = adaptive_threshold(&flux_values, sensitivity, hop_size);
+    let energy_envelope = compute_onset_energy(samples, fft_size, hop_size);
+    let combined = combine_detection_functions(&flux_values, &energy_envelope);
+    let onsets = adaptive_threshold(&combined, sensitivity, hop_size);
 
     TransientMap {
         onsets,
-        flux: flux_values,
+        flux: combined,
         hop_size,
     }
 }
@@ -149,7 +240,10 @@ const MIN_ONSET_GAP_FRAMES: usize = 4;
 const THRESHOLD_FLOOR: f32 = 0.01;
 
 /// Adaptive thresholding for onset detection.
-/// Uses a sliding median with multiplicative threshold.
+///
+/// Uses a sliding median with multiplicative threshold. The median is robust
+/// to outliers (unlike mean+stddev), making it well-suited for signals with
+/// a mix of strong transients and quiet passages.
 fn adaptive_threshold(flux: &[f32], sensitivity: f32, hop_size: usize) -> Vec<usize> {
     if flux.is_empty() {
         return vec![];

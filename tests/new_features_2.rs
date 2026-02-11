@@ -843,6 +843,7 @@ mod combined_new_api_workflows {
             .with_channels(1);
         let stretched = timestretch::stretch_buffer(&input, &params).unwrap();
         let rate = stretched.sample_rate;
+        let stretched_peak = stretched.peak();
 
         let mut raw: Vec<f32> = stretched.into_data();
         // Simulate external processing: apply simple gain
@@ -852,7 +853,14 @@ mod combined_new_api_workflows {
 
         // Wrap back into AudioBuffer
         let processed = AudioBuffer::from_mono(raw, rate);
-        assert!(processed.peak() < 0.85);
+        // After 0.8x gain, peak should be ~80% of the stretched output peak
+        let expected_peak = stretched_peak * 0.8;
+        assert!(
+            (processed.peak() - expected_peak).abs() < 0.01,
+            "Peak after 0.8x gain should be ~{:.4}, got {:.4}",
+            expected_peak,
+            processed.peak()
+        );
         assert!(processed.rms() > 0.01);
     }
 

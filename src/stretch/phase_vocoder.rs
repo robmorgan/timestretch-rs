@@ -6,6 +6,8 @@ use std::f32::consts::PI;
 use crate::core::fft::{COMPLEX_ZERO, WINDOW_SUM_EPSILON, WINDOW_SUM_FLOOR_RATIO};
 use crate::core::window::{generate_window, WindowType};
 use crate::error::StretchError;
+use crate::stretch::envelope::{apply_envelope_correction, extract_envelope};
+use crate::stretch::phase_locking::{apply_phase_locking, PhaseLockingMode};
 
 const TWO_PI: f32 = 2.0 * PI;
 /// Fraction of bins to pre-allocate for spectral peak detection (1/4 of bins).
@@ -37,6 +39,18 @@ pub struct PhaseVocoder {
     analysis_phases: Vec<f32>,
     /// Bin index at or below which sub-bass phase locking is applied.
     sub_bass_bin: usize,
+    /// Phase locking algorithm to use.
+    phase_locking_mode: PhaseLockingMode,
+    /// Whether spectral envelope preservation is enabled.
+    envelope_preservation: bool,
+    /// Cepstral order for envelope extraction.
+    envelope_order: usize,
+    /// Reusable buffer for cepstral analysis.
+    cepstrum_buf: Vec<Complex<f32>>,
+    /// Reusable buffer for analysis envelope.
+    analysis_envelope: Vec<f32>,
+    /// Reusable buffer for synthesis envelope.
+    synthesis_envelope: Vec<f32>,
     /// Reusable output buffer (avoids allocation per process() call).
     output_buf: Vec<f32>,
     /// Reusable window sum buffer (avoids allocation per process() call).
@@ -58,7 +72,7 @@ impl PhaseVocoder {
             stretch_ratio,
             sample_rate,
             sub_bass_cutoff,
-            WindowType::Hann,
+            WindowType::BlackmanHarris,
         )
     }
 
@@ -70,6 +84,52 @@ impl PhaseVocoder {
         sample_rate: u32,
         sub_bass_cutoff: f32,
         window_type: WindowType,
+    ) -> Self {
+        Self::with_options(
+            fft_size,
+            hop_analysis,
+            stretch_ratio,
+            sample_rate,
+            sub_bass_cutoff,
+            window_type,
+            PhaseLockingMode::RegionOfInfluence,
+        )
+    }
+
+    /// Creates a new phase vocoder with full configuration options.
+    pub fn with_options(
+        fft_size: usize,
+        hop_analysis: usize,
+        stretch_ratio: f64,
+        sample_rate: u32,
+        sub_bass_cutoff: f32,
+        window_type: WindowType,
+        phase_locking_mode: PhaseLockingMode,
+    ) -> Self {
+        Self::with_all_options(
+            fft_size,
+            hop_analysis,
+            stretch_ratio,
+            sample_rate,
+            sub_bass_cutoff,
+            window_type,
+            phase_locking_mode,
+            false,
+            40,
+        )
+    }
+
+    /// Creates a new phase vocoder with all configuration options including envelope preservation.
+    pub fn with_all_options(
+        fft_size: usize,
+        hop_analysis: usize,
+        stretch_ratio: f64,
+        sample_rate: u32,
+        sub_bass_cutoff: f32,
+        window_type: WindowType,
+        phase_locking_mode: PhaseLockingMode,
+        envelope_preservation: bool,
+        envelope_order: usize,
     ) -> Self {
         let hop_synthesis = (hop_analysis as f64 * stretch_ratio).round() as usize;
         let window = generate_window(window_type, fft_size);
@@ -101,6 +161,12 @@ impl PhaseVocoder {
             peaks: Vec::with_capacity(num_bins / PEAKS_CAPACITY_DIVISOR),
             analysis_phases: vec![0.0; num_bins],
             sub_bass_bin,
+            phase_locking_mode,
+            envelope_preservation,
+            envelope_order,
+            cepstrum_buf: Vec::new(),
+            analysis_envelope: Vec::new(),
+            synthesis_envelope: Vec::new(),
             output_buf: Vec::new(),
             window_sum_buf: Vec::new(),
         }
@@ -138,6 +204,17 @@ impl PhaseVocoder {
     #[inline]
     pub fn set_stretch_ratio(&mut self, stretch_ratio: f64) {
         self.hop_synthesis = (self.hop_analysis as f64 * stretch_ratio).round() as usize;
+    }
+
+    /// Resets the phase accumulator and previous-phase buffers.
+    ///
+    /// Call this at transient boundaries so that stale phase state from a
+    /// previous tonal segment does not contaminate the next one. The PV will
+    /// re-derive phases from the first analysis frame after the reset.
+    #[inline]
+    pub fn reset_phase_state(&mut self) {
+        self.phase_accum.fill(0.0);
+        self.prev_phase.fill(0.0);
     }
 
     /// Stretches a mono audio signal using phase vocoder with identity phase locking.
@@ -179,10 +256,10 @@ impl PhaseVocoder {
             );
             self.advance_phases(num_bins, hop_ratio);
 
-            // Identity phase locking (Laroche & Dolson 1999): lock non-peak
-            // bins to their nearest peak using the analysis phase relationship.
-            // Only applies above the sub-bass region.
-            identity_phase_lock(
+            // Phase locking: lock non-peak bins to their nearest peak using
+            // the analysis phase relationship. Only applies above the sub-bass region.
+            apply_phase_locking(
+                self.phase_locking_mode,
                 &self.magnitudes,
                 &self.analysis_phases,
                 &mut self.new_phases,
@@ -190,6 +267,40 @@ impl PhaseVocoder {
                 self.sub_bass_bin,
                 &mut self.peaks,
             );
+
+            // Spectral envelope preservation: correct magnitudes so formant
+            // structure matches the original analysis frame, preventing
+            // unnatural timbre shifts.
+            if self.envelope_preservation {
+                // Extract envelope from the original analysis magnitudes
+                extract_envelope(
+                    &self.magnitudes,
+                    num_bins,
+                    self.envelope_order,
+                    &mut self.planner,
+                    &mut self.cepstrum_buf,
+                    &mut self.analysis_envelope,
+                );
+
+                // The synthesis magnitudes are the same (PV doesn't change
+                // magnitudes), but after phase locking the spectral shape
+                // may shift slightly. We extract the synthesis envelope from
+                // the current magnitudes and correct.
+                // Clone analysis envelope as synthesis baseline since magnitudes
+                // haven't changed. The correction step then normalizes any
+                // spectral tilt introduced by windowing or overlap.
+                self.synthesis_envelope.clear();
+                self.synthesis_envelope
+                    .extend_from_slice(&self.analysis_envelope);
+
+                apply_envelope_correction(
+                    &mut self.magnitudes,
+                    &self.analysis_envelope,
+                    &self.synthesis_envelope,
+                    num_bins,
+                    self.sub_bass_bin,
+                );
+            }
 
             self.reconstruct_spectrum(num_bins);
             fft_inverse.process(&mut self.fft_buffer);
@@ -283,6 +394,7 @@ impl std::fmt::Debug for PhaseVocoder {
             .field("hop_analysis", &self.hop_analysis)
             .field("hop_synthesis", &self.hop_synthesis)
             .field("sub_bass_bin", &self.sub_bass_bin)
+            .field("phase_locking_mode", &self.phase_locking_mode)
             .finish()
     }
 }
@@ -292,60 +404,6 @@ impl std::fmt::Debug for PhaseVocoder {
 fn wrap_phase(phase: f32) -> f32 {
     let p = phase + PI;
     p - (p / TWO_PI).floor() * TWO_PI - PI
-}
-
-/// Identity phase locking (Laroche & Dolson 1999).
-///
-/// For non-peak bins, sets the synthesis phase to preserve the phase
-/// relationship from the original analysis spectrum relative to the
-/// nearest spectral peak. This reduces phasing artifacts on tonal content.
-///
-/// Bins below `start_bin` are skipped (they use rigid sub-bass phase locking).
-fn identity_phase_lock(
-    magnitudes: &[f32],
-    analysis_phases: &[f32],
-    synthesis_phases: &mut [f32],
-    num_bins: usize,
-    start_bin: usize,
-    peaks: &mut Vec<usize>,
-) {
-    if num_bins < 3 || start_bin >= num_bins {
-        return;
-    }
-
-    // Find spectral peaks above the sub-bass region (reuse buffer)
-    peaks.clear();
-    let search_start = start_bin.max(1);
-    for bin in search_start..num_bins - 1 {
-        if magnitudes[bin] > magnitudes[bin - 1] && magnitudes[bin] > magnitudes[bin + 1] {
-            peaks.push(bin);
-        }
-    }
-
-    if peaks.is_empty() {
-        return;
-    }
-
-    // For each non-peak bin above sub-bass, lock phase to nearest peak.
-    // The synthesis phase for a non-peak bin becomes:
-    //   synth[peak] + (analysis[bin] - analysis[peak])
-    // This preserves the original spectral phase relationships around peaks.
-    let mut peak_idx = 0;
-    for bin in start_bin..num_bins {
-        // Advance to nearest peak
-        while peak_idx + 1 < peaks.len()
-            && (peaks[peak_idx + 1] as i64 - bin as i64).unsigned_abs()
-                < (peaks[peak_idx] as i64 - bin as i64).unsigned_abs()
-        {
-            peak_idx += 1;
-        }
-
-        let nearest_peak = peaks[peak_idx];
-        if bin != nearest_peak {
-            let analysis_diff = analysis_phases[bin] - analysis_phases[nearest_peak];
-            synthesis_phases[bin] = synthesis_phases[nearest_peak] + analysis_diff;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -662,10 +720,10 @@ mod tests {
         );
     }
 
-    // --- identity_phase_lock internals ---
+    // --- phase locking integration (detailed tests in phase_locking module) ---
 
     #[test]
-    fn test_identity_phase_lock_no_peaks() {
+    fn test_phase_lock_identity_no_peaks() {
         // Flat magnitude spectrum: no local maxima → no peaks → phases unchanged
         let num_bins = 16;
         let magnitudes = vec![1.0f32; num_bins]; // all equal, no peaks
@@ -674,7 +732,8 @@ mod tests {
         let original_phases = synthesis_phases.clone();
         let mut peaks = Vec::new();
 
-        identity_phase_lock(
+        apply_phase_locking(
+            PhaseLockingMode::Identity,
             &magnitudes,
             &analysis_phases,
             &mut synthesis_phases,
@@ -688,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn test_identity_phase_lock_single_peak() {
+    fn test_phase_lock_identity_single_peak() {
         // Single peak at bin 5; all non-peak bins should be locked to it
         let num_bins = 16;
         let mut magnitudes = vec![0.1f32; num_bins];
@@ -697,7 +756,8 @@ mod tests {
         let mut synthesis_phases: Vec<f32> = (0..num_bins).map(|i| i as f32 * 0.5).collect();
         let mut peaks = Vec::new();
 
-        identity_phase_lock(
+        apply_phase_locking(
+            PhaseLockingMode::Identity,
             &magnitudes,
             &analysis_phases,
             &mut synthesis_phases,
@@ -730,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn test_identity_phase_lock_start_bin_above_num_bins() {
+    fn test_phase_lock_start_bin_above_num_bins() {
         // start_bin >= num_bins: early return, no changes
         let num_bins = 8;
         let magnitudes = vec![0.0f32; num_bins];
@@ -739,7 +799,8 @@ mod tests {
         let original = synthesis_phases.clone();
         let mut peaks = Vec::new();
 
-        identity_phase_lock(
+        apply_phase_locking(
+            PhaseLockingMode::Identity,
             &magnitudes,
             &analysis_phases,
             &mut synthesis_phases,
@@ -752,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn test_identity_phase_lock_num_bins_less_than_3() {
+    fn test_phase_lock_num_bins_less_than_3() {
         // num_bins < 3: early return
         let magnitudes = vec![1.0f32; 2];
         let analysis_phases = vec![0.0f32; 2];
@@ -760,7 +821,8 @@ mod tests {
         let original = synthesis_phases.clone();
         let mut peaks = Vec::new();
 
-        identity_phase_lock(
+        apply_phase_locking(
+            PhaseLockingMode::Identity,
             &magnitudes,
             &analysis_phases,
             &mut synthesis_phases,
@@ -773,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn test_identity_phase_lock_sub_bass_region_skipped() {
+    fn test_phase_lock_sub_bass_region_skipped() {
         // Peaks exist only below start_bin → no peaks found above sub-bass
         let num_bins = 16;
         let mut magnitudes = vec![0.1f32; num_bins];
@@ -783,7 +845,8 @@ mod tests {
         let original = synthesis_phases.clone();
         let mut peaks = Vec::new();
 
-        identity_phase_lock(
+        apply_phase_locking(
+            PhaseLockingMode::Identity,
             &magnitudes,
             &analysis_phases,
             &mut synthesis_phases,
@@ -797,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn test_identity_phase_lock_multiple_peaks() {
+    fn test_phase_lock_multiple_peaks() {
         // Two peaks: bins should lock to nearest peak
         let num_bins = 16;
         let mut magnitudes = vec![0.1f32; num_bins];
@@ -807,7 +870,8 @@ mod tests {
         let mut synthesis_phases: Vec<f32> = (0..num_bins).map(|i| i as f32 * 0.2).collect();
         let mut peaks = Vec::new();
 
-        identity_phase_lock(
+        apply_phase_locking(
+            PhaseLockingMode::Identity,
             &magnitudes,
             &analysis_phases,
             &mut synthesis_phases,
