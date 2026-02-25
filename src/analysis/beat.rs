@@ -278,6 +278,118 @@ fn quantize_to_grid_pll(onsets: &[f64], _intervals: &[f64], initial_interval: f6
     grid
 }
 
+/// Generate a grid of beat subdivision positions (e.g., 1/16th notes) from BPM.
+///
+/// Returns sample positions (as `f64` for sub-sample precision) for every
+/// subdivision within the given duration.
+///
+/// # Parameters
+/// - `bpm`: Tempo in beats per minute.
+/// - `sample_rate`: Audio sample rate in Hz.
+/// - `total_samples`: Total duration in samples; the grid stops before this.
+/// - `subdivision`: Number of subdivisions per beat (e.g., 16 for 1/16th notes).
+///
+/// # Example
+///
+/// ```
+/// use timestretch::analysis::beat::generate_subdivision_grid;
+///
+/// // 120 BPM, 44100 Hz, 1 second, 1/16th notes
+/// let grid = generate_subdivision_grid(120.0, 44100, 44100, 16);
+/// // 120 BPM = 2 beats/sec => 32 subdivisions per second
+/// // 32 * (22050/16) = 44100.0, which is not < 44100, so 32 entries (0..31)
+/// assert_eq!(grid.len(), 32);
+/// ```
+pub fn generate_subdivision_grid(
+    bpm: f64,
+    sample_rate: u32,
+    total_samples: usize,
+    subdivision: u32,
+) -> Vec<f64> {
+    if bpm <= 0.0 || subdivision == 0 || total_samples == 0 {
+        return Vec::new();
+    }
+    let beat_interval_samples = 60.0 * sample_rate as f64 / bpm;
+    let sub_interval = beat_interval_samples / subdivision as f64;
+    if sub_interval <= 0.0 {
+        return Vec::new();
+    }
+    let estimated_count = (total_samples as f64 / sub_interval).ceil() as usize + 1;
+    let mut grid = Vec::with_capacity(estimated_count);
+    let mut pos = 0.0;
+    while pos < total_samples as f64 {
+        grid.push(pos);
+        pos += sub_interval;
+    }
+    grid
+}
+
+/// Snap a transient position to the nearest beat subdivision.
+///
+/// Returns `Some(snapped_position)` if a subdivision is within `tolerance_samples`,
+/// or `None` if no subdivision is close enough (transient should be suppressed).
+///
+/// Uses binary search for efficient lookup in sorted grids.
+///
+/// # Parameters
+/// - `position`: The transient position in samples.
+/// - `grid`: Sorted grid of subdivision positions (from [`generate_subdivision_grid`]).
+/// - `tolerance_samples`: Maximum distance (in samples) for snapping.
+///
+/// # Example
+///
+/// ```
+/// use timestretch::analysis::beat::snap_to_subdivision;
+///
+/// let grid = vec![0.0, 1000.0, 2000.0, 3000.0];
+/// // Position 1005 is 5 samples from grid point 1000
+/// assert_eq!(snap_to_subdivision(1005.0, &grid, 10.0), Some(1000.0));
+/// // Position 1500 is 500 samples from any grid point — too far
+/// assert_eq!(snap_to_subdivision(1500.0, &grid, 10.0), None);
+/// ```
+pub fn snap_to_subdivision(position: f64, grid: &[f64], tolerance_samples: f64) -> Option<f64> {
+    if grid.is_empty() {
+        return None;
+    }
+
+    // Binary search for the insertion point
+    let idx = grid.partition_point(|&g| g < position);
+
+    let mut best_dist = f64::MAX;
+    let mut best_pos = position;
+
+    // Check the grid point before and at the insertion point
+    for &check_idx in &[idx.saturating_sub(1), idx] {
+        if check_idx < grid.len() {
+            let dist = (grid[check_idx] - position).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best_pos = grid[check_idx];
+            }
+        }
+    }
+
+    if best_dist <= tolerance_samples {
+        Some(best_pos)
+    } else {
+        None // No nearby subdivision — suppress this transient
+    }
+}
+
+/// Returns the default beat subdivision for a given preset and stretch ratio.
+///
+/// Different presets use different granularity:
+/// - Default / DjBeatmatch / HouseLoop / VocalChop: 16 (1/16th notes)
+/// - Halftime: 8 (1/8th notes) since time is doubled
+/// - Ambient: 4 (quarter notes) since the material is very slow
+pub fn default_subdivision_for_preset(preset: Option<crate::core::types::EdmPreset>) -> u32 {
+    match preset {
+        Some(crate::core::types::EdmPreset::Halftime) => 8,
+        Some(crate::core::types::EdmPreset::Ambient) => 4,
+        _ => 16,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,5 +696,238 @@ mod tests {
             grid.beats_fractional.len(),
             "beats and beats_fractional should have same length"
         );
+    }
+
+    // --- generate_subdivision_grid ---
+
+    #[test]
+    fn test_generate_subdivision_grid_120bpm_1sec() {
+        // 120 BPM = 2 beats/sec, 16 subdivisions per beat = 32 per second
+        let grid = generate_subdivision_grid(120.0, 44100, 44100, 16);
+        // sub_interval = 22050/16 = 1378.125 samples
+        // positions: 0, 1378.125, 2756.25, ... up to < 44100
+        // 32 * 1378.125 = 44100.0 which is NOT < 44100 (strictly less)
+        // So positions 0..31 = 32 entries
+        assert_eq!(
+            grid.len(),
+            32,
+            "Expected 32 subdivision positions, got {}",
+            grid.len()
+        );
+        assert!((grid[0] - 0.0).abs() < 1e-10, "First position should be 0");
+        // Check spacing is consistent
+        let expected_interval = 60.0 * 44100.0 / 120.0 / 16.0; // 1378.125
+        for i in 1..grid.len() {
+            let interval = grid[i] - grid[i - 1];
+            assert!(
+                (interval - expected_interval).abs() < 1e-6,
+                "Interval {} at position {} should be {}, got {}",
+                i,
+                grid[i],
+                expected_interval,
+                interval
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_subdivision_grid_zero_bpm() {
+        let grid = generate_subdivision_grid(0.0, 44100, 44100, 16);
+        assert!(grid.is_empty());
+    }
+
+    #[test]
+    fn test_generate_subdivision_grid_zero_subdivision() {
+        let grid = generate_subdivision_grid(120.0, 44100, 44100, 0);
+        assert!(grid.is_empty());
+    }
+
+    #[test]
+    fn test_generate_subdivision_grid_zero_samples() {
+        let grid = generate_subdivision_grid(120.0, 44100, 0, 16);
+        assert!(grid.is_empty());
+    }
+
+    #[test]
+    fn test_generate_subdivision_grid_quarter_notes() {
+        // 128 BPM, 48000 Hz, 2 seconds, quarter notes (subdivision=1)
+        let grid = generate_subdivision_grid(128.0, 48000, 96000, 1);
+        // beat interval = 60*48000/128 = 22500 samples
+        // positions: 0, 22500, 45000, 67500, 90000 (all < 96000)
+        assert_eq!(
+            grid.len(),
+            5,
+            "Expected 5 beat positions, got {}",
+            grid.len()
+        );
+    }
+
+    // --- snap_to_subdivision ---
+
+    #[test]
+    fn test_snap_to_subdivision_exact_on_grid() {
+        let grid = vec![0.0, 1000.0, 2000.0, 3000.0];
+        let result = snap_to_subdivision(1000.0, &grid, 220.0);
+        assert_eq!(result, Some(1000.0));
+    }
+
+    #[test]
+    fn test_snap_to_subdivision_within_tolerance() {
+        // 3ms at 44100 Hz ~= 132 samples
+        let grid = vec![0.0, 1000.0, 2000.0, 3000.0];
+        let tolerance = 44100.0 * 0.005; // 5ms = 220.5 samples
+        let result = snap_to_subdivision(1132.0, &grid, tolerance);
+        assert_eq!(
+            result,
+            Some(1000.0),
+            "Should snap to 1000 (132 samples away, within 220 tolerance)"
+        );
+    }
+
+    #[test]
+    fn test_snap_to_subdivision_outside_tolerance() {
+        // 10ms at 44100 Hz = 441 samples
+        let grid = vec![0.0, 1000.0, 2000.0, 3000.0];
+        let tolerance = 44100.0 * 0.005; // 5ms = 220.5 samples
+        let result = snap_to_subdivision(1441.0, &grid, tolerance);
+        assert_eq!(
+            result, None,
+            "Should suppress (441 samples away, outside 220 tolerance)"
+        );
+    }
+
+    #[test]
+    fn test_snap_to_subdivision_empty_grid() {
+        let result = snap_to_subdivision(1000.0, &[], 220.0);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_snap_to_subdivision_snaps_to_nearest() {
+        // Position closer to second grid point than first
+        let grid = vec![0.0, 1000.0, 2000.0];
+        let result = snap_to_subdivision(1800.0, &grid, 250.0);
+        assert_eq!(
+            result,
+            Some(2000.0),
+            "Should snap to 2000 (200 away), not 1000 (800 away)"
+        );
+    }
+
+    #[test]
+    fn test_snap_to_subdivision_first_position() {
+        let grid = vec![0.0, 1000.0, 2000.0];
+        let result = snap_to_subdivision(50.0, &grid, 100.0);
+        assert_eq!(result, Some(0.0));
+    }
+
+    #[test]
+    fn test_snap_to_subdivision_last_position() {
+        let grid = vec![0.0, 1000.0, 2000.0];
+        let result = snap_to_subdivision(1990.0, &grid, 100.0);
+        assert_eq!(result, Some(2000.0));
+    }
+
+    // --- default_subdivision_for_preset ---
+
+    #[test]
+    fn test_default_subdivision_for_preset() {
+        use crate::core::types::EdmPreset;
+        assert_eq!(default_subdivision_for_preset(None), 16);
+        assert_eq!(
+            default_subdivision_for_preset(Some(EdmPreset::DjBeatmatch)),
+            16
+        );
+        assert_eq!(
+            default_subdivision_for_preset(Some(EdmPreset::HouseLoop)),
+            16
+        );
+        assert_eq!(default_subdivision_for_preset(Some(EdmPreset::Halftime)), 8);
+        assert_eq!(default_subdivision_for_preset(Some(EdmPreset::Ambient)), 4);
+        assert_eq!(
+            default_subdivision_for_preset(Some(EdmPreset::VocalChop)),
+            16
+        );
+    }
+
+    // --- Integration test: beat-grid snapping end-to-end ---
+
+    #[test]
+    fn test_snap_transients_to_beat_grid_integration() {
+        // Generate a 128 BPM kick pattern: clicks exactly on every beat
+        let sample_rate = 44100u32;
+        let bpm = 128.0;
+        let num_samples = sample_rate as usize * 2; // 2 seconds
+        let beat_interval = (60.0 * sample_rate as f64 / bpm) as usize; // ~20671 samples
+
+        let mut samples = vec![0.0f32; num_samples];
+        let mut true_beat_positions = Vec::new();
+        for beat in 0..5 {
+            let pos = beat * beat_interval;
+            if pos >= num_samples {
+                break;
+            }
+            true_beat_positions.push(pos);
+            // Strong click at beat position
+            for j in 0..20.min(num_samples - pos) {
+                samples[pos + j] = if j < 5 { 1.0 } else { -0.5 };
+            }
+        }
+
+        // Detect transients
+        let transients =
+            crate::analysis::transient::detect_transients(&samples, sample_rate, 2048, 512, 0.4);
+
+        // Generate subdivision grid and snap
+        let grid = generate_subdivision_grid(bpm, sample_rate, num_samples, 16);
+        let tolerance = sample_rate as f64 * 0.005; // 5ms
+
+        let snapped: Vec<usize> = transients
+            .onsets
+            .iter()
+            .filter_map(|&onset| {
+                snap_to_subdivision(onset as f64, &grid, tolerance).map(|s| s.round() as usize)
+            })
+            .collect();
+
+        // Every snapped position should be within 2ms of a true beat position
+        let tolerance_2ms = (sample_rate as f64 * 0.002) as usize;
+        for &snapped_pos in &snapped {
+            let near_beat = true_beat_positions.iter().any(|&beat| {
+                snapped_pos.abs_diff(beat) <= tolerance_2ms || {
+                    // Also check if it's near a subdivision of a beat
+                    let sub_interval = beat_interval as f64 / 16.0;
+                    let nearest_sub = (snapped_pos as f64 / sub_interval).round() * sub_interval;
+                    (snapped_pos as f64 - nearest_sub).abs() <= tolerance_2ms as f64
+                }
+            });
+            assert!(
+                near_beat,
+                "Snapped position {} should be near a beat subdivision",
+                snapped_pos
+            );
+        }
+    }
+
+    #[test]
+    fn test_snap_preserves_dedup() {
+        // Multiple transients snapping to the same subdivision should deduplicate
+        let grid = vec![0.0, 1000.0, 2000.0, 3000.0];
+        let tolerance = 300.0;
+        let transients = [990, 1010]; // Both near grid point 1000
+
+        let mut snapped: Vec<usize> = transients
+            .iter()
+            .filter_map(|&onset| {
+                snap_to_subdivision(onset as f64, &grid, tolerance).map(|s| s.round() as usize)
+            })
+            .collect();
+        snapped.dedup();
+        assert_eq!(
+            snapped.len(),
+            1,
+            "Duplicate snapped positions should be deduplicated"
+        );
+        assert_eq!(snapped[0], 1000);
     }
 }

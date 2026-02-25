@@ -1,6 +1,8 @@
 //! Hybrid stretcher combining WSOLA (transients) with phase vocoder (tonal content).
 
-use crate::analysis::beat::detect_beats;
+use crate::analysis::beat::{
+    default_subdivision_for_preset, detect_beats, generate_subdivision_grid, snap_to_subdivision,
+};
 use crate::analysis::frequency::freq_to_bin;
 use crate::analysis::hpss::{hpss, HpssParams};
 use crate::analysis::transient::detect_transients;
@@ -8,6 +10,7 @@ use crate::core::fft::{COMPLEX_ZERO, WINDOW_SUM_EPSILON, WINDOW_SUM_FLOOR_RATIO}
 use crate::core::types::StretchParams;
 use crate::core::window::{generate_window, WindowType};
 use crate::error::StretchError;
+use crate::stretch::multi_resolution::MultiResolutionStretcher;
 use crate::stretch::phase_vocoder::PhaseVocoder;
 use crate::stretch::wsola::Wsola;
 use rustfft::{num_complex::Complex, FftPlanner};
@@ -33,14 +36,6 @@ const BAND_SPLIT_HOP: usize = BAND_SPLIT_FFT_SIZE / 4;
 /// Minimum distance (samples) between merged onset/beat positions.
 /// Positions closer than this are considered duplicates.
 const DEDUP_DISTANCE: usize = 512;
-/// Crossover frequency (Hz) for multi-resolution FFT processing.
-/// Below this, a larger FFT is used; above this, a smaller FFT provides
-/// better temporal resolution for transient-rich high-frequency content.
-const MULTI_RES_CROSSOVER_HZ: f32 = 3000.0;
-/// FFT size for the high-frequency band in multi-resolution mode.
-/// Half the default 4096, giving 2x better temporal resolution at the cost
-/// of 2x worse frequency resolution (acceptable above 4 kHz).
-const MULTI_RES_HIGH_FFT_SIZE: usize = 2048;
 
 /// Transient-aware hybrid stretcher.
 ///
@@ -164,6 +159,55 @@ impl HybridStretcher {
                 (&transients.onsets, &transients.strengths)
             };
 
+        // Step 1c: When BPM is known, snap transient positions to the nearest
+        // beat subdivision. This prevents glitches at musically incoherent
+        // boundaries. Only existing detected transients are snapped — no new
+        // cuts are introduced at empty beat positions.
+        let snapped_onsets;
+        let snapped_strengths;
+        let (onsets, strengths): (&[usize], &[f32]) = if let Some(bpm) = self.params.bpm {
+            let tolerance_samples = self.params.sample_rate as f64 * 0.005; // 5ms
+            let subdivision = default_subdivision_for_preset(self.params.preset);
+            let beat_grid =
+                generate_subdivision_grid(bpm, self.params.sample_rate, input.len(), subdivision);
+
+            // Snap each transient, keeping only those near a subdivision.
+            // Collect snapped positions and corresponding strengths together
+            // to preserve the strength association. Dedup consecutive duplicates
+            // (multiple transients snapping to the same grid point).
+            let mut last_snapped: Option<usize> = None;
+            let mut new_onsets = Vec::with_capacity(onsets.len());
+            let mut new_strengths = Vec::with_capacity(strengths.len());
+            for (i, &onset) in onsets.iter().enumerate() {
+                if let Some(snapped) =
+                    snap_to_subdivision(onset as f64, &beat_grid, tolerance_samples)
+                {
+                    let snapped_usize = snapped.round() as usize;
+                    // Deduplicate: skip if this snaps to the same position as the previous
+                    if last_snapped == Some(snapped_usize) {
+                        continue;
+                    }
+                    last_snapped = Some(snapped_usize);
+                    new_onsets.push(snapped_usize);
+                    if i < strengths.len() {
+                        new_strengths.push(strengths[i]);
+                    }
+                }
+            }
+            snapped_onsets = new_onsets;
+            snapped_strengths = new_strengths;
+            (
+                &snapped_onsets,
+                if snapped_strengths.is_empty() {
+                    &[]
+                } else {
+                    &snapped_strengths
+                },
+            )
+        } else {
+            (onsets, strengths)
+        };
+
         // Step 2: Segment audio at transient/beat boundaries
         let mut segments = self.segment_audio(input.len(), onsets, strengths);
 
@@ -188,20 +232,13 @@ impl HybridStretcher {
             self.params.phase_locking_mode,
         );
 
-        // Create a second PV with smaller FFT for multi-resolution high-band processing
-        let mut pv_high = if self.params.multi_resolution {
-            // Compute high-band hop to maintain the same overlap ratio as the main PV
-            let high_hop = (self.params.hop_size as f64 * MULTI_RES_HIGH_FFT_SIZE as f64
-                / self.params.fft_size as f64)
-                .round() as usize;
-            Some(PhaseVocoder::with_options(
-                MULTI_RES_HIGH_FFT_SIZE,
-                high_hop,
+        // Multi-resolution: 3-band filterbank stretcher (sub-bass / mid / high)
+        let mut multi_res = if self.params.multi_resolution {
+            Some(MultiResolutionStretcher::new(
+                self.params.fft_size,
                 self.params.stretch_ratio,
                 self.params.sample_rate,
                 self.params.sub_bass_cutoff,
-                self.params.window_type,
-                self.params.phase_locking_mode,
             ))
         } else {
             None
@@ -216,7 +253,7 @@ impl HybridStretcher {
                 segment.is_transient,
                 segment.stretch_ratio,
                 &mut pv,
-                &mut pv_high,
+                &mut multi_res,
             );
             output_segments.push(stretched);
 
@@ -229,21 +266,21 @@ impl HybridStretcher {
                 if reset_mask == [true; 4] {
                     // Full reset (fallback for beat-merged onsets or when all bands active)
                     pv.reset_phase_state();
-                    if let Some(ref mut pv_h) = pv_high {
-                        pv_h.reset_phase_state();
+                    if let Some(ref mut mr) = multi_res {
+                        mr.reset_phase_state();
                     }
                 } else {
                     pv.reset_phase_state_bands(reset_mask, self.params.sample_rate);
-                    if let Some(ref mut pv_h) = pv_high {
-                        pv_h.reset_phase_state_bands(reset_mask, self.params.sample_rate);
+                    if let Some(ref mut mr) = multi_res {
+                        mr.reset_phase_state_bands(reset_mask, self.params.sample_rate);
                     }
                 }
             }
 
             // Restore global ratio on PV for next segment (elastic may have changed it)
             pv.set_stretch_ratio(self.params.stretch_ratio);
-            if let Some(ref mut pv_h) = pv_high {
-                pv_h.set_stretch_ratio(self.params.stretch_ratio);
+            if let Some(ref mut mr) = multi_res {
+                mr.set_stretch_ratio(self.params.stretch_ratio);
             }
         }
 
@@ -285,8 +322,8 @@ impl HybridStretcher {
     /// - Very short segments (<256 samples) fall back to linear resampling
     /// - Transient segments use onset-aligned stretching (direct-copy attack + WSOLA decay)
     /// - Tonal segments long enough for FFT use the phase vocoder
-    /// - When multi-resolution is enabled, tonal segments are split into low/high
-    ///   bands and processed with different FFT sizes
+    /// - When multi-resolution is enabled, tonal segments use the 3-band
+    ///   [`MultiResolutionStretcher`] (sub-bass/mid/high with different FFT sizes)
     /// - Everything else (short tonal) uses WSOLA
     /// - On error, falls back to linear resampling
     ///
@@ -298,7 +335,7 @@ impl HybridStretcher {
         is_transient: bool,
         seg_ratio: f64,
         pv: &mut PhaseVocoder,
-        pv_high: &mut Option<PhaseVocoder>,
+        multi_res: &mut Option<MultiResolutionStretcher>,
     ) -> Vec<f32> {
         let out_len = (seg_data.len() as f64 * seg_ratio).round() as usize;
 
@@ -313,8 +350,8 @@ impl HybridStretcher {
 
         // Set the PV ratio for this segment
         pv.set_stretch_ratio(seg_ratio);
-        if let Some(ref mut pv_h) = pv_high {
-            pv_h.set_stretch_ratio(seg_ratio);
+        if let Some(ref mut mr) = multi_res {
+            mr.set_stretch_ratio(seg_ratio);
         }
 
         let use_phase_vocoder = seg_data.len() >= self.params.fft_size;
@@ -327,22 +364,12 @@ impl HybridStretcher {
             // Fall through to normal path if HPSS fails
         }
 
-        // Multi-resolution path: split tonal segments into low/high bands
-        if use_phase_vocoder && pv_high.is_some() {
-            let result =
-                self.process_tonal_multi_resolution(seg_data, pv, pv_high.as_mut().unwrap());
-            return result.unwrap_or_else(|_| {
-                crate::core::resample::resample_linear(seg_data, out_len.max(1))
-            });
-        }
-
-        // For segments too short for the main FFT but long enough for the
-        // high-band FFT, use the smaller PV when multi-resolution is enabled.
-        if seg_data.len() >= MULTI_RES_HIGH_FFT_SIZE
-            && seg_data.len() < self.params.fft_size
-            && pv_high.is_some()
-        {
-            let result = pv_high.as_mut().unwrap().process(seg_data);
+        // Multi-resolution 3-band path: split into sub-bass/mid/high, process each
+        // with different FFT sizes for optimal time-frequency resolution per band.
+        if multi_res.is_some() {
+            // The multi-resolution stretcher handles its own minimum-length logic
+            // internally (falls back to linear resample per-band if too short).
+            let result = multi_res.as_mut().unwrap().process(seg_data);
             return result.unwrap_or_else(|_| {
                 crate::core::resample::resample_linear(seg_data, out_len.max(1))
             });
@@ -520,52 +547,6 @@ impl HybridStretcher {
             .max(MIN_WSOLA_SEARCH);
         let mut wsola = Wsola::new(seg_size, search, ratio);
         wsola.process(seg_data)
-    }
-
-    /// Processes a tonal segment using multi-resolution FFT.
-    ///
-    /// Splits the segment into low (0-4 kHz) and high (4 kHz+) frequency bands,
-    /// processes the low band with the main PV (large FFT for frequency resolution)
-    /// and the high band with a smaller PV (better temporal resolution), then sums
-    /// the results.
-    fn process_tonal_multi_resolution(
-        &self,
-        seg_data: &[f32],
-        pv_low: &mut PhaseVocoder,
-        pv_high: &mut PhaseVocoder,
-    ) -> Result<Vec<f32>, StretchError> {
-        let (low_band, high_band) =
-            separate_bands(seg_data, MULTI_RES_CROSSOVER_HZ, self.params.sample_rate);
-
-        // Process low band (0-4kHz) with the main 4096 PV
-        let low_stretched = if low_band.len() >= self.params.fft_size {
-            pv_low.process(&low_band)?
-        } else {
-            let out_len = self.params.output_length(low_band.len()).max(1);
-            crate::core::resample::resample_linear(&low_band, out_len)
-        };
-
-        // Process high band (4kHz+) with the smaller 2048 PV
-        let high_stretched = if high_band.len() >= MULTI_RES_HIGH_FFT_SIZE {
-            pv_high.process(&high_band)?
-        } else {
-            let out_len = self.params.output_length(high_band.len()).max(1);
-            crate::core::resample::resample_linear(&high_band, out_len)
-        };
-
-        // Sum the two bands (zero-pad the shorter one to the longer length)
-        let out_len = low_stretched.len().max(high_stretched.len());
-        let zeros = std::iter::repeat(0.0f32);
-        let output: Vec<f32> = low_stretched
-            .iter()
-            .copied()
-            .chain(zeros.clone())
-            .zip(high_stretched.iter().copied().chain(zeros))
-            .take(out_len)
-            .map(|(l, h)| l + h)
-            .collect();
-
-        Ok(output)
     }
 
     /// Segments audio into transient and tonal regions.
@@ -915,65 +896,6 @@ fn separate_sub_bass(input: &[f32], cutoff_hz: f32, sample_rate: u32) -> (Vec<f3
 
     normalize_band_split(&mut sub_bass, &mut remainder, &window_sum);
     (sub_bass, remainder)
-}
-
-/// Separates audio into low and high frequency bands using FFT-based overlap-add filtering.
-///
-/// Uses the same approach as [`separate_sub_bass()`] but with a configurable crossover
-/// frequency (typically ~4000 Hz for multi-resolution processing).
-///
-/// Returns `(low_band, high_band)` where low contains everything below `crossover_hz`
-/// and high contains everything at or above `crossover_hz`. Both outputs have the same
-/// length as the input.
-fn separate_bands(input: &[f32], crossover_hz: f32, sample_rate: u32) -> (Vec<f32>, Vec<f32>) {
-    let fft_size = BAND_SPLIT_FFT_SIZE;
-    let hop = BAND_SPLIT_HOP;
-    let cutoff_bin = freq_to_bin(crossover_hz, fft_size, sample_rate);
-
-    if cutoff_bin == 0 || input.len() < fft_size {
-        return (input.to_vec(), vec![0.0; input.len()]);
-    }
-
-    let window = generate_window(WindowType::Hann, fft_size);
-    let mut planner = FftPlanner::new();
-    let fft_fwd = planner.plan_fft_forward(fft_size);
-    let fft_inv = planner.plan_fft_inverse(fft_size);
-    let norm = 1.0 / fft_size as f32;
-
-    let mut low_band = vec![0.0f32; input.len()];
-    let mut high_band = vec![0.0f32; input.len()];
-    let mut window_sum = vec![0.0f32; input.len()];
-
-    let num_frames = if input.len() <= fft_size {
-        1
-    } else {
-        (input.len() - fft_size) / hop + 1
-    };
-
-    let mut fft_buf = vec![COMPLEX_ZERO; fft_size];
-    let mut fft_buf2 = vec![COMPLEX_ZERO; fft_size];
-
-    for frame in 0..num_frames {
-        let pos = frame * hop;
-        let frame_end = (pos + fft_size).min(input.len());
-        let frame_len = frame_end - pos;
-
-        window_and_transform(&input[pos..frame_end], &window, &mut fft_buf, &fft_fwd);
-        split_bands(&mut fft_buf, &mut fft_buf2, fft_size, cutoff_bin);
-        fft_inv.process(&mut fft_buf);
-        fft_inv.process(&mut fft_buf2);
-
-        // Overlap-add with synthesis window
-        for i in 0..frame_len {
-            let out_idx = pos + i;
-            low_band[out_idx] += fft_buf[i].re * norm * window[i];
-            high_band[out_idx] += fft_buf2[i].re * norm * window[i];
-            window_sum[out_idx] += window[i] * window[i];
-        }
-    }
-
-    normalize_band_split(&mut low_band, &mut high_band, &window_sum);
-    (low_band, high_band)
 }
 
 /// Windows an input frame into the FFT buffer and transforms to frequency domain.
@@ -1892,5 +1814,176 @@ mod tests {
         let output = stretcher.process(&input).unwrap();
         assert!(!output.is_empty());
         assert!(output.iter().all(|s| s.is_finite()));
+    }
+
+    // --- BPM-aware transient snapping tests ---
+
+    #[test]
+    fn test_bpm_snapping_no_bpm_is_noop() {
+        // Without BPM set, the hybrid stretcher should work exactly as before
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+        let mut input = vec![0.0f32; num_samples];
+
+        // Add clicks every 0.5 seconds
+        for beat in 0..4 {
+            let pos = (beat as f64 * 0.5 * sample_rate as f64) as usize;
+            for j in 0..20.min(num_samples - pos) {
+                input[pos + j] = if j < 5 { 0.8 } else { -0.3 };
+            }
+        }
+        for (i, sample) in input.iter_mut().enumerate() {
+            *sample += 0.3 * (2.0 * PI * 200.0 * i as f32 / sample_rate as f32).sin();
+        }
+
+        // No BPM set (default)
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(1);
+        assert!(params.bpm.is_none());
+
+        let stretcher = HybridStretcher::new(params);
+        let output = stretcher.process(&input).unwrap();
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_bpm_snapping_with_bpm_set() {
+        // With BPM set, the hybrid stretcher should produce valid output
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+        let bpm = 120.0;
+        let beat_interval = (60.0 * sample_rate as f64 / bpm) as usize;
+
+        let mut input = vec![0.0f32; num_samples];
+
+        // Add kicks at beat positions
+        for beat in 0..5 {
+            let pos = beat * beat_interval;
+            if pos >= num_samples {
+                break;
+            }
+            for j in 0..20.min(num_samples - pos) {
+                input[pos + j] = if j < 5 { 0.9 } else { -0.4 };
+            }
+        }
+        for (i, sample) in input.iter_mut().enumerate() {
+            *sample += 0.3 * (2.0 * PI * 200.0 * i as f32 / sample_rate as f32).sin();
+        }
+
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_bpm(bpm);
+        assert_eq!(params.bpm, Some(bpm));
+
+        let stretcher = HybridStretcher::new(params);
+        let output = stretcher.process(&input).unwrap();
+        assert!(!output.is_empty());
+
+        let len_ratio = output.len() as f64 / input.len() as f64;
+        assert!(
+            (len_ratio - 1.5).abs() < 0.3,
+            "Length ratio {} too far from 1.5",
+            len_ratio
+        );
+    }
+
+    #[test]
+    fn test_bpm_snapping_with_preset_and_bpm() {
+        // Combine a preset with BPM for full integration
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+        let bpm = 128.0;
+        let beat_interval = (60.0 * sample_rate as f64 / bpm) as usize;
+
+        let mut input = vec![0.0f32; num_samples];
+        for beat in 0..5 {
+            let pos = beat * beat_interval;
+            if pos >= num_samples {
+                break;
+            }
+            for j in 0..20.min(num_samples - pos) {
+                input[pos + j] = if j < 5 { 0.9 } else { -0.4 };
+            }
+        }
+        for (i, sample) in input.iter_mut().enumerate() {
+            *sample += 0.3 * (2.0 * PI * 200.0 * i as f32 / sample_rate as f32).sin();
+        }
+
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_preset(EdmPreset::DjBeatmatch)
+            .with_bpm(bpm);
+        assert_eq!(params.bpm, Some(bpm));
+
+        let stretcher = HybridStretcher::new(params);
+        let output = stretcher.process(&input).unwrap();
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_bpm_snapping_halftime_uses_eighth_notes() {
+        // Halftime preset should use subdivision=8 (1/8th notes)
+        use crate::analysis::beat::default_subdivision_for_preset;
+        let sub = default_subdivision_for_preset(Some(EdmPreset::Halftime));
+        assert_eq!(sub, 8, "Halftime should use 1/8th note subdivisions");
+    }
+
+    #[test]
+    fn test_bpm_snapping_ambient_uses_quarter_notes() {
+        // Ambient preset should use subdivision=4 (quarter notes)
+        use crate::analysis::beat::default_subdivision_for_preset;
+        let sub = default_subdivision_for_preset(Some(EdmPreset::Ambient));
+        assert_eq!(sub, 4, "Ambient should use quarter note subdivisions");
+    }
+
+    #[test]
+    fn test_bpm_snapping_backward_compatible_output() {
+        // Output with BPM snapping should be similar length to output without it
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+        let bpm = 128.0;
+        let beat_interval = (60.0 * sample_rate as f64 / bpm) as usize;
+
+        let mut input = vec![0.0f32; num_samples];
+        for beat in 0..5 {
+            let pos = beat * beat_interval;
+            if pos >= num_samples {
+                break;
+            }
+            for j in 0..20.min(num_samples - pos) {
+                input[pos + j] = if j < 5 { 0.9 } else { -0.4 };
+            }
+        }
+        for (i, sample) in input.iter_mut().enumerate() {
+            *sample += 0.3 * (2.0 * PI * 200.0 * i as f32 / sample_rate as f32).sin();
+        }
+
+        // Without BPM
+        let params_no_bpm = StretchParams::new(1.3)
+            .with_sample_rate(sample_rate)
+            .with_channels(1);
+        let stretcher_no_bpm = HybridStretcher::new(params_no_bpm);
+        let output_no_bpm = stretcher_no_bpm.process(&input).unwrap();
+
+        // With BPM
+        let params_bpm = StretchParams::new(1.3)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_bpm(bpm);
+        let stretcher_bpm = HybridStretcher::new(params_bpm);
+        let output_bpm = stretcher_bpm.process(&input).unwrap();
+
+        // Both should produce output of similar length (within 20%)
+        let ratio = output_bpm.len() as f64 / output_no_bpm.len() as f64;
+        assert!(
+            (0.8..=1.2).contains(&ratio),
+            "BPM-snapped output length ({}) should be similar to non-snapped ({}), ratio={}",
+            output_bpm.len(),
+            output_no_bpm.len(),
+            ratio
+        );
     }
 }

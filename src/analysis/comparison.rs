@@ -1152,6 +1152,136 @@ pub fn generate_quality_report(
     }
 }
 
+/// Result of beat grid regularity comparison between two audio signals.
+#[derive(Debug, Clone)]
+pub struct BeatGridRegularityResult {
+    /// Overall regularity match score (0.0-1.0).
+    /// High values mean both signals have similar beat regularity.
+    pub score: f64,
+    /// Beat periodicity of the reference signal (0.0-1.0).
+    /// How regular/consistent the reference beats are at the expected tempo.
+    pub ref_periodicity: f64,
+    /// Beat periodicity of the test signal (0.0-1.0).
+    pub test_periodicity: f64,
+}
+
+/// Measures beat grid regularity in both reference and test signals and compares them.
+///
+/// Detects onsets in each signal, then computes autocorrelation of the onset envelope
+/// at the expected beat period to measure how regular the beat grid is. The score
+/// reflects how well the test signal preserves the reference's rhythmic regularity.
+///
+/// # Arguments
+/// * `ref_signal` - Reference audio (mono)
+/// * `test_signal` - Test audio (mono)
+/// * `sample_rate` - Sample rate in Hz
+/// * `expected_bpm` - Expected tempo in BPM
+/// * `fft_size` - FFT size for onset detection
+/// * `hop_size` - Hop size for onset detection
+/// * `sensitivity` - Onset detection sensitivity
+pub fn beat_grid_regularity_with_params(
+    ref_signal: &[f32],
+    test_signal: &[f32],
+    sample_rate: u32,
+    expected_bpm: f64,
+    fft_size: usize,
+    hop_size: usize,
+    sensitivity: f32,
+) -> BeatGridRegularityResult {
+    let ref_periodicity = compute_beat_periodicity(
+        ref_signal,
+        sample_rate,
+        expected_bpm,
+        fft_size,
+        hop_size,
+        sensitivity,
+    );
+    let test_periodicity = compute_beat_periodicity(
+        test_signal,
+        sample_rate,
+        expected_bpm,
+        fft_size,
+        hop_size,
+        sensitivity,
+    );
+
+    // Score: penalize difference in periodicity, but also reward high periodicity in both
+    let diff_penalty = 1.0 - (ref_periodicity - test_periodicity).abs();
+    let avg_periodicity = (ref_periodicity + test_periodicity) / 2.0;
+    let score = (0.5 * diff_penalty + 0.5 * avg_periodicity).clamp(0.0, 1.0);
+
+    BeatGridRegularityResult {
+        score,
+        ref_periodicity,
+        test_periodicity,
+    }
+}
+
+/// Computes beat periodicity by autocorrelation of the onset envelope at the expected tempo.
+fn compute_beat_periodicity(
+    signal: &[f32],
+    sample_rate: u32,
+    expected_bpm: f64,
+    fft_size: usize,
+    hop_size: usize,
+    sensitivity: f32,
+) -> f64 {
+    if signal.is_empty() || expected_bpm <= 0.0 {
+        return 0.0;
+    }
+
+    // Detect transients/onsets
+    let transients = detect_transients(signal, sample_rate, fft_size, hop_size, sensitivity);
+    if transients.onsets.is_empty() {
+        return 0.0;
+    }
+
+    // Build an onset impulse envelope at hop resolution
+    let num_frames = signal.len() / hop_size;
+    if num_frames == 0 {
+        return 0.0;
+    }
+    let mut envelope = vec![0.0f64; num_frames];
+    for (i, &onset) in transients.onsets.iter().enumerate() {
+        let frame = onset / hop_size;
+        if frame < num_frames {
+            let strength = if i < transients.strengths.len() {
+                transients.strengths[i] as f64
+            } else {
+                1.0
+            };
+            envelope[frame] = strength;
+        }
+    }
+
+    // Expected beat period in frames
+    let beat_period_samples = 60.0 * sample_rate as f64 / expected_bpm;
+    let beat_period_frames = beat_period_samples / hop_size as f64;
+    let lag = beat_period_frames.round() as usize;
+
+    if lag == 0 || lag >= num_frames / 2 {
+        return 0.0;
+    }
+
+    // Compute normalized autocorrelation at the beat period lag
+    let mean = envelope.iter().sum::<f64>() / num_frames as f64;
+    let mut auto_corr = 0.0;
+    let mut energy = 0.0;
+    for i in 0..num_frames - lag {
+        let a = envelope[i] - mean;
+        let b = envelope[i + lag] - mean;
+        auto_corr += a * b;
+        energy += a * a;
+    }
+
+    if energy < 1e-12 {
+        return 0.0;
+    }
+
+    // Normalized autocorrelation at beat lag, clamped to [0, 1]
+    (auto_corr / energy).clamp(0.0, 1.0)
+}
+
 /// Converts a 0.0-1.0 score to a letter grade.
 fn score_to_grade(score: f64) -> char {
     if score >= 0.9 {

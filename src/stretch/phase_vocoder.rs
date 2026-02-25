@@ -966,12 +966,20 @@ mod tests {
 
     #[test]
     fn test_phase_lock_identity_single_peak() {
-        // Single peak at bin 5; all non-peak bins should be locked to it
+        // Single peak at bin 5 with a realistic spectral lobe shape.
+        // Trough-bounded identity locking propagates the peak's phase
+        // rotation to all bins within its influence region (between troughs).
         let num_bins = 16;
-        let mut magnitudes = vec![0.1f32; num_bins];
-        magnitudes[5] = 1.0; // peak at bin 5
+        // Create a Gaussian-like lobe centered at bin 5, with troughs at 0 and 15
+        let magnitudes: Vec<f32> = (0..num_bins)
+            .map(|i| {
+                let dist = (i as f32 - 5.0).abs();
+                0.01 + 0.99 * (-dist * dist / 8.0).exp()
+            })
+            .collect();
         let analysis_phases: Vec<f32> = (0..num_bins).map(|i| i as f32 * 0.3).collect();
         let mut synthesis_phases: Vec<f32> = (0..num_bins).map(|i| i as f32 * 0.5).collect();
+        let peak_synth = synthesis_phases[5];
         let mut peaks = Vec::new();
 
         apply_phase_locking(
@@ -985,25 +993,30 @@ mod tests {
         );
 
         // Peak at bin 5 should keep its phase
-        // Non-peak bins should be: synth[peak] + (analysis[bin] - analysis[peak])
-        let peak_synth = 5.0 * 0.5; // original synthesis phase of peak
+        assert!(
+            (synthesis_phases[5] - peak_synth).abs() < 1e-6,
+            "Peak bin should keep its phase"
+        );
+
+        // The phase rotation from the peak
+        let phase_rotation = peak_synth - analysis_phases[5];
+
+        // Bins in the peak's influence region should have:
+        // synth[bin] = analysis[bin] + phase_rotation
+        // With a single Gaussian lobe and no other peaks, all bins should
+        // be in the peak's influence region.
         for bin in 1..num_bins - 1 {
             if bin == 5 {
-                // Peak bin keeps its phase
-                assert!(
-                    (synthesis_phases[bin] - peak_synth).abs() < 1e-6,
-                    "Peak bin should keep its phase"
-                );
-            } else {
-                let expected = peak_synth + (analysis_phases[bin] - analysis_phases[5]);
-                assert!(
-                    (synthesis_phases[bin] - expected).abs() < 1e-6,
-                    "Bin {} should be locked to peak: got {}, expected {}",
-                    bin,
-                    synthesis_phases[bin],
-                    expected
-                );
+                continue;
             }
+            let expected = analysis_phases[bin] + phase_rotation;
+            assert!(
+                (synthesis_phases[bin] - expected).abs() < 1e-5,
+                "Bin {} should be locked to peak: got {}, expected {}",
+                bin,
+                synthesis_phases[bin],
+                expected
+            );
         }
     }
 
@@ -1079,13 +1092,25 @@ mod tests {
 
     #[test]
     fn test_phase_lock_multiple_peaks() {
-        // Two peaks: bins should lock to nearest peak
+        // Two peaks with realistic spectral lobe shapes.
+        // Trough-bounded identity locking assigns each bin to the peak
+        // whose influence region (bounded by troughs) contains it.
         let num_bins = 16;
-        let mut magnitudes = vec![0.1f32; num_bins];
-        magnitudes[3] = 1.0; // peak at bin 3
-        magnitudes[10] = 0.8; // peak at bin 10
+        // Create two Gaussian lobes: peak at bin 3, peak at bin 10
+        // with a clear trough between them (around bin 7)
+        let magnitudes: Vec<f32> = (0..num_bins)
+            .map(|i| {
+                let d3 = (i as f32 - 3.0).abs();
+                let d10 = (i as f32 - 10.0).abs();
+                let lobe3 = 1.0 * (-d3 * d3 / 4.0).exp();
+                let lobe10 = 0.8 * (-d10 * d10 / 4.0).exp();
+                0.001 + lobe3.max(lobe10) // ensure non-zero floor
+            })
+            .collect();
         let analysis_phases: Vec<f32> = (0..num_bins).map(|i| i as f32 * 0.1).collect();
         let mut synthesis_phases: Vec<f32> = (0..num_bins).map(|i| i as f32 * 0.2).collect();
+        let synth_peak3 = synthesis_phases[3];
+        let synth_peak10 = synthesis_phases[10];
         let mut peaks = Vec::new();
 
         apply_phase_locking(
@@ -1098,18 +1123,30 @@ mod tests {
             &mut peaks,
         );
 
-        // Bin 1 is closest to peak at bin 3
-        let expected_1 = 3.0 * 0.2 + (1.0 * 0.1 - 3.0 * 0.1);
+        // Verify both peaks are found
+        assert!(peaks.contains(&3), "Should find peak at bin 3");
+        assert!(peaks.contains(&10), "Should find peak at bin 10");
+
+        // Phase rotation for each peak
+        let rotation_3 = synth_peak3 - analysis_phases[3];
+        let rotation_10 = synth_peak10 - analysis_phases[10];
+
+        // Bin 2 is in peak 3's influence region (between start_bin boundary and trough)
+        let expected_2 = analysis_phases[2] + rotation_3;
         assert!(
-            (synthesis_phases[1] - expected_1).abs() < 1e-5,
-            "Bin 1 should lock to peak 3"
+            (synthesis_phases[2] - expected_2).abs() < 1e-5,
+            "Bin 2 should lock to peak 3: got {}, expected {}",
+            synthesis_phases[2],
+            expected_2
         );
 
-        // Bin 12 is closest to peak at bin 10
-        let expected_12 = 10.0 * 0.2 + (12.0 * 0.1 - 10.0 * 0.1);
+        // Bin 12 is in peak 10's influence region
+        let expected_12 = analysis_phases[12] + rotation_10;
         assert!(
             (synthesis_phases[12] - expected_12).abs() < 1e-5,
-            "Bin 12 should lock to peak 10"
+            "Bin 12 should lock to peak 10: got {}, expected {}",
+            synthesis_phases[12],
+            expected_12
         );
     }
 

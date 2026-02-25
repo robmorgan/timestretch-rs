@@ -1,5 +1,6 @@
 //! Core types, window functions, and resampling utilities.
 
+pub mod crossover;
 pub mod fft;
 pub mod resample;
 pub mod types;

@@ -1414,12 +1414,17 @@ pub struct StretchParams {
     pub envelope_order: usize,
     /// Whether to use multi-resolution FFT processing.
     ///
-    /// When enabled, tonal segments are split into two frequency bands at ~4 kHz.
-    /// The low band (0-4 kHz) is processed with a larger FFT (4096) for better
-    /// frequency resolution, while the high band (4 kHz+) uses a smaller FFT
-    /// (2048) for better temporal resolution. This mirrors the approach used by
-    /// professional time-stretching algorithms like Ableton's Complex Pro.
-    /// Enabled by default for the [`EdmPreset::DjBeatmatch`] preset.
+    /// When enabled, tonal segments are split into three frequency bands using
+    /// Linkwitz-Riley crossover filters at 200 Hz and 4000 Hz. Each band is
+    /// processed with an FFT size optimized for its frequency range:
+    /// - Sub-bass (0-200 Hz): `fft_size * 4` for precise frequency resolution
+    /// - Mid (200-4000 Hz): `fft_size` (the configured value)
+    /// - High (4000+ Hz): `fft_size / 4` for sharp temporal resolution
+    ///
+    /// This mirrors the approach used by professional time-stretching algorithms
+    /// like Ableton's Complex Pro, and is particularly beneficial for material
+    /// with both sustained bass and transient-rich high frequencies.
+    /// Enabled by default for [`EdmPreset::DjBeatmatch`] and [`EdmPreset::Ambient`].
     pub multi_resolution: bool,
     /// Duration in seconds of the transient region around each detected onset.
     ///
@@ -1606,8 +1611,10 @@ impl StretchParams {
                 | EdmPreset::Ambient
                 | EdmPreset::VocalChop
         );
-        // Enable multi-resolution FFT for DjBeatmatch (transparency-critical)
-        self.multi_resolution = matches!(preset, EdmPreset::DjBeatmatch);
+        // Enable multi-resolution FFT for transparency-critical and extreme-stretch presets.
+        // DjBeatmatch needs it for transparent tempo changes; Ambient benefits from the
+        // large sub-bass FFT at extreme stretch ratios (2x-4x).
+        self.multi_resolution = matches!(preset, EdmPreset::DjBeatmatch | EdmPreset::Ambient);
         // Enable elastic beat distribution for rhythm-critical presets
         self.elastic_timing = matches!(preset, EdmPreset::DjBeatmatch | EdmPreset::HouseLoop);
         // Enable HPSS for presets where harmonic/percussive overlap matters
@@ -1718,10 +1725,11 @@ impl StretchParams {
 
     /// Enables or disables multi-resolution FFT processing.
     ///
-    /// When enabled, tonal segments are split into low (0-4 kHz) and high
-    /// (4 kHz+) bands. The low band uses a larger FFT for better frequency
-    /// resolution, while the high band uses a smaller FFT for better temporal
-    /// resolution. This improves quality for transient-rich material.
+    /// When enabled, tonal segments are split into three frequency bands
+    /// (sub-bass/mid/high) using Linkwitz-Riley crossover filters. Each
+    /// band uses an FFT size optimized for its frequency range, improving
+    /// quality for material with both sustained bass and transient-rich
+    /// high frequencies.
     pub fn with_multi_resolution(mut self, enabled: bool) -> Self {
         self.multi_resolution = enabled;
         self
