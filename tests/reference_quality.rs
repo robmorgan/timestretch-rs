@@ -68,12 +68,18 @@ struct PresetReport {
     length_diff_pct: f64,
     rms_diff_db: f64,
     spectral_similarity: f64,
+    perceptual_spectral_similarity: f64,
     band_similarity: BandSimilarityReport,
+    bark_band_similarity: BarkBandSimilarityReport,
     transient_match_rate: f64,
     transient_matched: usize,
     transient_total: usize,
+    onset_timing: OnsetTimingReport,
     cross_correlation_peak: f64,
     cross_correlation_offset: isize,
+    lufs_difference: f64,
+    spectral_flux_similarity: f64,
+    overall_grade: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +88,31 @@ struct BandSimilarityReport {
     low: f64,
     mid: f64,
     high: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct BarkBandSimilarityReport {
+    sub_bass: f64,
+    bass: f64,
+    low_mid: f64,
+    mid: f64,
+    upper_mid: f64,
+    presence: f64,
+    brilliance: f64,
+    air: f64,
+    overall: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct OnsetTimingReport {
+    mean_error_ms: f64,
+    median_error_ms: f64,
+    std_dev_ms: f64,
+    max_error_ms: f64,
+    within_5ms: usize,
+    within_10ms: usize,
+    within_20ms: usize,
+    total_onsets: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -253,7 +284,7 @@ fn reference_quality_benchmark() {
                     0.0
                 };
 
-                // Spectral similarity
+                // Spectral similarity (unweighted)
                 let spec_sim = timestretch::analysis::comparison::spectral_similarity(
                     &output,
                     &ref_audio.data,
@@ -261,8 +292,26 @@ fn reference_quality_benchmark() {
                     512,
                 );
 
-                // Band spectral similarity
+                // Perceptual spectral similarity (A-weighted)
+                let perc_sim = timestretch::analysis::comparison::perceptual_spectral_similarity(
+                    &output,
+                    &ref_audio.data,
+                    2048,
+                    512,
+                    original.sample_rate,
+                );
+
+                // Band spectral similarity (EDM bands)
                 let band_sim = timestretch::analysis::comparison::band_spectral_similarity(
+                    &output,
+                    &ref_audio.data,
+                    2048,
+                    512,
+                    original.sample_rate,
+                );
+
+                // Bark-scale band similarity
+                let bark_sim = timestretch::analysis::comparison::bark_band_similarity(
                     &output,
                     &ref_audio.data,
                     2048,
@@ -278,6 +327,13 @@ fn reference_quality_benchmark() {
                     10.0,
                 );
 
+                // Onset timing analysis
+                let onset_timing = timestretch::analysis::comparison::onset_timing_analysis(
+                    &ref_audio.data,
+                    &output,
+                    original.sample_rate,
+                );
+
                 // Cross-correlation (on a windowed segment to limit compute)
                 let max_corr_samples = (original.sample_rate as usize * 10)
                     .min(output.len())
@@ -285,6 +341,30 @@ fn reference_quality_benchmark() {
                 let xcorr = timestretch::analysis::comparison::cross_correlation(
                     &output[..max_corr_samples],
                     &ref_audio.data[..max_corr_samples],
+                );
+
+                // LUFS loudness difference
+                let lufs_diff = timestretch::analysis::comparison::lufs_difference(
+                    &output,
+                    &ref_audio.data,
+                    original.sample_rate,
+                );
+
+                // Spectral flux similarity
+                let flux_sim = timestretch::analysis::comparison::spectral_flux_similarity(
+                    &output,
+                    &ref_audio.data,
+                    2048,
+                    512,
+                );
+
+                // Generate overall quality report for grade
+                let quality_report = timestretch::analysis::comparison::generate_quality_report(
+                    &output,
+                    &ref_audio.data,
+                    original.sample_rate,
+                    2048,
+                    512,
                 );
 
                 // Track best preset
@@ -295,27 +375,62 @@ fn reference_quality_benchmark() {
                 }
 
                 // Console output
-                println!("    Preset: {}", preset_name);
                 println!(
-                    "      Length accuracy:       {:+} samples ({:+.2}%)",
+                    "    Preset: {} (Grade: {})",
+                    preset_name, quality_report.overall_grade
+                );
+                println!(
+                    "      Length accuracy:            {:+} samples ({:+.2}%)",
                     length_diff, length_diff_pct
                 );
-                println!("      RMS difference:        {:+.1} dB", rms_diff_db);
-                println!("      Spectral similarity:   {:.3}", spec_sim);
+                println!("      RMS difference:            {:+.1} dB", rms_diff_db);
+                println!("      LUFS difference:           {:+.2} dB", lufs_diff);
+                println!("      Spectral similarity:       {:.3}", spec_sim);
+                println!(
+                    "      Perceptual similarity:     {:.3} (A-weighted)",
+                    perc_sim
+                );
                 println!(
                     "        Sub-bass: {:.3}  Low: {:.3}  Mid: {:.3}  High: {:.3}",
                     band_sim.sub_bass, band_sim.low, band_sim.mid, band_sim.high
                 );
+                println!("      Bark bands (overall {:.3}):", bark_sim.overall);
+                for i in 0..timestretch::analysis::comparison::BARK_BAND_COUNT {
+                    println!(
+                        "        {}: {:.3}",
+                        timestretch::analysis::comparison::BARK_BAND_NAMES[i],
+                        bark_sim.bands[i]
+                    );
+                }
                 println!(
-                    "      Transient match rate:  {:.1}% ({}/{} matched)",
+                    "      Transient match rate:      {:.1}% ({}/{} matched)",
                     transient_result.match_rate * 100.0,
                     transient_result.matched,
                     transient_result.total_reference
                 );
+                if onset_timing.total_onsets > 0 {
+                    println!(
+                        "      Onset timing:              mean={:.1}ms median={:.1}ms std={:.1}ms max={:.1}ms",
+                        onset_timing.mean_error_ms,
+                        onset_timing.median_error_ms,
+                        onset_timing.std_dev_ms,
+                        onset_timing.max_error_ms,
+                    );
+                    println!(
+                        "        Within 5ms: {}/{}  10ms: {}/{}  20ms: {}/{}",
+                        onset_timing.within_5ms,
+                        onset_timing.total_onsets,
+                        onset_timing.within_10ms,
+                        onset_timing.total_onsets,
+                        onset_timing.within_20ms,
+                        onset_timing.total_onsets,
+                    );
+                }
                 println!(
-                    "      Cross-correlation:     {:.3} (offset: {:+} samples)\n",
+                    "      Cross-correlation:         {:.3} (offset: {:+} samples)",
                     xcorr.peak_value, xcorr.peak_offset
                 );
+                println!("      Spectral flux similarity:  {:.3}\n", flux_sim);
 
                 ref_report.presets.push(PresetReport {
                     preset: preset_name.to_string(),
@@ -323,17 +438,42 @@ fn reference_quality_benchmark() {
                     length_diff_pct,
                     rms_diff_db,
                     spectral_similarity: spec_sim,
+                    perceptual_spectral_similarity: perc_sim,
                     band_similarity: BandSimilarityReport {
                         sub_bass: band_sim.sub_bass,
                         low: band_sim.low,
                         mid: band_sim.mid,
                         high: band_sim.high,
                     },
+                    bark_band_similarity: BarkBandSimilarityReport {
+                        sub_bass: bark_sim.bands[0],
+                        bass: bark_sim.bands[1],
+                        low_mid: bark_sim.bands[2],
+                        mid: bark_sim.bands[3],
+                        upper_mid: bark_sim.bands[4],
+                        presence: bark_sim.bands[5],
+                        brilliance: bark_sim.bands[6],
+                        air: bark_sim.bands[7],
+                        overall: bark_sim.overall,
+                    },
                     transient_match_rate: transient_result.match_rate,
                     transient_matched: transient_result.matched,
                     transient_total: transient_result.total_reference,
+                    onset_timing: OnsetTimingReport {
+                        mean_error_ms: onset_timing.mean_error_ms,
+                        median_error_ms: onset_timing.median_error_ms,
+                        std_dev_ms: onset_timing.std_dev_ms,
+                        max_error_ms: onset_timing.max_error_ms,
+                        within_5ms: onset_timing.within_5ms,
+                        within_10ms: onset_timing.within_10ms,
+                        within_20ms: onset_timing.within_20ms,
+                        total_onsets: onset_timing.total_onsets,
+                    },
                     cross_correlation_peak: xcorr.peak_value,
                     cross_correlation_offset: xcorr.peak_offset,
+                    lufs_difference: lufs_diff,
+                    spectral_flux_similarity: flux_sim,
+                    overall_grade: quality_report.overall_grade.to_string(),
                 });
             }
 

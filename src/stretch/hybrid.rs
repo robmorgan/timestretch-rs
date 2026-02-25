@@ -255,7 +255,19 @@ impl HybridStretcher {
 
         let output = match self.params.crossfade_mode {
             crate::core::types::CrossfadeMode::Fixed(secs) => {
-                let crossfade_samples = (self.params.sample_rate as f64 * secs) as usize;
+                let mut crossfade_samples = (self.params.sample_rate as f64 * secs) as usize;
+
+                // Ensure crossfade is at least 2 cycles of the lowest frequency (60 Hz)
+                let min_crossfade_samples =
+                    (2.0 * self.params.sample_rate as f64 / CROSSFADE_MIN_FREQ_HZ) as usize;
+                crossfade_samples = crossfade_samples.max(min_crossfade_samples);
+
+                // Cap at 25% of the shortest output segment length
+                let shortest_segment_len =
+                    output_segments.iter().map(|s| s.len()).min().unwrap_or(0);
+                let max_crossfade = shortest_segment_len / 4;
+                crossfade_samples = crossfade_samples.min(max_crossfade);
+
                 concatenate_with_crossfade(&output_segments, crossfade_samples)
             }
             crate::core::types::CrossfadeMode::Adaptive => {
@@ -635,36 +647,58 @@ impl HybridStretcher {
 }
 
 /// Adaptive crossfade durations in seconds, by segment transition type.
-/// Tonal→Transient: fast transition to preserve onset.
-const CROSSFADE_TONAL_TO_TRANSIENT_SECS: f64 = 0.003;
-/// Transient→Tonal: smooth recovery after transient.
-const CROSSFADE_TRANSIENT_TO_TONAL_SECS: f64 = 0.008;
-/// Tonal→Tonal: default medium crossfade.
-const CROSSFADE_TONAL_TO_TONAL_SECS: f64 = 0.005;
-/// Transient→Transient: minimal blending.
-const CROSSFADE_TRANSIENT_TO_TRANSIENT_SECS: f64 = 0.002;
+/// Tonal→Transient: moderate transition to preserve onset while avoiding pops.
+const CROSSFADE_TONAL_TO_TRANSIENT_SECS: f64 = 0.011;
+/// Transient→Tonal: short crossfade to preserve attack crispness.
+const CROSSFADE_TRANSIENT_TO_TONAL_SECS: f64 = 0.009;
+/// Tonal→Tonal: longer crossfade for smooth blending.
+const CROSSFADE_TONAL_TO_TONAL_SECS: f64 = 0.017;
+/// Transient→Transient: minimal blending, but enough to avoid pops.
+const CROSSFADE_TRANSIENT_TO_TRANSIENT_SECS: f64 = 0.005;
+/// Lowest frequency (Hz) used to compute the minimum crossfade duration.
+/// Crossfades must span at least 2 cycles of this frequency to avoid pops.
+const CROSSFADE_MIN_FREQ_HZ: f64 = 60.0;
 
 /// Computes per-boundary crossfade lengths based on segment transitions.
 ///
 /// Returns a vector of crossfade lengths in samples, one per boundary
 /// (length = segments.len() - 1).
+///
+/// Each crossfade is at least 2 cycles of the lowest active frequency
+/// (`CROSSFADE_MIN_FREQ_HZ`) and at most 25% of the shorter adjacent
+/// segment's output length.
 fn compute_adaptive_crossfade_lens(segments: &[Segment], sample_rate: u32) -> Vec<usize> {
     if segments.len() <= 1 {
         return vec![];
     }
 
+    // Minimum crossfade: 2 full cycles of the lowest frequency we care about
+    let min_crossfade_samples = (2.0 * sample_rate as f64 / CROSSFADE_MIN_FREQ_HZ) as usize;
+
     let mut lens = Vec::with_capacity(segments.len() - 1);
     for i in 1..segments.len() {
-        let prev_is_transient = segments[i - 1].is_transient;
-        let cur_is_transient = segments[i].is_transient;
+        let prev = &segments[i - 1];
+        let cur = &segments[i];
 
-        let secs = match (prev_is_transient, cur_is_transient) {
+        let secs = match (prev.is_transient, cur.is_transient) {
             (false, true) => CROSSFADE_TONAL_TO_TRANSIENT_SECS,
             (true, false) => CROSSFADE_TRANSIENT_TO_TONAL_SECS,
             (false, false) => CROSSFADE_TONAL_TO_TONAL_SECS,
             (true, true) => CROSSFADE_TRANSIENT_TO_TRANSIENT_SECS,
         };
-        lens.push((sample_rate as f64 * secs) as usize);
+        let mut crossfade_samples = (sample_rate as f64 * secs) as usize;
+
+        // Enforce minimum: at least 2 cycles of the lowest frequency
+        crossfade_samples = crossfade_samples.max(min_crossfade_samples);
+
+        // Cap at 25% of the shorter adjacent segment's output length
+        let prev_out_len = ((prev.end - prev.start) as f64 * prev.stretch_ratio).round() as usize;
+        let cur_out_len = ((cur.end - cur.start) as f64 * cur.stretch_ratio).round() as usize;
+        let shortest_segment_len = prev_out_len.min(cur_out_len);
+        let max_crossfade = shortest_segment_len / 4;
+        crossfade_samples = crossfade_samples.min(max_crossfade);
+
+        lens.push(crossfade_samples);
     }
 
     lens

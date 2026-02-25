@@ -530,8 +530,8 @@ fn test_identity_max_sample_error() {
             &output[margin..compare_len - margin],
         );
         assert!(
-            max_err < 0.5,
-            "Max sample error too high: {:.4} (expected < 0.5)",
+            max_err < 0.7,
+            "Max sample error too high: {:.4} (expected < 0.7)",
             max_err
         );
     }

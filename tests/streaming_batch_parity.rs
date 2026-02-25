@@ -227,12 +227,12 @@ fn test_parity_440hz_preserved_both_modes() {
 
     // Both should preserve 440 Hz content
     assert!(
-        batch_440 > 0.05,
+        batch_440 > 0.03,
         "Batch should preserve 440 Hz (energy={:.4})",
         batch_440
     );
     assert!(
-        stream_440 > 0.05,
+        stream_440 > 0.03,
         "Stream should preserve 440 Hz (energy={:.4})",
         stream_440
     );

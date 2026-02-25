@@ -17,8 +17,13 @@ pub enum PhaseLockingMode {
     RegionOfInfluence,
 }
 
-/// Maximum phase deviation from analysis relationship before clamping (PI/4).
-const MAX_PHASE_DEVIATION: f32 = PI / 4.0;
+/// SNR threshold above which a bin is considered a strong harmonic peak.
+/// Strong peaks get wider phase deviation allowance to preserve vibrato/tremolo.
+const SNR_STRONG: f32 = 3.0;
+/// SNR threshold for medium-strength bins (between strong and noise floor).
+const SNR_MEDIUM: f32 = 1.5;
+/// Half-width of the local neighborhood for SNR estimation (total window = 2*SNR_RADIUS + 1).
+const SNR_RADIUS: usize = 2;
 
 /// Applies the selected phase locking algorithm.
 pub fn apply_phase_locking(
@@ -100,12 +105,16 @@ fn identity_phase_lock(
     }
 }
 
-/// Region-of-influence phase locking with parabolic peak interpolation.
+/// Region-of-influence phase locking with parabolic peak interpolation and
+/// SNR-weighted adaptive phase clamping.
 ///
 /// Improvements over identity phase locking:
 /// 1. Parabolic interpolation for more accurate peak frequency estimation
 /// 2. Influence zones extend to midpoints between adjacent peaks
-/// 3. Phase deviation clamping to reduce ringing (clamp to ±PI/4)
+/// 3. Adaptive phase deviation clamping based on local SNR:
+///    - Strong peaks (SNR > 3.0): allow PI/3 deviation (preserves vibrato/tremolo)
+///    - Medium/weak bins (SNR <= 1.5): allow PI/4 deviation (original default)
+///    - Smooth linear interpolation between PI/4 and PI/3 for intermediate SNR
 fn roi_phase_lock(
     magnitudes: &[f32],
     analysis_phases: &[f32],
@@ -147,19 +156,90 @@ fn roi_phase_lock(
             let analysis_diff = analysis_phases[bin] - analysis_phases[nearest_peak];
             let proposed = synthesis_phases[nearest_peak] + analysis_diff;
 
-            // Clamp phase deviation: if the synthesis phase deviates too far
-            // from the expected analysis relationship, clamp it to reduce ringing
+            // Adaptive phase clamping: compute local SNR and scale the
+            // maximum allowed deviation accordingly. Strong harmonic peaks
+            // get wider allowance (preserves natural vibrato/tremolo), while
+            // weak/noisy bins are clamped tighter to suppress artifacts.
+            let max_dev = compute_adaptive_max_deviation(magnitudes, bin, num_bins);
+
             let expected = synthesis_phases[bin]; // phase from standard PV advance
             let deviation = wrap_phase(proposed - expected);
-            if deviation.abs() > MAX_PHASE_DEVIATION {
-                // Clamp to the allowed range
-                let clamped_dev = deviation.clamp(-MAX_PHASE_DEVIATION, MAX_PHASE_DEVIATION);
+            if deviation.abs() > max_dev {
+                let clamped_dev = deviation.clamp(-max_dev, max_dev);
                 synthesis_phases[bin] = expected + clamped_dev;
             } else {
                 synthesis_phases[bin] = proposed;
             }
         }
     }
+}
+
+/// Computes the adaptive maximum phase deviation for a bin based on local SNR.
+///
+/// The local SNR is estimated as the ratio of the bin's magnitude to the median
+/// magnitude in a small neighborhood around the bin. This distinguishes strong
+/// harmonic peaks (which should allow natural phase modulation) from weak bins
+/// near the noise floor (which should be clamped tighter to reduce artifacts).
+///
+/// Returns the maximum phase deviation in radians using continuous interpolation
+/// based on local SNR. This avoids hard threshold artifacts by smoothly
+/// transitioning between clamping levels.
+///
+/// The range is PI/3 (strong peaks, preserves vibrato/tremolo) down to PI/4
+/// (noise floor, matches the prior fixed threshold). Bins at the noise floor
+/// retain the original PI/4 clamping to avoid degrading identity-stretch quality.
+/// Only strong harmonic peaks get wider allowance.
+#[inline]
+fn compute_adaptive_max_deviation(magnitudes: &[f32], bin: usize, num_bins: usize) -> f32 {
+    let local_snr = estimate_local_snr(magnitudes, bin, num_bins);
+    // Smoothly interpolate: SNR <= 1.5 -> PI/4, SNR >= 3.0 -> PI/3
+    // Linear ramp between thresholds, clamped at boundaries.
+    let t = ((local_snr - SNR_MEDIUM) / (SNR_STRONG - SNR_MEDIUM)).clamp(0.0, 1.0);
+    let min_dev = PI / 4.0; // noise floor: same as prior fixed threshold
+    let max_dev = PI / 3.0; // strong peaks: wider allowance
+    min_dev + t * (max_dev - min_dev)
+}
+
+/// Estimates the local SNR for a bin by comparing its magnitude to the median
+/// of a small neighborhood (±SNR_RADIUS bins).
+#[inline]
+fn estimate_local_snr(magnitudes: &[f32], bin: usize, num_bins: usize) -> f32 {
+    let start = bin.saturating_sub(SNR_RADIUS);
+    let end = (bin + SNR_RADIUS + 1).min(num_bins);
+    let neighborhood = &magnitudes[start..end];
+
+    // Compute median of the neighborhood
+    let median = local_median(neighborhood);
+
+    // Avoid division by zero; if median is ~0 treat SNR as high (isolated peak)
+    if median < 1e-12 {
+        if magnitudes[bin] > 1e-12 {
+            return SNR_STRONG + 1.0; // Clearly a peak above silence
+        }
+        return 0.0; // Both are essentially zero
+    }
+    magnitudes[bin] / median
+}
+
+/// Computes the median of a small slice (up to 2*SNR_RADIUS+1 = 5 elements).
+/// Uses a simple sort on a stack-allocated array for efficiency.
+#[inline]
+fn local_median(values: &[f32]) -> f32 {
+    debug_assert!(!values.is_empty());
+    // Stack buffer for small neighborhood (max 5 elements with SNR_RADIUS=2)
+    let mut buf = [0.0f32; 2 * SNR_RADIUS + 1];
+    let n = values.len().min(buf.len());
+    buf[..n].copy_from_slice(&values[..n]);
+    let buf = &mut buf[..n];
+    // Insertion sort for tiny arrays (faster than general sort for n <= 5)
+    for i in 1..n {
+        let mut j = i;
+        while j > 0 && buf[j - 1] > buf[j] {
+            buf.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    buf[n / 2]
 }
 
 /// Wraps a phase value to [-PI, PI].

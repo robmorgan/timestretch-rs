@@ -13,8 +13,9 @@
 //! Self-test: cargo run --release --example benchmark_quality -- --self-test
 
 use timestretch::analysis::comparison::{
-    cross_correlation, mean_band_spectral_similarity, mean_spectral_similarity,
-    spectral_similarity, transient_match_score_with_params, BandSimilarity,
+    beat_grid_regularity_with_params, cross_correlation, mean_band_spectral_similarity,
+    mean_spectral_similarity, spectral_similarity, transient_match_score_with_params,
+    BandSimilarity, BeatGridRegularityResult,
 };
 use timestretch::io::wav::{read_wav_file, write_wav_file_16bit};
 use timestretch::{EdmPreset, StretchParams};
@@ -159,7 +160,7 @@ fn main() {
     let ref_mono = to_mono(&reference.data, reference.channels.count());
     let out_mono = to_mono(&output.data, output.channels.count());
 
-    run_comparison(&ref_mono, &out_mono, sample_rate);
+    run_comparison(&ref_mono, &out_mono, sample_rate, effective_target_bpm);
 }
 
 /// Runs the self-test: benchmarks library output against itself.
@@ -183,7 +184,7 @@ fn run_self_test() {
     let out_mono = to_mono(&output.data, output.channels.count());
 
     println!("Comparing output against itself...\n");
-    run_comparison(&out_mono, &out_mono, output.sample_rate);
+    run_comparison(&out_mono, &out_mono, output.sample_rate, TARGET_BPM);
 }
 
 /// Runs the windowed comparison between reference and test signals.
@@ -194,7 +195,7 @@ fn run_self_test() {
 ///
 /// The overall score uses the mean spectral shape since it's robust to the
 /// non-uniform timing differences between different stretching algorithms.
-fn run_comparison(ref_mono: &[f32], out_mono: &[f32], sample_rate: u32) {
+fn run_comparison(ref_mono: &[f32], out_mono: &[f32], sample_rate: u32, expected_bpm: f64) {
     let seg_samples = SEGMENT_SECS * sample_rate as usize;
     let skip_samples = SKIP_SECS * sample_rate as usize;
     let usable_len = ref_mono.len().min(out_mono.len());
@@ -217,6 +218,7 @@ fn run_comparison(ref_mono: &[f32], out_mono: &[f32], sample_rate: u32) {
     let mut transient_matched = 0u32;
     let mut transient_ref_total = 0u32;
     let mut transient_test_total = 0u32;
+    let mut beat_reg_scores: Vec<BeatGridRegularityResult> = Vec::new();
 
     for seg_idx in 0..num_segments {
         let start = skip_samples + seg_idx * seg_samples;
@@ -244,9 +246,18 @@ fn run_comparison(ref_mono: &[f32], out_mono: &[f32], sample_rate: u32) {
             TRANSIENT_SENSITIVITY,
         );
         let xc = cross_correlation(ref_seg, out_seg);
+        let bgr = beat_grid_regularity_with_params(
+            ref_seg,
+            out_seg,
+            sample_rate,
+            expected_bpm,
+            TRANSIENT_FFT_SIZE,
+            TRANSIENT_HOP_SIZE,
+            TRANSIENT_SENSITIVITY,
+        );
 
         println!(
-            "  Seg {:>2}: mean={:.3} frame={:.3} sub={:.3} low={:.3} mid={:.3} hi={:.3} xcorr={:.3} trans={}/{}",
+            "  Seg {:>2}: mean={:.3} frame={:.3} sub={:.3} low={:.3} mid={:.3} hi={:.3} xcorr={:.3} trans={}/{} bgr={:.3}",
             seg_idx + 1,
             ms,
             ss,
@@ -257,6 +268,7 @@ fn run_comparison(ref_mono: &[f32], out_mono: &[f32], sample_rate: u32) {
             xc.peak_value,
             tm.matched,
             tm.total_reference,
+            bgr.score,
         );
 
         mean_spec_sims.push(ms);
@@ -266,6 +278,7 @@ fn run_comparison(ref_mono: &[f32], out_mono: &[f32], sample_rate: u32) {
         transient_matched += tm.matched as u32;
         transient_ref_total += tm.total_reference as u32;
         transient_test_total += tm.total_test as u32;
+        beat_reg_scores.push(bgr);
     }
 
     // Average results
@@ -282,6 +295,17 @@ fn run_comparison(ref_mono: &[f32], out_mono: &[f32], sample_rate: u32) {
     } else {
         0.0
     };
+    let avg_beat_reg = beat_reg_scores.iter().map(|b| b.score).sum::<f64>() / n;
+    let avg_ref_period = beat_reg_scores
+        .iter()
+        .map(|b| b.ref_periodicity)
+        .sum::<f64>()
+        / n;
+    let avg_test_period = beat_reg_scores
+        .iter()
+        .map(|b| b.test_periodicity)
+        .sum::<f64>()
+        / n;
 
     // --- Print report ---
     println!("\n╔══════════════════════════════════════════════╗");
@@ -346,11 +370,25 @@ fn run_comparison(ref_mono: &[f32], out_mono: &[f32], sample_rate: u32) {
         transient_matched, transient_ref_total, transient_test_total
     );
     println!("║                                              ║");
+    println!(
+        "║  Beat Regularity:      {:>6.4}  {}  ║",
+        avg_beat_reg,
+        grade(avg_beat_reg)
+    );
+    println!(
+        "║    Ref periodicity:  {:>6.3}                ║",
+        avg_ref_period
+    );
+    println!(
+        "║    Test periodicity: {:>6.3}                ║",
+        avg_test_period
+    );
+    println!("║                                              ║");
     println!("╚══════════════════════════════════════════════╝");
 
     // Overall score uses timing-invariant metrics since different algorithms
     // inherently produce different temporal placement of events.
-    let overall = (avg_mean_spec + avg_sub + avg_low + avg_mid + avg_high) / 5.0;
+    let overall = (avg_mean_spec + avg_sub + avg_low + avg_mid + avg_high + avg_beat_reg) / 6.0;
     println!(
         "\nOverall score: {:.4} {} (spectral shape weighted)",
         overall,

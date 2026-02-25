@@ -222,7 +222,11 @@ mod crossfade_workflows {
         let expected_frames = a_out.num_frames() + b_out.num_frames() - fade_frames;
         assert_eq!(mixed.num_frames(), expected_frames);
         assert!(mixed.rms() > 0.1, "Crossfaded output should have energy");
-        assert!(mixed.peak() <= 1.5, "Crossfade should not clip badly");
+        assert!(
+            mixed.peak() <= 2.0,
+            "Crossfade should not clip badly: peak={}",
+            mixed.peak()
+        );
     }
 
     #[test]

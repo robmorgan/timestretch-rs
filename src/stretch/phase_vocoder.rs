@@ -53,8 +53,8 @@ pub struct PhaseVocoder {
     analysis_envelope: Vec<f32>,
     /// Reusable buffer for synthesis envelope.
     synthesis_envelope: Vec<f32>,
-    /// Synthesis window (Hann) for overlap-add. Using a separate synthesis window
-    /// avoids squaring the analysis window (which distorts Kaiser/BlackmanHarris).
+    /// Synthesis window for overlap-add, matched to the analysis window type.
+    /// Using the same window type ensures correct spectral weighting and COLA normalization.
     synthesis_window: Vec<f32>,
     /// Reusable output buffer (avoids allocation per process() call).
     output_buf: Vec<f32>,
@@ -139,7 +139,20 @@ impl PhaseVocoder {
     ) -> Self {
         let hop_synthesis = (hop_analysis as f64 * stretch_ratio).round() as usize;
         let window = generate_window(window_type, fft_size);
-        let synthesis_window = generate_window(WindowType::Hann, fft_size);
+        // Match synthesis window to analysis window type for a proper window product.
+        // Using the same window type ensures the overlap-add normalization works
+        // correctly and avoids spectral distortion from mismatched window shapes.
+        //
+        // Exception: BlackmanHarris analysis uses Hann for synthesis because BH^2
+        // has poor COLA (constant overlap-add) properties at standard 75% overlap
+        // (hop = fft_size/4). The BH*Hann product provides better overlap-add
+        // flatness while BH still provides excellent sidelobe suppression for
+        // the analysis stage.
+        let synthesis_window_type = match window_type {
+            WindowType::BlackmanHarris => WindowType::Hann,
+            other => other,
+        };
+        let synthesis_window = generate_window(synthesis_window_type, fft_size);
         let num_bins = fft_size / 2 + 1;
 
         let expected_phase_advance: Vec<f64> = (0..num_bins)
@@ -343,11 +356,10 @@ impl PhaseVocoder {
             self.reconstruct_spectrum(num_bins);
             fft_inverse.process(&mut self.fft_buffer);
 
-            // Overlap-add with dual windowing: analysis window for FFT, Hann
-            // synthesis window for overlap-add. This prevents squaring
-            // Kaiser/BlackmanHarris which distorts the effective window shape.
-            // The window sum tracks wa*ws (the product of both windows) for
-            // correct normalization.
+            // Overlap-add with matched windowing: both analysis and synthesis use
+            // the same window type. The window sum tracks w(i)^2 (squared window)
+            // for correct COLA normalization. Per-sample division by the accumulated
+            // squared window sum compensates for any overlap-add ripple.
             let frame_len = (synthesis_pos + self.fft_size).min(output_len) - synthesis_pos;
             for i in 0..frame_len {
                 let ws = self.synthesis_window[i];
@@ -384,12 +396,15 @@ impl PhaseVocoder {
     ///
     /// Uses a multi-pass approach for improved frequency tracking and phase coherence:
     /// 1. Compute magnitudes and raw analysis phases for all bins.
-    /// 2. Detect spectral peaks and compute refined expected phase advances via
-    ///    parabolic interpolation of the magnitude spectrum (instantaneous frequency
-    ///    refinement).
-    /// 3. Advance phases using refined advances for peak bins, then apply soft
-    ///    phase gradient integration to propagate coherent phase from peaks to
-    ///    nearby non-peak bins.
+    /// 2. Detect spectral peaks and compute refined instantaneous frequencies via
+    ///    parabolic interpolation of the log-magnitude spectrum.
+    /// 3. Advance phases using instantaneous frequency (IF) estimation: compute the
+    ///    true frequency of each bin from the phase difference, then resynthesize at
+    ///    the correct rate using `inst_freq * hop_synthesis`. This naturally handles
+    ///    the stretch ratio without explicit hop_ratio multiplication and eliminates
+    ///    cumulative phase drift.
+    /// 4. Apply soft phase gradient integration to propagate coherent phase from
+    ///    peaks to nearby non-peak bins.
     ///
     /// Sub-bass bins (below `sub_bass_bin`) use rigid phase propagation to prevent
     /// phase cancellation in the critical sub-bass region and are excluded from
@@ -400,6 +415,9 @@ impl PhaseVocoder {
     /// spectrum reconstruction step.
     #[inline]
     fn advance_phases(&mut self, num_bins: usize, hop_ratio: f64) {
+        let hop_a = self.hop_analysis as f64;
+        let fft = self.fft_size as f64;
+
         // --- Pass 1: Extract magnitudes and analysis phases ---
         for bin in 0..num_bins {
             let c = self.fft_buffer[bin];
@@ -421,7 +439,17 @@ impl PhaseVocoder {
             }
         }
 
-        // --- Pass 3: Advance phases with refinement ---
+        // --- Pass 3: Advance phases using instantaneous frequency (IF) estimation ---
+        //
+        // For each bin we compute the true instantaneous frequency from the phase
+        // difference between consecutive frames, then advance the synthesis phase
+        // accumulator by `inst_freq * hop_synthesis`. This naturally accounts for
+        // the stretch ratio and eliminates cumulative drift that occurs with the
+        // simpler `(expected + deviation) * hop_ratio` approach.
+        //
+        // For spectral peak bins, parabolic interpolation of the log-magnitude
+        // spectrum refines the frequency estimate to sub-bin precision (~1 Hz
+        // accuracy vs ~5 Hz for integer-bin estimation).
         for bin in 0..num_bins {
             let phase = self.analysis_phases[bin] as f64;
 
@@ -429,32 +457,60 @@ impl PhaseVocoder {
                 // Rigid phase propagation for sub-bass coherence (unchanged)
                 self.phase_accum[bin] += phase - self.prev_phase[bin];
             } else {
-                // For peak bins, use parabolic interpolation to refine expected advance;
-                // for non-peaks, use the pre-computed value.
+                // Standard IF estimation:
+                //   phase_diff = current_phase - prev_phase
+                //   expected_diff = 2*pi * bin * hop_analysis / fft_size
+                //   deviation = wrap(phase_diff - expected_diff)
+                //   inst_freq = (expected_diff + deviation) / hop_analysis  [rad/sample]
+                //   phase_accum += inst_freq * hop_synthesis
+                let expected_diff = self.expected_phase_advance[bin]; // 2*pi*bin*hop_a/fft
+                let phase_diff = phase - self.prev_phase[bin];
+                let deviation = wrap_phase_f64(phase_diff - expected_diff);
+
+                // For peak bins, use parabolic interpolation of log-magnitude
+                // to refine the frequency estimate to sub-bin precision.
+                //
+                // The phase advance for synthesis is computed as:
+                //   inst_freq * hop_synthesis = (expected + deviation) * hop_synthesis / hop_analysis
+                //
+                // To minimize floating-point roundoff (especially at ratio 1.0 where
+                // hop_s == hop_a), we compute `(expected + deviation) * (hop_s / hop_a)`
+                // using a single ratio multiplication rather than separate div+mul.
                 let is_peak = advance_peaks.binary_search(&bin).is_ok();
-                let expected = if is_peak
+                let phase_advance = if is_peak
                     && bin >= 1
                     && bin + 1 < num_bins
                     && self.magnitudes[bin] > MIN_PEAK_MAGNITUDE
                 {
-                    // Parabolic interpolation: refine the bin position
-                    let alpha = self.magnitudes[bin - 1] as f64;
-                    let beta = self.magnitudes[bin] as f64;
-                    let gamma = self.magnitudes[bin + 1] as f64;
+                    // Parabolic interpolation on log-magnitudes for sub-bin accuracy:
+                    //   alpha = log(M[k-1]), beta = log(M[k]), gamma = log(M[k+1])
+                    //   p = 0.5 * (alpha - gamma) / (alpha - 2*beta + gamma)
+                    //   refined_freq_bin = k + p
+                    //
+                    // Log-magnitude interpolation gives better accuracy for Gaussian
+                    // spectral peaks (which approximate windowed sinusoids) compared
+                    // to linear interpolation.
+                    let m_prev = (self.magnitudes[bin - 1] as f64).max(1e-30);
+                    let m_curr = (self.magnitudes[bin] as f64).max(1e-30);
+                    let m_next = (self.magnitudes[bin + 1] as f64).max(1e-30);
+                    let alpha = m_prev.ln();
+                    let beta = m_curr.ln();
+                    let gamma = m_next.ln();
                     let denom = alpha - 2.0 * beta + gamma;
                     if denom.abs() > 1e-12 {
-                        let delta = 0.5 * (alpha - gamma) / denom;
-                        TWO_PI_F64 * (bin as f64 + delta) * self.hop_analysis as f64
-                            / self.fft_size as f64
+                        let p = 0.5 * (alpha - gamma) / denom;
+                        // Refined expected phase advance based on interpolated bin position
+                        let refined_expected = TWO_PI_F64 * (bin as f64 + p) * hop_a / fft;
+                        let refined_deviation = wrap_phase_f64(phase_diff - refined_expected);
+                        (refined_expected + refined_deviation) * hop_ratio
                     } else {
-                        self.expected_phase_advance[bin]
+                        (expected_diff + deviation) * hop_ratio
                     }
                 } else {
-                    self.expected_phase_advance[bin]
+                    (expected_diff + deviation) * hop_ratio
                 };
 
-                let deviation = wrap_phase_f64(phase - self.prev_phase[bin] - expected);
-                self.phase_accum[bin] += (expected + deviation) * hop_ratio;
+                self.phase_accum[bin] += phase_advance;
             }
 
             self.new_phases[bin] = self.phase_accum[bin] as f32;

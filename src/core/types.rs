@@ -1248,48 +1248,48 @@ impl EdmPreset {
         match self {
             EdmPreset::DjBeatmatch => PresetConfig {
                 fft_size: 4096,
-                hop_size: 4096 / 5, // ~820: Kaiser needs less overlap than BH
-                transient_sensitivity: 0.45,
+                hop_size: 4096 / 4, // 1024: 75% overlap, good COLA with Hann windows
+                transient_sensitivity: 0.3, // low sensitivity for clean ±5% DJ use
                 wsola_search_ms: WSOLA_SEARCH_MS_SMALL,
                 wsola_segment_ms: 50.0, // more context for cross-correlation at small ratios
                 transient_region_ms: 30.0, // kick attack+early decay is 30-50ms
-                window_type: WindowType::Kaiser(800), // beta=8.0: tight mainlobe for transparency
+                window_type: WindowType::Hann, // matched analysis/synthesis windows
             },
             EdmPreset::HouseLoop => PresetConfig {
                 fft_size: 4096,
-                hop_size: 4096 / 6, // ~683: BH needs more overlap (wider mainlobe)
+                hop_size: 4096 / 4, // 1024: 75% overlap, good COLA with Hann windows
                 transient_sensitivity: 0.5,
                 wsola_search_ms: WSOLA_SEARCH_MS_MEDIUM,
                 wsola_segment_ms: 40.0,
-                transient_region_ms: 25.0,
-                window_type: WindowType::BlackmanHarris,
+                transient_region_ms: 30.0, // wider region for better kick handling
+                window_type: WindowType::Hann, // matched analysis/synthesis windows
             },
             EdmPreset::Halftime => PresetConfig {
                 fft_size: 4096,
-                hop_size: 4096 / 6, // ~683
+                hop_size: 4096 / 4, // 1024: 75% overlap, good COLA with Hann windows
                 transient_sensitivity: 0.7,
                 wsola_search_ms: WSOLA_SEARCH_MS_LARGE,
                 wsola_segment_ms: 30.0,
-                transient_region_ms: 40.0, // halftime needs wide transient protection
-                window_type: WindowType::BlackmanHarris,
+                transient_region_ms: 20.0, // 20ms input = 40ms at 2x in output
+                window_type: WindowType::Hann, // matched analysis/synthesis windows
             },
             EdmPreset::Ambient => PresetConfig {
                 fft_size: 8192,
-                hop_size: 8192 / 4, // 2048: ambient can use less overlap
+                hop_size: 8192 / 2, // 4096: 50% overlap eliminates aliasing artifacts
                 transient_sensitivity: 0.2,
                 wsola_search_ms: WSOLA_SEARCH_MS_LARGE,
                 wsola_segment_ms: 20.0,
                 transient_region_ms: 10.0, // ambient has few transients
-                window_type: WindowType::BlackmanHarris,
+                window_type: WindowType::BlackmanHarris, // better sidelobe suppression for long FFT
             },
             EdmPreset::VocalChop => PresetConfig {
-                fft_size: 2048,
-                hop_size: 2048 / 4, // 512
-                transient_sensitivity: 0.6,
+                fft_size: 4096,
+                hop_size: 4096 / 4, // 1024: 75% overlap with Hann for better formant resolution
+                transient_sensitivity: 0.6, // phase-based detection reduces false positives
                 wsola_search_ms: WSOLA_SEARCH_MS_MEDIUM,
                 wsola_segment_ms: 25.0,
                 transient_region_ms: 20.0,
-                window_type: WindowType::Kaiser(600), // beta=6.0: good vocal balance
+                window_type: WindowType::Hann, // matched analysis/synthesis windows
             },
         }
     }
@@ -1451,6 +1451,17 @@ pub struct StretchParams {
     /// `Fixed` uses a constant duration; `Adaptive` scales based on the
     /// type of segments being joined (transient→tonal, tonal→transient, etc.).
     pub crossfade_mode: CrossfadeMode,
+    /// Optional BPM for beat-grid-aware stretching.
+    ///
+    /// When set, transient positions are snapped to the nearest beat subdivision,
+    /// improving rhythmic accuracy for tempo-matched content.
+    pub bpm: Option<f64>,
+    /// Whether to use dynamic WSOLA search range based on stretch ratio.
+    ///
+    /// When enabled, the effective search range scales with the stretch ratio,
+    /// giving the WSOLA algorithm more room to find good matches at extreme
+    /// ratios. The range is capped at 40ms to prevent excessive latency.
+    pub dynamic_wsola_search: bool,
 }
 
 /// Converts a duration in milliseconds to samples at the given sample rate.
@@ -1463,8 +1474,11 @@ fn ms_to_samples(ms: f64, sample_rate: u32) -> usize {
 const DEFAULT_SAMPLE_RATE: u32 = 44100;
 /// Default FFT size for phase vocoder (good frequency resolution for bass).
 const DEFAULT_FFT_SIZE: usize = 4096;
-/// Default hop size (FFT/8 ≈ 87.5% overlap for Blackman-Harris window).
-const DEFAULT_HOP_SIZE: usize = DEFAULT_FFT_SIZE / 8;
+/// Default hop size (FFT/4 = 75% overlap for Hann window COLA compliance).
+///
+/// 75% overlap (hop = FFT/4) provides good constant-overlap-add (COLA) behavior
+/// with Hann windows while halving the CPU cost compared to 87.5% overlap.
+const DEFAULT_HOP_SIZE: usize = DEFAULT_FFT_SIZE / 4;
 /// Default transient detection sensitivity (0.0–1.0).
 const DEFAULT_TRANSIENT_SENSITIVITY: f32 = 0.5;
 /// Default sub-bass phase lock cutoff in Hz.
@@ -1528,7 +1542,9 @@ impl StretchParams {
             transient_region_secs: DEFAULT_TRANSIENT_REGION_SECS,
             elastic_timing: false,
             hpss_enabled: false,
-            crossfade_mode: CrossfadeMode::Fixed(0.005),
+            crossfade_mode: CrossfadeMode::Fixed(0.012),
+            bpm: None,
+            dynamic_wsola_search: false,
         }
     }
 
@@ -1598,6 +1614,11 @@ impl StretchParams {
         self.hpss_enabled = matches!(preset, EdmPreset::DjBeatmatch | EdmPreset::HouseLoop);
         // Use adaptive crossfade for all presets
         self.crossfade_mode = CrossfadeMode::Adaptive;
+        // Enable dynamic WSOLA search range for presets where stretch ratio varies
+        self.dynamic_wsola_search = matches!(
+            preset,
+            EdmPreset::DjBeatmatch | EdmPreset::HouseLoop | EdmPreset::Halftime
+        );
         self
     }
 
@@ -1745,6 +1766,40 @@ impl StretchParams {
         self
     }
 
+    /// Set the BPM for beat-grid-aware stretching.
+    ///
+    /// When set, transient positions are snapped to the nearest beat subdivision,
+    /// improving rhythmic accuracy for tempo-matched content.
+    pub fn with_bpm(mut self, bpm: f64) -> Self {
+        self.bpm = Some(bpm);
+        self
+    }
+
+    /// Enables or disables dynamic WSOLA search range.
+    ///
+    /// When enabled, the effective search range scales with the stretch ratio,
+    /// giving the WSOLA algorithm more room to find good matches at extreme
+    /// ratios. The range is capped at 40ms to prevent excessive latency.
+    pub fn with_dynamic_wsola_search(mut self, enabled: bool) -> Self {
+        self.dynamic_wsola_search = enabled;
+        self
+    }
+
+    /// Compute the effective WSOLA search range in seconds.
+    ///
+    /// When `dynamic_wsola_search` is true, the base search range (in ms)
+    /// is scaled by the stretch ratio deviation from unity, capped at 40ms.
+    /// Otherwise returns the static search range converted to seconds.
+    pub fn effective_wsola_search_ms(&self) -> f64 {
+        let base_ms = self.wsola_search_range as f64 * 1000.0 / self.sample_rate as f64;
+        if self.dynamic_wsola_search {
+            let ratio_factor = self.stretch_ratio.max(1.0 / self.stretch_ratio);
+            (base_ms * ratio_factor).min(40.0) // cap at 40ms
+        } else {
+            base_ms
+        }
+    }
+
     /// Sets the stereo processing mode.
     ///
     /// - [`StereoMode::MidSide`] (default) — better stereo coherence
@@ -1888,8 +1943,9 @@ mod tests {
         let ambient = StretchParams::new(1.0).with_preset(EdmPreset::Ambient);
         assert!((ambient.transient_region_secs - 0.010).abs() < 1e-6);
 
+        // Halftime: 20ms input region (will be 40ms in 2x output)
         let halftime = StretchParams::new(1.0).with_preset(EdmPreset::Halftime);
-        assert!((halftime.transient_region_secs - 0.040).abs() < 1e-6);
+        assert!((halftime.transient_region_secs - 0.020).abs() < 1e-6);
     }
 
     #[test]
@@ -2445,17 +2501,25 @@ mod tests {
 
     #[test]
     fn test_preset_sets_window_type() {
-        // Ambient preset should use Blackman-Harris
+        // Ambient preset should use Blackman-Harris (better sidelobe suppression)
         let params = StretchParams::new(2.0).with_preset(EdmPreset::Ambient);
         assert_eq!(params.window_type, WindowType::BlackmanHarris);
 
-        // DjBeatmatch uses Kaiser(800)
+        // DjBeatmatch uses Hann (matched analysis/synthesis, good COLA at 75%)
         let params = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
-        assert_eq!(params.window_type, WindowType::Kaiser(800));
+        assert_eq!(params.window_type, WindowType::Hann);
 
-        // HouseLoop uses Blackman-Harris
+        // HouseLoop uses Hann
         let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
-        assert_eq!(params.window_type, WindowType::BlackmanHarris);
+        assert_eq!(params.window_type, WindowType::Hann);
+
+        // VocalChop uses Hann
+        let params = StretchParams::new(1.0).with_preset(EdmPreset::VocalChop);
+        assert_eq!(params.window_type, WindowType::Hann);
+
+        // Halftime uses Hann
+        let params = StretchParams::new(2.0).with_preset(EdmPreset::Halftime);
+        assert_eq!(params.window_type, WindowType::Hann);
     }
 
     #[test]
@@ -3210,5 +3274,176 @@ mod tests {
         assert_eq!(windowed.sample_rate, 48000);
         assert_eq!(windowed.channels, Channels::Mono);
         assert_eq!(windowed.num_frames(), 100);
+    }
+
+    // --- BPM field tests ---
+
+    #[test]
+    fn test_with_bpm() {
+        let params = StretchParams::new(1.0).with_bpm(128.0);
+        assert_eq!(params.bpm, Some(128.0));
+    }
+
+    #[test]
+    fn test_bpm_default_is_none() {
+        let params = StretchParams::new(1.0);
+        assert_eq!(params.bpm, None);
+    }
+
+    #[test]
+    fn test_bpm_none_after_preset() {
+        let params = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
+        assert_eq!(params.bpm, None);
+    }
+
+    #[test]
+    fn test_bpm_preserved_after_preset() {
+        // BPM set before preset should be overwritten (preset doesn't set BPM)
+        let params = StretchParams::new(1.0)
+            .with_bpm(140.0)
+            .with_preset(EdmPreset::HouseLoop);
+        // Preset does not reset bpm, so it should be preserved
+        assert_eq!(params.bpm, Some(140.0));
+    }
+
+    #[test]
+    fn test_from_tempo_bpm_is_none() {
+        let params = StretchParams::from_tempo(126.0, 128.0);
+        assert_eq!(params.bpm, None);
+    }
+
+    // --- Dynamic WSOLA search tests ---
+
+    #[test]
+    fn test_dynamic_wsola_search_default_is_false() {
+        let params = StretchParams::new(1.0);
+        assert!(!params.dynamic_wsola_search);
+    }
+
+    #[test]
+    fn test_with_dynamic_wsola_search() {
+        let params = StretchParams::new(1.0).with_dynamic_wsola_search(true);
+        assert!(params.dynamic_wsola_search);
+    }
+
+    #[test]
+    fn test_preset_enables_dynamic_wsola_search() {
+        // DjBeatmatch, HouseLoop, Halftime should enable it
+        let dj = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
+        assert!(dj.dynamic_wsola_search);
+
+        let house = StretchParams::new(1.0).with_preset(EdmPreset::HouseLoop);
+        assert!(house.dynamic_wsola_search);
+
+        let halftime = StretchParams::new(2.0).with_preset(EdmPreset::Halftime);
+        assert!(halftime.dynamic_wsola_search);
+
+        // Ambient and VocalChop should not enable it
+        let ambient = StretchParams::new(3.0).with_preset(EdmPreset::Ambient);
+        assert!(!ambient.dynamic_wsola_search);
+
+        let vocal = StretchParams::new(1.0).with_preset(EdmPreset::VocalChop);
+        assert!(!vocal.dynamic_wsola_search);
+    }
+
+    #[test]
+    fn test_effective_wsola_search_ms_static() {
+        // With dynamic disabled, should return the static value
+        let params = StretchParams::new(2.0)
+            .with_sample_rate(44100)
+            .with_wsola_search_range(ms_to_samples(10.0, 44100));
+        let ms = params.effective_wsola_search_ms();
+        assert!((ms - 10.0).abs() < 0.5, "Expected ~10ms, got {}", ms);
+    }
+
+    #[test]
+    fn test_effective_wsola_search_ms_dynamic_scales() {
+        // With dynamic enabled at 2x ratio, search should double
+        let params = StretchParams::new(2.0)
+            .with_sample_rate(44100)
+            .with_wsola_search_range(ms_to_samples(10.0, 44100))
+            .with_dynamic_wsola_search(true);
+        let ms = params.effective_wsola_search_ms();
+        assert!((ms - 20.0).abs() < 0.5, "Expected ~20ms, got {}", ms);
+    }
+
+    #[test]
+    fn test_effective_wsola_search_ms_dynamic_caps_at_40() {
+        // At extreme stretch ratio (10x), should cap at 40ms
+        let params = StretchParams::new(10.0)
+            .with_sample_rate(44100)
+            .with_wsola_search_range(ms_to_samples(10.0, 44100))
+            .with_dynamic_wsola_search(true);
+        let ms = params.effective_wsola_search_ms();
+        assert!((ms - 40.0).abs() < 0.5, "Expected cap at 40ms, got {}", ms);
+    }
+
+    #[test]
+    fn test_effective_wsola_search_ms_dynamic_compress() {
+        // With ratio < 1, should use 1/ratio as factor
+        let params = StretchParams::new(0.5)
+            .with_sample_rate(44100)
+            .with_wsola_search_range(ms_to_samples(10.0, 44100))
+            .with_dynamic_wsola_search(true);
+        let ms = params.effective_wsola_search_ms();
+        assert!((ms - 20.0).abs() < 0.5, "Expected ~20ms, got {}", ms);
+    }
+
+    // --- Preset tuning tests ---
+
+    #[test]
+    fn test_dj_beatmatch_tuning() {
+        let params = StretchParams::new(1.02).with_preset(EdmPreset::DjBeatmatch);
+        assert_eq!(params.fft_size, 4096);
+        assert_eq!(params.hop_size, 1024); // 75% overlap
+        assert!((params.transient_sensitivity - 0.3).abs() < f32::EPSILON);
+        assert_eq!(params.window_type, WindowType::Hann);
+        assert!(params.dynamic_wsola_search);
+    }
+
+    #[test]
+    fn test_house_loop_tuning() {
+        let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
+        assert_eq!(params.fft_size, 4096);
+        assert_eq!(params.hop_size, 1024); // 75% overlap
+        assert!((params.transient_region_secs - 0.030).abs() < 1e-6); // 30ms
+        assert_eq!(params.window_type, WindowType::Hann);
+        assert!(params.dynamic_wsola_search);
+    }
+
+    #[test]
+    fn test_halftime_tuning() {
+        let params = StretchParams::new(2.0).with_preset(EdmPreset::Halftime);
+        assert_eq!(params.fft_size, 4096);
+        assert_eq!(params.hop_size, 1024); // 75% overlap
+        assert!((params.transient_region_secs - 0.020).abs() < 1e-6); // 20ms
+        assert_eq!(params.window_type, WindowType::Hann);
+        assert!(params.dynamic_wsola_search);
+        assert_eq!(params.crossfade_mode, CrossfadeMode::Adaptive);
+    }
+
+    #[test]
+    fn test_ambient_tuning() {
+        let params = StretchParams::new(3.0).with_preset(EdmPreset::Ambient);
+        assert_eq!(params.fft_size, 8192);
+        assert_eq!(params.hop_size, 4096); // 50% overlap
+        assert_eq!(params.window_type, WindowType::BlackmanHarris);
+        assert_eq!(params.crossfade_mode, CrossfadeMode::Adaptive);
+        assert!(!params.dynamic_wsola_search);
+    }
+
+    #[test]
+    fn test_vocal_chop_tuning() {
+        let params = StretchParams::new(1.0).with_preset(EdmPreset::VocalChop);
+        assert_eq!(params.fft_size, 4096); // increased from 2048
+        assert_eq!(params.hop_size, 1024);
+        assert!((params.transient_sensitivity - 0.6).abs() < f32::EPSILON);
+        assert_eq!(params.window_type, WindowType::Hann);
+    }
+
+    #[test]
+    fn test_default_hop_size_is_fft_div_4() {
+        let params = StretchParams::new(1.0);
+        assert_eq!(params.hop_size, params.fft_size / 4);
     }
 }

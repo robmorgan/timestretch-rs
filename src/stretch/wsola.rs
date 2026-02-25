@@ -149,10 +149,11 @@ impl Wsola {
             }
 
             // Search for best matching position around nominal position
-            let best_pos = self.find_best_position(input, &output, nominal_pos, output_pos);
+            let (best_pos, fractional_offset) =
+                self.find_best_position(input, &output, nominal_pos, output_pos);
 
-            // Overlap-add with cross-fade
-            self.overlap_add(input, &mut output, best_pos, output_pos);
+            // Overlap-add with cross-fade (using sub-sample offset for precision)
+            self.overlap_add(input, &mut output, best_pos, output_pos, fractional_offset);
             actual_output_len = (output_pos + self.segment_size).max(actual_output_len);
 
             input_pos += advance_input as f64;
@@ -169,26 +170,33 @@ impl Wsola {
     /// Finds the best matching position within the search range using FFT-accelerated
     /// cross-correlation for large search ranges, falling back to direct computation
     /// for small ranges.
+    ///
+    /// Returns `(integer_position, fractional_offset)` where the true best alignment
+    /// is at `integer_position + fractional_offset` samples. The fractional offset
+    /// is determined via parabolic interpolation of the correlation peak.
     fn find_best_position(
         &mut self,
         input: &[f32],
         output: &[f32],
         nominal_pos: usize,
         output_pos: usize,
-    ) -> usize {
+    ) -> (usize, f64) {
         let search_start = nominal_pos.saturating_sub(self.search_range);
         let search_end =
             (nominal_pos + self.search_range).min(input.len().saturating_sub(self.segment_size));
 
         if search_start >= search_end {
-            return nominal_pos.min(input.len().saturating_sub(self.segment_size));
+            return (
+                nominal_pos.min(input.len().saturating_sub(self.segment_size)),
+                0.0,
+            );
         }
 
         let overlap_len = self
             .overlap_size
             .min(output.len().saturating_sub(output_pos));
         if overlap_len == 0 {
-            return nominal_pos;
+            return (nominal_pos, 0.0);
         }
 
         let num_candidates = search_end - search_start + 1;
@@ -216,6 +224,9 @@ impl Wsola {
     }
 
     /// Direct time-domain cross-correlation search (used for small search ranges).
+    ///
+    /// Returns `(integer_position, fractional_offset)` with parabolic refinement
+    /// of the correlation peak for sub-sample accuracy.
     fn find_best_position_direct(
         &self,
         input: &[f32],
@@ -224,9 +235,13 @@ impl Wsola {
         search_end: usize,
         output_pos: usize,
         overlap_len: usize,
-    ) -> usize {
+    ) -> (usize, f64) {
         let mut best_pos = search_start;
         let mut best_corr = f64::NEG_INFINITY;
+
+        // Collect correlation values for parabolic interpolation
+        let num_candidates = search_end - search_start + 1;
+        let mut corr_values = Vec::with_capacity(num_candidates);
 
         for pos in search_start..=search_end {
             if pos + overlap_len > input.len() {
@@ -238,19 +253,28 @@ impl Wsola {
                 &input[pos..pos + overlap_len],
             );
 
+            corr_values.push(corr);
+
             if corr > best_corr {
                 best_corr = corr;
                 best_pos = pos;
             }
         }
 
-        best_pos
+        // Parabolic interpolation for sub-sample accuracy
+        let best_idx = best_pos - search_start;
+        let fractional_offset = parabolic_interpolation(&corr_values, best_idx);
+
+        (best_pos, fractional_offset)
     }
 
     /// FFT-accelerated cross-correlation search.
     ///
     /// Computes cross-correlation between the output overlap region (reference)
     /// and all candidate positions in the input search region simultaneously.
+    ///
+    /// Returns `(integer_position, fractional_offset)` with parabolic refinement
+    /// of the correlation peak for sub-sample accuracy.
     fn find_best_position_fft(
         &mut self,
         input: &[f32],
@@ -259,7 +283,7 @@ impl Wsola {
         search_end: usize,
         output_pos: usize,
         overlap_len: usize,
-    ) -> usize {
+    ) -> (usize, f64) {
         let ref_signal = &output[output_pos..output_pos + overlap_len];
         let search_region_len = search_end - search_start + overlap_len;
 
@@ -267,7 +291,7 @@ impl Wsola {
         let actual_region_end = (search_start + search_region_len).min(input.len());
         let actual_region_len = actual_region_end - search_start;
         if actual_region_len < overlap_len {
-            return search_start;
+            return (search_start, 0.0);
         }
         let search_signal = &input[search_start..actual_region_end];
 
@@ -277,7 +301,7 @@ impl Wsola {
         // Compute reference energy (constant for all candidates)
         let ref_energy: f64 = ref_signal.iter().map(|&s| (s as f64) * (s as f64)).sum();
         if ref_energy < ENERGY_EPSILON {
-            return search_start;
+            return (search_start, 0.0);
         }
 
         // Find best candidate using normalized correlation
@@ -293,7 +317,7 @@ impl Wsola {
             self.prefix_sq_buf.push(accum);
         }
 
-        let best_pos = find_best_candidate(
+        let (best_pos, fractional_offset) = find_best_candidate(
             &self.prefix_sq_buf,
             &self.fft_corr_buf,
             ref_energy,
@@ -303,7 +327,7 @@ impl Wsola {
         );
 
         // Clamp to valid range
-        best_pos.min(search_end)
+        (best_pos.min(search_end), fractional_offset)
     }
 
     /// Computes cross-correlation between two signals using FFT.
@@ -352,31 +376,71 @@ impl Wsola {
 
     /// Overlap-adds a segment from input into output with raised-cosine crossfade.
     ///
+    /// When `fractional_offset` is non-zero, applies sub-sample interpolation to the
+    /// input read positions for pitch-drift-free alignment. The fractional offset
+    /// shifts the source read by a sub-sample amount using linear interpolation.
+    ///
     /// Split into two separate loops (crossfade region vs copy region) so each
     /// loop body is branch-free and amenable to auto-vectorization.
     #[inline]
-    fn overlap_add(&self, input: &[f32], output: &mut [f32], input_pos: usize, output_pos: usize) {
+    fn overlap_add(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        input_pos: usize,
+        output_pos: usize,
+        fractional_offset: f64,
+    ) {
         let segment_end = (input_pos + self.segment_size).min(input.len());
         let segment_len = segment_end - input_pos;
         let out_avail = output.len().saturating_sub(output_pos);
         let len = segment_len.min(out_avail);
 
+        // If we have a fractional offset that would require reading past the end,
+        // reduce len by 1 to leave room for the interpolation neighbor.
+        let len = if fractional_offset.abs() > 1e-10 && len > 0 {
+            // Need src_idx + 1 < input.len() for the last sample
+            let last_src = input_pos as f64 + (len - 1) as f64 + fractional_offset;
+            let last_idx = last_src.floor() as usize;
+            if last_idx + 1 >= input.len() {
+                len.saturating_sub(1)
+            } else {
+                len
+            }
+        } else {
+            len
+        };
+
         let overlap_len = self.overlap_size.min(len);
         let inv_overlap = 1.0 / self.overlap_size as f32;
+        let use_interp = fractional_offset.abs() > 1e-10;
 
         // Crossfade region: raised-cosine fade for smoother transitions
         for i in 0..overlap_len {
             let t = i as f32 * inv_overlap;
             let fade_in = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
             let fade_out = 1.0 - fade_in;
-            output[output_pos + i] =
-                output[output_pos + i] * fade_out + input[input_pos + i] * fade_in;
+            let in_sample = if use_interp {
+                subsample_interpolate(input, input_pos, i, fractional_offset)
+            } else {
+                input[input_pos + i]
+            };
+            output[output_pos + i] = output[output_pos + i] * fade_out + in_sample * fade_in;
         }
 
-        // Non-overlap region: direct copy
-        let copy_start = overlap_len;
-        output[output_pos + copy_start..output_pos + len]
-            .copy_from_slice(&input[input_pos + copy_start..input_pos + len]);
+        // Non-overlap region
+        if use_interp {
+            // Sub-sample interpolated copy
+            for i in overlap_len..len {
+                output[output_pos + i] =
+                    subsample_interpolate(input, input_pos, i, fractional_offset);
+            }
+        } else {
+            // Direct copy (fast path, no fractional offset)
+            let copy_start = overlap_len;
+            output[output_pos + copy_start..output_pos + len]
+                .copy_from_slice(&input[input_pos + copy_start..input_pos + len]);
+        }
     }
 }
 
@@ -384,6 +448,9 @@ impl Wsola {
 ///
 /// Scans `num_candidates` lag positions in `corr_buf`, normalizing each by
 /// the windowed energy (via pre-computed `prefix_sq`) and the reference energy.
+///
+/// Returns `(integer_position, fractional_offset)` with parabolic refinement
+/// of the correlation peak for sub-sample accuracy.
 fn find_best_candidate(
     prefix_sq: &[f64],
     corr_buf: &[Complex<f32>],
@@ -391,11 +458,15 @@ fn find_best_candidate(
     num_candidates: usize,
     overlap_len: usize,
     search_start: usize,
-) -> usize {
+) -> (usize, f64) {
     let norm = 1.0 / corr_buf.len() as f64;
 
     let mut best_pos = search_start;
     let mut best_ncorr = f64::NEG_INFINITY;
+    let mut best_k: usize = 0;
+
+    // Collect normalized correlation values for parabolic interpolation
+    let mut ncorr_values = Vec::with_capacity(num_candidates);
 
     for k in 0..num_candidates {
         let raw_corr = corr_buf[k].re as f64 * norm;
@@ -408,30 +479,53 @@ fn find_best_candidate(
             0.0
         };
 
+        ncorr_values.push(ncorr);
+
         if ncorr > best_ncorr {
             best_ncorr = ncorr;
             best_pos = search_start + k;
+            best_k = k;
         }
     }
 
-    best_pos
+    // Parabolic interpolation for sub-sample accuracy
+    let fractional_offset = parabolic_interpolation(&ncorr_values, best_k);
+
+    (best_pos, fractional_offset)
 }
 
-/// Normalized cross-correlation between two signals.
+/// Normalized cross-correlation between two signals with mean removal.
+///
+/// Mean-centering removes DC bias, ensuring the correlation measures only the
+/// similarity of the signal shapes rather than being influenced by DC offsets.
 #[inline]
 fn normalized_cross_correlation(a: &[f32], b: &[f32]) -> f64 {
-    if a.is_empty() || b.is_empty() {
+    let n = a.len().min(b.len());
+    if n == 0 {
         return 0.0;
     }
 
-    let (sum_ab, sum_a2, sum_b2) =
-        a.iter()
-            .zip(b.iter())
-            .fold((0.0f64, 0.0f64, 0.0f64), |(ab, a2, b2), (&va, &vb)| {
-                let va = va as f64;
-                let vb = vb as f64;
-                (ab + va * vb, a2 + va * va, b2 + vb * vb)
-            });
+    // Compute means for DC removal
+    let mut sum_a = 0.0f64;
+    let mut sum_b = 0.0f64;
+    for i in 0..n {
+        sum_a += a[i] as f64;
+        sum_b += b[i] as f64;
+    }
+    let mean_a = sum_a / n as f64;
+    let mean_b = sum_b / n as f64;
+
+    let mut sum_ab = 0.0f64;
+    let mut sum_a2 = 0.0f64;
+    let mut sum_b2 = 0.0f64;
+
+    for i in 0..n {
+        let da = a[i] as f64 - mean_a;
+        let db = b[i] as f64 - mean_b;
+        sum_ab += da * db;
+        sum_a2 += da * da;
+        sum_b2 += db * db;
+    }
 
     let denom = (sum_a2 * sum_b2).sqrt();
     if denom < ENERGY_EPSILON {
@@ -439,6 +533,48 @@ fn normalized_cross_correlation(a: &[f32], b: &[f32]) -> f64 {
     }
 
     sum_ab / denom
+}
+
+/// Parabolic interpolation for sub-sample peak refinement.
+///
+/// Given a vector of correlation values and the index `k` of the integer peak,
+/// fits a parabola through `corr[k-1]`, `corr[k]`, `corr[k+1]` and returns the
+/// fractional offset `p` in `[-0.5, 0.5]` of the true peak relative to `k`.
+#[inline]
+fn parabolic_interpolation(corr: &[f64], k: usize) -> f64 {
+    if k == 0 || k >= corr.len() - 1 || corr.len() < 3 {
+        return 0.0;
+    }
+
+    let alpha = corr[k - 1];
+    let beta = corr[k];
+    let gamma = corr[k + 1];
+    let denom = alpha - 2.0 * beta + gamma;
+
+    if denom.abs() > 1e-10 {
+        let p = 0.5 * (alpha - gamma) / denom;
+        // Clamp to [-0.5, 0.5] for safety
+        p.clamp(-0.5, 0.5)
+    } else {
+        0.0
+    }
+}
+
+/// Reads a sample from `input` at sub-sample position `input_pos + i + fractional_offset`
+/// using linear interpolation between adjacent samples.
+#[inline]
+fn subsample_interpolate(input: &[f32], input_pos: usize, i: usize, fractional_offset: f64) -> f32 {
+    let src_pos = (input_pos + i) as f64 + fractional_offset;
+    let src_idx = src_pos.floor() as usize;
+    let frac = (src_pos - src_pos.floor()) as f32;
+
+    if src_idx + 1 < input.len() {
+        input[src_idx] * (1.0 - frac) + input[src_idx + 1] * frac
+    } else if src_idx < input.len() {
+        input[src_idx]
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]
@@ -772,7 +908,7 @@ mod tests {
         let num_candidates = search_signal.len() - overlap_len + 1;
         let prefix_sq = compute_prefix_sq(&search_signal);
 
-        let best = find_best_candidate(
+        let (best, _fractional) = find_best_candidate(
             &prefix_sq,
             &wsola.fft_corr_buf,
             ref_energy,
@@ -800,7 +936,7 @@ mod tests {
         let num_candidates = search_signal.len() - overlap_len + 1;
         let prefix_sq = compute_prefix_sq(&search_signal);
 
-        let best = find_best_candidate(
+        let (best, _fractional) = find_best_candidate(
             &prefix_sq,
             &wsola.fft_corr_buf,
             ref_energy,
@@ -882,7 +1018,7 @@ mod tests {
         // Input segment is all 0.0
         let input = vec![0.0f32; 200];
 
-        wsola.overlap_add(&input, &mut output, 0, 50);
+        wsola.overlap_add(&input, &mut output, 0, 50, 0.0);
 
         // In the overlap region:
         //   t = i/overlap_size
@@ -919,7 +1055,7 @@ mod tests {
         let wsola = Wsola::new(100, 10, 1.0);
         let input = vec![0.5f32; 200];
         let mut output = vec![0.0f32; 60]; // Only 60 samples available
-        wsola.overlap_add(&input, &mut output, 0, 10);
+        wsola.overlap_add(&input, &mut output, 0, 10, 0.0);
         // Should write up to output[59] without panicking
         assert!(output.iter().all(|s| s.is_finite()));
     }
@@ -930,7 +1066,7 @@ mod tests {
         let wsola = Wsola::new(100, 10, 1.0);
         let input = vec![0.5f32; 30]; // Only 30 samples
         let mut output = vec![0.0f32; 100];
-        wsola.overlap_add(&input, &mut output, 0, 0);
+        wsola.overlap_add(&input, &mut output, 0, 0, 0.0);
         // Only first 30 samples should be written
         assert!((output[0] - 0.0).abs() < 1e-5); // fade_in at i=0 → 0*0.5 = 0
         assert!(output.iter().all(|s| s.is_finite()));

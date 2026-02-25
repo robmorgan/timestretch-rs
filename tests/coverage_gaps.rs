@@ -1074,18 +1074,21 @@ mod preset_configs {
 
     #[test]
     fn presets_use_expected_windows() {
-        // DjBeatmatch and VocalChop use Kaiser windows
+        // DjBeatmatch, HouseLoop, Halftime, and VocalChop use Hann (matched windows)
         let params = StretchParams::new(1.5).with_preset(EdmPreset::DjBeatmatch);
-        assert_eq!(params.window_type, WindowType::Kaiser(800));
+        assert_eq!(params.window_type, WindowType::Hann);
 
         let params = StretchParams::new(1.5).with_preset(EdmPreset::VocalChop);
-        assert_eq!(params.window_type, WindowType::Kaiser(600));
+        assert_eq!(params.window_type, WindowType::Hann);
 
-        // HouseLoop and Halftime use Blackman-Harris
         let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
-        assert_eq!(params.window_type, WindowType::BlackmanHarris);
+        assert_eq!(params.window_type, WindowType::Hann);
 
         let params = StretchParams::new(1.5).with_preset(EdmPreset::Halftime);
+        assert_eq!(params.window_type, WindowType::Hann);
+
+        // Ambient uses Blackman-Harris (better sidelobe suppression for long FFT)
+        let params = StretchParams::new(3.0).with_preset(EdmPreset::Ambient);
         assert_eq!(params.window_type, WindowType::BlackmanHarris);
     }
 

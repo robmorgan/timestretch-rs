@@ -351,6 +351,7 @@ fn test_beat_grid_snap_empty_grid() {
 fn test_beat_grid_interval_samples() {
     let grid = timestretch::BeatGrid {
         beats: vec![0, 22050],
+        beats_fractional: vec![0.0, 22050.0],
         bpm: 120.0,
         sample_rate: 44100,
     };
@@ -466,21 +467,21 @@ fn test_params_output_length_calculation() {
 
 #[test]
 fn test_preset_overrides_fft_and_hop() {
-    // DjBeatmatch preset: Kaiser(800), hop = fft_size/5
+    // DjBeatmatch preset: Hann, hop = fft_size/4 (75% overlap)
     let params = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
     assert_eq!(params.fft_size, 4096);
-    assert_eq!(params.hop_size, 4096 / 5);
+    assert_eq!(params.hop_size, 4096 / 4);
     assert!(params.beat_aware); // Presets enable beat_aware
 
-    // Ambient preset: BH, hop = fft_size/4
+    // Ambient preset: BH, hop = fft_size/2 (50% overlap)
     let params = StretchParams::new(1.0).with_preset(EdmPreset::Ambient);
     assert_eq!(params.fft_size, 8192);
-    assert_eq!(params.hop_size, 8192 / 4);
+    assert_eq!(params.hop_size, 8192 / 2);
 
-    // VocalChop preset: Kaiser(600), hop = fft_size/4
+    // VocalChop preset: Hann, fft_size=4096, hop = fft_size/4
     let params = StretchParams::new(1.0).with_preset(EdmPreset::VocalChop);
-    assert_eq!(params.fft_size, 2048);
-    assert_eq!(params.hop_size, 2048 / 4);
+    assert_eq!(params.fft_size, 4096);
+    assert_eq!(params.hop_size, 4096 / 4);
 }
 
 #[test]
