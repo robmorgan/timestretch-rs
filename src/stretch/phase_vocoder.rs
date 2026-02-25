@@ -327,15 +327,19 @@ impl PhaseVocoder {
             );
 
             // Blend IF estimates with locked phases for non-peak bins above sub-bass.
-            // This preserves some of the IF accuracy while still benefiting from
-            // phase coherence imposed by the locking algorithm.
-            for bin in self.sub_bass_bin..num_bins {
-                if self.peaks.binary_search(&bin).is_ok() {
-                    continue; // Peak bins keep their locked phase
+            // At ratio near 1.0, phase locking is very accurate so we trust it fully.
+            // As the ratio increases, IF estimates become more valuable for preserving
+            // frequency accuracy, so we blend in up to 30% IF.
+            let if_blend = (0.3 * ((hop_ratio - 1.0).abs() / 0.5).min(1.0)).min(0.3);
+            if if_blend > 1e-6 {
+                for bin in self.sub_bass_bin..num_bins {
+                    if self.peaks.binary_search(&bin).is_ok() {
+                        continue; // Peak bins keep their locked phase
+                    }
+                    let locked = self.new_phases[bin] as f64;
+                    let if_est = self.if_phases_backup[bin] as f64;
+                    self.new_phases[bin] = ((1.0 - if_blend) * locked + if_blend * if_est) as f32;
                 }
-                let locked = self.new_phases[bin] as f64;
-                let if_est = self.if_phases_backup[bin] as f64;
-                self.new_phases[bin] = (0.7 * locked + 0.3 * if_est) as f32;
             }
 
             // Spectral envelope preservation: correct magnitudes so formant
