@@ -22,6 +22,9 @@ const ENERGY_SMOOTH_ALPHA: f32 = 0.9;
 pub struct TransientMap {
     /// Sample positions of detected transient onsets.
     pub onsets: Vec<usize>,
+    /// Normalized onset strengths in [0, 1], one per onset.
+    /// Higher values indicate stronger transients (kicks) vs weaker ones (hi-hats).
+    pub strengths: Vec<f32>,
     /// Combined detection function values at each analysis frame.
     pub flux: Vec<f32>,
     /// Hop size used for analysis.
@@ -169,6 +172,7 @@ pub fn detect_transients(
     if samples.len() < fft_size {
         return TransientMap {
             onsets: vec![],
+            strengths: vec![],
             flux: vec![],
             hop_size,
         };
@@ -177,10 +181,22 @@ pub fn detect_transients(
     let flux_values = compute_spectral_flux(samples, sample_rate, fft_size, hop_size);
     let energy_envelope = compute_onset_energy(samples, fft_size, hop_size);
     let combined = combine_detection_functions(&flux_values, &energy_envelope);
-    let onsets = adaptive_threshold(&combined, sensitivity, hop_size);
+
+    // Use sensitivity-aware gap: high sensitivity (>0.6) uses smaller gap
+    // to detect rapid hi-hat patterns
+    let min_gap = if sensitivity > 0.6 {
+        MIN_ONSET_GAP_FRAMES_HIGH_SENS
+    } else {
+        MIN_ONSET_GAP_FRAMES
+    };
+    let onsets = adaptive_threshold_with_gap(&combined, sensitivity, hop_size, min_gap);
+
+    // Compute onset strengths from detection function values
+    let strengths = compute_onset_strengths(&combined, &onsets, hop_size);
 
     TransientMap {
         onsets,
+        strengths,
         flux: combined,
         hop_size,
     }
@@ -230,17 +246,25 @@ fn compute_bin_weights(fft_size: usize, sample_rate: u32) -> Vec<f32> {
 
 /// Number of frames in the local median window for adaptive thresholding.
 const MEDIAN_WINDOW_FRAMES: usize = 11;
-/// Minimum gap between detected onsets in frames (~50ms at typical hop sizes).
+/// Minimum gap between detected onsets in frames (~46ms at typical hop sizes).
 const MIN_ONSET_GAP_FRAMES: usize = 4;
+/// Reduced minimum gap for high-sensitivity presets (~23ms), allowing rapid
+/// hi-hat pattern detection (16th notes at 124 BPM = 121ms apart).
+const MIN_ONSET_GAP_FRAMES_HIGH_SENS: usize = 2;
 /// Floor added to threshold to avoid false positives in near-silence.
 const THRESHOLD_FLOOR: f32 = 0.01;
 
-/// Adaptive thresholding for onset detection.
+/// Adaptive thresholding with a configurable minimum gap between onsets.
 ///
 /// Uses a sliding median with multiplicative threshold. The median is robust
 /// to outliers (unlike mean+stddev), making it well-suited for signals with
 /// a mix of strong transients and quiet passages.
-fn adaptive_threshold(flux: &[f32], sensitivity: f32, hop_size: usize) -> Vec<usize> {
+fn adaptive_threshold_with_gap(
+    flux: &[f32],
+    sensitivity: f32,
+    hop_size: usize,
+    min_gap_frames: usize,
+) -> Vec<usize> {
     if flux.is_empty() {
         return vec![];
     }
@@ -268,7 +292,7 @@ fn adaptive_threshold(flux: &[f32], sensitivity: f32, hop_size: usize) -> Vec<us
         if flux_val > threshold {
             // Check minimum gap
             if let Some(last) = last_onset {
-                if i - last < MIN_ONSET_GAP_FRAMES {
+                if i - last < min_gap_frames {
                     continue;
                 }
             }
@@ -280,9 +304,45 @@ fn adaptive_threshold(flux: &[f32], sensitivity: f32, hop_size: usize) -> Vec<us
     onsets
 }
 
+/// Computes normalized onset strengths from the detection function values.
+///
+/// For each onset sample position, looks up the detection function value at
+/// the corresponding frame and normalizes all values to [0, 1].
+fn compute_onset_strengths(combined: &[f32], onsets: &[usize], hop_size: usize) -> Vec<f32> {
+    if onsets.is_empty() {
+        return vec![];
+    }
+
+    // Get raw detection values at each onset frame
+    let raw: Vec<f32> = onsets
+        .iter()
+        .map(|&onset_sample| {
+            let frame = onset_sample / hop_size;
+            if frame < combined.len() {
+                combined[frame]
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
+    // Normalize to [0, 1]
+    let max_val = raw.iter().copied().fold(0.0f32, f32::max);
+    if max_val < 1e-10 {
+        return vec![0.0; onsets.len()];
+    }
+
+    raw.iter().map(|&v| v / max_val).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test helper: adaptive_threshold with default gap.
+    fn adaptive_threshold(flux: &[f32], sensitivity: f32, hop_size: usize) -> Vec<usize> {
+        adaptive_threshold_with_gap(flux, sensitivity, hop_size, MIN_ONSET_GAP_FRAMES)
+    }
 
     #[test]
     fn test_detect_transients_click_train() {
@@ -325,7 +385,48 @@ mod tests {
         let samples = vec![0.0f32; 100];
         let result = detect_transients(&samples, 44100, 2048, 512, 0.5);
         assert!(result.onsets.is_empty());
+        assert!(result.strengths.is_empty());
         assert!(result.flux.is_empty());
+    }
+
+    #[test]
+    fn test_detect_transients_strengths() {
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize * 2;
+        let mut samples = vec![0.0f32; num_samples];
+
+        // Strong click and weaker click
+        let click_positions = [0, sample_rate as usize / 2, sample_rate as usize];
+        let click_amplitudes = [1.0f32, 0.3, 1.0];
+        for (&pos, &amp) in click_positions.iter().zip(click_amplitudes.iter()) {
+            for j in 0..10.min(num_samples - pos) {
+                samples[pos + j] = if j < 5 { amp } else { -amp * 0.5 };
+            }
+        }
+
+        let result = detect_transients(&samples, sample_rate, 2048, 512, 0.5);
+        assert_eq!(
+            result.onsets.len(),
+            result.strengths.len(),
+            "Onsets and strengths should have same length"
+        );
+        // All strengths should be in [0, 1]
+        for &s in &result.strengths {
+            assert!(
+                (0.0..=1.0).contains(&s),
+                "Strength {} out of [0, 1] range",
+                s
+            );
+        }
+        // At least one strength should be 1.0 (the maximum)
+        if !result.strengths.is_empty() {
+            let max_strength = result.strengths.iter().copied().fold(0.0f32, f32::max);
+            assert!(
+                (max_strength - 1.0).abs() < 1e-6,
+                "Max strength should be 1.0, got {}",
+                max_strength
+            );
+        }
     }
 
     #[test]

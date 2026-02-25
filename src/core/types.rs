@@ -1216,6 +1216,8 @@ struct PresetConfig {
     hop_size: usize,
     transient_sensitivity: f32,
     wsola_search_ms: f64,
+    wsola_segment_ms: f64,
+    transient_region_ms: f64,
     window_type: WindowType,
 }
 
@@ -1249,6 +1251,8 @@ impl EdmPreset {
                 hop_size: 4096 / 5, // ~820: Kaiser needs less overlap than BH
                 transient_sensitivity: 0.45,
                 wsola_search_ms: WSOLA_SEARCH_MS_SMALL,
+                wsola_segment_ms: 50.0, // more context for cross-correlation at small ratios
+                transient_region_ms: 30.0, // kick attack+early decay is 30-50ms
                 window_type: WindowType::Kaiser(800), // beta=8.0: tight mainlobe for transparency
             },
             EdmPreset::HouseLoop => PresetConfig {
@@ -1256,6 +1260,8 @@ impl EdmPreset {
                 hop_size: 4096 / 6, // ~683: BH needs more overlap (wider mainlobe)
                 transient_sensitivity: 0.5,
                 wsola_search_ms: WSOLA_SEARCH_MS_MEDIUM,
+                wsola_segment_ms: 40.0,
+                transient_region_ms: 25.0,
                 window_type: WindowType::BlackmanHarris,
             },
             EdmPreset::Halftime => PresetConfig {
@@ -1263,6 +1269,8 @@ impl EdmPreset {
                 hop_size: 4096 / 6, // ~683
                 transient_sensitivity: 0.7,
                 wsola_search_ms: WSOLA_SEARCH_MS_LARGE,
+                wsola_segment_ms: 30.0,
+                transient_region_ms: 40.0, // halftime needs wide transient protection
                 window_type: WindowType::BlackmanHarris,
             },
             EdmPreset::Ambient => PresetConfig {
@@ -1270,6 +1278,8 @@ impl EdmPreset {
                 hop_size: 8192 / 4, // 2048: ambient can use less overlap
                 transient_sensitivity: 0.2,
                 wsola_search_ms: WSOLA_SEARCH_MS_LARGE,
+                wsola_segment_ms: 20.0,
+                transient_region_ms: 10.0, // ambient has few transients
                 window_type: WindowType::BlackmanHarris,
             },
             EdmPreset::VocalChop => PresetConfig {
@@ -1277,6 +1287,8 @@ impl EdmPreset {
                 hop_size: 2048 / 4, // 512
                 transient_sensitivity: 0.6,
                 wsola_search_ms: WSOLA_SEARCH_MS_MEDIUM,
+                wsola_segment_ms: 25.0,
+                transient_region_ms: 20.0,
                 window_type: WindowType::Kaiser(600), // beta=6.0: good vocal balance
             },
         }
@@ -1394,6 +1406,13 @@ pub struct StretchParams {
     /// professional time-stretching algorithms like Ableton's Complex Pro.
     /// Enabled by default for the [`EdmPreset::DjBeatmatch`] preset.
     pub multi_resolution: bool,
+    /// Duration in seconds of the transient region around each detected onset.
+    ///
+    /// Controls how much audio around a transient is processed with WSOLA
+    /// instead of the phase vocoder. Larger values protect more of the
+    /// transient's attack and early decay from PV smearing.
+    /// Default: 0.010 (10ms). DjBeatmatch uses 0.030 (30ms).
+    pub transient_region_secs: f64,
 }
 
 /// Converts a duration in milliseconds to samples at the given sample rate.
@@ -1413,6 +1432,8 @@ const DEFAULT_TRANSIENT_SENSITIVITY: f32 = 0.5;
 /// Default sub-bass phase lock cutoff in Hz.
 const DEFAULT_SUB_BASS_CUTOFF: f32 = 120.0;
 
+/// Default transient region duration in seconds (~10ms around each onset).
+const DEFAULT_TRANSIENT_REGION_SECS: f64 = 0.010;
 /// Default WSOLA segment duration (~20ms) for transient-friendly segmentation.
 const WSOLA_SEGMENT_MS: f64 = 20.0;
 /// Default WSOLA search range (~10ms) for small stretch ratios.
@@ -1466,6 +1487,7 @@ impl StretchParams {
             envelope_preservation: false,
             envelope_order: 40,
             multi_resolution: false,
+            transient_region_secs: DEFAULT_TRANSIENT_REGION_SECS,
         }
     }
 
@@ -1477,14 +1499,19 @@ impl StretchParams {
 
     /// Sets the sample rate.
     ///
-    /// Note: this also recalculates WSOLA segment size (~20ms) and search range
-    /// (~10ms) for the new sample rate. Call `with_wsola_segment_size()` or
-    /// `with_wsola_search_range()` after this method to override those values.
+    /// Recalculates WSOLA segment size and search range for the new sample rate,
+    /// using the preset's values if a preset was set, or defaults otherwise.
     pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
         self.sample_rate = sample_rate;
-        // Adjust WSOLA params for sample rate
-        self.wsola_segment_size = ms_to_samples(WSOLA_SEGMENT_MS, sample_rate);
-        self.wsola_search_range = ms_to_samples(WSOLA_SEARCH_MS_SMALL, sample_rate);
+        // Recalculate WSOLA params from preset if one was set, otherwise use defaults
+        if let Some(preset) = self.preset {
+            let cfg = preset.config();
+            self.wsola_segment_size = ms_to_samples(cfg.wsola_segment_ms, sample_rate);
+            self.wsola_search_range = ms_to_samples(cfg.wsola_search_ms, sample_rate);
+        } else {
+            self.wsola_segment_size = ms_to_samples(WSOLA_SEGMENT_MS, sample_rate);
+            self.wsola_search_range = ms_to_samples(WSOLA_SEARCH_MS_SMALL, sample_rate);
+        }
         self
     }
 
@@ -1499,8 +1526,8 @@ impl StretchParams {
     }
 
     /// Sets the EDM preset, overriding FFT size, hop size, transient sensitivity,
-    /// and WSOLA search range. Call this before other builder methods if you want
-    /// to customize individual parameters after applying a preset.
+    /// WSOLA params, and transient region size. Call this before other builder
+    /// methods if you want to customize individual parameters after applying a preset.
     pub fn with_preset(mut self, preset: EdmPreset) -> Self {
         self.preset = Some(preset);
         self.beat_aware = true;
@@ -1510,6 +1537,8 @@ impl StretchParams {
         self.hop_size = cfg.hop_size;
         self.transient_sensitivity = cfg.transient_sensitivity;
         self.wsola_search_range = ms_to_samples(cfg.wsola_search_ms, self.sample_rate);
+        self.wsola_segment_size = ms_to_samples(cfg.wsola_segment_ms, self.sample_rate);
+        self.transient_region_secs = cfg.transient_region_ms / 1000.0;
         self.window_type = cfg.window_type;
         // Enable envelope preservation for presets where timbre matters
         self.envelope_preservation = matches!(
@@ -1627,6 +1656,16 @@ impl StretchParams {
     /// resolution. This improves quality for transient-rich material.
     pub fn with_multi_resolution(mut self, enabled: bool) -> Self {
         self.multi_resolution = enabled;
+        self
+    }
+
+    /// Sets the transient region duration in seconds.
+    ///
+    /// Controls how much audio around each detected onset is processed with
+    /// WSOLA instead of the phase vocoder. Larger values protect more of the
+    /// transient's attack and early decay from PV smearing.
+    pub fn with_transient_region_secs(mut self, secs: f64) -> Self {
+        self.transient_region_secs = secs;
         self
     }
 
@@ -1749,6 +1788,32 @@ mod tests {
         assert!((params.sub_bass_cutoff - 100.0).abs() < f32::EPSILON);
         assert_eq!(params.wsola_segment_size, 512);
         assert_eq!(params.wsola_search_range, 256);
+    }
+
+    #[test]
+    fn test_preset_then_sample_rate_preserves_wsola_params() {
+        // Calling with_preset then with_sample_rate should use preset's WSOLA config
+        let params = StretchParams::new(1.078)
+            .with_preset(EdmPreset::DjBeatmatch)
+            .with_sample_rate(44100)
+            .with_channels(2);
+        // DjBeatmatch: wsola_segment_ms=50, wsola_search_ms=10
+        let expected_segment = ms_to_samples(50.0, 44100);
+        let expected_search = ms_to_samples(10.0, 44100);
+        assert_eq!(params.wsola_segment_size, expected_segment);
+        assert_eq!(params.wsola_search_range, expected_search);
+    }
+
+    #[test]
+    fn test_preset_transient_region() {
+        let dj = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
+        assert!((dj.transient_region_secs - 0.030).abs() < 1e-6);
+
+        let ambient = StretchParams::new(1.0).with_preset(EdmPreset::Ambient);
+        assert!((ambient.transient_region_secs - 0.010).abs() < 1e-6);
+
+        let halftime = StretchParams::new(1.0).with_preset(EdmPreset::Halftime);
+        assert!((halftime.transient_region_secs - 0.040).abs() < 1e-6);
     }
 
     #[test]

@@ -744,8 +744,7 @@ fn test_identity_click_timing_preservation() {
 
     let params = StretchParams::new(1.0)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::HouseLoop);
+        .with_channels(1);
 
     let output = stretch(&input, &params).unwrap();
 

@@ -321,16 +321,31 @@ pub fn cross_correlation(a: &[f32], b: &[f32]) -> CrossCorrelationResult {
 ///
 /// Detects onsets in both signals and counts how many onsets in the reference
 /// signal have a matching onset in the test signal within `tolerance_ms`.
+/// Uses default detection parameters (fft=2048, hop=512, sensitivity=0.5).
+/// For custom detection parameters, use [`transient_match_score_with_params`].
 pub fn transient_match_score(
     reference: &[f32],
     test: &[f32],
     sample_rate: u32,
     tolerance_ms: f64,
 ) -> TransientMatchResult {
-    let fft_size = 2048;
-    let hop_size = 512;
-    let sensitivity = 0.5;
+    transient_match_score_with_params(reference, test, sample_rate, tolerance_ms, 2048, 512, 0.5)
+}
 
+/// Compares transient onset positions between two signals with configurable
+/// detection parameters.
+///
+/// This allows the benchmark to use the same detection settings as the
+/// stretch algorithm being tested (e.g., DjBeatmatch uses sensitivity=0.45).
+pub fn transient_match_score_with_params(
+    reference: &[f32],
+    test: &[f32],
+    sample_rate: u32,
+    tolerance_ms: f64,
+    fft_size: usize,
+    hop_size: usize,
+    sensitivity: f32,
+) -> TransientMatchResult {
     let ref_transients = detect_transients(reference, sample_rate, fft_size, hop_size, sensitivity);
     let test_transients = detect_transients(test, sample_rate, fft_size, hop_size, sensitivity);
 

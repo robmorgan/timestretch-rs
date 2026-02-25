@@ -13,8 +13,6 @@ use rustfft::{num_complex::Complex, FftPlanner};
 
 /// Crossfade duration in seconds between algorithm segments (5ms raised-cosine).
 const CROSSFADE_SECS: f64 = 0.005;
-/// Transient region duration in seconds (~10ms around each onset).
-const TRANSIENT_REGION_SECS: f64 = 0.010;
 /// Minimum segment length (samples) to use phase vocoder or WSOLA; shorter segments
 /// fall back to linear resampling.
 const MIN_SEGMENT_FOR_STRETCH: usize = 256;
@@ -153,17 +151,19 @@ impl HybridStretcher {
         // Step 1b: Optionally detect beat grid and merge with transient onsets.
         // Use a reference to avoid cloning when beat-aware is disabled.
         let merged;
-        let onsets: &[usize] =
+        let (onsets, strengths): (&[usize], &[f32]) =
             if self.params.beat_aware && input.len() >= MIN_SAMPLES_FOR_BEAT_DETECTION {
                 let grid = detect_beats(input, self.params.sample_rate);
                 merged = merge_onsets_and_beats(&transients.onsets, &grid.beats, input.len());
-                &merged
+                // Beat-merged onsets don't have individual strengths; use a
+                // default strength of 1.0 for all (full transient region).
+                (&merged, &[])
             } else {
-                &transients.onsets
+                (&transients.onsets, &transients.strengths)
             };
 
         // Step 2: Segment audio at transient/beat boundaries
-        let segments = self.segment_audio(input.len(), onsets);
+        let segments = self.segment_audio(input.len(), onsets, strengths);
 
         // Step 3: Process each segment with appropriate algorithm
         // Reuse a single PV instance for tonal segments (avoids FFT planner recreation)
@@ -229,10 +229,11 @@ impl HybridStretcher {
     /// Stretches a single segment using the appropriate algorithm.
     ///
     /// - Very short segments (<256 samples) fall back to linear resampling
+    /// - Transient segments use onset-aligned stretching (direct-copy attack + WSOLA decay)
     /// - Tonal segments long enough for FFT use the phase vocoder
     /// - When multi-resolution is enabled, tonal segments are split into low/high
     ///   bands and processed with different FFT sizes
-    /// - Everything else (transients, short tonal) uses WSOLA
+    /// - Everything else (short tonal) uses WSOLA
     /// - On error, falls back to linear resampling
     fn stretch_segment(
         &self,
@@ -246,7 +247,12 @@ impl HybridStretcher {
             return crate::core::resample::resample_linear(seg_data, out_len.max(1));
         }
 
-        let use_phase_vocoder = !is_transient && seg_data.len() >= self.params.fft_size;
+        // Onset-aligned transient stretching: copy attack, WSOLA the decay
+        if is_transient {
+            return self.stretch_transient_segment(seg_data);
+        }
+
+        let use_phase_vocoder = seg_data.len() >= self.params.fft_size;
 
         // Multi-resolution path: split tonal segments into low/high bands
         if use_phase_vocoder && pv_high.is_some() {
@@ -260,8 +266,7 @@ impl HybridStretcher {
 
         // For segments too short for the main FFT but long enough for the
         // high-band FFT, use the smaller PV when multi-resolution is enabled.
-        if !is_transient
-            && seg_data.len() >= MULTI_RES_HIGH_FFT_SIZE
+        if seg_data.len() >= MULTI_RES_HIGH_FFT_SIZE
             && seg_data.len() < self.params.fft_size
             && pv_high.is_some()
         {
@@ -282,6 +287,114 @@ impl HybridStretcher {
             let out_len = self.params.output_length(seg_data.len());
             crate::core::resample::resample_linear(seg_data, out_len.max(1))
         })
+    }
+
+    /// Onset-aligned transient stretching.
+    ///
+    /// Copies the first ~5ms (attack portion) directly to preserve onset shape
+    /// and timing, then WSOLA-stretches the decay tail. A short crossfade
+    /// joins the two parts.
+    fn stretch_transient_segment(&self, seg_data: &[f32]) -> Vec<f32> {
+        let out_len = self.params.output_length(seg_data.len());
+        if out_len == 0 {
+            return vec![];
+        }
+
+        // Attack portion: ~5ms direct copy (preserves onset shape and timing)
+        let attack_samples =
+            ((self.params.sample_rate as f64 * 0.005) as usize).min(seg_data.len());
+        // Crossfade duration between attack and decay (2ms)
+        let crossfade_len = ((self.params.sample_rate as f64 * 0.002) as usize)
+            .min(attack_samples / 2)
+            .max(1);
+
+        if seg_data.len() <= attack_samples * 2 || out_len <= attack_samples {
+            // Segment too short for split — just WSOLA the whole thing
+            return self.stretch_with_wsola(seg_data).unwrap_or_else(|_| {
+                crate::core::resample::resample_linear(seg_data, out_len.max(1))
+            });
+        }
+
+        // Direct-copy the attack
+        let attack = &seg_data[..attack_samples];
+        let decay = &seg_data[attack_samples..];
+
+        // Check if decay has enough energy for reliable WSOLA cross-correlation.
+        // Near-silent decay (e.g., isolated clicks in silence) produces unreliable
+        // WSOLA matching; fall back to stretching the whole segment with WSOLA.
+        let decay_energy: f32 = decay.iter().map(|&s| s * s).sum();
+        let decay_rms = (decay_energy / decay.len().max(1) as f32).sqrt();
+        if decay_rms < 1e-4 {
+            return self.stretch_with_wsola(seg_data).unwrap_or_else(|_| {
+                crate::core::resample::resample_linear(seg_data, out_len.max(1))
+            });
+        }
+
+        // WSOLA the decay tail. The attack and decay overlap by crossfade_len,
+        // so the decay must be stretched to (out_len - attack_samples + crossfade_len)
+        // to produce the correct total output length.
+        let decay_out_len = out_len
+            .saturating_sub(attack_samples)
+            .saturating_add(crossfade_len);
+        if decay_out_len < MIN_WSOLA_SEGMENT {
+            // Decay too short for WSOLA — linear resample it
+            let decay_stretched =
+                crate::core::resample::resample_linear(decay, decay_out_len.max(1));
+            // Simple concatenation (no crossfade for very short segments)
+            let mut output = Vec::with_capacity(attack_samples + decay_stretched.len());
+            output.extend_from_slice(attack);
+            output.extend_from_slice(&decay_stretched);
+            return output;
+        }
+
+        let decay_stretched = {
+            let seg_size = self
+                .params
+                .wsola_segment_size
+                .min(decay.len() / 2)
+                .max(MIN_WSOLA_SEGMENT);
+            let search = self
+                .params
+                .wsola_search_range
+                .min(seg_size / 2)
+                .max(MIN_WSOLA_SEARCH);
+            let mut wsola = Wsola::new(seg_size, search, decay_out_len as f64 / decay.len() as f64);
+            wsola.process(decay).unwrap_or_else(|_| {
+                crate::core::resample::resample_linear(decay, decay_out_len.max(1))
+            })
+        };
+
+        let crossfade_len = crossfade_len.min(attack_samples).min(decay_stretched.len());
+
+        if crossfade_len == 0 || decay_stretched.is_empty() {
+            let mut output = Vec::with_capacity(attack_samples + decay_stretched.len());
+            output.extend_from_slice(attack);
+            output.extend_from_slice(&decay_stretched);
+            return output;
+        }
+
+        // Build output: attack (minus crossfade tail) + crossfade + decay (minus crossfade head)
+        // Total = (attack - xfade) + xfade + (decay_stretched - xfade)
+        //       = attack + decay_stretched - xfade
+        //       = attack + (out_len - attack + xfade) - xfade = out_len
+        let pre_fade = attack_samples - crossfade_len;
+        let mut output = Vec::with_capacity(out_len);
+        output.extend_from_slice(&attack[..pre_fade]);
+
+        // Crossfade region
+        for i in 0..crossfade_len {
+            let t = i as f32 / crossfade_len as f32;
+            let fade_out = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
+            let fade_in = 1.0 - fade_out;
+            output.push(attack[pre_fade + i] * fade_out + decay_stretched[i] * fade_in);
+        }
+
+        // Rest of decay
+        if crossfade_len < decay_stretched.len() {
+            output.extend_from_slice(&decay_stretched[crossfade_len..]);
+        }
+
+        output
     }
 
     /// Processes a tonal segment using multi-resolution FFT.
@@ -347,7 +460,11 @@ impl HybridStretcher {
     }
 
     /// Segments audio into transient and tonal regions.
-    fn segment_audio(&self, input_len: usize, onsets: &[usize]) -> Vec<Segment> {
+    ///
+    /// Uses adaptive transient region sizing based on onset strengths:
+    /// strong transients (kicks) get the full `transient_region_secs`,
+    /// weak transients (hi-hats) get a smaller region (~5ms minimum).
+    fn segment_audio(&self, input_len: usize, onsets: &[usize], strengths: &[f32]) -> Vec<Segment> {
         if onsets.is_empty() {
             return vec![Segment {
                 start: 0,
@@ -356,12 +473,15 @@ impl HybridStretcher {
             }];
         }
 
-        let mut segments = Vec::new();
-        let transient_size = (self.params.sample_rate as f64 * TRANSIENT_REGION_SECS) as usize;
+        let max_transient_size =
+            (self.params.sample_rate as f64 * self.params.transient_region_secs) as usize;
+        // Minimum 5ms region for weak transients
+        let min_transient_size = (self.params.sample_rate as f64 * 0.005) as usize;
 
+        let mut segments = Vec::new();
         let mut pos = 0;
 
-        for &onset in onsets {
+        for (i, &onset) in onsets.iter().enumerate() {
             if onset <= pos {
                 continue;
             }
@@ -376,7 +496,17 @@ impl HybridStretcher {
                 });
             }
 
-            // Transient region
+            // Adaptive transient region: scale by onset strength
+            let strength = if i < strengths.len() {
+                strengths[i]
+            } else {
+                1.0 // default to full region if no strength info
+            };
+            // region = min + (max - min) * (0.3 + 0.7 * strength)
+            let scale = 0.3 + 0.7 * strength as f64;
+            let transient_size = min_transient_size
+                + ((max_transient_size - min_transient_size) as f64 * scale) as usize;
+
             let trans_end = (onset + transient_size).min(input_len);
             if trans_end > onset {
                 segments.push(Segment {
@@ -1197,7 +1327,7 @@ mod tests {
     fn test_segment_audio_no_onsets() {
         let params = StretchParams::new(1.5).with_sample_rate(44100);
         let stretcher = HybridStretcher::new(params);
-        let segments = stretcher.segment_audio(44100, &[]);
+        let segments = stretcher.segment_audio(44100, &[], &[]);
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].start, 0);
         assert_eq!(segments[0].end, 44100);
@@ -1210,7 +1340,7 @@ mod tests {
         let stretcher = HybridStretcher::new(params);
         let input_len = 44100;
         let onset = 10000;
-        let segments = stretcher.segment_audio(input_len, &[onset]);
+        let segments = stretcher.segment_audio(input_len, &[onset], &[]);
 
         // Should have: tonal [0, onset), transient [onset, onset+transient_size), tonal [onset+transient_size, end)
         assert!(segments.len() >= 2, "Should have at least 2 segments");
@@ -1228,7 +1358,7 @@ mod tests {
         // Entire input becomes a single tonal segment.
         let params = StretchParams::new(1.5).with_sample_rate(44100);
         let stretcher = HybridStretcher::new(params);
-        let segments = stretcher.segment_audio(44100, &[0]);
+        let segments = stretcher.segment_audio(44100, &[0], &[]);
 
         assert_eq!(segments.len(), 1);
         assert!(!segments[0].is_transient);
@@ -1243,7 +1373,7 @@ mod tests {
         let stretcher = HybridStretcher::new(params);
         let input_len = 44100;
         let onset = 44090; // Very near end
-        let segments = stretcher.segment_audio(input_len, &[onset]);
+        let segments = stretcher.segment_audio(input_len, &[onset], &[]);
 
         // Last transient segment should be clamped to input_len
         let last_transient = segments.iter().find(|s| s.is_transient).unwrap();
@@ -1255,11 +1385,11 @@ mod tests {
         // Two onsets where second falls within transient region of first
         let params = StretchParams::new(1.5).with_sample_rate(44100);
         let stretcher = HybridStretcher::new(params);
-        let transient_size = (44100.0 * TRANSIENT_REGION_SECS) as usize; // ~441
+        let transient_size = (44100.0 * 0.010) as usize; // ~441 (default transient region)
         let onset1 = 10000;
         let onset2 = onset1 + transient_size / 2; // Within transient region of onset1
 
-        let segments = stretcher.segment_audio(44100, &[onset1, onset2]);
+        let segments = stretcher.segment_audio(44100, &[onset1, onset2], &[]);
 
         // Second onset should be skipped (onset2 <= pos after first transient)
         let transient_count = segments.iter().filter(|s| s.is_transient).count();
@@ -1267,6 +1397,31 @@ mod tests {
         assert!(
             transient_count >= 1,
             "Should have at least 1 transient segment"
+        );
+    }
+
+    #[test]
+    fn test_segment_audio_adaptive_strength() {
+        // Weak strength should produce smaller transient region than strong
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(44100)
+            .with_transient_region_secs(0.030); // 30ms max
+        let stretcher = HybridStretcher::new(params);
+
+        let weak_segs = stretcher.segment_audio(44100, &[10000], &[0.1]);
+        let strong_segs = stretcher.segment_audio(44100, &[10000], &[1.0]);
+
+        let weak_trans = weak_segs.iter().find(|s| s.is_transient).unwrap();
+        let strong_trans = strong_segs.iter().find(|s| s.is_transient).unwrap();
+
+        let weak_size = weak_trans.end - weak_trans.start;
+        let strong_size = strong_trans.end - strong_trans.start;
+
+        assert!(
+            strong_size > weak_size,
+            "Strong transient region ({}) should be larger than weak ({})",
+            strong_size,
+            weak_size
         );
     }
 
