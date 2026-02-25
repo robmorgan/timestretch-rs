@@ -1,10 +1,11 @@
 //! Integration tests for creative audio effects combining new AudioBuffer APIs
 //! with time stretching, demonstrating real-world DJ and production workflows.
 
-use timestretch::{AudioBuffer, Channels, EdmPreset, StretchParams, StreamProcessor, WindowType};
+use timestretch::{AudioBuffer, EdmPreset, StreamProcessor, StretchParams, WindowType};
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 fn sine_mono(freq: f32, sample_rate: u32, num_samples: usize) -> AudioBuffer {
     let data: Vec<f32> = (0..num_samples)
         .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate as f32).sin())
@@ -14,7 +15,13 @@ fn sine_mono(freq: f32, sample_rate: u32, num_samples: usize) -> AudioBuffer {
 
 fn assert_finite(buf: &AudioBuffer, label: &str) {
     for (i, &s) in buf.data.iter().enumerate() {
-        assert!(s.is_finite(), "{}: non-finite at sample {}: {}", label, i, s);
+        assert!(
+            s.is_finite(),
+            "{}: non-finite at sample {}: {}",
+            label,
+            i,
+            s
+        );
     }
 }
 
@@ -23,7 +30,9 @@ fn assert_finite(buf: &AudioBuffer, label: &str) {
 #[test]
 fn silence_as_gap_between_stretched_segments() {
     let tone = AudioBuffer::tone(440.0, 44100, 0.5, 0.8);
-    let params = StretchParams::new(1.5).with_sample_rate(44100).with_channels(1);
+    let params = StretchParams::new(1.5)
+        .with_sample_rate(44100)
+        .with_channels(1);
     let stretched = timestretch::stretch_buffer(&tone, &params).unwrap();
 
     let gap = AudioBuffer::silence(44100, 0.2);
@@ -78,9 +87,15 @@ fn tone_at_different_frequencies_stretch() {
     // Sub-bass, mid, and high frequency tones
     for &freq in &[60.0f32, 440.0, 8000.0] {
         let tone = AudioBuffer::tone(freq as f64, 44100, 1.0, 0.5);
-        let params = StretchParams::new(1.5).with_sample_rate(44100).with_channels(1);
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(44100)
+            .with_channels(1);
         let stretched = timestretch::stretch_buffer(&tone, &params).unwrap();
-        assert!(!stretched.is_empty(), "Tone at {}Hz produced no output", freq);
+        assert!(
+            !stretched.is_empty(),
+            "Tone at {}Hz produced no output",
+            freq
+        );
         assert!(
             stretched.rms() > 0.01,
             "Tone at {}Hz produced silence after stretch",
@@ -93,7 +108,9 @@ fn tone_at_different_frequencies_stretch() {
 #[test]
 fn tone_pitch_shift_octave_up() {
     let tone = AudioBuffer::tone(440.0, 44100, 1.0, 0.8);
-    let params = StretchParams::new(1.0).with_sample_rate(44100).with_channels(1);
+    let params = StretchParams::new(1.0)
+        .with_sample_rate(44100)
+        .with_channels(1);
     let shifted = timestretch::pitch_shift_buffer(&tone, &params, 2.0).unwrap();
     // Length should be preserved
     assert_eq!(shifted.num_frames(), tone.num_frames());
@@ -171,7 +188,9 @@ fn sidechain_duck_effect() {
     assert_eq!(ducked.num_frames(), pad.num_frames());
 
     // Stretch the ducked audio
-    let params = StretchParams::new(1.5).with_sample_rate(44100).with_channels(1);
+    let params = StretchParams::new(1.5)
+        .with_sample_rate(44100)
+        .with_channels(1);
     let stretched = timestretch::stretch_buffer(&ducked, &params).unwrap();
     assert!(!stretched.is_empty());
     assert_finite(&stretched, "sidechain_duck");
@@ -193,7 +212,9 @@ fn gain_envelope_then_stretch_preserves_shape() {
         last_quarter.rms()
     );
 
-    let params = StretchParams::new(2.0).with_sample_rate(44100).with_channels(1);
+    let params = StretchParams::new(2.0)
+        .with_sample_rate(44100)
+        .with_channels(1);
     let stretched = timestretch::stretch_buffer(&enveloped, &params).unwrap();
     assert_finite(&stretched, "envelope_stretch");
 }
@@ -217,10 +238,8 @@ fn volume_automation_stereo() {
 #[test]
 fn remove_dc_before_stretch() {
     // Create a signal with DC offset
-    let mut data: Vec<f32> = (0..44100)
-        .map(|i| {
-            0.5 + 0.3 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin()
-        })
+    let data: Vec<f32> = (0..44100)
+        .map(|i| 0.5 + 0.3 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
         .collect();
     // Verify DC offset exists
     let mean_before: f64 = data.iter().map(|&s| s as f64).sum::<f64>() / data.len() as f64;
@@ -230,12 +249,18 @@ fn remove_dc_before_stretch() {
     let centered = buf.remove_dc();
 
     // Verify DC removed
-    let mean_after: f64 = centered.data.iter().map(|&s| s as f64).sum::<f64>()
-        / centered.data.len() as f64;
-    assert!(mean_after.abs() < 0.01, "DC should be removed: {}", mean_after);
+    let mean_after: f64 =
+        centered.data.iter().map(|&s| s as f64).sum::<f64>() / centered.data.len() as f64;
+    assert!(
+        mean_after.abs() < 0.01,
+        "DC should be removed: {}",
+        mean_after
+    );
 
     // Stretch the centered audio
-    let params = StretchParams::new(1.5).with_sample_rate(44100).with_channels(1);
+    let params = StretchParams::new(1.5)
+        .with_sample_rate(44100)
+        .with_channels(1);
     let stretched = timestretch::stretch_buffer(&centered, &params).unwrap();
     assert_finite(&stretched, "dc_removed_stretch");
     assert!(stretched.rms() > 0.01);
@@ -244,14 +269,10 @@ fn remove_dc_before_stretch() {
 #[test]
 fn remove_dc_stereo_then_stretch() {
     let l: Vec<f32> = (0..44100)
-        .map(|i| {
-            0.3 + 0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin()
-        })
+        .map(|i| 0.3 + 0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
         .collect();
     let r: Vec<f32> = (0..44100)
-        .map(|i| {
-            -0.2 + 0.5 * (2.0 * std::f32::consts::PI * 880.0 * i as f32 / 44100.0).sin()
-        })
+        .map(|i| -0.2 + 0.5 * (2.0 * std::f32::consts::PI * 880.0 * i as f32 / 44100.0).sin())
         .collect();
     let buf = AudioBuffer::from_channels(&[l, r], 44100);
     let centered = buf.remove_dc();
@@ -275,7 +296,9 @@ fn window_then_stretch_for_granular_synthesis() {
     assert!(windowed.data[0].abs() < 0.01);
     assert!(windowed.data[windowed.data.len() - 1].abs() < 0.01);
 
-    let params = StretchParams::new(2.0).with_sample_rate(44100).with_channels(1);
+    let params = StretchParams::new(2.0)
+        .with_sample_rate(44100)
+        .with_channels(1);
     let stretched = timestretch::stretch_buffer(&windowed, &params).unwrap();
     assert_finite(&stretched, "windowed_grain_stretch");
 }
@@ -284,9 +307,15 @@ fn window_then_stretch_for_granular_synthesis() {
 fn window_types_all_work_with_stretch() {
     let tone = AudioBuffer::tone(440.0, 44100, 0.5, 0.6);
 
-    for wt in &[WindowType::Hann, WindowType::BlackmanHarris, WindowType::Kaiser(12)] {
+    for wt in &[
+        WindowType::Hann,
+        WindowType::BlackmanHarris,
+        WindowType::Kaiser(12),
+    ] {
         let windowed = tone.apply_window(*wt);
-        let params = StretchParams::new(1.5).with_sample_rate(44100).with_channels(1);
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(44100)
+            .with_channels(1);
         let stretched = timestretch::stretch_buffer(&windowed, &params).unwrap();
         assert!(!stretched.is_empty(), "{:?} produced empty output", wt);
         assert_finite(&stretched, &format!("{:?}", wt));
@@ -317,13 +346,8 @@ fn tape_stop_effect() {
     let tone = AudioBuffer::tone(440.0, 44100, 1.0, 0.8);
 
     // Apply pitch-down effect via gain envelope (simulates tape slowing down)
-    let decelerated = tone.with_gain_envelope(&[
-        (0.0, 1.0),
-        (0.3, 0.9),
-        (0.6, 0.6),
-        (0.8, 0.3),
-        (1.0, 0.0),
-    ]);
+    let decelerated =
+        tone.with_gain_envelope(&[(0.0, 1.0), (0.3, 0.9), (0.6, 0.6), (0.8, 0.3), (1.0, 0.0)]);
 
     // Stretch the decelerating signal
     let params = StretchParams::new(2.0)
@@ -398,10 +422,8 @@ fn granular_freeze_effect() {
 #[test]
 fn dc_removal_in_processing_chain() {
     // Real-world scenario: audio with DC offset -> remove DC -> stretch -> normalize
-    let mut data: Vec<f32> = (0..88200)
-        .map(|i| {
-            0.3 + 0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin()
-        })
+    let data: Vec<f32> = (0..88200)
+        .map(|i| 0.3 + 0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
         .collect();
     let buf = AudioBuffer::from_mono(data, 44100);
 
@@ -434,7 +456,10 @@ fn streaming_with_tone_factory() {
         output.extend_from_slice(&out);
     }
 
-    assert!(!output.is_empty(), "Streaming with tone factory should produce output");
+    assert!(
+        !output.is_empty(),
+        "Streaming with tone factory should produce output"
+    );
     // Check target_bpm getter
     let target = proc.target_bpm().unwrap();
     assert!((target - 128.0).abs() < 0.1);

@@ -132,7 +132,10 @@ mod tests {
         let (mid, side) = encode_mid_side(&left, &right);
 
         for i in 0..100 {
-            assert!(mid[i].abs() < 1e-6, "Mid should be zero for opposite channels");
+            assert!(
+                mid[i].abs() < 1e-6,
+                "Mid should be zero for opposite channels"
+            );
             assert!(
                 (side[i] - left[i]).abs() < 1e-6,
                 "Side should equal left for opposite channels"

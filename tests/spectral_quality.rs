@@ -25,6 +25,7 @@ fn dft_energy_at_freq(signal: &[f32], freq: f32, sample_rate: u32) -> f64 {
 }
 
 /// Find the peak sample position in a signal (used for transient detection).
+#[allow(dead_code)]
 fn find_onset_position(signal: &[f32], threshold: f32) -> Option<usize> {
     // Find first sample that exceeds threshold
     signal.iter().position(|&s| s.abs() > threshold)

@@ -1247,7 +1247,7 @@ impl EdmPreset {
             EdmPreset::DjBeatmatch => PresetConfig {
                 fft_size: 4096,
                 hop_size: 4096 / 5, // ~820: Kaiser needs less overlap than BH
-                transient_sensitivity: 0.3,
+                transient_sensitivity: 0.45,
                 wsola_search_ms: WSOLA_SEARCH_MS_SMALL,
                 window_type: WindowType::Kaiser(800), // beta=8.0: tight mainlobe for transparency
             },
@@ -1397,8 +1397,8 @@ fn ms_to_samples(ms: f64, sample_rate: u32) -> usize {
 const DEFAULT_SAMPLE_RATE: u32 = 44100;
 /// Default FFT size for phase vocoder (good frequency resolution for bass).
 const DEFAULT_FFT_SIZE: usize = 4096;
-/// Default hop size (FFT/6 ≈ 83% overlap for Blackman-Harris window).
-const DEFAULT_HOP_SIZE: usize = DEFAULT_FFT_SIZE / 6;
+/// Default hop size (FFT/8 ≈ 87.5% overlap for Blackman-Harris window).
+const DEFAULT_HOP_SIZE: usize = DEFAULT_FFT_SIZE / 8;
 /// Default transient detection sensitivity (0.0–1.0).
 const DEFAULT_TRANSIENT_SENSITIVITY: f32 = 0.5;
 /// Default sub-bass phase lock cutoff in Hz.
@@ -1504,7 +1504,11 @@ impl StretchParams {
         // Enable envelope preservation for presets where timbre matters
         self.envelope_preservation = matches!(
             preset,
-            EdmPreset::HouseLoop | EdmPreset::Halftime | EdmPreset::Ambient | EdmPreset::VocalChop
+            EdmPreset::DjBeatmatch
+                | EdmPreset::HouseLoop
+                | EdmPreset::Halftime
+                | EdmPreset::Ambient
+                | EdmPreset::VocalChop
         );
         self
     }
@@ -2957,13 +2961,9 @@ mod tests {
     fn test_remove_dc_basic() {
         let buf = AudioBuffer::from_mono(vec![1.5, 1.6, 1.4, 1.5], 44100);
         let centered = buf.remove_dc();
-        let mean: f64 = centered.data.iter().map(|&s| s as f64).sum::<f64>()
-            / centered.data.len() as f64;
-        assert!(
-            mean.abs() < 1e-5,
-            "DC should be removed, got mean={}",
-            mean
-        );
+        let mean: f64 =
+            centered.data.iter().map(|&s| s as f64).sum::<f64>() / centered.data.len() as f64;
+        assert!(mean.abs() < 1e-5, "DC should be removed, got mean={}", mean);
     }
 
     #[test]
@@ -2987,8 +2987,16 @@ mod tests {
         let right: Vec<f32> = centered.data.iter().skip(1).step_by(2).copied().collect();
         let l_mean: f64 = left.iter().map(|&s| s as f64).sum::<f64>() / left.len() as f64;
         let r_mean: f64 = right.iter().map(|&s| s as f64).sum::<f64>() / right.len() as f64;
-        assert!(l_mean.abs() < 1e-5, "L DC should be removed, got {}", l_mean);
-        assert!(r_mean.abs() < 1e-5, "R DC should be removed, got {}", r_mean);
+        assert!(
+            l_mean.abs() < 1e-5,
+            "L DC should be removed, got {}",
+            l_mean
+        );
+        assert!(
+            r_mean.abs() < 1e-5,
+            "R DC should be removed, got {}",
+            r_mean
+        );
     }
 
     #[test]
@@ -3019,10 +3027,7 @@ mod tests {
         for frame in windowed.frames() {
             if frame[0].abs() > 1e-6 {
                 let ratio = frame[1] / frame[0];
-                assert!(
-                    (ratio - 0.5).abs() < 0.01,
-                    "L/R ratio should be preserved"
-                );
+                assert!((ratio - 0.5).abs() < 0.01, "L/R ratio should be preserved");
             }
         }
     }

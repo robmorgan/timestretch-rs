@@ -47,8 +47,16 @@ impl std::fmt::Debug for Wsola {
 
 impl Wsola {
     /// Creates a new WSOLA processor.
+    ///
+    /// For small stretch ratios (within ±15% of unity), uses a smaller overlap
+    /// region (`segment_size / 4`) to reduce transient smearing. Larger ratios
+    /// use the standard `segment_size / 2` overlap for better continuity.
     pub fn new(segment_size: usize, search_range: usize, stretch_ratio: f64) -> Self {
-        let overlap_size = segment_size / 2;
+        let overlap_size = if (stretch_ratio - 1.0).abs() < 0.15 {
+            segment_size / 4
+        } else {
+            segment_size / 2
+        };
         Self {
             segment_size,
             overlap_size,
@@ -316,16 +324,16 @@ impl Wsola {
         for slot in self.fft_ref_buf.iter_mut() {
             *slot = COMPLEX_ZERO;
         }
-        for i in 0..ref_signal.len() {
-            self.fft_ref_buf[i] = Complex::new(ref_signal[i], 0.0);
+        for (slot, &s) in self.fft_ref_buf.iter_mut().zip(ref_signal.iter()) {
+            *slot = Complex::new(s, 0.0);
         }
 
         self.fft_search_buf.resize(fft_size, COMPLEX_ZERO);
         for slot in self.fft_search_buf.iter_mut() {
             *slot = COMPLEX_ZERO;
         }
-        for i in 0..search_signal.len() {
-            self.fft_search_buf[i] = Complex::new(search_signal[i], 0.0);
+        for (slot, &s) in self.fft_search_buf.iter_mut().zip(search_signal.iter()) {
+            *slot = Complex::new(s, 0.0);
         }
 
         // Forward FFT
@@ -862,10 +870,12 @@ mod tests {
 
     #[test]
     fn test_overlap_add_crossfade_raised_cosine() {
-        // Verify the overlap region uses a raised-cosine crossfade
+        // Verify the overlap region uses a raised-cosine crossfade.
+        // Use ratio 2.0 to get the standard segment_size/2 overlap.
         let segment_size = 100;
-        let overlap_size = 50;
-        let wsola = Wsola::new(segment_size, 10, 1.0);
+        let wsola = Wsola::new(segment_size, 10, 2.0);
+        let overlap_size = wsola.overlap_size;
+        assert_eq!(overlap_size, 50);
 
         // Pre-fill output with 1.0
         let mut output = vec![1.0f32; 200];
@@ -874,8 +884,8 @@ mod tests {
 
         wsola.overlap_add(&input, &mut output, 0, 50);
 
-        // In the overlap region (output[50..100]):
-        //   t = i/50
+        // In the overlap region:
+        //   t = i/overlap_size
         //   fade_in = 0.5 * (1 - cos(PI * t))
         //   fade_out = 1 - fade_in
         //   output = 1.0 * fade_out + 0.0 * fade_in = fade_out
@@ -892,7 +902,7 @@ mod tests {
             );
         }
 
-        // After overlap (output[100..150]), should be the input (0.0)
+        // After overlap, should be the input (0.0)
         for i in overlap_size..segment_size {
             assert!(
                 (output[50 + i] - 0.0).abs() < 1e-5,

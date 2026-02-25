@@ -273,10 +273,9 @@ mod tests {
         let new_rate = 200.0;
         let mut max_error = 0.0f32;
         // Skip edges where the sinc kernel is truncated
-        for i in 20..180 {
-            let expected =
-                (2.0 * std::f32::consts::PI * freq * i as f32 / new_rate).sin();
-            let err = (output[i] - expected).abs();
+        for (i, &out_val) in output.iter().enumerate().take(180).skip(20) {
+            let expected = (2.0 * std::f32::consts::PI * freq * i as f32 / new_rate).sin();
+            let err = (out_val - expected).abs();
             max_error = max_error.max(err);
         }
         assert!(
@@ -328,8 +327,7 @@ mod tests {
         let mut sinc_err = 0.0f32;
         let mut cubic_err = 0.0f32;
         for i in 20..180 {
-            let expected =
-                (2.0 * std::f32::consts::PI * freq * i as f32 / new_rate).sin();
+            let expected = (2.0 * std::f32::consts::PI * freq * i as f32 / new_rate).sin();
             sinc_err += (sinc_out[i] - expected).abs();
             cubic_err += (cubic_out[i] - expected).abs();
         }

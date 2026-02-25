@@ -98,11 +98,7 @@ fn compute_onset_energy(samples: &[f32], fft_size: usize, hop_size: usize) -> Ve
     for frame_idx in 0..num_frames {
         let start = frame_idx * hop_size;
         let end = start + fft_size;
-        let rms: f32 = samples[start..end]
-            .iter()
-            .map(|&s| s * s)
-            .sum::<f32>()
-            * inv_fft;
+        let rms: f32 = samples[start..end].iter().map(|&s| s * s).sum::<f32>() * inv_fft;
         energies.push(rms.sqrt());
     }
 

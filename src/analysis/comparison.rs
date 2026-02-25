@@ -339,11 +339,7 @@ pub fn transient_match_score(
     let mut matched = 0usize;
     for &ref_onset in &ref_transients.onsets {
         for &test_onset in &test_transients.onsets {
-            let diff = if ref_onset > test_onset {
-                ref_onset - test_onset
-            } else {
-                test_onset - ref_onset
-            };
+            let diff = ref_onset.abs_diff(test_onset);
             if diff <= tolerance_samples {
                 matched += 1;
                 break;

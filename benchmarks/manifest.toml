@@ -27,3 +27,15 @@
 #   target_bpm = 128.0
 #   software = "Serato DJ Pro"
 #   algorithm = "Default"
+
+[[track]]
+id = "music-sounds-better-with-you"
+description = "Music Sounds Better With You (Original Mix), 124 BPM, stereo"
+original = "audio/12247392_Music Sounds Better With You_(Original Mix)_124bpm.wav"
+bpm = 124.0
+
+  [[track.reference]]
+  file = "audio/12247392_Music Sounds Better With You_(Original Mix)_115bpm.wav"
+  target_bpm = 115.0
+  software = "Ableton Live 11"
+  algorithm = "Complex Pro"

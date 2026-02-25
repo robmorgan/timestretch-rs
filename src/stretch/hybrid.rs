@@ -411,13 +411,13 @@ fn split_bands(
         let rem_gain = 1.0 - sub_gain;
 
         // Apply gains to positive-frequency bin
-        fft_buf[bin] = fft_buf[bin] * sub_gain;
-        fft_buf2[bin] = fft_buf2[bin] * rem_gain;
+        fft_buf[bin] *= sub_gain;
+        fft_buf2[bin] *= rem_gain;
 
         // Mirror for negative-frequency bin (conjugate symmetry)
         if bin > 0 && bin < half {
-            fft_buf[fft_size - bin] = fft_buf[fft_size - bin] * sub_gain;
-            fft_buf2[fft_size - bin] = fft_buf2[fft_size - bin] * rem_gain;
+            fft_buf[fft_size - bin] *= sub_gain;
+            fft_buf2[fft_size - bin] *= rem_gain;
         }
     }
 }

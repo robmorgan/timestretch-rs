@@ -1,15 +1,13 @@
 //! Phase vocoder time stretching with identity phase locking and sub-bass phase locking.
 
-use rustfft::{num_complex::Complex, FftPlanner};
-use std::f32::consts::PI;
-
 use crate::core::fft::{COMPLEX_ZERO, WINDOW_SUM_EPSILON, WINDOW_SUM_FLOOR_RATIO};
 use crate::core::window::{generate_window, WindowType};
 use crate::error::StretchError;
 use crate::stretch::envelope::{apply_envelope_correction, extract_envelope};
 use crate::stretch::phase_locking::{apply_phase_locking, PhaseLockingMode};
+use rustfft::{num_complex::Complex, FftPlanner};
 
-const TWO_PI: f32 = 2.0 * PI;
+const TWO_PI_F64: f64 = 2.0 * std::f64::consts::PI;
 /// Fraction of bins to pre-allocate for spectral peak detection (1/4 of bins).
 const PEAKS_CAPACITY_DIVISOR: usize = 4;
 
@@ -19,14 +17,14 @@ pub struct PhaseVocoder {
     hop_analysis: usize,
     hop_synthesis: usize,
     window: Vec<f32>,
-    /// Phase accumulator for resynthesis.
-    phase_accum: Vec<f32>,
-    /// Previous analysis phase.
-    prev_phase: Vec<f32>,
+    /// Phase accumulator for resynthesis (f64 for precision over long signals).
+    phase_accum: Vec<f64>,
+    /// Previous analysis phase (f64 to match accumulator precision).
+    prev_phase: Vec<f64>,
     /// FFT planner (cached).
     planner: FftPlanner<f32>,
-    /// Pre-computed expected phase advance per bin.
-    expected_phase_advance: Vec<f32>,
+    /// Pre-computed expected phase advance per bin (f64 for precision).
+    expected_phase_advance: Vec<f64>,
     /// Reusable FFT buffer.
     fft_buffer: Vec<Complex<f32>>,
     /// Reusable magnitude buffer.
@@ -51,6 +49,9 @@ pub struct PhaseVocoder {
     analysis_envelope: Vec<f32>,
     /// Reusable buffer for synthesis envelope.
     synthesis_envelope: Vec<f32>,
+    /// Synthesis window (Hann) for overlap-add. Using a separate synthesis window
+    /// avoids squaring the analysis window (which distorts Kaiser/BlackmanHarris).
+    synthesis_window: Vec<f32>,
     /// Reusable output buffer (avoids allocation per process() call).
     output_buf: Vec<f32>,
     /// Reusable window sum buffer (avoids allocation per process() call).
@@ -120,6 +121,7 @@ impl PhaseVocoder {
     }
 
     /// Creates a new phase vocoder with all configuration options including envelope preservation.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_all_options(
         fft_size: usize,
         hop_analysis: usize,
@@ -133,10 +135,11 @@ impl PhaseVocoder {
     ) -> Self {
         let hop_synthesis = (hop_analysis as f64 * stretch_ratio).round() as usize;
         let window = generate_window(window_type, fft_size);
+        let synthesis_window = generate_window(WindowType::Hann, fft_size);
         let num_bins = fft_size / 2 + 1;
 
-        let expected_phase_advance: Vec<f32> = (0..num_bins)
-            .map(|bin| TWO_PI * bin as f32 * hop_analysis as f32 / fft_size as f32)
+        let expected_phase_advance: Vec<f64> = (0..num_bins)
+            .map(|bin| TWO_PI_F64 * bin as f64 * hop_analysis as f64 / fft_size as f64)
             .collect();
 
         // Compute the bin index for the sub-bass cutoff frequency.
@@ -151,8 +154,8 @@ impl PhaseVocoder {
             hop_analysis,
             hop_synthesis,
             window,
-            phase_accum: vec![0.0; num_bins],
-            prev_phase: vec![0.0; num_bins],
+            phase_accum: vec![0.0f64; num_bins],
+            prev_phase: vec![0.0f64; num_bins],
             planner: FftPlanner::new(),
             expected_phase_advance,
             fft_buffer: vec![COMPLEX_ZERO; fft_size],
@@ -167,6 +170,7 @@ impl PhaseVocoder {
             cepstrum_buf: Vec::new(),
             analysis_envelope: Vec::new(),
             synthesis_envelope: Vec::new(),
+            synthesis_window,
             output_buf: Vec::new(),
             window_sum_buf: Vec::new(),
         }
@@ -243,7 +247,7 @@ impl PhaseVocoder {
         self.phase_accum.fill(0.0);
         self.prev_phase.fill(0.0);
 
-        let hop_ratio = self.hop_synthesis as f32 / self.hop_analysis as f32;
+        let hop_ratio = self.hop_synthesis as f64 / self.hop_analysis as f64;
         let norm = 1.0 / self.fft_size as f32;
 
         for frame_idx in 0..num_frames {
@@ -305,12 +309,16 @@ impl PhaseVocoder {
             self.reconstruct_spectrum(num_bins);
             fft_inverse.process(&mut self.fft_buffer);
 
-            // Overlap-add with synthesis window (structured for auto-vectorization)
+            // Overlap-add with dual windowing: analysis window for FFT, Hann
+            // synthesis window for overlap-add. This prevents squaring
+            // Kaiser/BlackmanHarris which distorts the effective window shape.
+            // The window sum tracks wa*ws (the product of both windows) for
+            // correct normalization.
             let frame_len = (synthesis_pos + self.fft_size).min(output_len) - synthesis_pos;
             for i in 0..frame_len {
-                let w = self.window[i];
-                self.output_buf[synthesis_pos + i] += self.fft_buffer[i].re * norm * w;
-                self.window_sum_buf[synthesis_pos + i] += w * w;
+                let ws = self.synthesis_window[i];
+                self.output_buf[synthesis_pos + i] += self.fft_buffer[i].re * norm * ws;
+                self.window_sum_buf[synthesis_pos + i] += self.window[i] * ws;
             }
         }
 
@@ -327,8 +335,13 @@ impl PhaseVocoder {
         fft_forward: &std::sync::Arc<dyn rustfft::Fft<f32>>,
     ) {
         let len = input_frame.len().min(self.fft_buffer.len());
-        for i in 0..len {
-            self.fft_buffer[i] = Complex::new(input_frame[i] * self.window[i], 0.0);
+        for (i, (&sample, &w)) in input_frame
+            .iter()
+            .zip(self.window.iter())
+            .enumerate()
+            .take(len)
+        {
+            self.fft_buffer[i] = Complex::new(sample * w, 0.0);
         }
         fft_forward.process(&mut self.fft_buffer);
     }
@@ -338,13 +351,17 @@ impl PhaseVocoder {
     /// Sub-bass bins (below `sub_bass_bin`) use rigid phase propagation to prevent
     /// phase cancellation in the critical sub-bass region. All other bins use
     /// standard phase vocoder deviation tracking.
+    ///
+    /// Phase accumulation uses f64 precision to prevent cumulative rounding errors
+    /// over long signals. The final phases are converted back to f32 for the
+    /// spectrum reconstruction step.
     #[inline]
-    fn advance_phases(&mut self, num_bins: usize, hop_ratio: f32) {
+    fn advance_phases(&mut self, num_bins: usize, hop_ratio: f64) {
         for bin in 0..num_bins {
             let c = self.fft_buffer[bin];
             self.magnitudes[bin] = c.norm();
-            let phase = c.arg();
-            self.analysis_phases[bin] = phase;
+            let phase = c.arg() as f64;
+            self.analysis_phases[bin] = phase as f32;
 
             if bin < self.sub_bass_bin {
                 // Rigid phase propagation for sub-bass coherence
@@ -352,11 +369,11 @@ impl PhaseVocoder {
             } else {
                 // Standard deviation tracking with hop-ratio scaling
                 let expected = self.expected_phase_advance[bin];
-                let deviation = wrap_phase(phase - self.prev_phase[bin] - expected);
+                let deviation = wrap_phase_f64(phase - self.prev_phase[bin] - expected);
                 self.phase_accum[bin] += (expected + deviation) * hop_ratio;
             }
 
-            self.new_phases[bin] = self.phase_accum[bin];
+            self.new_phases[bin] = self.phase_accum[bin] as f32;
             self.prev_phase[bin] = phase;
         }
     }
@@ -366,8 +383,7 @@ impl PhaseVocoder {
     #[inline]
     fn reconstruct_spectrum(&mut self, num_bins: usize) {
         for i in 0..num_bins {
-            self.fft_buffer[i] =
-                Complex::from_polar(self.magnitudes[i], self.new_phases[i]);
+            self.fft_buffer[i] = Complex::from_polar(self.magnitudes[i], self.new_phases[i]);
         }
         for bin in 1..num_bins - 1 {
             self.fft_buffer[self.fft_size - bin] = self.fft_buffer[bin].conj();
@@ -399,16 +415,26 @@ impl std::fmt::Debug for PhaseVocoder {
     }
 }
 
-/// Wraps a phase value to [-PI, PI] using efficient modulo arithmetic.
+/// Wraps a phase value to [-PI, PI] using f64 precision.
 #[inline]
-fn wrap_phase(phase: f32) -> f32 {
-    let p = phase + PI;
-    p - (p / TWO_PI).floor() * TWO_PI - PI
+fn wrap_phase_f64(phase: f64) -> f64 {
+    let pi = std::f64::consts::PI;
+    let p = phase + pi;
+    p - (p / TWO_PI_F64).floor() * TWO_PI_F64 - pi
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f32::consts::PI;
+
+    const TWO_PI: f32 = 2.0 * PI;
+
+    /// Wraps a phase value to [-PI, PI] using efficient modulo arithmetic (f32).
+    fn wrap_phase(phase: f32) -> f32 {
+        let p = phase + PI;
+        p - (p / TWO_PI).floor() * TWO_PI - PI
+    }
 
     #[test]
     fn test_wrap_phase() {

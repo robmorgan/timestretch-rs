@@ -7,7 +7,7 @@
 // - StreamProcessor::process_into() / flush_into() — zero-allocation streaming
 // - Streaming-batch parity verification
 
-use timestretch::{AudioBuffer, Channels, EdmPreset, StretchParams, StreamProcessor};
+use timestretch::{AudioBuffer, Channels, EdmPreset, StreamProcessor, StretchParams};
 
 // ──────────────────────────────────────────────────────────────────
 // Test signal helpers
@@ -266,7 +266,7 @@ mod mix_tests {
         let b = AudioBuffer::from_mono(vec![0.5; 1000], 44100);
         let mixed = a.mix(&b);
         assert_eq!(mixed.num_frames(), 1000); // Longer of the two
-        // First 500: 1.0 + 0.5 = 1.5
+                                              // First 500: 1.0 + 0.5 = 1.5
         assert!((mixed.data[0] - 1.5).abs() < 1e-6);
         // After 500: 0.0 + 0.5 = 0.5
         assert!((mixed.data[500] - 0.5).abs() < 1e-6);
@@ -528,12 +528,13 @@ mod process_into_tests {
         proc2.flush_into(&mut out2).unwrap();
 
         // Should produce identical output
-        assert_eq!(out1.len(), out2.len(), "process() and process_into() should produce same length");
+        assert_eq!(
+            out1.len(),
+            out2.len(),
+            "process() and process_into() should produce same length"
+        );
         for (i, (&a, &b)) in out1.iter().zip(out2.iter()).enumerate() {
-            assert!(
-                (a - b).abs() < 1e-6,
-                "Mismatch at sample {i}: {a} vs {b}"
-            );
+            assert!((a - b).abs() < 1e-6, "Mismatch at sample {i}: {a} vs {b}");
         }
     }
 
@@ -581,7 +582,11 @@ mod process_into_tests {
         proc.flush_into(&mut output).unwrap();
 
         // Stereo output must have even sample count
-        assert_eq!(output.len() % 2, 0, "Stereo process_into must produce even samples");
+        assert_eq!(
+            output.len() % 2,
+            0,
+            "Stereo process_into must produce even samples"
+        );
     }
 
     #[test]
@@ -792,8 +797,7 @@ mod combined_new_api_workflows {
             (0..4410)
                 .map(|i| {
                     let t = i as f32 / 44100.0;
-                    (2.0 * std::f32::consts::PI * 60.0 * t).sin()
-                        * (-t * 20.0).exp()
+                    (2.0 * std::f32::consts::PI * 60.0 * t).sin() * (-t * 20.0).exp()
                 })
                 .collect(),
             44100,

@@ -53,11 +53,11 @@ pub fn extract_envelope(
     // Step 3: Lifter - keep only low-quefrency components
     // Keep bins 0..order and (fft_size-order+1)..fft_size (conjugate mirror)
     let effective_order = order.min(fft_size / 2);
-    for i in 0..fft_size {
+    for (i, c) in cepstrum_buf.iter_mut().enumerate().take(fft_size) {
         if i > effective_order && i < fft_size - effective_order {
-            cepstrum_buf[i] = Complex::new(0.0, 0.0);
+            *c = Complex::new(0.0, 0.0);
         } else {
-            cepstrum_buf[i] *= norm; // Normalize IFFT
+            *c *= norm; // Normalize IFFT
         }
     }
 
@@ -110,14 +110,22 @@ mod tests {
         let mut cepstrum_buf = Vec::new();
         let mut envelope = Vec::new();
 
-        extract_envelope(&magnitudes, num_bins, 30, &mut planner, &mut cepstrum_buf, &mut envelope);
+        extract_envelope(
+            &magnitudes,
+            num_bins,
+            30,
+            &mut planner,
+            &mut cepstrum_buf,
+            &mut envelope,
+        );
 
         // Envelope should be approximately 1.0 everywhere
         for (i, &e) in envelope.iter().enumerate() {
             assert!(
                 (e - 1.0).abs() < 0.1,
                 "Envelope at bin {} should be ~1.0, got {}",
-                i, e
+                i,
+                e
             );
         }
     }
@@ -128,16 +136,23 @@ mod tests {
         let num_bins = 129;
         let mut magnitudes = vec![0.1f32; num_bins];
         // Create a broad peak around bin 30
-        for i in 20..40 {
-            magnitudes[i] = 1.0 - ((i as f32 - 30.0) / 10.0).powi(2);
-            magnitudes[i] = magnitudes[i].max(0.1);
+        for (i, mag) in magnitudes.iter_mut().enumerate().take(40).skip(20) {
+            *mag = 1.0 - ((i as f32 - 30.0) / 10.0).powi(2);
+            *mag = mag.max(0.1);
         }
 
         let mut planner = FftPlanner::new();
         let mut cepstrum_buf = Vec::new();
         let mut envelope = Vec::new();
 
-        extract_envelope(&magnitudes, num_bins, 20, &mut planner, &mut cepstrum_buf, &mut envelope);
+        extract_envelope(
+            &magnitudes,
+            num_bins,
+            20,
+            &mut planner,
+            &mut cepstrum_buf,
+            &mut envelope,
+        );
 
         // Envelope at the peak should be higher than at the edges
         assert!(
@@ -177,12 +192,12 @@ mod tests {
 
         apply_envelope_correction(&mut magnitudes, &analysis_env, &synthesis_env, num_bins, 0);
 
-        for i in 0..num_bins {
+        for (i, &mag) in magnitudes.iter().enumerate().take(num_bins) {
             assert!(
-                (magnitudes[i] - 2.0).abs() < 1e-6,
+                (mag - 2.0).abs() < 1e-6,
                 "Magnitude at bin {} should be 2.0, got {}",
                 i,
-                magnitudes[i]
+                mag
             );
         }
     }
@@ -197,12 +212,12 @@ mod tests {
 
         apply_envelope_correction(&mut magnitudes, &analysis_env, &synthesis_env, num_bins, 0);
 
-        for i in 0..num_bins {
+        for (i, &mag) in magnitudes.iter().enumerate().take(num_bins) {
             assert!(
-                magnitudes[i] <= 10.0 + 1e-6,
+                mag <= 10.0 + 1e-6,
                 "Magnitude at bin {} should be clamped to 10.0, got {}",
                 i,
-                magnitudes[i]
+                mag
             );
         }
     }

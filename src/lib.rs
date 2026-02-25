@@ -207,8 +207,7 @@ pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, Stretc
     let channel_outputs = if num_channels == 2
         && params.stereo_mode == stretch::stereo::StereoMode::MidSide
     {
-        let (left, right) =
-            stretch::stereo::stretch_mid_side(&channels[0], &channels[1], params)?;
+        let (left, right) = stretch::stereo::stretch_mid_side(&channels[0], &channels[1], params)?;
         vec![left, right]
     } else {
         let mut outs: Vec<Vec<f32>> = Vec::with_capacity(num_channels);
@@ -231,7 +230,7 @@ pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, Stretc
 
 /// Stretches audio samples, appending the result to a caller-provided buffer.
 ///
-/// This is the zero-copy variant of [`stretch`]. Instead of returning a new
+/// This is the zero-copy variant of [`stretch()`]. Instead of returning a new
 /// `Vec`, it appends stretched samples to `output`. This is useful for
 /// avoiding heap allocations when the caller already has a pre-allocated buffer.
 ///
@@ -283,8 +282,7 @@ pub fn stretch_into(
     let channel_outputs = if num_channels == 2
         && params.stereo_mode == stretch::stereo::StereoMode::MidSide
     {
-        let (left, right) =
-            stretch::stereo::stretch_mid_side(&channels[0], &channels[1], params)?;
+        let (left, right) = stretch::stereo::stretch_mid_side(&channels[0], &channels[1], params)?;
         vec![left, right]
     } else {
         let mut outs: Vec<Vec<f32>> = Vec::with_capacity(num_channels);

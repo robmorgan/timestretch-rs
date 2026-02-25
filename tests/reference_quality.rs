@@ -163,10 +163,9 @@ fn reference_quality_benchmark() {
             continue;
         }
 
-        let original = timestretch::io::wav::read_wav_file(
-            original_path.to_str().expect("Invalid path"),
-        )
-        .expect("Failed to read original WAV");
+        let original =
+            timestretch::io::wav::read_wav_file(original_path.to_str().expect("Invalid path"))
+                .expect("Failed to read original WAV");
 
         println!(
             "Track: {} ({}, {} BPM, {:?})",
@@ -195,10 +194,9 @@ fn reference_quality_benchmark() {
                 continue;
             }
 
-            let ref_audio = timestretch::io::wav::read_wav_file(
-                ref_path.to_str().expect("Invalid path"),
-            )
-            .expect("Failed to read reference WAV");
+            let ref_audio =
+                timestretch::io::wav::read_wav_file(ref_path.to_str().expect("Invalid path"))
+                    .expect("Failed to read reference WAV");
 
             let ratio = track.bpm / reference.target_bpm;
             println!(
@@ -220,8 +218,7 @@ fn reference_quality_benchmark() {
                     .with_channels(original.channels.count() as u32)
                     .with_preset(preset);
 
-                let output = timestretch::stretch(&original.data, &params)
-                    .expect("Stretch failed");
+                let output = timestretch::stretch(&original.data, &params).expect("Stretch failed");
 
                 // Write output WAV
                 let out_filename = format!("{}_{}.wav", track.id, preset_name);
@@ -383,10 +380,7 @@ fn reference_quality_benchmark() {
     let json = serde_json::to_string_pretty(&report).expect("Failed to serialize report");
     let report_path = output_dir.join("report.json");
     std::fs::write(&report_path, &json).expect("Failed to write report JSON");
-    println!(
-        "\nJSON report written to: {}\n",
-        report_path.display()
-    );
+    println!("\nJSON report written to: {}\n", report_path.display());
 }
 
 /// Computes RMS of a signal.
