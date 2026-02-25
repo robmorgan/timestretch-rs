@@ -37,7 +37,7 @@ const DEDUP_DISTANCE: usize = 512;
 /// Crossover frequency (Hz) for multi-resolution FFT processing.
 /// Below this, a larger FFT is used; above this, a smaller FFT provides
 /// better temporal resolution for transient-rich high-frequency content.
-const MULTI_RES_CROSSOVER_HZ: f32 = 4000.0;
+const MULTI_RES_CROSSOVER_HZ: f32 = 3000.0;
 /// FFT size for the high-frequency band in multi-resolution mode.
 /// Half the default 4096, giving 2x better temporal resolution at the cost
 /// of 2x worse frequency resolution (acceptable above 4 kHz).

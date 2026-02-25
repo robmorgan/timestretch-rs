@@ -108,6 +108,83 @@ pub fn spectral_similarity(a: &[f32], b: &[f32], fft_size: usize, hop_size: usiz
     similarity_sum / num_frames as f64
 }
 
+/// Computes cosine similarity of averaged magnitude spectra.
+///
+/// Unlike [`spectral_similarity`] which compares frame-by-frame, this computes
+/// the mean magnitude spectrum over all frames for each signal, then compares
+/// those averages. This is timing-invariant — it measures whether the two
+/// signals have the same overall frequency balance regardless of when events
+/// occur within the segment.
+pub fn mean_spectral_similarity(a: &[f32], b: &[f32], fft_size: usize, hop_size: usize) -> f64 {
+    let window = generate_window(WindowType::Hann, fft_size);
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(fft_size);
+    let num_bins = fft_size / 2 + 1;
+
+    let len_a = a.len();
+    let len_b = b.len();
+    if len_a < fft_size || len_b < fft_size {
+        return 0.0;
+    }
+
+    let frames_a = (len_a - fft_size) / hop_size + 1;
+    let frames_b = (len_b - fft_size) / hop_size + 1;
+    if frames_a == 0 || frames_b == 0 {
+        return 0.0;
+    }
+
+    let mut buf = vec![COMPLEX_ZERO; fft_size];
+
+    // Accumulate mean magnitude spectrum for signal A.
+    let mut mean_a = vec![0.0f64; num_bins];
+    for frame in 0..frames_a {
+        let start = frame * hop_size;
+        for i in 0..fft_size {
+            buf[i] = Complex::new(a[start + i] * window[i], 0.0);
+        }
+        fft.process(&mut buf);
+        for i in 0..num_bins {
+            mean_a[i] += buf[i].norm() as f64;
+        }
+    }
+    for v in &mut mean_a {
+        *v /= frames_a as f64;
+    }
+
+    // Accumulate mean magnitude spectrum for signal B.
+    let mut mean_b = vec![0.0f64; num_bins];
+    for frame in 0..frames_b {
+        let start = frame * hop_size;
+        for i in 0..fft_size {
+            buf[i] = Complex::new(b[start + i] * window[i], 0.0);
+        }
+        fft.process(&mut buf);
+        for i in 0..num_bins {
+            mean_b[i] += buf[i].norm() as f64;
+        }
+    }
+    for v in &mut mean_b {
+        *v /= frames_b as f64;
+    }
+
+    // Cosine similarity of the two mean spectra.
+    let mut dot = 0.0f64;
+    let mut norm_a_sq = 0.0f64;
+    let mut norm_b_sq = 0.0f64;
+    for i in 0..num_bins {
+        dot += mean_a[i] * mean_b[i];
+        norm_a_sq += mean_a[i] * mean_a[i];
+        norm_b_sq += mean_b[i] * mean_b[i];
+    }
+
+    let denom = (norm_a_sq * norm_b_sq).sqrt();
+    if denom > 1e-12 {
+        dot / denom
+    } else {
+        0.0
+    }
+}
+
 /// Computes per-band STFT magnitude cosine similarity.
 ///
 /// Same as [`spectral_similarity`] but split into sub-bass, low, mid, and high
@@ -221,6 +298,119 @@ pub fn band_spectral_similarity(
         low: band_sums[1] / n,
         mid: band_sums[2] / n,
         high: band_sums[3] / n,
+    }
+}
+
+/// Computes per-band cosine similarity of averaged magnitude spectra.
+///
+/// Timing-invariant version of [`band_spectral_similarity`]. Computes the mean
+/// magnitude spectrum for each signal, then compares per-band. This measures
+/// whether the two signals have the same frequency balance in each band,
+/// regardless of when events occur.
+pub fn mean_band_spectral_similarity(
+    a: &[f32],
+    b: &[f32],
+    fft_size: usize,
+    hop_size: usize,
+    sample_rate: u32,
+) -> BandSimilarity {
+    let bands = FrequencyBands::default();
+    let window = generate_window(WindowType::Hann, fft_size);
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(fft_size);
+    let num_bins = fft_size / 2 + 1;
+
+    let sub_bass_bin = freq_to_bin(bands.sub_bass, fft_size, sample_rate);
+    let low_bin = freq_to_bin(bands.low, fft_size, sample_rate);
+    let mid_bin = freq_to_bin(bands.mid, fft_size, sample_rate);
+
+    let len_a = a.len();
+    let len_b = b.len();
+    let empty = BandSimilarity {
+        overall: 0.0,
+        sub_bass: 0.0,
+        low: 0.0,
+        mid: 0.0,
+        high: 0.0,
+    };
+    if len_a < fft_size || len_b < fft_size {
+        return empty;
+    }
+    let frames_a = (len_a - fft_size) / hop_size + 1;
+    let frames_b = (len_b - fft_size) / hop_size + 1;
+    if frames_a == 0 || frames_b == 0 {
+        return empty;
+    }
+
+    let mut buf = vec![COMPLEX_ZERO; fft_size];
+
+    // Accumulate mean magnitude spectra.
+    let mut mean_a = vec![0.0f64; num_bins];
+    for frame in 0..frames_a {
+        let start = frame * hop_size;
+        for i in 0..fft_size {
+            buf[i] = Complex::new(a[start + i] * window[i], 0.0);
+        }
+        fft.process(&mut buf);
+        for i in 0..num_bins {
+            mean_a[i] += buf[i].norm() as f64;
+        }
+    }
+    for v in &mut mean_a {
+        *v /= frames_a as f64;
+    }
+
+    let mut mean_b = vec![0.0f64; num_bins];
+    for frame in 0..frames_b {
+        let start = frame * hop_size;
+        for i in 0..fft_size {
+            buf[i] = Complex::new(b[start + i] * window[i], 0.0);
+        }
+        fft.process(&mut buf);
+        for i in 0..num_bins {
+            mean_b[i] += buf[i].norm() as f64;
+        }
+    }
+    for v in &mut mean_b {
+        *v /= frames_b as f64;
+    }
+
+    // Per-band cosine similarity on mean spectra.
+    let band_ranges: [(usize, usize); 4] = [
+        (0, sub_bass_bin),
+        (sub_bass_bin, low_bin),
+        (low_bin, mid_bin),
+        (mid_bin, num_bins),
+    ];
+
+    let cosine_sim = |lo: usize, hi: usize| -> f64 {
+        let mut dot = 0.0f64;
+        let mut na = 0.0f64;
+        let mut nb = 0.0f64;
+        for i in lo..hi.min(num_bins) {
+            dot += mean_a[i] * mean_b[i];
+            na += mean_a[i] * mean_a[i];
+            nb += mean_b[i] * mean_b[i];
+        }
+        let denom = (na * nb).sqrt();
+        if denom > 1e-12 {
+            dot / denom
+        } else {
+            0.0
+        }
+    };
+
+    let band_scores: Vec<f64> = band_ranges
+        .iter()
+        .map(|&(lo, hi)| cosine_sim(lo, hi))
+        .collect();
+
+    BandSimilarity {
+        overall: cosine_sim(0, num_bins),
+        sub_bass: band_scores[0],
+        low: band_scores[1],
+        mid: band_scores[2],
+        high: band_scores[3],
     }
 }
 

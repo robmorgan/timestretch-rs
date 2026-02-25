@@ -92,7 +92,7 @@ pub fn apply_envelope_correction(
         let synth_env = synthesis_envelope[bin].max(LOG_FLOOR);
         let correction = analysis_envelope[bin] / synth_env;
         // Clamp correction to avoid extreme amplification
-        let clamped = correction.clamp(0.1, 10.0);
+        let clamped = correction.clamp(0.2, 5.0);
         magnitudes[bin] *= clamped;
     }
 }
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn test_envelope_correction_clamped() {
-        // Extreme ratio should be clamped to 10.0
+        // Extreme ratio should be clamped to 5.0
         let num_bins = 16;
         let analysis_env = vec![100.0f32; num_bins];
         let synthesis_env = vec![0.01f32; num_bins];
@@ -214,8 +214,8 @@ mod tests {
 
         for (i, &mag) in magnitudes.iter().enumerate().take(num_bins) {
             assert!(
-                mag <= 10.0 + 1e-6,
-                "Magnitude at bin {} should be clamped to 10.0, got {}",
+                mag <= 5.0 + 1e-6,
+                "Magnitude at bin {} should be clamped to 5.0, got {}",
                 i,
                 mag
             );

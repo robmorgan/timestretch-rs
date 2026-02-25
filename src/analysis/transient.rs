@@ -209,8 +209,8 @@ const BAND_MID_LIMIT: f32 = 2000.0;
 const BAND_HIGH_MID_LIMIT: f32 = 8000.0;
 
 // Spectral flux weights per frequency band.
-/// Sub-bass (<100 Hz): low weight — little transient content.
-const WEIGHT_SUB_BASS: f32 = 0.3;
+/// Sub-bass (<100 Hz): moderate weight — captures kick drum fundamentals.
+const WEIGHT_SUB_BASS: f32 = 0.8;
 /// Bass/low-mid (100–500 Hz): moderate weight — kick body.
 const WEIGHT_BASS_MID: f32 = 0.6;
 /// Mid (500–2000 Hz): moderate weight.
@@ -271,7 +271,7 @@ fn adaptive_threshold_with_gap(
 
     let half_window = MEDIAN_WINDOW_FRAMES / 2;
     // Higher sensitivity = lower threshold = more detections
-    let threshold_multiplier = 1.0 + (1.0 - sensitivity) * 4.0;
+    let threshold_multiplier = 1.0 + (1.0 - sensitivity) * 3.5;
 
     let mut onsets = Vec::new();
     let mut last_onset: Option<usize> = None;
@@ -433,8 +433,8 @@ mod tests {
     fn test_bin_weights() {
         let weights = compute_bin_weights(4096, 44100);
         assert_eq!(weights.len(), 2049);
-        // Sub-bass should have low weight
-        assert!(weights[0] < 0.5);
+        // Sub-bass should have moderate weight (captures kick fundamentals)
+        assert!(weights[0] < 1.0);
         // 4kHz bin should have high weight
         let bin_4k = (4000.0 / (44100.0 / 4096.0)) as usize;
         assert!(weights[bin_4k] > 1.0);
