@@ -217,7 +217,11 @@ impl HybridStretcher {
             && (self.params.stretch_ratio - 1.0).abs() > 1e-6
             && segments.len() > 1
         {
-            compute_elastic_ratios(&mut segments, self.params.stretch_ratio);
+            compute_elastic_ratios(
+                &mut segments,
+                self.params.stretch_ratio,
+                self.params.elastic_anchor,
+            );
         }
 
         // Step 3: Process each segment with appropriate algorithm
@@ -493,7 +497,7 @@ impl HybridStretcher {
                 .max(MIN_WSOLA_SEGMENT);
             let search = self
                 .params
-                .wsola_search_range
+                .effective_wsola_search_range()
                 .min(seg_size / 2)
                 .max(MIN_WSOLA_SEARCH);
             let mut wsola = Wsola::new(seg_size, search, decay_out_len as f64 / decay.len() as f64);
@@ -542,7 +546,7 @@ impl HybridStretcher {
             .max(MIN_WSOLA_SEGMENT);
         let search = self
             .params
-            .wsola_search_range
+            .effective_wsola_search_range()
             .min(seg_size / 2)
             .max(MIN_WSOLA_SEARCH);
         let mut wsola = Wsola::new(seg_size, search, ratio);
@@ -775,12 +779,16 @@ const ELASTIC_MAX_RATIO: f64 = 4.0;
 
 /// Computes per-segment stretch ratios for elastic beat distribution.
 ///
-/// Anchors transient segments close to ratio 1.0 (preserving their timing)
-/// and distributes the remaining stretch into tonal segments. The total output
-/// duration matches what the global ratio would produce.
+/// Blends transient segment ratios between the global ratio and 1.0 based on
+/// the `anchor` parameter:
+/// - `anchor = 0.0`: transients get the global ratio (beats at target tempo)
+/// - `anchor = 1.0`: transients stay at ratio 1.0 (beats at original tempo)
+///
+/// Tonal segments absorb the remaining stretch so the total output duration
+/// matches what the global ratio would produce.
 ///
 /// If no tonal segments exist, all segments keep the global ratio.
-fn compute_elastic_ratios(segments: &mut [Segment], global_ratio: f64) {
+fn compute_elastic_ratios(segments: &mut [Segment], global_ratio: f64, anchor: f64) {
     if segments.is_empty() {
         return;
     }
@@ -792,10 +800,11 @@ fn compute_elastic_ratios(segments: &mut [Segment], global_ratio: f64) {
 
     let total_target_output = total_input * global_ratio;
 
-    // Transient segments get ratio close to 1.0 (preserve timing).
-    // We use a blend: 90% identity + 10% global ratio to stay close to 1.0
-    // but still contribute some stretch.
-    let transient_ratio = 1.0 * 0.9 + global_ratio * 0.1;
+    // Blend between global ratio (anchor=0) and identity (anchor=1).
+    // anchor=0.0 → transients at target tempo (DJ beatmatch)
+    // anchor=1.0 → transients at original tempo (creative effects)
+    let anchor = anchor.clamp(0.0, 1.0);
+    let transient_ratio = global_ratio * (1.0 - anchor) + 1.0 * anchor;
 
     let transient_input: f64 = segments
         .iter()

@@ -56,6 +56,9 @@ pub struct PhaseVocoder {
     /// Synthesis window for overlap-add, matched to the analysis window type.
     /// Using the same window type ensures correct spectral weighting and COLA normalization.
     synthesis_window: Vec<f32>,
+    /// Backup of IF-estimated phases before phase locking overwrites them.
+    /// Used to blend IF estimates with locked phases for non-peak bins.
+    if_phases_backup: Vec<f32>,
     /// Reusable output buffer (avoids allocation per process() call).
     output_buf: Vec<f32>,
     /// Reusable window sum buffer (avoids allocation per process() call).
@@ -188,6 +191,7 @@ impl PhaseVocoder {
             analysis_envelope: Vec::new(),
             synthesis_envelope: Vec::new(),
             synthesis_window,
+            if_phases_backup: vec![0.0; num_bins],
             output_buf: Vec::new(),
             window_sum_buf: Vec::new(),
         }
@@ -307,6 +311,9 @@ impl PhaseVocoder {
             );
             self.advance_phases(num_bins, hop_ratio);
 
+            // Save IF-estimated phases before phase locking overwrites them.
+            self.if_phases_backup[..num_bins].copy_from_slice(&self.new_phases[..num_bins]);
+
             // Phase locking: lock non-peak bins to their nearest peak using
             // the analysis phase relationship. Only applies above the sub-bass region.
             apply_phase_locking(
@@ -318,6 +325,18 @@ impl PhaseVocoder {
                 self.sub_bass_bin,
                 &mut self.peaks,
             );
+
+            // Blend IF estimates with locked phases for non-peak bins above sub-bass.
+            // This preserves some of the IF accuracy while still benefiting from
+            // phase coherence imposed by the locking algorithm.
+            for bin in self.sub_bass_bin..num_bins {
+                if self.peaks.binary_search(&bin).is_ok() {
+                    continue; // Peak bins keep their locked phase
+                }
+                let locked = self.new_phases[bin] as f64;
+                let if_est = self.if_phases_backup[bin] as f64;
+                self.new_phases[bin] = (0.7 * locked + 0.3 * if_est) as f32;
+            }
 
             // Spectral envelope preservation: correct magnitudes so formant
             // structure matches the original analysis frame, preventing
@@ -454,8 +473,15 @@ impl PhaseVocoder {
             let phase = self.analysis_phases[bin] as f64;
 
             if bin < self.sub_bass_bin {
-                // Rigid phase propagation for sub-bass coherence (unchanged)
-                self.phase_accum[bin] += phase - self.prev_phase[bin];
+                // Sub-bass IF estimation: same instantaneous-frequency approach
+                // as standard bins, but without parabolic interpolation (sub-bass
+                // bins are narrow enough that integer-bin IF is sufficient).
+                // The identity phase locking in phase_locking.rs handles inter-bin
+                // coherence for sub-bass via trough-based regions.
+                let expected_diff = self.expected_phase_advance[bin];
+                let phase_diff = phase - self.prev_phase[bin];
+                let deviation = wrap_phase_f64(phase_diff - expected_diff);
+                self.phase_accum[bin] += (expected_diff + deviation) * hop_ratio;
             } else {
                 // Standard IF estimation:
                 //   phase_diff = current_phase - prev_phase
@@ -520,11 +546,13 @@ impl PhaseVocoder {
         // --- Phase gradient integration (soft vertical coherence) ---
         // Propagate phase from peaks to nearby non-peak bins using the analysis
         // phase gradient, blended with the independently-advanced phase.
-        // Only apply for moderate stretch ratios (< 1.3x) where per-frame phase
-        // changes are small enough for the gradient to track accurately. For
-        // extreme ratios the large hop difference makes gradient propagation
-        // unreliable and can cause amplitude artifacts.
-        if !advance_peaks.is_empty() && hop_ratio < 1.3 {
+        // Apply up to 2.5x ratio with a tapering blend: full strength at ratio≤1.0,
+        // linearly decreasing to zero at ratio=2.5. This extends coherence to
+        // moderate stretches while avoiding artifacts at extreme ratios.
+        if !advance_peaks.is_empty() && hop_ratio < 2.5 {
+            // Taper: PHASE_GRADIENT_BLEND at ratio≤1.0, linear down to 0.0 at ratio=2.5
+            let gradient_blend =
+                PHASE_GRADIENT_BLEND * (1.0 - ((hop_ratio - 1.0) / 1.5).clamp(0.0, 1.0));
             for bin in self.sub_bass_bin..num_bins {
                 if advance_peaks.binary_search(&bin).is_ok() {
                     continue; // Peak bins keep their phase (they are the anchors)
@@ -563,9 +591,8 @@ impl PhaseVocoder {
                     self.analysis_phases[bin] as f64 - self.analysis_phases[nearest_peak] as f64;
                 let propagated = self.new_phases[nearest_peak] as f64 + gradient;
                 let independent = self.new_phases[bin] as f64;
-                self.new_phases[bin] = ((1.0 - PHASE_GRADIENT_BLEND) * independent
-                    + PHASE_GRADIENT_BLEND * propagated)
-                    as f32;
+                self.new_phases[bin] =
+                    ((1.0 - gradient_blend) * independent + gradient_blend * propagated) as f32;
             }
         }
     }

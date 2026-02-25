@@ -1,10 +1,11 @@
 //! Linkwitz-Riley crossover filters for multi-band signal splitting.
 //!
-//! Provides 4th-order (24 dB/oct) Linkwitz-Riley crossover filters that split
-//! audio into frequency bands with flat magnitude response at the crossover
-//! frequency. LR4 crossovers are constructed by cascading two 2nd-order
-//! Butterworth filters, ensuring that the low and high outputs sum to unity
-//! at all frequencies (minus a small phase shift).
+//! Provides 4th-order (24 dB/oct) and 8th-order (48 dB/oct) Linkwitz-Riley
+//! crossover filters that split audio into frequency bands with flat magnitude
+//! response at the crossover frequency. LR4 crossovers cascade two 2nd-order
+//! Butterworth filters; LR8 crossovers cascade four for steeper roll-off.
+//! Both ensure that the low and high outputs sum to unity at all frequencies
+//! (minus a small phase shift).
 
 use std::f64::consts::PI;
 
@@ -212,12 +213,117 @@ impl LR4Crossover {
     }
 }
 
+/// 8th-order Linkwitz-Riley (LR8) crossover filter (48 dB/oct slope).
+///
+/// Splits an input signal into low-pass and high-pass bands at a specified
+/// crossover frequency. The LR8 topology cascades four 2nd-order Butterworth
+/// filters, producing a steeper roll-off than LR4 while maintaining a flat
+/// magnitude sum at the crossover point.
+///
+/// # Example
+///
+/// ```
+/// use timestretch::core::crossover::LR8Crossover;
+///
+/// let mut xover = LR8Crossover::new(200.0, 44100);
+/// let (low, high) = xover.process_sample(1.0);
+/// // low + high approximately equals the input (with phase shift)
+/// ```
+pub struct LR8Crossover {
+    /// Four cascaded 2nd-order Butterworth low-pass filters.
+    low_pass: [Biquad; 4],
+    /// Four cascaded 2nd-order Butterworth high-pass filters.
+    high_pass: [Biquad; 4],
+}
+
+impl LR8Crossover {
+    /// Creates a new LR8 crossover at the specified frequency.
+    ///
+    /// # Arguments
+    ///
+    /// * `crossover_freq` - Crossover frequency in Hz
+    /// * `sample_rate` - Audio sample rate in Hz
+    pub fn new(crossover_freq: f64, sample_rate: u32) -> Self {
+        Self {
+            low_pass: [
+                Biquad::lowpass(crossover_freq, sample_rate),
+                Biquad::lowpass(crossover_freq, sample_rate),
+                Biquad::lowpass(crossover_freq, sample_rate),
+                Biquad::lowpass(crossover_freq, sample_rate),
+            ],
+            high_pass: [
+                Biquad::highpass(crossover_freq, sample_rate),
+                Biquad::highpass(crossover_freq, sample_rate),
+                Biquad::highpass(crossover_freq, sample_rate),
+                Biquad::highpass(crossover_freq, sample_rate),
+            ],
+        }
+    }
+
+    /// Processes a single sample, returning (low, high) band outputs.
+    #[inline]
+    pub fn process_sample(&mut self, input: f32) -> (f32, f32) {
+        let x = input as f64;
+
+        // Cascade four Butterworth LP stages for 8th-order LR low-pass
+        let mut low = x;
+        for stage in &mut self.low_pass {
+            low = stage.process_sample(low);
+        }
+
+        // Cascade four Butterworth HP stages for 8th-order LR high-pass
+        let mut high = x;
+        for stage in &mut self.high_pass {
+            high = stage.process_sample(high);
+        }
+
+        (low as f32, high as f32)
+    }
+
+    /// Processes a buffer, splitting into low and high bands.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `low` or `high` is shorter than `input`.
+    pub fn process(&mut self, input: &[f32], low: &mut [f32], high: &mut [f32]) {
+        assert!(
+            low.len() >= input.len(),
+            "low buffer too short: {} < {}",
+            low.len(),
+            input.len()
+        );
+        assert!(
+            high.len() >= input.len(),
+            "high buffer too short: {} < {}",
+            high.len(),
+            input.len()
+        );
+
+        for (i, &sample) in input.iter().enumerate() {
+            let (l, h) = self.process_sample(sample);
+            low[i] = l;
+            high[i] = h;
+        }
+    }
+
+    /// Resets all filter state to zero.
+    pub fn reset(&mut self) {
+        for bq in &mut self.low_pass {
+            bq.reset();
+        }
+        for bq in &mut self.high_pass {
+            bq.reset();
+        }
+    }
+}
+
 /// Three-band signal splitter using two cascaded Linkwitz-Riley crossovers.
 ///
 /// Splits audio into sub-bass, mid, and high frequency bands using two
-/// LR4 crossover points. The first crossover separates sub-bass from
-/// everything above, and the second crossover splits the upper portion
-/// into mid and high bands.
+/// LR8 (48 dB/oct) crossover points. The first crossover separates sub-bass
+/// from everything above, and the second crossover splits the upper portion
+/// into mid and high bands. The steeper LR8 roll-off provides better band
+/// isolation than LR4, reducing inter-band leakage.
 ///
 /// # Example
 ///
@@ -233,9 +339,9 @@ impl LR4Crossover {
 /// ```
 pub struct ThreeBandSplitter {
     /// Crossover splitting sub-bass from mid+high.
-    low_mid: LR4Crossover,
+    low_mid: LR8Crossover,
     /// Crossover splitting mid from high (applied to the high output of low_mid).
-    mid_high: LR4Crossover,
+    mid_high: LR8Crossover,
 }
 
 impl ThreeBandSplitter {
@@ -248,8 +354,8 @@ impl ThreeBandSplitter {
     /// * `sample_rate` - Audio sample rate in Hz
     pub fn new(low_freq: f64, high_freq: f64, sample_rate: u32) -> Self {
         Self {
-            low_mid: LR4Crossover::new(low_freq, sample_rate),
-            mid_high: LR4Crossover::new(high_freq, sample_rate),
+            low_mid: LR8Crossover::new(low_freq, sample_rate),
+            mid_high: LR8Crossover::new(high_freq, sample_rate),
         }
     }
 
@@ -510,6 +616,96 @@ mod tests {
         assert!(
             mid_energy > high_energy * 10.0,
             "1 kHz should be mostly in mid band, but mid={mid_energy:.4}, high={high_energy:.4}"
+        );
+    }
+
+    /// Verify that the LR8 crossover preserves total energy (power complementary).
+    #[test]
+    fn test_lr8_crossover_energy_conservation() {
+        let sample_rate = 44100;
+        let crossover_freq = 1000.0;
+        let mut xover = LR8Crossover::new(crossover_freq, sample_rate);
+
+        let len = 16384;
+        let input: Vec<f32> = (0..len)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (2.0 * std::f32::consts::PI * 200.0 * t).sin() * 0.33
+                    + (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 0.33
+                    + (2.0 * std::f32::consts::PI * 5000.0 * t).sin() * 0.33
+            })
+            .collect();
+
+        let mut low = vec![0.0f32; len];
+        let mut high = vec![0.0f32; len];
+        xover.process(&input, &mut low, &mut high);
+
+        let settle = 1024;
+        let input_energy: f64 = input[settle..].iter().map(|s| (*s as f64).powi(2)).sum();
+        let low_energy: f64 = low[settle..].iter().map(|s| (*s as f64).powi(2)).sum();
+        let high_energy: f64 = high[settle..].iter().map(|s| (*s as f64).powi(2)).sum();
+
+        let combined_energy = low_energy + high_energy;
+        let energy_ratio = combined_energy / input_energy;
+
+        assert!(
+            (0.7..1.3).contains(&energy_ratio),
+            "LR8 energy ratio {energy_ratio:.4} too far from 1.0 (low={low_energy:.2}, high={high_energy:.2}, input={input_energy:.2})"
+        );
+    }
+
+    /// Verify that LR8 has steeper roll-off than LR4.
+    #[test]
+    fn test_lr8_steeper_rolloff_than_lr4() {
+        let sample_rate = 44100;
+        let crossover_freq = 1000.0;
+        let mut lr4 = LR4Crossover::new(crossover_freq, sample_rate);
+        let mut lr8 = LR8Crossover::new(crossover_freq, sample_rate);
+
+        // Test with a sine at 2x the crossover frequency (2000 Hz)
+        let freq = 2000.0;
+        let len = 16384;
+        let input: Vec<f32> = (0..len)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let mut lr4_low = vec![0.0f32; len];
+        let mut lr4_high = vec![0.0f32; len];
+        lr4.process(&input, &mut lr4_low, &mut lr4_high);
+
+        let mut lr8_low = vec![0.0f32; len];
+        let mut lr8_high = vec![0.0f32; len];
+        lr8.process(&input, &mut lr8_low, &mut lr8_high);
+
+        let settle = 2048;
+        let lr4_low_energy: f64 = lr4_low[settle..].iter().map(|s| (*s as f64).powi(2)).sum();
+        let lr8_low_energy: f64 = lr8_low[settle..].iter().map(|s| (*s as f64).powi(2)).sum();
+
+        // At 2x crossover freq, LR8 low-pass should have much less energy than LR4
+        // LR4 = 24 dB/oct, LR8 = 48 dB/oct, so at 1 octave above: LR4 = -24dB, LR8 = -48dB
+        // That's a ~24 dB difference, i.e. LR8 energy should be ~250x less
+        assert!(
+            lr8_low_energy < lr4_low_energy * 0.1,
+            "LR8 low-pass at 2x crossover should be much lower than LR4: LR8={lr8_low_energy:.6}, LR4={lr4_low_energy:.6}"
+        );
+    }
+
+    /// Verify that LR8 reset clears filter state.
+    #[test]
+    fn test_lr8_reset() {
+        let mut xover = LR8Crossover::new(1000.0, 44100);
+
+        for i in 0..100 {
+            xover.process_sample((i as f32 * 0.1).sin());
+        }
+
+        xover.reset();
+
+        let (low, high) = xover.process_sample(0.0);
+        assert!(low.abs() < 1e-10, "low should be ~0 after reset, got {low}");
+        assert!(
+            high.abs() < 1e-10,
+            "high should be ~0 after reset, got {high}"
         );
     }
 }

@@ -1437,11 +1437,21 @@ pub struct StretchParams {
     ///
     /// When enabled, beats are anchored to a target beat grid while sustain
     /// regions absorb the excess time. This preserves rhythmic feel by keeping
-    /// beats at their musically correct positions. Transient segments get a
-    /// ratio close to 1.0 (preserving timing), while tonal segments absorb
-    /// the remaining stretch. Automatically disabled when `stretch_ratio == 1.0`.
+    /// beats at their musically correct positions. The [`elastic_anchor`](Self::elastic_anchor)
+    /// field controls how strongly transients are anchored to ratio 1.0 vs
+    /// the global ratio. Automatically disabled when `stretch_ratio == 1.0`.
     /// Enabled by default for DjBeatmatch and HouseLoop presets.
     pub elastic_timing: bool,
+    /// How strongly elastic timing anchors transient segments to ratio 1.0.
+    ///
+    /// Range: 0.0 to 1.0.
+    /// - 0.0: transients get the global stretch ratio (no anchoring, beats move
+    ///   to the target tempo). Best for DJ beatmatching.
+    /// - 1.0: transients stay close to ratio 1.0 (maximum anchoring, beats stay
+    ///   near the original tempo). Best for creative effects like halftime.
+    ///
+    /// Only takes effect when `elastic_timing` is enabled. Default: 0.0.
+    pub elastic_anchor: f64,
     /// Whether to use HPSS (Harmonic-Percussive Source Separation) pre-processing.
     ///
     /// When enabled, tonal segments are separated into harmonic and percussive
@@ -1546,6 +1556,7 @@ impl StretchParams {
             multi_resolution: false,
             transient_region_secs: DEFAULT_TRANSIENT_REGION_SECS,
             elastic_timing: false,
+            elastic_anchor: 0.0,
             hpss_enabled: false,
             crossfade_mode: CrossfadeMode::Fixed(0.012),
             bpm: None,
@@ -1615,8 +1626,16 @@ impl StretchParams {
         // DjBeatmatch needs it for transparent tempo changes; Ambient benefits from the
         // large sub-bass FFT at extreme stretch ratios (2x-4x).
         self.multi_resolution = matches!(preset, EdmPreset::DjBeatmatch | EdmPreset::Ambient);
-        // Enable elastic beat distribution for rhythm-critical presets
+        // Enable elastic beat distribution for rhythm-critical presets.
+        // DjBeatmatch and HouseLoop use low anchor so beats land at the target BPM;
+        // creative presets like Halftime would use a high anchor to keep beats
+        // near the original tempo (but elastic_timing is off for those).
         self.elastic_timing = matches!(preset, EdmPreset::DjBeatmatch | EdmPreset::HouseLoop);
+        self.elastic_anchor = match preset {
+            EdmPreset::DjBeatmatch => 0.0,
+            EdmPreset::HouseLoop => 0.1,
+            _ => 0.0,
+        };
         // Enable HPSS for presets where harmonic/percussive overlap matters
         self.hpss_enabled = matches!(preset, EdmPreset::DjBeatmatch | EdmPreset::HouseLoop);
         // Use adaptive crossfade for all presets
@@ -1749,10 +1768,21 @@ impl StretchParams {
     ///
     /// When enabled and beats are detected, stretch ratios are distributed
     /// non-uniformly: transient segments stay close to ratio 1.0 while tonal
-    /// segments absorb the excess stretch. This keeps beats at their musically
-    /// correct positions.
+    /// segments absorb the excess stretch. Use [`with_elastic_anchor`](Self::with_elastic_anchor)
+    /// to control how strongly transients are anchored to 1.0.
     pub fn with_elastic_timing(mut self, enabled: bool) -> Self {
         self.elastic_timing = enabled;
+        self
+    }
+
+    /// Sets how strongly elastic timing anchors transient segments to ratio 1.0.
+    ///
+    /// - 0.0: transients use the global ratio (beats at target tempo, best for DJ)
+    /// - 1.0: transients stay near ratio 1.0 (beats near original tempo, creative effects)
+    ///
+    /// Only takes effect when elastic timing is enabled.
+    pub fn with_elastic_anchor(mut self, anchor: f64) -> Self {
+        self.elastic_anchor = anchor.clamp(0.0, 1.0);
         self
     }
 
@@ -1805,6 +1835,22 @@ impl StretchParams {
             (base_ms * ratio_factor).min(40.0) // cap at 40ms
         } else {
             base_ms
+        }
+    }
+
+    /// Compute the effective WSOLA search range in samples.
+    ///
+    /// When `dynamic_wsola_search` is true, the base search range is scaled by
+    /// the stretch ratio deviation from unity, capped at 40ms worth of samples.
+    /// Otherwise returns the static `wsola_search_range`.
+    pub fn effective_wsola_search_range(&self) -> usize {
+        if self.dynamic_wsola_search {
+            let ratio_factor = self.stretch_ratio.max(1.0 / self.stretch_ratio);
+            let base = self.wsola_search_range as f64;
+            let max_samples = 0.040 * self.sample_rate as f64; // 40ms cap
+            (base * ratio_factor).min(max_samples) as usize
+        } else {
+            self.wsola_search_range
         }
     }
 
@@ -3395,6 +3441,46 @@ mod tests {
             .with_dynamic_wsola_search(true);
         let ms = params.effective_wsola_search_ms();
         assert!((ms - 20.0).abs() < 0.5, "Expected ~20ms, got {}", ms);
+    }
+
+    #[test]
+    fn test_effective_wsola_search_range_static() {
+        // With dynamic disabled, should return the raw value
+        let params = StretchParams::new(2.0)
+            .with_sample_rate(44100)
+            .with_wsola_search_range(100);
+        assert_eq!(params.effective_wsola_search_range(), 100);
+    }
+
+    #[test]
+    fn test_effective_wsola_search_range_dynamic_scales() {
+        // At ratio=2.0, base=441 (10ms) → 882 (20ms)
+        let params = StretchParams::new(2.0)
+            .with_sample_rate(44100)
+            .with_wsola_search_range(441)
+            .with_dynamic_wsola_search(true);
+        assert_eq!(params.effective_wsola_search_range(), 882);
+    }
+
+    #[test]
+    fn test_effective_wsola_search_range_dynamic_symmetric() {
+        // ratio=0.5 should use 1/0.5 = 2.0 as factor, same as ratio=2.0
+        let params = StretchParams::new(0.5)
+            .with_sample_rate(44100)
+            .with_wsola_search_range(441)
+            .with_dynamic_wsola_search(true);
+        assert_eq!(params.effective_wsola_search_range(), 882);
+    }
+
+    #[test]
+    fn test_effective_wsola_search_range_dynamic_caps_at_40ms() {
+        // base=1323 (30ms) at ratio=2.0 → 2646 (60ms) but capped at 1764 (40ms)
+        let params = StretchParams::new(2.0)
+            .with_sample_rate(44100)
+            .with_wsola_search_range(1323)
+            .with_dynamic_wsola_search(true);
+        let max_samples = (0.040 * 44100.0) as usize; // 1764
+        assert_eq!(params.effective_wsola_search_range(), max_samples);
     }
 
     // --- Preset tuning tests ---
