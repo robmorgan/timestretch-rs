@@ -1,8 +1,9 @@
-//! Audio analysis: transient detection, beat tracking, and frequency analysis.
+//! Audio analysis: transient detection, beat tracking, frequency analysis, and HPSS.
 
 pub mod beat;
 pub mod comparison;
 pub mod frequency;
+pub mod hpss;
 pub mod transient;
 
 pub use beat::*;

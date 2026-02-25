@@ -2,6 +2,7 @@
 
 use crate::analysis::beat::detect_beats;
 use crate::analysis::frequency::freq_to_bin;
+use crate::analysis::hpss::{hpss, HpssParams};
 use crate::analysis::transient::detect_transients;
 use crate::core::fft::{COMPLEX_ZERO, WINDOW_SUM_EPSILON, WINDOW_SUM_FLOOR_RATIO};
 use crate::core::types::StretchParams;
@@ -11,8 +12,6 @@ use crate::stretch::phase_vocoder::PhaseVocoder;
 use crate::stretch::wsola::Wsola;
 use rustfft::{num_complex::Complex, FftPlanner};
 
-/// Crossfade duration in seconds between algorithm segments (5ms raised-cosine).
-const CROSSFADE_SECS: f64 = 0.005;
 /// Minimum segment length (samples) to use phase vocoder or WSOLA; shorter segments
 /// fall back to linear resampling.
 const MIN_SEGMENT_FOR_STRETCH: usize = 256;
@@ -57,6 +56,9 @@ struct Segment {
     start: usize,
     end: usize,
     is_transient: bool,
+    /// Per-segment stretch ratio. Defaults to the global ratio but may
+    /// differ when elastic beat distribution is active.
+    stretch_ratio: f64,
 }
 
 impl HybridStretcher {
@@ -163,7 +165,16 @@ impl HybridStretcher {
             };
 
         // Step 2: Segment audio at transient/beat boundaries
-        let segments = self.segment_audio(input.len(), onsets, strengths);
+        let mut segments = self.segment_audio(input.len(), onsets, strengths);
+
+        // Step 2b: Compute elastic per-segment ratios if enabled.
+        // Guard: only when elastic_timing is on AND ratio != 1.0 (identity).
+        if self.params.elastic_timing
+            && (self.params.stretch_ratio - 1.0).abs() > 1e-6
+            && segments.len() > 1
+        {
+            compute_elastic_ratios(&mut segments, self.params.stretch_ratio);
+        }
 
         // Step 3: Process each segment with appropriate algorithm
         // Reuse a single PV instance for tonal segments (avoids FFT planner recreation)
@@ -200,17 +211,39 @@ impl HybridStretcher {
 
         for segment in &segments {
             let seg_data = &input[segment.start..segment.end];
-            let stretched =
-                self.stretch_segment(seg_data, segment.is_transient, &mut pv, &mut pv_high);
+            let stretched = self.stretch_segment(
+                seg_data,
+                segment.is_transient,
+                segment.stretch_ratio,
+                &mut pv,
+                &mut pv_high,
+            );
             output_segments.push(stretched);
 
             // Reset PV phase state after transient segments so stale phase
             // from the previous tonal region doesn't contaminate the next one.
+            // Use per-band reset when band flux data is available to avoid
+            // disrupting phase tracking in bands where no transient occurred.
             if segment.is_transient {
-                pv.reset_phase_state();
-                if let Some(ref mut pv_h) = pv_high {
-                    pv_h.reset_phase_state();
+                let reset_mask = compute_band_reset_mask(segment.start, &transients);
+                if reset_mask == [true; 4] {
+                    // Full reset (fallback for beat-merged onsets or when all bands active)
+                    pv.reset_phase_state();
+                    if let Some(ref mut pv_h) = pv_high {
+                        pv_h.reset_phase_state();
+                    }
+                } else {
+                    pv.reset_phase_state_bands(reset_mask, self.params.sample_rate);
+                    if let Some(ref mut pv_h) = pv_high {
+                        pv_h.reset_phase_state_bands(reset_mask, self.params.sample_rate);
+                    }
                 }
+            }
+
+            // Restore global ratio on PV for next segment (elastic may have changed it)
+            pv.set_stretch_ratio(self.params.stretch_ratio);
+            if let Some(ref mut pv_h) = pv_high {
+                pv_h.set_stretch_ratio(self.params.stretch_ratio);
             }
         }
 
@@ -220,8 +253,17 @@ impl HybridStretcher {
             return Ok(output_segments.into_iter().next().unwrap_or_default());
         }
 
-        let crossfade_samples = (self.params.sample_rate as f64 * CROSSFADE_SECS) as usize;
-        let output = concatenate_with_crossfade(&output_segments, crossfade_samples);
+        let output = match self.params.crossfade_mode {
+            crate::core::types::CrossfadeMode::Fixed(secs) => {
+                let crossfade_samples = (self.params.sample_rate as f64 * secs) as usize;
+                concatenate_with_crossfade(&output_segments, crossfade_samples)
+            }
+            crate::core::types::CrossfadeMode::Adaptive => {
+                let crossfade_lens =
+                    compute_adaptive_crossfade_lens(&segments, self.params.sample_rate);
+                concatenate_with_adaptive_crossfade(&output_segments, &crossfade_lens)
+            }
+        };
 
         Ok(output)
     }
@@ -235,31 +277,49 @@ impl HybridStretcher {
     ///   bands and processed with different FFT sizes
     /// - Everything else (short tonal) uses WSOLA
     /// - On error, falls back to linear resampling
+    ///
+    /// `seg_ratio` is the per-segment stretch ratio (may differ from `self.params.stretch_ratio`
+    /// when elastic beat distribution is active).
     fn stretch_segment(
         &self,
         seg_data: &[f32],
         is_transient: bool,
+        seg_ratio: f64,
         pv: &mut PhaseVocoder,
         pv_high: &mut Option<PhaseVocoder>,
     ) -> Vec<f32> {
+        let out_len = (seg_data.len() as f64 * seg_ratio).round() as usize;
+
         if seg_data.len() < MIN_SEGMENT_FOR_STRETCH {
-            let out_len = self.params.output_length(seg_data.len());
             return crate::core::resample::resample_linear(seg_data, out_len.max(1));
         }
 
         // Onset-aligned transient stretching: copy attack, WSOLA the decay
         if is_transient {
-            return self.stretch_transient_segment(seg_data);
+            return self.stretch_transient_segment_with_ratio(seg_data, seg_ratio);
+        }
+
+        // Set the PV ratio for this segment
+        pv.set_stretch_ratio(seg_ratio);
+        if let Some(ref mut pv_h) = pv_high {
+            pv_h.set_stretch_ratio(seg_ratio);
         }
 
         let use_phase_vocoder = seg_data.len() >= self.params.fft_size;
+
+        // HPSS path: separate harmonic/percussive, stretch each with its optimal algorithm
+        if self.params.hpss_enabled && use_phase_vocoder {
+            if let Some(result) = self.stretch_tonal_hpss(seg_data, seg_ratio, pv) {
+                return result;
+            }
+            // Fall through to normal path if HPSS fails
+        }
 
         // Multi-resolution path: split tonal segments into low/high bands
         if use_phase_vocoder && pv_high.is_some() {
             let result =
                 self.process_tonal_multi_resolution(seg_data, pv, pv_high.as_mut().unwrap());
             return result.unwrap_or_else(|_| {
-                let out_len = self.params.output_length(seg_data.len());
                 crate::core::resample::resample_linear(seg_data, out_len.max(1))
             });
         }
@@ -272,7 +332,6 @@ impl HybridStretcher {
         {
             let result = pv_high.as_mut().unwrap().process(seg_data);
             return result.unwrap_or_else(|_| {
-                let out_len = self.params.output_length(seg_data.len());
                 crate::core::resample::resample_linear(seg_data, out_len.max(1))
             });
         }
@@ -280,22 +339,68 @@ impl HybridStretcher {
         let result = if use_phase_vocoder {
             pv.process(seg_data)
         } else {
-            self.stretch_with_wsola(seg_data)
+            self.stretch_with_wsola_ratio(seg_data, seg_ratio)
         };
 
-        result.unwrap_or_else(|_| {
-            let out_len = self.params.output_length(seg_data.len());
-            crate::core::resample::resample_linear(seg_data, out_len.max(1))
-        })
+        result.unwrap_or_else(|_| crate::core::resample::resample_linear(seg_data, out_len.max(1)))
     }
 
-    /// Onset-aligned transient stretching.
+    /// Stretches a tonal segment using HPSS separation.
     ///
-    /// Copies the first ~5ms (attack portion) directly to preserve onset shape
-    /// and timing, then WSOLA-stretches the decay tail. A short crossfade
-    /// joins the two parts.
-    fn stretch_transient_segment(&self, seg_data: &[f32]) -> Vec<f32> {
-        let out_len = self.params.output_length(seg_data.len());
+    /// Separates the segment into harmonic and percussive components,
+    /// PV-stretches the harmonic part, WSOLA-stretches the percussive part,
+    /// and sums the results. Returns `None` if processing fails.
+    fn stretch_tonal_hpss(
+        &self,
+        seg_data: &[f32],
+        seg_ratio: f64,
+        pv: &mut PhaseVocoder,
+    ) -> Option<Vec<f32>> {
+        let hpss_params = HpssParams::default();
+        let (harmonic, percussive) = hpss(
+            seg_data,
+            self.params.fft_size,
+            self.params.hop_size,
+            &hpss_params,
+        );
+
+        // PV-stretch harmonic component
+        let harmonic_stretched = if harmonic.len() >= self.params.fft_size {
+            pv.process(&harmonic).ok()?
+        } else {
+            let out_len = (harmonic.len() as f64 * seg_ratio).round() as usize;
+            crate::core::resample::resample_linear(&harmonic, out_len.max(1))
+        };
+
+        // WSOLA-stretch percussive component
+        let percussive_out_len = (percussive.len() as f64 * seg_ratio).round() as usize;
+        let percussive_stretched = self
+            .stretch_with_wsola_ratio(&percussive, seg_ratio)
+            .unwrap_or_else(|_| {
+                crate::core::resample::resample_linear(&percussive, percussive_out_len.max(1))
+            });
+
+        // Sum the two components (zero-pad shorter to match longer)
+        let out_len = harmonic_stretched.len().max(percussive_stretched.len());
+        let zeros = std::iter::repeat(0.0f32);
+        let output: Vec<f32> = harmonic_stretched
+            .iter()
+            .copied()
+            .chain(zeros.clone())
+            .zip(percussive_stretched.iter().copied().chain(zeros))
+            .take(out_len)
+            .map(|(h, p)| h + p)
+            .collect();
+
+        Some(output)
+    }
+
+    /// Onset-aligned transient stretching with a specific ratio.
+    ///
+    /// Same as `stretch_transient_segment` but uses the provided ratio instead
+    /// of `self.params.stretch_ratio`.
+    fn stretch_transient_segment_with_ratio(&self, seg_data: &[f32], ratio: f64) -> Vec<f32> {
+        let out_len = (seg_data.len() as f64 * ratio).round() as usize;
         if out_len == 0 {
             return vec![];
         }
@@ -309,38 +414,32 @@ impl HybridStretcher {
             .max(1);
 
         if seg_data.len() <= attack_samples * 2 || out_len <= attack_samples {
-            // Segment too short for split — just WSOLA the whole thing
-            return self.stretch_with_wsola(seg_data).unwrap_or_else(|_| {
-                crate::core::resample::resample_linear(seg_data, out_len.max(1))
-            });
+            return self
+                .stretch_with_wsola_ratio(seg_data, ratio)
+                .unwrap_or_else(|_| {
+                    crate::core::resample::resample_linear(seg_data, out_len.max(1))
+                });
         }
 
-        // Direct-copy the attack
         let attack = &seg_data[..attack_samples];
         let decay = &seg_data[attack_samples..];
 
-        // Check if decay has enough energy for reliable WSOLA cross-correlation.
-        // Near-silent decay (e.g., isolated clicks in silence) produces unreliable
-        // WSOLA matching; fall back to stretching the whole segment with WSOLA.
         let decay_energy: f32 = decay.iter().map(|&s| s * s).sum();
         let decay_rms = (decay_energy / decay.len().max(1) as f32).sqrt();
         if decay_rms < 1e-4 {
-            return self.stretch_with_wsola(seg_data).unwrap_or_else(|_| {
-                crate::core::resample::resample_linear(seg_data, out_len.max(1))
-            });
+            return self
+                .stretch_with_wsola_ratio(seg_data, ratio)
+                .unwrap_or_else(|_| {
+                    crate::core::resample::resample_linear(seg_data, out_len.max(1))
+                });
         }
 
-        // WSOLA the decay tail. The attack and decay overlap by crossfade_len,
-        // so the decay must be stretched to (out_len - attack_samples + crossfade_len)
-        // to produce the correct total output length.
         let decay_out_len = out_len
             .saturating_sub(attack_samples)
             .saturating_add(crossfade_len);
         if decay_out_len < MIN_WSOLA_SEGMENT {
-            // Decay too short for WSOLA — linear resample it
             let decay_stretched =
                 crate::core::resample::resample_linear(decay, decay_out_len.max(1));
-            // Simple concatenation (no crossfade for very short segments)
             let mut output = Vec::with_capacity(attack_samples + decay_stretched.len());
             output.extend_from_slice(attack);
             output.extend_from_slice(&decay_stretched);
@@ -373,15 +472,10 @@ impl HybridStretcher {
             return output;
         }
 
-        // Build output: attack (minus crossfade tail) + crossfade + decay (minus crossfade head)
-        // Total = (attack - xfade) + xfade + (decay_stretched - xfade)
-        //       = attack + decay_stretched - xfade
-        //       = attack + (out_len - attack + xfade) - xfade = out_len
         let pre_fade = attack_samples - crossfade_len;
         let mut output = Vec::with_capacity(out_len);
         output.extend_from_slice(&attack[..pre_fade]);
 
-        // Crossfade region
         for i in 0..crossfade_len {
             let t = i as f32 / crossfade_len as f32;
             let fade_out = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
@@ -389,12 +483,31 @@ impl HybridStretcher {
             output.push(attack[pre_fade + i] * fade_out + decay_stretched[i] * fade_in);
         }
 
-        // Rest of decay
         if crossfade_len < decay_stretched.len() {
             output.extend_from_slice(&decay_stretched[crossfade_len..]);
         }
 
         output
+    }
+
+    /// Stretches a segment using WSOLA with a specific ratio.
+    fn stretch_with_wsola_ratio(
+        &self,
+        seg_data: &[f32],
+        ratio: f64,
+    ) -> Result<Vec<f32>, StretchError> {
+        let seg_size = self
+            .params
+            .wsola_segment_size
+            .min(seg_data.len() / 2)
+            .max(MIN_WSOLA_SEGMENT);
+        let search = self
+            .params
+            .wsola_search_range
+            .min(seg_size / 2)
+            .max(MIN_WSOLA_SEARCH);
+        let mut wsola = Wsola::new(seg_size, search, ratio);
+        wsola.process(seg_data)
     }
 
     /// Processes a tonal segment using multi-resolution FFT.
@@ -443,22 +556,6 @@ impl HybridStretcher {
         Ok(output)
     }
 
-    /// Stretches a segment using WSOLA with clamped parameters.
-    fn stretch_with_wsola(&self, seg_data: &[f32]) -> Result<Vec<f32>, StretchError> {
-        let seg_size = self
-            .params
-            .wsola_segment_size
-            .min(seg_data.len() / 2)
-            .max(MIN_WSOLA_SEGMENT);
-        let search = self
-            .params
-            .wsola_search_range
-            .min(seg_size / 2)
-            .max(MIN_WSOLA_SEARCH);
-        let mut wsola = Wsola::new(seg_size, search, self.params.stretch_ratio);
-        wsola.process(seg_data)
-    }
-
     /// Segments audio into transient and tonal regions.
     ///
     /// Uses adaptive transient region sizing based on onset strengths:
@@ -470,6 +567,7 @@ impl HybridStretcher {
                 start: 0,
                 end: input_len,
                 is_transient: false,
+                stretch_ratio: self.params.stretch_ratio,
             }];
         }
 
@@ -478,6 +576,7 @@ impl HybridStretcher {
         // Minimum 5ms region for weak transients
         let min_transient_size = (self.params.sample_rate as f64 * 0.005) as usize;
 
+        let global_ratio = self.params.stretch_ratio;
         let mut segments = Vec::new();
         let mut pos = 0;
 
@@ -493,6 +592,7 @@ impl HybridStretcher {
                     start: pos,
                     end: tonal_end,
                     is_transient: false,
+                    stretch_ratio: global_ratio,
                 });
             }
 
@@ -513,6 +613,7 @@ impl HybridStretcher {
                     start: onset,
                     end: trans_end,
                     is_transient: true,
+                    stretch_ratio: global_ratio,
                 });
             }
 
@@ -525,10 +626,202 @@ impl HybridStretcher {
                 start: pos,
                 end: input_len,
                 is_transient: false,
+                stretch_ratio: global_ratio,
             });
         }
 
         segments
+    }
+}
+
+/// Adaptive crossfade durations in seconds, by segment transition type.
+/// Tonal→Transient: fast transition to preserve onset.
+const CROSSFADE_TONAL_TO_TRANSIENT_SECS: f64 = 0.003;
+/// Transient→Tonal: smooth recovery after transient.
+const CROSSFADE_TRANSIENT_TO_TONAL_SECS: f64 = 0.008;
+/// Tonal→Tonal: default medium crossfade.
+const CROSSFADE_TONAL_TO_TONAL_SECS: f64 = 0.005;
+/// Transient→Transient: minimal blending.
+const CROSSFADE_TRANSIENT_TO_TRANSIENT_SECS: f64 = 0.002;
+
+/// Computes per-boundary crossfade lengths based on segment transitions.
+///
+/// Returns a vector of crossfade lengths in samples, one per boundary
+/// (length = segments.len() - 1).
+fn compute_adaptive_crossfade_lens(segments: &[Segment], sample_rate: u32) -> Vec<usize> {
+    if segments.len() <= 1 {
+        return vec![];
+    }
+
+    let mut lens = Vec::with_capacity(segments.len() - 1);
+    for i in 1..segments.len() {
+        let prev_is_transient = segments[i - 1].is_transient;
+        let cur_is_transient = segments[i].is_transient;
+
+        let secs = match (prev_is_transient, cur_is_transient) {
+            (false, true) => CROSSFADE_TONAL_TO_TRANSIENT_SECS,
+            (true, false) => CROSSFADE_TRANSIENT_TO_TONAL_SECS,
+            (false, false) => CROSSFADE_TONAL_TO_TONAL_SECS,
+            (true, true) => CROSSFADE_TRANSIENT_TO_TRANSIENT_SECS,
+        };
+        lens.push((sample_rate as f64 * secs) as usize);
+    }
+
+    lens
+}
+
+/// Concatenates segments with per-boundary crossfade lengths.
+fn concatenate_with_adaptive_crossfade(
+    segments: &[Vec<f32>],
+    crossfade_lens: &[usize],
+) -> Vec<f32> {
+    match segments.len() {
+        0 => return vec![],
+        1 => return segments[0].clone(),
+        _ => {}
+    }
+
+    let total: usize = segments.iter().map(|s| s.len()).sum();
+    let overlap_total: usize = crossfade_lens.iter().sum();
+    let mut output = Vec::with_capacity(total.saturating_sub(overlap_total));
+
+    for (idx, segment) in segments.iter().enumerate() {
+        if idx == 0 {
+            output.extend_from_slice(segment);
+        } else {
+            let fade_len = crossfade_lens
+                .get(idx - 1)
+                .copied()
+                .unwrap_or(0)
+                .min(output.len())
+                .min(segment.len());
+            let output_start = output.len() - fade_len;
+
+            // Crossfade overlap region with raised cosine
+            for i in 0..fade_len {
+                let t = i as f32 / fade_len as f32;
+                let fade_out = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
+                let fade_in = 1.0 - fade_out;
+                output[output_start + i] =
+                    output[output_start + i] * fade_out + segment[i] * fade_in;
+            }
+
+            // Append non-overlapping part
+            if fade_len < segment.len() {
+                output.extend_from_slice(&segment[fade_len..]);
+            }
+        }
+    }
+
+    output
+}
+
+/// Threshold for considering a band's flux significant enough to warrant phase reset.
+const BAND_FLUX_RESET_THRESHOLD: f32 = 0.1;
+
+/// Computes a per-band phase reset mask for a transient segment.
+///
+/// Looks up the per-frame band flux at the onset position to determine which
+/// frequency bands had significant transient energy. Returns `[true; 4]` if
+/// no band flux data is available (fallback to full reset).
+fn compute_band_reset_mask(
+    segment_start: usize,
+    transients: &crate::analysis::transient::TransientMap,
+) -> [bool; 4] {
+    if transients.per_frame_band_flux.is_empty() || transients.hop_size == 0 {
+        return [true; 4]; // No band data — full reset
+    }
+
+    let frame_idx = segment_start / transients.hop_size;
+    if frame_idx >= transients.per_frame_band_flux.len() {
+        return [true; 4];
+    }
+
+    let band_flux = transients.per_frame_band_flux[frame_idx];
+
+    // Normalize by the max band flux to get relative energy
+    let max_flux = band_flux.iter().copied().fold(0.0f32, f32::max);
+    if max_flux < 1e-10 {
+        return [true; 4]; // Near-silent — full reset is safe
+    }
+
+    [
+        band_flux[0] / max_flux > BAND_FLUX_RESET_THRESHOLD,
+        band_flux[1] / max_flux > BAND_FLUX_RESET_THRESHOLD,
+        band_flux[2] / max_flux > BAND_FLUX_RESET_THRESHOLD,
+        band_flux[3] / max_flux > BAND_FLUX_RESET_THRESHOLD,
+    ]
+}
+
+/// Minimum per-segment stretch ratio for elastic distribution.
+const ELASTIC_MIN_RATIO: f64 = 0.5;
+/// Maximum per-segment stretch ratio for elastic distribution.
+const ELASTIC_MAX_RATIO: f64 = 4.0;
+
+/// Computes per-segment stretch ratios for elastic beat distribution.
+///
+/// Anchors transient segments close to ratio 1.0 (preserving their timing)
+/// and distributes the remaining stretch into tonal segments. The total output
+/// duration matches what the global ratio would produce.
+///
+/// If no tonal segments exist, all segments keep the global ratio.
+fn compute_elastic_ratios(segments: &mut [Segment], global_ratio: f64) {
+    if segments.is_empty() {
+        return;
+    }
+
+    let total_input: f64 = segments.iter().map(|s| (s.end - s.start) as f64).sum();
+    if total_input < 1.0 {
+        return;
+    }
+
+    let total_target_output = total_input * global_ratio;
+
+    // Transient segments get ratio close to 1.0 (preserve timing).
+    // We use a blend: 90% identity + 10% global ratio to stay close to 1.0
+    // but still contribute some stretch.
+    let transient_ratio = 1.0 * 0.9 + global_ratio * 0.1;
+
+    let transient_input: f64 = segments
+        .iter()
+        .filter(|s| s.is_transient)
+        .map(|s| (s.end - s.start) as f64)
+        .sum();
+    let tonal_input: f64 = segments
+        .iter()
+        .filter(|s| !s.is_transient)
+        .map(|s| (s.end - s.start) as f64)
+        .sum();
+
+    if tonal_input < 1.0 {
+        // All transient — no tonal segments to absorb slack; keep global ratio
+        return;
+    }
+
+    // Output consumed by transient segments at their ratio
+    let transient_output = transient_input * transient_ratio;
+
+    // Remaining output for tonal segments
+    let tonal_output = total_target_output - transient_output;
+    let tonal_ratio = (tonal_output / tonal_input).clamp(ELASTIC_MIN_RATIO, ELASTIC_MAX_RATIO);
+
+    // If the clamped tonal ratio can't absorb all the slack, redistribute
+    // back to transients proportionally.
+    let actual_output = transient_input * transient_ratio + tonal_input * tonal_ratio;
+    let correction = if actual_output > 1.0 {
+        total_target_output / actual_output
+    } else {
+        1.0
+    };
+
+    for segment in segments.iter_mut() {
+        if segment.is_transient {
+            segment.stretch_ratio =
+                (transient_ratio * correction).clamp(ELASTIC_MIN_RATIO, ELASTIC_MAX_RATIO);
+        } else {
+            segment.stretch_ratio =
+                (tonal_ratio * correction).clamp(ELASTIC_MIN_RATIO, ELASTIC_MAX_RATIO);
+        }
     }
 }
 

@@ -225,6 +225,36 @@ impl PhaseVocoder {
         self.prev_phase.fill(0.0);
     }
 
+    /// Selectively resets phase state for specific frequency bands.
+    ///
+    /// Only zeros `phase_accum` and `prev_phase` for bins within the bands
+    /// indicated by `reset_mask`: `[sub_bass, low, mid, high]`.
+    /// Band boundaries: sub-bass <100Hz, low 100-500Hz, mid 500-4000Hz, high >4000Hz.
+    ///
+    /// This avoids disrupting phase tracking in bands where no transient occurred
+    /// (e.g., a hi-hat hit shouldn't reset the sustained bass phase).
+    pub fn reset_phase_state_bands(&mut self, reset_mask: [bool; 4], sample_rate: u32) {
+        let num_bins = self.fft_size / 2 + 1;
+        let bin_freq = sample_rate as f32 / self.fft_size as f32;
+
+        for bin in 0..num_bins {
+            let freq = bin as f32 * bin_freq;
+            let band_idx = if freq < 100.0 {
+                0
+            } else if freq < 500.0 {
+                1
+            } else if freq < 4000.0 {
+                2
+            } else {
+                3
+            };
+            if reset_mask[band_idx] {
+                self.phase_accum[bin] = 0.0;
+                self.prev_phase[bin] = 0.0;
+            }
+        }
+    }
+
     /// Stretches a mono audio signal using phase vocoder with identity phase locking.
     pub fn process(&mut self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
         if input.len() < self.fft_size {

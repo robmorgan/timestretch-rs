@@ -29,18 +29,28 @@ pub struct TransientMap {
     pub flux: Vec<f32>,
     /// Hop size used for analysis.
     pub hop_size: usize,
+    /// Per-frame spectral flux broken down by frequency band.
+    /// Each element is `[sub_bass, low, mid, high]` flux for that analysis frame.
+    /// Band boundaries: sub-bass <100Hz, low 100-500Hz, mid 500-4000Hz, high >4000Hz.
+    pub per_frame_band_flux: Vec<[f32; 4]>,
 }
+
+/// Band boundary frequencies for per-band flux (Hz).
+const BAND_FLUX_LOW_LIMIT: f32 = 100.0;
+const BAND_FLUX_MID_LIMIT: f32 = 500.0;
+const BAND_FLUX_HIGH_LIMIT: f32 = 4000.0;
 
 /// Computes the spectral flux for each frame of a mono audio signal.
 ///
-/// Returns a vector of flux values, one per analysis frame. Flux is weighted
-/// by frequency band to emphasize the 2-8 kHz transient range.
+/// Returns `(flux_values, band_flux)` where:
+/// - `flux_values` is a vector of total weighted flux, one per analysis frame
+/// - `band_flux` is per-frame `[sub_bass, low, mid, high]` flux values
 fn compute_spectral_flux(
     samples: &[f32],
     sample_rate: u32,
     fft_size: usize,
     hop_size: usize,
-) -> Vec<f32> {
+) -> (Vec<f32>, Vec<[f32; 4]>) {
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(fft_size);
 
@@ -48,10 +58,12 @@ fn compute_spectral_flux(
         crate::core::window::generate_window(crate::core::window::WindowType::Hann, fft_size);
 
     let bin_weights = compute_bin_weights(fft_size, sample_rate);
+    let bin_freq = sample_rate as f32 / fft_size as f32;
     let num_bins = fft_size / 2 + 1;
     let num_frames = (samples.len() - fft_size) / hop_size + 1;
     let mut prev_magnitude = vec![0.0f32; num_bins];
     let mut flux_values = Vec::with_capacity(num_frames);
+    let mut band_flux_values = Vec::with_capacity(num_frames);
     let mut fft_buffer = vec![COMPLEX_ZERO; fft_size];
 
     for frame_idx in 0..num_frames {
@@ -67,23 +79,38 @@ fn compute_spectral_flux(
         fft.process(&mut fft_buffer);
 
         let mut flux = 0.0f32;
-        for ((&c, prev), &weight) in fft_buffer[..num_bins]
+        let mut band_flux = [0.0f32; 4]; // [sub_bass, low, mid, high]
+        for (bin, ((&c, prev), &weight)) in fft_buffer[..num_bins]
             .iter()
             .zip(prev_magnitude.iter_mut())
             .zip(bin_weights[..num_bins].iter())
+            .enumerate()
         {
             let mag = c.norm();
             let diff = mag - *prev;
             if diff > 0.0 {
                 flux += diff * weight;
+                // Accumulate per-band flux
+                let freq = bin as f32 * bin_freq;
+                let band_idx = if freq < BAND_FLUX_LOW_LIMIT {
+                    0 // sub-bass
+                } else if freq < BAND_FLUX_MID_LIMIT {
+                    1 // low
+                } else if freq < BAND_FLUX_HIGH_LIMIT {
+                    2 // mid
+                } else {
+                    3 // high
+                };
+                band_flux[band_idx] += diff;
             }
             *prev = mag;
         }
 
         flux_values.push(flux);
+        band_flux_values.push(band_flux);
     }
 
-    flux_values
+    (flux_values, band_flux_values)
 }
 
 /// Computes the onset energy envelope for each analysis frame.
@@ -175,10 +202,11 @@ pub fn detect_transients(
             strengths: vec![],
             flux: vec![],
             hop_size,
+            per_frame_band_flux: vec![],
         };
     }
 
-    let flux_values = compute_spectral_flux(samples, sample_rate, fft_size, hop_size);
+    let (flux_values, band_flux) = compute_spectral_flux(samples, sample_rate, fft_size, hop_size);
     let energy_envelope = compute_onset_energy(samples, fft_size, hop_size);
     let combined = combine_detection_functions(&flux_values, &energy_envelope);
 
@@ -199,6 +227,7 @@ pub fn detect_transients(
         strengths,
         flux: combined,
         hop_size,
+        per_frame_band_flux: band_flux,
     }
 }
 
@@ -609,10 +638,17 @@ mod tests {
     fn test_spectral_flux_silence_is_zero() {
         // Silence should produce zero (or near-zero) flux for all frames
         let samples = vec![0.0f32; 44100];
-        let flux = compute_spectral_flux(&samples, 44100, 2048, 512);
+        let (flux, band_flux) = compute_spectral_flux(&samples, 44100, 2048, 512);
         assert!(!flux.is_empty());
         for &f in &flux {
             assert!(f.abs() < 1e-6, "Flux for silence should be ~0, got {}", f);
+        }
+        // Band flux should also be all zeros for silence
+        assert_eq!(flux.len(), band_flux.len());
+        for bf in &band_flux {
+            for &v in bf {
+                assert!(v.abs() < 1e-6, "Band flux for silence should be ~0");
+            }
         }
     }
 
@@ -625,7 +661,7 @@ mod tests {
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin())
             .collect();
 
-        let flux = compute_spectral_flux(&input, sample_rate, 2048, 512);
+        let (flux, _band_flux) = compute_spectral_flux(&input, sample_rate, 2048, 512);
         assert!(flux.len() > 2);
 
         // First frame has high flux (transition from zeros in prev_magnitude)
@@ -662,7 +698,7 @@ mod tests {
             }
         }
 
-        let flux = compute_spectral_flux(&input, sample_rate, fft_size, hop_size);
+        let (flux, _band_flux) = compute_spectral_flux(&input, sample_rate, fft_size, hop_size);
 
         // Find frame containing the impulse
         let impulse_frame = impulse_pos / hop_size;
@@ -681,5 +717,20 @@ mod tests {
                 avg_flux
             );
         }
+    }
+
+    #[test]
+    fn test_per_frame_band_flux_populated() {
+        // Verify that detect_transients populates per_frame_band_flux
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate as usize;
+        let mut samples = vec![0.0f32; num_samples];
+        // Add an impulse
+        for j in 0..10 {
+            samples[num_samples / 2 + j] = if j < 5 { 1.0 } else { -0.5 };
+        }
+        let result = detect_transients(&samples, sample_rate, 2048, 512, 0.5);
+        assert!(!result.per_frame_band_flux.is_empty());
+        assert_eq!(result.flux.len(), result.per_frame_band_flux.len());
     }
 }

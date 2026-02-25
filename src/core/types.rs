@@ -1307,6 +1307,21 @@ impl std::fmt::Display for EdmPreset {
     }
 }
 
+/// Crossfade mode for segment transitions in the hybrid stretcher.
+///
+/// Controls how the crossfade duration between algorithm segments is determined.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CrossfadeMode {
+    /// Fixed crossfade duration in seconds (e.g., 0.005 for 5ms).
+    Fixed(f64),
+    /// Adaptive crossfade that varies by segment type transition:
+    /// - Tonal→Transient: 3ms (fast transition to preserve onset)
+    /// - Transient→Tonal: 8ms (smooth recovery)
+    /// - Tonal→Tonal: 5ms (default)
+    /// - Transient→Transient: 2ms (minimal blending)
+    Adaptive,
+}
+
 /// Parameters for the time stretching algorithm.
 ///
 /// Use the builder methods to configure. A ratio >1.0 makes audio longer
@@ -1413,6 +1428,29 @@ pub struct StretchParams {
     /// transient's attack and early decay from PV smearing.
     /// Default: 0.010 (10ms). DjBeatmatch uses 0.030 (30ms).
     pub transient_region_secs: f64,
+    /// Whether to use elastic beat distribution for non-uniform stretching.
+    ///
+    /// When enabled, beats are anchored to a target beat grid while sustain
+    /// regions absorb the excess time. This preserves rhythmic feel by keeping
+    /// beats at their musically correct positions. Transient segments get a
+    /// ratio close to 1.0 (preserving timing), while tonal segments absorb
+    /// the remaining stretch. Automatically disabled when `stretch_ratio == 1.0`.
+    /// Enabled by default for DjBeatmatch and HouseLoop presets.
+    pub elastic_timing: bool,
+    /// Whether to use HPSS (Harmonic-Percussive Source Separation) pre-processing.
+    ///
+    /// When enabled, tonal segments are separated into harmonic and percussive
+    /// components. The harmonic part is PV-stretched (excellent for sustained tones)
+    /// while the percussive part is WSOLA-stretched (preserves transient detail).
+    /// The two stretched components are summed. This improves quality when harmonic
+    /// and percussive content overlap (e.g., kick drum over a sustained chord).
+    pub hpss_enabled: bool,
+    /// Crossfade mode for segment transitions.
+    ///
+    /// Controls how crossfade durations are computed at segment boundaries.
+    /// `Fixed` uses a constant duration; `Adaptive` scales based on the
+    /// type of segments being joined (transient→tonal, tonal→transient, etc.).
+    pub crossfade_mode: CrossfadeMode,
 }
 
 /// Converts a duration in milliseconds to samples at the given sample rate.
@@ -1488,6 +1526,9 @@ impl StretchParams {
             envelope_order: 40,
             multi_resolution: false,
             transient_region_secs: DEFAULT_TRANSIENT_REGION_SECS,
+            elastic_timing: false,
+            hpss_enabled: false,
+            crossfade_mode: CrossfadeMode::Fixed(0.005),
         }
     }
 
@@ -1551,6 +1592,12 @@ impl StretchParams {
         );
         // Enable multi-resolution FFT for DjBeatmatch (transparency-critical)
         self.multi_resolution = matches!(preset, EdmPreset::DjBeatmatch);
+        // Enable elastic beat distribution for rhythm-critical presets
+        self.elastic_timing = matches!(preset, EdmPreset::DjBeatmatch | EdmPreset::HouseLoop);
+        // Enable HPSS for presets where harmonic/percussive overlap matters
+        self.hpss_enabled = matches!(preset, EdmPreset::DjBeatmatch | EdmPreset::HouseLoop);
+        // Use adaptive crossfade for all presets
+        self.crossfade_mode = CrossfadeMode::Adaptive;
         self
     }
 
@@ -1666,6 +1713,35 @@ impl StretchParams {
     /// transient's attack and early decay from PV smearing.
     pub fn with_transient_region_secs(mut self, secs: f64) -> Self {
         self.transient_region_secs = secs;
+        self
+    }
+
+    /// Enables or disables elastic beat distribution.
+    ///
+    /// When enabled and beats are detected, stretch ratios are distributed
+    /// non-uniformly: transient segments stay close to ratio 1.0 while tonal
+    /// segments absorb the excess stretch. This keeps beats at their musically
+    /// correct positions.
+    pub fn with_elastic_timing(mut self, enabled: bool) -> Self {
+        self.elastic_timing = enabled;
+        self
+    }
+
+    /// Enables or disables HPSS (Harmonic-Percussive Source Separation).
+    ///
+    /// When enabled, tonal segments are separated into harmonic and percussive
+    /// components before stretching. Harmonics use PV, percussive uses WSOLA.
+    pub fn with_hpss(mut self, enabled: bool) -> Self {
+        self.hpss_enabled = enabled;
+        self
+    }
+
+    /// Sets the crossfade mode for segment transitions.
+    ///
+    /// - `CrossfadeMode::Fixed(secs)` — constant crossfade duration
+    /// - [`CrossfadeMode::Adaptive`] — varies by segment type transition
+    pub fn with_crossfade_mode(mut self, mode: CrossfadeMode) -> Self {
+        self.crossfade_mode = mode;
         self
     }
 
