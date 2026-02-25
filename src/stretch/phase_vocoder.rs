@@ -10,6 +10,10 @@ use rustfft::{num_complex::Complex, FftPlanner};
 const TWO_PI_F64: f64 = 2.0 * std::f64::consts::PI;
 /// Fraction of bins to pre-allocate for spectral peak detection (1/4 of bins).
 const PEAKS_CAPACITY_DIVISOR: usize = 4;
+/// Blend factor for phase gradient integration (soft vertical coherence).
+const PHASE_GRADIENT_BLEND: f64 = 0.3;
+/// Minimum magnitude to consider a bin as a spectral peak (avoids noise peaks).
+const MIN_PEAK_MAGNITUDE: f32 = 1e-8;
 
 /// Phase vocoder state for time stretching.
 pub struct PhaseVocoder {
@@ -348,33 +352,135 @@ impl PhaseVocoder {
 
     /// Extracts magnitudes and advances phase accumulators for each bin.
     ///
+    /// Uses a multi-pass approach for improved frequency tracking and phase coherence:
+    /// 1. Compute magnitudes and raw analysis phases for all bins.
+    /// 2. Detect spectral peaks and compute refined expected phase advances via
+    ///    parabolic interpolation of the magnitude spectrum (instantaneous frequency
+    ///    refinement).
+    /// 3. Advance phases using refined advances for peak bins, then apply soft
+    ///    phase gradient integration to propagate coherent phase from peaks to
+    ///    nearby non-peak bins.
+    ///
     /// Sub-bass bins (below `sub_bass_bin`) use rigid phase propagation to prevent
-    /// phase cancellation in the critical sub-bass region. All other bins use
-    /// standard phase vocoder deviation tracking.
+    /// phase cancellation in the critical sub-bass region and are excluded from
+    /// peak-based refinements.
     ///
     /// Phase accumulation uses f64 precision to prevent cumulative rounding errors
     /// over long signals. The final phases are converted back to f32 for the
     /// spectrum reconstruction step.
     #[inline]
     fn advance_phases(&mut self, num_bins: usize, hop_ratio: f64) {
+        // --- Pass 1: Extract magnitudes and analysis phases ---
         for bin in 0..num_bins {
             let c = self.fft_buffer[bin];
             self.magnitudes[bin] = c.norm();
-            let phase = c.arg() as f64;
-            self.analysis_phases[bin] = phase as f32;
+            self.analysis_phases[bin] = c.arg();
+        }
+
+        // --- Pass 2: Detect peaks for IF refinement + phase gradient ---
+        let search_start = self.sub_bass_bin.max(1);
+        let mut advance_peaks: Vec<usize> = Vec::with_capacity(num_bins / PEAKS_CAPACITY_DIVISOR);
+        if num_bins >= 3 && search_start < num_bins.saturating_sub(1) {
+            for bin in search_start..num_bins - 1 {
+                if self.magnitudes[bin] > MIN_PEAK_MAGNITUDE
+                    && self.magnitudes[bin] > self.magnitudes[bin - 1]
+                    && self.magnitudes[bin] > self.magnitudes[bin + 1]
+                {
+                    advance_peaks.push(bin);
+                }
+            }
+        }
+
+        // --- Pass 3: Advance phases with refinement ---
+        for bin in 0..num_bins {
+            let phase = self.analysis_phases[bin] as f64;
 
             if bin < self.sub_bass_bin {
-                // Rigid phase propagation for sub-bass coherence
+                // Rigid phase propagation for sub-bass coherence (unchanged)
                 self.phase_accum[bin] += phase - self.prev_phase[bin];
             } else {
-                // Standard deviation tracking with hop-ratio scaling
-                let expected = self.expected_phase_advance[bin];
+                // For peak bins, use parabolic interpolation to refine expected advance;
+                // for non-peaks, use the pre-computed value.
+                let is_peak = advance_peaks.binary_search(&bin).is_ok();
+                let expected = if is_peak
+                    && bin >= 1
+                    && bin + 1 < num_bins
+                    && self.magnitudes[bin] > MIN_PEAK_MAGNITUDE
+                {
+                    // Parabolic interpolation: refine the bin position
+                    let alpha = self.magnitudes[bin - 1] as f64;
+                    let beta = self.magnitudes[bin] as f64;
+                    let gamma = self.magnitudes[bin + 1] as f64;
+                    let denom = alpha - 2.0 * beta + gamma;
+                    if denom.abs() > 1e-12 {
+                        let delta = 0.5 * (alpha - gamma) / denom;
+                        TWO_PI_F64 * (bin as f64 + delta) * self.hop_analysis as f64
+                            / self.fft_size as f64
+                    } else {
+                        self.expected_phase_advance[bin]
+                    }
+                } else {
+                    self.expected_phase_advance[bin]
+                };
+
                 let deviation = wrap_phase_f64(phase - self.prev_phase[bin] - expected);
                 self.phase_accum[bin] += (expected + deviation) * hop_ratio;
             }
 
             self.new_phases[bin] = self.phase_accum[bin] as f32;
             self.prev_phase[bin] = phase;
+        }
+
+        // --- Phase gradient integration (soft vertical coherence) ---
+        // Propagate phase from peaks to nearby non-peak bins using the analysis
+        // phase gradient, blended with the independently-advanced phase.
+        // Only apply for moderate stretch ratios (< 1.3x) where per-frame phase
+        // changes are small enough for the gradient to track accurately. For
+        // extreme ratios the large hop difference makes gradient propagation
+        // unreliable and can cause amplitude artifacts.
+        if !advance_peaks.is_empty() && hop_ratio < 1.3 {
+            for bin in self.sub_bass_bin..num_bins {
+                if advance_peaks.binary_search(&bin).is_ok() {
+                    continue; // Peak bins keep their phase (they are the anchors)
+                }
+
+                // Find the nearest peak via binary search
+                let nearest_peak = match advance_peaks.binary_search(&bin) {
+                    Ok(_) => unreachable!(),
+                    Err(idx) => {
+                        let lower = if idx > 0 {
+                            Some(advance_peaks[idx - 1])
+                        } else {
+                            None
+                        };
+                        let upper = if idx < advance_peaks.len() {
+                            Some(advance_peaks[idx])
+                        } else {
+                            None
+                        };
+                        match (lower, upper) {
+                            (Some(l), Some(u)) => {
+                                if bin - l <= u - bin {
+                                    l
+                                } else {
+                                    u
+                                }
+                            }
+                            (Some(l), None) => l,
+                            (None, Some(u)) => u,
+                            (None, None) => continue,
+                        }
+                    }
+                };
+
+                let gradient =
+                    self.analysis_phases[bin] as f64 - self.analysis_phases[nearest_peak] as f64;
+                let propagated = self.new_phases[nearest_peak] as f64 + gradient;
+                let independent = self.new_phases[bin] as f64;
+                self.new_phases[bin] = ((1.0 - PHASE_GRADIENT_BLEND) * independent
+                    + PHASE_GRADIENT_BLEND * propagated)
+                    as f32;
+            }
         }
     }
 

@@ -36,6 +36,14 @@ const BAND_SPLIT_HOP: usize = BAND_SPLIT_FFT_SIZE / 4;
 /// Minimum distance (samples) between merged onset/beat positions.
 /// Positions closer than this are considered duplicates.
 const DEDUP_DISTANCE: usize = 512;
+/// Crossover frequency (Hz) for multi-resolution FFT processing.
+/// Below this, a larger FFT is used; above this, a smaller FFT provides
+/// better temporal resolution for transient-rich high-frequency content.
+const MULTI_RES_CROSSOVER_HZ: f32 = 4000.0;
+/// FFT size for the high-frequency band in multi-resolution mode.
+/// Half the default 4096, giving 2x better temporal resolution at the cost
+/// of 2x worse frequency resolution (acceptable above 4 kHz).
+const MULTI_RES_HIGH_FFT_SIZE: usize = 2048;
 
 /// Transient-aware hybrid stretcher.
 ///
@@ -168,17 +176,41 @@ impl HybridStretcher {
             self.params.window_type,
             self.params.phase_locking_mode,
         );
+
+        // Create a second PV with smaller FFT for multi-resolution high-band processing
+        let mut pv_high = if self.params.multi_resolution {
+            // Compute high-band hop to maintain the same overlap ratio as the main PV
+            let high_hop = (self.params.hop_size as f64 * MULTI_RES_HIGH_FFT_SIZE as f64
+                / self.params.fft_size as f64)
+                .round() as usize;
+            Some(PhaseVocoder::with_options(
+                MULTI_RES_HIGH_FFT_SIZE,
+                high_hop,
+                self.params.stretch_ratio,
+                self.params.sample_rate,
+                self.params.sub_bass_cutoff,
+                self.params.window_type,
+                self.params.phase_locking_mode,
+            ))
+        } else {
+            None
+        };
+
         let mut output_segments: Vec<Vec<f32>> = Vec::with_capacity(segments.len());
 
         for segment in &segments {
             let seg_data = &input[segment.start..segment.end];
-            let stretched = self.stretch_segment(seg_data, segment.is_transient, &mut pv);
+            let stretched =
+                self.stretch_segment(seg_data, segment.is_transient, &mut pv, &mut pv_high);
             output_segments.push(stretched);
 
             // Reset PV phase state after transient segments so stale phase
             // from the previous tonal region doesn't contaminate the next one.
             if segment.is_transient {
                 pv.reset_phase_state();
+                if let Some(ref mut pv_h) = pv_high {
+                    pv_h.reset_phase_state();
+                }
             }
         }
 
@@ -198,6 +230,8 @@ impl HybridStretcher {
     ///
     /// - Very short segments (<256 samples) fall back to linear resampling
     /// - Tonal segments long enough for FFT use the phase vocoder
+    /// - When multi-resolution is enabled, tonal segments are split into low/high
+    ///   bands and processed with different FFT sizes
     /// - Everything else (transients, short tonal) uses WSOLA
     /// - On error, falls back to linear resampling
     fn stretch_segment(
@@ -205,6 +239,7 @@ impl HybridStretcher {
         seg_data: &[f32],
         is_transient: bool,
         pv: &mut PhaseVocoder,
+        pv_high: &mut Option<PhaseVocoder>,
     ) -> Vec<f32> {
         if seg_data.len() < MIN_SEGMENT_FOR_STRETCH {
             let out_len = self.params.output_length(seg_data.len());
@@ -212,6 +247,31 @@ impl HybridStretcher {
         }
 
         let use_phase_vocoder = !is_transient && seg_data.len() >= self.params.fft_size;
+
+        // Multi-resolution path: split tonal segments into low/high bands
+        if use_phase_vocoder && pv_high.is_some() {
+            let result =
+                self.process_tonal_multi_resolution(seg_data, pv, pv_high.as_mut().unwrap());
+            return result.unwrap_or_else(|_| {
+                let out_len = self.params.output_length(seg_data.len());
+                crate::core::resample::resample_linear(seg_data, out_len.max(1))
+            });
+        }
+
+        // For segments too short for the main FFT but long enough for the
+        // high-band FFT, use the smaller PV when multi-resolution is enabled.
+        if !is_transient
+            && seg_data.len() >= MULTI_RES_HIGH_FFT_SIZE
+            && seg_data.len() < self.params.fft_size
+            && pv_high.is_some()
+        {
+            let result = pv_high.as_mut().unwrap().process(seg_data);
+            return result.unwrap_or_else(|_| {
+                let out_len = self.params.output_length(seg_data.len());
+                crate::core::resample::resample_linear(seg_data, out_len.max(1))
+            });
+        }
+
         let result = if use_phase_vocoder {
             pv.process(seg_data)
         } else {
@@ -222,6 +282,52 @@ impl HybridStretcher {
             let out_len = self.params.output_length(seg_data.len());
             crate::core::resample::resample_linear(seg_data, out_len.max(1))
         })
+    }
+
+    /// Processes a tonal segment using multi-resolution FFT.
+    ///
+    /// Splits the segment into low (0-4 kHz) and high (4 kHz+) frequency bands,
+    /// processes the low band with the main PV (large FFT for frequency resolution)
+    /// and the high band with a smaller PV (better temporal resolution), then sums
+    /// the results.
+    fn process_tonal_multi_resolution(
+        &self,
+        seg_data: &[f32],
+        pv_low: &mut PhaseVocoder,
+        pv_high: &mut PhaseVocoder,
+    ) -> Result<Vec<f32>, StretchError> {
+        let (low_band, high_band) =
+            separate_bands(seg_data, MULTI_RES_CROSSOVER_HZ, self.params.sample_rate);
+
+        // Process low band (0-4kHz) with the main 4096 PV
+        let low_stretched = if low_band.len() >= self.params.fft_size {
+            pv_low.process(&low_band)?
+        } else {
+            let out_len = self.params.output_length(low_band.len()).max(1);
+            crate::core::resample::resample_linear(&low_band, out_len)
+        };
+
+        // Process high band (4kHz+) with the smaller 2048 PV
+        let high_stretched = if high_band.len() >= MULTI_RES_HIGH_FFT_SIZE {
+            pv_high.process(&high_band)?
+        } else {
+            let out_len = self.params.output_length(high_band.len()).max(1);
+            crate::core::resample::resample_linear(&high_band, out_len)
+        };
+
+        // Sum the two bands (zero-pad the shorter one to the longer length)
+        let out_len = low_stretched.len().max(high_stretched.len());
+        let zeros = std::iter::repeat(0.0f32);
+        let output: Vec<f32> = low_stretched
+            .iter()
+            .copied()
+            .chain(zeros.clone())
+            .zip(high_stretched.iter().copied().chain(zeros))
+            .take(out_len)
+            .map(|(l, h)| l + h)
+            .collect();
+
+        Ok(output)
     }
 
     /// Stretches a segment using WSOLA with clamped parameters.
@@ -352,6 +458,65 @@ fn separate_sub_bass(input: &[f32], cutoff_hz: f32, sample_rate: u32) -> (Vec<f3
 
     normalize_band_split(&mut sub_bass, &mut remainder, &window_sum);
     (sub_bass, remainder)
+}
+
+/// Separates audio into low and high frequency bands using FFT-based overlap-add filtering.
+///
+/// Uses the same approach as [`separate_sub_bass()`] but with a configurable crossover
+/// frequency (typically ~4000 Hz for multi-resolution processing).
+///
+/// Returns `(low_band, high_band)` where low contains everything below `crossover_hz`
+/// and high contains everything at or above `crossover_hz`. Both outputs have the same
+/// length as the input.
+fn separate_bands(input: &[f32], crossover_hz: f32, sample_rate: u32) -> (Vec<f32>, Vec<f32>) {
+    let fft_size = BAND_SPLIT_FFT_SIZE;
+    let hop = BAND_SPLIT_HOP;
+    let cutoff_bin = freq_to_bin(crossover_hz, fft_size, sample_rate);
+
+    if cutoff_bin == 0 || input.len() < fft_size {
+        return (input.to_vec(), vec![0.0; input.len()]);
+    }
+
+    let window = generate_window(WindowType::Hann, fft_size);
+    let mut planner = FftPlanner::new();
+    let fft_fwd = planner.plan_fft_forward(fft_size);
+    let fft_inv = planner.plan_fft_inverse(fft_size);
+    let norm = 1.0 / fft_size as f32;
+
+    let mut low_band = vec![0.0f32; input.len()];
+    let mut high_band = vec![0.0f32; input.len()];
+    let mut window_sum = vec![0.0f32; input.len()];
+
+    let num_frames = if input.len() <= fft_size {
+        1
+    } else {
+        (input.len() - fft_size) / hop + 1
+    };
+
+    let mut fft_buf = vec![COMPLEX_ZERO; fft_size];
+    let mut fft_buf2 = vec![COMPLEX_ZERO; fft_size];
+
+    for frame in 0..num_frames {
+        let pos = frame * hop;
+        let frame_end = (pos + fft_size).min(input.len());
+        let frame_len = frame_end - pos;
+
+        window_and_transform(&input[pos..frame_end], &window, &mut fft_buf, &fft_fwd);
+        split_bands(&mut fft_buf, &mut fft_buf2, fft_size, cutoff_bin);
+        fft_inv.process(&mut fft_buf);
+        fft_inv.process(&mut fft_buf2);
+
+        // Overlap-add with synthesis window
+        for i in 0..frame_len {
+            let out_idx = pos + i;
+            low_band[out_idx] += fft_buf[i].re * norm * window[i];
+            high_band[out_idx] += fft_buf2[i].re * norm * window[i];
+            window_sum[out_idx] += window[i] * window[i];
+        }
+    }
+
+    normalize_band_split(&mut low_band, &mut high_band, &window_sum);
+    (low_band, high_band)
 }
 
 /// Windows an input frame into the FFT buffer and transforms to frequency domain.

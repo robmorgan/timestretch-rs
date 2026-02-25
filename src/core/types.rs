@@ -1385,6 +1385,15 @@ pub struct StretchParams {
     /// Controls the smoothness of the envelope: lower = smoother, higher = more detail.
     /// Typical values: 30-50 for vocals, 20-30 for general music.
     pub envelope_order: usize,
+    /// Whether to use multi-resolution FFT processing.
+    ///
+    /// When enabled, tonal segments are split into two frequency bands at ~4 kHz.
+    /// The low band (0-4 kHz) is processed with a larger FFT (4096) for better
+    /// frequency resolution, while the high band (4 kHz+) uses a smaller FFT
+    /// (2048) for better temporal resolution. This mirrors the approach used by
+    /// professional time-stretching algorithms like Ableton's Complex Pro.
+    /// Enabled by default for the [`EdmPreset::DjBeatmatch`] preset.
+    pub multi_resolution: bool,
 }
 
 /// Converts a duration in milliseconds to samples at the given sample rate.
@@ -1456,6 +1465,7 @@ impl StretchParams {
             stereo_mode: StereoMode::MidSide,
             envelope_preservation: false,
             envelope_order: 40,
+            multi_resolution: false,
         }
     }
 
@@ -1510,6 +1520,8 @@ impl StretchParams {
                 | EdmPreset::Ambient
                 | EdmPreset::VocalChop
         );
+        // Enable multi-resolution FFT for DjBeatmatch (transparency-critical)
+        self.multi_resolution = matches!(preset, EdmPreset::DjBeatmatch);
         self
     }
 
@@ -1604,6 +1616,17 @@ impl StretchParams {
     /// higher values preserve more spectral detail. Default: 40.
     pub fn with_envelope_order(mut self, order: usize) -> Self {
         self.envelope_order = order;
+        self
+    }
+
+    /// Enables or disables multi-resolution FFT processing.
+    ///
+    /// When enabled, tonal segments are split into low (0-4 kHz) and high
+    /// (4 kHz+) bands. The low band uses a larger FFT for better frequency
+    /// resolution, while the high band uses a smaller FFT for better temporal
+    /// resolution. This improves quality for transient-rich material.
+    pub fn with_multi_resolution(mut self, enabled: bool) -> Self {
+        self.multi_resolution = enabled;
         self
     }
 
