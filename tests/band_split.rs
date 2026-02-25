@@ -58,7 +58,9 @@ fn edm_like_signal(sample_rate: u32, duration_secs: f64) -> Vec<f32> {
 
 #[test]
 fn test_band_split_enabled_by_default_with_presets() {
-    // All EDM presets should enable band_split
+    // All EDM presets should enable either band_split or multi_resolution.
+    // Presets with multi_resolution=true set band_split=false to avoid
+    // redundant sub-bass processing paths.
     let presets = [
         EdmPreset::DjBeatmatch,
         EdmPreset::HouseLoop,
@@ -70,8 +72,8 @@ fn test_band_split_enabled_by_default_with_presets() {
     for preset in presets {
         let params = StretchParams::new(1.5).with_preset(preset);
         assert!(
-            params.band_split,
-            "Preset {:?} should enable band_split",
+            params.band_split || params.multi_resolution,
+            "Preset {:?} should enable band_split or multi_resolution",
             preset
         );
     }

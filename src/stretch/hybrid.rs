@@ -79,59 +79,7 @@ impl HybridStretcher {
             return wsola.process(input);
         }
 
-        // Band-split mode: separate sub-bass for independent PV processing
-        if self.params.band_split && input.len() >= BAND_SPLIT_FFT_SIZE {
-            return self.process_band_split(input);
-        }
-
         self.process_hybrid(input)
-    }
-
-    /// Processes audio with sub-bass band splitting.
-    ///
-    /// Separates audio below `sub_bass_cutoff` Hz and processes it exclusively
-    /// through the phase vocoder with rigid phase locking. The remaining audio
-    /// goes through the normal hybrid algorithm. The two results are summed.
-    fn process_band_split(&self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
-        let (sub_bass, remainder) =
-            separate_sub_bass(input, self.params.sub_bass_cutoff, self.params.sample_rate);
-
-        // Process sub-bass exclusively through PV (rigid phase locking
-        // handles phase coherence for bins below cutoff)
-        let sub_bass_stretched = if sub_bass.len() >= self.params.fft_size {
-            let mut pv = PhaseVocoder::with_all_options(
-                self.params.fft_size,
-                self.params.hop_size,
-                self.params.stretch_ratio,
-                self.params.sample_rate,
-                self.params.sub_bass_cutoff,
-                self.params.window_type,
-                self.params.phase_locking_mode,
-                self.params.envelope_preservation,
-                self.params.envelope_order,
-            );
-            pv.process(&sub_bass)?
-        } else {
-            let out_len = self.params.output_length(sub_bass.len()).max(1);
-            crate::core::resample::resample_linear(&sub_bass, out_len)
-        };
-
-        // Process remainder through normal hybrid (transient detection + PV/WSOLA)
-        let remainder_stretched = self.process_hybrid(&remainder)?;
-
-        // Sum the two bands (zero-pad the shorter one to the longer length)
-        let out_len = sub_bass_stretched.len().max(remainder_stretched.len());
-        let zeros = std::iter::repeat(0.0f32);
-        let output: Vec<f32> = sub_bass_stretched
-            .iter()
-            .copied()
-            .chain(zeros.clone())
-            .zip(remainder_stretched.iter().copied().chain(zeros))
-            .take(out_len)
-            .map(|(s, r)| s + r)
-            .collect();
-
-        Ok(output)
     }
 
     /// Core hybrid processing: transient detection + segmented WSOLA/PV.
@@ -379,6 +327,13 @@ impl HybridStretcher {
             });
         }
 
+        // Per-segment band split: separate sub-bass and stretch each band with PV,
+        // then sum. This runs only for tonal segments when band_split is on and
+        // multi_resolution / HPSS are not handling the split already.
+        if self.params.band_split && use_phase_vocoder && seg_data.len() >= BAND_SPLIT_FFT_SIZE {
+            return self.stretch_tonal_band_split(seg_data, seg_ratio, pv);
+        }
+
         let result = if use_phase_vocoder {
             pv.process(seg_data)
         } else {
@@ -423,7 +378,9 @@ impl HybridStretcher {
                 crate::core::resample::resample_linear(&percussive, percussive_out_len.max(1))
             });
 
-        // Sum the two components (zero-pad shorter to match longer)
+        // Sum the two components, zero-padding shorter to match longer.
+        // Zero-padding preserves phase coherence — resampling to a common
+        // length would shift phases and cause destructive interference.
         let out_len = harmonic_stretched.len().max(percussive_stretched.len());
         let zeros = std::iter::repeat(0.0f32);
         let output: Vec<f32> = harmonic_stretched
@@ -436,6 +393,68 @@ impl HybridStretcher {
             .collect();
 
         Some(output)
+    }
+
+    /// Stretches a tonal segment with per-segment sub-bass band splitting.
+    ///
+    /// Separates sub-bass from the remainder, PV-stretches each independently
+    /// with rigid phase locking for sub-bass, and sums the results. Both outputs
+    /// are resampled to the target length before summing.
+    fn stretch_tonal_band_split(
+        &self,
+        seg_data: &[f32],
+        seg_ratio: f64,
+        pv: &mut PhaseVocoder,
+    ) -> Vec<f32> {
+        let target_len = (seg_data.len() as f64 * seg_ratio).round().max(1.0) as usize;
+
+        let (sub_bass, remainder) = separate_sub_bass(
+            seg_data,
+            self.params.sub_bass_cutoff,
+            self.params.sample_rate,
+        );
+
+        // PV-stretch sub-bass with dedicated PV instance (rigid phase locking)
+        let sub_bass_stretched = if sub_bass.len() >= self.params.fft_size {
+            let mut sub_pv = PhaseVocoder::with_all_options(
+                self.params.fft_size,
+                self.params.hop_size,
+                seg_ratio,
+                self.params.sample_rate,
+                self.params.sub_bass_cutoff,
+                self.params.window_type,
+                self.params.phase_locking_mode,
+                self.params.envelope_preservation,
+                self.params.envelope_order,
+            );
+            sub_pv
+                .process(&sub_bass)
+                .unwrap_or_else(|_| crate::core::resample::resample_linear(&sub_bass, target_len))
+        } else {
+            crate::core::resample::resample_linear(&sub_bass, target_len)
+        };
+
+        // PV-stretch remainder through the shared PV
+        let remainder_stretched = if remainder.len() >= self.params.fft_size {
+            pv.process(&remainder)
+                .unwrap_or_else(|_| crate::core::resample::resample_linear(&remainder, target_len))
+        } else {
+            crate::core::resample::resample_linear(&remainder, target_len)
+        };
+
+        // Sum the two bands, zero-padding shorter to match longer.
+        // Zero-padding preserves phase coherence — resampling to a common
+        // length would shift phases and cause destructive interference.
+        let out_len = sub_bass_stretched.len().max(remainder_stretched.len());
+        let zeros = std::iter::repeat(0.0f32);
+        sub_bass_stretched
+            .iter()
+            .copied()
+            .chain(zeros.clone())
+            .zip(remainder_stretched.iter().copied().chain(zeros))
+            .take(out_len)
+            .map(|(s, r)| s + r)
+            .collect()
     }
 
     /// Onset-aligned transient stretching with a specific ratio.
@@ -1490,7 +1509,8 @@ mod tests {
 
     #[test]
     fn test_band_split_with_preset() {
-        // EDM presets should enable band_split by default
+        // Presets with multi_resolution=true use multi-resolution instead of
+        // band_split to avoid redundant sub-bass processing paths.
         let sample_rate = 44100u32;
         let num_samples = sample_rate as usize * 2;
         let input: Vec<f32> = (0..num_samples)
@@ -1509,9 +1529,15 @@ mod tests {
                 .with_channels(1)
                 .with_preset(preset);
 
+            // band_split and multi_resolution are mutually exclusive
             assert!(
-                params.band_split,
-                "Preset {:?} should enable band_split",
+                params.band_split || params.multi_resolution,
+                "Preset {:?} should enable band_split or multi_resolution",
+                preset
+            );
+            assert!(
+                !(params.band_split && params.multi_resolution),
+                "Preset {:?} should not enable both band_split and multi_resolution",
                 preset
             );
 

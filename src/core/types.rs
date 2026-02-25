@@ -1604,7 +1604,6 @@ impl StretchParams {
     pub fn with_preset(mut self, preset: EdmPreset) -> Self {
         self.preset = Some(preset);
         self.beat_aware = true;
-        self.band_split = true;
         let cfg = preset.config();
         self.fft_size = cfg.fft_size;
         self.hop_size = cfg.hop_size;
@@ -1626,6 +1625,10 @@ impl StretchParams {
         // DjBeatmatch needs it for transparent tempo changes; Ambient benefits from the
         // large sub-bass FFT at extreme stretch ratios (2x-4x).
         self.multi_resolution = matches!(preset, EdmPreset::DjBeatmatch | EdmPreset::Ambient);
+        // Band-split is only useful when multi_resolution is off; multi_resolution
+        // already provides its own per-band sub-bass handling, so enabling both
+        // would create redundant sub-bass processing paths.
+        self.band_split = !self.multi_resolution;
         // Enable elastic beat distribution for rhythm-critical presets.
         // DjBeatmatch and HouseLoop use low anchor so beats land at the target BPM;
         // creative presets like Halftime would use a high anchor to keep beats

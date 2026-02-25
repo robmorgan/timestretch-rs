@@ -1101,7 +1101,7 @@ mod preset_configs {
     }
 
     #[test]
-    fn all_presets_enable_band_split() {
+    fn all_presets_enable_band_split_or_multi_resolution() {
         let presets = [
             EdmPreset::DjBeatmatch,
             EdmPreset::HouseLoop,
@@ -1112,8 +1112,8 @@ mod preset_configs {
         for preset in &presets {
             let params = StretchParams::new(1.5).with_preset(*preset);
             assert!(
-                params.band_split,
-                "Preset {:?} should enable band_split",
+                params.band_split || params.multi_resolution,
+                "Preset {:?} should enable band_split or multi_resolution",
                 preset
             );
         }

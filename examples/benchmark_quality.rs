@@ -159,6 +159,10 @@ fn main() {
     // Convert to mono for comparison
     let ref_mono = to_mono(&reference.data, reference.channels.count());
     let out_mono = to_mono(&output.data, output.channels.count());
+    let orig_mono = to_mono(&original.data, original.channels.count());
+
+    // RMS energy diagnostic: compare input vs output energy in 30s windows
+    print_rms_diagnostic(&orig_mono, &out_mono, sample_rate);
 
     run_comparison(&ref_mono, &out_mono, sample_rate, effective_target_bpm);
 }
@@ -399,6 +403,62 @@ fn run_comparison(ref_mono: &[f32], out_mono: &[f32], sample_rate: u32, expected
         avg_xcorr,
         grade(avg_xcorr)
     );
+}
+
+/// Prints per-window RMS energy ratio between input and output to diagnose
+/// whether any volume loss comes from the stretcher or the source material.
+fn print_rms_diagnostic(input_mono: &[f32], output_mono: &[f32], sample_rate: u32) {
+    let window_secs = 30;
+    let window_samples = window_secs * sample_rate as usize;
+
+    // The output is stretched, so map output windows back to corresponding
+    // input positions using the length ratio.
+    let ratio = output_mono.len() as f64 / input_mono.len().max(1) as f64;
+
+    println!("\n--- RMS Energy Diagnostic ({}s windows) ---", window_secs);
+    println!(
+        "  {:>4}  {:>10}  {:>10}  {:>10}",
+        "Win", "Input RMS", "Output RMS", "Ratio(dB)"
+    );
+
+    let num_windows = output_mono.len() / window_samples;
+    for w in 0..num_windows {
+        let out_start = w * window_samples;
+        let out_end = out_start + window_samples;
+        let out_rms = rms(&output_mono[out_start..out_end]);
+
+        // Corresponding input window
+        let in_start = ((out_start as f64 / ratio) as usize).min(input_mono.len());
+        let in_end = ((out_end as f64 / ratio) as usize).min(input_mono.len());
+        let in_rms = if in_end > in_start {
+            rms(&input_mono[in_start..in_end])
+        } else {
+            0.0
+        };
+
+        let ratio_db = if in_rms > 1e-10 && out_rms > 1e-10 {
+            20.0 * (out_rms / in_rms).log10()
+        } else {
+            0.0
+        };
+        println!(
+            "  {:>4}  {:>10.6}  {:>10.6}  {:>+9.2} dB",
+            w + 1,
+            in_rms,
+            out_rms,
+            ratio_db
+        );
+    }
+    println!();
+}
+
+/// Computes the RMS (root mean square) of a signal.
+fn rms(data: &[f32]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f64 = data.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    (sum_sq / data.len() as f64).sqrt()
 }
 
 /// Converts interleaved multi-channel audio to mono by averaging channels.

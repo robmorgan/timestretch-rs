@@ -258,7 +258,11 @@ impl MultiResolutionStretcher {
             crate::core::resample::resample_linear(&self.high_buf[..len], out_len_fallback)
         };
 
-        // Sum the three bands, zero-padding shorter outputs
+        // Sum the three bands, zero-padding shorter outputs.
+        // Zero-padding preserves phase coherence between bands — resampling
+        // to a common length would shift phases and cause destructive
+        // interference. The shorter bands are naturally near-silent at their
+        // tails due to PV edge effects, so zero-padding is safe.
         let max_len = sub_bass_out.len().max(mid_out.len()).max(high_out.len());
 
         let mut output = vec![0.0f32; max_len];
