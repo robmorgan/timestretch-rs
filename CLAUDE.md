@@ -8,7 +8,7 @@ The following checks run on every push to `main` and on every pull request. All 
 ```bash
 cargo test --all-targets
 ```
-Runs on Ubuntu, macOS, and Windows with stable Rust, plus Ubuntu with MSRV (1.65.0).
+Runs on Ubuntu, macOS, and Windows with stable Rust, plus Ubuntu with MSRV (1.82.0).
 
 ### Clippy
 ```bash

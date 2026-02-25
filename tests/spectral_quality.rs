@@ -598,7 +598,7 @@ fn test_frequency_sweep_no_holes() {
         }
     }
 
-    let total_chunks = (output.len() + chunk_size - 1) / chunk_size;
+    let total_chunks = output.len().div_ceil(chunk_size);
     assert!(
         silent_chunks < total_chunks / 3,
         "Too many silent chunks in sweep output: {}/{} silent",
