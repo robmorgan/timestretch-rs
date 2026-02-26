@@ -19,7 +19,7 @@ mfcc_distance = 0.20
 transient_preservation = 0.25
 
 [agent.claude_code]
-max_turns = 10
+max_turns = 30
 allowed_tools = ["Edit", "Write", "Bash"]
 
 [agent.codex]

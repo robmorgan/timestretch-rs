@@ -18,26 +18,30 @@ ${WORST_CASES}
 - **MFCC Distance**: Measures timbral similarity. High distance means the "character" of the sound has changed.
 - **Transient Preservation**: Measures how well onsets (drum hits, etc.) are preserved. Low scores mean transients are "softened" or "doubled".
 
+## CRITICAL RULES
+- **Do NOT spend more than 5 turns reading code.** You must start editing quickly.
+- **Do NOT use Task/subagent tools.** Work directly — read, edit, build, score.
+- **You MUST run scoring and commit if improved before your turns run out.**
+
 ## Instructions
-1. **Analyze**: Read the relevant Rust source files in `src/` (especially `src/stretch/`).
+1. **Quickly analyze** the relevant Rust source files in `src/stretch/` (hybrid.rs, phase_vocoder.rs, wsola.rs are the key files). Do not read every file — focus on the worst performing areas.
 2. **Diagnose**: Look at the worst performing cases. Are they transients (drums)? Are they harmonic (sine/vocals)?
 3. **Modify**: Make **ONE** targeted change to the DSP logic to improve the scores.
    - Focus on: window functions, overlap-add logic, phase advancement, transient detection, or cross-correlation (WSOLA).
    - Do NOT refactor or reorganize. Only modify DSP math/logic.
-4. **Verify**: Ensure the code still compiles with `cargo build --release`.
-5. **Score**: Re-run the scoring pipeline to verify your change improved the score:
+4. **Build**: Run `cargo build --release` to verify compilation.
+5. **Score**: Re-run the scoring pipeline to measure the impact:
    ```bash
-   cd /home/rjm/go/src/github.com/robmorgan/timestretch-rs
    source optimize/.venv/bin/activate
    ./optimize/scripts/run_test_suite.py
    ./optimize/scripts/score.py --batch optimize/logs/scores_verify.json
    ```
-6. **Commit if improved**: If the new average score is higher than the previous score (${AVG_SCORE}), commit your changes:
+6. **Commit if improved**: If the new average score is higher than **${AVG_SCORE}**, you MUST commit:
    ```bash
    git add src/
    git commit -m "opt: <brief description of change>, score=<new_score>"
    ```
-   If the score did not improve, revert your changes with `git checkout -- src/` and try a different approach.
-7. **Explain**: Briefly explain what you changed and why in your response.
+   If the score did not improve, revert with `git checkout -- src/` and try a different approach. You may attempt up to 3 changes per session.
+7. **Explain**: Briefly explain what you changed and why.
 
-Focus on reaching the target score of ${TARGET_SCORE}.
+**Your goal is to reach ${TARGET_SCORE}. Current score: ${AVG_SCORE}. Always commit improvements.**
