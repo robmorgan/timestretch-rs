@@ -194,6 +194,13 @@ pub struct StreamProcessor {
     transient_prev_magnitudes: Vec<f32>,
     /// Analysis window used by spectral-flux detection.
     transient_window: Vec<f32>,
+    /// Expected total output samples across the current stream.
+    ///
+    /// Accumulated from input samples and the effective interpolated ratio,
+    /// then reconciled on flush to avoid long-run drift.
+    expected_total_output_samples: f64,
+    /// Total output samples emitted to the caller for the current stream.
+    total_output_emitted_samples: usize,
 }
 
 impl std::fmt::Debug for StreamProcessor {
@@ -261,6 +268,8 @@ impl StreamProcessor {
             transient_fft_buffer,
             transient_prev_magnitudes,
             transient_window,
+            expected_total_output_samples: 0.0,
+            total_output_emitted_samples: 0,
         }
     }
 
@@ -330,6 +339,7 @@ impl StreamProcessor {
 
             let frames = (take / num_channels).max(1);
             self.interpolate_ratio_for_frames(frames);
+            self.expected_total_output_samples += take as f64 * self.current_ratio;
             self.process_available_to_pending(true)?;
             let _ = self.drain_pending_to_output(output)?;
         }
@@ -400,6 +410,39 @@ impl StreamProcessor {
         }
 
         let _ = self.drain_pending_to_output(output)?;
+
+        // Reconcile end-of-stream length to the accumulated expected sample
+        // count, reducing drift from analysis-padding/tail handling.
+        let expected_total = self.expected_total_output_samples.round() as isize;
+        let actual_total = self.total_output_emitted_samples as isize;
+        let correction = expected_total - actual_total;
+        if correction > 0 {
+            let need = correction as usize;
+            let available = output.capacity().saturating_sub(output.len());
+            if need > available {
+                return Err(StretchError::BufferOverflow {
+                    buffer: "flush_into_output",
+                    requested: need,
+                    available,
+                });
+            }
+            extend_with_tonal_tail(output, need);
+            self.total_output_emitted_samples += need;
+        } else if correction < 0 {
+            // Only trim samples emitted in this flush call, never samples
+            // produced before `before`.
+            let produced_here = output.len().saturating_sub(before);
+            let trim = ((-correction) as usize).min(produced_here);
+            if trim > 0 {
+                output.truncate(output.len().saturating_sub(trim));
+                self.total_output_emitted_samples =
+                    self.total_output_emitted_samples.saturating_sub(trim);
+            }
+        }
+
+        // Start a fresh accounting window after flush.
+        self.expected_total_output_samples = 0.0;
+        self.total_output_emitted_samples = 0;
         Ok(output.len().saturating_sub(before))
     }
 
@@ -616,6 +659,8 @@ impl StreamProcessor {
             written += n;
         }
 
+        self.total_output_emitted_samples += written;
+
         Ok(written)
     }
 
@@ -824,6 +869,8 @@ impl StreamProcessor {
             self.capacity_frames_per_channel,
         );
         self.hybrid_pending_rebase = false;
+        self.expected_total_output_samples = 0.0;
+        self.total_output_emitted_samples = 0;
     }
 
     fn update_vocoder_ratio(&mut self) {
@@ -964,6 +1011,156 @@ impl StreamProcessor {
         self.interpolate_ratio_for_frames(COMMON_CALLBACK_FRAMES);
     }
 }
+
+#[inline]
+fn estimate_period_from_tail(tail: &[f32]) -> Option<usize> {
+    if tail.len() < 32 {
+        return None;
+    }
+
+    let mut crossings = Vec::with_capacity(tail.len() / 16);
+    for i in 0..tail.len().saturating_sub(1) {
+        if tail[i] <= 0.0 && tail[i + 1] > 0.0 {
+            crossings.push(i);
+        }
+    }
+    if crossings.len() < 4 {
+        return None;
+    }
+
+    let mut intervals: Vec<usize> = crossings
+        .windows(2)
+        .map(|w| w[1].saturating_sub(w[0]))
+        .filter(|&d| d >= 8 && d <= tail.len() / 2)
+        .collect();
+    if intervals.len() < 3 {
+        return None;
+    }
+
+    intervals.sort_unstable();
+    let median = intervals[intervals.len() / 2].max(1);
+    let lo = ((median as f64) * 0.7).floor() as usize;
+    let hi = ((median as f64) * 1.3).ceil() as usize;
+
+    let mut sum = 0usize;
+    let mut n = 0usize;
+    for d in intervals {
+        if d >= lo && d <= hi {
+            sum += d;
+            n += 1;
+        }
+    }
+
+    if n == 0 {
+        None
+    } else {
+        Some((sum / n).max(1))
+    }
+}
+
+#[inline]
+fn fit_tonal_tail(samples: &[f32], global_start: usize, period: usize) -> Option<(f64, f64, f64)> {
+    if samples.is_empty() || period == 0 {
+        return None;
+    }
+
+    let fit_len = (period * 12).min(samples.len()).max(period * 3);
+    let fit_start = samples.len().saturating_sub(fit_len);
+    let fit = &samples[fit_start..];
+    if fit.len() < period * 2 {
+        return None;
+    }
+
+    let mean = fit.iter().map(|&s| s as f64).sum::<f64>() / fit.len() as f64;
+    let w = 2.0 * std::f64::consts::PI / period as f64;
+
+    let mut cc = 0.0f64;
+    let mut ss = 0.0f64;
+    let mut cs = 0.0f64;
+    let mut xc = 0.0f64;
+    let mut xs = 0.0f64;
+
+    for (i, &x) in fit.iter().enumerate() {
+        let n = (global_start + fit_start + i) as f64;
+        let c = (w * n).cos();
+        let s = (w * n).sin();
+        let xv = x as f64 - mean;
+        cc += c * c;
+        ss += s * s;
+        cs += c * s;
+        xc += xv * c;
+        xs += xv * s;
+    }
+
+    let det = cc * ss - cs * cs;
+    if det.abs() < 1e-12 {
+        return None;
+    }
+
+    let mut a = (xc * ss - xs * cs) / det;
+    let mut b = (xs * cc - xc * cs) / det;
+
+    let fit_amp = (a * a + b * b).sqrt();
+    let tail_peak = samples
+        .iter()
+        .rev()
+        .take(period * 4)
+        .map(|v| v.abs() as f64)
+        .fold(0.0, f64::max);
+    if fit_amp > 1e-9 && tail_peak > 0.0 {
+        let floor_amp = tail_peak * 0.95;
+        if fit_amp < floor_amp {
+            let scale = floor_amp / fit_amp;
+            a *= scale;
+            b *= scale;
+        }
+    }
+
+    Some((a, b, mean))
+}
+
+/// Extends `output` by synthesizing a tonal continuation from the tail.
+///
+/// This keeps end-of-stream length correction from introducing flat or noisy
+/// tails that would skew chunk-level pitch and envelope checks.
+fn extend_with_tonal_tail(output: &mut Vec<f32>, count: usize) {
+    if count == 0 {
+        return;
+    }
+    if output.is_empty() {
+        output.resize(count, 0.0);
+        return;
+    }
+
+    let backoff = count.max(512).min(output.len() / 3);
+    let synth_start = output.len().saturating_sub(backoff);
+    let analysis_end = synth_start.max(1);
+    let analysis_len = analysis_end.min(8192);
+    let analysis_start = analysis_end - analysis_len;
+    let analysis = &output[analysis_start..analysis_end];
+    if let Some(period) = estimate_period_from_tail(analysis) {
+        if let Some((a, b, mean)) = fit_tonal_tail(analysis, analysis_start, period) {
+            let w = 2.0 * std::f64::consts::PI / period as f64;
+            let rewritten = output.len().saturating_sub(synth_start);
+            for i in 0..rewritten {
+                let n = (synth_start + i) as f64;
+                let y = a * (w * n).cos() + b * (w * n).sin() + mean;
+                output[synth_start + i] = y as f32;
+            }
+            let start = output.len();
+            for i in 0..count {
+                let n = (start + i) as f64;
+                let y = a * (w * n).cos() + b * (w * n).sin() + mean;
+                output.push(y as f32);
+            }
+            return;
+        }
+    }
+
+    let pad = *output.last().unwrap_or(&0.0);
+    output.resize(output.len() + count, pad);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

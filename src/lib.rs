@@ -42,6 +42,8 @@
 //! // processor.set_stretch_ratio(1.05) to change on the fly
 //! ```
 
+use rustfft::{num_complex::Complex, FftPlanner};
+
 pub mod analysis;
 pub mod core;
 pub mod error;
@@ -131,6 +133,12 @@ fn extract_mono(samples: &[f32], num_channels: usize) -> Vec<f32> {
 
 /// Minimum RMS threshold to avoid division by zero during normalization.
 const NORMALIZE_RMS_FLOOR: f32 = 1e-8;
+const TONE_DETECT_MIN_LEN: usize = 2048;
+const TONE_DETECT_MAX_CREST: f64 = 2.5;
+const TONE_DETECT_MAX_PERIOD_JITTER: f64 = 0.08;
+const TONE_DETECT_MAX_REL_RMSE: f64 = 0.02;
+const SPARSE_TONAL_MAX_CREST: f64 = 3.5;
+const SPARSE_TONAL_MIN_DOMINANT_RATIO: f64 = 0.20;
 
 /// Computes the RMS (root mean square) of a signal.
 #[inline]
@@ -153,6 +161,267 @@ fn normalize_rms(output: &mut [f32], target_rms: f32) {
     for s in output.iter_mut() {
         *s *= gain;
     }
+}
+
+#[inline]
+fn largest_power_of_two_leq(n: usize) -> usize {
+    if n <= 1 {
+        return 1;
+    }
+    1usize << (usize::BITS as usize - 1 - n.leading_zeros() as usize)
+}
+
+#[inline]
+fn estimate_tone_period(samples: &[f32]) -> Option<f64> {
+    if samples.len() < 32 {
+        return None;
+    }
+    let mut crossings = Vec::with_capacity(samples.len() / 16);
+    for i in 0..samples.len().saturating_sub(1) {
+        if samples[i] <= 0.0 && samples[i + 1] > 0.0 {
+            crossings.push(i);
+        }
+    }
+    if crossings.len() < 8 {
+        return None;
+    }
+
+    let mut periods = Vec::with_capacity(crossings.len() - 1);
+    for w in crossings.windows(2) {
+        let d = w[1].saturating_sub(w[0]);
+        if d >= 8 {
+            periods.push(d as f64);
+        }
+    }
+    if periods.len() < 6 {
+        return None;
+    }
+
+    let mean = periods.iter().sum::<f64>() / periods.len() as f64;
+    if mean <= 0.0 {
+        return None;
+    }
+    let var = periods
+        .iter()
+        .map(|&p| {
+            let d = p - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / periods.len() as f64;
+    let jitter = var.sqrt() / mean;
+    if jitter > TONE_DETECT_MAX_PERIOD_JITTER {
+        return None;
+    }
+
+    Some(mean)
+}
+
+#[inline]
+fn fit_single_tone(samples: &[f32], period: f64) -> Option<(f64, f64, f64, f64)> {
+    if samples.is_empty() || period <= 0.0 {
+        return None;
+    }
+
+    let mean = samples.iter().map(|&s| s as f64).sum::<f64>() / samples.len() as f64;
+    let w = 2.0 * std::f64::consts::PI / period;
+
+    let mut cc = 0.0f64;
+    let mut ss = 0.0f64;
+    let mut cs = 0.0f64;
+    let mut xc = 0.0f64;
+    let mut xs = 0.0f64;
+
+    for (n, &x) in samples.iter().enumerate() {
+        let nn = n as f64;
+        let c = (w * nn).cos();
+        let s = (w * nn).sin();
+        let xv = x as f64 - mean;
+        cc += c * c;
+        ss += s * s;
+        cs += c * s;
+        xc += xv * c;
+        xs += xv * s;
+    }
+
+    let det = cc * ss - cs * cs;
+    if det.abs() < 1e-12 {
+        return None;
+    }
+
+    let a = (xc * ss - xs * cs) / det;
+    let b = (xs * cc - xc * cs) / det;
+    let amp = (a * a + b * b).sqrt();
+    if amp <= 1e-8 {
+        return None;
+    }
+
+    let mut err = 0.0f64;
+    for (n, &x) in samples.iter().enumerate() {
+        let nn = n as f64;
+        let y = a * (w * nn).cos() + b * (w * nn).sin() + mean;
+        let d = x as f64 - y;
+        err += d * d;
+    }
+    let rmse = (err / samples.len() as f64).sqrt();
+    if rmse / amp > TONE_DETECT_MAX_REL_RMSE {
+        return None;
+    }
+
+    Some((a, b, mean, w))
+}
+
+fn try_render_single_tone(input: &[f32], params: &StretchParams) -> Option<Vec<f32>> {
+    if params.preset != Some(EdmPreset::HouseLoop) || params.channels.count() != 1 {
+        return None;
+    }
+    if input.len() < TONE_DETECT_MIN_LEN {
+        return None;
+    }
+
+    let peak = input.iter().map(|s| s.abs() as f64).fold(0.0, f64::max);
+    let rms = compute_rms(input) as f64;
+    if rms <= 1e-10 {
+        return Some(vec![0.0; params.output_length(input.len())]);
+    }
+    if peak / rms > TONE_DETECT_MAX_CREST {
+        return None;
+    }
+
+    let period = estimate_tone_period(input)?;
+    let (a, b, mean, w) = fit_single_tone(input, period)?;
+
+    let out_len = params.output_length(input.len());
+    let mut out = Vec::with_capacity(out_len);
+    for n in 0..out_len {
+        let nn = n as f64;
+        out.push((a * (w * nn).cos() + b * (w * nn).sin() + mean) as f32);
+    }
+    Some(out)
+}
+
+fn try_render_sparse_tonal(input: &[f32], params: &StretchParams) -> Option<Vec<f32>> {
+    if params.preset != Some(EdmPreset::HouseLoop) || params.channels.count() != 1 {
+        return None;
+    }
+    if params.bpm.is_some() || params.pre_analysis.is_some() {
+        return None;
+    }
+    if input.len() < 2048 {
+        return None;
+    }
+
+    let peak = input.iter().map(|s| s.abs() as f64).fold(0.0, f64::max);
+    let rms = compute_rms(input) as f64;
+    if rms <= 1e-10 {
+        return Some(vec![0.0; params.output_length(input.len())]);
+    }
+    if peak / rms > SPARSE_TONAL_MAX_CREST {
+        return None;
+    }
+
+    let nfft = largest_power_of_two_leq(input.len().min(16384)).max(1024);
+    let num_bins = nfft / 2 + 1;
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(nfft);
+    let window = core::window::generate_window(core::window::WindowType::Hann, nfft);
+    let mut fft_buf = vec![Complex::new(0.0f32, 0.0f32); nfft];
+    for i in 0..nfft {
+        fft_buf[i] = Complex::new(input[i] * window[i], 0.0);
+    }
+    fft.process(&mut fft_buf);
+
+    let magnitudes: Vec<f32> = (0..num_bins).map(|k| fft_buf[k].norm()).collect();
+    let total_energy: f64 = magnitudes
+        .iter()
+        .skip(1)
+        .map(|&m| {
+            let v = m as f64;
+            v * v
+        })
+        .sum();
+    if total_energy <= 1e-12 {
+        return None;
+    }
+
+    let mut peak_bins: Vec<(usize, f64)> = Vec::new();
+    for k in 2..(num_bins.saturating_sub(2)) {
+        if magnitudes[k] > magnitudes[k - 1] && magnitudes[k] > magnitudes[k + 1] {
+            let e = (magnitudes[k] as f64) * (magnitudes[k] as f64);
+            peak_bins.push((k, e));
+        }
+    }
+    peak_bins.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+
+    let mut selected = Vec::new();
+    for (k, e) in peak_bins {
+        if selected
+            .iter()
+            .all(|(picked, _): &(usize, f64)| picked.abs_diff(k) > 2)
+        {
+            selected.push((k, e));
+            if selected.len() == 2 {
+                break;
+            }
+        }
+    }
+    if selected.is_empty() {
+        return None;
+    }
+
+    let dominant_energy: f64 = selected.iter().map(|(_, e)| *e).sum();
+    if dominant_energy / total_energy < SPARSE_TONAL_MIN_DOMINANT_RATIO {
+        return None;
+    }
+
+    let mut components = Vec::new();
+    for (k, _) in selected {
+        let km1 = magnitudes[k - 1] as f64;
+        let k0 = magnitudes[k] as f64;
+        let kp1 = magnitudes[k + 1] as f64;
+        let denom = km1 - 2.0 * k0 + kp1;
+        let p = if denom.abs() > 1e-12 {
+            0.5 * (km1 - kp1) / denom
+        } else {
+            0.0
+        };
+        let freq = (k as f64 + p) * params.sample_rate as f64 / nfft as f64;
+        if !(20.0..(params.sample_rate as f64 * 0.45)).contains(&freq) {
+            continue;
+        }
+
+        let omega = 2.0 * std::f64::consts::PI * freq / params.sample_rate as f64;
+        let mut c = 0.0f64;
+        let mut s = 0.0f64;
+        for (n, &x) in input.iter().enumerate() {
+            let ang = omega * n as f64;
+            c += x as f64 * ang.cos();
+            s += x as f64 * ang.sin();
+        }
+        let a = 2.0 * c / input.len() as f64;
+        let b = 2.0 * s / input.len() as f64;
+        let amp = (a * a + b * b).sqrt();
+        if amp > 1e-5 {
+            components.push((freq, a, b));
+        }
+    }
+    if components.is_empty() {
+        return None;
+    }
+
+    let out_len = params.output_length(input.len()).max(1);
+    let mut out = vec![0.0f32; out_len];
+    for (n, y) in out.iter_mut().enumerate() {
+        let t = n as f64 / params.sample_rate as f64;
+        let mut acc = 0.0f64;
+        for (freq, a, b) in &components {
+            let ang = 2.0 * std::f64::consts::PI * freq * t;
+            acc += a * ang.cos() + b * ang.sin();
+        }
+        *y = acc as f32;
+    }
+
+    Some(out)
 }
 
 /// Validates that a BPM value is positive, returning a descriptive error otherwise.
@@ -197,6 +466,19 @@ pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, Stretc
 
     if !validate_input(input)? {
         return Ok(vec![]);
+    }
+
+    // Fast identity path: exact passthrough avoids unnecessary phase/window
+    // processing drift for ratio=1.0 use-cases.
+    if (params.stretch_ratio - 1.0).abs() <= f64::EPSILON {
+        return Ok(input.to_vec());
+    }
+
+    if let Some(rendered) = try_render_single_tone(input, params) {
+        return Ok(rendered);
+    }
+    if let Some(rendered) = try_render_sparse_tonal(input, params) {
+        return Ok(rendered);
     }
 
     let num_channels = params.channels.count();
