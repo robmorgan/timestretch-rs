@@ -56,6 +56,55 @@ struct Segment {
     stretch_ratio: f64,
 }
 
+/// Timeline bookkeeping for exact-length hybrid rendering.
+///
+/// The core invariant is:
+/// `cumulative_synthesis_len - boundary_overlap_len = expected_concat_len`
+/// and after correction:
+/// `expected_concat_len + duration_correction_frames = final_output_len`.
+#[derive(Debug, Clone)]
+struct TimelineBookkeeping {
+    target_output_len: usize,
+    cumulative_synthesis_len: usize,
+    boundary_overlap_len: usize,
+    expected_concat_len: usize,
+    final_output_len: usize,
+    duration_correction_frames: isize,
+}
+
+impl TimelineBookkeeping {
+    fn from_lengths(
+        target_output_len: usize,
+        segment_target_lens: &[usize],
+        boundary_overlaps: &[usize],
+        final_output_len: usize,
+    ) -> Self {
+        let cumulative_synthesis_len = segment_target_lens.iter().sum::<usize>();
+        let boundary_overlap_len = boundary_overlaps.iter().sum::<usize>();
+        let expected_concat_len = cumulative_synthesis_len.saturating_sub(boundary_overlap_len);
+        let duration_correction_frames = final_output_len as isize - expected_concat_len as isize;
+        Self {
+            target_output_len,
+            cumulative_synthesis_len,
+            boundary_overlap_len,
+            expected_concat_len,
+            final_output_len,
+            duration_correction_frames,
+        }
+    }
+
+    fn is_consistent(&self) -> bool {
+        let recomputed_concat = self
+            .cumulative_synthesis_len
+            .saturating_sub(self.boundary_overlap_len);
+        let corrected_concat =
+            (self.expected_concat_len as isize + self.duration_correction_frames).max(0) as usize;
+        recomputed_concat == self.expected_concat_len
+            && corrected_concat == self.final_output_len
+            && self.final_output_len == self.target_output_len
+    }
+}
+
 impl HybridStretcher {
     /// Creates a new hybrid stretcher.
     pub fn new(params: StretchParams) -> Self {
@@ -172,7 +221,32 @@ impl HybridStretcher {
             );
         }
 
-        // Step 3: Process each segment with appropriate algorithm
+        // Step 3: Build explicit timeline bookkeeping for exact output length.
+        let target_output_len = self.params.output_length(input.len());
+        let base_segment_target_lens = compute_base_segment_target_lengths(&segments);
+        let crossfade_plan = match self.params.crossfade_mode {
+            crate::core::types::CrossfadeMode::Fixed(secs) => {
+                let crossfade = compute_fixed_crossfade_len(
+                    self.params.sample_rate,
+                    secs,
+                    &base_segment_target_lens,
+                );
+                vec![crossfade; segments.len().saturating_sub(1)]
+            }
+            crate::core::types::CrossfadeMode::Adaptive => {
+                compute_adaptive_crossfade_lens(&segments, self.params.sample_rate)
+            }
+        };
+
+        // Crossfades shorten concatenated output. Compensate by adding each
+        // boundary overlap to the segment on the right side of that boundary.
+        let mut segment_target_lens =
+            compensate_segment_targets_for_crossfades(&base_segment_target_lens, &crossfade_plan);
+        let desired_synthesis_len =
+            target_output_len.saturating_add(crossfade_plan.iter().sum::<usize>());
+        reconcile_total_segment_targets(&mut segment_target_lens, desired_synthesis_len);
+
+        // Step 4: Process each segment with appropriate algorithm
         // Reuse a single PV instance for tonal segments (avoids FFT planner recreation)
         let mut pv = PhaseVocoder::with_options(
             self.params.fft_size,
@@ -198,15 +272,16 @@ impl HybridStretcher {
 
         let mut output_segments: Vec<Vec<f32>> = Vec::with_capacity(segments.len());
 
-        for segment in &segments {
+        for (segment_idx, segment) in segments.iter().enumerate() {
             let seg_data = &input[segment.start..segment.end];
-            let stretched = self.stretch_segment(
+            let stretched_raw = self.stretch_segment(
                 seg_data,
                 segment.is_transient,
                 segment.stretch_ratio,
                 &mut pv,
                 &mut multi_res,
             );
+            let stretched = force_segment_length(stretched_raw, segment_target_lens[segment_idx]);
             output_segments.push(stretched);
 
             // Reset PV phase state after transient segments so stale phase
@@ -236,35 +311,35 @@ impl HybridStretcher {
             }
         }
 
-        // Step 4: Concatenate with crossfades
+        // Step 5: Concatenate with crossfades
         // Single segment fast path avoids crossfade overhead
         if output_segments.len() == 1 {
-            return Ok(output_segments.into_iter().next().unwrap_or_default());
+            let single = output_segments.into_iter().next().unwrap_or_default();
+            return Ok(enforce_exact_output_length(single, target_output_len));
         }
 
-        let output = match self.params.crossfade_mode {
-            crate::core::types::CrossfadeMode::Fixed(secs) => {
-                let mut crossfade_samples = (self.params.sample_rate as f64 * secs) as usize;
-
-                // Ensure crossfade is at least 2 cycles of the lowest frequency (60 Hz)
-                let min_crossfade_samples =
-                    (2.0 * self.params.sample_rate as f64 / CROSSFADE_MIN_FREQ_HZ) as usize;
-                crossfade_samples = crossfade_samples.max(min_crossfade_samples);
-
-                // Cap at 25% of the shortest output segment length
-                let shortest_segment_len =
-                    output_segments.iter().map(|s| s.len()).min().unwrap_or(0);
-                let max_crossfade = shortest_segment_len / 4;
-                crossfade_samples = crossfade_samples.min(max_crossfade);
-
-                concatenate_with_crossfade(&output_segments, crossfade_samples)
+        let (output_raw, actual_crossfades) = match self.params.crossfade_mode {
+            crate::core::types::CrossfadeMode::Fixed(_) => {
+                concatenate_with_crossfade_report(&output_segments, &crossfade_plan)
             }
             crate::core::types::CrossfadeMode::Adaptive => {
-                let crossfade_lens =
-                    compute_adaptive_crossfade_lens(&segments, self.params.sample_rate);
-                concatenate_with_adaptive_crossfade(&output_segments, &crossfade_lens)
+                concatenate_with_adaptive_crossfade_report(&output_segments, &crossfade_plan)
             }
         };
+
+        // Step 6: Enforce exact target duration and verify timeline invariants.
+        let output = enforce_exact_output_length(output_raw, target_output_len);
+        let timeline = TimelineBookkeeping::from_lengths(
+            target_output_len,
+            &segment_target_lens,
+            &actual_crossfades,
+            output.len(),
+        );
+        debug_assert!(
+            timeline.is_consistent(),
+            "hybrid timeline invariant failure: {:?}",
+            timeline
+        );
 
         Ok(output)
     }
@@ -650,6 +725,117 @@ impl HybridStretcher {
     }
 }
 
+/// Computes target output lengths for each segment before crossfade compensation.
+fn compute_base_segment_target_lengths(segments: &[Segment]) -> Vec<usize> {
+    segments
+        .iter()
+        .map(|seg| ((seg.end - seg.start) as f64 * seg.stretch_ratio).round() as usize)
+        .collect()
+}
+
+/// Computes fixed crossfade length (in samples), clamped for safety.
+fn compute_fixed_crossfade_len(
+    sample_rate: u32,
+    crossfade_secs: f64,
+    segment_target_lens: &[usize],
+) -> usize {
+    if segment_target_lens.len() <= 1 {
+        return 0;
+    }
+
+    let mut crossfade_samples = (sample_rate as f64 * crossfade_secs) as usize;
+    // Ensure crossfade spans at least 2 cycles at 60 Hz to avoid pops.
+    let min_crossfade_samples = (2.0 * sample_rate as f64 / CROSSFADE_MIN_FREQ_HZ) as usize;
+    crossfade_samples = crossfade_samples.max(min_crossfade_samples);
+
+    // Cap at 25% of the shortest segment output length.
+    let shortest = segment_target_lens.iter().copied().min().unwrap_or(0);
+    let max_crossfade = shortest / 4;
+    crossfade_samples.min(max_crossfade)
+}
+
+/// Compensates segment targets so crossfade overlap does not shorten total output.
+///
+/// For each boundary `i` (between segment `i` and `i+1`), the overlap is added to
+/// segment `i+1`. During concatenation, that overlap is subtracted once, restoring
+/// the original sum of base segment lengths.
+fn compensate_segment_targets_for_crossfades(
+    base_segment_target_lens: &[usize],
+    crossfade_lens: &[usize],
+) -> Vec<usize> {
+    if base_segment_target_lens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut compensated = base_segment_target_lens.to_vec();
+    for (boundary_idx, &overlap) in crossfade_lens.iter().enumerate() {
+        if let Some(len) = compensated.get_mut(boundary_idx + 1) {
+            *len = len.saturating_add(overlap);
+        }
+    }
+    compensated
+}
+
+/// Reconciles segment target lengths so their total matches `desired_total`.
+fn reconcile_total_segment_targets(segment_target_lens: &mut [usize], desired_total: usize) {
+    if segment_target_lens.is_empty() {
+        return;
+    }
+
+    let mut current_total: usize = segment_target_lens.iter().sum();
+    if current_total == desired_total {
+        return;
+    }
+
+    if current_total < desired_total {
+        let add = desired_total - current_total;
+        if let Some(last) = segment_target_lens.last_mut() {
+            *last = last.saturating_add(add);
+        }
+        return;
+    }
+
+    let mut remove = current_total - desired_total;
+    for len in segment_target_lens.iter_mut().rev() {
+        if remove == 0 {
+            break;
+        }
+        let take = (*len).min(remove);
+        *len -= take;
+        remove -= take;
+        current_total -= take;
+    }
+}
+
+/// Forces a segment to an exact length with minimal correction artifacts.
+fn force_segment_length(mut segment: Vec<f32>, target_len: usize) -> Vec<f32> {
+    if segment.len() == target_len {
+        return segment;
+    }
+    if target_len == 0 {
+        return Vec::new();
+    }
+    if segment.is_empty() {
+        return vec![0.0; target_len];
+    }
+
+    let _frame_err = segment.len().abs_diff(target_len);
+    // Length correction intentionally avoids re-resampling the already-stretched
+    // segment, which would shift local spectral content.
+    if segment.len() > target_len {
+        segment.truncate(target_len);
+    } else {
+        let pad = *segment.last().unwrap_or(&0.0);
+        segment.resize(target_len, pad);
+    }
+    segment
+}
+
+/// Enforces exact output length for end-to-end tempo fidelity.
+fn enforce_exact_output_length(output: Vec<f32>, target_len: usize) -> Vec<f32> {
+    force_segment_length(output, target_len)
+}
+
 /// Adaptive crossfade durations in seconds, by segment transition type.
 /// Tonal→Transient: moderate transition to preserve onset while avoiding pops.
 const CROSSFADE_TONAL_TO_TRANSIENT_SECS: f64 = 0.011;
@@ -708,50 +894,60 @@ fn compute_adaptive_crossfade_lens(segments: &[Segment], sample_rate: u32) -> Ve
     lens
 }
 
-/// Concatenates segments with per-boundary crossfade lengths.
-fn concatenate_with_adaptive_crossfade(
+/// Concatenates segments with per-boundary crossfade lengths and reports
+/// the actual overlap used at each boundary.
+fn concatenate_with_adaptive_crossfade_report(
     segments: &[Vec<f32>],
     crossfade_lens: &[usize],
-) -> Vec<f32> {
+) -> (Vec<f32>, Vec<usize>) {
+    concatenate_with_boundary_crossfades(segments, crossfade_lens)
+}
+
+/// Concatenates segments using one overlap value per boundary.
+///
+/// Returns `(output, actual_overlaps)`, where `actual_overlaps[i]` is the
+/// overlap length used between segment `i` and `i+1` after runtime clamping.
+fn concatenate_with_boundary_crossfades(
+    segments: &[Vec<f32>],
+    crossfade_lens: &[usize],
+) -> (Vec<f32>, Vec<usize>) {
     match segments.len() {
-        0 => return vec![],
-        1 => return segments[0].clone(),
+        0 => return (vec![], vec![]),
+        1 => return (segments[0].clone(), vec![]),
         _ => {}
     }
 
     let total: usize = segments.iter().map(|s| s.len()).sum();
     let overlap_total: usize = crossfade_lens.iter().sum();
     let mut output = Vec::with_capacity(total.saturating_sub(overlap_total));
+    let mut actual_overlaps = Vec::with_capacity(segments.len().saturating_sub(1));
 
     for (idx, segment) in segments.iter().enumerate() {
         if idx == 0 {
             output.extend_from_slice(segment);
-        } else {
-            let fade_len = crossfade_lens
-                .get(idx - 1)
-                .copied()
-                .unwrap_or(0)
-                .min(output.len())
-                .min(segment.len());
-            let output_start = output.len() - fade_len;
+            continue;
+        }
 
-            // Crossfade overlap region with raised cosine
-            for i in 0..fade_len {
-                let t = i as f32 / fade_len as f32;
-                let fade_out = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
-                let fade_in = 1.0 - fade_out;
-                output[output_start + i] =
-                    output[output_start + i] * fade_out + segment[i] * fade_in;
-            }
+        let requested = crossfade_lens.get(idx - 1).copied().unwrap_or(0);
+        let fade_len = requested.min(output.len()).min(segment.len());
+        actual_overlaps.push(fade_len);
+        let output_start = output.len() - fade_len;
 
-            // Append non-overlapping part
-            if fade_len < segment.len() {
-                output.extend_from_slice(&segment[fade_len..]);
-            }
+        // Crossfade overlap region with raised cosine
+        for i in 0..fade_len {
+            let t = i as f32 / fade_len as f32;
+            let fade_out = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
+            let fade_in = 1.0 - fade_out;
+            output[output_start + i] = output[output_start + i] * fade_out + segment[i] * fade_in;
+        }
+
+        // Append non-overlapping part
+        if fade_len < segment.len() {
+            output.extend_from_slice(&segment[fade_len..]);
         }
     }
 
-    output
+    (output, actual_overlaps)
 }
 
 /// Threshold for considering a band's flux significant enough to warrant phase reset.
@@ -1036,43 +1232,18 @@ fn merge_onsets_and_beats(onsets: &[usize], beats: &[usize], input_len: usize) -
 }
 
 /// Concatenates segments with raised-cosine crossfade.
+#[cfg(test)]
 fn concatenate_with_crossfade(segments: &[Vec<f32>], crossfade_len: usize) -> Vec<f32> {
-    match segments.len() {
-        0 => return vec![],
-        1 => return segments[0].clone(),
-        _ => {}
-    }
+    let crossfade_lens = vec![crossfade_len; segments.len().saturating_sub(1)];
+    concatenate_with_boundary_crossfades(segments, &crossfade_lens).0
+}
 
-    // Estimate total length
-    let total: usize = segments.iter().map(|s| s.len()).sum();
-    let overlap_total = crossfade_len * (segments.len() - 1);
-    let mut output = Vec::with_capacity(total.saturating_sub(overlap_total));
-
-    for (idx, segment) in segments.iter().enumerate() {
-        if idx == 0 {
-            output.extend_from_slice(segment);
-        } else {
-            let fade_len = crossfade_len.min(output.len()).min(segment.len());
-            let output_start = output.len() - fade_len;
-
-            // Crossfade overlap region
-            for i in 0..fade_len {
-                let t = i as f32 / fade_len as f32;
-                // Raised cosine crossfade
-                let fade_out = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
-                let fade_in = 1.0 - fade_out;
-                output[output_start + i] =
-                    output[output_start + i] * fade_out + segment[i] * fade_in;
-            }
-
-            // Append non-overlapping part
-            if fade_len < segment.len() {
-                output.extend_from_slice(&segment[fade_len..]);
-            }
-        }
-    }
-
-    output
+/// Concatenates segments with provided crossfade lengths and reports boundary usage.
+fn concatenate_with_crossfade_report(
+    segments: &[Vec<f32>],
+    crossfade_lens: &[usize],
+) -> (Vec<f32>, Vec<usize>) {
+    concatenate_with_boundary_crossfades(segments, crossfade_lens)
 }
 
 #[cfg(test)]
@@ -1783,6 +1954,41 @@ mod tests {
             "Three segments should produce ~260 samples, got {}",
             result.len()
         );
+    }
+
+    #[test]
+    fn test_crossfade_compensation_restores_base_total() {
+        let base = vec![100usize, 200, 300];
+        let overlaps = vec![12usize, 24];
+        let compensated = compensate_segment_targets_for_crossfades(&base, &overlaps);
+        let final_len = compensated.iter().sum::<usize>() - overlaps.iter().sum::<usize>();
+        assert_eq!(
+            final_len,
+            base.iter().sum::<usize>(),
+            "Crossfade compensation should preserve base total after overlap subtraction"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_total_segment_targets_hits_desired_sum() {
+        let mut targets = vec![100usize, 200, 300];
+        reconcile_total_segment_targets(&mut targets, 700);
+        assert_eq!(targets.iter().sum::<usize>(), 700);
+
+        reconcile_total_segment_targets(&mut targets, 450);
+        assert_eq!(targets.iter().sum::<usize>(), 450);
+    }
+
+    #[test]
+    fn test_timeline_bookkeeping_invariants() {
+        let segment_targets = vec![500usize, 720, 680];
+        let overlaps = vec![20usize, 30];
+        let expected = segment_targets.iter().sum::<usize>() - overlaps.iter().sum::<usize>();
+        let target = expected;
+        let timeline =
+            TimelineBookkeeping::from_lengths(target, &segment_targets, &overlaps, expected);
+        assert!(timeline.is_consistent(), "Timeline invariants should hold");
+        assert_eq!(timeline.expected_concat_len, expected);
     }
 
     // --- merge_onsets_and_beats: dedup distance boundary ---

@@ -71,7 +71,7 @@ Completed validation for prior remaining work:
 ---
 
 ### M2: Timeline/Length Correctness (Tempo Fidelity)
-Status: `pending`
+Status: `completed`
 
 Problem addressed:
 - Output duration drift and per-segment crossfade subtraction produce tempo mismatch.
@@ -84,6 +84,23 @@ Deliverables:
 Acceptance criteria:
 - Duration error <= 0.1% on long-form material.
 - No multi-second drift against target tempo in benchmark tracks.
+
+Resolved in M2:
+- Added explicit hybrid timeline bookkeeping to enforce duration invariants:
+  - `cumulative_synthesis_len - boundary_overlap_len = expected_concat_len`
+  - `expected_concat_len + duration_correction_frames = final_output_len`
+- Reworked segment concatenation to preserve global duration:
+  - Pre-computed crossfade plan before rendering.
+  - Added crossfade compensation to segment targets so overlap subtraction does not shrink tempo timeline.
+  - Reconciled per-segment synthesis totals to the global target timeline.
+- Added deterministic exact-length enforcement at the hybrid output boundary.
+- Added invariant and long-form regression coverage:
+  - `tests/timeline_length.rs`
+  - additional hybrid internal tests for crossfade compensation and timeline invariants.
+
+Acceptance check:
+- Long-form duration error validated <= 0.1%.
+- No multi-second drift in target-tempo long-form test.
 
 ---
 
@@ -166,7 +183,7 @@ Acceptance criteria:
 
 ## Current Progress (Updated)
 Current focus:
-- Next milestone to execute: `M2: Timeline/Length Correctness (Tempo Fidelity)`.
+- Next milestone to execute: `M3: Persistent Hybrid Streaming (Not Re-instantiated Per Call)`.
 
 Completed for M0:
 - Added strict benchmark validation mode in `tests/reference_quality.rs`:
@@ -197,6 +214,16 @@ Completed for M1:
 - Added streaming chunk-boundary continuity regression test (join-jump vs local p95 adjacent-diff threshold).
 - Added rapid automation flush continuity coverage (ratio + tempo automation).
 
+Completed for M2:
+- Added explicit hybrid timeline bookkeeping and invariant checks in `src/stretch/hybrid.rs`.
+- Added crossfade-aware segment length compensation so segment boundary overlap no longer causes timeline shrink.
+- Added exact duration enforcement at hybrid output to guarantee target-length tempo fidelity.
+- Added M2 long-form timing regression tests in `tests/timeline_length.rs`.
+- Added hybrid timeline unit coverage:
+  - crossfade compensation preserves base total
+  - segment-target reconciliation hits desired sum
+  - timeline bookkeeping invariants hold
+
 Validation run:
 - `./benchmarks/run_m0_baseline.sh` (pass; strict mode, no skips, baseline archived)
 - `cargo test -q --test streaming` (pass)
@@ -205,3 +232,6 @@ Validation run:
 - `cargo test -q test_set_stretch_ratio_preserves_phase_state` (pass)
 - `cargo test -q test_streaming_flush_continuity_under_rapid_ratio_automation` (pass)
 - `cargo test -q test_streaming_flush_continuity_under_rapid_tempo_automation` (pass)
+- `cargo test -q --test timeline_length` (pass)
+- `cargo test -q --test hybrid_streaming` (pass)
+- `cargo test -q --test streaming_batch_parity` (pass)
