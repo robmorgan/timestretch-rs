@@ -176,7 +176,7 @@ Acceptance check:
 ---
 
 ### M5: Stereo Coherence Hardening
-Status: `pending`
+Status: `completed`
 
 Problem addressed:
 - Independent M/S processing can desync lengths/phase behavior.
@@ -189,6 +189,21 @@ Deliverables:
 Acceptance criteria:
 - No channel-length mismatch in stereo processing.
 - Improved stereo coherence metrics on benchmark material.
+
+Resolved in M5:
+- Added shared stereo segmentation/timing map path:
+  - Mid channel now builds a shared onset/beat map.
+  - Both Mid and Side are processed with the same onset anchors via `HybridStretcher::process_with_onsets()`.
+- Added deterministic channel-length agreement before decode:
+  - Mid and Side outputs are length-aligned to exact target length before M/S decode.
+- Added stereo coherence regression coverage:
+  - channel length agreement vs target
+  - mid/side energy ratio consistency
+  - inter-channel lag drift bound
+
+Acceptance check:
+- Stereo output channels are deterministic and equal-length.
+- Stereo coherence bounds covered in new unit tests.
 
 ---
 
@@ -220,7 +235,7 @@ Acceptance criteria:
 
 ## Current Progress (Updated)
 Current focus:
-- Next milestone to execute: `M5: Stereo Coherence Hardening`.
+- Next milestone to execute: `M6: Quality Gates and Release Criteria`.
 
 Completed for M0:
 - Added strict benchmark validation mode in `tests/reference_quality.rs`:
@@ -287,6 +302,15 @@ Completed for M4:
   - `tests/preanalysis_pipeline.rs`
   - core pre-analysis + parameter tests
 
+Completed for M5:
+- Added `HybridStretcher::process_with_onsets()` for shared-anchor rendering.
+- Refactored stereo mid/side path to use shared onset map from Mid channel.
+- Added deterministic per-channel target-length enforcement pre-decode.
+- Added stereo coherence tests in `src/stretch/stereo.rs`:
+  - `test_stretch_mid_side_channel_length_agreement`
+  - `test_stretch_mid_side_energy_coherence`
+  - `test_stretch_mid_side_phase_drift_bound`
+
 Validation run:
 - `./benchmarks/run_m0_baseline.sh` (pass; strict mode, no skips, baseline archived)
 - `cargo test -q --test streaming` (pass)
@@ -302,3 +326,4 @@ Validation run:
 - `cargo test -q --test preanalysis_pipeline` (pass)
 - `cargo test -q --lib analysis::preanalysis` (pass)
 - `cargo test -q --lib core::types` (pass)
+- `cargo test -q --lib stretch::stereo` (pass)

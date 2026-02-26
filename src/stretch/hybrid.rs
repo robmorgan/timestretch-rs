@@ -262,6 +262,55 @@ impl HybridStretcher {
             );
         }
 
+        self.render_with_segments(input, &segments, Some(&transients))
+    }
+
+    /// Stretches using an externally supplied shared onset map.
+    ///
+    /// Useful for stereo coherence: both channels can be segmented from the
+    /// same onset/timing map to avoid channel divergence.
+    pub fn process_with_onsets(
+        &self,
+        input: &[f32],
+        onsets: &[usize],
+        strengths: &[f32],
+    ) -> Result<Vec<f32>, StretchError> {
+        if input.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let min_size = self.params.fft_size.max(self.params.wsola_segment_size);
+        if input.len() < min_size {
+            let mut wsola = Wsola::new(
+                input.len().min(self.params.wsola_segment_size),
+                self.params.wsola_search_range.min(input.len() / 4),
+                self.params.stretch_ratio,
+            );
+            return wsola.process(input);
+        }
+
+        let mut segments = self.segment_audio(input.len(), onsets, strengths);
+        if self.params.elastic_timing
+            && (self.params.stretch_ratio - 1.0).abs() > 1e-6
+            && segments.len() > 1
+        {
+            compute_elastic_ratios(
+                &mut segments,
+                self.params.stretch_ratio,
+                self.params.elastic_anchor,
+            );
+        }
+
+        self.render_with_segments(input, &segments, None)
+    }
+
+    /// Renders pre-segmented hybrid content with exact-length timeline control.
+    fn render_with_segments(
+        &self,
+        input: &[f32],
+        segments: &[Segment],
+        transients: Option<&crate::analysis::transient::TransientMap>,
+    ) -> Result<Vec<f32>, StretchError> {
         // Step 3: Build explicit timeline bookkeeping for exact output length.
         let target_output_len = self.params.output_length(input.len());
         let base_segment_target_lens = compute_base_segment_target_lengths(&segments);
@@ -330,7 +379,9 @@ impl HybridStretcher {
             // Use per-band reset when band flux data is available to avoid
             // disrupting phase tracking in bands where no transient occurred.
             if segment.is_transient {
-                let reset_mask = compute_band_reset_mask(segment.start, &transients);
+                let reset_mask = transients
+                    .map(|t| compute_band_reset_mask(segment.start, t))
+                    .unwrap_or([true; 4]);
                 if reset_mask == [true; 4] {
                     // Full reset (fallback for beat-merged onsets or when all bands active)
                     pv.reset_phase_state();
