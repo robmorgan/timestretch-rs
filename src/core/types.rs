@@ -1549,7 +1549,7 @@ impl StretchParams {
             wsola_search_range: ms_to_samples(WSOLA_SEARCH_MS_SMALL, DEFAULT_SAMPLE_RATE),
             beat_aware: false,
             band_split: false,
-            window_type: WindowType::BlackmanHarris,
+            window_type: WindowType::Hann,
             normalize: false,
             phase_locking_mode: PhaseLockingMode::RegionOfInfluence,
             stereo_mode: StereoMode::MidSide,
@@ -2589,9 +2589,9 @@ mod tests {
     }
 
     #[test]
-    fn test_window_type_default_is_blackman_harris() {
+    fn test_window_type_default_is_hann() {
         let params = StretchParams::new(1.0);
-        assert_eq!(params.window_type, WindowType::BlackmanHarris);
+        assert_eq!(params.window_type, WindowType::Hann);
     }
 
     #[test]
