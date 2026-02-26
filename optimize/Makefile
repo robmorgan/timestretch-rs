@@ -26,7 +26,7 @@ setup:           ## Create venv and install all dependencies
 	$(MAKE) install-tools
 
 install-deps:    ## Install Python dependencies
-	uv pip install librosa soundfile numpy matplotlib pandas
+	uv pip install librosa soundfile numpy matplotlib pandas tabulate
 
 install-tools:   ## Install reference audio tools
 	@OS=$$(uname -s); \

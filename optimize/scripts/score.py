@@ -248,12 +248,21 @@ def main():
             res['ratio'] = ratio
             results.append(res)
             
+        class NumpyEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, (np.floating,)):
+                    return float(obj)
+                if isinstance(obj, (np.integer,)):
+                    return int(obj)
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                return super().default(obj)
+
         with open(args.batch, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(results, f, indent=2, cls=NumpyEncoder)
             
         avg_score = np.mean([r['total_score'] for r in results])
-        print(f"
-Batch completed. Average Score: {avg_score:.2f}", file=sys.stderr)
+        print(f"\nBatch completed. Average Score: {avg_score:.2f}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()

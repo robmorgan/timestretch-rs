@@ -1,0 +1,10 @@
+[
+  {"source": "samples/sine_440.wav", "ratio": 0.5, "description": "sine wave slowdown"},
+  {"source": "samples/sine_440.wav", "ratio": 2.0, "description": "sine wave speedup"},
+  {"source": "samples/drums_break.wav", "ratio": 0.75, "description": "transient-heavy slowdown"},
+  {"source": "samples/drums_break.wav", "ratio": 1.5, "description": "transient-heavy speedup"},
+  {"source": "samples/vocal_phrase.wav", "ratio": 0.8, "description": "vocal slowdown"},
+  {"source": "samples/vocal_phrase.wav", "ratio": 1.25, "description": "vocal speedup"},
+  {"source": "samples/full_mix.wav", "ratio": 0.9, "description": "complex mix slight stretch"},
+  {"source": "samples/silence_transient.wav", "ratio": 1.0, "description": "silence to transient edge case"}
+]

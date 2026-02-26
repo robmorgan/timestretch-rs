@@ -25,6 +25,19 @@ ${WORST_CASES}
    - Focus on: window functions, overlap-add logic, phase advancement, transient detection, or cross-correlation (WSOLA).
    - Do NOT refactor or reorganize. Only modify DSP math/logic.
 4. **Verify**: Ensure the code still compiles with `cargo build --release`.
-5. **Explain**: Briefly explain what you changed and why in your response.
+5. **Score**: Re-run the scoring pipeline to verify your change improved the score:
+   ```bash
+   cd /home/rjm/go/src/github.com/robmorgan/timestretch-rs
+   source optimize/.venv/bin/activate
+   ./optimize/scripts/run_test_suite.py
+   ./optimize/scripts/score.py --batch optimize/logs/scores_verify.json
+   ```
+6. **Commit if improved**: If the new average score is higher than the previous score (${AVG_SCORE}), commit your changes:
+   ```bash
+   git add src/
+   git commit -m "opt: <brief description of change>, score=<new_score>"
+   ```
+   If the score did not improve, revert your changes with `git checkout -- src/` and try a different approach.
+7. **Explain**: Briefly explain what you changed and why in your response.
 
 Focus on reaching the target score of ${TARGET_SCORE}.

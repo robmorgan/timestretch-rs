@@ -7,7 +7,7 @@ CONFIG_PATH="$REPO_ROOT/optimize/config.toml"
 
 get_config_val() {
     local key=$1
-    grep "^$key" "$CONFIG_PATH" | cut -d'=' -f2 | tr -d ' ",' | xargs
+    grep "^${key}\s*=" "$CONFIG_PATH" | head -n1 | cut -d'=' -f2 | sed 's/#.*//' | tr -d ' ",' | xargs
 }
 
 run_agent() {

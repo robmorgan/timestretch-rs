@@ -11,6 +11,11 @@ PROGRESS_CSV="$LOG_DIR/progress.csv"
 
 cd "$REPO_ROOT/.." # Go to real repo root
 
+# Activate venv if present
+if [ -f "optimize/.venv/bin/activate" ]; then
+    source "optimize/.venv/bin/activate"
+fi
+
 # Load common agent functions
 source "optimize/agents/common.sh"
 
@@ -96,7 +101,7 @@ for (( i=START_ITER; i<=MAX_ITERATIONS; i++ )); do
     GIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "no-git")
     echo "$i,$(date -u +%Y-%m-%dT%H:%M:%SZ),$AVG_SCORE,$WORST_SCORE,"$WORST_CASE",$(get_config "general.agent"),$GIT_SHA" >> "$PROGRESS_CSV"
     
-    if (( $(echo "$AVG_SCORE >= $TARGET_SCORE" | bc -l) )); then
+    if python3 -c "import sys; sys.exit(0 if $AVG_SCORE >= $TARGET_SCORE else 1)"; then
         echo "Target score reached! Converged at iteration $i."
         break
     fi
@@ -136,19 +141,26 @@ for item in sorted_data:
     export TARGET_SCORE=$TARGET_SCORE
     export SCORE_HISTORY="$SCORE_HISTORY"
     export JSON_SCORES="$JSON_SCORES"
-    export WORST_CASES=$(python3 -c "import json; data=json.load(open('$SCORES_JSON')); sorted_data = sorted(data, key=lambda x: x['total_score'])[:3]; [print(f'- {d["description"]}: {d["total_score"]:.2f}') for d in sorted_data]")
+    export WORST_CASES=$(python3 -c "
+import json
+data = json.load(open('$SCORES_JSON'))
+sorted_data = sorted(data, key=lambda x: x['total_score'])[:3]
+for d in sorted_data:
+    print(f'- {d[\"description\"]}: {d[\"total_score\"]:.2f}')
+")
     
     envsubst < "optimize/scripts/agent_prompt.md.tmpl" > "$PROMPT_FILE"
     
-    # 5. Run Agent
+    # 5. Run Agent (agent self-scores and commits if improved)
     if ! run_agent "$PROMPT_FILE" "$i"; then
         echo "Agent failed or build broken. Reverting changes..."
         git checkout -- src/
-        # Optional: retry with "fix the build" prompt
-    else
-        # 6. Git commit
-        git add -A
-        git commit -m "opt: iteration $i, score=$AVG_SCORE"
+    fi
+
+    # Cool off before next iteration
+    if [ $i -lt $MAX_ITERATIONS ]; then
+        echo "Cooling off for 30 seconds..."
+        sleep 30
     fi
 done
 

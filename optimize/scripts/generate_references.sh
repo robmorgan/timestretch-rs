@@ -5,7 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-MANIFEST_PATH="$REPO_ROOT/test_manifest.json"
+MANIFEST_PATH="$REPO_ROOT/../test_manifest.json"
 CONFIG_PATH="$REPO_ROOT/config.toml"
 REF_DIR="$REPO_ROOT/references"
 
@@ -67,7 +67,8 @@ validate_refs() {
     python3 -c "import json, os, subprocess;
 manifest = json.load(open('$MANIFEST_PATH'))
 for item in manifest:
-    ref_name = os.path.basename(item['source']).replace('.wav', '') + f'_ref_{item["ratio"]}.wav'
+    ratio = item['ratio']
+    ref_name = os.path.basename(item['source']).replace('.wav', '') + f'_ref_{ratio}.wav'
     ref_path = os.path.join('$REF_DIR', ref_name)
     if not os.path.exists(ref_path):
         print(f'Missing: {ref_path}')
@@ -127,7 +128,8 @@ for item in manifest:
         print(f'Warning: Source file not found: {source}')
         continue
 
-    print(f'Generating reference for {item["description"]} (ratio: {ratio})...')
+    desc = item.get('description', '')
+    print(f'Generating reference for {desc} (ratio: {ratio})...')
     
     if tool == 'rubberband':
         # High quality

@@ -7,10 +7,16 @@ LOG_FILE="optimize/logs/agent_${ITERATION}.log"
 
 MAX_TURNS=$(grep "max_turns" optimize/config.toml | cut -d'=' -f2 | tr -d ' ' || echo 10)
 
+AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+echo "=== Agent Prompt (Iteration $ITERATION) ==="
+cat "$PROMPT_FILE"
+echo ""
+echo "==========================================="
 echo "Running Claude Code agent..."
-# Assuming 'claude' CLI is available
-# Using --non-interactive if supported or just piping/passing prompt
-claude -p "$(cat "$PROMPT_FILE")" --allowedTools Edit,Write,Bash --max-turns "$MAX_TURNS" 2>&1 | tee "$LOG_FILE"
+claude -p "$(cat "$PROMPT_FILE")" --allowedTools Edit,Write,Bash --max-turns "$MAX_TURNS" --verbose --output-format stream-json 2>&1 \
+    | tee "$LOG_FILE" \
+    | python3 "$AGENT_DIR/stream_filter.py"
 
 # Check if build is broken after agent changes
 echo "Verifying build..."
