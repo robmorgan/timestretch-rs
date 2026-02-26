@@ -208,7 +208,7 @@ Acceptance check:
 ---
 
 ### M6: Quality Gates and Release Criteria
-Status: `pending`
+Status: `completed`
 
 Deliverables:
 - Tighten tests from coarse sanity checks to DJ-grade thresholds.
@@ -224,6 +224,24 @@ Acceptance criteria:
 - Regressions fail CI.
 - Measurable improvement vs M0 baseline across primary tracks.
 
+Resolved in M6:
+- Added executable quality-gate benchmark subset in `tests/quality_gates.rs` with pass/fail thresholds for:
+  - duration error
+  - transient alignment
+  - cross-correlation timing coherence
+  - loudness deviation
+  - spectral similarity by EDM band
+- Added CI target in `.github/workflows/ci.yml`:
+  - `quality-gates` job runs `cargo test --test quality_gates -- --nocapture`
+  - Gate regressions now fail CI on every PR/push.
+- Added strict-mode baseline regression guard in `tests/reference_quality.rs`:
+  - Strict corpus runs now compare against `benchmarks/baselines/m0_baseline_latest.json`
+  - Fails when average/per-track spectral similarity regresses beyond tolerance.
+
+Acceptance check:
+- Quality-gate subset passes locally and is enforced in CI.
+- Strict reference benchmark retains regression checks against M0 baseline snapshot.
+
 ## Execution Order
 1. M0 baseline integrity
 2. M1 stateful PV streaming core
@@ -235,7 +253,7 @@ Acceptance criteria:
 
 ## Current Progress (Updated)
 Current focus:
-- Next milestone to execute: `M6: Quality Gates and Release Criteria`.
+- All milestones `M0` through `M6` are completed.
 
 Completed for M0:
 - Added strict benchmark validation mode in `tests/reference_quality.rs`:
@@ -308,8 +326,14 @@ Completed for M5:
 - Added deterministic per-channel target-length enforcement pre-decode.
 - Added stereo coherence tests in `src/stretch/stereo.rs`:
   - `test_stretch_mid_side_channel_length_agreement`
-  - `test_stretch_mid_side_energy_coherence`
-  - `test_stretch_mid_side_phase_drift_bound`
+- `test_stretch_mid_side_energy_coherence`
+- `test_stretch_mid_side_phase_drift_bound`
+
+Completed for M6:
+- Added benchmark-subset quality gates in `tests/quality_gates.rs`.
+- Added CI enforcement job (`quality-gates`) in `.github/workflows/ci.yml`.
+- Added strict M0 baseline regression assertions in `tests/reference_quality.rs`.
+- Tightened coverage to explicit pass/fail thresholds for duration/transient/xcorr/loudness/spectral-band metrics.
 
 Validation run:
 - `./benchmarks/run_m0_baseline.sh` (pass; strict mode, no skips, baseline archived)
@@ -327,3 +351,5 @@ Validation run:
 - `cargo test -q --lib analysis::preanalysis` (pass)
 - `cargo test -q --lib core::types` (pass)
 - `cargo test -q --lib stretch::stereo` (pass)
+- `cargo test -q --test quality_gates` (pass)
+- `TIMESTRETCH_REFERENCE_MAX_SECONDS=5 cargo test -q --test reference_quality -- --nocapture` (pass)

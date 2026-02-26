@@ -17,6 +17,10 @@ use std::path::{Component, Path, PathBuf};
 const STRICT_ENV_VAR: &str = "TIMESTRETCH_STRICT_REFERENCE_BENCHMARK";
 /// Optional environment variable to limit analyzed audio duration per file.
 const MAX_SECONDS_ENV_VAR: &str = "TIMESTRETCH_REFERENCE_MAX_SECONDS";
+/// Baseline report path captured at M0.
+const M0_BASELINE_PATH: &str = "benchmarks/baselines/m0_baseline_latest.json";
+/// Allowed spectral regression slack against M0 baseline.
+const M0_SPECTRAL_REGRESSION_TOLERANCE: f64 = 0.01;
 
 // ---------------------------------------------------------------------------
 // Manifest types
@@ -54,13 +58,13 @@ struct Reference {
 // Report types (JSON output)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Report {
     tracks: Vec<TrackReport>,
     summary: Summary,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct TrackReport {
     id: String,
     description: String,
@@ -68,7 +72,7 @@ struct TrackReport {
     references: Vec<ReferenceReport>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ReferenceReport {
     software: String,
     algorithm: String,
@@ -77,7 +81,7 @@ struct ReferenceReport {
     presets: Vec<PresetReport>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct PresetReport {
     preset: String,
     length_diff_samples: isize,
@@ -98,7 +102,7 @@ struct PresetReport {
     overall_grade: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BandSimilarityReport {
     sub_bass: f64,
     low: f64,
@@ -106,7 +110,7 @@ struct BandSimilarityReport {
     high: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BarkBandSimilarityReport {
     sub_bass: f64,
     bass: f64,
@@ -119,7 +123,7 @@ struct BarkBandSimilarityReport {
     overall: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct OnsetTimingReport {
     mean_error_ms: f64,
     median_error_ms: f64,
@@ -131,7 +135,7 @@ struct OnsetTimingReport {
     total_onsets: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Summary {
     tracks_tested: usize,
     references_tested: usize,
@@ -140,7 +144,7 @@ struct Summary {
     best_preset_per_track: Vec<BestPreset>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BestPreset {
     track_id: String,
     preset: String,
@@ -644,6 +648,7 @@ fn reference_quality_benchmark() {
             report.summary.skipped, 0,
             "Strict mode does not allow skipped tracks/references"
         );
+        assert_not_worse_than_m0_baseline(&report);
     }
 
     // Write JSON report
@@ -768,6 +773,52 @@ fn compute_sha256(file_path: &Path) -> Result<String, String> {
     }
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn assert_not_worse_than_m0_baseline(report: &Report) {
+    let baseline_path = Path::new(M0_BASELINE_PATH);
+    if !baseline_path.exists() {
+        println!(
+            "M0 baseline not found at {}, skipping baseline regression check",
+            baseline_path.display()
+        );
+        return;
+    }
+
+    let baseline_json =
+        std::fs::read_to_string(baseline_path).expect("Failed to read M0 baseline report");
+    let baseline: Report =
+        serde_json::from_str(&baseline_json).expect("Failed to parse M0 baseline report");
+
+    let current_avg = report.summary.average_spectral_similarity;
+    let baseline_avg = baseline.summary.average_spectral_similarity;
+    assert!(
+        current_avg + M0_SPECTRAL_REGRESSION_TOLERANCE >= baseline_avg,
+        "Average spectral similarity regressed vs M0 baseline: current {:.4}, baseline {:.4}, tolerance {:.4}",
+        current_avg,
+        baseline_avg,
+        M0_SPECTRAL_REGRESSION_TOLERANCE
+    );
+
+    for current_track in &report.summary.best_preset_per_track {
+        let Some(baseline_track) = baseline
+            .summary
+            .best_preset_per_track
+            .iter()
+            .find(|b| b.track_id == current_track.track_id)
+        else {
+            continue;
+        };
+        assert!(
+            current_track.spectral_similarity + M0_SPECTRAL_REGRESSION_TOLERANCE
+                >= baseline_track.spectral_similarity,
+            "Track '{}' regressed vs M0 baseline: current {:.4}, baseline {:.4}, tolerance {:.4}",
+            current_track.track_id,
+            current_track.spectral_similarity,
+            baseline_track.spectral_similarity,
+            M0_SPECTRAL_REGRESSION_TOLERANCE
+        );
+    }
 }
 
 /// Computes RMS of a signal.

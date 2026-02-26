@@ -66,6 +66,22 @@ cargo test --test reference_quality -- --nocapture
 You can optionally set `TIMESTRETCH_REFERENCE_MAX_SECONDS=<seconds>` for deterministic
 short-window analysis during ad-hoc runs as well.
 
+## CI Quality Gate Subset
+
+CI enforces a corpus-independent benchmark subset via:
+
+```bash
+cargo test --test quality_gates -- --nocapture
+```
+
+This test uses synthetic DJ-like material and fails on regressions for:
+
+- duration error
+- transient alignment
+- cross-correlation timing coherence
+- loudness deviation
+- spectral similarity by band
+
 ## Metrics
 
 | Metric | Description |
