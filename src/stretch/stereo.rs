@@ -10,7 +10,7 @@ use crate::analysis::beat::detect_beats;
 use crate::analysis::transient::detect_transients;
 use crate::core::types::StretchParams;
 use crate::error::StretchError;
-use crate::stretch::hybrid::HybridStretcher;
+use crate::stretch::hybrid::{merge_onsets_and_beats, HybridStretcher};
 
 /// Maximum FFT size used for shared transient detection.
 const STEREO_TRANSIENT_MAX_FFT: usize = 2048;
@@ -18,8 +18,6 @@ const STEREO_TRANSIENT_MAX_FFT: usize = 2048;
 const STEREO_TRANSIENT_MAX_HOP: usize = 512;
 /// Minimum signal length before beat detection is used to augment shared map.
 const STEREO_MIN_SAMPLES_FOR_BEAT_DETECTION: usize = 44100;
-/// Minimum distance between merged transient/beat positions in shared map.
-const STEREO_DEDUP_DISTANCE: usize = 512;
 
 /// Stereo processing mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,26 +104,18 @@ fn build_shared_onset_map(mid: &[f32], params: &StretchParams) -> (Vec<usize>, V
         params.transient_sensitivity,
     );
 
-    let mut onsets = transient_map.onsets.clone();
+    let onsets = transient_map.onsets.clone();
+    let strengths = if transient_map.strengths.len() == onsets.len() {
+        transient_map.strengths.clone()
+    } else {
+        vec![1.0; onsets.len()]
+    };
     if params.beat_aware && mid.len() >= STEREO_MIN_SAMPLES_FOR_BEAT_DETECTION {
         let beat_grid = detect_beats(mid, params.sample_rate);
-        for beat in beat_grid.beats {
-            if beat >= mid.len() {
-                continue;
-            }
-            let too_close = onsets
-                .iter()
-                .any(|&existing| existing.abs_diff(beat) < STEREO_DEDUP_DISTANCE);
-            if !too_close {
-                onsets.push(beat);
-            }
-        }
-        onsets.sort_unstable();
-        // Beat-merged map has no per-onset strengths.
-        return (onsets, Vec::new());
+        return merge_onsets_and_beats(&onsets, &strengths, &beat_grid.beats, mid.len());
     }
 
-    (onsets, transient_map.strengths)
+    (onsets, strengths)
 }
 
 /// Forces a channel to deterministic target length without pitch-shifting.

@@ -12,6 +12,7 @@ use crate::stretch::multi_resolution::MultiResolutionStretcher;
 use crate::stretch::phase_vocoder::PhaseVocoder;
 use crate::stretch::wsola::Wsola;
 use rustfft::{num_complex::Complex, FftPlanner};
+use std::collections::BTreeMap;
 
 /// Minimum segment length (samples) to use phase vocoder or WSOLA; shorter segments
 /// fall back to linear resampling.
@@ -34,6 +35,16 @@ const BAND_SPLIT_HOP: usize = BAND_SPLIT_FFT_SIZE / 4;
 /// Minimum distance (samples) between merged onset/beat positions.
 /// Positions closer than this are considered duplicates.
 const DEDUP_DISTANCE: usize = 512;
+/// Sentinel strength value marking a beat-only segmentation anchor.
+///
+/// Beat-only anchors create tonal boundaries but do not create transient regions.
+const BEAT_ANCHOR_STRENGTH: f32 = f32::NEG_INFINITY;
+/// Base direct-copy attack length for transient segments.
+const TRANSIENT_ATTACK_COPY_SECS: f64 = 0.008;
+/// Minimum WSOLA search time for transient decays to keep low-end alignment stable.
+const TRANSIENT_DECAY_SEARCH_FLOOR_SECS: f64 = 0.012;
+/// WSOLA search range boost for transient decays.
+const TRANSIENT_DECAY_SEARCH_BOOST: f64 = 2.0;
 
 /// Transient-aware hybrid stretcher.
 ///
@@ -103,6 +114,29 @@ impl TimelineBookkeeping {
     }
 }
 
+/// Returns true when an anchor strength encodes a real transient.
+#[inline]
+fn strength_marks_transient(strength: f32) -> bool {
+    strength.is_finite() && strength >= 0.0
+}
+
+/// Merges two anchor strengths at the same position.
+///
+/// Transients always win over beat-only anchors. If both are transients,
+/// the stronger one is kept.
+#[inline]
+fn merge_anchor_strength(existing: f32, candidate: f32) -> f32 {
+    let existing_is_transient = strength_marks_transient(existing);
+    let candidate_is_transient = strength_marks_transient(candidate);
+
+    match (existing_is_transient, candidate_is_transient) {
+        (false, true) => candidate,
+        (true, false) => existing,
+        (true, true) => existing.max(candidate),
+        (false, false) => existing,
+    }
+}
+
 impl HybridStretcher {
     /// Creates a new hybrid stretcher.
     pub fn new(params: StretchParams) -> Self {
@@ -153,38 +187,37 @@ impl HybridStretcher {
                 && !artifact.beat_positions.is_empty()
         });
 
-        let merged;
-        let live_beats;
-        let (onsets, strengths): (&[usize], &[f32]) =
-            if self.params.beat_aware && input.len() >= MIN_SAMPLES_FOR_BEAT_DETECTION {
-                let beats = if let Some(artifact) = confident_pre {
-                    &artifact.beat_positions
-                } else {
-                    live_beats = detect_beats(input, self.params.sample_rate).beats;
-                    &live_beats
-                };
+        let mut onsets = transients.onsets.clone();
+        let mut strengths = if transients.strengths.len() == transients.onsets.len() {
+            transients.strengths.clone()
+        } else {
+            vec![1.0; transients.onsets.len()]
+        };
 
-                merged = merge_onsets_and_beats(&transients.onsets, beats, input.len());
-                // Beat-merged onsets don't have individual strengths; use a
-                // default strength of 1.0 for all (full transient region).
-                (&merged, &[])
+        if self.params.beat_aware && input.len() >= MIN_SAMPLES_FOR_BEAT_DETECTION {
+            let live_beats;
+            let beats = if let Some(artifact) = confident_pre {
+                &artifact.beat_positions
             } else {
-                (&transients.onsets, &transients.strengths)
+                live_beats = detect_beats(input, self.params.sample_rate).beats;
+                &live_beats
             };
+            let (merged_onsets, merged_strengths) =
+                merge_onsets_and_beats(&onsets, &strengths, beats, input.len());
+            onsets = merged_onsets;
+            strengths = merged_strengths;
+        }
 
         // Step 1c: When BPM is known, snap transient positions to the nearest
-        // beat subdivision. This prevents glitches at musically incoherent
-        // boundaries. Only existing detected transients are snapped — no new
-        // cuts are introduced at empty beat positions.
-        let snapped_onsets;
-        let snapped_strengths;
+        // beat subdivision. Beat-only anchors are left unchanged; they exist
+        // only to create tonal timing boundaries.
         let snap_bpm = self
             .params
             .bpm
             .or_else(|| confident_pre.map(|artifact| artifact.bpm))
             .filter(|bpm| bpm.is_finite() && *bpm > 0.0);
 
-        let (onsets, strengths): (&[usize], &[f32]) = if let Some(bpm) = snap_bpm {
+        if let Some(bpm) = snap_bpm {
             let tolerance_samples = self.params.sample_rate as f64
                 * (self.params.beat_snap_tolerance_ms / 1000.0).max(0.001);
             let subdivision = default_subdivision_for_preset(self.params.preset);
@@ -199,55 +232,39 @@ impl HybridStretcher {
                 phase_offset,
             );
 
-            // Snap each transient, keeping only those near a subdivision.
-            // Collect snapped positions and corresponding strengths together
-            // to preserve the strength association. Dedup consecutive duplicates
-            // (multiple transients snapping to the same grid point).
+            // Keep transient strength association after snapping and preserve
+            // beat-only boundaries as non-transient anchors.
             let strict_suppression = confident_pre.is_some();
-            let mut last_position: Option<usize> = None;
-            let mut new_onsets = Vec::with_capacity(onsets.len());
-            let mut new_strengths = Vec::with_capacity(strengths.len());
+            let had_transients = strengths.iter().copied().any(strength_marks_transient);
+            let mut snapped: BTreeMap<usize, f32> = BTreeMap::new();
             for (i, &onset) in onsets.iter().enumerate() {
-                let chosen = match snap_to_subdivision(onset as f64, &beat_grid, tolerance_samples)
-                {
-                    Some(snapped) => snapped.round() as usize,
-                    None if strict_suppression => continue,
-                    None => onset,
+                let strength = strengths.get(i).copied().unwrap_or(1.0);
+                let is_transient = strength_marks_transient(strength);
+                let chosen = if is_transient {
+                    match snap_to_subdivision(onset as f64, &beat_grid, tolerance_samples) {
+                        Some(snapped) => snapped.round() as usize,
+                        None if strict_suppression => continue,
+                        None => onset,
+                    }
+                } else {
+                    onset
                 };
 
-                // Deduplicate: skip if this maps to the same position as previous.
-                if last_position == Some(chosen) {
-                    continue;
-                }
-                last_position = Some(chosen);
-                new_onsets.push(chosen);
-                if i < strengths.len() {
-                    new_strengths.push(strengths[i]);
-                }
+                snapped
+                    .entry(chosen)
+                    .and_modify(|existing| *existing = merge_anchor_strength(*existing, strength))
+                    .or_insert(strength);
             }
 
-            // Safety fallback: avoid suppressing all transients.
-            if new_onsets.is_empty() && !onsets.is_empty() {
-                new_onsets.extend_from_slice(onsets);
-                new_strengths.extend_from_slice(strengths);
+            let snapped_has_transients = snapped.values().copied().any(strength_marks_transient);
+            if !snapped.is_empty() && (!had_transients || snapped_has_transients) {
+                onsets = snapped.keys().copied().collect();
+                strengths = snapped.values().copied().collect();
             }
-
-            snapped_onsets = new_onsets;
-            snapped_strengths = new_strengths;
-            (
-                &snapped_onsets,
-                if snapped_strengths.is_empty() {
-                    &[]
-                } else {
-                    &snapped_strengths
-                },
-            )
-        } else {
-            (onsets, strengths)
-        };
+        }
 
         // Step 2: Segment audio at transient/beat boundaries
-        let mut segments = self.segment_audio(input.len(), onsets, strengths);
+        let mut segments = self.segment_audio(input.len(), &onsets, &strengths);
 
         // Step 2b: Compute elastic per-segment ratios if enabled.
         // Guard: only when elastic_timing is on AND ratio != 1.0 (identity).
@@ -634,9 +651,12 @@ impl HybridStretcher {
             return vec![];
         }
 
-        // Attack portion: ~5ms direct copy (preserves onset shape and timing)
-        let attack_samples =
-            ((self.params.sample_rate as f64 * 0.005) as usize).min(seg_data.len());
+        // Attack portion: longer direct copy keeps kick onset and early low-end
+        // phase relationship intact before WSOLA handles the decay.
+        let attack_samples = ((self.params.sample_rate as f64 * TRANSIENT_ATTACK_COPY_SECS)
+            as usize)
+            .min(seg_data.len())
+            .max(1);
         // Crossfade duration between attack and decay (2ms)
         let crossfade_len = ((self.params.sample_rate as f64 * 0.002) as usize)
             .min(attack_samples / 2)
@@ -681,11 +701,15 @@ impl HybridStretcher {
                 .wsola_segment_size
                 .min(decay.len() / 2)
                 .max(MIN_WSOLA_SEGMENT);
-            let search = self
-                .params
-                .effective_wsola_search_range()
-                .min(seg_size / 2)
-                .max(MIN_WSOLA_SEARCH);
+            let boosted_search = ((self.params.effective_wsola_search_range() as f64)
+                * TRANSIENT_DECAY_SEARCH_BOOST)
+                .round() as usize;
+            let transient_search_floor =
+                (self.params.sample_rate as f64 * TRANSIENT_DECAY_SEARCH_FLOOR_SECS) as usize;
+            let search = boosted_search
+                .max(transient_search_floor)
+                .max(MIN_WSOLA_SEARCH)
+                .min(seg_size.saturating_sub(1));
             let mut wsola = Wsola::new(seg_size, search, decay_out_len as f64 / decay.len() as f64);
             wsola.process(decay).unwrap_or_else(|_| {
                 crate::core::resample::resample_linear(decay, decay_out_len.max(1))
@@ -768,7 +792,7 @@ impl HybridStretcher {
                 continue;
             }
 
-            // Tonal region before this onset
+            // Tonal region before this boundary
             let tonal_end = onset.min(input_len);
             if tonal_end > pos {
                 segments.push(Segment {
@@ -779,12 +803,15 @@ impl HybridStretcher {
                 });
             }
 
+            let strength = strengths.get(i).copied().unwrap_or(1.0);
+            let is_transient_anchor = strength_marks_transient(strength);
+            if !is_transient_anchor {
+                // Beat-only anchor: create a tonal boundary without a transient segment.
+                pos = tonal_end;
+                continue;
+            }
+
             // Adaptive transient region: scale by onset strength
-            let strength = if i < strengths.len() {
-                strengths[i]
-            } else {
-                1.0 // default to full region if no strength info
-            };
             // region = min + (max - min) * (0.3 + 0.7 * strength)
             let scale = 0.3 + 0.7 * strength as f64;
             let transient_size = min_transient_size
@@ -836,8 +863,8 @@ fn compute_fixed_crossfade_len(
     }
 
     let mut crossfade_samples = (sample_rate as f64 * crossfade_secs) as usize;
-    // Ensure crossfade spans at least 2 cycles at 60 Hz to avoid pops.
-    let min_crossfade_samples = (2.0 * sample_rate as f64 / CROSSFADE_MIN_FREQ_HZ) as usize;
+    // Ensure crossfade spans at least 2 cycles at low frequency to avoid pops.
+    let min_crossfade_samples = (2.0 * sample_rate as f64 / CROSSFADE_MIN_FREQ_HZ_TONAL) as usize;
     crossfade_samples = crossfade_samples.max(min_crossfade_samples);
 
     // Cap at 25% of the shortest segment output length.
@@ -937,25 +964,26 @@ const CROSSFADE_TRANSIENT_TO_TONAL_SECS: f64 = 0.009;
 const CROSSFADE_TONAL_TO_TONAL_SECS: f64 = 0.017;
 /// Transient→Transient: minimal blending, but enough to avoid pops.
 const CROSSFADE_TRANSIENT_TO_TRANSIENT_SECS: f64 = 0.005;
-/// Lowest frequency (Hz) used to compute the minimum crossfade duration.
-/// Crossfades must span at least 2 cycles of this frequency to avoid pops.
-const CROSSFADE_MIN_FREQ_HZ: f64 = 60.0;
+/// Lowest frequency (Hz) for fixed/tonal crossfade minimum duration.
+const CROSSFADE_MIN_FREQ_HZ_TONAL: f64 = 60.0;
+/// Lowest frequency (Hz) for transient-boundary crossfades.
+///
+/// Using a higher floor frequency shortens transient boundary overlaps so kick
+/// attacks are not smeared by long blends.
+const CROSSFADE_MIN_FREQ_HZ_TRANSIENT: f64 = 180.0;
 
 /// Computes per-boundary crossfade lengths based on segment transitions.
 ///
 /// Returns a vector of crossfade lengths in samples, one per boundary
 /// (length = segments.len() - 1).
 ///
-/// Each crossfade is at least 2 cycles of the lowest active frequency
-/// (`CROSSFADE_MIN_FREQ_HZ`) and at most 25% of the shorter adjacent
-/// segment's output length.
+/// Each crossfade is at least 2 cycles of a transition-dependent minimum
+/// frequency (shorter at transient boundaries, longer for tonal boundaries),
+/// and at most 25% of the shorter adjacent segment's output length.
 fn compute_adaptive_crossfade_lens(segments: &[Segment], sample_rate: u32) -> Vec<usize> {
     if segments.len() <= 1 {
         return vec![];
     }
-
-    // Minimum crossfade: 2 full cycles of the lowest frequency we care about
-    let min_crossfade_samples = (2.0 * sample_rate as f64 / CROSSFADE_MIN_FREQ_HZ) as usize;
 
     let mut lens = Vec::with_capacity(segments.len() - 1);
     for i in 1..segments.len() {
@@ -970,7 +998,14 @@ fn compute_adaptive_crossfade_lens(segments: &[Segment], sample_rate: u32) -> Ve
         };
         let mut crossfade_samples = (sample_rate as f64 * secs) as usize;
 
-        // Enforce minimum: at least 2 cycles of the lowest frequency
+        // Enforce transition-dependent minimum:
+        // transient boundaries can use shorter overlaps than tonal boundaries.
+        let min_freq_hz = if prev.is_transient || cur.is_transient {
+            CROSSFADE_MIN_FREQ_HZ_TRANSIENT
+        } else {
+            CROSSFADE_MIN_FREQ_HZ_TONAL
+        };
+        let min_crossfade_samples = (2.0 * sample_rate as f64 / min_freq_hz) as usize;
         crossfade_samples = crossfade_samples.max(min_crossfade_samples);
 
         // Cap at 25% of the shorter adjacent segment's output length
@@ -1301,26 +1336,62 @@ fn normalize_band_split(sub_bass: &mut [f32], remainder: &mut [f32], window_sum:
 ///
 /// Beat positions that fall within `DEDUP_DISTANCE` samples of an existing
 /// transient onset are dropped to avoid creating overly short segments.
-fn merge_onsets_and_beats(onsets: &[usize], beats: &[usize], input_len: usize) -> Vec<usize> {
-    let mut merged: Vec<usize> = Vec::with_capacity(onsets.len() + beats.len());
-    merged.extend_from_slice(onsets);
+///
+/// The returned strengths are aligned with returned onset positions:
+/// - finite `>= 0.0`: transient anchor with that strength
+/// - non-finite (`BEAT_ANCHOR_STRENGTH`): beat-only anchor
+pub(crate) fn merge_onsets_and_beats(
+    onsets: &[usize],
+    strengths: &[f32],
+    beats: &[usize],
+    input_len: usize,
+) -> (Vec<usize>, Vec<f32>) {
+    let mut merged_positions: Vec<usize> = Vec::with_capacity(onsets.len() + beats.len());
+    let mut merged_strengths: Vec<f32> = Vec::with_capacity(onsets.len() + beats.len());
 
-    // Add beat positions that aren't too close to existing transient onsets
+    for (i, &onset) in onsets.iter().enumerate() {
+        if onset >= input_len {
+            continue;
+        }
+        merged_positions.push(onset);
+        merged_strengths.push(strengths.get(i).copied().unwrap_or(1.0));
+    }
+
+    // Add beat positions that aren't too close to existing anchors.
     for &beat in beats {
         if beat >= input_len {
             continue;
         }
-        let too_close = merged.iter().any(|&pos| {
+        let too_close = merged_positions.iter().any(|&pos| {
             let dist = pos.abs_diff(beat);
             dist < DEDUP_DISTANCE
         });
         if !too_close {
-            merged.push(beat);
+            merged_positions.push(beat);
+            merged_strengths.push(BEAT_ANCHOR_STRENGTH);
         }
     }
 
-    merged.sort_unstable();
-    merged
+    let mut pairs: Vec<(usize, f32)> = merged_positions.into_iter().zip(merged_strengths).collect();
+    pairs.sort_unstable_by_key(|(pos, _)| *pos);
+
+    // Collapse exact duplicate positions while preserving transient priority.
+    let mut out_onsets = Vec::with_capacity(pairs.len());
+    let mut out_strengths = Vec::with_capacity(pairs.len());
+    for (pos, strength) in pairs {
+        if let Some(last_pos) = out_onsets.last().copied() {
+            if last_pos == pos {
+                if let Some(last_strength) = out_strengths.last_mut() {
+                    *last_strength = merge_anchor_strength(*last_strength, strength);
+                }
+                continue;
+            }
+        }
+        out_onsets.push(pos);
+        out_strengths.push(strength);
+    }
+
+    (out_onsets, out_strengths)
 }
 
 /// Generates a subdivision grid with a phase/downbeat offset.
@@ -1447,34 +1518,49 @@ mod tests {
 
     #[test]
     fn test_merge_onsets_and_beats_empty() {
-        let result = merge_onsets_and_beats(&[], &[], 44100);
-        assert!(result.is_empty());
+        let (onsets, strengths) = merge_onsets_and_beats(&[], &[], &[], 44100);
+        assert!(onsets.is_empty());
+        assert!(strengths.is_empty());
     }
 
     #[test]
     fn test_merge_onsets_and_beats_no_overlap() {
         let onsets = vec![1000, 5000];
+        let strengths = vec![0.8, 0.6];
         let beats = vec![10000, 20000];
-        let result = merge_onsets_and_beats(&onsets, &beats, 44100);
-        assert_eq!(result, vec![1000, 5000, 10000, 20000]);
+        let (merged_onsets, merged_strengths) =
+            merge_onsets_and_beats(&onsets, &strengths, &beats, 44100);
+        assert_eq!(merged_onsets, vec![1000, 5000, 10000, 20000]);
+        assert_eq!(merged_strengths[0], 0.8);
+        assert_eq!(merged_strengths[1], 0.6);
+        assert!(!strength_marks_transient(merged_strengths[2]));
+        assert!(!strength_marks_transient(merged_strengths[3]));
     }
 
     #[test]
     fn test_merge_onsets_and_beats_dedup_close() {
         // Beat at 1100 is within 512 samples of onset at 1000 — should be deduped
         let onsets = vec![1000, 5000];
+        let strengths = vec![0.7, 0.9];
         let beats = vec![1100, 20000];
-        let result = merge_onsets_and_beats(&onsets, &beats, 44100);
-        assert_eq!(result, vec![1000, 5000, 20000]);
+        let (merged_onsets, merged_strengths) =
+            merge_onsets_and_beats(&onsets, &strengths, &beats, 44100);
+        assert_eq!(merged_onsets, vec![1000, 5000, 20000]);
+        assert_eq!(merged_strengths[0], 0.7);
+        assert_eq!(merged_strengths[1], 0.9);
+        assert!(!strength_marks_transient(merged_strengths[2]));
     }
 
     #[test]
     fn test_merge_onsets_and_beats_out_of_bounds() {
         // Beat at 50000 exceeds input_len of 44100 — should be dropped
         let onsets = vec![1000];
+        let strengths = vec![0.5];
         let beats = vec![50000];
-        let result = merge_onsets_and_beats(&onsets, &beats, 44100);
-        assert_eq!(result, vec![1000]);
+        let (merged_onsets, merged_strengths) =
+            merge_onsets_and_beats(&onsets, &strengths, &beats, 44100);
+        assert_eq!(merged_onsets, vec![1000]);
+        assert_eq!(merged_strengths, strengths);
     }
 
     #[test]
@@ -2000,6 +2086,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_segment_audio_beat_only_anchor_is_tonal_boundary() {
+        let params = StretchParams::new(1.2).with_sample_rate(44100);
+        let stretcher = HybridStretcher::new(params);
+        let input_len = 44100;
+        let onsets = vec![10000, 20000];
+        let strengths = vec![BEAT_ANCHOR_STRENGTH, 0.9];
+
+        let segments = stretcher.segment_audio(input_len, &onsets, &strengths);
+        assert!(
+            segments.len() >= 3,
+            "Expected tonal split + transient region, got {segments:?}"
+        );
+        assert_eq!(segments[0].start, 0);
+        assert_eq!(segments[0].end, 10000);
+        assert!(!segments[0].is_transient);
+        assert_eq!(segments[1].start, 10000);
+        assert_eq!(segments[1].end, 20000);
+        assert!(!segments[1].is_transient);
+        assert_eq!(segments[2].start, 20000);
+        assert!(segments[2].is_transient);
+    }
+
     // --- concatenate_with_crossfade edge cases ---
 
     #[test]
@@ -2090,6 +2199,47 @@ mod tests {
     }
 
     #[test]
+    fn test_adaptive_crossfade_shorter_on_transient_boundaries() {
+        let segments = vec![
+            Segment {
+                start: 0,
+                end: 10000,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 10000,
+                end: 20000,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 20000,
+                end: 30000,
+                is_transient: true,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 30000,
+                end: 40000,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+        ];
+
+        let lens = compute_adaptive_crossfade_lens(&segments, 44100);
+        assert_eq!(lens.len(), 3);
+        assert!(
+            lens[1] < lens[0],
+            "Tonal→transient crossfade should be shorter than tonal→tonal"
+        );
+        assert!(
+            lens[2] < lens[0],
+            "Transient→tonal crossfade should be shorter than tonal→tonal"
+        );
+    }
+
+    #[test]
     fn test_reconcile_total_segment_targets_hits_desired_sum() {
         let mut targets = vec![100usize, 200, 300];
         reconcile_total_segment_targets(&mut targets, 700);
@@ -2117,19 +2267,21 @@ mod tests {
     fn test_merge_dedup_distance_exactly_512() {
         // Beat exactly 512 samples from onset → just barely too close, should be deduped
         let onsets = vec![1000];
+        let strengths = vec![1.0];
         let beats = vec![1512]; // exactly 512 away
-        let result = merge_onsets_and_beats(&onsets, &beats, 44100);
+        let (merged_onsets, _) = merge_onsets_and_beats(&onsets, &strengths, &beats, 44100);
         // DEDUP_DISTANCE = 512, condition is dist < 512, so 512 is NOT too close
-        assert_eq!(result, vec![1000, 1512]);
+        assert_eq!(merged_onsets, vec![1000, 1512]);
     }
 
     #[test]
     fn test_merge_dedup_distance_511() {
         // Beat 511 samples from onset → too close, should be deduped
         let onsets = vec![1000];
+        let strengths = vec![1.0];
         let beats = vec![1511]; // 511 away (< 512)
-        let result = merge_onsets_and_beats(&onsets, &beats, 44100);
-        assert_eq!(result, vec![1000]); // beat deduped
+        let (merged_onsets, _) = merge_onsets_and_beats(&onsets, &strengths, &beats, 44100);
+        assert_eq!(merged_onsets, vec![1000]); // beat deduped
     }
 
     // --- separate_sub_bass: short input fallback ---
