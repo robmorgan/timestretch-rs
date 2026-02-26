@@ -11,7 +11,7 @@ Improve DJ beatmatching audio quality and timing correctness for both offline an
 ## Milestones
 
 ### M0: Baseline + Measurement Integrity
-Status: `pending`
+Status: `in_progress`
 
 Deliverables:
 - Fix benchmark manifest/path inconsistencies so reference comparison always runs.
@@ -22,10 +22,17 @@ Acceptance criteria:
 - `reference_quality_benchmark` processes real files (no silent skip).
 - Baseline report archived for comparison against each milestone.
 
+Current state:
+- `tests/reference_quality.rs` benchmark harness is implemented and reports timing/spectral/transient/loudness/length metrics in one command:
+  - `cargo test --test reference_quality -- --nocapture`
+- Manifest/path consistency is not fully resolved yet:
+  - Current manifest entries are resolved as `benchmarks/audio/<path>`, but the checked-in sample track uses `audio/...`, yielding `benchmarks/audio/audio/...` at runtime.
+- Baseline report archival workflow is not yet finalized.
+
 ---
 
 ### M1: Stateful Streaming Phase Vocoder Core
-Status: `in_progress` (started in this pass)
+Status: `completed`
 
 Problem addressed:
 - Realtime PV quality is limited by per-call state handling and chunk-boundary overlap behavior.
@@ -44,8 +51,10 @@ Files (initial pass):
 - `src/stream/processor.rs`
 - `tests/streaming_edge_cases.rs`
 
-Remaining work in M1:
-- Validate tail/flush behavior under rapid tempo-ratio automation.
+Completed validation for prior remaining work:
+- Tail/flush continuity validated under rapid ratio and tempo automation:
+  - `test_streaming_flush_continuity_under_rapid_ratio_automation`
+  - `test_streaming_flush_continuity_under_rapid_tempo_automation`
 
 ---
 
@@ -143,8 +152,8 @@ Acceptance criteria:
 6. M5 stereo hardening
 7. M6 quality gates
 
-## Current Progress (This Pass)
-Completed/started for M1:
+## Current Progress (Updated)
+Completed for M1:
 - Added stateful streaming PV methods:
   - `PhaseVocoder::process_streaming()`
   - `PhaseVocoder::flush_streaming()`
@@ -154,11 +163,13 @@ Completed/started for M1:
 - Changed streaming input drain policy to hop-based consumption (`frames * hop`) to keep required analysis context.
 - Added stream-tail flush integration in `StreamProcessor::flush()` and `flush_into()`.
 - Added streaming chunk-boundary continuity regression test (join-jump vs local p95 adjacent-diff threshold).
+- Added rapid automation flush continuity coverage (ratio + tempo automation).
 
-Validation run in this pass:
-- `cargo test -q test_streaming_chunk_boundary_continuity` (pass)
-- `cargo test -q --test streaming_edge_cases` (pass)
+Validation run:
 - `cargo test -q --test streaming` (pass)
+- `cargo test -q --test streaming_edge_cases` (pass)
 - `cargo test -q --test hybrid_streaming` (pass)
-- `cargo test -q stream_processor_` (pass)
 - `cargo test -q test_set_stretch_ratio_preserves_phase_state` (pass)
+- `cargo test -q test_streaming_flush_continuity_under_rapid_ratio_automation` (pass)
+- `cargo test -q test_streaming_flush_continuity_under_rapid_tempo_automation` (pass)
+- `cargo test -q --test reference_quality -- --nocapture` (pass; currently reports skipped track due to manifest path mismatch)
