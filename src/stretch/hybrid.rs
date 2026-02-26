@@ -826,53 +826,66 @@ impl HybridStretcher {
             }];
         }
 
+        let max_transient_size =
+            (self.params.sample_rate as f64 * self.params.transient_region_secs) as usize;
+        // Minimum 5ms region for weak transients
+        let min_transient_size = (self.params.sample_rate as f64 * 0.005) as usize;
+
         let global_ratio = self.params.stretch_ratio;
         let mut segments = Vec::new();
-
-        // Build onset-to-onset segments instead of creating tiny transient
-        // regions. This produces longer segments that the phase vocoder can
-        // process with full spectral quality. Segments that begin at a
-        // transient onset are marked `is_transient` so that the PV phase
-        // state is reset at those boundaries for temporal alignment.
-        let mut boundaries: Vec<(usize, bool)> = Vec::with_capacity(onsets.len() + 2);
-        boundaries.push((0, false));
+        let mut pos = 0;
 
         for (i, &onset) in onsets.iter().enumerate() {
-            if onset > 0 && onset < input_len {
-                let strength = strengths.get(i).copied().unwrap_or(1.0);
-                let is_transient = strength_marks_transient(strength);
-                boundaries.push((onset, is_transient));
+            if onset <= pos {
+                continue;
             }
-        }
 
-        // Sort and deduplicate by position (keep strongest transient flag).
-        boundaries.sort_by_key(|&(pos, _)| pos);
-        boundaries.dedup_by(|a, b| {
-            if a.0 == b.0 {
-                // Keep transient flag if either boundary is transient
-                b.1 = b.1 || a.1;
-                true
-            } else {
-                false
-            }
-        });
-
-        for i in 0..boundaries.len() {
-            let (start, is_transient) = boundaries[i];
-            let end = if i + 1 < boundaries.len() {
-                boundaries[i + 1].0
-            } else {
-                input_len
-            };
-
-            if end > start {
+            // Tonal region before this boundary
+            let tonal_end = onset.min(input_len);
+            if tonal_end > pos {
                 segments.push(Segment {
-                    start,
-                    end,
-                    is_transient,
+                    start: pos,
+                    end: tonal_end,
+                    is_transient: false,
                     stretch_ratio: global_ratio,
                 });
             }
+
+            let strength = strengths.get(i).copied().unwrap_or(1.0);
+            let is_transient_anchor = strength_marks_transient(strength);
+            if !is_transient_anchor {
+                // Beat-only anchor: create a tonal boundary without a transient segment.
+                pos = tonal_end;
+                continue;
+            }
+
+            // Adaptive transient region: scale by onset strength
+            // region = min + (max - min) * (0.3 + 0.7 * strength)
+            let scale = 0.3 + 0.7 * strength as f64;
+            let transient_size = min_transient_size
+                + ((max_transient_size - min_transient_size) as f64 * scale) as usize;
+
+            let trans_end = (onset + transient_size).min(input_len);
+            if trans_end > onset {
+                segments.push(Segment {
+                    start: onset,
+                    end: trans_end,
+                    is_transient: true,
+                    stretch_ratio: global_ratio,
+                });
+            }
+
+            pos = trans_end;
+        }
+
+        // Remaining tonal region
+        if pos < input_len {
+            segments.push(Segment {
+                start: pos,
+                end: input_len,
+                is_transient: false,
+                stretch_ratio: global_ratio,
+            });
         }
 
         segments

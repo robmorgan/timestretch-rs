@@ -20,7 +20,7 @@ const DEFAULT_LOW_CROSSOVER: f64 = 200.0;
 const DEFAULT_HIGH_CROSSOVER: f64 = 4000.0;
 
 /// Multiplier for sub-bass FFT size relative to mid FFT size.
-const SUB_BASS_FFT_MULTIPLIER: usize = 2;
+const SUB_BASS_FFT_MULTIPLIER: usize = 4;
 /// Divisor for high-band FFT size relative to mid FFT size.
 const HIGH_FFT_DIVISOR: usize = 4;
 

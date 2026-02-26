@@ -961,7 +961,10 @@ impl AudioBuffer {
     /// assert!((l - r).abs() < 1e-6);
     /// ```
     pub fn pan(&self, pan: f32) -> Self {
-        let pan = pan.clamp(-1.0, 1.0);
+        assert!(
+            (-1.0..=1.0).contains(&pan),
+            "pan must be in [-1.0, 1.0], got {pan}"
+        );
 
         if self.channels == Channels::Stereo {
             return self.clone();
@@ -1219,7 +1222,7 @@ impl EdmPreset {
             EdmPreset::DjBeatmatch => PresetConfig {
                 fft_size: 4096,
                 hop_size: 4096 / 4, // 1024: 75% overlap, good COLA with Hann windows
-                transient_sensitivity: 0.5, // increased sensitivity for cleaner transients
+                transient_sensitivity: 0.3,
                 wsola_search_ms: WSOLA_SEARCH_MS_SMALL,
                 wsola_segment_ms: 50.0, // more context for cross-correlation at small ratios
                 transient_region_ms: 30.0, // kick attack+early decay is 30-50ms
