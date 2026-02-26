@@ -1,0 +1,30 @@
+# Time-Stretch Quality Optimization - Iteration ${ITERATION}
+
+You are an expert DSP engineer. Your goal is to optimize the time-stretching quality of the `timestretch-rs` library.
+
+## Current Performance Summary
+- **Average Score:** ${AVG_SCORE} / 100 (Target: ${TARGET_SCORE})
+- **Score Trend (Last 3):** ${SCORE_HISTORY}
+
+## Detailed Metrics per Test Case
+${JSON_SCORES}
+
+## Worst Performing Cases
+${WORST_CASES}
+
+### Understanding the Metrics
+- **Spectral Convergence**: Measures magnitude similarity in the frequency domain. Low scores mean frequency content is distorted or "smeared".
+- **Log Spectral Distance**: Measures spectral difference in dB. High values indicate tonal coloration or gain issues.
+- **MFCC Distance**: Measures timbral similarity. High distance means the "character" of the sound has changed.
+- **Transient Preservation**: Measures how well onsets (drum hits, etc.) are preserved. Low scores mean transients are "softened" or "doubled".
+
+## Instructions
+1. **Analyze**: Read the relevant Rust source files in `src/` (especially `src/stretch/`).
+2. **Diagnose**: Look at the worst performing cases. Are they transients (drums)? Are they harmonic (sine/vocals)?
+3. **Modify**: Make **ONE** targeted change to the DSP logic to improve the scores.
+   - Focus on: window functions, overlap-add logic, phase advancement, transient detection, or cross-correlation (WSOLA).
+   - Do NOT refactor or reorganize. Only modify DSP math/logic.
+4. **Verify**: Ensure the code still compiles with `cargo build --release`.
+5. **Explain**: Briefly explain what you changed and why in your response.
+
+Focus on reaching the target score of ${TARGET_SCORE}.

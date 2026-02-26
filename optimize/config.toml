@@ -1,0 +1,26 @@
+[general]
+max_iterations = 50
+target_score = 92.0
+agent = "claude_code"  # or "codex"
+
+[reference_tool]
+# Preference order: rubberband > soundstretch > sox
+# The script should auto-detect which is available
+primary = "rubberband"
+fallback = "soundstretch"
+rubberband_quality = "-3 -F --pitch-hq"  # R3 + fine mode
+soundstretch_opts = ""
+
+[scoring]
+# weights for the final score
+spectral_convergence = 0.30
+log_spectral_distance = 0.25
+mfcc_distance = 0.20
+transient_preservation = 0.25
+
+[agent.claude_code]
+max_turns = 10
+allowed_tools = ["Edit", "Write", "Bash"]
+
+[agent.codex]
+model = "o3-mini"
