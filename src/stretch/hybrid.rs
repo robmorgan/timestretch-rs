@@ -48,6 +48,12 @@ const TRANSIENT_DECAY_SEARCH_BOOST: f64 = 2.0;
 /// RMS threshold (linear) below which audio is considered silence for the
 /// leading-silence bypass in tonal segments. Approximately -66 dB.
 const LEADING_SILENCE_RMS_THRESHOLD: f32 = 5e-4;
+/// Crest-factor threshold used to detect sparse impulse-like content.
+const IMPULSIVE_CREST_THRESHOLD: f32 = 20.0;
+/// Samples above this fraction of peak are considered "strong".
+const IMPULSIVE_STRONG_SAMPLE_FRACTION: f32 = 0.5;
+/// Maximum number of strong samples for the signal to be treated as sparse/impulsive.
+const IMPULSIVE_MAX_STRONG_SAMPLES: usize = 8;
 
 /// Transient-aware hybrid stretcher.
 ///
@@ -140,6 +146,35 @@ fn merge_anchor_strength(existing: f32, candidate: f32) -> f32 {
     }
 }
 
+#[inline]
+fn is_sparse_impulsive(signal: &[f32]) -> bool {
+    // Restrict this heuristic to long one-shot buffers; applying it to small
+    // streaming chunks can skew the effective ratio.
+    if signal.len() < MIN_SAMPLES_FOR_BEAT_DETECTION {
+        return false;
+    }
+
+    let peak = signal.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+    if peak <= 1e-6 {
+        return false;
+    }
+
+    let rms = (signal.iter().map(|&s| s * s).sum::<f32>() / signal.len() as f32).sqrt();
+    if rms <= 1e-9 {
+        return false;
+    }
+    if peak / rms < IMPULSIVE_CREST_THRESHOLD {
+        return false;
+    }
+
+    let strong_threshold = peak * IMPULSIVE_STRONG_SAMPLE_FRACTION;
+    let strong_count = signal
+        .iter()
+        .filter(|&&sample| sample.abs() >= strong_threshold)
+        .count();
+    strong_count <= IMPULSIVE_MAX_STRONG_SAMPLES
+}
+
 impl HybridStretcher {
     /// Creates a new hybrid stretcher.
     pub fn new(params: StretchParams) -> Self {
@@ -155,6 +190,13 @@ impl HybridStretcher {
     pub fn process(&self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
         if input.is_empty() {
             return Ok(vec![]);
+        }
+
+        // Sparse impulses are poorly represented by tonal PV processing.
+        // Keep their transient peak by using direct resampling instead.
+        if is_sparse_impulsive(input) {
+            let out_len = (input.len() as f64 * self.params.stretch_ratio).round() as usize;
+            return Ok(crate::core::resample::resample_linear(input, out_len.max(1)));
         }
 
         let min_size = self.params.fft_size.max(self.params.wsola_segment_size);

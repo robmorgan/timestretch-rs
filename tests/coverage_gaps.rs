@@ -614,19 +614,23 @@ mod audio_buffer_edges {
     }
 
     #[test]
-    #[should_panic(expected = "sample rate mismatch")]
-    fn concatenate_mismatched_sample_rate_panics() {
+    fn concatenate_mismatched_sample_rate_returns_empty() {
         let buf1 = AudioBuffer::from_mono(vec![1.0], 44100);
         let buf2 = AudioBuffer::from_mono(vec![2.0], 48000);
-        let _result = AudioBuffer::concatenate(&[&buf1, &buf2]);
+        let result = AudioBuffer::concatenate(&[&buf1, &buf2]);
+        assert!(result.is_empty());
+        assert_eq!(result.sample_rate, buf1.sample_rate);
+        assert_eq!(result.channels, buf1.channels);
     }
 
     #[test]
-    #[should_panic(expected = "channel layout mismatch")]
-    fn concatenate_mismatched_channels_panics() {
+    fn concatenate_mismatched_channels_returns_empty() {
         let buf1 = AudioBuffer::from_mono(vec![1.0], 44100);
         let buf2 = AudioBuffer::new(vec![1.0, 2.0], 44100, Channels::Stereo);
-        let _result = AudioBuffer::concatenate(&[&buf1, &buf2]);
+        let result = AudioBuffer::concatenate(&[&buf1, &buf2]);
+        assert!(result.is_empty());
+        assert_eq!(result.sample_rate, buf1.sample_rate);
+        assert_eq!(result.channels, buf1.channels);
     }
 
     #[test]
