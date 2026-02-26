@@ -1,7 +1,11 @@
 //! Real-time streaming time-stretch processor.
 
+use rustfft::{num_complex::Complex, FftPlanner};
+
+use crate::core::fft::COMPLEX_ZERO;
 use crate::core::ring_buffer::RingBuffer;
 use crate::core::types::{QualityMode, StretchParams};
+use crate::core::window::{generate_window, WindowType};
 use crate::error::StretchError;
 use crate::stretch::hybrid::HybridStretcher;
 use crate::stretch::phase_vocoder::PhaseVocoder;
@@ -22,6 +26,22 @@ const LATENCY_FFT_DENOMINATOR: usize = 2;
 const MAX_CALLBACK_FRAMES: usize = 1024;
 const MIN_CALLBACK_FRAMES: usize = 64;
 const COMMON_CALLBACK_FRAMES: usize = 256;
+/// Mid-band start for spectral-flux transient detection (Hz).
+const FLUX_MID_START_HZ: f64 = 500.0;
+/// High-band start for spectral-flux transient detection (Hz).
+const FLUX_HIGH_START_HZ: f64 = 4000.0;
+/// EMA coefficient for adaptive spectral-flux statistics.
+const FLUX_EMA_ALPHA: f64 = 0.2;
+/// Sigma multiplier for adaptive spectral-flux threshold.
+const FLUX_THRESHOLD_SIGMA: f64 = 2.5;
+/// Required jump versus previous frame flux to classify a transient.
+const FLUX_SPIKE_RATIO: f64 = 1.6;
+/// Absolute guard to suppress near-silence false triggers.
+const FLUX_ABS_MIN: f64 = 1e-4;
+/// Extra emphasis on high-band flux.
+const FLUX_HIGH_WEIGHT: f64 = 1.25;
+/// Number of flux frames to observe before trigger checks.
+const FLUX_WARMUP_FRAMES: usize = 3;
 
 /// Computes the minimum number of frames required before processing can begin.
 #[inline]
@@ -166,6 +186,14 @@ pub struct StreamProcessor {
     hybrid_pending_rebase: bool,
     /// Reusable mono mixdown buffer for stereo phase coherence.
     mid_buffer: Vec<f32>,
+    /// Cached FFT for spectral-flux transient detection.
+    transient_fft: std::sync::Arc<dyn rustfft::Fft<f32>>,
+    /// Reusable FFT buffer for spectral-flux detection.
+    transient_fft_buffer: Vec<Complex<f32>>,
+    /// Reusable previous magnitudes for spectral-flux detection.
+    transient_prev_magnitudes: Vec<f32>,
+    /// Analysis window used by spectral-flux detection.
+    transient_window: Vec<f32>,
 }
 
 impl std::fmt::Debug for StreamProcessor {
@@ -205,6 +233,11 @@ impl StreamProcessor {
             .map(|_| Vec::with_capacity(output_capacity_frames))
             .collect();
         let hybrid_state = HybridStreamingState::new(&params, ratio, capacity_frames_per_channel);
+        let mut planner = FftPlanner::new();
+        let transient_fft = planner.plan_fft_forward(params.fft_size);
+        let transient_fft_buffer = vec![COMPLEX_ZERO; params.fft_size];
+        let transient_prev_magnitudes = vec![0.0; params.fft_size / 2 + 1];
+        let transient_window = generate_window(WindowType::Hann, params.fft_size);
 
         Self {
             params,
@@ -224,6 +257,10 @@ impl StreamProcessor {
             hybrid_state,
             hybrid_pending_rebase: false,
             mid_buffer: Vec::with_capacity(capacity_frames_per_channel),
+            transient_fft,
+            transient_fft_buffer,
+            transient_prev_magnitudes,
+            transient_window,
         }
     }
 
@@ -778,6 +815,7 @@ impl StreamProcessor {
         self.target_ratio = self.params.stretch_ratio;
         self.vocoder_ratio = self.params.stretch_ratio;
         self.initialized = false;
+        self.transient_prev_magnitudes.fill(0.0);
 
         self.vocoders = Self::create_vocoders(&self.params, self.params.stretch_ratio);
         self.hybrid_state.reset(
@@ -814,36 +852,90 @@ impl StreamProcessor {
         }
 
         let hop = self.params.hop_size;
-        if hop == 0 || total_frames < hop * 2 {
+        if hop == 0 || total_frames < self.params.fft_size + hop {
             return;
         }
 
-        let num_blocks = total_frames / hop;
-        if num_blocks < 2 {
+        let fft_size = self.params.fft_size;
+        let num_frames = (total_frames - fft_size) / hop + 1;
+        if num_frames < 2 {
             return;
         }
 
-        let mut prev_energy = 0.0f64;
+        let num_bins = fft_size / 2 + 1;
+        if self.transient_fft_buffer.len() < fft_size
+            || self.transient_prev_magnitudes.len() < num_bins
+            || self.transient_window.len() < fft_size
+        {
+            return;
+        }
+
+        let bin_hz = self.params.sample_rate as f64 / fft_size as f64;
+        let mid_start_bin = ((FLUX_MID_START_HZ / bin_hz).floor() as usize)
+            .max(1)
+            .min(num_bins.saturating_sub(1));
+        let high_start_bin = ((FLUX_HIGH_START_HZ / bin_hz).floor() as usize).min(num_bins);
+        self.transient_prev_magnitudes[..num_bins].fill(0.0);
+
+        // Prime previous magnitudes with the first analysis frame.
+        for i in 0..fft_size {
+            self.transient_fft_buffer[i] =
+                Complex::new(self.mid_buffer[i] * self.transient_window[i], 0.0);
+        }
+        self.transient_fft.process(&mut self.transient_fft_buffer);
+        for bin in mid_start_bin..num_bins {
+            self.transient_prev_magnitudes[bin] = self.transient_fft_buffer[bin].norm();
+        }
+
+        let mut mean_flux = 0.0f64;
+        let mut var_flux = 0.0f64;
+        let mut prev_flux = 0.0f64;
         let mut transient_detected = false;
 
-        for block in 0..num_blocks {
-            let start = block * hop;
-            let end = (start + hop).min(total_frames);
-            let energy: f64 = self.mid_buffer[start..end]
-                .iter()
-                .map(|&s| (s as f64) * (s as f64))
-                .sum();
-
-            if block > 0 && prev_energy > 1e-10 && energy > prev_energy * 3.0 {
-                transient_detected = true;
-                break;
+        for frame_idx in 1..num_frames {
+            let start = frame_idx * hop;
+            let frame = &self.mid_buffer[start..start + fft_size];
+            for i in 0..fft_size {
+                self.transient_fft_buffer[i] =
+                    Complex::new(frame[i] * self.transient_window[i], 0.0);
             }
-            prev_energy = energy;
+            self.transient_fft.process(&mut self.transient_fft_buffer);
+
+            let mut mid_flux = 0.0f64;
+            let mut high_flux = 0.0f64;
+            for bin in mid_start_bin..num_bins {
+                let mag = self.transient_fft_buffer[bin].norm();
+                let diff = (mag - self.transient_prev_magnitudes[bin]).max(0.0) as f64;
+                if bin >= high_start_bin {
+                    high_flux += diff;
+                } else {
+                    mid_flux += diff;
+                }
+                self.transient_prev_magnitudes[bin] = mag;
+            }
+
+            let flux = mid_flux + high_flux * FLUX_HIGH_WEIGHT;
+            if frame_idx >= FLUX_WARMUP_FRAMES {
+                let sigma = var_flux.max(0.0).sqrt();
+                let threshold = mean_flux + FLUX_THRESHOLD_SIGMA * sigma;
+                if flux > threshold
+                    && flux > prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
+                    && flux > FLUX_ABS_MIN
+                {
+                    transient_detected = true;
+                    break;
+                }
+            }
+
+            let delta = flux - mean_flux;
+            mean_flux += FLUX_EMA_ALPHA * delta;
+            var_flux += FLUX_EMA_ALPHA * (delta * delta - var_flux);
+            prev_flux = flux;
         }
 
         if transient_detected {
             for voc in &mut self.vocoders {
-                voc.reset_phase_state();
+                voc.reset_phase_state_bands([false, false, true, true], self.params.sample_rate);
             }
         }
     }

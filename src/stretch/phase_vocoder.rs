@@ -14,12 +14,19 @@ const PEAKS_CAPACITY_DIVISOR: usize = 4;
 const PHASE_GRADIENT_BLEND: f64 = 0.3;
 /// Minimum magnitude to consider a bin as a spectral peak (avoids noise peaks).
 const MIN_PEAK_MAGNITUDE: f32 = 1e-8;
+/// Treat values this close to integers as integral synthesis positions.
+const SYNTH_POS_EPSILON: f64 = 1e-9;
 
 /// Phase vocoder state for time stretching.
 pub struct PhaseVocoder {
     fft_size: usize,
     hop_analysis: usize,
     hop_synthesis: usize,
+    stretch_ratio: f64,
+    /// Absolute synthesis position (in samples) of the next frame start.
+    synthesis_pos: f64,
+    /// Number of synthesized samples already emitted by the streaming path.
+    synthesis_emitted: usize,
     window: Vec<f32>,
     /// Phase accumulator for resynthesis (f64 for precision over long signals).
     phase_accum: Vec<f64>,
@@ -181,6 +188,9 @@ impl PhaseVocoder {
             fft_size,
             hop_analysis,
             hop_synthesis,
+            stretch_ratio,
+            synthesis_pos: 0.0,
+            synthesis_emitted: 0,
             window,
             phase_accum: vec![0.0f64; num_bins],
             prev_phase: vec![0.0f64; num_bins],
@@ -240,6 +250,7 @@ impl PhaseVocoder {
     /// real-time ratio changes that avoid clicks and discontinuities.
     #[inline]
     pub fn set_stretch_ratio(&mut self, stretch_ratio: f64) {
+        self.stretch_ratio = stretch_ratio;
         self.hop_synthesis = (self.hop_analysis as f64 * stretch_ratio).round() as usize;
     }
 
@@ -304,8 +315,7 @@ impl PhaseVocoder {
     /// hop-aligned samples that are final for this call.
     pub fn process_streaming(&mut self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
         let mut output = Vec::with_capacity(
-            ((input.len() as f64 * self.hop_synthesis as f64 / self.hop_analysis as f64).ceil()
-                as usize)
+            ((input.len() as f64 * self.stretch_ratio).ceil() as usize)
                 .saturating_add(self.fft_size),
         );
         self.process_streaming_into(input, &mut output)?;
@@ -325,8 +335,15 @@ impl PhaseVocoder {
             return Ok(());
         }
 
-        let (num_frames, output_len) = self.process_core(input, false)?;
-        let emit_len = num_frames.saturating_mul(self.hop_synthesis);
+        let (emit_len, output_len) = self.process_core(input, false)?;
+        if output.capacity() < emit_len {
+            return Err(StretchError::BufferOverflow {
+                buffer: "phase_vocoder_stream_output",
+                requested: emit_len,
+                available: output.capacity(),
+            });
+        }
+
         let work_len = output_len
             .max(emit_len)
             .max(self.streaming_tail.len())
@@ -360,17 +377,10 @@ impl PhaseVocoder {
                 .extend_from_slice(&self.streaming_accum_window_sum[emit_len..work_len]);
         }
 
-        if output.capacity() < emit_len {
-            return Err(StretchError::BufferOverflow {
-                buffer: "phase_vocoder_stream_output",
-                requested: emit_len,
-                available: output.capacity(),
-            });
-        }
-
         output.resize(emit_len, 0.0);
         output[..emit_len].copy_from_slice(&self.streaming_accum_output[..emit_len]);
         Self::normalize_output(output, &self.streaming_accum_window_sum[..emit_len]);
+        self.synthesis_emitted = self.synthesis_emitted.saturating_add(emit_len);
         Ok(())
     }
 
@@ -386,6 +396,8 @@ impl PhaseVocoder {
         if self.streaming_tail.is_empty() || self.streaming_tail_window_sum.is_empty() {
             self.streaming_tail.clear();
             self.streaming_tail_window_sum.clear();
+            self.synthesis_pos = 0.0;
+            self.synthesis_emitted = 0;
             output.clear();
             return Ok(());
         }
@@ -406,14 +418,17 @@ impl PhaseVocoder {
         Self::normalize_output(output, &self.streaming_tail_window_sum[..len]);
         self.streaming_tail.clear();
         self.streaming_tail_window_sum.clear();
+        self.synthesis_pos = 0.0;
+        self.synthesis_emitted = 0;
         Ok(())
     }
 
     /// Shared PV core used by both batch and streaming paths.
     ///
-    /// Returns `(num_frames, output_len)` where `output_len` samples are
+    /// Returns `(emit_len, output_len)` where `output_len` samples are
     /// accumulated (unnormalized) into `self.output_buf` and
-    /// `self.window_sum_buf`.
+    /// `self.window_sum_buf`, and `emit_len` is the number of samples
+    /// finalized for streaming emission (`floor(next_synthesis_pos)`).
     fn process_core(
         &mut self,
         input: &[f32],
@@ -428,7 +443,41 @@ impl PhaseVocoder {
 
         let num_bins = self.fft_size / 2 + 1;
         let num_frames = (input.len() - self.fft_size) / self.hop_analysis + 1;
-        let output_len = (num_frames - 1) * self.hop_synthesis + self.fft_size;
+
+        if reset_phase_state {
+            self.phase_accum.fill(0.0);
+            self.prev_phase.fill(0.0);
+            self.synthesis_pos = 0.0;
+            self.synthesis_emitted = 0;
+        }
+
+        let fft_forward = self.planner.plan_fft_forward(self.fft_size);
+        let fft_inverse = self.planner.plan_fft_inverse(self.fft_size);
+
+        let hop_ratio = self.stretch_ratio;
+        let frame_advance = self.hop_analysis as f64 * hop_ratio;
+        let norm = 1.0 / self.fft_size as f32;
+
+        // Local synthesis timeline starts at the current emission cursor.
+        let start_synthesis_pos =
+            snap_near_integer((self.synthesis_pos - self.synthesis_emitted as f64).max(0.0));
+
+        // Pre-compute required accumulation length with fractional placement.
+        let mut max_write_idx = 0usize;
+        let mut synthesis_scan_pos = start_synthesis_pos;
+        for _ in 0..num_frames {
+            let synthesis_pos = snap_near_integer(synthesis_scan_pos);
+            let synthesis_floor = synthesis_pos.floor() as usize;
+            let frac = synthesis_pos - synthesis_floor as f64;
+            let frame_end = synthesis_floor.saturating_add(
+                self.fft_size
+                    .saturating_sub(1)
+                    .saturating_add(usize::from(frac > SYNTH_POS_EPSILON)),
+            );
+            max_write_idx = max_write_idx.max(frame_end);
+            synthesis_scan_pos = synthesis_pos + frame_advance;
+        }
+        let output_len = max_write_idx.saturating_add(1);
 
         // Reuse pre-allocated buffers, growing if needed (never shrinks).
         self.output_buf.resize(output_len, 0.0);
@@ -436,20 +485,12 @@ impl PhaseVocoder {
         self.window_sum_buf.resize(output_len, 0.0);
         self.window_sum_buf.fill(0.0);
 
-        let fft_forward = self.planner.plan_fft_forward(self.fft_size);
-        let fft_inverse = self.planner.plan_fft_inverse(self.fft_size);
-
-        if reset_phase_state {
-            self.phase_accum.fill(0.0);
-            self.prev_phase.fill(0.0);
-        }
-
-        let hop_ratio = self.hop_synthesis as f64 / self.hop_analysis as f64;
-        let norm = 1.0 / self.fft_size as f32;
-
+        let mut synthesis_frame_pos = start_synthesis_pos;
         for frame_idx in 0..num_frames {
             let analysis_pos = frame_idx * self.hop_analysis;
-            let synthesis_pos = frame_idx * self.hop_synthesis;
+            let synthesis_pos = snap_near_integer(synthesis_frame_pos);
+            let synthesis_floor = synthesis_pos.floor() as usize;
+            let frac = synthesis_pos - synthesis_floor as f64;
 
             self.analyze_frame(
                 &input[analysis_pos..analysis_pos + self.fft_size],
@@ -525,19 +566,39 @@ impl PhaseVocoder {
             self.reconstruct_spectrum(num_bins);
             fft_inverse.process(&mut self.fft_buffer);
 
-            // Overlap-add with matched windowing: both analysis and synthesis use
-            // the same window type. The window sum tracks w(i)^2 (squared window)
-            // for correct COLA normalization. Per-sample division by the accumulated
-            // squared window sum compensates for any overlap-add ripple.
-            let frame_len = (synthesis_pos + self.fft_size).min(output_len) - synthesis_pos;
-            for i in 0..frame_len {
-                let ws = self.synthesis_window[i];
-                self.output_buf[synthesis_pos + i] += self.fft_buffer[i].re * norm * ws;
-                self.window_sum_buf[synthesis_pos + i] += self.window[i] * ws;
+            // Fractional overlap-add: when synthesis frame starts between samples,
+            // distribute each sample between nearest output samples via linear interpolation.
+            if frac <= SYNTH_POS_EPSILON {
+                for i in 0..self.fft_size {
+                    let idx = synthesis_floor + i;
+                    let ws = self.synthesis_window[i];
+                    self.output_buf[idx] += self.fft_buffer[i].re * norm * ws;
+                    self.window_sum_buf[idx] += self.window[i] * ws;
+                }
+            } else {
+                let w0 = 1.0 - frac;
+                let w1 = frac;
+                for i in 0..self.fft_size {
+                    let idx = synthesis_floor + i;
+                    let ws = self.synthesis_window[i] as f64;
+                    let sample = self.fft_buffer[i].re as f64 * norm as f64 * ws;
+                    let window_weight = self.window[i] as f64 * ws;
+
+                    self.output_buf[idx] += (sample * w0) as f32;
+                    self.output_buf[idx + 1] += (sample * w1) as f32;
+                    self.window_sum_buf[idx] += (window_weight * w0) as f32;
+                    self.window_sum_buf[idx + 1] += (window_weight * w1) as f32;
+                }
             }
+
+            synthesis_frame_pos = synthesis_pos + frame_advance;
         }
 
-        Ok((num_frames, output_len))
+        let next_local_synthesis_pos = snap_near_integer(synthesis_frame_pos);
+        let emit_len = next_local_synthesis_pos.floor() as usize;
+        self.synthesis_pos = self.synthesis_emitted as f64 + next_local_synthesis_pos;
+
+        Ok((emit_len, output_len))
     }
 
     /// Windows the input frame and transforms to frequency domain.
@@ -776,10 +837,23 @@ impl std::fmt::Debug for PhaseVocoder {
             .field("fft_size", &self.fft_size)
             .field("hop_analysis", &self.hop_analysis)
             .field("hop_synthesis", &self.hop_synthesis)
+            .field("stretch_ratio", &self.stretch_ratio)
+            .field("synthesis_pos", &self.synthesis_pos)
             .field("sub_bass_bin", &self.sub_bass_bin)
             .field("phase_locking_mode", &self.phase_locking_mode)
             .field("streaming_tail_len", &self.streaming_tail.len())
             .finish()
+    }
+}
+
+/// Snaps values extremely close to integer grid points to the exact integer.
+#[inline]
+fn snap_near_integer(value: f64) -> f64 {
+    let rounded = value.round();
+    if (value - rounded).abs() <= SYNTH_POS_EPSILON {
+        rounded
+    } else {
+        value
     }
 }
 
