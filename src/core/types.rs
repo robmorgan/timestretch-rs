@@ -1,6 +1,7 @@
 //! Core types shared across the crate: samples, buffers, parameters, and errors.
 
 use crate::core::window::WindowType;
+use crate::core::PreAnalysisArtifact;
 use crate::stretch::phase_locking::PhaseLockingMode;
 use crate::stretch::stereo::StereoMode;
 
@@ -1471,6 +1472,16 @@ pub struct StretchParams {
     /// When set, transient positions are snapped to the nearest beat subdivision,
     /// improving rhythmic accuracy for tempo-matched content.
     pub bpm: Option<f64>,
+    /// Optional offline pre-analysis artifact.
+    ///
+    /// When present and confidence is high enough, beat/grid snapping can use
+    /// this artifact instead of live beat detection.
+    pub pre_analysis: Option<PreAnalysisArtifact>,
+    /// Minimum confidence required to trust beat-snapping decisions from either
+    /// offline pre-analysis or live beat tracking.
+    pub beat_snap_confidence_threshold: f32,
+    /// Max onset-to-grid snap distance in milliseconds.
+    pub beat_snap_tolerance_ms: f64,
     /// Whether to use dynamic WSOLA search range based on stretch ratio.
     ///
     /// When enabled, the effective search range scales with the stretch ratio,
@@ -1501,6 +1512,10 @@ const DEFAULT_SUB_BASS_CUTOFF: f32 = 120.0;
 
 /// Default transient region duration in seconds (~10ms around each onset).
 const DEFAULT_TRANSIENT_REGION_SECS: f64 = 0.010;
+/// Default minimum confidence required for beat-grid snapping decisions.
+const DEFAULT_BEAT_SNAP_CONFIDENCE_THRESHOLD: f32 = 0.35;
+/// Default transient-to-grid snap tolerance in milliseconds.
+const DEFAULT_BEAT_SNAP_TOLERANCE_MS: f64 = 5.0;
 /// Default WSOLA segment duration (~20ms) for transient-friendly segmentation.
 const WSOLA_SEGMENT_MS: f64 = 20.0;
 /// Default WSOLA search range (~10ms) for small stretch ratios.
@@ -1560,6 +1575,9 @@ impl StretchParams {
             hpss_enabled: false,
             crossfade_mode: CrossfadeMode::Fixed(0.012),
             bpm: None,
+            pre_analysis: None,
+            beat_snap_confidence_threshold: DEFAULT_BEAT_SNAP_CONFIDENCE_THRESHOLD,
+            beat_snap_tolerance_ms: DEFAULT_BEAT_SNAP_TOLERANCE_MS,
             dynamic_wsola_search: false,
         }
     }
@@ -1813,6 +1831,26 @@ impl StretchParams {
     /// improving rhythmic accuracy for tempo-matched content.
     pub fn with_bpm(mut self, bpm: f64) -> Self {
         self.bpm = Some(bpm);
+        self
+    }
+
+    /// Attaches an offline pre-analysis artifact for runtime beat snapping.
+    pub fn with_pre_analysis(mut self, artifact: PreAnalysisArtifact) -> Self {
+        self.pre_analysis = Some(artifact);
+        self
+    }
+
+    /// Sets minimum confidence required for beat-snapping decisions.
+    pub fn with_beat_snap_confidence_threshold(mut self, threshold: f32) -> Self {
+        self.beat_snap_confidence_threshold = threshold.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Sets beat-snap tolerance in milliseconds.
+    pub fn with_beat_snap_tolerance_ms(mut self, tolerance_ms: f64) -> Self {
+        if tolerance_ms.is_finite() && tolerance_ms > 0.0 {
+            self.beat_snap_tolerance_ms = tolerance_ms;
+        }
         self
     }
 
@@ -3367,6 +3405,37 @@ mod tests {
     fn test_from_tempo_bpm_is_none() {
         let params = StretchParams::from_tempo(126.0, 128.0);
         assert_eq!(params.bpm, None);
+    }
+
+    #[test]
+    fn test_pre_analysis_default_is_none() {
+        let params = StretchParams::new(1.0);
+        assert!(params.pre_analysis.is_none());
+    }
+
+    #[test]
+    fn test_with_pre_analysis_sets_artifact() {
+        let artifact = PreAnalysisArtifact {
+            sample_rate: 44100,
+            bpm: 128.0,
+            downbeat_offset_samples: 123,
+            confidence: 0.8,
+            beat_positions: vec![0, 22050],
+            transient_onsets: vec![0, 22050],
+        };
+        let params = StretchParams::new(1.0).with_pre_analysis(artifact.clone());
+        let stored = params.pre_analysis.expect("artifact should be present");
+        assert_eq!(stored.sample_rate, artifact.sample_rate);
+        assert_eq!(stored.bpm, artifact.bpm);
+    }
+
+    #[test]
+    fn test_beat_snap_controls() {
+        let params = StretchParams::new(1.0)
+            .with_beat_snap_confidence_threshold(0.75)
+            .with_beat_snap_tolerance_ms(8.0);
+        assert!((params.beat_snap_confidence_threshold - 0.75).abs() < f32::EPSILON);
+        assert!((params.beat_snap_tolerance_ms - 8.0).abs() < 1e-10);
     }
 
     // --- Dynamic WSOLA search tests ---

@@ -11,6 +11,8 @@ readme = "README.md"
 
 [dependencies]
 rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [[bin]]
 name = "timestretch-cli"
@@ -25,9 +27,7 @@ path = "test_audio/generate.rs"
 cli = []
 
 [dev-dependencies]
-serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-serde_json = "1"
 sha2 = "0.10"
 
 [profile.release]

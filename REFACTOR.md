@@ -138,7 +138,7 @@ Acceptance check:
 ---
 
 ### M4: Beat/Onset Alignment Pipeline for DJ Use
-Status: `pending`
+Status: `completed`
 
 Problem addressed:
 - BPM/subdivision snapping lacks robust phase/downbeat anchoring and can suppress valid onsets.
@@ -151,6 +151,27 @@ Deliverables:
 Acceptance criteria:
 - Beat-aligned segmentation improves transient timing metrics without increased false suppression.
 - Stable behavior on tracks outside strict 100-160 BPM assumptions.
+
+Resolved in M4:
+- Added optional offline pre-analysis artifact support:
+  - `PreAnalysisArtifact` (BPM, downbeat phase offset, confidence, beat positions, transient map)
+  - JSON artifact I/O helpers:
+    - `write_preanalysis_json()`
+    - `read_preanalysis_json()`
+  - Offline analyzer:
+    - `analyze_for_dj()`
+- Runtime integration in hybrid path:
+  - Uses confident pre-analysis beat positions when available.
+  - Falls back to live beat detection when artifact is unavailable/mismatched/low-confidence.
+- Added safer snapping controls in `StretchParams`:
+  - `beat_snap_confidence_threshold`
+  - `beat_snap_tolerance_ms`
+  - safe fallback policy avoids suppressing all transients.
+- Added phase-aware subdivision generation using downbeat offset from pre-analysis.
+
+Acceptance check:
+- Confident pre-analysis path validated via integration tests.
+- Fallback path validated when artifact is unavailable/mismatched.
 
 ---
 
@@ -199,7 +220,7 @@ Acceptance criteria:
 
 ## Current Progress (Updated)
 Current focus:
-- Next milestone to execute: `M4: Beat/Onset Alignment Pipeline for DJ Use`.
+- Next milestone to execute: `M5: Stereo Coherence Hardening`.
 
 Completed for M0:
 - Added strict benchmark validation mode in `tests/reference_quality.rs`:
@@ -251,8 +272,20 @@ Completed for M3:
 - Added ratio-change rebase handling for persistent hybrid buffers.
 - Added M3 coverage:
   - `test_stream_processor_hybrid_state_persists_across_calls`
-  - `test_hybrid_streaming_persistent_small_vs_large_chunk_length`
-  - `test_hybrid_streaming_chunk_boundary_artifacts_bounded`
+- `test_hybrid_streaming_persistent_small_vs_large_chunk_length`
+- `test_hybrid_streaming_chunk_boundary_artifacts_bounded`
+
+Completed for M4:
+- Added pre-analysis artifact model in `src/core/preanalysis.rs`.
+- Added offline pre-analysis pipeline in `src/analysis/preanalysis.rs`.
+- Added runtime pre-analysis/fallback integration and phase-aware snap grid in `src/stretch/hybrid.rs`.
+- Added new beat-snap control fields and builders in `StretchParams`:
+  - pre-analysis attachment
+  - confidence threshold
+  - tolerance control
+- Added M4 tests:
+  - `tests/preanalysis_pipeline.rs`
+  - core pre-analysis + parameter tests
 
 Validation run:
 - `./benchmarks/run_m0_baseline.sh` (pass; strict mode, no skips, baseline archived)
@@ -266,3 +299,6 @@ Validation run:
 - `cargo test -q --test hybrid_streaming` (pass)
 - `cargo test -q --test streaming_batch_parity` (pass)
 - `cargo test -q --lib stream::processor` (pass)
+- `cargo test -q --test preanalysis_pipeline` (pass)
+- `cargo test -q --lib analysis::preanalysis` (pass)
+- `cargo test -q --lib core::types` (pass)

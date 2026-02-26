@@ -1,8 +1,6 @@
 //! Hybrid stretcher combining WSOLA (transients) with phase vocoder (tonal content).
 
-use crate::analysis::beat::{
-    default_subdivision_for_preset, detect_beats, generate_subdivision_grid, snap_to_subdivision,
-};
+use crate::analysis::beat::{default_subdivision_for_preset, detect_beats, snap_to_subdivision};
 use crate::analysis::frequency::freq_to_bin;
 use crate::analysis::hpss::{hpss, HpssParams};
 use crate::analysis::transient::detect_transients;
@@ -148,12 +146,25 @@ impl HybridStretcher {
         );
 
         // Step 1b: Optionally detect beat grid and merge with transient onsets.
-        // Use a reference to avoid cloning when beat-aware is disabled.
+        // Prefer offline pre-analysis when confidence is sufficient.
+        let confident_pre = self.params.pre_analysis.as_ref().filter(|artifact| {
+            artifact.sample_rate == self.params.sample_rate
+                && artifact.is_confident(self.params.beat_snap_confidence_threshold)
+                && !artifact.beat_positions.is_empty()
+        });
+
         let merged;
+        let live_beats;
         let (onsets, strengths): (&[usize], &[f32]) =
             if self.params.beat_aware && input.len() >= MIN_SAMPLES_FOR_BEAT_DETECTION {
-                let grid = detect_beats(input, self.params.sample_rate);
-                merged = merge_onsets_and_beats(&transients.onsets, &grid.beats, input.len());
+                let beats = if let Some(artifact) = confident_pre {
+                    &artifact.beat_positions
+                } else {
+                    live_beats = detect_beats(input, self.params.sample_rate).beats;
+                    &live_beats
+                };
+
+                merged = merge_onsets_and_beats(&transients.onsets, beats, input.len());
                 // Beat-merged onsets don't have individual strengths; use a
                 // default strength of 1.0 for all (full transient region).
                 (&merged, &[])
@@ -167,35 +178,60 @@ impl HybridStretcher {
         // cuts are introduced at empty beat positions.
         let snapped_onsets;
         let snapped_strengths;
-        let (onsets, strengths): (&[usize], &[f32]) = if let Some(bpm) = self.params.bpm {
-            let tolerance_samples = self.params.sample_rate as f64 * 0.005; // 5ms
+        let snap_bpm = self
+            .params
+            .bpm
+            .or_else(|| confident_pre.map(|artifact| artifact.bpm))
+            .filter(|bpm| bpm.is_finite() && *bpm > 0.0);
+
+        let (onsets, strengths): (&[usize], &[f32]) = if let Some(bpm) = snap_bpm {
+            let tolerance_samples = self.params.sample_rate as f64
+                * (self.params.beat_snap_tolerance_ms / 1000.0).max(0.001);
             let subdivision = default_subdivision_for_preset(self.params.preset);
-            let beat_grid =
-                generate_subdivision_grid(bpm, self.params.sample_rate, input.len(), subdivision);
+            let phase_offset = confident_pre
+                .map(|artifact| artifact.downbeat_offset_samples)
+                .unwrap_or(0);
+            let beat_grid = generate_subdivision_grid_with_phase(
+                bpm,
+                self.params.sample_rate,
+                input.len(),
+                subdivision,
+                phase_offset,
+            );
 
             // Snap each transient, keeping only those near a subdivision.
             // Collect snapped positions and corresponding strengths together
             // to preserve the strength association. Dedup consecutive duplicates
             // (multiple transients snapping to the same grid point).
-            let mut last_snapped: Option<usize> = None;
+            let strict_suppression = confident_pre.is_some();
+            let mut last_position: Option<usize> = None;
             let mut new_onsets = Vec::with_capacity(onsets.len());
             let mut new_strengths = Vec::with_capacity(strengths.len());
             for (i, &onset) in onsets.iter().enumerate() {
-                if let Some(snapped) =
-                    snap_to_subdivision(onset as f64, &beat_grid, tolerance_samples)
+                let chosen = match snap_to_subdivision(onset as f64, &beat_grid, tolerance_samples)
                 {
-                    let snapped_usize = snapped.round() as usize;
-                    // Deduplicate: skip if this snaps to the same position as the previous
-                    if last_snapped == Some(snapped_usize) {
-                        continue;
-                    }
-                    last_snapped = Some(snapped_usize);
-                    new_onsets.push(snapped_usize);
-                    if i < strengths.len() {
-                        new_strengths.push(strengths[i]);
-                    }
+                    Some(snapped) => snapped.round() as usize,
+                    None if strict_suppression => continue,
+                    None => onset,
+                };
+
+                // Deduplicate: skip if this maps to the same position as previous.
+                if last_position == Some(chosen) {
+                    continue;
+                }
+                last_position = Some(chosen);
+                new_onsets.push(chosen);
+                if i < strengths.len() {
+                    new_strengths.push(strengths[i]);
                 }
             }
+
+            // Safety fallback: avoid suppressing all transients.
+            if new_onsets.is_empty() && !onsets.is_empty() {
+                new_onsets.extend_from_slice(onsets);
+                new_strengths.extend_from_slice(strengths);
+            }
+
             snapped_onsets = new_onsets;
             snapped_strengths = new_strengths;
             (
@@ -1234,6 +1270,34 @@ fn merge_onsets_and_beats(onsets: &[usize], beats: &[usize], input_len: usize) -
 
     merged.sort_unstable();
     merged
+}
+
+/// Generates a subdivision grid with a phase/downbeat offset.
+fn generate_subdivision_grid_with_phase(
+    bpm: f64,
+    sample_rate: u32,
+    total_samples: usize,
+    subdivision: u32,
+    phase_offset_samples: usize,
+) -> Vec<f64> {
+    if bpm <= 0.0 || subdivision == 0 || total_samples == 0 {
+        return Vec::new();
+    }
+
+    let beat_interval_samples = 60.0 * sample_rate as f64 / bpm;
+    let sub_interval = beat_interval_samples / subdivision as f64;
+    if sub_interval <= 0.0 {
+        return Vec::new();
+    }
+
+    let phase = (phase_offset_samples as f64).rem_euclid(sub_interval);
+    let mut grid = Vec::new();
+    let mut pos = phase;
+    while pos < total_samples as f64 {
+        grid.push(pos);
+        pos += sub_interval;
+    }
+    grid
 }
 
 /// Concatenates segments with raised-cosine crossfade.

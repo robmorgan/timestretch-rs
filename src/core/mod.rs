@@ -2,9 +2,11 @@
 
 pub mod crossover;
 pub mod fft;
+pub mod preanalysis;
 pub mod resample;
 pub mod types;
 pub mod window;
 
+pub use preanalysis::*;
 pub use types::*;
 pub use window::{apply_window, apply_window_copy, generate_window, WindowType};
