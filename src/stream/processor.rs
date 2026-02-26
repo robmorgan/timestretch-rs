@@ -895,9 +895,11 @@ impl StreamProcessor {
         for frame_idx in 1..num_frames {
             let start = frame_idx * hop;
             let frame = &self.mid_buffer[start..start + fft_size];
-            for i in 0..fft_size {
-                self.transient_fft_buffer[i] =
-                    Complex::new(frame[i] * self.transient_window[i], 0.0);
+            for (buf, (&s, &w)) in self.transient_fft_buffer[..fft_size]
+                .iter_mut()
+                .zip(frame.iter().zip(self.transient_window.iter()))
+            {
+                *buf = Complex::new(s * w, 0.0);
             }
             self.transient_fft.process(&mut self.transient_fft_buffer);
 

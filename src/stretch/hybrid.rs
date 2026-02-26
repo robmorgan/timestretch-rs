@@ -45,6 +45,9 @@ const TRANSIENT_ATTACK_COPY_SECS: f64 = 0.008;
 const TRANSIENT_DECAY_SEARCH_FLOOR_SECS: f64 = 0.012;
 /// WSOLA search range boost for transient decays.
 const TRANSIENT_DECAY_SEARCH_BOOST: f64 = 2.0;
+/// RMS threshold (linear) below which audio is considered silence for the
+/// leading-silence bypass in tonal segments. Approximately -66 dB.
+const LEADING_SILENCE_RMS_THRESHOLD: f32 = 5e-4;
 
 /// Transient-aware hybrid stretcher.
 ///
@@ -484,36 +487,81 @@ impl HybridStretcher {
             return self.stretch_transient_segment_with_ratio(seg_data, seg_ratio);
         }
 
+        // Bypass leading near-silence so the phase vocoder doesn't smear a
+        // distant onset backward through its analysis window.  The silent
+        // prefix is linearly resampled (perfect for silence) and only the
+        // remainder is PV-processed.
+        let hop = self.params.hop_size;
+        if seg_data.len() > hop {
+            let mut silence_end = 0usize;
+            let mut pos = 0usize;
+            while pos + hop <= seg_data.len() {
+                let rms = (seg_data[pos..pos + hop].iter().map(|&s| s * s).sum::<f32>()
+                    / hop as f32)
+                    .sqrt();
+                if rms >= LEADING_SILENCE_RMS_THRESHOLD {
+                    break;
+                }
+                silence_end = pos + hop;
+                pos += hop;
+            }
+
+            if silence_end > 0 && silence_end < seg_data.len() {
+                let silent_out_len = (silence_end as f64 * seg_ratio).round() as usize;
+                let mut result = crate::core::resample::resample_linear(
+                    &seg_data[..silence_end],
+                    silent_out_len.max(1),
+                );
+                let remainder = &seg_data[silence_end..];
+                let rem_out_len = out_len.saturating_sub(silent_out_len).max(1);
+                let rem_stretched = if remainder.len() < MIN_SEGMENT_FOR_STRETCH {
+                    crate::core::resample::resample_linear(remainder, rem_out_len)
+                } else {
+                    pv.set_stretch_ratio(seg_ratio);
+                    if let Some(ref mut mr) = multi_res {
+                        mr.set_stretch_ratio(seg_ratio);
+                    }
+                    self.stretch_tonal_core(remainder, seg_ratio, pv, multi_res)
+                };
+                result.extend_from_slice(&rem_stretched);
+                return result;
+            }
+        }
+
         // Set the PV ratio for this segment
         pv.set_stretch_ratio(seg_ratio);
         if let Some(ref mut mr) = multi_res {
             mr.set_stretch_ratio(seg_ratio);
         }
 
+        self.stretch_tonal_core(seg_data, seg_ratio, pv, multi_res)
+    }
+
+    /// Tonal stretching core shared by [`stretch_segment`] and the
+    /// leading-silence bypass path. Assumes PV ratio is already set.
+    fn stretch_tonal_core(
+        &self,
+        seg_data: &[f32],
+        seg_ratio: f64,
+        pv: &mut PhaseVocoder,
+        multi_res: &mut Option<MultiResolutionStretcher>,
+    ) -> Vec<f32> {
+        let out_len = (seg_data.len() as f64 * seg_ratio).round() as usize;
         let use_phase_vocoder = seg_data.len() >= self.params.fft_size;
 
-        // HPSS path: separate harmonic/percussive, stretch each with its optimal algorithm
         if self.params.hpss_enabled && use_phase_vocoder {
             if let Some(result) = self.stretch_tonal_hpss(seg_data, seg_ratio, pv) {
                 return result;
             }
-            // Fall through to normal path if HPSS fails
         }
 
-        // Multi-resolution 3-band path: split into sub-bass/mid/high, process each
-        // with different FFT sizes for optimal time-frequency resolution per band.
         if let Some(multi) = multi_res.as_mut() {
-            // The multi-resolution stretcher handles its own minimum-length logic
-            // internally (falls back to linear resample per-band if too short).
             let result = multi.process(seg_data);
             return result.unwrap_or_else(|_| {
                 crate::core::resample::resample_linear(seg_data, out_len.max(1))
             });
         }
 
-        // Per-segment band split: separate sub-bass and stretch each band with PV,
-        // then sum. This runs only for tonal segments when band_split is on and
-        // multi_resolution / HPSS are not handling the split already.
         if self.params.band_split && use_phase_vocoder && seg_data.len() >= BAND_SPLIT_FFT_SIZE {
             return self.stretch_tonal_band_split(seg_data, seg_ratio, pv);
         }
