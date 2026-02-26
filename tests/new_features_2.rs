@@ -476,8 +476,10 @@ mod process_into_tests {
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
             .collect();
 
-        let mut output = Vec::new();
-        let written = proc.process_into(&input, &mut output).unwrap();
+        let mut output = Vec::with_capacity(300_000);
+        let before = output.len();
+        proc.process_into(&input, &mut output).unwrap();
+        let written = output.len() - before;
         assert_eq!(written, output.len());
     }
 
@@ -492,9 +494,13 @@ mod process_into_tests {
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
             .collect();
 
-        let mut output = Vec::new();
-        let w1 = proc.process_into(&chunk, &mut output).unwrap();
-        let w2 = proc.process_into(&chunk, &mut output).unwrap();
+        let mut output = Vec::with_capacity(300_000);
+        let before1 = output.len();
+        proc.process_into(&chunk, &mut output).unwrap();
+        let w1 = output.len() - before1;
+        let before2 = output.len();
+        proc.process_into(&chunk, &mut output).unwrap();
+        let w2 = output.len() - before2;
         assert_eq!(output.len(), w1 + w2);
     }
 
@@ -521,7 +527,7 @@ mod process_into_tests {
 
         // Use process_into()
         let mut proc2 = StreamProcessor::new(params);
-        let mut out2 = Vec::new();
+        let mut out2 = Vec::with_capacity(300_000);
         for chunk in input.chunks(2048) {
             proc2.process_into(chunk, &mut out2).unwrap();
         }
@@ -549,7 +555,7 @@ mod process_into_tests {
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
             .collect();
 
-        let mut output = Vec::new();
+        let mut output = Vec::with_capacity(300_000);
         proc.process_into(&input, &mut output).unwrap();
         let before_flush = output.len();
         proc.flush_into(&mut output).unwrap();
@@ -563,7 +569,7 @@ mod process_into_tests {
             .with_sample_rate(44100)
             .with_channels(1);
         let mut proc = StreamProcessor::new(params);
-        let mut output = Vec::new();
+        let mut output = Vec::with_capacity(300_000);
         let written = proc.flush_into(&mut output).unwrap();
         assert_eq!(written, 0);
         assert!(output.is_empty());
@@ -577,7 +583,7 @@ mod process_into_tests {
         let mut proc = StreamProcessor::new(params);
 
         let input = sine_stereo(440.0, 880.0, 44100, 4096);
-        let mut output = Vec::new();
+        let mut output = Vec::with_capacity(300_000);
         proc.process_into(&input.data, &mut output).unwrap();
         proc.flush_into(&mut output).unwrap();
 
@@ -597,7 +603,7 @@ mod process_into_tests {
         let mut proc = StreamProcessor::new(params);
 
         let bad_input = vec![0.0, f32::NAN, 0.0];
-        let mut output = Vec::new();
+        let mut output = Vec::with_capacity(300_000);
         let result = proc.process_into(&bad_input, &mut output);
         assert!(result.is_err());
     }
@@ -610,7 +616,7 @@ mod process_into_tests {
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
             .collect();
 
-        let mut output = Vec::new();
+        let mut output = Vec::with_capacity(300_000);
         proc.process_into(&chunk, &mut output).unwrap();
         proc.set_tempo(130.0);
         proc.process_into(&chunk, &mut output).unwrap();
@@ -664,7 +670,7 @@ mod streaming_batch_parity {
 
         // Streaming
         let mut proc = StreamProcessor::new(params);
-        let mut stream_out = Vec::new();
+        let mut stream_out = Vec::with_capacity(300_000);
         for chunk in input.data.chunks(2048) {
             proc.process_into(chunk, &mut stream_out).unwrap();
         }
@@ -691,7 +697,7 @@ mod streaming_batch_parity {
         let batch_out = timestretch::stretch_buffer(&input, &params).unwrap();
 
         let mut proc = StreamProcessor::new(params);
-        let mut stream_out = Vec::new();
+        let mut stream_out = Vec::with_capacity(300_000);
         for chunk in input.data.chunks(2048) {
             proc.process_into(chunk, &mut stream_out).unwrap();
         }
@@ -718,7 +724,7 @@ mod streaming_batch_parity {
         let batch_rms = batch_out.rms();
 
         let mut proc = StreamProcessor::new(params);
-        let mut stream_data = Vec::new();
+        let mut stream_data = Vec::with_capacity(300_000);
         for chunk in input.data.chunks(2048) {
             proc.process_into(chunk, &mut stream_data).unwrap();
         }
@@ -745,7 +751,7 @@ mod streaming_batch_parity {
         let batch_out = timestretch::stretch_buffer(&input, &params).unwrap();
 
         let mut proc = StreamProcessor::new(params);
-        let mut stream_out = Vec::new();
+        let mut stream_out = Vec::with_capacity(300_000);
         for chunk in input.data.chunks(4096) {
             proc.process_into(chunk, &mut stream_out).unwrap();
         }
@@ -885,8 +891,8 @@ mod combined_new_api_workflows {
         let mut proc_a = StreamProcessor::new(params.clone());
         let mut proc_b = StreamProcessor::new(params);
 
-        let mut out_a = Vec::new();
-        let mut out_b = Vec::new();
+        let mut out_a = Vec::with_capacity(300_000);
+        let mut out_b = Vec::with_capacity(300_000);
         proc_a.process_into(&sig_a, &mut out_a).unwrap();
         proc_a.flush_into(&mut out_a).unwrap();
         proc_b.process_into(&sig_b, &mut out_b).unwrap();

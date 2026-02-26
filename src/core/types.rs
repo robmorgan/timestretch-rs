@@ -115,7 +115,9 @@ impl AudioBuffer {
     /// Extracts a single channel from interleaved data.
     pub fn channel(&self, ch: usize) -> Vec<Sample> {
         let nc = self.channels.count();
-        assert!(ch < nc, "channel index out of range");
+        if ch >= nc {
+            return Vec::new();
+        }
         self.data.iter().skip(ch).step_by(nc).copied().collect()
     }
 
@@ -222,10 +224,6 @@ impl AudioBuffer {
     /// Returns a new buffer containing frames from `start_frame` to
     /// `start_frame + num_frames` (or the end if fewer frames remain).
     ///
-    /// # Panics
-    ///
-    /// Panics if `start_frame` is beyond the buffer length.
-    ///
     /// # Example
     ///
     /// ```
@@ -237,12 +235,13 @@ impl AudioBuffer {
     /// ```
     pub fn slice(&self, start_frame: usize, num_frames: usize) -> Self {
         let total_frames = self.num_frames();
-        assert!(
-            start_frame <= total_frames,
-            "start_frame {} exceeds buffer length {}",
-            start_frame,
-            total_frames
-        );
+        if start_frame >= total_frames {
+            return Self {
+                data: Vec::new(),
+                sample_rate: self.sample_rate,
+                channels: self.channels,
+            };
+        }
         let end_frame = (start_frame + num_frames).min(total_frames);
         let nc = self.channels.count();
         let start_idx = start_frame * nc;
@@ -256,11 +255,8 @@ impl AudioBuffer {
 
     /// Concatenates multiple buffers into a single buffer.
     ///
-    /// All buffers must have the same sample rate and channel layout.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffers have mismatched sample rates or channel layouts.
+    /// All buffers should have the same sample rate and channel layout.
+    /// If they do not match, returns an empty buffer.
     ///
     /// # Example
     ///
@@ -285,16 +281,13 @@ impl AudioBuffer {
         let total_len: usize = buffers.iter().map(|b| b.data.len()).sum();
         let mut data = Vec::with_capacity(total_len);
         for buf in buffers {
-            assert_eq!(
-                buf.sample_rate, sample_rate,
-                "sample rate mismatch: {} vs {}",
-                buf.sample_rate, sample_rate
-            );
-            assert_eq!(
-                buf.channels, channels,
-                "channel layout mismatch: {:?} vs {:?}",
-                buf.channels, channels
-            );
+            if buf.sample_rate != sample_rate || buf.channels != channels {
+                return Self {
+                    data: Vec::new(),
+                    sample_rate,
+                    channels,
+                };
+            }
             data.extend_from_slice(&buf.data);
         }
         Self {
@@ -357,7 +350,7 @@ impl AudioBuffer {
         let last = (0..total_frames)
             .rev()
             .find(|&frame| (0..nc).any(|ch| self.data[frame * nc + ch].abs() >= threshold))
-            .unwrap(); // safe: first exists so last must too
+            .unwrap_or(first);
 
         self.slice(first, last - first + 1)
     }
@@ -663,9 +656,8 @@ impl AudioBuffer {
     /// The resulting buffer has length `self.num_frames() + other.num_frames() - crossfade_frames`.
     /// If `crossfade_frames` exceeds either buffer's length, it is clamped.
     ///
-    /// # Panics
-    ///
-    /// Panics if the buffers have different sample rates or channel layouts.
+    /// If the buffers have different sample rates or channel layouts, returns
+    /// a clone of `self`.
     ///
     /// # Example
     ///
@@ -678,16 +670,9 @@ impl AudioBuffer {
     /// assert_eq!(mixed.num_frames(), 1900); // 1000 + 1000 - 100
     /// ```
     pub fn crossfade_into(&self, other: &AudioBuffer, crossfade_frames: usize) -> Self {
-        assert_eq!(
-            self.sample_rate, other.sample_rate,
-            "sample rate mismatch: {} vs {}",
-            self.sample_rate, other.sample_rate
-        );
-        assert_eq!(
-            self.channels, other.channels,
-            "channel layout mismatch: {:?} vs {:?}",
-            self.channels, other.channels
-        );
+        if self.sample_rate != other.sample_rate || self.channels != other.channels {
+            return self.clone();
+        }
 
         let nc = self.channels.count();
         let self_frames = self.num_frames();
@@ -862,9 +847,8 @@ impl AudioBuffer {
     /// [`normalize`](Self::normalize) or [`apply_gain`](Self::apply_gain)
     /// if the result exceeds ±1.0.
     ///
-    /// # Panics
-    ///
-    /// Panics if the buffers have different sample rates or channel layouts.
+    /// If the buffers have different sample rates or channel layouts, returns
+    /// a clone of `self`.
     ///
     /// # Example
     ///
@@ -877,16 +861,9 @@ impl AudioBuffer {
     /// assert!((mixed.data[0] - 0.8).abs() < 1e-6);
     /// ```
     pub fn mix(&self, other: &AudioBuffer) -> Self {
-        assert_eq!(
-            self.sample_rate, other.sample_rate,
-            "sample rate mismatch: {} vs {}",
-            self.sample_rate, other.sample_rate
-        );
-        assert_eq!(
-            self.channels, other.channels,
-            "channel layout mismatch: {:?} vs {:?}",
-            self.channels, other.channels
-        );
+        if self.sample_rate != other.sample_rate || self.channels != other.channels {
+            return self.clone();
+        }
 
         let len = self.data.len().max(other.data.len());
         let mut data = vec![0.0f32; len];
@@ -971,10 +948,6 @@ impl AudioBuffer {
     ///
     /// For stereo input, this is a no-op and returns a clone.
     ///
-    /// # Panics
-    ///
-    /// Panics if `pan` is outside the range `[-1.0, 1.0]`.
-    ///
     /// # Example
     ///
     /// ```
@@ -988,11 +961,7 @@ impl AudioBuffer {
     /// assert!((l - r).abs() < 1e-6);
     /// ```
     pub fn pan(&self, pan: f32) -> Self {
-        assert!(
-            (-1.0..=1.0).contains(&pan),
-            "pan must be in [-1.0, 1.0], got {}",
-            pan
-        );
+        let pan = pan.clamp(-1.0, 1.0);
 
         if self.channels == Channels::Stereo {
             return self.clone();
@@ -1323,6 +1292,17 @@ pub enum CrossfadeMode {
     Adaptive,
 }
 
+/// Streaming quality/performance mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityMode {
+    /// Lower latency profile for very small callbacks (64-128 frames).
+    LowLatency,
+    /// Balanced real-time profile for common callbacks (128-256 frames).
+    Balanced,
+    /// Highest quality profile for larger callbacks (256-1024) or offline usage.
+    MaxQuality,
+}
+
 /// Parameters for the time stretching algorithm.
 ///
 /// Use the builder methods to configure. A ratio >1.0 makes audio longer
@@ -1350,6 +1330,8 @@ pub struct StretchParams {
     pub sample_rate: u32,
     /// Number of channels.
     pub channels: Channels,
+    /// Streaming quality/performance profile.
+    pub quality_mode: QualityMode,
     /// FFT size for phase vocoder.
     pub fft_size: usize,
     /// Hop size (analysis step).
@@ -1542,7 +1524,11 @@ impl std::fmt::Display for StretchParams {
         if let Some(preset) = &self.preset {
             write!(f, ", preset={}", preset)?;
         }
-        write!(f, ", fft={}, hop={})", self.fft_size, self.hop_size)
+        write!(
+            f,
+            ", fft={}, hop={}, quality={:?})",
+            self.fft_size, self.hop_size, self.quality_mode
+        )
     }
 }
 
@@ -1553,6 +1539,7 @@ impl StretchParams {
             stretch_ratio,
             sample_rate: DEFAULT_SAMPLE_RATE,
             channels: Channels::Stereo,
+            quality_mode: QualityMode::Balanced,
             fft_size: DEFAULT_FFT_SIZE,
             hop_size: DEFAULT_HOP_SIZE,
             preset: None,
@@ -1613,6 +1600,12 @@ impl StretchParams {
         } else {
             Channels::Stereo
         };
+        self
+    }
+
+    /// Sets the quality/performance mode used by streaming processors.
+    pub fn with_quality_mode(mut self, mode: QualityMode) -> Self {
+        self.quality_mode = mode;
         self
     }
 
@@ -2229,19 +2222,19 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "sample rate mismatch")]
     fn test_audio_buffer_concatenate_mismatched_rate() {
         let a = AudioBuffer::from_mono(vec![1.0], 44100);
         let b = AudioBuffer::from_mono(vec![2.0], 48000);
-        AudioBuffer::concatenate(&[&a, &b]);
+        let out = AudioBuffer::concatenate(&[&a, &b]);
+        assert!(out.is_empty());
     }
 
     #[test]
-    #[should_panic(expected = "channel layout mismatch")]
     fn test_audio_buffer_concatenate_mismatched_channels() {
         let a = AudioBuffer::from_mono(vec![1.0], 44100);
         let b = AudioBuffer::from_stereo(vec![2.0, 3.0], 44100);
-        AudioBuffer::concatenate(&[&a, &b]);
+        let out = AudioBuffer::concatenate(&[&a, &b]);
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -2335,6 +2328,13 @@ mod tests {
         assert_eq!(params.sample_rate, 44100);
         assert_eq!(params.channels, Channels::Stereo);
         assert_eq!(params.fft_size, 4096);
+        assert_eq!(params.quality_mode, QualityMode::Balanced);
+    }
+
+    #[test]
+    fn test_stretch_params_quality_mode_builder() {
+        let params = StretchParams::new(1.0).with_quality_mode(QualityMode::LowLatency);
+        assert_eq!(params.quality_mode, QualityMode::LowLatency);
     }
 
     #[test]
@@ -2833,19 +2833,19 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "sample rate mismatch")]
     fn test_crossfade_into_mismatched_rate() {
         let a = AudioBuffer::from_mono(vec![1.0; 10], 44100);
         let b = AudioBuffer::from_mono(vec![0.5; 10], 48000);
-        a.crossfade_into(&b, 5);
+        let mixed = a.crossfade_into(&b, 5);
+        assert_eq!(mixed.data, a.data);
     }
 
     #[test]
-    #[should_panic(expected = "channel layout mismatch")]
     fn test_crossfade_into_mismatched_channels() {
         let a = AudioBuffer::from_mono(vec![1.0; 10], 44100);
         let b = AudioBuffer::from_stereo(vec![0.5; 20], 44100);
-        a.crossfade_into(&b, 5);
+        let mixed = a.crossfade_into(&b, 5);
+        assert_eq!(mixed.data, a.data);
     }
 
     #[test]
@@ -3043,19 +3043,19 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "sample rate mismatch")]
     fn test_mix_mismatched_rate() {
         let a = AudioBuffer::from_mono(vec![0.5], 44100);
         let b = AudioBuffer::from_mono(vec![0.5], 48000);
-        a.mix(&b);
+        let mixed = a.mix(&b);
+        assert_eq!(mixed.data, a.data);
     }
 
     #[test]
-    #[should_panic(expected = "channel layout mismatch")]
     fn test_mix_mismatched_channels() {
         let a = AudioBuffer::from_mono(vec![0.5], 44100);
         let b = AudioBuffer::from_stereo(vec![0.5, 0.5], 44100);
-        a.mix(&b);
+        let mixed = a.mix(&b);
+        assert_eq!(mixed.data, a.data);
     }
 
     #[test]

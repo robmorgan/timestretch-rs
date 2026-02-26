@@ -75,20 +75,23 @@ let output = timestretch::stretch(&input, &params).unwrap();
 ### Real-Time Streaming
 
 ```rust
-use timestretch::{StreamProcessor, StretchParams, EdmPreset};
+use timestretch::{QualityMode, StreamProcessor, StretchParams, EdmPreset};
 
 let params = StretchParams::new(1.02)
     .with_preset(EdmPreset::DjBeatmatch)
     .with_sample_rate(44100)
-    .with_channels(2);
+    .with_channels(2)
+    .with_quality_mode(QualityMode::Balanced);
 
 let mut processor = StreamProcessor::new(params);
 processor.set_hybrid_mode(true); // optional: persistent hybrid streaming path
+let mut output_chunk = Vec::with_capacity(8192); // pre-allocate once
 
 // Feed chunks as they arrive from your audio driver
 loop {
     let input_chunk = read_audio_chunk(1024);
-    let output_chunk = processor.process(&input_chunk).unwrap();
+    output_chunk.clear();
+    processor.process_into(&input_chunk, &mut output_chunk).unwrap();
     play_audio(&output_chunk);
 }
 
@@ -96,7 +99,8 @@ loop {
 processor.set_stretch_ratio(1.05);
 
 // Flush remaining samples when done
-let remaining = processor.flush().unwrap();
+let mut remaining = Vec::with_capacity(8192);
+processor.flush_into(&mut remaining).unwrap();
 ```
 
 ### Tempo-Aware Streaming (DJ)
@@ -304,6 +308,7 @@ See `benchmarks/README.md` for corpus setup and manifest/checksum requirements.
 - **`AudioBuffer`** — holds interleaved sample data with metadata (sample rate,
   channel layout)
 - **`EdmPreset`** — enum of tuned parameter sets for EDM workflows
+- **`QualityMode`** — explicit streaming profile: `LowLatency`, `Balanced`, `MaxQuality`
 - **`StreamProcessor`** — chunked real-time processor with on-the-fly ratio/tempo
   changes, `from_tempo()`/`set_tempo()`, `process_into()`, and optional persistent hybrid mode
 - **`PreAnalysisArtifact`** — serializable offline beat/onset analysis artifact

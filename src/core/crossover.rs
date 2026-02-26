@@ -173,26 +173,10 @@ impl LR4Crossover {
 
     /// Processes a buffer, splitting into low and high bands.
     ///
-    /// The `low` and `high` output slices must be at least as long as `input`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `low` or `high` is shorter than `input`.
+    /// Processes up to the minimum shared length of `input`, `low`, and `high`.
     pub fn process(&mut self, input: &[f32], low: &mut [f32], high: &mut [f32]) {
-        assert!(
-            low.len() >= input.len(),
-            "low buffer too short: {} < {}",
-            low.len(),
-            input.len()
-        );
-        assert!(
-            high.len() >= input.len(),
-            "high buffer too short: {} < {}",
-            high.len(),
-            input.len()
-        );
-
-        for (i, &sample) in input.iter().enumerate() {
+        let len = input.len().min(low.len()).min(high.len());
+        for (i, &sample) in input.iter().take(len).enumerate() {
             let (l, h) = self.process_sample(sample);
             low[i] = l;
             high[i] = h;
@@ -282,24 +266,10 @@ impl LR8Crossover {
 
     /// Processes a buffer, splitting into low and high bands.
     ///
-    /// # Panics
-    ///
-    /// Panics if `low` or `high` is shorter than `input`.
+    /// Processes up to the minimum shared length of `input`, `low`, and `high`.
     pub fn process(&mut self, input: &[f32], low: &mut [f32], high: &mut [f32]) {
-        assert!(
-            low.len() >= input.len(),
-            "low buffer too short: {} < {}",
-            low.len(),
-            input.len()
-        );
-        assert!(
-            high.len() >= input.len(),
-            "high buffer too short: {} < {}",
-            high.len(),
-            input.len()
-        );
-
-        for (i, &sample) in input.iter().enumerate() {
+        let len = input.len().min(low.len()).min(high.len());
+        for (i, &sample) in input.iter().take(len).enumerate() {
             let (l, h) = self.process_sample(sample);
             low[i] = l;
             high[i] = h;
@@ -361,11 +331,7 @@ impl ThreeBandSplitter {
 
     /// Splits input into three bands: sub_bass, mid, and high.
     ///
-    /// All output slices must be at least as long as `input`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if any output buffer is shorter than `input`.
+    /// Processes up to the minimum shared length of all input/output slices.
     pub fn process(
         &mut self,
         input: &[f32],
@@ -373,26 +339,12 @@ impl ThreeBandSplitter {
         mid: &mut [f32],
         high: &mut [f32],
     ) {
-        assert!(
-            sub_bass.len() >= input.len(),
-            "sub_bass buffer too short: {} < {}",
-            sub_bass.len(),
-            input.len()
-        );
-        assert!(
-            mid.len() >= input.len(),
-            "mid buffer too short: {} < {}",
-            mid.len(),
-            input.len()
-        );
-        assert!(
-            high.len() >= input.len(),
-            "high buffer too short: {} < {}",
-            high.len(),
-            input.len()
-        );
-
-        for (i, &sample) in input.iter().enumerate() {
+        let len = input
+            .len()
+            .min(sub_bass.len())
+            .min(mid.len())
+            .min(high.len());
+        for (i, &sample) in input.iter().take(len).enumerate() {
             // First crossover: sub-bass vs upper
             let (lo, upper) = self.low_mid.process_sample(sample);
             // Second crossover: mid vs high

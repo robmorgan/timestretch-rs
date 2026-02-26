@@ -502,10 +502,10 @@ impl HybridStretcher {
 
         // Multi-resolution 3-band path: split into sub-bass/mid/high, process each
         // with different FFT sizes for optimal time-frequency resolution per band.
-        if multi_res.is_some() {
+        if let Some(multi) = multi_res.as_mut() {
             // The multi-resolution stretcher handles its own minimum-length logic
             // internally (falls back to linear resample per-band if too short).
-            let result = multi_res.as_mut().unwrap().process(seg_data);
+            let result = multi.process(seg_data);
             return result.unwrap_or_else(|_| {
                 crate::core::resample::resample_linear(seg_data, out_len.max(1))
             });

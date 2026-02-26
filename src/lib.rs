@@ -53,7 +53,7 @@ pub use analysis::beat::BeatGrid;
 pub use analysis::preanalysis::analyze_for_dj;
 pub use core::preanalysis::{read_preanalysis_json, write_preanalysis_json, PreAnalysisArtifact};
 pub use core::types::{
-    AudioBuffer, Channels, CrossfadeMode, EdmPreset, FrameIter, Sample, StretchParams,
+    AudioBuffer, Channels, CrossfadeMode, EdmPreset, FrameIter, QualityMode, Sample, StretchParams,
 };
 pub use core::window::WindowType;
 pub use error::StretchError;

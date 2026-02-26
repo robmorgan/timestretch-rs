@@ -20,6 +20,16 @@ pub enum StretchError {
     BpmDetectionFailed(String),
     /// Input contains non-finite samples (NaN or infinity).
     NonFiniteInput,
+    /// Channel index out of range.
+    InvalidChannelIndex { requested: usize, available: usize },
+    /// Fixed-capacity buffer overflow in real-time path.
+    BufferOverflow {
+        buffer: &'static str,
+        requested: usize,
+        available: usize,
+    },
+    /// Processor entered an invalid state.
+    InvalidState(&'static str),
 }
 
 impl fmt::Display for StretchError {
@@ -41,6 +51,24 @@ impl fmt::Display for StretchError {
             StretchError::NonFiniteInput => {
                 write!(f, "input contains non-finite samples (NaN or infinity)")
             }
+            StretchError::InvalidChannelIndex {
+                requested,
+                available,
+            } => write!(
+                f,
+                "invalid channel index {} (available channels: {})",
+                requested, available
+            ),
+            StretchError::BufferOverflow {
+                buffer,
+                requested,
+                available,
+            } => write!(
+                f,
+                "buffer overflow in {}: requested {}, available {}",
+                buffer, requested, available
+            ),
+            StretchError::InvalidState(msg) => write!(f, "invalid state: {}", msg),
         }
     }
 }

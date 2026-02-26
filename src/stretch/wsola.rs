@@ -32,6 +32,10 @@ pub struct Wsola {
     prefix_sq_buf: Vec<f64>,
     /// Reusable output buffer for overlap-add accumulation.
     output_buf: Vec<f32>,
+    /// Reusable correlation buffer for direct-search candidates.
+    corr_values_buf: Vec<f64>,
+    /// Reusable normalized-correlation buffer for FFT candidate scan.
+    norm_corr_values_buf: Vec<f64>,
 }
 
 impl std::fmt::Debug for Wsola {
@@ -68,6 +72,8 @@ impl Wsola {
             fft_corr_buf: Vec::new(),
             prefix_sq_buf: Vec::new(),
             output_buf: Vec::new(),
+            corr_values_buf: Vec::new(),
+            norm_corr_values_buf: Vec::new(),
         }
     }
 
@@ -228,7 +234,7 @@ impl Wsola {
     /// Returns `(integer_position, fractional_offset)` with parabolic refinement
     /// of the correlation peak for sub-sample accuracy.
     fn find_best_position_direct(
-        &self,
+        &mut self,
         input: &[f32],
         output: &[f32],
         search_start: usize,
@@ -241,7 +247,11 @@ impl Wsola {
 
         // Collect correlation values for parabolic interpolation
         let num_candidates = search_end - search_start + 1;
-        let mut corr_values = Vec::with_capacity(num_candidates);
+        self.corr_values_buf.clear();
+        if self.corr_values_buf.capacity() < num_candidates {
+            self.corr_values_buf
+                .reserve(num_candidates - self.corr_values_buf.capacity());
+        }
 
         for pos in search_start..=search_end {
             if pos + overlap_len > input.len() {
@@ -253,7 +263,7 @@ impl Wsola {
                 &input[pos..pos + overlap_len],
             );
 
-            corr_values.push(corr);
+            self.corr_values_buf.push(corr);
 
             if corr > best_corr {
                 best_corr = corr;
@@ -263,7 +273,7 @@ impl Wsola {
 
         // Parabolic interpolation for sub-sample accuracy
         let best_idx = best_pos - search_start;
-        let fractional_offset = parabolic_interpolation(&corr_values, best_idx);
+        let fractional_offset = parabolic_interpolation(&self.corr_values_buf, best_idx);
 
         (best_pos, fractional_offset)
     }
@@ -324,6 +334,7 @@ impl Wsola {
             num_candidates,
             overlap_len,
             search_start,
+            &mut self.norm_corr_values_buf,
         );
 
         // Clamp to valid range
@@ -458,6 +469,7 @@ fn find_best_candidate(
     num_candidates: usize,
     overlap_len: usize,
     search_start: usize,
+    norm_corr_values: &mut Vec<f64>,
 ) -> (usize, f64) {
     let norm = 1.0 / corr_buf.len() as f64;
 
@@ -466,7 +478,10 @@ fn find_best_candidate(
     let mut best_k: usize = 0;
 
     // Collect normalized correlation values for parabolic interpolation
-    let mut ncorr_values = Vec::with_capacity(num_candidates);
+    norm_corr_values.clear();
+    if norm_corr_values.capacity() < num_candidates {
+        norm_corr_values.reserve(num_candidates - norm_corr_values.capacity());
+    }
 
     for k in 0..num_candidates {
         let raw_corr = corr_buf[k].re as f64 * norm;
@@ -479,7 +494,7 @@ fn find_best_candidate(
             0.0
         };
 
-        ncorr_values.push(ncorr);
+        norm_corr_values.push(ncorr);
 
         if ncorr > best_ncorr {
             best_ncorr = ncorr;
@@ -489,7 +504,7 @@ fn find_best_candidate(
     }
 
     // Parabolic interpolation for sub-sample accuracy
-    let fractional_offset = parabolic_interpolation(&ncorr_values, best_k);
+    let fractional_offset = parabolic_interpolation(norm_corr_values, best_k);
 
     (best_pos, fractional_offset)
 }
@@ -907,6 +922,7 @@ mod tests {
         let ref_energy: f64 = ref_signal.iter().map(|&s| (s as f64) * (s as f64)).sum();
         let num_candidates = search_signal.len() - overlap_len + 1;
         let prefix_sq = compute_prefix_sq(&search_signal);
+        let mut norm_corr_values = Vec::new();
 
         let (best, _fractional) = find_best_candidate(
             &prefix_sq,
@@ -915,6 +931,7 @@ mod tests {
             num_candidates,
             overlap_len,
             0, // search_start
+            &mut norm_corr_values,
         );
 
         assert_eq!(
@@ -935,6 +952,7 @@ mod tests {
         let ref_energy: f64 = ref_signal.iter().map(|&s| (s as f64) * (s as f64)).sum();
         let num_candidates = search_signal.len() - overlap_len + 1;
         let prefix_sq = compute_prefix_sq(&search_signal);
+        let mut norm_corr_values = Vec::new();
 
         let (best, _fractional) = find_best_candidate(
             &prefix_sq,
@@ -943,6 +961,7 @@ mod tests {
             num_candidates,
             overlap_len,
             100, // search_start=100
+            &mut norm_corr_values,
         );
 
         // With all zero energy, ncorr=0.0 for all candidates. First one wins.

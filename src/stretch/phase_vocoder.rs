@@ -67,6 +67,10 @@ pub struct PhaseVocoder {
     streaming_tail: Vec<f32>,
     /// Window-sum tail matching `streaming_tail`.
     streaming_tail_window_sum: Vec<f32>,
+    /// Reusable accumulation buffer for streaming overlap-add.
+    streaming_accum_output: Vec<f32>,
+    /// Reusable window-sum accumulation buffer for streaming overlap-add.
+    streaming_accum_window_sum: Vec<f32>,
 }
 
 impl PhaseVocoder {
@@ -200,6 +204,8 @@ impl PhaseVocoder {
             window_sum_buf: Vec::new(),
             streaming_tail: Vec::new(),
             streaming_tail_window_sum: Vec::new(),
+            streaming_accum_output: Vec::new(),
+            streaming_accum_window_sum: Vec::new(),
         }
     }
 
@@ -297,8 +303,26 @@ impl PhaseVocoder {
     /// method keeps synthesis overlap/window tails internally and emits only
     /// hop-aligned samples that are final for this call.
     pub fn process_streaming(&mut self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
+        let mut output = Vec::with_capacity(
+            ((input.len() as f64 * self.hop_synthesis as f64 / self.hop_analysis as f64).ceil()
+                as usize)
+                .saturating_add(self.fft_size),
+        );
+        self.process_streaming_into(input, &mut output)?;
+        Ok(output)
+    }
+
+    /// Streaming phase-vocoder pass writing directly into `output`.
+    ///
+    /// This avoids temporary output allocations in real-time paths.
+    pub fn process_streaming_into(
+        &mut self,
+        input: &[f32],
+        output: &mut Vec<f32>,
+    ) -> Result<(), StretchError> {
         if input.len() < self.fft_size {
-            return Ok(vec![]);
+            output.clear();
+            return Ok(());
         }
 
         let (num_frames, output_len) = self.process_core(input, false)?;
@@ -308,19 +332,22 @@ impl PhaseVocoder {
             .max(self.streaming_tail.len())
             .max(self.streaming_tail_window_sum.len());
 
-        let mut accum_output = vec![0.0f32; work_len];
-        let mut accum_window_sum = vec![0.0f32; work_len];
+        self.streaming_accum_output.resize(work_len, 0.0);
+        self.streaming_accum_output.fill(0.0);
+        self.streaming_accum_window_sum.resize(work_len, 0.0);
+        self.streaming_accum_window_sum.fill(0.0);
 
-        accum_output[..output_len].copy_from_slice(&self.output_buf[..output_len]);
-        accum_window_sum[..output_len].copy_from_slice(&self.window_sum_buf[..output_len]);
+        self.streaming_accum_output[..output_len].copy_from_slice(&self.output_buf[..output_len]);
+        self.streaming_accum_window_sum[..output_len]
+            .copy_from_slice(&self.window_sum_buf[..output_len]);
 
         let tail_len = self
             .streaming_tail
             .len()
             .min(self.streaming_tail_window_sum.len());
         for i in 0..tail_len {
-            accum_output[i] += self.streaming_tail[i];
-            accum_window_sum[i] += self.streaming_tail_window_sum[i];
+            self.streaming_accum_output[i] += self.streaming_tail[i];
+            self.streaming_accum_window_sum[i] += self.streaming_tail_window_sum[i];
         }
 
         // Keep the unresolved overlap region for the next chunk.
@@ -328,30 +355,58 @@ impl PhaseVocoder {
         self.streaming_tail_window_sum.clear();
         if emit_len < work_len {
             self.streaming_tail
-                .extend_from_slice(&accum_output[emit_len..work_len]);
+                .extend_from_slice(&self.streaming_accum_output[emit_len..work_len]);
             self.streaming_tail_window_sum
-                .extend_from_slice(&accum_window_sum[emit_len..work_len]);
+                .extend_from_slice(&self.streaming_accum_window_sum[emit_len..work_len]);
         }
 
-        let mut emitted = accum_output[..emit_len].to_vec();
-        Self::normalize_output(&mut emitted, &accum_window_sum[..emit_len]);
-        Ok(emitted)
+        if output.capacity() < emit_len {
+            return Err(StretchError::BufferOverflow {
+                buffer: "phase_vocoder_stream_output",
+                requested: emit_len,
+                available: output.capacity(),
+            });
+        }
+
+        output.resize(emit_len, 0.0);
+        output[..emit_len].copy_from_slice(&self.streaming_accum_output[..emit_len]);
+        Self::normalize_output(output, &self.streaming_accum_window_sum[..emit_len]);
+        Ok(())
     }
 
     /// Flushes remaining streaming overlap/window tail at end of stream.
     pub fn flush_streaming(&mut self) -> Result<Vec<f32>, StretchError> {
+        let mut output = Vec::with_capacity(self.streaming_tail.len());
+        self.flush_streaming_into(&mut output)?;
+        Ok(output)
+    }
+
+    /// Flushes remaining streaming overlap/window tail into `output`.
+    pub fn flush_streaming_into(&mut self, output: &mut Vec<f32>) -> Result<(), StretchError> {
         if self.streaming_tail.is_empty() || self.streaming_tail_window_sum.is_empty() {
             self.streaming_tail.clear();
             self.streaming_tail_window_sum.clear();
-            return Ok(vec![]);
+            output.clear();
+            return Ok(());
         }
 
-        let mut output = std::mem::take(&mut self.streaming_tail);
-        let window_sum = std::mem::take(&mut self.streaming_tail_window_sum);
-        let len = output.len().min(window_sum.len());
-        output.truncate(len);
-        Self::normalize_output(&mut output, &window_sum[..len]);
-        Ok(output)
+        let len = self
+            .streaming_tail
+            .len()
+            .min(self.streaming_tail_window_sum.len());
+        if output.capacity() < len {
+            return Err(StretchError::BufferOverflow {
+                buffer: "phase_vocoder_flush_output",
+                requested: len,
+                available: output.capacity(),
+            });
+        }
+        output.resize(len, 0.0);
+        output.copy_from_slice(&self.streaming_tail[..len]);
+        Self::normalize_output(output, &self.streaming_tail_window_sum[..len]);
+        self.streaming_tail.clear();
+        self.streaming_tail_window_sum.clear();
+        Ok(())
     }
 
     /// Shared PV core used by both batch and streaming paths.
