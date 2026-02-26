@@ -2,6 +2,44 @@
 
 use timestretch::{EdmPreset, StreamProcessor, StretchError, StretchParams};
 
+fn finite_signal(label: &str, samples: &[f32]) {
+    for (i, &s) in samples.iter().enumerate() {
+        assert!(s.is_finite(), "{}: non-finite sample at {}", label, i);
+    }
+}
+
+fn p95_adjacent_diff(samples: &[f32]) -> f32 {
+    if samples.len() < 2 {
+        return 0.0;
+    }
+
+    let mut diffs: Vec<f32> = samples
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .filter(|d| d.is_finite())
+        .collect();
+    if diffs.is_empty() {
+        return 0.0;
+    }
+    diffs.sort_by(|a, b| a.total_cmp(b));
+    let idx = ((diffs.len() - 1) as f32 * 0.95).round() as usize;
+    diffs[idx]
+}
+
+fn automation_chunk(start_sample: usize, len: usize, sample_rate: f32) -> Vec<f32> {
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let n = start_sample + i;
+        let t = n as f32 / sample_rate;
+        let tone = 0.45 * (2.0 * std::f32::consts::PI * 110.0 * t).sin()
+            + 0.35 * (2.0 * std::f32::consts::PI * 330.0 * t).sin()
+            + 0.2 * (2.0 * std::f32::consts::PI * 2200.0 * t).sin();
+        let click = if n % 2205 < 6 { 0.7 } else { 0.0 };
+        out.push((tone + click).clamp(-1.0, 1.0));
+    }
+    out
+}
+
 // ===== Rapid ratio changes =====
 
 #[test]
@@ -58,6 +96,105 @@ fn test_streaming_multiple_tempo_changes() {
             assert!(s.is_finite());
         }
     }
+}
+
+#[test]
+fn test_streaming_flush_continuity_under_rapid_ratio_automation() {
+    let params = StretchParams::new(1.0)
+        .with_sample_rate(44100)
+        .with_channels(1)
+        .with_preset(EdmPreset::DjBeatmatch);
+    let mut proc = StreamProcessor::new(params);
+
+    let ratios = [1.0, 1.08, 0.92, 1.12, 0.88, 1.04, 0.96];
+    let chunk_size = 2048usize;
+    let mut sample_cursor = 0usize;
+    let mut pre_flush = Vec::new();
+
+    for chunk_idx in 0..56 {
+        proc.set_stretch_ratio(ratios[chunk_idx % ratios.len()]);
+        let chunk = automation_chunk(sample_cursor, chunk_size, 44100.0);
+        sample_cursor += chunk_size;
+        let out = proc.process(&chunk).unwrap();
+        finite_signal("rapid-ratio process", &out);
+        pre_flush.extend_from_slice(&out);
+    }
+
+    assert!(
+        !pre_flush.is_empty(),
+        "Rapid ratio automation should produce output before flush"
+    );
+
+    let flushed = proc.flush().unwrap();
+    finite_signal("rapid-ratio flush", &flushed);
+
+    if !flushed.is_empty() {
+        let boundary_jump = (flushed[0] - pre_flush[pre_flush.len() - 1]).abs();
+        let tail_start = pre_flush.len().saturating_sub(4096);
+        let local_p95 = p95_adjacent_diff(&pre_flush[tail_start..]);
+        // The flush boundary jump should stay in family with recent local variation.
+        // A much larger jump would indicate chunk-tail discontinuity.
+        assert!(
+            boundary_jump <= local_p95 * 8.0 + 0.1,
+            "Rapid ratio flush boundary jump too large: jump={}, local_p95={}",
+            boundary_jump,
+            local_p95
+        );
+    }
+
+    let second_flush = proc.flush().unwrap();
+    assert!(
+        second_flush.is_empty(),
+        "Second flush should be empty after tail drain"
+    );
+}
+
+#[test]
+fn test_streaming_flush_continuity_under_rapid_tempo_automation() {
+    let mut proc = StreamProcessor::from_tempo(126.0, 126.0, 44100, 1);
+
+    let target_bpms = [124.0, 128.0, 130.0, 122.0, 127.0, 132.0, 125.0];
+    let chunk_size = 2048usize;
+    let mut sample_cursor = 0usize;
+    let mut pre_flush = Vec::new();
+
+    for chunk_idx in 0..56 {
+        assert!(
+            proc.set_tempo(target_bpms[chunk_idx % target_bpms.len()]),
+            "set_tempo should succeed for from_tempo processor"
+        );
+        let chunk = automation_chunk(sample_cursor, chunk_size, 44100.0);
+        sample_cursor += chunk_size;
+        let out = proc.process(&chunk).unwrap();
+        finite_signal("rapid-tempo process", &out);
+        pre_flush.extend_from_slice(&out);
+    }
+
+    assert!(
+        !pre_flush.is_empty(),
+        "Rapid tempo automation should produce output before flush"
+    );
+
+    let flushed = proc.flush().unwrap();
+    finite_signal("rapid-tempo flush", &flushed);
+
+    if !flushed.is_empty() {
+        let boundary_jump = (flushed[0] - pre_flush[pre_flush.len() - 1]).abs();
+        let tail_start = pre_flush.len().saturating_sub(4096);
+        let local_p95 = p95_adjacent_diff(&pre_flush[tail_start..]);
+        assert!(
+            boundary_jump <= local_p95 * 8.0 + 0.1,
+            "Rapid tempo flush boundary jump too large: jump={}, local_p95={}",
+            boundary_jump,
+            local_p95
+        );
+    }
+
+    let second_flush = proc.flush().unwrap();
+    assert!(
+        second_flush.is_empty(),
+        "Second flush should be empty after tail drain"
+    );
 }
 
 #[test]

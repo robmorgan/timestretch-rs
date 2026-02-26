@@ -32,7 +32,7 @@ const fn min_latency_frames(fft_size: usize) -> usize {
 /// For ratios near 1.0 (0.9..1.1 — typical DJ pitch range), uses the reduced
 /// 1.5x FFT latency buffer for responsiveness. For larger stretches or
 /// compressions, uses 2x FFT to give the phase vocoder enough context per
-/// call to produce coherent output (since the PV resets phase state each call).
+/// call to produce coherent output and reduce boundary sensitivity.
 #[inline]
 fn effective_min_frames(fft_size: usize, ratio: f64) -> usize {
     if (0.9..=1.1).contains(&ratio) {
@@ -216,7 +216,7 @@ impl StreamProcessor {
 
         for ch in 0..num_channels {
             self.deinterleave_channel(ch, num_channels);
-            let stretched = self.vocoders[ch].process(&self.channel_buffers[ch])?;
+            let stretched = self.vocoders[ch].process_streaming(&self.channel_buffers[ch])?;
             min_output_len = min_output_len.min(stretched.len());
             self.channel_buffers[ch] = stretched;
         }
@@ -249,7 +249,7 @@ impl StreamProcessor {
             0
         };
         let samples_consumed = if num_frames_processed > 0 {
-            ((num_frames_processed - 1) * hop + self.params.fft_size) * num_channels
+            (num_frames_processed * hop) * num_channels
         } else {
             0
         };
@@ -500,39 +500,26 @@ impl StreamProcessor {
     /// Zero-copy variant of [`flush`](Self::flush). Returns the number of
     /// samples written to `output`.
     pub fn flush_into(&mut self, output: &mut Vec<f32>) -> Result<usize, StretchError> {
-        if self.input_buffer.is_empty() {
-            return Ok(0);
+        let num_channels = self.params.channels.count();
+        self.interpolate_ratio();
+
+        let mut written = 0usize;
+        written += self.flush_pending_input_into(num_channels, output)?;
+
+        if !self.use_hybrid {
+            written += self.flush_vocoder_tails_into(num_channels, output)?;
         }
 
-        let nc = self.params.channels.count();
-        let min_size = effective_min_frames(self.params.fft_size, self.current_ratio) * nc;
-        while self.input_buffer.len() < min_size {
-            self.input_buffer.push(0.0);
-        }
-
-        let result = self.process_into(&[], output);
-        // Clear any leftover samples to prevent infinite flush loops
+        // Any remaining buffered analysis context is stale once stream is flushed.
         self.input_buffer.clear();
-        result
+        Ok(written)
     }
 
     /// Flushes remaining buffered samples.
     pub fn flush(&mut self) -> Result<Vec<f32>, StretchError> {
-        if self.input_buffer.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Pad input to minimum size and process
-        let nc = self.params.channels.count();
-        let min_size = effective_min_frames(self.params.fft_size, self.current_ratio) * nc;
-        while self.input_buffer.len() < min_size {
-            self.input_buffer.push(0.0);
-        }
-
-        let result = self.process(&[]);
-        // Clear any leftover samples to prevent infinite flush loops
-        self.input_buffer.clear();
-        result
+        let mut out = Vec::new();
+        self.flush_into(&mut out)?;
+        Ok(out)
     }
 
     /// Interleaves per-channel outputs directly into a caller-provided buffer.
@@ -552,6 +539,62 @@ impl StreamProcessor {
             }
         }
         total
+    }
+
+    /// Processes any buffered input once during flush (padding up to one FFT if needed).
+    fn flush_pending_input_into(
+        &mut self,
+        num_channels: usize,
+        output: &mut Vec<f32>,
+    ) -> Result<usize, StretchError> {
+        if self.input_buffer.is_empty() {
+            return Ok(0);
+        }
+
+        let fft = self.params.fft_size;
+        let min_samples = fft * num_channels;
+        if self.input_buffer.len() < min_samples {
+            self.input_buffer.resize(min_samples, 0.0);
+        }
+
+        let total_frames = self.input_buffer.len() / num_channels;
+        if total_frames < fft {
+            return Ok(0);
+        }
+
+        if self.use_hybrid {
+            return self.process_hybrid_into(num_channels, total_frames, output);
+        }
+
+        self.update_vocoder_ratio();
+        if num_channels == 2 {
+            self.sync_stereo_phase_reset();
+        }
+
+        let min_output_len = self.process_channels(num_channels)?;
+        if min_output_len == 0 {
+            return Ok(0);
+        }
+        Ok(self.interleave_into(min_output_len, num_channels, output))
+    }
+
+    /// Flushes per-vocoder synthesis overlap tails into interleaved output.
+    fn flush_vocoder_tails_into(
+        &mut self,
+        num_channels: usize,
+        output: &mut Vec<f32>,
+    ) -> Result<usize, StretchError> {
+        let mut min_output_len = usize::MAX;
+        for ch in 0..num_channels {
+            let tail = self.vocoders[ch].flush_streaming()?;
+            min_output_len = min_output_len.min(tail.len());
+            self.channel_buffers[ch] = tail;
+        }
+
+        if min_output_len == usize::MAX || min_output_len == 0 {
+            return Ok(0);
+        }
+        Ok(self.interleave_into(min_output_len, num_channels, output))
     }
 
     /// Processes accumulated input through hybrid algorithm, writing into caller buffer.

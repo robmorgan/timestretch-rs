@@ -63,6 +63,10 @@ pub struct PhaseVocoder {
     output_buf: Vec<f32>,
     /// Reusable window sum buffer (avoids allocation per process() call).
     window_sum_buf: Vec<f32>,
+    /// Unnormalized overlap-add tail carried between streaming calls.
+    streaming_tail: Vec<f32>,
+    /// Window-sum tail matching `streaming_tail`.
+    streaming_tail_window_sum: Vec<f32>,
 }
 
 impl PhaseVocoder {
@@ -194,6 +198,8 @@ impl PhaseVocoder {
             if_phases_backup: vec![0.0; num_bins],
             output_buf: Vec::new(),
             window_sum_buf: Vec::new(),
+            streaming_tail: Vec::new(),
+            streaming_tail_window_sum: Vec::new(),
         }
     }
 
@@ -274,6 +280,90 @@ impl PhaseVocoder {
 
     /// Stretches a mono audio signal using phase vocoder with identity phase locking.
     pub fn process(&mut self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
+        // Batch calls are independent; clear any prior streaming overlap state.
+        self.streaming_tail.clear();
+        self.streaming_tail_window_sum.clear();
+
+        let (_num_frames, output_len) = self.process_core(input, true)?;
+        let mut output = self.output_buf[..output_len].to_vec();
+        Self::normalize_output(&mut output, &self.window_sum_buf[..output_len]);
+        Ok(output)
+    }
+
+    /// Streaming phase-vocoder pass that preserves phase across calls.
+    ///
+    /// `input` should include any required analysis overlap context from the
+    /// caller (typically managed by a higher-level stream processor). This
+    /// method keeps synthesis overlap/window tails internally and emits only
+    /// hop-aligned samples that are final for this call.
+    pub fn process_streaming(&mut self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
+        if input.len() < self.fft_size {
+            return Ok(vec![]);
+        }
+
+        let (num_frames, output_len) = self.process_core(input, false)?;
+        let emit_len = num_frames.saturating_mul(self.hop_synthesis);
+        let work_len = output_len
+            .max(emit_len)
+            .max(self.streaming_tail.len())
+            .max(self.streaming_tail_window_sum.len());
+
+        let mut accum_output = vec![0.0f32; work_len];
+        let mut accum_window_sum = vec![0.0f32; work_len];
+
+        accum_output[..output_len].copy_from_slice(&self.output_buf[..output_len]);
+        accum_window_sum[..output_len].copy_from_slice(&self.window_sum_buf[..output_len]);
+
+        let tail_len = self
+            .streaming_tail
+            .len()
+            .min(self.streaming_tail_window_sum.len());
+        for i in 0..tail_len {
+            accum_output[i] += self.streaming_tail[i];
+            accum_window_sum[i] += self.streaming_tail_window_sum[i];
+        }
+
+        // Keep the unresolved overlap region for the next chunk.
+        self.streaming_tail.clear();
+        self.streaming_tail_window_sum.clear();
+        if emit_len < work_len {
+            self.streaming_tail
+                .extend_from_slice(&accum_output[emit_len..work_len]);
+            self.streaming_tail_window_sum
+                .extend_from_slice(&accum_window_sum[emit_len..work_len]);
+        }
+
+        let mut emitted = accum_output[..emit_len].to_vec();
+        Self::normalize_output(&mut emitted, &accum_window_sum[..emit_len]);
+        Ok(emitted)
+    }
+
+    /// Flushes remaining streaming overlap/window tail at end of stream.
+    pub fn flush_streaming(&mut self) -> Result<Vec<f32>, StretchError> {
+        if self.streaming_tail.is_empty() || self.streaming_tail_window_sum.is_empty() {
+            self.streaming_tail.clear();
+            self.streaming_tail_window_sum.clear();
+            return Ok(vec![]);
+        }
+
+        let mut output = std::mem::take(&mut self.streaming_tail);
+        let window_sum = std::mem::take(&mut self.streaming_tail_window_sum);
+        let len = output.len().min(window_sum.len());
+        output.truncate(len);
+        Self::normalize_output(&mut output, &window_sum[..len]);
+        Ok(output)
+    }
+
+    /// Shared PV core used by both batch and streaming paths.
+    ///
+    /// Returns `(num_frames, output_len)` where `output_len` samples are
+    /// accumulated (unnormalized) into `self.output_buf` and
+    /// `self.window_sum_buf`.
+    fn process_core(
+        &mut self,
+        input: &[f32],
+        reset_phase_state: bool,
+    ) -> Result<(usize, usize), StretchError> {
         if input.len() < self.fft_size {
             return Err(StretchError::InputTooShort {
                 provided: input.len(),
@@ -294,9 +384,10 @@ impl PhaseVocoder {
         let fft_forward = self.planner.plan_fft_forward(self.fft_size);
         let fft_inverse = self.planner.plan_fft_inverse(self.fft_size);
 
-        // Reset phase state without reallocating
-        self.phase_accum.fill(0.0);
-        self.prev_phase.fill(0.0);
+        if reset_phase_state {
+            self.phase_accum.fill(0.0);
+            self.prev_phase.fill(0.0);
+        }
 
         let hop_ratio = self.hop_synthesis as f64 / self.hop_analysis as f64;
         let norm = 1.0 / self.fft_size as f32;
@@ -391,9 +482,7 @@ impl PhaseVocoder {
             }
         }
 
-        Self::normalize_output(&mut self.output_buf, &self.window_sum_buf);
-        // Return a copy of the output; the buffers stay allocated for reuse.
-        Ok(self.output_buf[..output_len].to_vec())
+        Ok((num_frames, output_len))
     }
 
     /// Windows the input frame and transforms to frequency domain.
@@ -634,6 +723,7 @@ impl std::fmt::Debug for PhaseVocoder {
             .field("hop_synthesis", &self.hop_synthesis)
             .field("sub_bass_bin", &self.sub_bass_bin)
             .field("phase_locking_mode", &self.phase_locking_mode)
+            .field("streaming_tail_len", &self.streaming_tail.len())
             .finish()
     }
 }
@@ -1306,6 +1396,74 @@ mod tests {
         let output2 = pv.process(&input).unwrap();
         assert!(!output2.is_empty());
         assert!(output2.len() > output1.len()); // 1.5x should be longer
+    }
+
+    #[test]
+    fn test_process_streaming_and_flush_produce_finite_output() {
+        let fft_size = 2048;
+        let hop = 512;
+        let sample_rate = 44100u32;
+        let num_samples = fft_size * 10;
+
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (2.0 * PI * 220.0 * t).sin() * 0.6 + (2.0 * PI * 880.0 * t).sin() * 0.25
+            })
+            .collect();
+
+        let mut pv = PhaseVocoder::new(fft_size, hop, 1.1, sample_rate, 120.0);
+        let mut total_output = Vec::new();
+        let mut analysis_buffer = Vec::new();
+
+        for chunk in input.chunks(700) {
+            analysis_buffer.extend_from_slice(chunk);
+            if analysis_buffer.len() < fft_size {
+                continue;
+            }
+
+            let out = pv.process_streaming(&analysis_buffer).unwrap();
+            total_output.extend_from_slice(&out);
+
+            let num_frames = (analysis_buffer.len() - fft_size) / hop + 1;
+            let consumed = num_frames * hop;
+            analysis_buffer.drain(..consumed);
+        }
+
+        if !analysis_buffer.is_empty() {
+            analysis_buffer.resize(fft_size, 0.0);
+            let out = pv.process_streaming(&analysis_buffer).unwrap();
+            total_output.extend_from_slice(&out);
+        }
+
+        let tail = pv.flush_streaming().unwrap();
+        total_output.extend_from_slice(&tail);
+
+        assert!(
+            !total_output.is_empty(),
+            "Streaming path should produce output"
+        );
+        assert!(total_output.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn test_flush_streaming_is_idempotent() {
+        let fft_size = 1024;
+        let hop = 256;
+        let sample_rate = 44100u32;
+        let input: Vec<f32> = (0..fft_size * 3)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .collect();
+
+        let mut pv = PhaseVocoder::new(fft_size, hop, 1.0, sample_rate, 120.0);
+        let _ = pv.process_streaming(&input).unwrap();
+
+        let _first = pv.flush_streaming().unwrap();
+        let second = pv.flush_streaming().unwrap();
+        assert!(
+            second.is_empty(),
+            "Second flush_streaming() call should be empty"
+        );
     }
 
     // --- sub_bass_bin edge cases ---
