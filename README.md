@@ -4,17 +4,29 @@ Pure Rust audio time-stretching library optimized for electronic dance music.
 
 Stretches audio in time without changing its pitch, using a hybrid algorithm that
 combines phase vocoder (for tonal content) with WSOLA (for transients). The only
-external dependency is [`rustfft`](https://crates.io/crates/rustfft).
+external DSP dependency is [`rustfft`](https://crates.io/crates/rustfft).
 
 ## Features
 
 - **Hybrid algorithm** — automatically switches between phase vocoder and WSOLA
   at transient boundaries so kicks stay punchy while pads stretch smoothly
+- **Exact timeline fidelity** — explicit segment timeline bookkeeping and
+  crossfade compensation keep output duration locked to target tempo
 - **EDM presets** — tuned parameter sets for DJ beatmatching, house loops,
   halftime effects, ambient stretches, and vocal chops
+- **Persistent hybrid streaming** — optional high-quality stream mode that keeps
+  rolling state across calls instead of re-instantiating per chunk
+- **Stateful streaming PV core** — phase state and overlap tails persist across
+  stream chunks for smoother continuity
 - **Streaming API** — process audio in chunks for real-time use with dynamic
-  stretch ratio changes
+  stretch ratio and tempo changes
+- **Offline pre-analysis pipeline** — optional reusable artifact (BPM, phase,
+  confidence, transient map) for safer beat/onset alignment at runtime
+- **Stereo coherence hardening** — shared onset/timing map and deterministic
+  channel length agreement in mid/side mode
 - **Sub-bass phase locking** — locks phase below 120 Hz to prevent bass smearing
+- **Quality gates** — benchmark-style pass/fail regression checks for duration,
+  transient alignment, timing coherence, loudness, and spectral similarity
 - **WAV I/O** — built-in reader/writer for 16-bit, 24-bit, and 32-bit float WAV files
 - **Safe Rust** — `#![forbid(unsafe_code)]`, no panics in library code
 
@@ -46,11 +58,11 @@ let output = timestretch::stretch(&input, &params).unwrap();
 ### DJ Beatmatching (126 BPM to 128 BPM)
 
 ```rust
-use timestretch::{StretchParams, EdmPreset};
+use timestretch::{StretchParams, EdmPreset, bpm_ratio};
 
 let original_bpm = 126.0_f64;
 let target_bpm = 128.0_f64;
-let ratio = target_bpm / original_bpm; // ~1.016
+let ratio = bpm_ratio(original_bpm, target_bpm); // source / target = ~0.984
 
 let params = StretchParams::new(ratio)
     .with_preset(EdmPreset::DjBeatmatch)
@@ -71,6 +83,7 @@ let params = StretchParams::new(1.02)
     .with_channels(2);
 
 let mut processor = StreamProcessor::new(params);
+processor.set_hybrid_mode(true); // optional: persistent hybrid streaming path
 
 // Feed chunks as they arrive from your audio driver
 loop {
@@ -84,6 +97,24 @@ processor.set_stretch_ratio(1.05);
 
 // Flush remaining samples when done
 let remaining = processor.flush().unwrap();
+```
+
+### Tempo-Aware Streaming (DJ)
+
+```rust
+use timestretch::StreamProcessor;
+
+let mut processor = StreamProcessor::from_tempo(126.0, 128.0, 44100, 2);
+processor.set_hybrid_mode(true); // optional: higher-quality hybrid stream path
+
+// Move the target deck tempo during playback
+processor.set_tempo(130.0);
+
+println!(
+    "Current target BPM: {:.2}, latency: {:.1} ms",
+    processor.target_bpm().unwrap_or(0.0),
+    processor.latency_secs() * 1000.0
+);
 ```
 
 ### AudioBuffer API
@@ -126,6 +157,31 @@ let params = StretchParams::new(1.0) // ratio computed automatically
 let output = timestretch::stretch_to_bpm(&input, &params, 126.0, 128.0).unwrap();
 ```
 
+### Offline Pre-Analysis (Optional)
+
+```rust
+use timestretch::{
+    analyze_for_dj, read_preanalysis_json, stretch, write_preanalysis_json,
+    StretchParams, EdmPreset,
+};
+use std::path::Path;
+
+// Build a reusable analysis artifact once (offline)
+let artifact = analyze_for_dj(&input, 44100);
+write_preanalysis_json(Path::new("track.preanalysis.json"), &artifact).unwrap();
+
+// Load artifact at runtime and attach it to params
+let loaded = read_preanalysis_json(Path::new("track.preanalysis.json")).unwrap();
+let params = StretchParams::new(126.0 / 128.0)
+    .with_preset(EdmPreset::DjBeatmatch)
+    .with_sample_rate(44100)
+    .with_pre_analysis(loaded)
+    .with_beat_snap_confidence_threshold(0.35)
+    .with_beat_snap_tolerance_ms(5.0);
+
+let output = stretch(&input, &params).unwrap();
+```
+
 ### WAV File I/O
 
 ```rust
@@ -160,21 +216,28 @@ timestretch::stretch_wav_file("input.wav", "output.wav", &params).unwrap();
 
 ## How It Works
 
-The library uses a three-stage hybrid approach:
+The library uses a hybrid segmented pipeline:
 
 1. **Transient detection** — spectral flux with adaptive threshold identifies
    attack transients (kicks, snares, hi-hats). High-frequency bins (2–8 kHz)
    are weighted more heavily to catch percussive onsets.
 
-2. **Segment-wise stretching** — the audio is split at transient boundaries.
+2. **Beat-aware segmentation (optional)** — transient boundaries can be merged
+   with beat-grid positions and snapped to subdivisions. If provided, an
+   offline pre-analysis artifact is preferred when confidence is high.
+
+3. **Segment-wise stretching** — the audio is split at boundaries.
    Transient segments are stretched with WSOLA (preserves waveform shape and
    attack character). Tonal segments are stretched with a phase vocoder
    (preserves frequency content with identity phase locking).
 
-3. **Sub-bass treatment** — frequencies below 120 Hz always use phase-locked
+4. **Sub-bass treatment** — frequencies below 120 Hz always use phase-locked
    processing to prevent phase cancellation that would weaken the bass.
 
-Segments are joined with 5ms raised-cosine crossfades.
+5. **Timeline correction** — explicit timeline bookkeeping compensates boundary
+   overlap so concatenation preserves target output duration exactly.
+
+Segment joins use fixed or adaptive raised-cosine crossfades.
 
 ## Parameters
 
@@ -184,13 +247,22 @@ Segments are joined with 5ms raised-cosine crossfades.
 let params = StretchParams::new(1.5)
     .with_sample_rate(48000)
     .with_channels(2)
-    .with_preset(EdmPreset::HouseLoop)  // apply preset first
-    .with_fft_size(4096)                // then override individual params
+    .with_preset(EdmPreset::HouseLoop)   // apply preset first
+    .with_fft_size(4096)                 // then override individual params
     .with_hop_size(1024)
     .with_transient_sensitivity(0.6)
+    .with_elastic_timing(true)
+    .with_crossfade_mode(timestretch::CrossfadeMode::Adaptive)
+    .with_hpss(true)
+    .with_multi_resolution(true)
     .with_sub_bass_cutoff(100.0)
+    .with_stereo_mode(timestretch::StereoMode::MidSide)
+    .with_phase_locking_mode(timestretch::PhaseLockingMode::RegionOfInfluence)
     .with_wsola_segment_size(960)
-    .with_wsola_search_range(480);
+    .with_wsola_search_range(480)
+    .with_beat_aware(true)
+    .with_beat_snap_confidence_threshold(0.35)
+    .with_beat_snap_tolerance_ms(5.0);
 ```
 
 **Defaults:** 44100 Hz, stereo, FFT 4096, hop 1024 (75% overlap), 120 Hz
@@ -198,27 +270,43 @@ sub-bass cutoff, ~20ms WSOLA segments, ~10ms search range.
 
 ## Performance
 
-Measured on a modern CPU (release build), processing 5 seconds of 44.1 kHz audio:
+Performance depends heavily on preset, ratio, and mode (PV-only streaming vs
+hybrid streaming vs offline batch).
 
-| Configuration | Speed | Real-time Factor |
-|---------------|-------|-----------------|
-| Phase vocoder, mono | ~28ms | 176x |
-| Phase vocoder, stereo | ~54ms | 93x |
-| Streaming, stereo | ~59ms | 169x |
+Run built-in benchmark tests:
 
-All buffers are pre-allocated on init. The processing loop performs zero
-heap allocations.
+```sh
+# Throughput-oriented benchmark suite (use release for realistic timing)
+cargo test --release --test benchmarks -- --nocapture
+
+# M0 baseline command (strict corpus validation + archive)
+./benchmarks/run_m0_baseline.sh
+
+# Quality-gate benchmark subset (CI-enforced)
+cargo test --test quality_gates -- --nocapture
+
+# Reference-quality comparison (strict corpus required)
+TIMESTRETCH_STRICT_REFERENCE_BENCHMARK=1 TIMESTRETCH_REFERENCE_MAX_SECONDS=30 cargo test --test reference_quality -- --nocapture
+
+# Ad-hoc reference-quality run (non-strict, short window)
+TIMESTRETCH_REFERENCE_MAX_SECONDS=5 cargo test --test reference_quality -- --nocapture
+```
+
+See `benchmarks/README.md` for corpus setup and manifest/checksum requirements.
 
 ## API Reference
 
 ### Core Types
 
 - **`StretchParams`** — builder-pattern configuration: stretch ratio, sample rate,
-  channels, FFT size, hop size, EDM preset, and WSOLA parameters
+  channels, FFT size, hop size, EDM preset, WSOLA parameters, beat-snap controls,
+  optional pre-analysis artifact, and tempo helpers like `from_tempo()`
 - **`AudioBuffer`** — holds interleaved sample data with metadata (sample rate,
   channel layout)
 - **`EdmPreset`** — enum of tuned parameter sets for EDM workflows
-- **`StreamProcessor`** — chunked real-time processor with on-the-fly ratio changes
+- **`StreamProcessor`** — chunked real-time processor with on-the-fly ratio/tempo
+  changes, `from_tempo()`/`set_tempo()`, `process_into()`, and optional persistent hybrid mode
+- **`PreAnalysisArtifact`** — serializable offline beat/onset analysis artifact
 - **`StretchError`** — error type covering invalid parameters, I/O failures,
   and input-too-short conditions
 
@@ -226,9 +314,12 @@ heap allocations.
 
 **Time stretching:**
 - `stretch(&[f32], &StretchParams)` — stretch raw sample data
+- `stretch_into(&[f32], &StretchParams, &mut Vec<f32>)` — append stretched output into caller buffer
 - `stretch_buffer(&AudioBuffer, &StretchParams)` — stretch an `AudioBuffer`
 - `stretch_to_bpm(&[f32], &StretchParams, source_bpm, target_bpm)` — BPM-based stretch
 - `stretch_to_bpm_auto(&[f32], &StretchParams, target_bpm)` — auto-detect BPM and stretch
+- `stretch_bpm_buffer(&AudioBuffer, &StretchParams, source_bpm, target_bpm)` — BPM stretch for `AudioBuffer`
+- `stretch_bpm_buffer_auto(&AudioBuffer, &StretchParams, target_bpm)` — auto BPM stretch for `AudioBuffer`
 
 **Pitch shifting:**
 - `pitch_shift(&[f32], &StretchParams, factor)` — shift pitch without changing duration
@@ -238,10 +329,18 @@ heap allocations.
 - `detect_bpm(&[f32], sample_rate)` — detect tempo from raw samples
 - `detect_bpm_buffer(&AudioBuffer)` — detect tempo from an `AudioBuffer`
 - `detect_beat_grid(&[f32], sample_rate)` — detect beat grid positions
+- `detect_beat_grid_buffer(&AudioBuffer)` — detect beat grid from an `AudioBuffer`
 - `bpm_ratio(source_bpm, target_bpm)` — compute stretch ratio for BPM change
+
+**Pre-analysis artifact pipeline:**
+- `analyze_for_dj(&[f32], sample_rate)` — generate offline beat/onset artifact
+- `write_preanalysis_json(path, &PreAnalysisArtifact)` — write artifact JSON
+- `read_preanalysis_json(path)` — read artifact JSON
 
 **WAV file convenience:**
 - `stretch_wav_file(input, output, &StretchParams)` — read, stretch, and write a WAV file
+- `stretch_to_bpm_wav_file(input, output, &StretchParams, source_bpm, target_bpm)` — WAV BPM stretch
+- `stretch_to_bpm_auto_wav_file(input, output, &StretchParams, target_bpm)` — WAV auto BPM stretch
 - `pitch_shift_wav_file(input, output, &StretchParams, factor)` — read, pitch-shift, and write
 
 See the [API documentation](https://docs.rs/timestretch) for full details.
@@ -252,7 +351,9 @@ Run the included examples:
 
 ```sh
 cargo run --example basic_stretch      # Simple time stretch
+cargo run --example benchmark_quality  # Offline quality benchmark helper
 cargo run --example dj_beatmatch       # 126 → 128 BPM tempo sync
+cargo run --example dj_mix             # Streaming DJ transition demo
 cargo run --example sample_halftime    # 2x halftime effect
 cargo run --example pitch_shift        # Pitch shifting demo
 cargo run --example realtime_stream    # Streaming API demo
