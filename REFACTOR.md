@@ -165,6 +165,9 @@ Acceptance criteria:
 7. M6 quality gates
 
 ## Current Progress (Updated)
+Current focus:
+- Next milestone to execute: `M2: Timeline/Length Correctness (Tempo Fidelity)`.
+
 Completed for M0:
 - Added strict benchmark validation mode in `tests/reference_quality.rs`:
   - Missing manifest/files/references/checksums fail in strict mode (no silent skip).
@@ -175,6 +178,12 @@ Completed for M0:
 - Archived baseline from strict run:
   - `benchmarks/baselines/m0_baseline_latest.json`
   - `benchmarks/baselines/m0_baseline_20260226T021840Z.json`
+- Latest baseline snapshot (strict, 30s window):
+  - `tracks_tested`: 1
+  - `references_tested`: 1
+  - `skipped`: 0
+  - `average_spectral_similarity`: 0.6276
+  - Best preset on current corpus track: `Ambient` (spectral similarity: 0.6422)
 
 Completed for M1:
 - Added stateful streaming PV methods:
