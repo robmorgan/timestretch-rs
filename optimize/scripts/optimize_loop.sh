@@ -152,9 +152,38 @@ for d in sorted_data:
     envsubst < "optimize/scripts/agent_prompt.md.tmpl" > "$PROMPT_FILE"
     
     # 5. Run Agent (agent self-scores and commits if improved)
+    AGENT_OK=1
     if ! run_agent "$PROMPT_FILE" "$i"; then
-        echo "Agent failed or build broken. Reverting changes..."
+        echo "Agent failed or build broken."
+        AGENT_OK=0
+    fi
+
+    # 6. Safety net: verify and commit any uncommitted improvements
+    if git diff --quiet src/ && git diff --cached --quiet src/; then
+        echo "No uncommitted changes in src/."
+    elif [ $AGENT_OK -eq 0 ]; then
+        echo "Agent failed. Reverting uncommitted changes..."
         git checkout -- src/
+    else
+        echo "Uncommitted changes detected. Re-scoring to check for improvement..."
+        if cargo build --release 2>/dev/null; then
+            ./optimize/scripts/run_test_suite.py
+            VERIFY_JSON="$LOG_DIR/scores_${i}_verify.json"
+            ./optimize/scripts/score.py --batch "$VERIFY_JSON"
+            NEW_AVG=$(python3 -c "import json; data=json.load(open('$VERIFY_JSON')); print(sum(r['total_score'] for r in data)/len(data))")
+            echo "Post-agent score: $NEW_AVG (was: $AVG_SCORE)"
+            if python3 -c "import sys; sys.exit(0 if $NEW_AVG > $AVG_SCORE else 1)"; then
+                echo "Score improved! Committing uncommitted agent changes..."
+                git add src/
+                git commit -m "opt(loop): auto-commit agent improvement, score=$NEW_AVG (was $AVG_SCORE)"
+            else
+                echo "Score did not improve ($NEW_AVG <= $AVG_SCORE). Reverting..."
+                git checkout -- src/
+            fi
+        else
+            echo "Build failed with uncommitted changes. Reverting..."
+            git checkout -- src/
+        fi
     fi
 
     # Cool off before next iteration
