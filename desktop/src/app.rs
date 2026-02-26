@@ -109,15 +109,23 @@ impl TimeStretchApp {
 
                 let sample_rate = decoded.sample_rate;
                 let num_frames = decoded.num_frames;
-                let samples = Arc::new(decoded.samples);
+                let channel_layout = timestretch::Channels::from_count(decoded.channels as usize)
+                    .unwrap_or(timestretch::Channels::Stereo);
+                let bpm_buffer =
+                    timestretch::AudioBuffer::new(decoded.samples, sample_rate, channel_layout);
 
                 // Compute waveform peaks
-                self.waveform_peaks =
-                    Some(WaveformPeaks::compute(&samples, 2, 800));
+                self.waveform_peaks = Some(WaveformPeaks::compute(&bpm_buffer.data, 2, 800));
 
-                // Detect BPM
-                let bpm = timestretch::detect_bpm(&samples, sample_rate);
+                // Detect BPM from channel-aware buffer (stereo-safe).
+                let bpm = timestretch::detect_bpm_buffer(&bpm_buffer);
                 log::info!("Detected BPM: {bpm:.1}");
+                self.target_bpm_text = if bpm > 0.0 {
+                    format!("{bpm:.1}")
+                } else {
+                    String::new()
+                };
+                let samples = Arc::new(bpm_buffer.into_data());
 
                 // Update shared state
                 {
@@ -126,6 +134,7 @@ impl TimeStretchApp {
                     st.total_frames = num_frames;
                     st.position_frames = 0;
                     st.detected_bpm = bpm;
+                    st.target_bpm = bpm.max(0.0);
                     st.transport = Transport::Stopped;
                     st.stretch_ratio = self.stretch_ratio;
                     st.pitch_semitones = self.pitch_semitones;
@@ -319,6 +328,12 @@ impl TimeStretchApp {
                 ui.label(format!("{} Hz", st.sample_rate));
                 ui.separator();
                 ui.label(format!("{:.1}s", st.duration_secs()));
+                ui.separator();
+                if st.detected_bpm > 0.0 {
+                    ui.label(format!("{:.1} BPM", st.detected_bpm));
+                } else {
+                    ui.label("BPM: --");
+                }
             }
         });
     }
