@@ -8,6 +8,7 @@ rust-version = "1.82"
 keywords = ["audio", "dsp", "time-stretching", "phase-vocoder", "edm"]
 categories = ["multimedia::audio", "algorithms"]
 readme = "README.md"
+repository = "https://github.com/robmorgan/timestretch-rs"
 
 [dependencies]
 rustfft = "6"
