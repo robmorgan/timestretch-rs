@@ -42,6 +42,61 @@ fn effective_min_frames(fft_size: usize, ratio: f64) -> usize {
     }
 }
 
+/// Persistent hybrid-streaming state.
+///
+/// Keeps rolling per-channel analysis buffers and emits only newly-rendered
+/// output on each call, instead of re-instantiating `HybridStretcher` per call.
+struct HybridStreamingState {
+    stretchers: Vec<HybridStretcher>,
+    rolling_inputs: Vec<Vec<f32>>,
+    emitted_output_lens: Vec<usize>,
+    last_ratio: f64,
+}
+
+impl HybridStreamingState {
+    fn new(params: &StretchParams, ratio: f64) -> Self {
+        let num_channels = params.channels.count();
+        let mut per_channel = params.clone();
+        per_channel.stretch_ratio = ratio;
+
+        Self {
+            stretchers: (0..num_channels)
+                .map(|_| HybridStretcher::new(per_channel.clone()))
+                .collect(),
+            rolling_inputs: (0..num_channels).map(|_| Vec::new()).collect(),
+            emitted_output_lens: vec![0; num_channels],
+            last_ratio: ratio,
+        }
+    }
+
+    fn reset(&mut self, params: &StretchParams, ratio: f64) {
+        *self = Self::new(params, ratio);
+    }
+
+    fn update_ratio(&mut self, ratio: f64) {
+        if (ratio - self.last_ratio).abs() <= RATIO_SNAP_THRESHOLD {
+            return;
+        }
+        for stretcher in &mut self.stretchers {
+            stretcher.set_stretch_ratio(ratio);
+        }
+        self.last_ratio = ratio;
+    }
+
+    /// Rebase rolling buffers when ratio changes so already-emitted history
+    /// remains immutable while preserving a small analysis context tail.
+    fn rebase_after_ratio_change(&mut self, fft_size: usize) {
+        let keep_tail = fft_size * 2;
+        for input in &mut self.rolling_inputs {
+            if input.len() > keep_tail {
+                let drop = input.len() - keep_tail;
+                input.drain(..drop);
+            }
+        }
+        self.emitted_output_lens.fill(0);
+    }
+}
+
 /// Streaming chunk-based processor for real-time time stretching.
 ///
 /// Accumulates input samples in an internal buffer and processes them
@@ -92,6 +147,10 @@ pub struct StreamProcessor {
     /// When true, use the full hybrid algorithm (transient detection + WSOLA + PV)
     /// instead of PV-only. Higher quality for EDM but higher latency.
     use_hybrid: bool,
+    /// Persistent hybrid streaming state (rolling inputs + incremental outputs).
+    hybrid_state: HybridStreamingState,
+    /// Indicates that hybrid rolling buffers should rebase on the next process call.
+    hybrid_pending_rebase: bool,
     /// Reusable mono mixdown buffer for stereo phase coherence.
     /// Used to detect transients on the mid signal so both channels share
     /// the same phase reset timing.
@@ -120,6 +179,7 @@ impl StreamProcessor {
         let source_bpm = params.bpm;
         let vocoders = Self::create_vocoders(&params, ratio);
         let channel_buffers = (0..num_channels).map(|_| Vec::new()).collect();
+        let hybrid_state = HybridStreamingState::new(&params, ratio);
 
         Self {
             params,
@@ -133,6 +193,8 @@ impl StreamProcessor {
             output_scratch: Vec::new(),
             source_bpm,
             use_hybrid: false,
+            hybrid_state,
+            hybrid_pending_rebase: false,
             mid_buffer: Vec::new(),
         }
     }
@@ -182,7 +244,7 @@ impl StreamProcessor {
         }
 
         if self.use_hybrid {
-            return self.process_hybrid_path(num_channels, total_frames);
+            return self.process_hybrid_path(num_channels);
         }
 
         // Update vocoders' stretch ratio in-place to preserve phase state.
@@ -274,37 +336,53 @@ impl StreamProcessor {
         self.output_scratch.clone()
     }
 
-    /// Processes accumulated input through the hybrid algorithm (transient detection + WSOLA + PV).
-    ///
-    /// Deinterleaves the input, runs each channel through a fresh HybridStretcher
-    /// with the current ratio, then reinterleaves the output. All accumulated input
-    /// is consumed on each call.
-    fn process_hybrid_path(
-        &mut self,
-        num_channels: usize,
-        total_frames: usize,
-    ) -> Result<Vec<f32>, StretchError> {
-        // Build params with the current (interpolated) ratio
-        let mut hybrid_params = self.params.clone();
-        hybrid_params.stretch_ratio = self.current_ratio;
-
-        let mut min_output_len = usize::MAX;
-
+    /// Appends newly accumulated interleaved input into the persistent
+    /// per-channel rolling hybrid buffers.
+    fn append_hybrid_input(&mut self, num_channels: usize) {
         for ch in 0..num_channels {
             self.deinterleave_channel(ch, num_channels);
-            let stretcher = HybridStretcher::new(hybrid_params.clone());
-            let stretched = stretcher.process(&self.channel_buffers[ch])?;
-            min_output_len = min_output_len.min(stretched.len());
-            self.channel_buffers[ch] = stretched;
+            self.hybrid_state.rolling_inputs[ch].extend_from_slice(&self.channel_buffers[ch]);
+        }
+        self.input_buffer.clear();
+    }
+
+    /// Runs persistent hybrid rendering on rolling input and keeps only delta output.
+    fn process_hybrid_persistent_channels(
+        &mut self,
+        num_channels: usize,
+    ) -> Result<usize, StretchError> {
+        if self.hybrid_pending_rebase {
+            // Ratio changes should not retroactively rewrite already-emitted history.
+            self.hybrid_state
+                .rebase_after_ratio_change(self.params.fft_size);
+            self.hybrid_pending_rebase = false;
+        }
+        self.hybrid_state.update_ratio(self.current_ratio);
+
+        self.append_hybrid_input(num_channels);
+
+        let mut min_output_len = usize::MAX;
+        for ch in 0..num_channels {
+            let rendered =
+                self.hybrid_state.stretchers[ch].process(&self.hybrid_state.rolling_inputs[ch])?;
+            let emitted = self.hybrid_state.emitted_output_lens[ch].min(rendered.len());
+            let delta = rendered[emitted..].to_vec();
+            self.hybrid_state.emitted_output_lens[ch] = rendered.len();
+            min_output_len = min_output_len.min(delta.len());
+            self.channel_buffers[ch] = delta;
         }
 
-        // Consume all input
-        self.input_buffer.clear();
-        // Keep overlap for continuity: retain the last FFT window of frames
-        // (not applicable in hybrid mode — each call is self-contained)
-        let _ = total_frames; // used for API consistency
+        Ok(if min_output_len == usize::MAX {
+            0
+        } else {
+            min_output_len
+        })
+    }
 
-        if min_output_len == usize::MAX || min_output_len == 0 {
+    /// Processes accumulated input through persistent hybrid streaming state.
+    fn process_hybrid_path(&mut self, num_channels: usize) -> Result<Vec<f32>, StretchError> {
+        let min_output_len = self.process_hybrid_persistent_channels(num_channels)?;
+        if min_output_len == 0 {
             return Ok(vec![]);
         }
         Ok(self.interleave_output(min_output_len, num_channels))
@@ -334,6 +412,9 @@ impl StreamProcessor {
     ///
     /// The ratio change is interpolated smoothly to avoid clicks.
     pub fn set_stretch_ratio(&mut self, ratio: f64) {
+        if (ratio - self.target_ratio).abs() > RATIO_SNAP_THRESHOLD {
+            self.hybrid_pending_rebase = true;
+        }
         self.target_ratio = ratio;
     }
 
@@ -347,6 +428,10 @@ impl StreamProcessor {
     ///
     /// When disabled (default), uses phase vocoder only for lowest latency.
     pub fn set_hybrid_mode(&mut self, enabled: bool) {
+        if enabled && !self.use_hybrid {
+            self.hybrid_state.reset(&self.params, self.current_ratio);
+            self.hybrid_pending_rebase = false;
+        }
         self.use_hybrid = enabled;
     }
 
@@ -421,6 +506,9 @@ impl StreamProcessor {
 
         // Recreate vocoders with original ratio
         self.vocoders = Self::create_vocoders(&self.params, self.params.stretch_ratio);
+        self.hybrid_state
+            .reset(&self.params, self.params.stretch_ratio);
+        self.hybrid_pending_rebase = false;
     }
 
     /// Processes a chunk of interleaved audio, writing output into `output`.
@@ -475,7 +563,7 @@ impl StreamProcessor {
         }
 
         if self.use_hybrid {
-            return self.process_hybrid_into(num_channels, total_frames, output);
+            return self.process_hybrid_into(num_channels, output);
         }
 
         self.update_vocoder_ratio();
@@ -512,6 +600,10 @@ impl StreamProcessor {
 
         // Any remaining buffered analysis context is stale once stream is flushed.
         self.input_buffer.clear();
+        if self.use_hybrid {
+            self.hybrid_state.reset(&self.params, self.current_ratio);
+            self.hybrid_pending_rebase = false;
+        }
         Ok(written)
     }
 
@@ -563,7 +655,7 @@ impl StreamProcessor {
         }
 
         if self.use_hybrid {
-            return self.process_hybrid_into(num_channels, total_frames, output);
+            return self.process_hybrid_into(num_channels, output);
         }
 
         self.update_vocoder_ratio();
@@ -601,29 +693,12 @@ impl StreamProcessor {
     fn process_hybrid_into(
         &mut self,
         num_channels: usize,
-        total_frames: usize,
         output: &mut Vec<f32>,
     ) -> Result<usize, StretchError> {
-        let mut hybrid_params = self.params.clone();
-        hybrid_params.stretch_ratio = self.current_ratio;
-
-        let mut min_output_len = usize::MAX;
-
-        for ch in 0..num_channels {
-            self.deinterleave_channel(ch, num_channels);
-            let stretcher = HybridStretcher::new(hybrid_params.clone());
-            let stretched = stretcher.process(&self.channel_buffers[ch])?;
-            min_output_len = min_output_len.min(stretched.len());
-            self.channel_buffers[ch] = stretched;
-        }
-
-        self.input_buffer.clear();
-        let _ = total_frames;
-
-        if min_output_len == usize::MAX || min_output_len == 0 {
+        let min_output_len = self.process_hybrid_persistent_channels(num_channels)?;
+        if min_output_len == 0 {
             return Ok(0);
         }
-
         Ok(self.interleave_into(min_output_len, num_channels, output))
     }
 
@@ -1081,6 +1156,37 @@ mod tests {
                 ratio
             );
         }
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_state_persists_across_calls() {
+        let params = StretchParams::new(1.25)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_preset(crate::core::types::EdmPreset::HouseLoop);
+
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        let signal: Vec<f32> = (0..44100 * 3)
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44100.0).sin())
+            .collect();
+
+        let _ = proc.process(&signal[..16384]).unwrap();
+        let emitted_after_first = proc.hybrid_state.emitted_output_lens[0];
+        assert!(
+            emitted_after_first > 0,
+            "Expected hybrid state to emit output after first call"
+        );
+
+        let _ = proc.process(&signal[16384..32768]).unwrap();
+        let emitted_after_second = proc.hybrid_state.emitted_output_lens[0];
+        assert!(
+            emitted_after_second > emitted_after_first,
+            "Hybrid emitted length should grow across calls ({} -> {})",
+            emitted_after_first,
+            emitted_after_second
+        );
     }
 
     #[test]

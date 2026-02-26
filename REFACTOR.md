@@ -105,7 +105,7 @@ Acceptance check:
 ---
 
 ### M3: Persistent Hybrid Streaming (Not Re-instantiated Per Call)
-Status: `pending`
+Status: `completed`
 
 Problem addressed:
 - Hybrid path recreates stretcher state each call, breaking continuity.
@@ -118,6 +118,22 @@ Deliverables:
 Acceptance criteria:
 - Streaming hybrid timing metrics materially improve vs current state.
 - Reduced chunk-boundary artifacts in transient-rich material.
+
+Resolved in M3:
+- Replaced per-call hybrid re-instantiation in `StreamProcessor` with persistent state:
+  - Added rolling per-channel hybrid analysis buffers.
+  - Added persistent per-channel `HybridStretcher` instances.
+  - Added per-channel emitted-length tracking to output only incremental render deltas.
+- Added ratio-change rebase policy for hybrid rolling buffers:
+  - Prevents retroactive history rewrite after target-ratio changes.
+  - Preserves recent analysis context while keeping emitted output monotonic.
+- Unified stream-mode hybrid rendering path for both `process()` and `process_into()`.
+- Added hybrid-state lifecycle integration:
+  - reset/flush/hybrid-mode toggle now reset persistent hybrid state coherently.
+
+Acceptance check:
+- Hybrid streaming no longer recreates stretchers per processing call.
+- Added regression coverage for persistent hybrid state growth and chunk-boundary roughness bounds.
 
 ---
 
@@ -183,7 +199,7 @@ Acceptance criteria:
 
 ## Current Progress (Updated)
 Current focus:
-- Next milestone to execute: `M3: Persistent Hybrid Streaming (Not Re-instantiated Per Call)`.
+- Next milestone to execute: `M4: Beat/Onset Alignment Pipeline for DJ Use`.
 
 Completed for M0:
 - Added strict benchmark validation mode in `tests/reference_quality.rs`:
@@ -222,7 +238,21 @@ Completed for M2:
 - Added hybrid timeline unit coverage:
   - crossfade compensation preserves base total
   - segment-target reconciliation hits desired sum
-  - timeline bookkeeping invariants hold
+- timeline bookkeeping invariants hold
+
+Completed for M3:
+- Added `HybridStreamingState` in `src/stream/processor.rs`:
+  - persistent per-channel `HybridStretcher` allocation
+  - rolling analysis buffers
+  - incremental output emission tracking
+- Refactored hybrid stream path to use persistent state in:
+  - `StreamProcessor::process_hybrid_path()`
+  - `StreamProcessor::process_hybrid_into()`
+- Added ratio-change rebase handling for persistent hybrid buffers.
+- Added M3 coverage:
+  - `test_stream_processor_hybrid_state_persists_across_calls`
+  - `test_hybrid_streaming_persistent_small_vs_large_chunk_length`
+  - `test_hybrid_streaming_chunk_boundary_artifacts_bounded`
 
 Validation run:
 - `./benchmarks/run_m0_baseline.sh` (pass; strict mode, no skips, baseline archived)
@@ -235,3 +265,4 @@ Validation run:
 - `cargo test -q --test timeline_length` (pass)
 - `cargo test -q --test hybrid_streaming` (pass)
 - `cargo test -q --test streaming_batch_parity` (pass)
+- `cargo test -q --lib stream::processor` (pass)

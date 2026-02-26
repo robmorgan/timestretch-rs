@@ -14,6 +14,23 @@ fn rms(signal: &[f32]) -> f32 {
     (signal.iter().map(|x| x * x).sum::<f32>() / signal.len() as f32).sqrt()
 }
 
+fn p95_adjacent_diff(signal: &[f32]) -> f32 {
+    if signal.len() < 2 {
+        return 0.0;
+    }
+    let mut diffs: Vec<f32> = signal
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .filter(|d| d.is_finite())
+        .collect();
+    if diffs.is_empty() {
+        return 0.0;
+    }
+    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((diffs.len() as f32) * 0.95).floor() as usize;
+    diffs[idx.min(diffs.len() - 1)]
+}
+
 /// Generates an EDM-like signal with kicks, hi-hats, sub-bass, and a pad.
 fn generate_edm_signal(sample_rate: u32, bpm: f64, duration_secs: f64) -> Vec<f32> {
     let total_samples = (sample_rate as f64 * duration_secs) as usize;
@@ -517,4 +534,58 @@ fn test_hybrid_streaming_reset() {
     }
 
     assert!(!output.is_empty(), "Should produce output after reset");
+}
+
+#[test]
+fn test_hybrid_streaming_persistent_small_vs_large_chunk_length() {
+    let sample_rate = 44100u32;
+    let input = generate_edm_signal(sample_rate, 128.0, 4.0);
+
+    let params = StretchParams::new(1.25)
+        .with_sample_rate(sample_rate)
+        .with_channels(1)
+        .with_preset(EdmPreset::HouseLoop);
+
+    // Small chunks exercise persistent rolling-buffer behavior.
+    let small_chunk_output = hybrid_stream_stretch(&input, params.clone(), 2048);
+    // Large chunk approximates single-pass rendering.
+    let large_chunk_output = hybrid_stream_stretch(&input, params, input.len());
+
+    assert!(!small_chunk_output.is_empty());
+    assert!(!large_chunk_output.is_empty());
+
+    let len_diff = small_chunk_output.len().abs_diff(large_chunk_output.len()) as f64;
+    let base = large_chunk_output.len().max(1) as f64;
+    let len_diff_pct = (len_diff / base) * 100.0;
+    assert!(
+        len_diff_pct < 5.0,
+        "Small-chunk hybrid length deviated too far from large-chunk output: {:.3}%",
+        len_diff_pct
+    );
+}
+
+#[test]
+fn test_hybrid_streaming_chunk_boundary_artifacts_bounded() {
+    let sample_rate = 44100u32;
+    let input = generate_edm_signal(sample_rate, 128.0, 4.0);
+
+    let params = StretchParams::new(1.5)
+        .with_sample_rate(sample_rate)
+        .with_channels(1)
+        .with_preset(EdmPreset::HouseLoop);
+
+    let small_chunk_output = hybrid_stream_stretch(&input, params.clone(), 2048);
+    let large_chunk_output = hybrid_stream_stretch(&input, params, input.len());
+
+    let p95_small = p95_adjacent_diff(&small_chunk_output);
+    let p95_large = p95_adjacent_diff(&large_chunk_output);
+
+    // Small-chunk streaming may be noisier than single-pass, but should remain
+    // within a bounded factor (no severe chunk-boundary discontinuities).
+    assert!(
+        p95_small <= p95_large * 3.0 + 0.02,
+        "Chunk-boundary roughness too high: small={:.5}, large={:.5}",
+        p95_small,
+        p95_large
+    );
 }

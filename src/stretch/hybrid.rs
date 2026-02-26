@@ -111,6 +111,11 @@ impl HybridStretcher {
         Self { params }
     }
 
+    /// Updates the global stretch ratio used for subsequent processing.
+    pub fn set_stretch_ratio(&mut self, ratio: f64) {
+        self.params.stretch_ratio = ratio;
+    }
+
     /// Stretches a mono audio signal using the hybrid algorithm.
     pub fn process(&self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
         if input.is_empty() {
