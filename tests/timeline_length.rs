@@ -6,12 +6,12 @@ fn generate_long_form_signal(sample_rate: u32, duration_secs: f64, bpm: f64) -> 
     let beat_interval = (60.0 * sample_rate as f64 / bpm) as usize;
     let mut out = vec![0.0f32; total_samples];
 
-    for i in 0..total_samples {
+    for (i, sample) in out.iter_mut().enumerate().take(total_samples) {
         let t = i as f32 / sample_rate as f32;
         // Tonal bed
-        out[i] += 0.20 * (2.0 * PI * 55.0 * t).sin();
-        out[i] += 0.15 * (2.0 * PI * 220.0 * t).sin();
-        out[i] += 0.10 * (2.0 * PI * 440.0 * t).sin();
+        *sample += 0.20 * (2.0 * PI * 55.0 * t).sin();
+        *sample += 0.15 * (2.0 * PI * 220.0 * t).sin();
+        *sample += 0.10 * (2.0 * PI * 440.0 * t).sin();
 
         // Beat transient every quarter note
         let beat_pos = i % beat_interval;
@@ -19,7 +19,7 @@ fn generate_long_form_signal(sample_rate: u32, duration_secs: f64, bpm: f64) -> 
             // ~10ms pulse with exponential decay
             let x = beat_pos as f32 / sample_rate as f32;
             let env = (-x * 120.0).exp();
-            out[i] += 0.7 * env;
+            *sample += 0.7 * env;
         }
     }
 

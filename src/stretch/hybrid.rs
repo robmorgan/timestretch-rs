@@ -330,7 +330,7 @@ impl HybridStretcher {
     ) -> Result<Vec<f32>, StretchError> {
         // Step 3: Build explicit timeline bookkeeping for exact output length.
         let target_output_len = self.params.output_length(input.len());
-        let base_segment_target_lens = compute_base_segment_target_lengths(&segments);
+        let base_segment_target_lens = compute_base_segment_target_lengths(segments);
         let crossfade_plan = match self.params.crossfade_mode {
             crate::core::types::CrossfadeMode::Fixed(secs) => {
                 let crossfade = compute_fixed_crossfade_len(
@@ -341,7 +341,7 @@ impl HybridStretcher {
                 vec![crossfade; segments.len().saturating_sub(1)]
             }
             crate::core::types::CrossfadeMode::Adaptive => {
-                compute_adaptive_crossfade_lens(&segments, self.params.sample_rate)
+                compute_adaptive_crossfade_lens(segments, self.params.sample_rate)
             }
         };
 
@@ -901,7 +901,7 @@ fn reconcile_total_segment_targets(segment_target_lens: &mut [usize], desired_to
         return;
     }
 
-    let mut current_total: usize = segment_target_lens.iter().sum();
+    let current_total: usize = segment_target_lens.iter().sum();
     if current_total == desired_total {
         return;
     }
@@ -922,7 +922,6 @@ fn reconcile_total_segment_targets(segment_target_lens: &mut [usize], desired_to
         let take = (*len).min(remove);
         *len -= take;
         remove -= take;
-        current_total -= take;
     }
 }
 

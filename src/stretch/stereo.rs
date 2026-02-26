@@ -327,9 +327,9 @@ mod tests {
             .collect();
         let left = base.clone();
         let mut right = vec![0.0f32; n];
-        for i in 0..n {
+        for (i, sample) in right.iter_mut().enumerate().take(n) {
             let src = i.saturating_sub(lag_in);
-            right[i] = base[src];
+            *sample = base[src];
         }
 
         let params = StretchParams::new(1.25)
