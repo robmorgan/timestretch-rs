@@ -30,10 +30,12 @@ benchmarks/
    - `id` - A short identifier (used in filenames)
    - `description` - Human-readable description
    - `original` - Path relative to `benchmarks/audio/` (e.g., `originals/my-track.wav`)
+   - `original_sha256` - SHA-256 of the original WAV (for corpus lock)
    - `bpm` - Original tempo in BPM
 
    Each reference entry needs:
    - `file` - Path relative to `benchmarks/audio/`
+   - `file_sha256` - SHA-256 of the reference WAV (for corpus lock)
    - `target_bpm` - Target tempo the reference was stretched to
    - `software` - Software used (e.g., "Ableton Live 11")
    - `algorithm` - Algorithm/mode used (e.g., "Complex Pro")
@@ -41,16 +43,28 @@ benchmarks/
 ## Running Benchmarks
 
 ```bash
-# Run with console output
-cargo test --test reference_quality -- --nocapture
-
-# The test will:
-# - Skip gracefully if manifest.toml has no tracks or audio files are missing
-# - Process each original with all 5 EDM presets
-# - Compare output against professional references
-# - Print a formatted console report
-# - Write a JSON report to benchmarks/audio/output/report.json
+# M0 baseline command (strict validation + archive)
+./benchmarks/run_m0_baseline.sh
 ```
+
+This command:
+
+- Enables strict validation (`TIMESTRETCH_STRICT_REFERENCE_BENCHMARK=1`)
+- Uses a fixed 30-second analysis window (`TIMESTRETCH_REFERENCE_MAX_SECONDS=30`)
+- Fails on missing files, invalid paths, or checksum mismatches
+- Processes each original with all 5 EDM presets
+- Prints timing/spectral/transient/loudness/length metrics
+- Writes JSON metrics to `benchmarks/audio/output/report.json`
+- Archives the baseline to `benchmarks/baselines/`
+
+For ad-hoc runs without strict enforcement:
+
+```bash
+cargo test --test reference_quality -- --nocapture
+```
+
+You can optionally set `TIMESTRETCH_REFERENCE_MAX_SECONDS=<seconds>` for deterministic
+short-window analysis during ad-hoc runs as well.
 
 ## Metrics
 

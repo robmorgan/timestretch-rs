@@ -11,7 +11,7 @@ Improve DJ beatmatching audio quality and timing correctness for both offline an
 ## Milestones
 
 ### M0: Baseline + Measurement Integrity
-Status: `in_progress`
+Status: `completed`
 
 Deliverables:
 - Fix benchmark manifest/path inconsistencies so reference comparison always runs.
@@ -22,12 +22,24 @@ Acceptance criteria:
 - `reference_quality_benchmark` processes real files (no silent skip).
 - Baseline report archived for comparison against each milestone.
 
-Current state:
-- `tests/reference_quality.rs` benchmark harness is implemented and reports timing/spectral/transient/loudness/length metrics in one command:
-  - `cargo test --test reference_quality -- --nocapture`
-- Manifest/path consistency is not fully resolved yet:
-  - Current manifest entries are resolved as `benchmarks/audio/<path>`, but the checked-in sample track uses `audio/...`, yielding `benchmarks/audio/audio/...` at runtime.
-- Baseline report archival workflow is not yet finalized.
+Resolved in M0:
+- Fixed benchmark manifest path consistency:
+  - Track/reference paths are now validated as relative to `benchmarks/audio/`.
+  - `audio/...` prefix mistakes are detected and fail in strict mode.
+- Froze a reproducible corpus via manifest checksums:
+  - Added `original_sha256` and `file_sha256` fields in `benchmarks/manifest.toml`.
+  - Benchmark validates SHA-256 values in strict mode.
+- Added a single baseline command that outputs full metrics and archives results:
+  - `./benchmarks/run_m0_baseline.sh`
+  - Enables strict mode (`TIMESTRETCH_STRICT_REFERENCE_BENCHMARK=1`)
+  - Uses fixed benchmark window (`TIMESTRETCH_REFERENCE_MAX_SECONDS=30`) for reproducible runtime
+  - Archives to:
+    - `benchmarks/baselines/m0_baseline_latest.json`
+    - `benchmarks/baselines/m0_baseline_<timestamp>.json`
+
+Acceptance check:
+- `reference_quality_benchmark` processes real files with strict no-skip validation.
+- Baseline report is archived for milestone comparison.
 
 ---
 
@@ -153,6 +165,17 @@ Acceptance criteria:
 7. M6 quality gates
 
 ## Current Progress (Updated)
+Completed for M0:
+- Added strict benchmark validation mode in `tests/reference_quality.rs`:
+  - Missing manifest/files/references/checksums fail in strict mode (no silent skip).
+  - Path safety/consistency checks enforce audio-base-relative manifest paths.
+- Added corpus lock checksums in `benchmarks/manifest.toml`.
+- Added baseline runner script `benchmarks/run_m0_baseline.sh`.
+- Added baseline archive docs in `benchmarks/baselines/README.md`.
+- Archived baseline from strict run:
+  - `benchmarks/baselines/m0_baseline_latest.json`
+  - `benchmarks/baselines/m0_baseline_20260226T021840Z.json`
+
 Completed for M1:
 - Added stateful streaming PV methods:
   - `PhaseVocoder::process_streaming()`
@@ -166,10 +189,10 @@ Completed for M1:
 - Added rapid automation flush continuity coverage (ratio + tempo automation).
 
 Validation run:
+- `./benchmarks/run_m0_baseline.sh` (pass; strict mode, no skips, baseline archived)
 - `cargo test -q --test streaming` (pass)
 - `cargo test -q --test streaming_edge_cases` (pass)
 - `cargo test -q --test hybrid_streaming` (pass)
 - `cargo test -q test_set_stretch_ratio_preserves_phase_state` (pass)
 - `cargo test -q test_streaming_flush_continuity_under_rapid_ratio_automation` (pass)
 - `cargo test -q test_streaming_flush_continuity_under_rapid_tempo_automation` (pass)
-- `cargo test -q --test reference_quality -- --nocapture` (pass; currently reports skipped track due to manifest path mismatch)

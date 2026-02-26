@@ -14,16 +14,19 @@
 # id = "deep-house-loop-01"
 # description = "4-bar deep house loop, 124 BPM, stereo"
 # original = "originals/deep-house-loop-01.wav"
+# original_sha256 = "<sha256 of original wav>"
 # bpm = 124.0
 #
 #   [[track.reference]]
 #   file = "references/deep-house-loop-01_128bpm_ableton.wav"
+#   file_sha256 = "<sha256 of reference wav>"
 #   target_bpm = 128.0
 #   software = "Ableton Live 11"
 #   algorithm = "Complex Pro"
 #
 #   [[track.reference]]
 #   file = "references/deep-house-loop-01_128bpm_serato.wav"
+#   file_sha256 = "<sha256 of reference wav>"
 #   target_bpm = 128.0
 #   software = "Serato DJ Pro"
 #   algorithm = "Default"
@@ -32,10 +35,12 @@
 id = "music-sounds-better-with-you"
 description = "Music Sounds Better With You (Original Mix), 124 BPM, stereo"
 original = "12247392_Music Sounds Better With You_(Original Mix)_124bpm.wav"
+original_sha256 = "ddcbfee5fb7d6e62d185836020475de828d90d564720a97e4ada81cbb397b9da"
 bpm = 124.0
 
   [[track.reference]]
   file = "12247392_Music Sounds Better With You_(Original Mix)_115bpm.wav"
+  file_sha256 = "978eefc52aef76ff480d1d625cb1400177b8e83addba806c1fb03039d45e98ba"
   target_bpm = 115.0
   software = "Ableton Live 11"
   algorithm = "Complex Pro"

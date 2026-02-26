@@ -1,10 +1,22 @@
 //! Reference audio quality benchmark.
 //!
 //! Compares library time-stretch output against professionally-stretched
-//! reference audio files. Skips gracefully when audio files are not present.
+//! reference audio files.
+//!
+//! By default, this benchmark skips when the corpus is unavailable so regular
+//! CI can run without copyrighted assets. Set
+//! `TIMESTRETCH_STRICT_REFERENCE_BENCHMARK=1` to require a fully configured
+//! corpus and fail on any missing file/checksum.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use sha2::{Digest, Sha256};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+
+/// Environment variable that enables strict corpus validation.
+const STRICT_ENV_VAR: &str = "TIMESTRETCH_STRICT_REFERENCE_BENCHMARK";
+/// Optional environment variable to limit analyzed audio duration per file.
+const MAX_SECONDS_ENV_VAR: &str = "TIMESTRETCH_REFERENCE_MAX_SECONDS";
 
 // ---------------------------------------------------------------------------
 // Manifest types
@@ -21,6 +33,8 @@ struct Track {
     id: String,
     description: String,
     original: String,
+    #[serde(default)]
+    original_sha256: Option<String>,
     bpm: f64,
     #[serde(default)]
     reference: Vec<Reference>,
@@ -29,6 +43,8 @@ struct Track {
 #[derive(Debug, Deserialize)]
 struct Reference {
     file: String,
+    #[serde(default)]
+    file_sha256: Option<String>,
     target_bpm: f64,
     software: String,
     algorithm: String,
@@ -149,9 +165,16 @@ const ALL_PRESETS: &[(timestretch::EdmPreset, &str)] = &[
 
 #[test]
 fn reference_quality_benchmark() {
+    let strict = strict_benchmark_mode();
+    let max_seconds = benchmark_max_seconds();
     let manifest_path = Path::new("benchmarks/manifest.toml");
     if !manifest_path.exists() {
-        println!("benchmarks/manifest.toml not found, skipping reference quality benchmark");
+        if strict {
+            panic!("benchmarks/manifest.toml not found in strict mode");
+        }
+        println!(
+            "benchmarks/manifest.toml not found, skipping reference quality benchmark (strict mode disabled)"
+        );
         return;
     }
 
@@ -159,7 +182,12 @@ fn reference_quality_benchmark() {
     let manifest: Manifest = toml::from_str(&manifest_str).expect("Failed to parse manifest");
 
     if manifest.track.is_empty() {
-        println!("No tracks in manifest, skipping reference quality benchmark");
+        if strict {
+            panic!("No tracks in manifest in strict mode");
+        }
+        println!(
+            "No tracks in manifest, skipping reference quality benchmark (strict mode disabled)"
+        );
         return;
     }
 
@@ -180,11 +208,50 @@ fn reference_quality_benchmark() {
 
     let mut all_spectral_sims: Vec<f64> = Vec::new();
 
-    println!("\n=== Reference Audio Quality Report ===\n");
+    println!(
+        "\n=== Reference Audio Quality Report ==={}",
+        if strict { " (strict mode)" } else { "" }
+    );
+    if let Some(secs) = max_seconds {
+        println!(
+            "Using benchmark window: first {:.1}s per original/reference file",
+            secs
+        );
+    }
+    println!();
 
     for track in &manifest.track {
-        let original_path = audio_base.join(&track.original);
+        if track.reference.is_empty() {
+            if strict {
+                panic!(
+                    "Track '{}' has no references configured in strict mode",
+                    track.id
+                );
+            }
+            println!("Skipping track '{}': no references configured", track.id);
+            report.summary.skipped += 1;
+            continue;
+        }
+
+        let original_path = match resolve_audio_path(audio_base, &track.original) {
+            Ok(path) => path,
+            Err(msg) => {
+                if strict {
+                    panic!("Invalid original path for track '{}': {}", track.id, msg);
+                }
+                println!("Skipping track '{}': {}", track.id, msg);
+                report.summary.skipped += 1;
+                continue;
+            }
+        };
         if !original_path.exists() {
+            if strict {
+                panic!(
+                    "Track '{}' original file not found in strict mode ({})",
+                    track.id,
+                    original_path.display()
+                );
+            }
             println!(
                 "Skipping track '{}': original file not found ({})",
                 track.id,
@@ -193,10 +260,23 @@ fn reference_quality_benchmark() {
             report.summary.skipped += 1;
             continue;
         }
+        validate_sha256(
+            &original_path,
+            track.original_sha256.as_deref(),
+            &format!("track '{}' original", track.id),
+            strict,
+        )
+        .unwrap_or_else(|msg| panic!("{}", msg));
 
         let original =
             timestretch::io::wav::read_wav_file(original_path.to_str().expect("Invalid path"))
                 .expect("Failed to read original WAV");
+        let original_data = maybe_trim_interleaved(
+            &original.data,
+            original.sample_rate,
+            original.channels.count(),
+            max_seconds,
+        );
 
         println!(
             "Track: {} ({}, {} BPM, {:?})",
@@ -214,8 +294,29 @@ fn reference_quality_benchmark() {
         let mut best_spectral = 0.0f64;
 
         for reference in &track.reference {
-            let ref_path = audio_base.join(&reference.file);
+            let ref_path = match resolve_audio_path(audio_base, &reference.file) {
+                Ok(path) => path,
+                Err(msg) => {
+                    if strict {
+                        panic!(
+                            "Invalid reference path for track '{}' ({}): {}",
+                            track.id, reference.software, msg
+                        );
+                    }
+                    println!("  Skipping reference: {} ({})", reference.software, msg);
+                    report.summary.skipped += 1;
+                    continue;
+                }
+            };
             if !ref_path.exists() {
+                if strict {
+                    panic!(
+                        "Reference '{}' for track '{}' not found in strict mode ({})",
+                        reference.software,
+                        track.id,
+                        ref_path.display()
+                    );
+                }
                 println!(
                     "  Skipping reference: {} not found ({})",
                     reference.software,
@@ -224,10 +325,23 @@ fn reference_quality_benchmark() {
                 report.summary.skipped += 1;
                 continue;
             }
+            validate_sha256(
+                &ref_path,
+                reference.file_sha256.as_deref(),
+                &format!("track '{}' reference '{}'", track.id, reference.software),
+                strict,
+            )
+            .unwrap_or_else(|msg| panic!("{}", msg));
 
             let ref_audio =
                 timestretch::io::wav::read_wav_file(ref_path.to_str().expect("Invalid path"))
                     .expect("Failed to read reference WAV");
+            let ref_data = maybe_trim_interleaved(
+                &ref_audio.data,
+                ref_audio.sample_rate,
+                ref_audio.channels.count(),
+                max_seconds,
+            );
 
             let ratio = track.bpm / reference.target_bpm;
             println!(
@@ -249,7 +363,7 @@ fn reference_quality_benchmark() {
                     .with_channels(original.channels.count() as u32)
                     .with_preset(preset);
 
-                let output = timestretch::stretch(&original.data, &params).expect("Stretch failed");
+                let output = timestretch::stretch(&original_data, &params).expect("Stretch failed");
 
                 // Write output WAV
                 let out_filename = format!("{}_{}.wav", track.id, preset_name);
@@ -268,16 +382,16 @@ fn reference_quality_benchmark() {
                 // --- Compute metrics ---
 
                 // Length accuracy
-                let length_diff = output.len() as isize - ref_audio.data.len() as isize;
-                let length_diff_pct = if !ref_audio.data.is_empty() {
-                    (length_diff as f64 / ref_audio.data.len() as f64) * 100.0
+                let length_diff = output.len() as isize - ref_data.len() as isize;
+                let length_diff_pct = if !ref_data.is_empty() {
+                    (length_diff as f64 / ref_data.len() as f64) * 100.0
                 } else {
                     0.0
                 };
 
                 // RMS difference in dB
                 let output_rms = rms(&output);
-                let ref_rms = rms(&ref_audio.data);
+                let ref_rms = rms(&ref_data);
                 let rms_diff_db = if ref_rms > 1e-10 && output_rms > 1e-10 {
                     20.0 * (output_rms / ref_rms).log10()
                 } else {
@@ -286,16 +400,13 @@ fn reference_quality_benchmark() {
 
                 // Spectral similarity (unweighted)
                 let spec_sim = timestretch::analysis::comparison::spectral_similarity(
-                    &output,
-                    &ref_audio.data,
-                    2048,
-                    512,
+                    &output, &ref_data, 2048, 512,
                 );
 
                 // Perceptual spectral similarity (A-weighted)
                 let perc_sim = timestretch::analysis::comparison::perceptual_spectral_similarity(
                     &output,
-                    &ref_audio.data,
+                    &ref_data,
                     2048,
                     512,
                     original.sample_rate,
@@ -304,7 +415,7 @@ fn reference_quality_benchmark() {
                 // Band spectral similarity (EDM bands)
                 let band_sim = timestretch::analysis::comparison::band_spectral_similarity(
                     &output,
-                    &ref_audio.data,
+                    &ref_data,
                     2048,
                     512,
                     original.sample_rate,
@@ -313,7 +424,7 @@ fn reference_quality_benchmark() {
                 // Bark-scale band similarity
                 let bark_sim = timestretch::analysis::comparison::bark_band_similarity(
                     &output,
-                    &ref_audio.data,
+                    &ref_data,
                     2048,
                     512,
                     original.sample_rate,
@@ -321,7 +432,7 @@ fn reference_quality_benchmark() {
 
                 // Transient match
                 let transient_result = timestretch::analysis::comparison::transient_match_score(
-                    &ref_audio.data,
+                    &ref_data,
                     &output,
                     original.sample_rate,
                     10.0,
@@ -329,7 +440,7 @@ fn reference_quality_benchmark() {
 
                 // Onset timing analysis
                 let onset_timing = timestretch::analysis::comparison::onset_timing_analysis(
-                    &ref_audio.data,
+                    &ref_data,
                     &output,
                     original.sample_rate,
                 );
@@ -337,31 +448,28 @@ fn reference_quality_benchmark() {
                 // Cross-correlation (on a windowed segment to limit compute)
                 let max_corr_samples = (original.sample_rate as usize * 10)
                     .min(output.len())
-                    .min(ref_audio.data.len());
+                    .min(ref_data.len());
                 let xcorr = timestretch::analysis::comparison::cross_correlation(
                     &output[..max_corr_samples],
-                    &ref_audio.data[..max_corr_samples],
+                    &ref_data[..max_corr_samples],
                 );
 
                 // LUFS loudness difference
                 let lufs_diff = timestretch::analysis::comparison::lufs_difference(
                     &output,
-                    &ref_audio.data,
+                    &ref_data,
                     original.sample_rate,
                 );
 
                 // Spectral flux similarity
                 let flux_sim = timestretch::analysis::comparison::spectral_flux_similarity(
-                    &output,
-                    &ref_audio.data,
-                    2048,
-                    512,
+                    &output, &ref_data, 2048, 512,
                 );
 
                 // Generate overall quality report for grade
                 let quality_report = timestretch::analysis::comparison::generate_quality_report(
                     &output,
-                    &ref_audio.data,
+                    &ref_data,
                     original.sample_rate,
                     2048,
                     512,
@@ -481,6 +589,13 @@ fn reference_quality_benchmark() {
             track_report.references.push(ref_report);
         }
 
+        if strict && track_report.references.is_empty() {
+            panic!(
+                "Track '{}' had zero valid references in strict mode",
+                track.id
+            );
+        }
+
         if !best_preset_name.is_empty() {
             report.summary.best_preset_per_track.push(BestPreset {
                 track_id: track.id.clone(),
@@ -516,11 +631,143 @@ fn reference_quality_benchmark() {
         report.summary.tracks_tested, report.summary.references_tested, report.summary.skipped
     );
 
+    if strict {
+        assert!(
+            report.summary.tracks_tested > 0,
+            "Strict mode requires at least one tested track"
+        );
+        assert!(
+            report.summary.references_tested > 0,
+            "Strict mode requires at least one tested reference"
+        );
+        assert_eq!(
+            report.summary.skipped, 0,
+            "Strict mode does not allow skipped tracks/references"
+        );
+    }
+
     // Write JSON report
     let json = serde_json::to_string_pretty(&report).expect("Failed to serialize report");
     let report_path = output_dir.join("report.json");
     std::fs::write(&report_path, &json).expect("Failed to write report JSON");
     println!("\nJSON report written to: {}\n", report_path.display());
+}
+
+fn strict_benchmark_mode() -> bool {
+    let value = std::env::var(STRICT_ENV_VAR).unwrap_or_default();
+    let normalized = value.trim().to_ascii_lowercase();
+    !normalized.is_empty() && normalized != "0" && normalized != "false" && normalized != "no"
+}
+
+fn benchmark_max_seconds() -> Option<f64> {
+    let value = std::env::var(MAX_SECONDS_ENV_VAR).ok()?;
+    let parsed = value.trim().parse::<f64>().ok()?;
+    (parsed.is_finite() && parsed > 0.0).then_some(parsed)
+}
+
+fn maybe_trim_interleaved(
+    data: &[f32],
+    sample_rate: u32,
+    channels: usize,
+    max_seconds: Option<f64>,
+) -> Vec<f32> {
+    let Some(max_seconds) = max_seconds else {
+        return data.to_vec();
+    };
+    let max_frames = (sample_rate as f64 * max_seconds).round() as usize;
+    let max_samples = max_frames.saturating_mul(channels);
+    let keep = data.len().min(max_samples);
+    data[..keep].to_vec()
+}
+
+fn resolve_audio_path(audio_base: &Path, configured: &str) -> Result<PathBuf, String> {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return Err("empty path".to_string());
+    }
+
+    let relative = configured
+        .strip_prefix("benchmarks/audio/")
+        .unwrap_or(configured);
+    if relative.starts_with("audio/") {
+        return Err(format!(
+            "path '{}' includes 'audio/' prefix; paths must be relative to benchmarks/audio/",
+            configured
+        ));
+    }
+
+    let rel_path = Path::new(relative);
+    if rel_path.is_absolute() {
+        return Err(format!("absolute path '{}' is not allowed", configured));
+    }
+    if rel_path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(format!(
+            "path '{}' contains parent traversal ('..'), which is not allowed",
+            configured
+        ));
+    }
+
+    Ok(audio_base.join(rel_path))
+}
+
+fn validate_sha256(
+    file_path: &Path,
+    expected_sha256: Option<&str>,
+    label: &str,
+    strict: bool,
+) -> Result<(), String> {
+    let Some(expected_sha256) = expected_sha256 else {
+        if strict {
+            return Err(format!(
+                "{} is missing required SHA-256 in strict mode",
+                label
+            ));
+        }
+        return Ok(());
+    };
+
+    let expected = expected_sha256.trim().to_ascii_lowercase();
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{} has invalid SHA-256 '{}' in manifest",
+            label, expected_sha256
+        ));
+    }
+
+    let actual = compute_sha256(file_path)
+        .map_err(|msg| format!("{} checksum calculation failed: {}", label, msg))?;
+    if actual != expected {
+        return Err(format!(
+            "{} checksum mismatch: expected {}, got {} ({})",
+            label,
+            expected,
+            actual,
+            file_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn compute_sha256(file_path: &Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(file_path)
+        .map_err(|err| format!("unable to open {}: {}", file_path.display(), err))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|err| format!("unable to read {}: {}", file_path.display(), err))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Computes RMS of a signal.
