@@ -1219,7 +1219,7 @@ impl EdmPreset {
             EdmPreset::DjBeatmatch => PresetConfig {
                 fft_size: 4096,
                 hop_size: 4096 / 4, // 1024: 75% overlap, good COLA with Hann windows
-                transient_sensitivity: 0.3, // low sensitivity for clean ±5% DJ use
+                transient_sensitivity: 0.5, // increased sensitivity for cleaner transients
                 wsola_search_ms: WSOLA_SEARCH_MS_SMALL,
                 wsola_segment_ms: 50.0, // more context for cross-correlation at small ratios
                 transient_region_ms: 30.0, // kick attack+early decay is 30-50ms
