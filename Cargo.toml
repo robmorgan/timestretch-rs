@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Pure Rust audio time stretching library optimized for EDM"
 license = "MIT"
+license-file = "LICENSE"
 rust-version = "1.82"
 keywords = ["audio", "dsp", "time-stretching", "phase-vocoder", "edm"]
 categories = ["multimedia::audio", "algorithms"]
