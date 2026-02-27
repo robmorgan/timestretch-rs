@@ -14,7 +14,7 @@ cat "$PROMPT_FILE"
 echo ""
 echo "==========================================="
 echo "Running Claude Code agent..."
-claude -p "$(cat "$PROMPT_FILE")" --allowedTools Edit,Write,Bash --max-turns "$MAX_TURNS" --verbose --output-format stream-json 2>&1 \
+claude -p "$(cat "$PROMPT_FILE")" --model claude-opus-4-6 --allowedTools Edit,Write,Bash --max-turns "$MAX_TURNS" --verbose --output-format stream-json 2>&1 \
     | tee "$LOG_FILE" \
     | python3 "$AGENT_DIR/stream_filter.py"
 

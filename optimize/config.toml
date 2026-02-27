@@ -1,7 +1,7 @@
 [general]
 max_iterations = 50
 target_score = 92.0
-agent = "codex"  # or "claude_code"
+agent = "claude_code"  # or "codex"
 
 [reference_tool]
 # Preference order: rubberband > soundstretch > sox
