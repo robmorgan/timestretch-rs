@@ -849,11 +849,12 @@ impl PhaseVocoder {
     #[inline]
     fn normalize_output(output: &mut [f32], window_sum: &[f32], stretch_ratio: f64) {
         let max_window_sum = window_sum.iter().copied().fold(0.0f32, f32::max);
-        // For stretches >1.0, synthesis frames are farther apart and fixed 10%
-        // flooring can over-attenuate low-overlap regions. Relax the floor in
-        // proportion to ratio while keeping a safety minimum against blow-ups.
+        // For stretches >1.0, synthesis frames are farther apart and aggressive
+        // flooring can over-attenuate low-overlap regions. Relax the floor more
+        // strongly with ratio while keeping a safety minimum against blow-ups.
         let floor_ratio = if stretch_ratio > 1.0 {
-            (WINDOW_SUM_FLOOR_RATIO / stretch_ratio as f32).clamp(0.02, WINDOW_SUM_FLOOR_RATIO)
+            (WINDOW_SUM_FLOOR_RATIO / (stretch_ratio as f32 * stretch_ratio as f32))
+                .clamp(0.005, WINDOW_SUM_FLOOR_RATIO)
         } else {
             WINDOW_SUM_FLOOR_RATIO
         };
