@@ -1558,7 +1558,7 @@ impl StretchParams {
             stereo_mode: StereoMode::MidSide,
             envelope_preservation: false,
             envelope_order: 40,
-            multi_resolution: false,
+            multi_resolution: true,
             transient_region_secs: DEFAULT_TRANSIENT_REGION_SECS,
             elastic_timing: false,
             elastic_anchor: 0.0,
