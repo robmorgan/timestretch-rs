@@ -756,12 +756,13 @@ impl PhaseVocoder {
         // Propagate phase from peaks to nearby non-peak bins using the analysis
         // phase gradient, blended with the independently-advanced phase.
         // Apply up to 2.5x ratio with a tapering blend: full strength at ratio≤1.0,
-        // linearly decreasing to zero at ratio=2.5. This extends coherence to
-        // moderate stretches while avoiding artifacts at extreme ratios.
+        // then gradually reduced for larger ratios. Keep more blend at higher
+        // ratios to preserve vertical coherence on narrow-band tonal content.
         if !advance_peaks.is_empty() && hop_ratio < 2.5 {
-            // Taper: PHASE_GRADIENT_BLEND at ratio≤1.0, linear down to 0.0 at ratio=2.5
+            // Slower taper than before: still attenuate at high ratios, but avoid
+            // dropping coherence too early.
             let gradient_blend =
-                PHASE_GRADIENT_BLEND * (1.0 - ((hop_ratio - 1.0) / 1.5).clamp(0.0, 1.0));
+                PHASE_GRADIENT_BLEND * (1.0 - ((hop_ratio - 1.0) / 2.0).clamp(0.0, 1.0));
             for bin in self.sub_bass_bin..num_bins {
                 if advance_peaks.binary_search(&bin).is_ok() {
                     continue; // Peak bins keep their phase (they are the anchors)
