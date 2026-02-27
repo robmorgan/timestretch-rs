@@ -23,4 +23,4 @@ max_turns = 30
 allowed_tools = ["Edit", "Write", "Bash"]
 
 [agent.codex]
-model = "o3-mini"
+model = "gpt-5.3-codex"
