@@ -303,7 +303,11 @@ impl PhaseVocoder {
 
         let (_num_frames, output_len) = self.process_core(input, true)?;
         let mut output = self.output_buf[..output_len].to_vec();
-        Self::normalize_output(&mut output, &self.window_sum_buf[..output_len]);
+        Self::normalize_output(
+            &mut output,
+            &self.window_sum_buf[..output_len],
+            self.stretch_ratio,
+        );
         Ok(output)
     }
 
@@ -379,7 +383,11 @@ impl PhaseVocoder {
 
         output.resize(emit_len, 0.0);
         output[..emit_len].copy_from_slice(&self.streaming_accum_output[..emit_len]);
-        Self::normalize_output(output, &self.streaming_accum_window_sum[..emit_len]);
+        Self::normalize_output(
+            output,
+            &self.streaming_accum_window_sum[..emit_len],
+            self.stretch_ratio,
+        );
         self.synthesis_emitted = self.synthesis_emitted.saturating_add(emit_len);
         Ok(())
     }
@@ -415,7 +423,11 @@ impl PhaseVocoder {
         }
         output.resize(len, 0.0);
         output.copy_from_slice(&self.streaming_tail[..len]);
-        Self::normalize_output(output, &self.streaming_tail_window_sum[..len]);
+        Self::normalize_output(
+            output,
+            &self.streaming_tail_window_sum[..len],
+            self.stretch_ratio,
+        );
         self.streaming_tail.clear();
         self.streaming_tail_window_sum.clear();
         self.synthesis_pos = 0.0;
@@ -835,9 +847,17 @@ impl PhaseVocoder {
     /// Normalizes output by window sum, clamping to prevent amplification in
     /// low-overlap regions (occurs when synthesis hop > analysis hop).
     #[inline]
-    fn normalize_output(output: &mut [f32], window_sum: &[f32]) {
+    fn normalize_output(output: &mut [f32], window_sum: &[f32], stretch_ratio: f64) {
         let max_window_sum = window_sum.iter().copied().fold(0.0f32, f32::max);
-        let min_window_sum = (max_window_sum * WINDOW_SUM_FLOOR_RATIO).max(WINDOW_SUM_EPSILON);
+        // For stretches >1.0, synthesis frames are farther apart and fixed 10%
+        // flooring can over-attenuate low-overlap regions. Relax the floor in
+        // proportion to ratio while keeping a safety minimum against blow-ups.
+        let floor_ratio = if stretch_ratio > 1.0 {
+            (WINDOW_SUM_FLOOR_RATIO / stretch_ratio as f32).clamp(0.02, WINDOW_SUM_FLOOR_RATIO)
+        } else {
+            WINDOW_SUM_FLOOR_RATIO
+        };
+        let min_window_sum = (max_window_sum * floor_ratio).max(WINDOW_SUM_EPSILON);
         let len = output.len().min(window_sum.len());
         for i in 0..len {
             output[i] /= window_sum[i].max(min_window_sum);
