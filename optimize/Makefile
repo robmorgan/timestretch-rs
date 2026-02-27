@@ -1,8 +1,11 @@
-.PHONY: refs score loop report clean setup install-deps install-tools resume
+.PHONY: samples refs score loop report clean setup install-deps install-tools resume
 
 REPO_ROOT := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
-refs:            ## Generate reference files
+samples:         ## Generate synthetic test WAV samples
+	./scripts/generate_samples.sh
+
+refs: samples     ## Generate reference files
 	./scripts/generate_references.sh
 
 score:           ## Run scoring only (no optimization)
