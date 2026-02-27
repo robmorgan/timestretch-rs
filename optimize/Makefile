@@ -32,7 +32,7 @@ install-tools:   ## Install reference audio tools
 	@OS=$$(uname -s); \
 	if [ "$$OS" = "Darwin" ]; then \
 		echo "Installing via Homebrew..."; \
-		brew install rubberband soundtouch sox; \
+		brew install rubberband sound-touch sox; \
 	elif [ -f /etc/arch-release ]; then \
 		echo "Installing via pacman..."; \
 		sudo pacman -S --needed rubberband soundtouch sox; \
