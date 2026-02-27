@@ -1,0 +1,4 @@
+interface:
+  display_name: "Timestretch Maintainer"
+  short_description: "Maintain Rust DSP code and quality workflows"
+  default_prompt: "Use $timestretch-maintainer to run a safe maintenance pass with tiered checks."
