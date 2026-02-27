@@ -9,7 +9,7 @@ MODEL=$(grep "model" optimize/config.toml | cut -d'=' -f2 | tr -d ' "' || echo "
 
 echo "Running Codex agent..."
 # Assuming 'codex' CLI is available
-codex -q --model "$MODEL" --approval-mode full-auto "$(cat "$PROMPT_FILE")" 2>&1 | tee "$LOG_FILE"
+codex exec --full-auto --model "$MODEL" "$(cat "$PROMPT_FILE")" 2>&1 | tee "$LOG_FILE"
 
 # Check if build is broken after agent changes
 echo "Verifying build..."
