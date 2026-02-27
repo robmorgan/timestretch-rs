@@ -1441,7 +1441,7 @@ mod tests {
         // When window_sum is uniform, output should be divided by that value
         let mut output = vec![2.0f32; 10];
         let window_sum = vec![2.0f32; 10];
-        PhaseVocoder::normalize_output(&mut output, &window_sum);
+        PhaseVocoder::normalize_output(&mut output, &window_sum, 1.0);
         for &s in &output {
             assert!((s - 1.0).abs() < 1e-6, "Expected 1.0, got {}", s);
         }
@@ -1455,7 +1455,7 @@ mod tests {
         let mut window_sum = vec![1.0f32; 10];
         // One sample has near-zero window sum (low-overlap region)
         window_sum[5] = 1e-10;
-        PhaseVocoder::normalize_output(&mut output, &window_sum);
+        PhaseVocoder::normalize_output(&mut output, &window_sum, 1.0);
 
         // The clamped sample should NOT be amplified wildly
         // min_window_sum = max(1.0) * WINDOW_SUM_FLOOR_RATIO = 0.1
@@ -1474,7 +1474,7 @@ mod tests {
         // All-zero window sum: should use WINDOW_SUM_EPSILON floor
         let mut output = vec![1.0f32; 5];
         let window_sum = vec![0.0f32; 5];
-        PhaseVocoder::normalize_output(&mut output, &window_sum);
+        PhaseVocoder::normalize_output(&mut output, &window_sum, 1.0);
         // Each sample = 1.0 / WINDOW_SUM_EPSILON
         for &s in &output {
             assert!(s.is_finite(), "Output should be finite, got {}", s);
