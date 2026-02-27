@@ -785,8 +785,11 @@ impl PhaseVocoder {
         // either side (compression or expansion) to avoid over-locking artifacts.
         if !advance_peaks.is_empty() && hop_ratio < 2.5 {
             let ratio_distance = (hop_ratio - 1.0).abs();
+            // For ratios >1.0, taper gradient locking faster to avoid
+            // over-locking smearing at larger slowdowns.
+            let taper_span = if hop_ratio > 1.0 { 1.2 } else { 1.5 };
             let gradient_blend =
-                PHASE_GRADIENT_BLEND * (1.0 - (ratio_distance / 1.5).clamp(0.0, 1.0));
+                PHASE_GRADIENT_BLEND * (1.0 - (ratio_distance / taper_span).clamp(0.0, 1.0));
             for bin in self.sub_bass_bin..num_bins {
                 if advance_peaks.binary_search(&bin).is_ok() {
                     continue; // Peak bins keep their phase (they are the anchors)
