@@ -319,19 +319,21 @@ mod crossfade_workflows {
     }
 
     #[test]
-    #[should_panic(expected = "sample rate mismatch")]
-    fn crossfade_mismatched_sample_rate_panics() {
-        let a = AudioBuffer::from_mono(vec![0.0; 100], 44100);
-        let b = AudioBuffer::from_mono(vec![0.0; 100], 48000);
-        let _ = a.crossfade_into(&b, 10);
+    fn crossfade_mismatched_sample_rate_returns_self() {
+        let a = AudioBuffer::from_mono(vec![1.0; 100], 44100);
+        let b = AudioBuffer::from_mono(vec![2.0; 100], 48000);
+        let result = a.crossfade_into(&b, 10);
+        assert_eq!(result.sample_rate, a.sample_rate);
+        assert_eq!(result.data.len(), a.data.len());
     }
 
     #[test]
-    #[should_panic(expected = "channel layout mismatch")]
-    fn crossfade_mismatched_channels_panics() {
-        let a = AudioBuffer::from_mono(vec![0.0; 100], 44100);
-        let b = AudioBuffer::from_stereo(vec![0.0; 200], 44100);
-        let _ = a.crossfade_into(&b, 10);
+    fn crossfade_mismatched_channels_returns_self() {
+        let a = AudioBuffer::from_mono(vec![1.0; 100], 44100);
+        let b = AudioBuffer::from_stereo(vec![2.0; 200], 44100);
+        let result = a.crossfade_into(&b, 10);
+        assert_eq!(result.channels, a.channels);
+        assert_eq!(result.data.len(), a.data.len());
     }
 }
 

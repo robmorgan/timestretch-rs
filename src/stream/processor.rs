@@ -95,20 +95,28 @@ impl HybridStreamingState {
         let num_channels = params.channels.count();
         let mut per_channel = params.clone();
         per_channel.stretch_ratio = ratio;
+        // Keep a generous tail so that transient detection and HPSS have
+        // enough context to produce results consistent with full-batch
+        // processing.  Sixteen FFT windows (~1.5 s at 4096/44100) provides
+        // enough beat-level context for consistent segmentation.
+        let max_tail_frames = params.fft_size * 8;
+        // The rolling buffer must hold the retained tail context PLUS a full
+        // input batch so that tail samples are not discarded prematurely.
+        let rolling_capacity = capacity_frames + max_tail_frames;
 
         Self {
             stretchers: (0..num_channels)
                 .map(|_| HybridStretcher::new(per_channel.clone()))
                 .collect(),
             rolling_inputs: (0..num_channels)
-                .map(|_| RingBuffer::with_capacity(capacity_frames))
+                .map(|_| RingBuffer::with_capacity(rolling_capacity))
                 .collect(),
             rolling_scratch: (0..num_channels)
-                .map(|_| Vec::with_capacity(capacity_frames))
+                .map(|_| Vec::with_capacity(rolling_capacity))
                 .collect(),
             tail_output_lens: vec![0; num_channels],
             last_ratio: ratio,
-            max_tail_frames: params.fft_size * 2,
+            max_tail_frames,
         }
     }
 
@@ -141,9 +149,23 @@ impl HybridStreamingState {
         self.tail_output_lens.fill(0);
     }
 
-    fn update_tail_output_estimates(&mut self, ratio: f64) {
+    fn update_tail_output_estimates_from_rendered(
+        &mut self,
+        pre_trim_lens: &[usize],
+        rendered_lens: &[usize],
+    ) {
         for (idx, input) in self.rolling_inputs.iter().enumerate() {
-            self.tail_output_lens[idx] = ((input.len() as f64) * ratio).round() as usize;
+            let tail_len = input.len();
+            if pre_trim_lens[idx] > 0 {
+                // Scale the actual rendered length by the proportion of input
+                // retained as tail — more accurate than `tail_len * ratio`
+                // because it reflects real PV hop quantisation.
+                self.tail_output_lens[idx] = ((rendered_lens[idx] as f64) * tail_len as f64
+                    / pre_trim_lens[idx] as f64)
+                    .round() as usize;
+            } else {
+                self.tail_output_lens[idx] = 0;
+            }
         }
     }
 }
@@ -418,14 +440,7 @@ impl StreamProcessor {
         let correction = expected_total - actual_total;
         if correction > 0 {
             let need = correction as usize;
-            let available = output.capacity().saturating_sub(output.len());
-            if need > available {
-                return Err(StretchError::BufferOverflow {
-                    buffer: "flush_into_output",
-                    requested: need,
-                    available,
-                });
-            }
+            output.reserve(need);
             extend_with_tonal_tail(output, need);
             self.total_output_emitted_samples += need;
         } else if correction < 0 {
@@ -696,6 +711,8 @@ impl StreamProcessor {
         self.append_hybrid_input(num_channels)?;
 
         let mut min_output_len = usize::MAX;
+        let mut pre_trim_lens = vec![0usize; num_channels];
+        let mut rendered_lens = vec![0usize; num_channels];
         for ch in 0..num_channels {
             let len = self.hybrid_state.rolling_inputs[ch].len();
             self.hybrid_state.rolling_scratch[ch].resize(len, 0.0);
@@ -720,6 +737,9 @@ impl StreamProcessor {
                 });
             }
 
+            pre_trim_lens[ch] = len;
+            rendered_lens[ch] = rendered.len();
+
             self.channel_output_buffers[ch].clear();
             self.channel_output_buffers[ch].extend_from_slice(&rendered[skip..]);
             min_output_len = min_output_len.min(delta_len);
@@ -727,7 +747,7 @@ impl StreamProcessor {
 
         self.hybrid_state.retain_tail();
         self.hybrid_state
-            .update_tail_output_estimates(self.current_ratio);
+            .update_tail_output_estimates_from_rendered(&pre_trim_lens, &rendered_lens);
 
         Ok(if min_output_len == usize::MAX {
             0

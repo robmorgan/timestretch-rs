@@ -196,7 +196,10 @@ impl HybridStretcher {
         // Keep their transient peak by using direct resampling instead.
         if is_sparse_impulsive(input) {
             let out_len = (input.len() as f64 * self.params.stretch_ratio).round() as usize;
-            return Ok(crate::core::resample::resample_linear(input, out_len.max(1)));
+            return Ok(crate::core::resample::resample_linear(
+                input,
+                out_len.max(1),
+            ));
         }
 
         let min_size = self.params.fft_size.max(self.params.wsola_segment_size);
