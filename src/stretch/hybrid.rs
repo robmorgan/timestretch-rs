@@ -871,12 +871,17 @@ impl HybridStretcher {
             }];
         }
 
-        let max_transient_size =
-            (self.params.sample_rate as f64 * self.params.transient_region_secs) as usize;
+        let global_ratio = self.params.stretch_ratio;
+        // For stretches >1.0, give transients proportionally more input context
+        // so onset/early-decay structure survives longer output durations.
+        let transient_ratio_scale = global_ratio.max(1.0).min(1.6);
+        let max_transient_size = ((self.params.sample_rate as f64
+            * self.params.transient_region_secs
+            * transient_ratio_scale)
+            .round()) as usize;
         // Minimum 5ms region for weak transients
         let min_transient_size = (self.params.sample_rate as f64 * 0.005) as usize;
 
-        let global_ratio = self.params.stretch_ratio;
         let mut segments = Vec::new();
         let mut pos = 0;
 
