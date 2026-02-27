@@ -1562,7 +1562,7 @@ impl StretchParams {
             transient_region_secs: DEFAULT_TRANSIENT_REGION_SECS,
             elastic_timing: false,
             elastic_anchor: 0.0,
-            hpss_enabled: false,
+            hpss_enabled: true,
             crossfade_mode: CrossfadeMode::Fixed(0.012),
             bpm: None,
             pre_analysis: None,
