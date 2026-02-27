@@ -24,7 +24,7 @@ def main():
     binary = os.path.join(repo_root, "target/release/timestretch-cli")
     
     for item in manifest:
-        source = os.path.join(repo_root, item['source'])
+        source = os.path.join(repo_root, "optimize", item['source'])
         ratio = item['ratio']
         source_base = os.path.basename(item['source']).replace('.wav', '')
         output = os.path.join(output_dir, f"{source_base}_test_{ratio}.wav")
