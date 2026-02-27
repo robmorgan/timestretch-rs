@@ -965,9 +965,9 @@ fn compute_fixed_crossfade_len(
     let min_crossfade_samples = (2.0 * sample_rate as f64 / CROSSFADE_MIN_FREQ_HZ_TONAL) as usize;
     crossfade_samples = crossfade_samples.max(min_crossfade_samples);
 
-    // Cap at 25% of the shortest segment output length.
+    // Cap fixed crossfades more conservatively to reduce transient smearing.
     let shortest = segment_target_lens.iter().copied().min().unwrap_or(0);
-    let max_crossfade = shortest / 4;
+    let max_crossfade = shortest / 8;
     crossfade_samples.min(max_crossfade)
 }
 
