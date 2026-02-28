@@ -42,7 +42,7 @@ const FLUX_SPIKE_RATIO: f64 = 1.6;
 ///
 /// Smooths phase discontinuities caused by re-rendering overlapping audio
 /// with fresh PV phase state on each call.
-const HYBRID_STREAM_CROSSFADE_SAMPLES: usize = 256;
+const HYBRID_STREAM_CROSSFADE_SAMPLES: usize = 2048;
 /// Absolute guard to suppress near-silence false triggers.
 const FLUX_ABS_MIN: f64 = 1e-4;
 /// Extra emphasis on high-band flux.
