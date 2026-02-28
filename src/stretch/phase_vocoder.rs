@@ -667,8 +667,7 @@ impl PhaseVocoder {
 
         // First frame after a full phase reset: seed synthesis phases directly
         // from analysis to avoid a large bogus IF jump from zeroed prev_phase.
-        if self.prev_phase.iter().all(|&p| p == 0.0) && self.phase_accum.iter().all(|&p| p == 0.0)
-        {
+        if self.prev_phase.iter().all(|&p| p == 0.0) && self.phase_accum.iter().all(|&p| p == 0.0) {
             for bin in 0..num_bins {
                 let phase = self.analysis_phases[bin] as f64;
                 self.phase_accum[bin] = phase;

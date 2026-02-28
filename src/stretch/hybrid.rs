@@ -39,8 +39,6 @@ const DEDUP_DISTANCE: usize = 512;
 ///
 /// Beat-only anchors create tonal boundaries but do not create transient regions.
 const BEAT_ANCHOR_STRENGTH: f32 = f32::NEG_INFINITY;
-/// Base direct-copy attack length for transient segments.
-const TRANSIENT_ATTACK_COPY_SECS: f64 = 0.008;
 /// Minimum WSOLA search time for transient decays to keep low-end alignment stable.
 const TRANSIENT_DECAY_SEARCH_FLOOR_SECS: f64 = 0.012;
 /// WSOLA search range boost for transient decays.
@@ -744,96 +742,31 @@ impl HybridStretcher {
             return vec![];
         }
 
-        // Attack portion: longer direct copy keeps kick onset and early low-end
-        // phase relationship intact before WSOLA handles the decay.
-        let attack_samples = ((self.params.sample_rate as f64 * TRANSIENT_ATTACK_COPY_SECS)
-            as usize)
-            .min(seg_data.len())
-            .max(1);
-        // Crossfade duration between attack and decay (2ms)
-        let crossfade_len = ((self.params.sample_rate as f64 * 0.002) as usize)
-            .min(attack_samples / 2)
-            .max(1);
+        // Use WSOLA on the full transient segment with a boosted search range
+        // for better waveform matching. WSOLA naturally preserves transients
+        // through correlation-based overlap selection, while maintaining uniform
+        // stretch timing across the entire segment for better spectral alignment.
+        let seg_size = self
+            .params
+            .wsola_segment_size
+            .min(seg_data.len() / 2)
+            .max(MIN_WSOLA_SEGMENT);
+        let boosted_search = ((self.params.effective_wsola_search_range() as f64)
+            * TRANSIENT_DECAY_SEARCH_BOOST)
+            .round() as usize;
+        let transient_search_floor =
+            (self.params.sample_rate as f64 * TRANSIENT_DECAY_SEARCH_FLOOR_SECS) as usize;
+        let search = boosted_search
+            .max(transient_search_floor)
+            .max(MIN_WSOLA_SEARCH)
+            .min(seg_size.saturating_sub(1));
 
-        if seg_data.len() <= attack_samples * 2 || out_len <= attack_samples {
-            return self
-                .stretch_with_wsola_ratio(seg_data, ratio)
-                .unwrap_or_else(|_| {
-                    crate::core::resample::resample_linear(seg_data, out_len.max(1))
-                });
-        }
-
-        let attack = &seg_data[..attack_samples];
-        let decay = &seg_data[attack_samples..];
-
-        let decay_energy: f32 = decay.iter().map(|&s| s * s).sum();
-        let decay_rms = (decay_energy / decay.len().max(1) as f32).sqrt();
-        if decay_rms < 1e-4 {
-            return self
-                .stretch_with_wsola_ratio(seg_data, ratio)
-                .unwrap_or_else(|_| {
-                    crate::core::resample::resample_linear(seg_data, out_len.max(1))
-                });
-        }
-
-        let decay_out_len = out_len
-            .saturating_sub(attack_samples)
-            .saturating_add(crossfade_len);
-        if decay_out_len < MIN_WSOLA_SEGMENT {
-            let decay_stretched =
-                crate::core::resample::resample_linear(decay, decay_out_len.max(1));
-            let mut output = Vec::with_capacity(attack_samples + decay_stretched.len());
-            output.extend_from_slice(attack);
-            output.extend_from_slice(&decay_stretched);
-            return output;
-        }
-
-        let decay_stretched = {
-            let seg_size = self
-                .params
-                .wsola_segment_size
-                .min(decay.len() / 2)
-                .max(MIN_WSOLA_SEGMENT);
-            let boosted_search = ((self.params.effective_wsola_search_range() as f64)
-                * TRANSIENT_DECAY_SEARCH_BOOST)
-                .round() as usize;
-            let transient_search_floor =
-                (self.params.sample_rate as f64 * TRANSIENT_DECAY_SEARCH_FLOOR_SECS) as usize;
-            let search = boosted_search
-                .max(transient_search_floor)
-                .max(MIN_WSOLA_SEARCH)
-                .min(seg_size.saturating_sub(1));
-            let mut wsola = Wsola::new(seg_size, search, decay_out_len as f64 / decay.len() as f64);
-            wsola.process(decay).unwrap_or_else(|_| {
-                crate::core::resample::resample_linear(decay, decay_out_len.max(1))
+        self.stretch_with_wsola_ratio(seg_data, ratio)
+            .or_else(|_| {
+                let mut wsola = Wsola::new(seg_size, search, ratio);
+                wsola.process(seg_data)
             })
-        };
-
-        let crossfade_len = crossfade_len.min(attack_samples).min(decay_stretched.len());
-
-        if crossfade_len == 0 || decay_stretched.is_empty() {
-            let mut output = Vec::with_capacity(attack_samples + decay_stretched.len());
-            output.extend_from_slice(attack);
-            output.extend_from_slice(&decay_stretched);
-            return output;
-        }
-
-        let pre_fade = attack_samples - crossfade_len;
-        let mut output = Vec::with_capacity(out_len);
-        output.extend_from_slice(&attack[..pre_fade]);
-
-        for i in 0..crossfade_len {
-            let t = i as f32 / crossfade_len as f32;
-            let fade_out = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
-            let fade_in = 1.0 - fade_out;
-            output.push(attack[pre_fade + i] * fade_out + decay_stretched[i] * fade_in);
-        }
-
-        if crossfade_len < decay_stretched.len() {
-            output.extend_from_slice(&decay_stretched[crossfade_len..]);
-        }
-
-        output
+            .unwrap_or_else(|_| crate::core::resample::resample_linear(seg_data, out_len.max(1)))
     }
 
     /// Stretches a segment using WSOLA with a specific ratio.
@@ -874,7 +807,7 @@ impl HybridStretcher {
         let global_ratio = self.params.stretch_ratio;
         // For stretches >1.0, give transients proportionally more input context
         // so onset/early-decay structure survives longer output durations.
-        let transient_ratio_scale = global_ratio.max(1.0).min(1.6);
+        let transient_ratio_scale = global_ratio.clamp(1.0, 1.6);
         let max_transient_size = ((self.params.sample_rate as f64
             * self.params.transient_region_secs
             * transient_ratio_scale)
