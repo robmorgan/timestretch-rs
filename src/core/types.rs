@@ -1347,7 +1347,7 @@ impl TransientThresholdPolicy {
     /// Returns a clamped, internally valid policy.
     #[inline]
     pub fn sanitized(self) -> Self {
-        let mut window = self.median_window_frames.max(1).min(63);
+        let mut window = self.median_window_frames.clamp(1, 63);
         if window % 2 == 0 {
             window = window.saturating_add(1).min(63);
         }
@@ -1355,8 +1355,8 @@ impl TransientThresholdPolicy {
             median_window_frames: window,
             threshold_floor: self.threshold_floor.max(0.0),
             threshold_sensitivity_slope: self.threshold_sensitivity_slope.max(0.0),
-            min_gap_frames: self.min_gap_frames.max(1).min(32),
-            high_sensitivity_min_gap_frames: self.high_sensitivity_min_gap_frames.max(1).min(32),
+            min_gap_frames: self.min_gap_frames.clamp(1, 32),
+            high_sensitivity_min_gap_frames: self.high_sensitivity_min_gap_frames.clamp(1, 32),
             high_sensitivity_split: self.high_sensitivity_split.clamp(0.0, 1.0),
         }
     }

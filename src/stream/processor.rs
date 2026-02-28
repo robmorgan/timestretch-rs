@@ -38,6 +38,11 @@ const FLUX_EMA_ALPHA: f64 = 0.2;
 const FLUX_THRESHOLD_SIGMA: f64 = 2.5;
 /// Required jump versus previous frame flux to classify a transient.
 const FLUX_SPIKE_RATIO: f64 = 1.6;
+/// Cross-fade length (in samples) at hybrid streaming chunk boundaries.
+///
+/// Smooths phase discontinuities caused by re-rendering overlapping audio
+/// with fresh PV phase state on each call.
+const HYBRID_STREAM_CROSSFADE_SAMPLES: usize = 256;
 /// Absolute guard to suppress near-silence false triggers.
 const FLUX_ABS_MIN: f64 = 1e-4;
 /// Extra emphasis on high-band flux.
@@ -90,6 +95,10 @@ struct HybridStreamingState {
     tail_output_lens: Vec<usize>,
     last_ratio: f64,
     max_tail_frames: usize,
+    /// Per-channel held-back samples from the previous delta's tail,
+    /// used for cross-fading at chunk boundaries to smooth phase
+    /// discontinuities from fresh PV state on each re-render.
+    crossfade_held: Vec<Vec<f32>>,
 }
 
 impl HybridStreamingState {
@@ -119,6 +128,7 @@ impl HybridStreamingState {
             tail_output_lens: vec![0; num_channels],
             last_ratio: ratio,
             max_tail_frames,
+            crossfade_held: (0..num_channels).map(|_| Vec::new()).collect(),
         }
     }
 
@@ -465,6 +475,20 @@ impl StreamProcessor {
 
         self.input_ring.clear();
         if self.use_hybrid {
+            // Emit any held-back cross-fade tails before resetting state.
+            let mut held_min_len = usize::MAX;
+            for ch in 0..num_channels {
+                let held = &self.hybrid_state.crossfade_held[ch];
+                if !held.is_empty() {
+                    self.channel_output_buffers[ch].clear();
+                    self.channel_output_buffers[ch].extend_from_slice(held);
+                    held_min_len = held_min_len.min(held.len());
+                }
+            }
+            if held_min_len != usize::MAX && held_min_len > 0 {
+                self.interleave_to_pending(held_min_len, num_channels)?;
+            }
+
             self.hybrid_state.reset(
                 &self.params,
                 self.current_ratio,
@@ -796,8 +820,40 @@ impl StreamProcessor {
             rendered_lens[ch] = rendered.len();
 
             self.channel_output_buffers[ch].clear();
-            self.channel_output_buffers[ch].extend_from_slice(&rendered[skip..]);
-            min_output_len = min_output_len.min(delta_len);
+
+            // Cross-fade at the chunk boundary to smooth phase discontinuities.
+            // The hybrid stretcher creates a fresh PV on each call, so the
+            // absolute phase of the rendered output may differ between
+            // consecutive calls for the overlapping tail region. Without
+            // cross-fading, this creates clicks at chunk boundaries.
+            let xfade = HYBRID_STREAM_CROSSFADE_SAMPLES
+                .min(skip)
+                .min(delta_len / 2);
+            let held = &self.hybrid_state.crossfade_held[ch];
+            if !held.is_empty() && xfade > 0 {
+                // Cross-fade: blend the held-back samples (previous delta end)
+                // with the current rendering's prediction of that region
+                // (rendered[skip-xfade..skip]).
+                let overlap = &rendered[skip - xfade..skip];
+                let actual_xfade = held.len().min(xfade).min(overlap.len());
+                for i in 0..actual_xfade {
+                    let t = (i as f32 + 0.5) / actual_xfade as f32;
+                    let s = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
+                    self.channel_output_buffers[ch]
+                        .push(held[i] * (1.0 - s) + overlap[i] * s);
+                }
+            }
+
+            // Emit the new delta, holding back the tail for next cross-fade.
+            let emit_end = delta_len.saturating_sub(xfade);
+            self.channel_output_buffers[ch]
+                .extend_from_slice(&rendered[skip..skip + emit_end]);
+
+            // Save the tail for the next cross-fade.
+            self.hybrid_state.crossfade_held[ch] =
+                rendered[skip + emit_end..skip + delta_len].to_vec();
+
+            min_output_len = min_output_len.min(self.channel_output_buffers[ch].len());
         }
 
         self.hybrid_state.retain_tail();

@@ -109,6 +109,7 @@ pub fn apply_phase_locking(
 
 /// Real-time-safe phase-locking variant that reuses caller-provided scratch
 /// buffers to avoid per-frame allocations.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_phase_locking_realtime(
     mode: PhaseLockingMode,
     magnitudes: &[f32],
@@ -400,6 +401,7 @@ fn identity_phase_lock_realtime(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn roi_phase_lock_realtime(
     magnitudes: &[f32],
     analysis_phases: &[f32],
@@ -450,6 +452,7 @@ fn roi_phase_lock_realtime(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn selective_phase_lock_realtime(
     magnitudes: &[f32],
     analysis_phases: &[f32],
