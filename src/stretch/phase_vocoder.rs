@@ -458,7 +458,70 @@ impl PhaseVocoder {
             let expected_len = (input.len() as f64 * self.stretch_ratio).round() as usize;
             let trim_end = (trim_start + expected_len).min(output.len());
             if trim_start < output.len() {
-                return Ok(output[trim_start..trim_end].to_vec());
+                let mut result = output[trim_start..trim_end].to_vec();
+
+                // Edge amplitude correction: mirror padding causes phase
+                // interference near the signal boundary, reducing amplitude
+                // in the first ~fft_size*ratio output samples.  Measure
+                // this droop and apply a smooth gain ramp to match the
+                // steady-state level, preventing false onset detection.
+                let correction_len =
+                    (self.fft_size as f64 * self.stretch_ratio.abs().max(1.0)).ceil() as usize;
+                let correction_len = correction_len.min(result.len() / 4);
+                if correction_len >= 128 && result.len() >= correction_len * 4 {
+                    let ss_start = correction_len;
+                    let ss_end = (correction_len * 3).min(result.len());
+                    let ss_len = ss_end - ss_start;
+                    let ss_energy: f64 =
+                        result[ss_start..ss_end].iter().map(|&s| (s as f64) * (s as f64)).sum();
+                    let ss_rms = (ss_energy / ss_len as f64).sqrt();
+                    if ss_rms > 1e-6 {
+                        let edge_energy: f64 = result[..correction_len]
+                            .iter()
+                            .map(|&s| (s as f64) * (s as f64))
+                            .sum();
+                        let edge_rms = (edge_energy / correction_len as f64).sqrt();
+                        // Only correct if the edge is significantly quieter
+                        if edge_rms < ss_rms * 0.7 && edge_rms > 1e-8 {
+                            let gain = (ss_rms / edge_rms).min(4.0) as f32;
+                            for i in 0..correction_len {
+                                // Smooth ramp: full correction at start, tapering to 1.0
+                                let t = i as f32 / correction_len as f32;
+                                let g = 1.0 + (gain - 1.0) * (1.0 - t) * (1.0 - t);
+                                result[i] *= g;
+                            }
+                        }
+                    }
+                }
+
+                // Same correction for the end edge (mirror padding droop).
+                if correction_len >= 128 && result.len() >= correction_len * 4 {
+                    let ss_start = result.len() / 4;
+                    let ss_end = result.len() * 3 / 4;
+                    let ss_len = ss_end - ss_start;
+                    let ss_energy: f64 =
+                        result[ss_start..ss_end].iter().map(|&s| (s as f64) * (s as f64)).sum();
+                    let ss_rms = (ss_energy / ss_len as f64).sqrt();
+                    if ss_rms > 1e-6 {
+                        let end_start = result.len() - correction_len;
+                        let end_energy: f64 = result[end_start..]
+                            .iter()
+                            .map(|&s| (s as f64) * (s as f64))
+                            .sum();
+                        let end_rms = (end_energy / correction_len as f64).sqrt();
+                        if end_rms < ss_rms * 0.7 && end_rms > 1e-8 {
+                            let gain = (ss_rms / end_rms).min(4.0) as f32;
+                            let rlen = result.len();
+                            for i in 0..correction_len {
+                                let t = i as f32 / correction_len as f32;
+                                let g = 1.0 + (gain - 1.0) * t * t;
+                                result[rlen - correction_len + i] *= g;
+                            }
+                        }
+                    }
+                }
+
+                return Ok(result);
             }
         }
 

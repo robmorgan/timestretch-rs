@@ -19,3 +19,20 @@ iter=18: Halved PV analysis hop (hop_size/2) in hybrid stretcher only -> score=6
 iter=19: Reduced WINDOW_SUM_FLOOR_RATIO from 0.1 to 0.02 -> score=68.73 (was 68.72098684310913), reverted. No meaningful change.
 iter=20: Changed streaming crossfade from constant-amplitude (Hann) to equal-power (cos/sin) -> score=67.34 (was 68.72098684310913), reverted. Equal-power creates amplitude bumps for correlated signals, worsening SC.
 iter=21: Relaxed streaming crossfade limit from delta_len/2 to delta_len*3/4 -> score=68.76845121383667 (was 68.72098684310913), committed. Improved sine slowdown streaming SC+LSD.
+iter=22: Ratio-aware PV mirror padding (hop*2*ratio_scale, capped at fft_size) -> score=68.22 (was 68.76845121383667), reverted. Hurt transient LSD and complex mix streaming TP.
+iter=23: Removed IF blend (phase noise) from PV non-peak bins -> score=68.72 (was 68.76845121383667), reverted. Helped transient streaming +1.4 but hurt complex mix streaming TP 100→87.5.
+iter=24: Increased PV mirror padding from hop*2 to fft_size -> score=67.62 (was 68.77567648887634), reverted. SC degraded significantly for vocal/complex/streaming.
+iter=25: Increased CLI streaming chunk_size from 1024 to 2048 -> score=68.78 (was 68.77567648887634), no meaningful change, reverted.
+iter=26: Added soft spectral gate (-80dB) in PV reconstruct_spectrum -> score=68.64 (was 68.80), reverted. LSD worsened because gated output had less energy in quiet bins than reference.
+iter=27: Increased PV mirror padding from hop*2 to hop*4 -> score=69.06 (was 68.80), committed. Complex mix streaming TP 87.5->100, streaming avg +0.50.
+iter=28: Removed ratio scaling from streaming crossfade (fixed at 2048 samples) -> score=70.04 (was 70.15574407577515), reverted
+iter=29: Ratio-adaptive PV hop (hop/4 for ratio>1.0 instead of hop/2) -> score=68.85 (was 70.15574407577515), reverted. Sine speedup streaming TP 100->0, batch SC dropped.
+iter=30: Increased WSOLA overlap to seg*2/3 for |ratio-1|>0.4 -> score=69.83 (was 70.15574407577515), reverted. SC improved +5-7 on transient-heavy but LSD and TP worsened.
+iter=31: Increased multi-resolution PV hop overlap from fft/4 to fft/8 -> score=70.16 (was 70.15574407577515), no meaningful change. Multi-res may not be exercised for most segments.
+iter=32: Enabled dynamic_wsola_search by default -> score=70.16 (was 70.15574407577515), reverted. No effect - WSOLA search range not bottleneck.
+iter=33: Disabled HPSS by default (multi-resolution fallback) -> score=55.58 (was 70.15574407577515), reverted. HPSS is critical for quality.
+iter=34: Asymmetric PV mirror padding (start=hop*4, end=hop*8) to preserve onset sharpness -> score=71.99 (was 70.69277691841125), committed. Sine speedup TP 0->100 (+24.5pts), but vocal speedup batch TP 100->50 (-12.4pts). Net +1.30.
+iter=35: Required 3*fft_size for HPSS (short tonal segments fall to multi_res) -> score=72.52 (was 72.71735882759094), reverted
+iter=36: Reduced PV start mirror padding to hop*2 for ratio<1.0 -> score=72.46 (was 72.71735882759094), reverted. Complex mix streaming TP dropped 100->87.5.
+iter=37: WSOLA shortcut for tonal segments < 2*fft_size -> score=72.67 (was 72.71735882759094), reverted. Only complex mix streaming affected (-0.69); transient-heavy scores unchanged (tonal segments all >= 2*fft_size).
+iter=38: PV edge amplitude correction (gain ramp for start/end edges with <70% of steady-state RMS) -> score=72.93 (was 72.71735882759094), committed. Transient-heavy slowdown streaming LSD improved significantly (+10pts). Sine/vocal TP still 50% (false onsets not from PV edge amplitude).
