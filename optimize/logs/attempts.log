@@ -1,0 +1,21 @@
+iter=1: Swapped multi_res priority over HPSS in stretch_tonal_core + removed ratio=1.0 bypass -> score=56.55 (was 68.22), reverted
+iter=2: Disabled both multi_resolution and hpss_enabled defaults -> score=62.60 (was 68.22), reverted. HPSS/multi_res helps with TP for complex mix and drums.
+iter=3: Skipped WSOLA on negligible percussive (<1% energy) in HPSS -> score=63.54 (was 68.22), reverted. False onsets not from percussive WSOLA.
+iter=4: Reduced DEFAULT_FFT_SIZE from 4096 to 2048 -> score=67.04 (was 68.77), reverted. Helped sine/vocal SC but destroyed drum quality (SC, TP, LSD all worse).
+iter=5: Disabled hpss_enabled only (kept multi_res) -> score=59.73 (was 68.77), reverted.
+iter=6: Enabled normalize=true by default -> score=68.75 (was 68.77), reverted. No meaningful change.
+iter=7: Changed default window from Hann to BlackmanHarris -> score=68.32 (was 68.77), reverted.
+iter=8: Doubled WSOLA_SEARCH_MS_SMALL from 10 to 20ms -> score=68.77 (unchanged), reverted.
+iter=9: Added 256-sample crossfade at hybrid streaming chunk boundaries -> score=64.83 (was 62.04), committed
+iter=10: Increased crossfade from 256 to 2048 samples -> score=65.85 (was 64.83), committed
+iter=11: Scale streaming crossfade with stretch ratio (ratio_scale = max(ratio,1.0)) -> score=66.89 (was 66.6310248374939), committed
+iter=12: Increased PV mirror padding from hop*2 to fft_size -> score=66.97 (was 67.8831558227539), reverted. Batch +0.49, streaming -2.31
+iter=13: Changed default crossfade to Adaptive mode -> score=67.38 (was 67.8831558227539), reverted. Transient-heavy TP dropped.
+iter=14: Increased CLI streaming chunk_size from 1024 to 4096 -> score=67.58 (was 67.8831558227539), reverted. Complex mix streaming TP dropped 100→87.5
+iter=15: Lowered DEFAULT_TRANSIENT_SENSITIVITY from 0.5 to 0.3 -> score=68.67 (was 67.8831558227539), committed
+iter=16: Reduced DEFAULT_HOP_SIZE from fft/8 to fft/16 (256) -> score=65.16 (was 68.46), reverted. Helped tonal SC (+2pts) but destroyed drum SC (-20pts) and TP due to HPSS using smaller hop.
+iter=17: Cross-correlation skip alignment in hybrid streaming -> score=62.27 (was 68.46420478820801), reverted. Drums SC=0 from spurious xcorr matches.
+iter=18: Halved PV analysis hop (hop_size/2) in hybrid stretcher only -> score=68.72 (was 68.46420478820801), committed.
+iter=19: Reduced WINDOW_SUM_FLOOR_RATIO from 0.1 to 0.02 -> score=68.73 (was 68.72098684310913), reverted. No meaningful change.
+iter=20: Changed streaming crossfade from constant-amplitude (Hann) to equal-power (cos/sin) -> score=67.34 (was 68.72098684310913), reverted. Equal-power creates amplitude bumps for correlated signals, worsening SC.
+iter=21: Relaxed streaming crossfade limit from delta_len/2 to delta_len*3/4 -> score=68.76845121383667 (was 68.72098684310913), committed. Improved sine slowdown streaming SC+LSD.
