@@ -1485,11 +1485,13 @@ fn ms_to_samples(ms: f64, sample_rate: u32) -> usize {
 const DEFAULT_SAMPLE_RATE: u32 = 44100;
 /// Default FFT size for phase vocoder (good frequency resolution for bass).
 const DEFAULT_FFT_SIZE: usize = 4096;
-/// Default hop size (FFT/4 = 75% overlap for Hann window COLA compliance).
+/// Default hop size (FFT/8 = 87.5% overlap for Hann window COLA compliance).
 ///
-/// 75% overlap (hop = FFT/4) provides good constant-overlap-add (COLA) behavior
-/// with Hann windows while halving the CPU cost compared to 87.5% overlap.
-const DEFAULT_HOP_SIZE: usize = DEFAULT_FFT_SIZE / 4;
+/// 87.5% overlap (hop = FFT/8) ensures constant-overlap-add (COLA) behavior
+/// with Hann windows is maintained even at high stretch ratios (up to 2.0x).
+/// At FFT/4, a ratio of 2.0 would produce synthesis hop = FFT/2 (only 50%
+/// overlap), violating COLA and causing audible gain modulation.
+const DEFAULT_HOP_SIZE: usize = DEFAULT_FFT_SIZE / 8;
 /// Default transient detection sensitivity (0.0–1.0).
 const DEFAULT_TRANSIENT_SENSITIVITY: f32 = 0.5;
 /// Default sub-bass phase lock cutoff in Hz.
