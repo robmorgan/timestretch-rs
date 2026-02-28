@@ -50,9 +50,9 @@ impl TimeStretchApp {
         let stream_active = Arc::new(AtomicBool::new(false));
         let position = Arc::new(AtomicPosition::new());
 
-        // Try to create audio engine
+        // Try to create audio engine to detect default sample rate
         let (audio_engine, output_sample_rate) =
-            match AudioEngine::new(state.clone(), stream_active.clone()) {
+            match AudioEngine::new(state.clone(), stream_active.clone(), None) {
                 Ok((engine, _producer)) => {
                     let sr = engine.output_sample_rate;
                     // We'll create a new engine when loading a file
@@ -168,9 +168,10 @@ impl TimeStretchApp {
             st.sample_rate
         };
 
-        // Create audio engine with ring buffer
+        // Create audio engine with ring buffer, matching the source file's sample rate
+        // so playback speed is correct regardless of the device's native rate.
         let (engine, producer) =
-            match AudioEngine::new(self.state.clone(), self.stream_active.clone()) {
+            match AudioEngine::new(self.state.clone(), self.stream_active.clone(), Some(sample_rate)) {
                 Ok((e, p)) => (e, p),
                 Err(e) => {
                     self.error_message = Some(format!("Audio error: {e}"));

@@ -20,9 +20,14 @@ pub struct AudioEngine {
 impl AudioEngine {
     /// Create a new audio engine with a cpal output stream.
     /// Returns the engine and a ring buffer producer for feeding audio.
+    ///
+    /// If `desired_sample_rate` is provided, the output stream will be
+    /// configured at that rate (Core Audio handles resampling to hardware).
+    /// Otherwise the device's default sample rate is used.
     pub fn new(
         state: SharedStateHandle,
         stream_active: Arc<AtomicBool>,
+        desired_sample_rate: Option<u32>,
     ) -> Result<(Self, RingProducer), String> {
         let host = cpal::default_host();
         let device = host
@@ -33,7 +38,7 @@ impl AudioEngine {
             .default_output_config()
             .map_err(|e| format!("Failed to get default output config: {e}"))?;
 
-        let sample_rate = default_config.sample_rate().0;
+        let sample_rate = desired_sample_rate.unwrap_or(default_config.sample_rate().0);
         let config = StreamConfig {
             channels: 2,
             sample_rate: SampleRate(sample_rate),
