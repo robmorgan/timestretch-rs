@@ -1750,7 +1750,7 @@ impl StretchParams {
             wsola_search_range: ms_to_samples(WSOLA_SEARCH_MS_SMALL, DEFAULT_SAMPLE_RATE),
             beat_aware: false,
             band_split: false,
-            window_type: WindowType::Hann,
+            window_type: WindowType::BlackmanHarris,
             normalize: false,
             phase_locking_mode: PhaseLockingMode::RegionOfInfluence,
             adaptive_phase_locking: DEFAULT_ADAPTIVE_PHASE_LOCKING,
