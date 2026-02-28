@@ -349,7 +349,6 @@ fn test_ratio_sweep_two_tone_peak_bins() {
 fn test_ratio_sweep_impulse_train_transient_count_and_sharpness() {
     let n = 12_000usize;
     let period = 500usize;
-    let expected_count = ((n - 1) / period) + 1;
     let input = gen_impulse_train(period, n, 1.0);
 
     for &ratio in &RATIOS {
