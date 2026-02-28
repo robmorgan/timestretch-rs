@@ -682,10 +682,18 @@ impl HybridStretcher {
         reconcile_total_segment_targets(&mut segment_target_lens, desired_synthesis_len);
 
         // Step 4: Process each segment with appropriate algorithm
-        // Reuse a single PV instance for tonal segments (avoids FFT planner recreation)
+        // Reuse a single PV instance for tonal segments (avoids FFT planner recreation).
+        // Use a finer analysis hop (half the default) for the PV to increase
+        // synthesis overlap. More overlapping windows improve window-sum
+        // smoothness, reduce per-frame phase errors, and lower spectral
+        // distortion — especially for large stretch ratios where the synthesis
+        // hop would otherwise leave only 4 overlapping frames.
+        // The HPSS STFT decomposition and transient detection keep the
+        // original hop_size so drum quality is unaffected.
+        let pv_hop = self.params.hop_size / 2;
         let mut pv = PhaseVocoder::with_options(
             self.params.fft_size,
-            self.params.hop_size,
+            pv_hop,
             self.params.stretch_ratio,
             self.params.sample_rate,
             self.params.sub_bass_cutoff,
