@@ -110,7 +110,7 @@ impl HybridStreamingState {
         // enough context to produce results consistent with full-batch
         // processing.  Sixteen FFT windows (~1.5 s at 4096/44100) provides
         // enough beat-level context for consistent segmentation.
-        let max_tail_frames = params.fft_size * 8;
+        let max_tail_frames = params.fft_size * 16;
         // The rolling buffer must hold the retained tail context PLUS a full
         // input batch so that tail samples are not discarded prematurely.
         let rolling_capacity = capacity_frames + max_tail_frames;
