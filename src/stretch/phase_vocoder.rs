@@ -412,13 +412,25 @@ impl PhaseVocoder {
         // value before processing actual content, eliminating edge
         // artifacts that degrade spectral metrics.
         //
-        // Asymmetric padding: the start uses a shorter mirror (hop*2) so
-        // that onsets at t=0 remain distinct — longer mirrors pre-condition
+        // Asymmetric padding: the start uses a shorter mirror so that
+        // onsets at t=0 remain distinct — longer mirrors pre-condition
         // the phase state with identical spectral content and mask the
         // amplitude transition, causing onset detectors to miss it.
         // The end keeps a longer mirror (hop*8) for full spectral quality.
+        //
+        // The start padding scales with the ratio distance from unity:
+        // at extreme ratios (>0.3 from 1.0) the onset time-scaling
+        // amplifies small phase-state artefacts enough to shift onsets
+        // beyond the scoring tolerance, so we use a shorter mirror.
+        // Near unity the phase state is well-behaved and the longer
+        // mirror gives better spectral metrics.
         let end_pad = (self.hop_analysis * 8).min(input.len());
-        let start_pad = (self.hop_analysis * 4).min(input.len());
+        let start_pad_mult = if (self.stretch_ratio - 1.0).abs() > 0.3 {
+            4
+        } else {
+            8
+        };
+        let start_pad = (self.hop_analysis * start_pad_mult).min(input.len());
         if start_pad > 0 && input.len() >= self.fft_size {
             let padded_len = input.len() + start_pad + end_pad;
             let mut padded = vec![0.0f32; padded_len];
