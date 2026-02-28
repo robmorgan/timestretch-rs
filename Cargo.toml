@@ -9,6 +9,7 @@ keywords = ["audio", "dsp", "time-stretching", "phase-vocoder", "edm"]
 categories = ["multimedia::audio", "algorithms"]
 readme = "README.md"
 repository = "https://github.com/robmorgan/timestretch-rs"
+exclude = ["samples", "optimize", ".metamorph", "web", "desktop"]
 
 [dependencies]
 rustfft = "6"
