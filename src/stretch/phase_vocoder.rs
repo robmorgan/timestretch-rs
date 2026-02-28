@@ -15,7 +15,7 @@ const TWO_PI_F64: f64 = 2.0 * std::f64::consts::PI;
 /// Fraction of bins to pre-allocate for spectral peak detection (1/4 of bins).
 const PEAKS_CAPACITY_DIVISOR: usize = 4;
 /// Blend factor for phase gradient integration (soft vertical coherence).
-const PHASE_GRADIENT_BLEND: f64 = 0.3;
+const PHASE_GRADIENT_BLEND: f64 = 0.15;
 /// Minimum magnitude to consider a bin as a spectral peak (avoids noise peaks).
 const MIN_PEAK_MAGNITUDE: f32 = 1e-8;
 /// Treat values this close to integers as integral synthesis positions.
