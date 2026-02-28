@@ -66,6 +66,28 @@ cargo test --test reference_quality -- --nocapture
 You can optionally set `TIMESTRETCH_REFERENCE_MAX_SECONDS=<seconds>` for deterministic
 short-window analysis during ad-hoc runs as well.
 
+### External Rubber Band Scenario
+
+For a focused one-off benchmark against a Rubber Band render (black-box reference),
+provide paths through environment variables:
+
+```bash
+TIMESTRETCH_RUBBERBAND_ORIGINAL_WAV=benchmarks/audio/originals/my-loop.wav \
+TIMESTRETCH_RUBBERBAND_REFERENCE_WAV=benchmarks/audio/references/my-loop_rubberband.wav \
+TIMESTRETCH_RUBBERBAND_RATIO=1.024 \
+cargo test --test rubberband_comparison -- --nocapture
+```
+
+Optional variables:
+
+- `TIMESTRETCH_RUBBERBAND_SOURCE_BPM` + `TIMESTRETCH_RUBBERBAND_TARGET_BPM` (used if `..._RATIO` is not set)
+- `TIMESTRETCH_RUBBERBAND_MAX_SECONDS` (default `20.0`, trims analysis window for determinism)
+
+Outputs are written to `target/rubberband_benchmark/`:
+
+- `rubberband_comparison_report.csv`
+- `timestretch_vs_rubberband_output.wav`
+
 ## CI Quality Gate Subset
 
 CI enforces a corpus-independent benchmark subset via:
@@ -74,6 +96,20 @@ CI enforces a corpus-independent benchmark subset via:
 cargo test --test quality_gates -- --nocapture
 ```
 
+CI also enforces a strict worst-case callback-time budget gate in release mode:
+
+```bash
+TIMESTRETCH_STRICT_CALLBACK_BUDGET=1 cargo test --release --test quality_gates -- --nocapture
+```
+
+To emit machine-readable dashboard artifacts locally:
+
+```bash
+TIMESTRETCH_QUALITY_DASHBOARD_DIR=target/quality_dashboard cargo test --test quality_gates -- --nocapture
+```
+
+This writes per-gate CSV files under `target/quality_dashboard/`.
+
 This test uses synthetic DJ-like material and fails on regressions for:
 
 - duration error
@@ -81,6 +117,21 @@ This test uses synthetic DJ-like material and fails on regressions for:
 - cross-correlation timing coherence
 - loudness deviation
 - spectral similarity by band
+
+## Synthetic Quality Harness (Including Pitch/Formant)
+
+Run the full synthetic benchmark harness (ignored by default because it is slower):
+
+```bash
+cargo test --test quality_benchmark -- --ignored --nocapture
+```
+
+Outputs are written to `target/quality_benchmark/`:
+
+- `quality_report.csv` (baseline PV vs overhauled hybrid time-stretch metrics)
+- `pitch_formant_report.csv` (pitch-shift metrics for `EnvelopePreset::Off` vs `EnvelopePreset::Vocal`)
+- `pitch_formant_delta.csv` (vocal-minus-off deltas per pitch factor)
+- `*.wav` and `spectrogram_*.csv` artifacts for manual listening/visual inspection
 
 ## Metrics
 

@@ -3,6 +3,7 @@
 use crate::core::fft::COMPLEX_ZERO;
 use crate::error::StretchError;
 use rustfft::{num_complex::Complex, FftPlanner};
+use std::sync::Arc;
 
 /// Minimum energy threshold to avoid division by near-zero in correlation normalization.
 const ENERGY_EPSILON: f64 = 1e-12;
@@ -10,6 +11,11 @@ const ENERGY_EPSILON: f64 = 1e-12;
 const FFT_CANDIDATE_THRESHOLD: usize = 64;
 /// Minimum overlap length for FFT-based correlation to be worthwhile.
 const FFT_OVERLAP_THRESHOLD: usize = 32;
+/// Extra slack for loop-guard iteration bounds in dynamic WSOLA loops.
+const LOOP_GUARD_SLACK: usize = 8;
+/// Unroll factor for correlation kernels. This layout is friendly to
+/// auto-vectorization on AVX2/NEON, with scalar cleanup for the tail.
+const CORR_UNROLL: usize = 8;
 
 /// WSOLA (Waveform Similarity Overlap-Add) time stretching.
 ///
@@ -22,6 +28,16 @@ pub struct Wsola {
     search_range: usize,
     stretch_ratio: f64,
     planner: FftPlanner<f32>,
+    /// Cached FFT size for correlation plan reuse.
+    fft_plan_size: usize,
+    /// Cached forward FFT plan for the current `fft_plan_size`.
+    fft_fwd: Option<Arc<dyn rustfft::Fft<f32>>>,
+    /// Cached inverse FFT plan for the current `fft_plan_size`.
+    fft_inv: Option<Arc<dyn rustfft::Fft<f32>>>,
+    /// Scratch for forward FFT execution.
+    fft_fwd_scratch: Vec<Complex<f32>>,
+    /// Scratch for inverse FFT execution.
+    fft_inv_scratch: Vec<Complex<f32>>,
     /// Reusable FFT buffer for reference signal in cross-correlation.
     fft_ref_buf: Vec<Complex<f32>>,
     /// Reusable FFT buffer for search signal in cross-correlation.
@@ -36,6 +52,10 @@ pub struct Wsola {
     corr_values_buf: Vec<f64>,
     /// Reusable normalized-correlation buffer for FFT candidate scan.
     norm_corr_values_buf: Vec<f64>,
+    /// Precomputed raised-cosine fade-in weights for overlap-add.
+    crossfade_in: Vec<f32>,
+    /// Precomputed raised-cosine fade-out weights for overlap-add.
+    crossfade_out: Vec<f32>,
 }
 
 impl std::fmt::Debug for Wsola {
@@ -61,12 +81,18 @@ impl Wsola {
         } else {
             segment_size / 2
         };
+        let (crossfade_in, crossfade_out) = build_crossfade_tables(overlap_size);
         Self {
             segment_size,
             overlap_size,
             search_range,
             stretch_ratio,
             planner: FftPlanner::new(),
+            fft_plan_size: 0,
+            fft_fwd: None,
+            fft_inv: None,
+            fft_fwd_scratch: Vec::new(),
+            fft_inv_scratch: Vec::new(),
             fft_ref_buf: Vec::new(),
             fft_search_buf: Vec::new(),
             fft_corr_buf: Vec::new(),
@@ -74,6 +100,8 @@ impl Wsola {
             output_buf: Vec::new(),
             corr_values_buf: Vec::new(),
             norm_corr_values_buf: Vec::new(),
+            crossfade_in,
+            crossfade_out,
         }
     }
 
@@ -97,6 +125,15 @@ impl Wsola {
 
     /// Stretches a mono audio signal using WSOLA.
     pub fn process(&mut self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
+        if self.segment_size == 0 {
+            return Err(StretchError::InvalidState("WSOLA segment_size must be > 0"));
+        }
+        if self.overlap_size >= self.segment_size {
+            return Err(StretchError::InvalidState(
+                "WSOLA overlap_size must be < segment_size",
+            ));
+        }
+
         if input.len() < self.segment_size {
             return Err(StretchError::InputTooShort {
                 provided: input.len(),
@@ -105,6 +142,11 @@ impl Wsola {
         }
 
         let advance_input = self.segment_size - self.overlap_size;
+        if advance_input == 0 {
+            return Err(StretchError::InvalidState(
+                "WSOLA analysis advance must be > 0",
+            ));
+        }
         let advance_output_f = advance_input as f64 * self.stretch_ratio;
 
         if advance_output_f < 1.0 {
@@ -138,8 +180,21 @@ impl Wsola {
         // Track output position fractionally to avoid cumulative rounding error
         let mut output_pos_f: f64 = advance_output_f;
         let mut actual_output_len = first_len;
+        let mut iterations = 0usize;
+        let max_iterations = input
+            .len()
+            .saturating_sub(self.segment_size)
+            .saturating_div(advance_input)
+            .saturating_add(LOOP_GUARD_SLACK);
 
         while (input_pos as usize) + self.segment_size <= input.len() {
+            iterations = iterations.saturating_add(1);
+            if iterations > max_iterations {
+                self.output_buf = output;
+                return Err(StretchError::InvalidState(
+                    "WSOLA main loop iteration bound exceeded",
+                ));
+            }
             // For compression (ratio < 1.0), stop once we've produced enough output
             if actual_output_len >= target_output_len {
                 break;
@@ -244,32 +299,40 @@ impl Wsola {
     ) -> (usize, f64) {
         let mut best_pos = search_start;
         let mut best_corr = f64::NEG_INFINITY;
+        let ref_slice = &output[output_pos..output_pos + overlap_len];
+        let (ref_sum, ref_sum2) = sum_and_square_sum(ref_slice);
+        let n = ref_slice.len() as f64;
+        let ref_var = ref_sum2 - (ref_sum * ref_sum) / n.max(1.0);
+        if ref_var <= ENERGY_EPSILON {
+            return (search_start, 0.0);
+        }
 
         // Collect correlation values for parabolic interpolation
         let num_candidates = search_end - search_start + 1;
-        self.corr_values_buf.clear();
-        if self.corr_values_buf.capacity() < num_candidates {
-            self.corr_values_buf
-                .reserve(num_candidates - self.corr_values_buf.capacity());
-        }
+        self.corr_values_buf.resize(num_candidates, 0.0);
+        let mut computed = 0usize;
 
-        for pos in search_start..=search_end {
+        for (idx, pos) in (search_start..=search_end).enumerate() {
             if pos + overlap_len > input.len() {
                 break;
             }
 
-            let corr = normalized_cross_correlation(
-                &output[output_pos..output_pos + overlap_len],
+            let corr = normalized_cross_correlation_with_reference_stats(
+                ref_slice,
+                ref_sum,
+                ref_sum2,
+                ref_var,
                 &input[pos..pos + overlap_len],
             );
-
-            self.corr_values_buf.push(corr);
+            self.corr_values_buf[idx] = corr;
+            computed = idx + 1;
 
             if corr > best_corr {
                 best_corr = corr;
                 best_pos = pos;
             }
         }
+        self.corr_values_buf.truncate(computed);
 
         // Parabolic interpolation for sub-sample accuracy
         let best_idx = best_pos - search_start;
@@ -318,13 +381,11 @@ impl Wsola {
         let num_candidates = actual_region_len.saturating_sub(overlap_len) + 1;
 
         // Reuse prefix_sq_buf for energy normalization
-        self.prefix_sq_buf.clear();
-        self.prefix_sq_buf.reserve(search_signal.len() + 1);
-        self.prefix_sq_buf.push(0.0f64);
+        self.prefix_sq_buf.resize(search_signal.len() + 1, 0.0);
         let mut accum = 0.0f64;
-        for &s in search_signal {
+        for (i, &s) in search_signal.iter().enumerate() {
             accum += (s as f64) * (s as f64);
-            self.prefix_sq_buf.push(accum);
+            self.prefix_sq_buf[i + 1] = accum;
         }
 
         let (best_pos, fractional_offset) = find_best_candidate(
@@ -349,31 +410,36 @@ impl Wsola {
         let conv_len = search_signal.len() + ref_signal.len() - 1;
         let fft_size = conv_len.next_power_of_two();
 
-        let fft_fwd = self.planner.plan_fft_forward(fft_size);
-        let fft_inv = self.planner.plan_fft_inverse(fft_size);
+        self.ensure_fft_plan(fft_size);
+        let fft_fwd = self
+            .fft_fwd
+            .as_ref()
+            .expect("forward FFT plan must be present after ensure_fft_plan")
+            .clone();
+        let fft_inv = self
+            .fft_inv
+            .as_ref()
+            .expect("inverse FFT plan must be present after ensure_fft_plan")
+            .clone();
 
         // Resize and fill reusable buffers (grow-only, never shrink).
         // Zero-fill first, then copy signal data — avoids per-element branch
         // which inhibits auto-vectorization.
         self.fft_ref_buf.resize(fft_size, COMPLEX_ZERO);
-        for slot in self.fft_ref_buf.iter_mut() {
-            *slot = COMPLEX_ZERO;
-        }
+        self.fft_ref_buf.fill(COMPLEX_ZERO);
         for (slot, &s) in self.fft_ref_buf.iter_mut().zip(ref_signal.iter()) {
             *slot = Complex::new(s, 0.0);
         }
 
         self.fft_search_buf.resize(fft_size, COMPLEX_ZERO);
-        for slot in self.fft_search_buf.iter_mut() {
-            *slot = COMPLEX_ZERO;
-        }
+        self.fft_search_buf.fill(COMPLEX_ZERO);
         for (slot, &s) in self.fft_search_buf.iter_mut().zip(search_signal.iter()) {
             *slot = Complex::new(s, 0.0);
         }
 
         // Forward FFT
-        fft_fwd.process(&mut self.fft_ref_buf);
-        fft_fwd.process(&mut self.fft_search_buf);
+        fft_fwd.process_with_scratch(&mut self.fft_ref_buf, &mut self.fft_fwd_scratch);
+        fft_fwd.process_with_scratch(&mut self.fft_search_buf, &mut self.fft_fwd_scratch);
 
         // Multiply conj(Ref) * Search into corr_buf (index-based for auto-vectorization)
         self.fft_corr_buf.resize(fft_size, COMPLEX_ZERO);
@@ -382,7 +448,25 @@ impl Wsola {
         }
 
         // Inverse FFT in-place
-        fft_inv.process(&mut self.fft_corr_buf);
+        fft_inv.process_with_scratch(&mut self.fft_corr_buf, &mut self.fft_inv_scratch);
+    }
+
+    /// Ensures cached FFT plans/scratch match `fft_size`.
+    fn ensure_fft_plan(&mut self, fft_size: usize) {
+        if self.fft_plan_size == fft_size && self.fft_fwd.is_some() && self.fft_inv.is_some() {
+            return;
+        }
+
+        let fft_fwd = self.planner.plan_fft_forward(fft_size);
+        let fft_inv = self.planner.plan_fft_inverse(fft_size);
+        let fwd_scratch = fft_fwd.get_inplace_scratch_len();
+        let inv_scratch = fft_inv.get_inplace_scratch_len();
+
+        self.fft_plan_size = fft_size;
+        self.fft_fwd = Some(fft_fwd);
+        self.fft_inv = Some(fft_inv);
+        self.fft_fwd_scratch.resize(fwd_scratch, COMPLEX_ZERO);
+        self.fft_inv_scratch.resize(inv_scratch, COMPLEX_ZERO);
     }
 
     /// Overlap-adds a segment from input into output with raised-cosine crossfade.
@@ -423,14 +507,12 @@ impl Wsola {
         };
 
         let overlap_len = self.overlap_size.min(len);
-        let inv_overlap = 1.0 / self.overlap_size as f32;
         let use_interp = fractional_offset.abs() > 1e-10;
 
         // Crossfade region: raised-cosine fade for smoother transitions
         for i in 0..overlap_len {
-            let t = i as f32 * inv_overlap;
-            let fade_in = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
-            let fade_out = 1.0 - fade_in;
+            let fade_in = self.crossfade_in[i];
+            let fade_out = self.crossfade_out[i];
             let in_sample = if use_interp {
                 subsample_interpolate(input, input_pos, i, fractional_offset)
             } else {
@@ -453,6 +535,23 @@ impl Wsola {
                 .copy_from_slice(&input[input_pos + copy_start..input_pos + len]);
         }
     }
+}
+
+fn build_crossfade_tables(overlap_size: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut fade_in = Vec::with_capacity(overlap_size);
+    let mut fade_out = Vec::with_capacity(overlap_size);
+    if overlap_size == 0 {
+        return (fade_in, fade_out);
+    }
+
+    let inv_overlap = 1.0 / overlap_size as f32;
+    for i in 0..overlap_size {
+        let t = i as f32 * inv_overlap;
+        let fi = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
+        fade_in.push(fi);
+        fade_out.push(1.0 - fi);
+    }
+    (fade_in, fade_out)
 }
 
 /// Finds the best correlation candidate using prefix-sum energy normalization.
@@ -478,10 +577,7 @@ fn find_best_candidate(
     let mut best_k: usize = 0;
 
     // Collect normalized correlation values for parabolic interpolation
-    norm_corr_values.clear();
-    if norm_corr_values.capacity() < num_candidates {
-        norm_corr_values.reserve(num_candidates - norm_corr_values.capacity());
-    }
+    norm_corr_values.resize(num_candidates, 0.0);
 
     for k in 0..num_candidates {
         let raw_corr = corr_buf[k].re as f64 * norm;
@@ -494,7 +590,7 @@ fn find_best_candidate(
             0.0
         };
 
-        norm_corr_values.push(ncorr);
+        norm_corr_values[k] = ncorr;
 
         if ncorr > best_ncorr {
             best_ncorr = ncorr;
@@ -509,45 +605,207 @@ fn find_best_candidate(
     (best_pos, fractional_offset)
 }
 
+/// Computes `sum(x)` and `sum(x^2)` in one pass.
+///
+/// The unrolled structure is intentionally simple so LLVM can map it to
+/// platform SIMD where available (AVX2/NEON) and scalar fallback otherwise.
+#[inline]
+fn sum_and_square_sum(x: &[f32]) -> (f64, f64) {
+    let n = x.len();
+    let mut sum0 = 0.0f64;
+    let mut sum1 = 0.0f64;
+    let mut sum2 = 0.0f64;
+    let mut sum3 = 0.0f64;
+    let mut sum4 = 0.0f64;
+    let mut sum5 = 0.0f64;
+    let mut sum6 = 0.0f64;
+    let mut sum7 = 0.0f64;
+    let mut sq0 = 0.0f64;
+    let mut sq1 = 0.0f64;
+    let mut sq2 = 0.0f64;
+    let mut sq3 = 0.0f64;
+    let mut sq4 = 0.0f64;
+    let mut sq5 = 0.0f64;
+    let mut sq6 = 0.0f64;
+    let mut sq7 = 0.0f64;
+
+    let mut i = 0usize;
+    while i + CORR_UNROLL <= n {
+        let v0 = x[i] as f64;
+        let v1 = x[i + 1] as f64;
+        let v2 = x[i + 2] as f64;
+        let v3 = x[i + 3] as f64;
+        let v4 = x[i + 4] as f64;
+        let v5 = x[i + 5] as f64;
+        let v6 = x[i + 6] as f64;
+        let v7 = x[i + 7] as f64;
+
+        sum0 += v0;
+        sum1 += v1;
+        sum2 += v2;
+        sum3 += v3;
+        sum4 += v4;
+        sum5 += v5;
+        sum6 += v6;
+        sum7 += v7;
+        sq0 += v0 * v0;
+        sq1 += v1 * v1;
+        sq2 += v2 * v2;
+        sq3 += v3 * v3;
+        sq4 += v4 * v4;
+        sq5 += v5 * v5;
+        sq6 += v6 * v6;
+        sq7 += v7 * v7;
+        i += CORR_UNROLL;
+    }
+
+    let mut sum = sum0 + sum1 + sum2 + sum3 + sum4 + sum5 + sum6 + sum7;
+    let mut sum_sq = sq0 + sq1 + sq2 + sq3 + sq4 + sq5 + sq6 + sq7;
+    while i < n {
+        let v = x[i] as f64;
+        sum += v;
+        sum_sq += v * v;
+        i += 1;
+    }
+    (sum, sum_sq)
+}
+
+/// Computes `sum(y)` and `sum(y^2)` and `sum(x*y)` in one pass.
+///
+/// Uses the same unrolled SIMD-friendly structure as [`sum_and_square_sum`].
+#[inline]
+fn sum_cross_terms(x: &[f32], y: &[f32]) -> (f64, f64, f64) {
+    let n = x.len().min(y.len());
+    let mut ysum0 = 0.0f64;
+    let mut ysum1 = 0.0f64;
+    let mut ysum2 = 0.0f64;
+    let mut ysum3 = 0.0f64;
+    let mut ysum4 = 0.0f64;
+    let mut ysum5 = 0.0f64;
+    let mut ysum6 = 0.0f64;
+    let mut ysum7 = 0.0f64;
+    let mut ysq0 = 0.0f64;
+    let mut ysq1 = 0.0f64;
+    let mut ysq2 = 0.0f64;
+    let mut ysq3 = 0.0f64;
+    let mut ysq4 = 0.0f64;
+    let mut ysq5 = 0.0f64;
+    let mut ysq6 = 0.0f64;
+    let mut ysq7 = 0.0f64;
+    let mut xy0 = 0.0f64;
+    let mut xy1 = 0.0f64;
+    let mut xy2 = 0.0f64;
+    let mut xy3 = 0.0f64;
+    let mut xy4 = 0.0f64;
+    let mut xy5 = 0.0f64;
+    let mut xy6 = 0.0f64;
+    let mut xy7 = 0.0f64;
+
+    let mut i = 0usize;
+    while i + CORR_UNROLL <= n {
+        let x0 = x[i] as f64;
+        let x1 = x[i + 1] as f64;
+        let x2 = x[i + 2] as f64;
+        let x3 = x[i + 3] as f64;
+        let x4 = x[i + 4] as f64;
+        let x5 = x[i + 5] as f64;
+        let x6 = x[i + 6] as f64;
+        let x7 = x[i + 7] as f64;
+        let y0 = y[i] as f64;
+        let y1 = y[i + 1] as f64;
+        let y2 = y[i + 2] as f64;
+        let y3 = y[i + 3] as f64;
+        let y4 = y[i + 4] as f64;
+        let y5 = y[i + 5] as f64;
+        let y6 = y[i + 6] as f64;
+        let y7 = y[i + 7] as f64;
+
+        ysum0 += y0;
+        ysum1 += y1;
+        ysum2 += y2;
+        ysum3 += y3;
+        ysum4 += y4;
+        ysum5 += y5;
+        ysum6 += y6;
+        ysum7 += y7;
+        ysq0 += y0 * y0;
+        ysq1 += y1 * y1;
+        ysq2 += y2 * y2;
+        ysq3 += y3 * y3;
+        ysq4 += y4 * y4;
+        ysq5 += y5 * y5;
+        ysq6 += y6 * y6;
+        ysq7 += y7 * y7;
+        xy0 += x0 * y0;
+        xy1 += x1 * y1;
+        xy2 += x2 * y2;
+        xy3 += x3 * y3;
+        xy4 += x4 * y4;
+        xy5 += x5 * y5;
+        xy6 += x6 * y6;
+        xy7 += x7 * y7;
+        i += CORR_UNROLL;
+    }
+
+    let mut sum_y = ysum0 + ysum1 + ysum2 + ysum3 + ysum4 + ysum5 + ysum6 + ysum7;
+    let mut sum_y2 = ysq0 + ysq1 + ysq2 + ysq3 + ysq4 + ysq5 + ysq6 + ysq7;
+    let mut sum_xy = xy0 + xy1 + xy2 + xy3 + xy4 + xy5 + xy6 + xy7;
+    while i < n {
+        let xv = x[i] as f64;
+        let yv = y[i] as f64;
+        sum_y += yv;
+        sum_y2 += yv * yv;
+        sum_xy += xv * yv;
+        i += 1;
+    }
+    (sum_y, sum_y2, sum_xy)
+}
+
+#[inline]
+fn normalized_cross_correlation_with_reference_stats(
+    reference: &[f32],
+    ref_sum: f64,
+    ref_sum2: f64,
+    ref_var: f64,
+    candidate: &[f32],
+) -> f64 {
+    let n = reference.len().min(candidate.len());
+    if n == 0 {
+        return 0.0;
+    }
+
+    let n_f = n as f64;
+    let reference = &reference[..n];
+    let candidate = &candidate[..n];
+    let (sum_b, sum_b2, sum_ab) = sum_cross_terms(reference, candidate);
+    let numerator = sum_ab - (ref_sum * sum_b / n_f);
+    let var_b = sum_b2 - (sum_b * sum_b / n_f);
+    if var_b <= ENERGY_EPSILON || ref_var <= ENERGY_EPSILON {
+        return 0.0;
+    }
+
+    // Keep the explicit use of ref_sum2 to avoid recalculation in callers.
+    let _ = ref_sum2;
+    numerator / (ref_var * var_b).sqrt()
+}
+
 /// Normalized cross-correlation between two signals with mean removal.
 ///
 /// Mean-centering removes DC bias, ensuring the correlation measures only the
 /// similarity of the signal shapes rather than being influenced by DC offsets.
 #[inline]
+#[cfg(test)]
 fn normalized_cross_correlation(a: &[f32], b: &[f32]) -> f64 {
     let n = a.len().min(b.len());
     if n == 0 {
         return 0.0;
     }
-
-    // Compute means for DC removal
-    let mut sum_a = 0.0f64;
-    let mut sum_b = 0.0f64;
-    for i in 0..n {
-        sum_a += a[i] as f64;
-        sum_b += b[i] as f64;
-    }
-    let mean_a = sum_a / n as f64;
-    let mean_b = sum_b / n as f64;
-
-    let mut sum_ab = 0.0f64;
-    let mut sum_a2 = 0.0f64;
-    let mut sum_b2 = 0.0f64;
-
-    for i in 0..n {
-        let da = a[i] as f64 - mean_a;
-        let db = b[i] as f64 - mean_b;
-        sum_ab += da * db;
-        sum_a2 += da * da;
-        sum_b2 += db * db;
-    }
-
-    let denom = (sum_a2 * sum_b2).sqrt();
-    if denom < ENERGY_EPSILON {
-        return 0.0;
-    }
-
-    sum_ab / denom
+    let a = &a[..n];
+    let b = &b[..n];
+    let (sum_a, sum_a2) = sum_and_square_sum(a);
+    let n_f = n as f64;
+    let var_a = sum_a2 - (sum_a * sum_a / n_f);
+    normalized_cross_correlation_with_reference_stats(a, sum_a, sum_a2, var_a, b)
 }
 
 /// Parabolic interpolation for sub-sample peak refinement.
@@ -1100,5 +1358,17 @@ mod tests {
         let input = vec![0.0f32; 4410];
         let result = wsola.process(&input);
         assert!(result.is_err(), "Extremely small ratio should return error");
+    }
+
+    #[test]
+    fn test_wsola_rejects_zero_segment_size() {
+        let mut wsola = Wsola::new(0, 32, 1.0);
+        let input = vec![0.0f32; 128];
+        let result = wsola.process(&input);
+        assert!(
+            matches!(result, Err(StretchError::InvalidState(_))),
+            "Zero segment size must fail with InvalidState, got: {:?}",
+            result
+        );
     }
 }

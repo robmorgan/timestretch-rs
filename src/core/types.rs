@@ -1299,11 +1299,90 @@ pub enum CrossfadeMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QualityMode {
     /// Lower latency profile for very small callbacks (64-128 frames).
+    /// Disables HPSS/adaptive phase-lock switching to reduce callback cost.
     LowLatency,
     /// Balanced real-time profile for common callbacks (128-256 frames).
     Balanced,
     /// Highest quality profile for larger callbacks (256-1024) or offline usage.
+    /// Enables HPSS routing and adaptive crossfade/phase-lock features.
     MaxQuality,
+}
+
+/// Formant/envelope preservation profile for pitch and timbre-sensitive material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopePreset {
+    /// Disable envelope preservation.
+    Off,
+    /// General-purpose envelope preservation for mixed content.
+    Balanced,
+    /// Stronger formant preservation tuned for vocal content.
+    Vocal,
+}
+
+/// Adaptive-threshold policy for transient detection.
+///
+/// This policy controls the threshold shape around the user-facing
+/// `transient_sensitivity` value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransientThresholdPolicy {
+    /// Sliding median window size in analysis frames.
+    ///
+    /// Even values are rounded up to the next odd value to keep the median centered.
+    pub median_window_frames: usize,
+    /// Additive threshold floor to suppress near-silence false positives.
+    pub threshold_floor: f32,
+    /// Sensitivity-to-threshold slope used in:
+    /// `multiplier = 1 + (1 - sensitivity) * threshold_sensitivity_slope`.
+    pub threshold_sensitivity_slope: f32,
+    /// Minimum onset spacing in frames for normal sensitivity settings.
+    pub min_gap_frames: usize,
+    /// Minimum onset spacing in frames when sensitivity is above
+    /// `high_sensitivity_split`.
+    pub high_sensitivity_min_gap_frames: usize,
+    /// Sensitivity split above which high-sensitivity min-gap is used.
+    pub high_sensitivity_split: f32,
+}
+
+impl TransientThresholdPolicy {
+    /// Returns a clamped, internally valid policy.
+    #[inline]
+    pub fn sanitized(self) -> Self {
+        let mut window = self.median_window_frames.max(1).min(63);
+        if window % 2 == 0 {
+            window = window.saturating_add(1).min(63);
+        }
+        Self {
+            median_window_frames: window,
+            threshold_floor: self.threshold_floor.max(0.0),
+            threshold_sensitivity_slope: self.threshold_sensitivity_slope.max(0.0),
+            min_gap_frames: self.min_gap_frames.max(1).min(32),
+            high_sensitivity_min_gap_frames: self.high_sensitivity_min_gap_frames.max(1).min(32),
+            high_sensitivity_split: self.high_sensitivity_split.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Returns the onset-gap policy for a given sensitivity.
+    #[inline]
+    pub fn min_gap_for_sensitivity(&self, sensitivity: f32) -> usize {
+        if sensitivity > self.high_sensitivity_split {
+            self.high_sensitivity_min_gap_frames
+        } else {
+            self.min_gap_frames
+        }
+    }
+}
+
+impl Default for TransientThresholdPolicy {
+    fn default() -> Self {
+        Self {
+            median_window_frames: DEFAULT_TRANSIENT_MEDIAN_WINDOW_FRAMES,
+            threshold_floor: DEFAULT_TRANSIENT_THRESHOLD_FLOOR,
+            threshold_sensitivity_slope: DEFAULT_TRANSIENT_THRESHOLD_SENSITIVITY_SLOPE,
+            min_gap_frames: DEFAULT_TRANSIENT_MIN_GAP_FRAMES,
+            high_sensitivity_min_gap_frames: DEFAULT_TRANSIENT_HIGH_SENS_MIN_GAP_FRAMES,
+            high_sensitivity_split: DEFAULT_TRANSIENT_HIGH_SENS_SPLIT,
+        }
+    }
 }
 
 /// Parameters for the time stretching algorithm.
@@ -1343,6 +1422,24 @@ pub struct StretchParams {
     pub preset: Option<EdmPreset>,
     /// Transient detection sensitivity (0.0 to 1.0).
     pub transient_sensitivity: f32,
+    /// Number of lookahead frames used by transient onset confirmation.
+    ///
+    /// `0` disables lookahead confirmation.
+    pub transient_lookahead_frames: usize,
+    /// Relaxation factor for future-frame threshold checks.
+    ///
+    /// Range: `[0.0, 1.0]`. Lower values make confirmation easier.
+    pub transient_lookahead_threshold_relax: f32,
+    /// Relative continuation threshold versus the candidate peak.
+    ///
+    /// Range: `[0.0, 1.0]`. Lower values make confirmation easier.
+    pub transient_lookahead_peak_retain_ratio: f32,
+    /// Multiplier above local threshold that bypasses lookahead checks.
+    ///
+    /// Values near `1.0` bypass more candidates; higher values are more selective.
+    pub transient_strong_spike_bypass_multiplier: f32,
+    /// Adaptive threshold policy used by transient onset detection.
+    pub transient_threshold_policy: TransientThresholdPolicy,
     /// Sub-bass phase lock cutoff frequency in Hz.
     pub sub_bass_cutoff: f32,
     /// WSOLA segment size in samples.
@@ -1381,7 +1478,15 @@ pub struct StretchParams {
     ///
     /// - [`PhaseLockingMode::Identity`] — simple nearest-peak locking (fast, may ring)
     /// - [`PhaseLockingMode::RegionOfInfluence`] — influence zones with deviation clamping (better quality)
+    /// - [`PhaseLockingMode::Selective`] — confidence-weighted partial locking (balanced)
     pub phase_locking_mode: PhaseLockingMode,
+    /// Enables confidence-driven adaptive phase-lock mode switching per frame.
+    ///
+    /// When enabled, the phase vocoder may switch between Identity, Selective,
+    /// and ROI locking based on frame confidence (spectral crest/flatness) and ratio.
+    /// This keeps harmonic frames coherent while preferring ROI safety on noisy
+    /// or extreme-ratio frames.
+    pub adaptive_phase_locking: bool,
     /// Stereo processing mode.
     ///
     /// - [`StereoMode::MidSide`] (default) — preserves stereo image via mid/side encoding
@@ -1393,6 +1498,19 @@ pub struct StretchParams {
     /// is preserved in the output, preventing unnatural timbre shifts.
     /// Most audible on vocals and synth pads.
     pub envelope_preservation: bool,
+    /// Envelope correction strength.
+    ///
+    /// `1.0` applies full correction, `0.0` disables correction while keeping
+    /// the envelope path available for fast reconfiguration.
+    /// Values above `1.0` increase correction intensity (useful for vocals).
+    pub envelope_strength: f32,
+    /// Whether to use adaptive cepstral order per frame.
+    ///
+    /// Adaptive order increases detail on bright/vocal frames and smooths
+    /// bass-heavy/noise-like frames.
+    pub adaptive_envelope_order: bool,
+    /// Named envelope/formant profile currently applied.
+    pub envelope_preset: EnvelopePreset,
     /// Cepstral order for spectral envelope extraction.
     ///
     /// Controls the smoothness of the envelope: lower = smoother, higher = more detail.
@@ -1446,6 +1564,20 @@ pub struct StretchParams {
     /// The two stretched components are summed. This improves quality when harmonic
     /// and percussive content overlap (e.g., kick drum over a sustained chord).
     pub hpss_enabled: bool,
+    /// Enables class-aware transient WSOLA adaptation (kick/snare/hat).
+    ///
+    /// When enabled, transient segments are classified on the fly and WSOLA
+    /// parameters are adapted per class (attack copy, search span, crossfade).
+    pub transient_class_adaptive_wsola: bool,
+    /// Enables an explicit residual/noise branch in HPSS tonal routing.
+    ///
+    /// Residual content is estimated as `input - (harmonic + percussive)` and
+    /// stretched independently before recombination.
+    pub residual_branch: bool,
+    /// Mix amount for the explicit residual branch.
+    ///
+    /// `0.0` keeps the branch computed but muted, `1.0` applies full residual.
+    pub residual_mix: f32,
     /// Crossfade mode for segment transitions.
     ///
     /// Controls how crossfade durations are computed at segment boundaries.
@@ -1494,8 +1626,42 @@ const DEFAULT_FFT_SIZE: usize = 4096;
 const DEFAULT_HOP_SIZE: usize = DEFAULT_FFT_SIZE / 8;
 /// Default transient detection sensitivity (0.0–1.0).
 const DEFAULT_TRANSIENT_SENSITIVITY: f32 = 0.5;
+/// Default transient lookahead-confirmation frame count.
+const DEFAULT_TRANSIENT_LOOKAHEAD_FRAMES: usize = 2;
+/// Default transient lookahead threshold relaxation factor.
+const DEFAULT_TRANSIENT_LOOKAHEAD_THRESHOLD_RELAX: f32 = 0.85;
+/// Default transient lookahead peak-retention ratio.
+const DEFAULT_TRANSIENT_LOOKAHEAD_PEAK_RETAIN_RATIO: f32 = 0.30;
+/// Default strong-spike bypass multiplier for transient confirmation.
+const DEFAULT_TRANSIENT_STRONG_SPIKE_BYPASS_MULTIPLIER: f32 = 3.0;
+/// Default transient median window size in frames.
+const DEFAULT_TRANSIENT_MEDIAN_WINDOW_FRAMES: usize = 11;
+/// Default transient threshold floor.
+const DEFAULT_TRANSIENT_THRESHOLD_FLOOR: f32 = 0.01;
+/// Default slope in sensitivity->threshold multiplier mapping.
+const DEFAULT_TRANSIENT_THRESHOLD_SENSITIVITY_SLOPE: f32 = 3.5;
+/// Default minimum onset gap for normal sensitivity.
+const DEFAULT_TRANSIENT_MIN_GAP_FRAMES: usize = 4;
+/// Default minimum onset gap for high sensitivity.
+const DEFAULT_TRANSIENT_HIGH_SENS_MIN_GAP_FRAMES: usize = 2;
+/// Default sensitivity split used for high-sensitivity gap mode.
+const DEFAULT_TRANSIENT_HIGH_SENS_SPLIT: f32 = 0.6;
 /// Default sub-bass phase lock cutoff in Hz.
 const DEFAULT_SUB_BASS_CUTOFF: f32 = 120.0;
+/// Default adaptive phase-locking enable flag.
+const DEFAULT_ADAPTIVE_PHASE_LOCKING: bool = false;
+/// Default envelope correction strength.
+const DEFAULT_ENVELOPE_STRENGTH: f32 = 1.0;
+/// Default adaptive envelope-order behavior.
+const DEFAULT_ADAPTIVE_ENVELOPE_ORDER: bool = true;
+/// Default envelope preset.
+const DEFAULT_ENVELOPE_PRESET: EnvelopePreset = EnvelopePreset::Balanced;
+/// Default class-aware transient WSOLA adaptation flag.
+const DEFAULT_TRANSIENT_CLASS_ADAPTIVE_WSOLA: bool = true;
+/// Default explicit residual/noise HPSS branch flag.
+const DEFAULT_RESIDUAL_BRANCH: bool = true;
+/// Default residual/noise branch mix.
+const DEFAULT_RESIDUAL_MIX: f32 = 0.25;
 
 /// Default transient region duration in seconds (~10ms around each onset).
 const DEFAULT_TRANSIENT_REGION_SECS: f64 = 0.010;
@@ -1538,6 +1704,30 @@ impl std::fmt::Display for StretchParams {
 }
 
 impl StretchParams {
+    /// Applies a named envelope/formant profile to this parameter set.
+    fn apply_envelope_preset(&mut self, preset: EnvelopePreset) {
+        self.envelope_preset = preset;
+        match preset {
+            EnvelopePreset::Off => {
+                self.envelope_preservation = false;
+                self.envelope_strength = 0.0;
+                self.adaptive_envelope_order = false;
+            }
+            EnvelopePreset::Balanced => {
+                self.envelope_preservation = true;
+                self.envelope_strength = 1.0;
+                self.adaptive_envelope_order = true;
+                self.envelope_order = 40;
+            }
+            EnvelopePreset::Vocal => {
+                self.envelope_preservation = true;
+                self.envelope_strength = 1.35;
+                self.adaptive_envelope_order = true;
+                self.envelope_order = 52;
+            }
+        }
+    }
+
     /// Creates new stretch params with the given ratio.
     pub fn new(stretch_ratio: f64) -> Self {
         Self {
@@ -1549,6 +1739,12 @@ impl StretchParams {
             hop_size: DEFAULT_HOP_SIZE,
             preset: None,
             transient_sensitivity: DEFAULT_TRANSIENT_SENSITIVITY,
+            transient_lookahead_frames: DEFAULT_TRANSIENT_LOOKAHEAD_FRAMES,
+            transient_lookahead_threshold_relax: DEFAULT_TRANSIENT_LOOKAHEAD_THRESHOLD_RELAX,
+            transient_lookahead_peak_retain_ratio: DEFAULT_TRANSIENT_LOOKAHEAD_PEAK_RETAIN_RATIO,
+            transient_strong_spike_bypass_multiplier:
+                DEFAULT_TRANSIENT_STRONG_SPIKE_BYPASS_MULTIPLIER,
+            transient_threshold_policy: TransientThresholdPolicy::default(),
             sub_bass_cutoff: DEFAULT_SUB_BASS_CUTOFF,
             wsola_segment_size: ms_to_samples(WSOLA_SEGMENT_MS, DEFAULT_SAMPLE_RATE),
             wsola_search_range: ms_to_samples(WSOLA_SEARCH_MS_SMALL, DEFAULT_SAMPLE_RATE),
@@ -1557,14 +1753,21 @@ impl StretchParams {
             window_type: WindowType::Hann,
             normalize: false,
             phase_locking_mode: PhaseLockingMode::RegionOfInfluence,
+            adaptive_phase_locking: DEFAULT_ADAPTIVE_PHASE_LOCKING,
             stereo_mode: StereoMode::MidSide,
             envelope_preservation: true,
+            envelope_strength: DEFAULT_ENVELOPE_STRENGTH,
+            adaptive_envelope_order: DEFAULT_ADAPTIVE_ENVELOPE_ORDER,
+            envelope_preset: DEFAULT_ENVELOPE_PRESET,
             envelope_order: 40,
             multi_resolution: true,
             transient_region_secs: DEFAULT_TRANSIENT_REGION_SECS,
             elastic_timing: false,
             elastic_anchor: 0.0,
             hpss_enabled: true,
+            transient_class_adaptive_wsola: DEFAULT_TRANSIENT_CLASS_ADAPTIVE_WSOLA,
+            residual_branch: DEFAULT_RESIDUAL_BRANCH,
+            residual_mix: DEFAULT_RESIDUAL_MIX,
             crossfade_mode: CrossfadeMode::Fixed(0.012),
             bpm: None,
             pre_analysis: None,
@@ -1611,6 +1814,24 @@ impl StretchParams {
     /// Sets the quality/performance mode used by streaming processors.
     pub fn with_quality_mode(mut self, mode: QualityMode) -> Self {
         self.quality_mode = mode;
+        match mode {
+            // Keep callback cost deterministic for tiny buffers.
+            QualityMode::LowLatency => {
+                self.hpss_enabled = false;
+                self.adaptive_phase_locking = false;
+                self.residual_branch = false;
+            }
+            // Balanced leaves current tuning untouched.
+            QualityMode::Balanced => {}
+            // Promote hybrid quality features in max-quality profile.
+            QualityMode::MaxQuality => {
+                self.hpss_enabled = true;
+                self.crossfade_mode = CrossfadeMode::Adaptive;
+                self.adaptive_phase_locking = true;
+                self.residual_branch = true;
+                self.apply_envelope_preset(EnvelopePreset::Balanced);
+            }
+        }
         self
     }
 
@@ -1628,15 +1849,15 @@ impl StretchParams {
         self.wsola_segment_size = ms_to_samples(cfg.wsola_segment_ms, self.sample_rate);
         self.transient_region_secs = cfg.transient_region_ms / 1000.0;
         self.window_type = cfg.window_type;
-        // Enable envelope preservation for presets where timbre matters
-        self.envelope_preservation = matches!(
-            preset,
+        // Apply envelope/formant profile tuned to each preset.
+        let envelope_preset = match preset {
+            EdmPreset::VocalChop => EnvelopePreset::Vocal,
             EdmPreset::DjBeatmatch
-                | EdmPreset::HouseLoop
-                | EdmPreset::Halftime
-                | EdmPreset::Ambient
-                | EdmPreset::VocalChop
-        );
+            | EdmPreset::HouseLoop
+            | EdmPreset::Halftime
+            | EdmPreset::Ambient => EnvelopePreset::Balanced,
+        };
+        self.apply_envelope_preset(envelope_preset);
         // Enable multi-resolution FFT for transparency-critical and extreme-stretch presets.
         // DjBeatmatch needs it for transparent tempo changes; Ambient benefits from the
         // large sub-bass FFT at extreme stretch ratios (2x-4x).
@@ -1664,6 +1885,12 @@ impl StretchParams {
             preset,
             EdmPreset::DjBeatmatch | EdmPreset::HouseLoop | EdmPreset::Halftime
         );
+        // Enable adaptive phase-lock switching for EDM presets.
+        self.adaptive_phase_locking = true;
+        // Use class-aware transient tuning and explicit residual branch by default.
+        self.transient_class_adaptive_wsola = true;
+        self.residual_branch = true;
+        self.residual_mix = DEFAULT_RESIDUAL_MIX;
         self
     }
 
@@ -1683,6 +1910,84 @@ impl StretchParams {
     /// Sets transient sensitivity.
     pub fn with_transient_sensitivity(mut self, sensitivity: f32) -> Self {
         self.transient_sensitivity = sensitivity;
+        self
+    }
+
+    /// Sets transient lookahead frame count used for onset confirmation.
+    ///
+    /// Values above 16 are clamped to 16 to keep per-frame confirmation bounded.
+    pub fn with_transient_lookahead_frames(mut self, frames: usize) -> Self {
+        self.transient_lookahead_frames = frames.min(16);
+        self
+    }
+
+    /// Sets transient lookahead threshold relaxation factor.
+    ///
+    /// Range: `[0.0, 1.0]`. Lower values make lookahead confirmation less strict.
+    pub fn with_transient_lookahead_threshold_relax(mut self, relax: f32) -> Self {
+        self.transient_lookahead_threshold_relax = relax.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Sets transient lookahead peak-retention ratio.
+    ///
+    /// Range: `[0.0, 1.0]`. Lower values make lookahead confirmation less strict.
+    pub fn with_transient_lookahead_peak_retain_ratio(mut self, ratio: f32) -> Self {
+        self.transient_lookahead_peak_retain_ratio = ratio.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Sets the strong-spike bypass multiplier for onset confirmation.
+    ///
+    /// Values below `1.0` are clamped to `1.0`.
+    pub fn with_transient_strong_spike_bypass_multiplier(mut self, mult: f32) -> Self {
+        self.transient_strong_spike_bypass_multiplier = mult.max(1.0);
+        self
+    }
+
+    /// Sets the transient detector adaptive-threshold policy.
+    pub fn with_transient_threshold_policy(mut self, policy: TransientThresholdPolicy) -> Self {
+        self.transient_threshold_policy = policy.sanitized();
+        self
+    }
+
+    /// Sets transient detector median window size in analysis frames.
+    ///
+    /// Even values are rounded to the next odd value.
+    pub fn with_transient_median_window_frames(mut self, frames: usize) -> Self {
+        self.transient_threshold_policy.median_window_frames = frames;
+        self.transient_threshold_policy = self.transient_threshold_policy.sanitized();
+        self
+    }
+
+    /// Sets the additive transient threshold floor.
+    pub fn with_transient_threshold_floor(mut self, floor: f32) -> Self {
+        self.transient_threshold_policy.threshold_floor = floor.max(0.0);
+        self
+    }
+
+    /// Sets the sensitivity-to-threshold slope.
+    pub fn with_transient_threshold_sensitivity_slope(mut self, slope: f32) -> Self {
+        self.transient_threshold_policy.threshold_sensitivity_slope = slope.max(0.0);
+        self
+    }
+
+    /// Sets transient minimum onset gap for normal/high sensitivity ranges.
+    pub fn with_transient_min_gap_frames(
+        mut self,
+        normal_gap: usize,
+        high_sens_gap: usize,
+    ) -> Self {
+        self.transient_threshold_policy.min_gap_frames = normal_gap.max(1);
+        self.transient_threshold_policy
+            .high_sensitivity_min_gap_frames = high_sens_gap.max(1);
+        self.transient_threshold_policy = self.transient_threshold_policy.sanitized();
+        self
+    }
+
+    /// Sets the sensitivity split above which high-sensitivity min-gap is used.
+    pub fn with_transient_high_sensitivity_split(mut self, split: f32) -> Self {
+        self.transient_threshold_policy.high_sensitivity_split = split.clamp(0.0, 1.0);
         self
     }
 
@@ -1749,6 +2054,43 @@ impl StretchParams {
     /// preventing unnatural timbre shifts on vocals and synth pads.
     pub fn with_envelope_preservation(mut self, enabled: bool) -> Self {
         self.envelope_preservation = enabled;
+        if !enabled {
+            self.envelope_preset = EnvelopePreset::Off;
+            self.envelope_strength = 0.0;
+        } else if self.envelope_preset == EnvelopePreset::Off {
+            self.envelope_preset = EnvelopePreset::Balanced;
+            if self.envelope_strength <= 0.0 {
+                self.envelope_strength = 1.0;
+            }
+        }
+        self
+    }
+
+    /// Sets envelope correction strength.
+    ///
+    /// Clamped to `[0.0, 2.0]`. Values above `1.0` increase formant
+    /// correction intensity for vocal-heavy content.
+    pub fn with_envelope_strength(mut self, strength: f32) -> Self {
+        self.envelope_strength = strength.clamp(0.0, 2.0);
+        if self.envelope_strength <= 0.0 {
+            self.envelope_preservation = false;
+            self.envelope_preset = EnvelopePreset::Off;
+        } else if self.envelope_preset == EnvelopePreset::Off {
+            self.envelope_preset = EnvelopePreset::Balanced;
+            self.envelope_preservation = true;
+        }
+        self
+    }
+
+    /// Enables or disables adaptive per-frame cepstral order selection.
+    pub fn with_adaptive_envelope_order(mut self, enabled: bool) -> Self {
+        self.adaptive_envelope_order = enabled;
+        self
+    }
+
+    /// Applies a named envelope/formant profile.
+    pub fn with_envelope_preset(mut self, preset: EnvelopePreset) -> Self {
+        self.apply_envelope_preset(preset);
         self
     }
 
@@ -1811,6 +2153,26 @@ impl StretchParams {
     /// components before stretching. Harmonics use PV, percussive uses WSOLA.
     pub fn with_hpss(mut self, enabled: bool) -> Self {
         self.hpss_enabled = enabled;
+        self
+    }
+
+    /// Enables or disables class-aware WSOLA adaptation for transient segments.
+    pub fn with_transient_class_adaptive_wsola(mut self, enabled: bool) -> Self {
+        self.transient_class_adaptive_wsola = enabled;
+        self
+    }
+
+    /// Enables or disables explicit residual/noise branch processing in HPSS routing.
+    pub fn with_residual_branch(mut self, enabled: bool) -> Self {
+        self.residual_branch = enabled;
+        self
+    }
+
+    /// Sets explicit residual/noise branch mix amount.
+    ///
+    /// Clamped to `[0.0, 1.5]`.
+    pub fn with_residual_mix(mut self, mix: f32) -> Self {
+        self.residual_mix = mix.clamp(0.0, 1.5);
         self
     }
 
@@ -1906,8 +2268,15 @@ impl StretchParams {
     ///
     /// - [`PhaseLockingMode::Identity`] — fast but may produce ringing
     /// - [`PhaseLockingMode::RegionOfInfluence`] — better quality with deviation clamping
+    /// - [`PhaseLockingMode::Selective`] — balanced locking for mixed material
     pub fn with_phase_locking_mode(mut self, mode: PhaseLockingMode) -> Self {
         self.phase_locking_mode = mode;
+        self
+    }
+
+    /// Enables or disables confidence-driven adaptive phase-lock mode switching.
+    pub fn with_adaptive_phase_locking(mut self, enabled: bool) -> Self {
+        self.adaptive_phase_locking = enabled;
         self
     }
 
@@ -2015,6 +2384,72 @@ mod tests {
     }
 
     #[test]
+    fn test_transient_lookahead_defaults() {
+        let params = StretchParams::new(1.0);
+        assert_eq!(
+            params.transient_lookahead_frames,
+            DEFAULT_TRANSIENT_LOOKAHEAD_FRAMES
+        );
+        assert!(
+            (params.transient_lookahead_threshold_relax
+                - DEFAULT_TRANSIENT_LOOKAHEAD_THRESHOLD_RELAX)
+                .abs()
+                < 1e-6
+        );
+        assert!(
+            (params.transient_lookahead_peak_retain_ratio
+                - DEFAULT_TRANSIENT_LOOKAHEAD_PEAK_RETAIN_RATIO)
+                .abs()
+                < 1e-6
+        );
+        assert!(
+            (params.transient_strong_spike_bypass_multiplier
+                - DEFAULT_TRANSIENT_STRONG_SPIKE_BYPASS_MULTIPLIER)
+                .abs()
+                < 1e-6
+        );
+        assert_eq!(
+            params.transient_threshold_policy,
+            TransientThresholdPolicy::default()
+        );
+    }
+
+    #[test]
+    fn test_transient_lookahead_builder_clamps() {
+        let params = StretchParams::new(1.0)
+            .with_transient_lookahead_frames(99)
+            .with_transient_lookahead_threshold_relax(1.5)
+            .with_transient_lookahead_peak_retain_ratio(-0.2)
+            .with_transient_strong_spike_bypass_multiplier(0.5)
+            .with_transient_median_window_frames(12)
+            .with_transient_threshold_floor(-1.0)
+            .with_transient_threshold_sensitivity_slope(-4.0)
+            .with_transient_min_gap_frames(0, 0)
+            .with_transient_high_sensitivity_split(1.2);
+
+        assert_eq!(params.transient_lookahead_frames, 16);
+        assert!((params.transient_lookahead_threshold_relax - 1.0).abs() < 1e-6);
+        assert!((params.transient_lookahead_peak_retain_ratio - 0.0).abs() < 1e-6);
+        assert!((params.transient_strong_spike_bypass_multiplier - 1.0).abs() < 1e-6);
+        assert_eq!(params.transient_threshold_policy.median_window_frames, 13);
+        assert_eq!(params.transient_threshold_policy.threshold_floor, 0.0);
+        assert_eq!(
+            params
+                .transient_threshold_policy
+                .threshold_sensitivity_slope,
+            0.0
+        );
+        assert_eq!(params.transient_threshold_policy.min_gap_frames, 1);
+        assert_eq!(
+            params
+                .transient_threshold_policy
+                .high_sensitivity_min_gap_frames,
+            1
+        );
+        assert!((params.transient_threshold_policy.high_sensitivity_split - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn test_preset_then_sample_rate_preserves_wsola_params() {
         // Calling with_preset then with_sample_rate should use preset's WSOLA config
         let params = StretchParams::new(1.078)
@@ -2026,6 +2461,38 @@ mod tests {
         let expected_search = ms_to_samples(10.0, 44100);
         assert_eq!(params.wsola_segment_size, expected_segment);
         assert_eq!(params.wsola_search_range, expected_search);
+    }
+
+    #[test]
+    fn test_with_transient_threshold_policy_sanitizes() {
+        let policy = TransientThresholdPolicy {
+            median_window_frames: 0,
+            threshold_floor: -0.5,
+            threshold_sensitivity_slope: -1.0,
+            min_gap_frames: 0,
+            high_sensitivity_min_gap_frames: 99,
+            high_sensitivity_split: -1.0,
+        };
+        let params = StretchParams::new(1.0).with_transient_threshold_policy(policy);
+        assert_eq!(params.transient_threshold_policy.median_window_frames, 1);
+        assert_eq!(params.transient_threshold_policy.threshold_floor, 0.0);
+        assert_eq!(
+            params
+                .transient_threshold_policy
+                .threshold_sensitivity_slope,
+            0.0
+        );
+        assert_eq!(params.transient_threshold_policy.min_gap_frames, 1);
+        assert_eq!(
+            params
+                .transient_threshold_policy
+                .high_sensitivity_min_gap_frames,
+            32
+        );
+        assert_eq!(
+            params.transient_threshold_policy.high_sensitivity_split,
+            0.0
+        );
     }
 
     #[test]
@@ -2343,6 +2810,70 @@ mod tests {
     }
 
     #[test]
+    fn test_quality_mode_low_latency_disables_hpss_profile() {
+        let params = StretchParams::new(1.0)
+            .with_hpss(true)
+            .with_residual_branch(true)
+            .with_adaptive_phase_locking(true)
+            .with_quality_mode(QualityMode::LowLatency);
+        assert!(!params.hpss_enabled);
+        assert!(!params.residual_branch);
+        assert!(!params.adaptive_phase_locking);
+    }
+
+    #[test]
+    fn test_quality_mode_max_quality_enables_hpss_profile() {
+        let params = StretchParams::new(1.0)
+            .with_hpss(false)
+            .with_residual_branch(false)
+            .with_adaptive_phase_locking(false)
+            .with_crossfade_mode(CrossfadeMode::Fixed(0.010))
+            .with_quality_mode(QualityMode::MaxQuality);
+        assert!(params.hpss_enabled);
+        assert!(params.residual_branch);
+        assert!(params.adaptive_phase_locking);
+        assert_eq!(params.crossfade_mode, CrossfadeMode::Adaptive);
+        assert_eq!(params.envelope_preset, EnvelopePreset::Balanced);
+        assert!(params.envelope_preservation);
+        assert!((params.envelope_strength - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_envelope_preset_vocal_builder() {
+        let params = StretchParams::new(1.0).with_envelope_preset(EnvelopePreset::Vocal);
+        assert_eq!(params.envelope_preset, EnvelopePreset::Vocal);
+        assert!(params.envelope_preservation);
+        assert!(params.adaptive_envelope_order);
+        assert!(params.envelope_order >= 50);
+        assert!(params.envelope_strength > 1.0);
+    }
+
+    #[test]
+    fn test_envelope_strength_clamps_and_disables_when_zero() {
+        let params = StretchParams::new(1.0).with_envelope_strength(3.0);
+        assert!((params.envelope_strength - 2.0).abs() < 1e-6);
+
+        let off = StretchParams::new(1.0).with_envelope_strength(0.0);
+        assert_eq!(off.envelope_preset, EnvelopePreset::Off);
+        assert!(!off.envelope_preservation);
+    }
+
+    #[test]
+    fn test_residual_mix_clamps() {
+        let low = StretchParams::new(1.0).with_residual_mix(-0.5);
+        assert_eq!(low.residual_mix, 0.0);
+
+        let high = StretchParams::new(1.0).with_residual_mix(2.0);
+        assert_eq!(high.residual_mix, 1.5);
+    }
+
+    #[test]
+    fn test_transient_class_adaptive_wsola_defaults_enabled() {
+        let params = StretchParams::new(1.0);
+        assert!(params.transient_class_adaptive_wsola);
+    }
+
+    #[test]
     fn test_stretch_params_display() {
         let params = StretchParams::new(1.5)
             .with_sample_rate(48000)
@@ -2591,6 +3122,21 @@ mod tests {
 
         let params = StretchParams::new(1.0).with_window_type(WindowType::Kaiser(800));
         assert_eq!(params.window_type, WindowType::Kaiser(800));
+    }
+
+    #[test]
+    fn test_adaptive_phase_locking_default_and_builder() {
+        let params = StretchParams::new(1.0);
+        assert!(!params.adaptive_phase_locking);
+
+        let params = StretchParams::new(1.0).with_adaptive_phase_locking(true);
+        assert!(params.adaptive_phase_locking);
+    }
+
+    #[test]
+    fn test_preset_enables_adaptive_phase_locking() {
+        let params = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
+        assert!(params.adaptive_phase_locking);
     }
 
     #[test]
@@ -3610,6 +4156,10 @@ mod tests {
         assert_eq!(params.hop_size, 1024);
         assert!((params.transient_sensitivity - 0.6).abs() < f32::EPSILON);
         assert_eq!(params.window_type, WindowType::Hann);
+        assert_eq!(params.envelope_preset, EnvelopePreset::Vocal);
+        assert!(params.envelope_preservation);
+        assert!(params.envelope_strength > 1.0);
+        assert!(params.adaptive_envelope_order);
     }
 
     #[test]

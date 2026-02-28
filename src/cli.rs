@@ -22,7 +22,8 @@ fn main() {
     let mut format_float = false;
     let mut verbose = false;
     let mut window_type: Option<WindowType> = None;
-    let mut normalize = false;
+    // Default to loudness-consistent output for file-based workflows.
+    let mut normalize = true;
     let mut streaming = false;
     let mut chunk_size: usize = 1024;
 
@@ -54,6 +55,7 @@ fn main() {
             "--float" => format_float = true,
             "--verbose" | "-v" => verbose = true,
             "--normalize" | "-n" => normalize = true,
+            "--no-normalize" => normalize = false,
             "--streaming" => streaming = true,
             "--chunk-size" => {
                 i += 1;
@@ -145,9 +147,7 @@ fn main() {
         params = params.with_window_type(w);
     }
 
-    if normalize {
-        params = params.with_normalize(true);
-    }
+    params = params.with_normalize(normalize);
 
     if verbose {
         eprintln!("Parameters: {}", params);
@@ -267,7 +267,8 @@ fn print_usage() {
     eprintln!("  --window <type>   hann (default), blackman-harris, kaiser:<beta>");
     eprintln!("  --streaming       Use streaming (chunked) processor instead of batch");
     eprintln!("  --chunk-size <N>  Frames per streaming chunk (default: 1024)");
-    eprintln!("  --normalize, -n   Match output RMS to input (consistent loudness)");
+    eprintln!("  --normalize, -n   Match output RMS to input (default: on)");
+    eprintln!("  --no-normalize    Disable RMS matching");
     eprintln!("  --24bit           Write 24-bit PCM output (default: 16-bit)");
     eprintln!("  --float           Write 32-bit float output");
     eprintln!("  --verbose, -v     Show detailed processing parameters and timing");

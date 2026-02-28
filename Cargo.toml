@@ -31,6 +31,7 @@ cli = []
 [dev-dependencies]
 toml = "0.8"
 sha2 = "0.10"
+hound = "3"
 
 [profile.release]
 opt-level = 3

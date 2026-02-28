@@ -55,7 +55,8 @@ pub use analysis::beat::BeatGrid;
 pub use analysis::preanalysis::analyze_for_dj;
 pub use core::preanalysis::{read_preanalysis_json, write_preanalysis_json, PreAnalysisArtifact};
 pub use core::types::{
-    AudioBuffer, Channels, CrossfadeMode, EdmPreset, FrameIter, QualityMode, Sample, StretchParams,
+    AudioBuffer, Channels, CrossfadeMode, EdmPreset, EnvelopePreset, FrameIter, QualityMode,
+    Sample, StretchParams, TransientThresholdPolicy,
 };
 pub use core::window::WindowType;
 pub use error::StretchError;
@@ -133,12 +134,25 @@ fn extract_mono(samples: &[f32], num_channels: usize) -> Vec<f32> {
 
 /// Minimum RMS threshold to avoid division by zero during normalization.
 const NORMALIZE_RMS_FLOOR: f32 = 1e-8;
+const FORMANT_WINDOW_SUM_EPS: f32 = 1e-6;
+const PITCH_FORMANT_MAX_FFT: usize = 4096;
+const PITCH_FORMANT_MIN_FFT: usize = 256;
+const PITCH_FORMANT_DOWNWARD_MUTE_END: f32 = 0.8;
+const PITCH_FORMANT_UPWARD_TAPER_START: f32 = 1.4;
+const PITCH_FORMANT_UPWARD_TAPER_END: f32 = 2.0;
+const VOCAL_FORMANT_HF_TAPER_START_HZ: f32 = 4_500.0;
+const VOCAL_FORMANT_HF_TAPER_MAX: f32 = 0.72;
+const VOCAL_FORMANT_HF_UPWARD_EXTRA_TAPER: f32 = 0.18;
+const VOCAL_FORMANT_HF_MAX_BOOST_DB: f32 = 2.5;
+const VOCAL_FORMANT_HF_ABS_TRIM_MAX: f32 = 0.60;
 const TONE_DETECT_MIN_LEN: usize = 2048;
 const TONE_DETECT_MAX_CREST: f64 = 2.5;
 const TONE_DETECT_MAX_PERIOD_JITTER: f64 = 0.08;
 const TONE_DETECT_MAX_REL_RMSE: f64 = 0.02;
 const SPARSE_TONAL_MAX_CREST: f64 = 3.5;
 const SPARSE_TONAL_MIN_DOMINANT_RATIO: f64 = 0.20;
+const SPARSE_TONAL_MAX_COMPONENTS: usize = 3;
+const DUAL_MONO_MATCH_EPS: f32 = 1e-5;
 
 /// Computes the RMS (root mean square) of a signal.
 #[inline]
@@ -161,6 +175,239 @@ fn normalize_rms(output: &mut [f32], target_rms: f32) {
     for s in output.iter_mut() {
         *s *= gain;
     }
+}
+
+/// Applies post-resample formant correction for pitch shifting.
+///
+/// Uses a short-time cepstral envelope match:
+/// output-frame envelope is nudged toward the corresponding input-frame envelope
+/// while preserving output-frame phase.
+fn preserve_formants_after_pitch_shift(
+    reference: &[f32],
+    shifted: &[f32],
+    params: &StretchParams,
+    pitch_factor: f64,
+) -> Vec<f32> {
+    if shifted.is_empty()
+        || reference.is_empty()
+        || !params.envelope_preservation
+        || params.envelope_strength <= 0.0
+    {
+        return shifted.to_vec();
+    }
+
+    let target_fft = params
+        .fft_size
+        .clamp(PITCH_FORMANT_MIN_FFT, PITCH_FORMANT_MAX_FFT);
+    let fft_size = largest_power_of_two_leq(target_fft).max(PITCH_FORMANT_MIN_FFT);
+    if shifted.len() < fft_size || reference.len() < fft_size {
+        return shifted.to_vec();
+    }
+
+    let hop = (fft_size / 4).max(1);
+    let num_bins = fft_size / 2 + 1;
+    let window = core::window::generate_window(params.window_type, fft_size);
+    let mut planner = FftPlanner::new();
+    let fft_forward = planner.plan_fft_forward(fft_size);
+    let fft_inverse = planner.plan_fft_inverse(fft_size);
+    let mut fwd_scratch = vec![Complex::new(0.0, 0.0); fft_forward.get_inplace_scratch_len()];
+    let mut inv_scratch = vec![Complex::new(0.0, 0.0); fft_inverse.get_inplace_scratch_len()];
+    let mut ref_fft = vec![Complex::new(0.0, 0.0); fft_size];
+    let mut shifted_fft = vec![Complex::new(0.0, 0.0); fft_size];
+    let mut ref_magnitudes = vec![0.0f32; num_bins];
+    let mut shifted_magnitudes = vec![0.0f32; num_bins];
+    let mut corrected_magnitudes = vec![0.0f32; num_bins];
+    let mut shifted_phases = vec![0.0f32; num_bins];
+    let mut cepstrum_buf = Vec::new();
+    let mut ref_envelope = Vec::new();
+    let mut shifted_envelope = Vec::new();
+    let mut noise_scratch = Vec::new();
+    let mut ola = vec![0.0f32; shifted.len() + fft_size];
+    let mut window_sum = vec![0.0f32; shifted.len() + fft_size];
+    let inv_fft = 1.0 / fft_size as f32;
+    let strength = (params.envelope_strength.clamp(0.0, 2.0)
+        * envelope_strength_scale_for_pitch(pitch_factor, params.envelope_preset))
+    .clamp(0.0, 2.0);
+
+    let mut frame_start = 0usize;
+    while frame_start < shifted.len() {
+        for i in 0..fft_size {
+            let idx = frame_start + i;
+            let ref_sample = reference.get(idx).copied().unwrap_or(0.0);
+            let shifted_sample = shifted.get(idx).copied().unwrap_or(0.0);
+            ref_fft[i] = Complex::new(ref_sample * window[i], 0.0);
+            shifted_fft[i] = Complex::new(shifted_sample * window[i], 0.0);
+        }
+
+        fft_forward.process_with_scratch(&mut ref_fft, &mut fwd_scratch);
+        fft_forward.process_with_scratch(&mut shifted_fft, &mut fwd_scratch);
+
+        for bin in 0..num_bins {
+            ref_magnitudes[bin] = ref_fft[bin].norm();
+            shifted_magnitudes[bin] = shifted_fft[bin].norm();
+            shifted_phases[bin] = shifted_fft[bin].arg();
+        }
+
+        let order = if params.adaptive_envelope_order {
+            let centroid =
+                stretch::envelope::spectral_centroid(&ref_magnitudes, params.sample_rate, fft_size);
+            stretch::envelope::adaptive_cepstral_order(centroid, fft_size)
+        } else {
+            params.envelope_order.max(1)
+        };
+
+        stretch::envelope::extract_envelope(
+            &ref_magnitudes,
+            num_bins,
+            order,
+            &mut planner,
+            &mut cepstrum_buf,
+            &mut ref_envelope,
+        );
+        stretch::envelope::extract_envelope(
+            &shifted_magnitudes,
+            num_bins,
+            order,
+            &mut planner,
+            &mut cepstrum_buf,
+            &mut shifted_envelope,
+        );
+
+        corrected_magnitudes.copy_from_slice(&shifted_magnitudes);
+        stretch::envelope::apply_envelope_correction_with_scratch(
+            &mut corrected_magnitudes,
+            &ref_envelope,
+            &shifted_envelope,
+            num_bins,
+            0,
+            &mut noise_scratch,
+        );
+
+        let upward_pitch_taper =
+            ((pitch_factor as f32 - 1.0) / (PITCH_FORMANT_UPWARD_TAPER_END - 1.0)).clamp(0.0, 1.0);
+        for bin in 0..num_bins {
+            let original = shifted_magnitudes[bin];
+            let corrected = corrected_magnitudes[bin];
+            let mut blended = original + (corrected - original) * strength;
+            if params.envelope_preset == EnvelopePreset::Vocal {
+                let bin_hz = bin as f32 * params.sample_rate as f32 / fft_size as f32;
+                let nyquist = params.sample_rate as f32 * 0.5;
+                if bin_hz > VOCAL_FORMANT_HF_TAPER_START_HZ
+                    && nyquist > VOCAL_FORMANT_HF_TAPER_START_HZ
+                {
+                    let t = ((bin_hz - VOCAL_FORMANT_HF_TAPER_START_HZ)
+                        / (nyquist - VOCAL_FORMANT_HF_TAPER_START_HZ))
+                        .clamp(0.0, 1.0);
+                    let taper_depth = VOCAL_FORMANT_HF_TAPER_MAX
+                        + VOCAL_FORMANT_HF_UPWARD_EXTRA_TAPER * upward_pitch_taper;
+                    let taper = 1.0 - (taper_depth * t).clamp(0.0, 0.97);
+                    blended = original + (blended - original) * taper;
+                    // Cap high-band boost from envelope correction to prevent
+                    // vocal preset leakage above ~5 kHz at upward shifts.
+                    let max_boost_db = VOCAL_FORMANT_HF_MAX_BOOST_DB * (1.0 - t);
+                    let max_boost = 10.0f32.powf(max_boost_db * 0.05);
+                    let boost_cap = original.max(1e-10) * max_boost;
+                    blended = blended.min(boost_cap);
+                    // Apply a gentle absolute HF trim so vocal mode does not
+                    // add persistent >5kHz haze relative to envelope-off mode.
+                    let trim_depth =
+                        VOCAL_FORMANT_HF_ABS_TRIM_MAX * t * (0.5 + 0.5 * upward_pitch_taper);
+                    blended *= (1.0 - trim_depth).clamp(0.70, 1.0);
+                }
+            }
+            shifted_fft[bin] = Complex::from_polar(blended.max(0.0), shifted_phases[bin]);
+        }
+        for bin in 1..num_bins.saturating_sub(1) {
+            shifted_fft[fft_size - bin] = shifted_fft[bin].conj();
+        }
+
+        fft_inverse.process_with_scratch(&mut shifted_fft, &mut inv_scratch);
+
+        for i in 0..fft_size {
+            let idx = frame_start + i;
+            if idx >= ola.len() {
+                break;
+            }
+            let win = window[i];
+            let sample = shifted_fft[i].re * inv_fft * win;
+            ola[idx] += sample;
+            window_sum[idx] += win * win;
+        }
+
+        frame_start = frame_start.saturating_add(hop);
+    }
+
+    let mut output = vec![0.0f32; shifted.len()];
+    for i in 0..shifted.len() {
+        let denom = window_sum[i];
+        output[i] = if denom > FORMANT_WINDOW_SUM_EPS {
+            ola[i] / denom
+        } else {
+            ola[i]
+        };
+    }
+    if params.envelope_preset == EnvelopePreset::Vocal {
+        apply_vocal_hf_tilt(&mut output, params.sample_rate, pitch_factor);
+    }
+    output
+}
+
+#[inline]
+fn apply_vocal_hf_tilt(output: &mut [f32], sample_rate: u32, pitch_factor: f64) {
+    if output.len() < 2 || sample_rate == 0 {
+        return;
+    }
+    let pitch = pitch_factor as f32;
+    if !pitch.is_finite() || pitch <= 1.0 {
+        return;
+    }
+
+    // Upward shifts generate the most audible HF haze; apply a gentle
+    // de-esser-like tilt that increases with pitch factor.
+    let pitch_t = ((pitch - 1.0) / (PITCH_FORMANT_UPWARD_TAPER_END - 1.0)).clamp(0.0, 1.0);
+    let cutoff_hz = 6_000.0 - 2_000.0 * pitch_t;
+    let alpha = (2.0 * std::f32::consts::PI * cutoff_hz / sample_rate as f32).clamp(0.0, 1.0);
+    let high_trim = (0.35 + 0.55 * pitch_t).clamp(0.0, 0.92);
+
+    let mut low = output[0];
+    for sample in output.iter_mut() {
+        low += alpha * (*sample - low);
+        let high = *sample - low;
+        *sample = low + high * (1.0 - high_trim);
+    }
+}
+
+#[inline]
+fn envelope_strength_scale_for_pitch(pitch_factor: f64, preset: EnvelopePreset) -> f32 {
+    if preset != EnvelopePreset::Vocal {
+        return 1.0;
+    }
+
+    let pf = pitch_factor as f32;
+    if !pf.is_finite() {
+        return 1.0;
+    }
+
+    if pf < 1.0 {
+        // Below ~0.8x, disable vocal envelope correction to avoid downward
+        // formant overshoot. Then fade in quadratically toward 1.0x.
+        if pf <= PITCH_FORMANT_DOWNWARD_MUTE_END {
+            return 0.0;
+        }
+        let t = ((pf - PITCH_FORMANT_DOWNWARD_MUTE_END) / (1.0 - PITCH_FORMANT_DOWNWARD_MUTE_END))
+            .clamp(0.0, 1.0);
+        return t * t;
+    }
+
+    if pf > PITCH_FORMANT_UPWARD_TAPER_START {
+        // Above ~+6 semitones, taper toward zero to avoid formant overshoot.
+        let t = ((pf - PITCH_FORMANT_UPWARD_TAPER_START)
+            / (PITCH_FORMANT_UPWARD_TAPER_END - PITCH_FORMANT_UPWARD_TAPER_START))
+            .clamp(0.0, 1.0);
+        return 1.0 - t;
+    }
+
+    1.0
 }
 
 #[inline]
@@ -271,8 +518,13 @@ fn fit_single_tone(samples: &[f32], period: f64) -> Option<(f64, f64, f64, f64)>
     Some((a, b, mean, w))
 }
 
+#[inline]
+fn preset_allows_tonal_fast_path(preset: Option<EdmPreset>) -> bool {
+    matches!(preset, Some(EdmPreset::HouseLoop | EdmPreset::DjBeatmatch))
+}
+
 fn try_render_single_tone(input: &[f32], params: &StretchParams) -> Option<Vec<f32>> {
-    if params.preset != Some(EdmPreset::HouseLoop) || params.channels.count() != 1 {
+    if !preset_allows_tonal_fast_path(params.preset) || params.channels.count() != 1 {
         return None;
     }
     if input.len() < TONE_DETECT_MIN_LEN {
@@ -301,7 +553,7 @@ fn try_render_single_tone(input: &[f32], params: &StretchParams) -> Option<Vec<f
 }
 
 fn try_render_sparse_tonal(input: &[f32], params: &StretchParams) -> Option<Vec<f32>> {
-    if params.preset != Some(EdmPreset::HouseLoop) || params.channels.count() != 1 {
+    if !preset_allows_tonal_fast_path(params.preset) || params.channels.count() != 1 {
         return None;
     }
     if params.bpm.is_some() || params.pre_analysis.is_some() {
@@ -360,7 +612,7 @@ fn try_render_sparse_tonal(input: &[f32], params: &StretchParams) -> Option<Vec<
             .all(|(picked, _): &(usize, f64)| picked.abs_diff(k) > 2)
         {
             selected.push((k, e));
-            if selected.len() == 2 {
+            if selected.len() == SPARSE_TONAL_MAX_COMPONENTS {
                 break;
             }
         }
@@ -424,6 +676,53 @@ fn try_render_sparse_tonal(input: &[f32], params: &StretchParams) -> Option<Vec<
     Some(out)
 }
 
+#[inline]
+fn try_extract_dual_mono(input: &[f32]) -> Option<Vec<f32>> {
+    if input.len() < 2 || input.len() % 2 != 0 {
+        return None;
+    }
+
+    let mut mono = Vec::with_capacity(input.len() / 2);
+    for frame in input.chunks_exact(2) {
+        if (frame[0] - frame[1]).abs() > DUAL_MONO_MATCH_EPS {
+            return None;
+        }
+        mono.push(frame[0]);
+    }
+    Some(mono)
+}
+
+#[inline]
+fn duplicate_mono_interleaved(mono: &[f32]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(mono.len() * 2);
+    for &sample in mono {
+        out.push(sample);
+        out.push(sample);
+    }
+    out
+}
+
+fn try_render_tonal_fast_path(input: &[f32], params: &StretchParams) -> Option<Vec<f32>> {
+    if !preset_allows_tonal_fast_path(params.preset) {
+        return None;
+    }
+
+    match params.channels.count() {
+        1 => {
+            try_render_single_tone(input, params).or_else(|| try_render_sparse_tonal(input, params))
+        }
+        2 => {
+            let mono = try_extract_dual_mono(input)?;
+            let mut mono_params = params.clone();
+            mono_params.channels = Channels::Mono;
+            let rendered = try_render_single_tone(&mono, &mono_params)
+                .or_else(|| try_render_sparse_tonal(&mono, &mono_params))?;
+            Some(duplicate_mono_interleaved(&rendered))
+        }
+        _ => None,
+    }
+}
+
 /// Validates that a BPM value is positive, returning a descriptive error otherwise.
 #[inline]
 fn validate_bpm(bpm: f64, label: &str) -> Result<(), StretchError> {
@@ -474,21 +773,21 @@ pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, Stretc
         return Ok(input.to_vec());
     }
 
-    if let Some(rendered) = try_render_single_tone(input, params) {
-        return Ok(rendered);
-    }
-    if let Some(rendered) = try_render_sparse_tonal(input, params) {
-        return Ok(rendered);
-    }
-
-    let num_channels = params.channels.count();
-    let channels = deinterleave(input, num_channels);
-
     let input_rms = if params.normalize {
         compute_rms(input)
     } else {
         0.0
     };
+
+    if let Some(mut rendered) = try_render_tonal_fast_path(input, params) {
+        if params.normalize {
+            normalize_rms(&mut rendered, input_rms);
+        }
+        return Ok(rendered);
+    }
+
+    let num_channels = params.channels.count();
+    let channels = deinterleave(input, num_channels);
 
     let channel_outputs = if num_channels == 2
         && params.stereo_mode == stretch::stereo::StereoMode::MidSide
@@ -556,14 +855,23 @@ pub fn stretch_into(
         return Ok(0);
     }
 
-    let num_channels = params.channels.count();
-    let channels = deinterleave(input, num_channels);
-
     let input_rms = if params.normalize {
         compute_rms(input)
     } else {
         0.0
     };
+
+    if let Some(mut rendered) = try_render_tonal_fast_path(input, params) {
+        if params.normalize {
+            normalize_rms(&mut rendered, input_rms);
+        }
+        let n = rendered.len();
+        output.extend_from_slice(&rendered);
+        return Ok(n);
+    }
+
+    let num_channels = params.channels.count();
+    let channels = deinterleave(input, num_channels);
 
     let channel_outputs = if num_channels == 2
         && params.stereo_mode == stretch::stereo::StereoMode::MidSide
@@ -693,11 +1001,27 @@ pub fn pitch_shift(
     // Step 2: Resample each channel to original length using windowed-sinc interpolation
     let num_channels = params.channels.count();
     let num_input_frames = input.len() / num_channels;
-    let channels = deinterleave(&stretched, num_channels);
+    let input_channels = deinterleave(input, num_channels);
+    let stretched_channels = deinterleave(&stretched, num_channels);
+    let use_formant_preservation =
+        params.envelope_preservation && (pitch_factor - 1.0).abs() > 1e-9;
 
-    let channel_outputs: Vec<Vec<f32>> = channels
+    let channel_outputs: Vec<Vec<f32>> = stretched_channels
         .iter()
-        .map(|ch| core::resample::resample_sinc_default(ch, num_input_frames))
+        .enumerate()
+        .map(|(idx, ch)| {
+            let resampled = core::resample::resample_sinc_default(ch, num_input_frames);
+            if use_formant_preservation {
+                preserve_formants_after_pitch_shift(
+                    &input_channels[idx],
+                    &resampled,
+                    params,
+                    pitch_factor,
+                )
+            } else {
+                resampled
+            }
+        })
         .collect();
 
     let mut output = interleave(&channel_outputs);
@@ -1185,6 +1509,22 @@ mod tests {
         let output = pitch_shift(&input, &params, 0.8).unwrap();
         assert_eq!(output.len(), input.len());
         assert_eq!(output.len() % 2, 0);
+    }
+
+    #[test]
+    fn test_vocal_envelope_strength_scale_for_pitch() {
+        let down = envelope_strength_scale_for_pitch(0.75, EnvelopePreset::Vocal);
+        let near_unity = envelope_strength_scale_for_pitch(1.0, EnvelopePreset::Vocal);
+        let mild_up = envelope_strength_scale_for_pitch(1.35, EnvelopePreset::Vocal);
+        let extreme_up = envelope_strength_scale_for_pitch(2.5, EnvelopePreset::Vocal);
+
+        assert!(down < near_unity);
+        assert!(down <= 1e-6);
+        assert!((mild_up - 1.0).abs() < 1e-6);
+        assert!(extreme_up < near_unity);
+
+        let non_vocal = envelope_strength_scale_for_pitch(0.75, EnvelopePreset::Balanced);
+        assert!((non_vocal - 1.0).abs() < 1e-6);
     }
 
     #[test]

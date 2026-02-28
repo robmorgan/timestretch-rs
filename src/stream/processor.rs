@@ -26,6 +26,8 @@ const LATENCY_FFT_DENOMINATOR: usize = 2;
 const MAX_CALLBACK_FRAMES: usize = 1024;
 const MIN_CALLBACK_FRAMES: usize = 64;
 const COMMON_CALLBACK_FRAMES: usize = 256;
+/// Iteration slack for bounded dynamic loops in the real-time path.
+const LOOP_GUARD_SLACK: usize = 8;
 /// Mid-band start for spectral-flux transient detection (Hz).
 const FLUX_MID_START_HZ: f64 = 500.0;
 /// High-band start for spectral-flux transient detection (Hz).
@@ -212,6 +214,8 @@ pub struct StreamProcessor {
     transient_fft: std::sync::Arc<dyn rustfft::Fft<f32>>,
     /// Reusable FFT buffer for spectral-flux detection.
     transient_fft_buffer: Vec<Complex<f32>>,
+    /// Scratch buffer for spectral-flux FFT execution.
+    transient_fft_scratch: Vec<Complex<f32>>,
     /// Reusable previous magnitudes for spectral-flux detection.
     transient_prev_magnitudes: Vec<f32>,
     /// Analysis window used by spectral-flux detection.
@@ -264,6 +268,7 @@ impl StreamProcessor {
         let hybrid_state = HybridStreamingState::new(&params, ratio, capacity_frames_per_channel);
         let mut planner = FftPlanner::new();
         let transient_fft = planner.plan_fft_forward(params.fft_size);
+        let transient_fft_scratch = vec![COMPLEX_ZERO; transient_fft.get_inplace_scratch_len()];
         let transient_fft_buffer = vec![COMPLEX_ZERO; params.fft_size];
         let transient_prev_magnitudes = vec![0.0; params.fft_size / 2 + 1];
         let transient_window = generate_window(WindowType::Hann, params.fft_size);
@@ -288,6 +293,7 @@ impl StreamProcessor {
             mid_buffer: Vec::with_capacity(capacity_frames_per_channel),
             transient_fft,
             transient_fft_buffer,
+            transient_fft_scratch,
             transient_prev_magnitudes,
             transient_window,
             expected_total_output_samples: 0.0,
@@ -299,7 +305,7 @@ impl StreamProcessor {
     fn create_vocoders(params: &StretchParams, ratio: f64) -> Vec<PhaseVocoder> {
         (0..params.channels.count())
             .map(|_| {
-                PhaseVocoder::with_all_options(
+                let mut pv = PhaseVocoder::with_all_options(
                     params.fft_size,
                     params.hop_size,
                     ratio,
@@ -309,7 +315,11 @@ impl StreamProcessor {
                     params.phase_locking_mode,
                     params.envelope_preservation,
                     params.envelope_order,
-                )
+                );
+                pv.set_adaptive_phase_locking(params.adaptive_phase_locking);
+                pv.set_envelope_strength(params.envelope_strength);
+                pv.set_adaptive_envelope_order(params.adaptive_envelope_order);
+                pv
             })
             .collect()
     }
@@ -342,7 +352,18 @@ impl StreamProcessor {
         self.initialized = true;
         let num_channels = self.params.channels.count().max(1);
         let mut offset = 0usize;
+        let mut iterations = 0usize;
+        let max_iterations = input
+            .len()
+            .saturating_add(LOOP_GUARD_SLACK)
+            .max(LOOP_GUARD_SLACK);
         while offset < input.len() {
+            iterations = iterations.saturating_add(1);
+            if iterations > max_iterations {
+                return Err(StretchError::InvalidState(
+                    "process_into iteration bound exceeded",
+                ));
+            }
             if self.input_ring.available() == 0 {
                 self.interpolate_ratio_for_frames(COMMON_CALLBACK_FRAMES);
                 self.process_available_to_pending(true)?;
@@ -356,6 +377,11 @@ impl StreamProcessor {
             }
 
             let take = (input.len() - offset).min(self.input_ring.available());
+            if take == 0 {
+                return Err(StretchError::InvalidState(
+                    "process_into made zero progress while input remained",
+                ));
+            }
             self.push_input_samples(&input[offset..offset + take])?;
             offset += take;
 
@@ -400,8 +426,24 @@ impl StreamProcessor {
                 }
                 let zeros = [0.0f32; 256];
                 let mut remaining = missing;
+                let mut iterations = 0usize;
+                let max_iterations = missing
+                    .saturating_add(zeros.len().saturating_sub(1))
+                    .saturating_div(zeros.len())
+                    .saturating_add(LOOP_GUARD_SLACK);
                 while remaining > 0 {
+                    iterations = iterations.saturating_add(1);
+                    if iterations > max_iterations {
+                        return Err(StretchError::InvalidState(
+                            "flush zero-padding iteration bound exceeded",
+                        ));
+                    }
                     let chunk = remaining.min(zeros.len());
+                    if chunk == 0 {
+                        return Err(StretchError::InvalidState(
+                            "flush zero-padding made zero progress",
+                        ));
+                    }
                     let pushed = self.input_ring.push_slice(&zeros[..chunk]);
                     if pushed != chunk {
                         return Err(StretchError::BufferOverflow {
@@ -665,10 +707,23 @@ impl StreamProcessor {
 
         let mut written = 0usize;
         let mut chunk = [0.0f32; 512];
+        let mut iterations = 0usize;
+        let max_iterations = pending
+            .saturating_add(chunk.len().saturating_sub(1))
+            .saturating_div(chunk.len())
+            .saturating_add(LOOP_GUARD_SLACK);
         while !self.pending_output.is_empty() {
+            iterations = iterations.saturating_add(1);
+            if iterations > max_iterations {
+                return Err(StretchError::InvalidState(
+                    "pending-output drain iteration bound exceeded",
+                ));
+            }
             let n = self.pending_output.pop_slice(&mut chunk);
             if n == 0 {
-                break;
+                return Err(StretchError::InvalidState(
+                    "pending-output drain made zero progress",
+                ));
             }
             output.extend_from_slice(&chunk[..n]);
             written += n;
@@ -936,6 +991,7 @@ impl StreamProcessor {
         {
             return;
         }
+        let transient_fft = std::sync::Arc::clone(&self.transient_fft);
 
         let bin_hz = self.params.sample_rate as f64 / fft_size as f64;
         let mid_start_bin = ((FLUX_MID_START_HZ / bin_hz).floor() as usize)
@@ -949,7 +1005,10 @@ impl StreamProcessor {
             self.transient_fft_buffer[i] =
                 Complex::new(self.mid_buffer[i] * self.transient_window[i], 0.0);
         }
-        self.transient_fft.process(&mut self.transient_fft_buffer);
+        transient_fft.process_with_scratch(
+            &mut self.transient_fft_buffer,
+            &mut self.transient_fft_scratch,
+        );
         for bin in mid_start_bin..num_bins {
             self.transient_prev_magnitudes[bin] = self.transient_fft_buffer[bin].norm();
         }
@@ -968,7 +1027,10 @@ impl StreamProcessor {
             {
                 *buf = Complex::new(s * w, 0.0);
             }
-            self.transient_fft.process(&mut self.transient_fft_buffer);
+            transient_fft.process_with_scratch(
+                &mut self.transient_fft_buffer,
+                &mut self.transient_fft_scratch,
+            );
 
             let mut mid_flux = 0.0f64;
             let mut high_flux = 0.0f64;

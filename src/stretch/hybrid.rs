@@ -3,7 +3,7 @@
 use crate::analysis::beat::{default_subdivision_for_preset, detect_beats, snap_to_subdivision};
 use crate::analysis::frequency::freq_to_bin;
 use crate::analysis::hpss::{hpss, HpssParams};
-use crate::analysis::transient::detect_transients;
+use crate::analysis::transient::{detect_transients_with_options, TransientDetectionOptions};
 use crate::core::fft::{COMPLEX_ZERO, WINDOW_SUM_EPSILON, WINDOW_SUM_FLOOR_RATIO};
 use crate::core::types::StretchParams;
 use crate::core::window::{generate_window, WindowType};
@@ -41,19 +41,73 @@ const DEDUP_DISTANCE: usize = 512;
 const BEAT_ANCHOR_STRENGTH: f32 = f32::NEG_INFINITY;
 /// Base direct-copy attack length for transient segments.
 const TRANSIENT_ATTACK_COPY_SECS: f64 = 0.008;
+/// Kick attack copy length (longer low-end anchor).
+const TRANSIENT_ATTACK_COPY_SECS_KICK: f64 = 0.012;
+/// Snare attack copy length (default profile).
+const TRANSIENT_ATTACK_COPY_SECS_SNARE: f64 = TRANSIENT_ATTACK_COPY_SECS;
+/// Hat attack copy length (shorter high-band attack).
+const TRANSIENT_ATTACK_COPY_SECS_HAT: f64 = 0.004;
+/// Early transient window searched for the local attack center.
+const TRANSIENT_CENTER_SEARCH_SECS: f64 = 0.025;
+/// Target position of the attack center inside the copied attack window.
+///
+/// `0.0` = center pinned to the start, `1.0` = center pinned to the end.
+/// A value around 0.35 leaves enough copied post-center context for stable
+/// attack-to-decay handoff while still tolerating onset detector jitter.
+const TRANSIENT_CENTER_TARGET_FRACTION: f64 = 0.35;
 /// Minimum WSOLA search time for transient decays to keep low-end alignment stable.
 const TRANSIENT_DECAY_SEARCH_FLOOR_SECS: f64 = 0.012;
+/// Kick decay search floor.
+const TRANSIENT_DECAY_SEARCH_FLOOR_SECS_KICK: f64 = 0.016;
+/// Hat decay search floor.
+const TRANSIENT_DECAY_SEARCH_FLOOR_SECS_HAT: f64 = 0.008;
 /// WSOLA search range boost for transient decays.
 const TRANSIENT_DECAY_SEARCH_BOOST: f64 = 2.0;
+/// Kick decay search boost.
+const TRANSIENT_DECAY_SEARCH_BOOST_KICK: f64 = 2.4;
+/// Hat decay search boost.
+const TRANSIENT_DECAY_SEARCH_BOOST_HAT: f64 = 1.4;
+/// Default attack/decay crossfade in transient processing.
+const TRANSIENT_ATTACK_CROSSFADE_SECS: f64 = 0.002;
+/// Kick attack/decay crossfade.
+const TRANSIENT_ATTACK_CROSSFADE_SECS_KICK: f64 = 0.003;
+/// Hat attack/decay crossfade.
+const TRANSIENT_ATTACK_CROSSFADE_SECS_HAT: f64 = 0.0015;
 /// RMS threshold (linear) below which audio is considered silence for the
 /// leading-silence bypass in tonal segments. Approximately -66 dB.
 const LEADING_SILENCE_RMS_THRESHOLD: f32 = 5e-4;
+/// Transient segments shorter than this are treated as low-confidence boundaries.
+const LOW_CONF_TRANSIENT_REGION_SECS: f64 = 0.008;
+/// Blend factor that pushes low-confidence transient boundaries toward tonal
+/// crossfade behaviour for smoother transitions.
+const LOW_CONF_TRANSITION_BLEND: f64 = 0.7;
 /// Crest-factor threshold used to detect sparse impulse-like content.
-const IMPULSIVE_CREST_THRESHOLD: f32 = 20.0;
+const IMPULSIVE_CREST_THRESHOLD: f32 = 12.0;
+/// Very low active-ratio override for sparse burst-like content even when crest
+/// is below the strict impulse threshold.
+const IMPULSIVE_VERY_SPARSE_ACTIVE_RATIO: f32 = 0.08;
 /// Samples above this fraction of peak are considered "strong".
-const IMPULSIVE_STRONG_SAMPLE_FRACTION: f32 = 0.5;
-/// Maximum number of strong samples for the signal to be treated as sparse/impulsive.
-const IMPULSIVE_MAX_STRONG_SAMPLES: usize = 8;
+const IMPULSIVE_STRONG_SAMPLE_FRACTION: f32 = 0.35;
+/// Absolute lower bound for strong-sample budget in sparse-impulse detection.
+const IMPULSIVE_MIN_STRONG_SAMPLES: usize = 8;
+/// Maximum strong-sample ratio for sparse-impulse detection.
+const IMPULSIVE_MAX_STRONG_SAMPLE_RATIO: f32 = 0.008;
+/// Maximum active-sample ratio (at 8% peak threshold) for sparse-impulse detection.
+const IMPULSIVE_MAX_ACTIVE_RATIO: f32 = 0.20;
+/// Hard bound for dynamic subdivision-grid generation.
+const MAX_SUBDIVISION_GRID_POINTS: usize = 1_000_000;
+/// Minimum transient anchors required before enabling live beat-grid merging.
+const MIN_LIVE_BEAT_ANCHORS: usize = 2;
+/// Minimum anchor strength considered "reliable" for live beat-grid merging.
+const MIN_LIVE_BEAT_ANCHOR_STRENGTH: f32 = 0.2;
+/// Maximum transient coverage ratio before we force full tonal rendering.
+///
+/// If only one tiny transient region is present (often onset detector residue
+/// on near-pure tonal material), rendering the entire signal as tonal avoids
+/// unnecessary boundary/crossfade timing shifts.
+const TONAL_FORCE_MAX_TRANSIENT_COVERAGE: f64 = 0.03;
+/// Maximum transient segment count for full-tonal fallback.
+const TONAL_FORCE_MAX_TRANSIENT_SEGMENTS: usize = 1;
 
 /// Transient-aware hybrid stretcher.
 ///
@@ -72,6 +126,24 @@ struct Segment {
     /// Per-segment stretch ratio. Defaults to the global ratio but may
     /// differ when elastic beat distribution is active.
     stretch_ratio: f64,
+}
+
+/// Coarse transient classes used to adapt WSOLA attack/decay parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransientClass {
+    Kick,
+    Snare,
+    Hat,
+}
+
+/// WSOLA adaptation profile for a transient class.
+#[derive(Debug, Clone, Copy)]
+struct TransientWsolaProfile {
+    attack_copy_secs: f64,
+    crossfade_secs: f64,
+    search_boost: f64,
+    search_floor_secs: f64,
+    segment_scale: f64,
 }
 
 /// Timeline bookkeeping for exact-length hybrid rendering.
@@ -163,7 +235,18 @@ fn is_sparse_impulsive(signal: &[f32]) -> bool {
     if rms <= 1e-9 {
         return false;
     }
-    if peak / rms < IMPULSIVE_CREST_THRESHOLD {
+    let active_threshold = peak * 0.08;
+    let active_count = signal
+        .iter()
+        .filter(|&&sample| sample.abs() >= active_threshold)
+        .count();
+    let active_ratio = active_count as f32 / signal.len() as f32;
+    if active_ratio > IMPULSIVE_MAX_ACTIVE_RATIO {
+        return false;
+    }
+
+    let crest = peak / rms;
+    if crest < IMPULSIVE_CREST_THRESHOLD && active_ratio > IMPULSIVE_VERY_SPARSE_ACTIVE_RATIO {
         return false;
     }
 
@@ -172,7 +255,171 @@ fn is_sparse_impulsive(signal: &[f32]) -> bool {
         .iter()
         .filter(|&&sample| sample.abs() >= strong_threshold)
         .count();
-    strong_count <= IMPULSIVE_MAX_STRONG_SAMPLES
+    let mut max_strong = ((signal.len() as f32 * IMPULSIVE_MAX_STRONG_SAMPLE_RATIO).round()
+        as usize)
+        .max(IMPULSIVE_MIN_STRONG_SAMPLES);
+    if active_ratio <= IMPULSIVE_VERY_SPARSE_ACTIVE_RATIO {
+        max_strong = max_strong.max((signal.len() as f32 * 0.02).round() as usize);
+    }
+    strong_count <= max_strong
+}
+
+#[inline]
+fn transient_wsola_profile(class: TransientClass) -> TransientWsolaProfile {
+    match class {
+        TransientClass::Kick => TransientWsolaProfile {
+            attack_copy_secs: TRANSIENT_ATTACK_COPY_SECS_KICK,
+            crossfade_secs: TRANSIENT_ATTACK_CROSSFADE_SECS_KICK,
+            search_boost: TRANSIENT_DECAY_SEARCH_BOOST_KICK,
+            search_floor_secs: TRANSIENT_DECAY_SEARCH_FLOOR_SECS_KICK,
+            segment_scale: 1.15,
+        },
+        TransientClass::Snare => TransientWsolaProfile {
+            attack_copy_secs: TRANSIENT_ATTACK_COPY_SECS_SNARE,
+            crossfade_secs: TRANSIENT_ATTACK_CROSSFADE_SECS,
+            search_boost: TRANSIENT_DECAY_SEARCH_BOOST,
+            search_floor_secs: TRANSIENT_DECAY_SEARCH_FLOOR_SECS,
+            segment_scale: 1.0,
+        },
+        TransientClass::Hat => TransientWsolaProfile {
+            attack_copy_secs: TRANSIENT_ATTACK_COPY_SECS_HAT,
+            crossfade_secs: TRANSIENT_ATTACK_CROSSFADE_SECS_HAT,
+            search_boost: TRANSIENT_DECAY_SEARCH_BOOST_HAT,
+            search_floor_secs: TRANSIENT_DECAY_SEARCH_FLOOR_SECS_HAT,
+            segment_scale: 0.75,
+        },
+    }
+}
+
+#[inline]
+fn classify_transient_segment(seg_data: &[f32], sample_rate: u32) -> TransientClass {
+    if seg_data.len() < 16 || sample_rate == 0 {
+        return TransientClass::Snare;
+    }
+
+    let analysis_len = ((sample_rate as f64 * 0.03).round() as usize)
+        .max(16)
+        .min(seg_data.len());
+    let low_a = (2.0 * std::f64::consts::PI * 220.0 / sample_rate as f64).clamp(0.0, 1.0) as f32;
+    let mid_a = (2.0 * std::f64::consts::PI * 2400.0 / sample_rate as f64).clamp(0.0, 1.0) as f32;
+
+    let mut low_state = 0.0f32;
+    let mut mid_state = 0.0f32;
+    let mut low_energy = 0.0f64;
+    let mut mid_energy = 0.0f64;
+    let mut high_energy = 0.0f64;
+    let mut zero_crossings = 0usize;
+    let mut prev = seg_data[0];
+
+    for &x in seg_data.iter().take(analysis_len) {
+        low_state += low_a * (x - low_state);
+        mid_state += mid_a * (x - mid_state);
+
+        let low = low_state;
+        let mid = mid_state - low_state;
+        let high = x - mid_state;
+
+        low_energy += (low as f64) * (low as f64);
+        mid_energy += (mid as f64) * (mid as f64);
+        high_energy += (high as f64) * (high as f64);
+
+        if (x >= 0.0) != (prev >= 0.0) {
+            zero_crossings = zero_crossings.saturating_add(1);
+        }
+        prev = x;
+    }
+
+    let total = (low_energy + mid_energy + high_energy).max(1e-12);
+    let low_ratio = low_energy / total;
+    let high_ratio = high_energy / total;
+    let zcr = zero_crossings as f64 / analysis_len.max(1) as f64;
+
+    if low_ratio > 0.56 && high_ratio < 0.24 && zcr < 0.18 {
+        TransientClass::Kick
+    } else if high_ratio > 0.52 && zcr > 0.22 {
+        TransientClass::Hat
+    } else {
+        TransientClass::Snare
+    }
+}
+
+/// Estimates a transient center index in the early part of a transient segment.
+///
+/// Uses peak absolute amplitude in a short search window as a robust,
+/// low-cost anchor proxy for kick/snare attacks.
+#[inline]
+fn estimate_transient_center_index(seg_data: &[f32], sample_rate: u32) -> usize {
+    if seg_data.is_empty() {
+        return 0;
+    }
+    let search_len = ((sample_rate as f64 * TRANSIENT_CENTER_SEARCH_SECS).round() as usize)
+        .max(1)
+        .min(seg_data.len());
+    seg_data
+        .iter()
+        .take(search_len)
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
+}
+
+/// Computes anchored attack-copy length so the detected transient center stays
+/// inside the direct-copy region (and not only in the WSOLA decay branch).
+#[inline]
+fn compute_anchored_attack_samples(
+    seg_data: &[f32],
+    sample_rate: u32,
+    base_attack_secs: f64,
+) -> usize {
+    if seg_data.is_empty() {
+        return 0;
+    }
+    let base_secs = if base_attack_secs.is_finite() && base_attack_secs > 0.0 {
+        base_attack_secs
+    } else {
+        TRANSIENT_ATTACK_COPY_SECS
+    };
+    let base_attack_samples = ((sample_rate as f64 * base_secs).round() as usize)
+        .max(1)
+        .min(seg_data.len());
+    let center_idx = estimate_transient_center_index(seg_data, sample_rate);
+    let post_center_context =
+        ((base_attack_samples as f64 * (1.0 - TRANSIENT_CENTER_TARGET_FRACTION)).round() as usize)
+            .max(1);
+    base_attack_samples
+        .max(center_idx.saturating_add(post_center_context))
+        .min(seg_data.len())
+}
+
+#[inline]
+fn should_use_live_beat_aware_anchors(strengths: &[f32]) -> bool {
+    strengths
+        .iter()
+        .copied()
+        .filter(|&s| strength_marks_transient(s) && s >= MIN_LIVE_BEAT_ANCHOR_STRENGTH)
+        .count()
+        >= MIN_LIVE_BEAT_ANCHORS
+}
+
+#[inline]
+fn should_force_tonal_render(segments: &[Segment], input_len: usize) -> bool {
+    if input_len == 0 || segments.is_empty() {
+        return false;
+    }
+
+    let transient_count = segments.iter().filter(|s| s.is_transient).count();
+    if transient_count == 0 || transient_count > TONAL_FORCE_MAX_TRANSIENT_SEGMENTS {
+        return false;
+    }
+
+    let transient_samples: usize = segments
+        .iter()
+        .filter(|s| s.is_transient)
+        .map(|s| s.end.saturating_sub(s.start))
+        .sum();
+    let coverage = transient_samples as f64 / input_len as f64;
+    coverage <= TONAL_FORCE_MAX_TRANSIENT_COVERAGE
 }
 
 impl HybridStretcher {
@@ -219,12 +466,13 @@ impl HybridStretcher {
     /// Core hybrid processing: transient detection + segmented WSOLA/PV.
     fn process_hybrid(&self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
         // Step 1: Detect transients
-        let transients = detect_transients(
+        let transients = detect_transients_with_options(
             input,
             self.params.sample_rate,
             self.params.fft_size.min(TRANSIENT_MAX_FFT),
             self.params.hop_size.min(TRANSIENT_MAX_HOP),
             self.params.transient_sensitivity,
+            TransientDetectionOptions::from_stretch_params(&self.params),
         );
 
         // Step 1b: Optionally detect beat grid and merge with transient onsets.
@@ -244,16 +492,20 @@ impl HybridStretcher {
 
         if self.params.beat_aware && input.len() >= MIN_SAMPLES_FOR_BEAT_DETECTION {
             let live_beats;
-            let beats = if let Some(artifact) = confident_pre {
-                &artifact.beat_positions
-            } else {
-                live_beats = detect_beats(input, self.params.sample_rate).beats;
-                &live_beats
-            };
-            let (merged_onsets, merged_strengths) =
-                merge_onsets_and_beats(&onsets, &strengths, beats, input.len());
-            onsets = merged_onsets;
-            strengths = merged_strengths;
+            let use_live_beats =
+                confident_pre.is_some() || should_use_live_beat_aware_anchors(&strengths);
+            if use_live_beats {
+                let beats = if let Some(artifact) = confident_pre {
+                    &artifact.beat_positions
+                } else {
+                    live_beats = detect_beats(input, self.params.sample_rate).beats;
+                    &live_beats
+                };
+                let (merged_onsets, merged_strengths) =
+                    merge_onsets_and_beats(&onsets, &strengths, beats, input.len());
+                onsets = merged_onsets;
+                strengths = merged_strengths;
+            }
         }
 
         // Step 1c: When BPM is known, snap transient positions to the nearest
@@ -313,6 +565,14 @@ impl HybridStretcher {
 
         // Step 2: Segment audio at transient/beat boundaries
         let mut segments = self.segment_audio(input.len(), &onsets, &strengths);
+        if should_force_tonal_render(&segments, input.len()) {
+            segments = vec![Segment {
+                start: 0,
+                end: input.len(),
+                is_transient: false,
+                stretch_ratio: self.params.stretch_ratio,
+            }];
+        }
 
         // Step 2b: Compute elastic per-segment ratios if enabled.
         // Guard: only when elastic_timing is on AND ratio != 1.0 (identity).
@@ -344,6 +604,14 @@ impl HybridStretcher {
             return Ok(vec![]);
         }
 
+        if is_sparse_impulsive(input) {
+            let out_len = (input.len() as f64 * self.params.stretch_ratio).round() as usize;
+            return Ok(crate::core::resample::resample_linear(
+                input,
+                out_len.max(1),
+            ));
+        }
+
         let min_size = self.params.fft_size.max(self.params.wsola_segment_size);
         if input.len() < min_size {
             let mut wsola = Wsola::new(
@@ -355,6 +623,14 @@ impl HybridStretcher {
         }
 
         let mut segments = self.segment_audio(input.len(), onsets, strengths);
+        if should_force_tonal_render(&segments, input.len()) {
+            segments = vec![Segment {
+                start: 0,
+                end: input.len(),
+                is_transient: false,
+                stretch_ratio: self.params.stretch_ratio,
+            }];
+        }
         if self.params.elastic_timing
             && (self.params.stretch_ratio - 1.0).abs() > 1e-6
             && segments.len() > 1
@@ -379,18 +655,22 @@ impl HybridStretcher {
         // Step 3: Build explicit timeline bookkeeping for exact output length.
         let target_output_len = self.params.output_length(input.len());
         let base_segment_target_lens = compute_base_segment_target_lengths(segments);
-        let crossfade_plan = match self.params.crossfade_mode {
+        let (crossfade_plan, crossfade_shapes) = match self.params.crossfade_mode {
             crate::core::types::CrossfadeMode::Fixed(secs) => {
                 let crossfade = compute_fixed_crossfade_len(
                     self.params.sample_rate,
                     secs,
                     &base_segment_target_lens,
                 );
-                vec![crossfade; segments.len().saturating_sub(1)]
+                (vec![crossfade; segments.len().saturating_sub(1)], None)
             }
-            crate::core::types::CrossfadeMode::Adaptive => {
-                compute_adaptive_crossfade_lens(segments, self.params.sample_rate)
-            }
+            crate::core::types::CrossfadeMode::Adaptive => (
+                compute_adaptive_crossfade_lens(segments, self.params.sample_rate),
+                Some(compute_adaptive_crossfade_shapes(
+                    segments,
+                    self.params.sample_rate,
+                )),
+            ),
         };
 
         // Crossfades shorten concatenated output. Compensate by adding each
@@ -412,15 +692,22 @@ impl HybridStretcher {
             self.params.window_type,
             self.params.phase_locking_mode,
         );
+        pv.set_adaptive_phase_locking(self.params.adaptive_phase_locking);
+        pv.set_envelope_strength(self.params.envelope_strength);
+        pv.set_adaptive_envelope_order(self.params.adaptive_envelope_order);
 
         // Multi-resolution: 3-band filterbank stretcher (sub-bass / mid / high)
         let mut multi_res = if self.params.multi_resolution {
-            Some(MultiResolutionStretcher::new(
+            let mut mr = MultiResolutionStretcher::new(
                 self.params.fft_size,
                 self.params.stretch_ratio,
                 self.params.sample_rate,
                 self.params.sub_bass_cutoff,
-            ))
+            );
+            mr.set_adaptive_phase_locking(self.params.adaptive_phase_locking);
+            mr.set_envelope_strength(self.params.envelope_strength);
+            mr.set_adaptive_envelope_order(self.params.adaptive_envelope_order);
+            Some(mr)
         } else {
             None
         };
@@ -480,7 +767,11 @@ impl HybridStretcher {
                 concatenate_with_crossfade_report(&output_segments, &crossfade_plan)
             }
             crate::core::types::CrossfadeMode::Adaptive => {
-                concatenate_with_adaptive_crossfade_report(&output_segments, &crossfade_plan)
+                concatenate_with_adaptive_crossfade_report(
+                    &output_segments,
+                    &crossfade_plan,
+                    crossfade_shapes.as_deref(),
+                )
             }
         };
 
@@ -537,10 +828,17 @@ impl HybridStretcher {
         // prefix is linearly resampled (perfect for silence) and only the
         // remainder is PV-processed.
         let hop = self.params.hop_size;
+        if hop == 0 {
+            return crate::core::resample::resample_linear(seg_data, out_len.max(1));
+        }
         if seg_data.len() > hop {
             let mut silence_end = 0usize;
             let mut pos = 0usize;
-            while pos + hop <= seg_data.len() {
+            let max_windows = seg_data.len().saturating_div(hop).saturating_add(1);
+            for _ in 0..max_windows {
+                if pos + hop > seg_data.len() {
+                    break;
+                }
                 let rms = (seg_data[pos..pos + hop].iter().map(|&s| s * s).sum::<f32>()
                     / hop as f32)
                     .sqrt();
@@ -655,19 +953,56 @@ impl HybridStretcher {
                 crate::core::resample::resample_linear(&percussive, percussive_out_len.max(1))
             });
 
-        // Sum the two components, zero-padding shorter to match longer.
+        // Optional explicit residual/noise branch:
+        // residual = input - (harmonic + percussive).
+        let residual_stretched = if self.params.residual_branch && self.params.residual_mix > 0.0 {
+            let residual: Vec<f32> = seg_data
+                .iter()
+                .copied()
+                .zip(harmonic.iter().copied().zip(percussive.iter().copied()))
+                .map(|(x, (h, p))| x - h - p)
+                .collect();
+            let residual_rms = (residual.iter().map(|&s| s * s).sum::<f32>()
+                / residual.len().max(1) as f32)
+                .sqrt();
+            if residual_rms > 1e-5 {
+                let residual_out_len = (residual.len() as f64 * seg_ratio).round() as usize;
+                Some(crate::core::resample::resample_linear(
+                    &residual,
+                    residual_out_len.max(1),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Sum components, zero-padding shorter to match longer.
         // Zero-padding preserves phase coherence — resampling to a common
         // length would shift phases and cause destructive interference.
-        let out_len = harmonic_stretched.len().max(percussive_stretched.len());
-        let zeros = std::iter::repeat(0.0f32);
-        let output: Vec<f32> = harmonic_stretched
-            .iter()
-            .copied()
-            .chain(zeros.clone())
-            .zip(percussive_stretched.iter().copied().chain(zeros))
-            .take(out_len)
-            .map(|(h, p)| h + p)
-            .collect();
+        let out_len = harmonic_stretched
+            .len()
+            .max(percussive_stretched.len())
+            .max(
+                residual_stretched
+                    .as_ref()
+                    .map(|res| res.len())
+                    .unwrap_or(0),
+            );
+        let mut output = vec![0.0f32; out_len];
+        for (i, &v) in harmonic_stretched.iter().enumerate() {
+            output[i] += v;
+        }
+        for (i, &v) in percussive_stretched.iter().enumerate() {
+            output[i] += v;
+        }
+        if let Some(residual) = residual_stretched.as_ref() {
+            let mix = self.params.residual_mix.clamp(0.0, 1.5);
+            for (i, &v) in residual.iter().enumerate() {
+                output[i] += v * mix;
+            }
+        }
 
         Some(output)
     }
@@ -704,6 +1039,9 @@ impl HybridStretcher {
                 self.params.envelope_preservation,
                 self.params.envelope_order,
             );
+            sub_pv.set_adaptive_phase_locking(self.params.adaptive_phase_locking);
+            sub_pv.set_envelope_strength(self.params.envelope_strength);
+            sub_pv.set_adaptive_envelope_order(self.params.adaptive_envelope_order);
             sub_pv
                 .process(&sub_bass)
                 .unwrap_or_else(|_| crate::core::resample::resample_linear(&sub_bass, target_len))
@@ -744,14 +1082,24 @@ impl HybridStretcher {
             return vec![];
         }
 
-        // Attack portion: longer direct copy keeps kick onset and early low-end
-        // phase relationship intact before WSOLA handles the decay.
-        let attack_samples = ((self.params.sample_rate as f64 * TRANSIENT_ATTACK_COPY_SECS)
-            as usize)
-            .min(seg_data.len())
-            .max(1);
-        // Crossfade duration between attack and decay (2ms)
-        let crossfade_len = ((self.params.sample_rate as f64 * 0.002) as usize)
+        let transient_class = if self.params.transient_class_adaptive_wsola {
+            classify_transient_segment(seg_data, self.params.sample_rate)
+        } else {
+            TransientClass::Snare
+        };
+        let profile = transient_wsola_profile(transient_class);
+
+        // Attack portion: direct copy keeps kick onset and early low-end phase
+        // relationship intact. Anchor this region to the local transient center
+        // so small onset-detector jitter does not push the true attack into the
+        // WSOLA-only decay branch.
+        let attack_samples = compute_anchored_attack_samples(
+            seg_data,
+            self.params.sample_rate,
+            profile.attack_copy_secs,
+        );
+        // Crossfade duration between attack and decay.
+        let crossfade_len = ((self.params.sample_rate as f64 * profile.crossfade_secs) as usize)
             .min(attack_samples / 2)
             .max(1);
 
@@ -789,16 +1137,15 @@ impl HybridStretcher {
         }
 
         let decay_stretched = {
-            let seg_size = self
-                .params
-                .wsola_segment_size
-                .min(decay.len() / 2)
-                .max(MIN_WSOLA_SEGMENT);
+            let base_seg = ((self.params.wsola_segment_size as f64) * profile.segment_scale)
+                .round()
+                .max(MIN_WSOLA_SEGMENT as f64) as usize;
+            let seg_size = base_seg.min(decay.len() / 2).max(MIN_WSOLA_SEGMENT);
             let boosted_search = ((self.params.effective_wsola_search_range() as f64)
-                * TRANSIENT_DECAY_SEARCH_BOOST)
+                * profile.search_boost)
                 .round() as usize;
             let transient_search_floor =
-                (self.params.sample_rate as f64 * TRANSIENT_DECAY_SEARCH_FLOOR_SECS) as usize;
+                (self.params.sample_rate as f64 * profile.search_floor_secs) as usize;
             let search = boosted_search
                 .max(transient_search_floor)
                 .max(MIN_WSOLA_SEARCH)
@@ -886,7 +1233,7 @@ impl HybridStretcher {
         let mut pos = 0;
 
         for (i, &onset) in onsets.iter().enumerate() {
-            if onset <= pos {
+            if onset < pos {
                 continue;
             }
 
@@ -901,13 +1248,14 @@ impl HybridStretcher {
                 });
             }
 
-            let strength = strengths.get(i).copied().unwrap_or(1.0);
-            let is_transient_anchor = strength_marks_transient(strength);
+            let strength_raw = strengths.get(i).copied().unwrap_or(1.0);
+            let is_transient_anchor = strength_marks_transient(strength_raw);
             if !is_transient_anchor {
                 // Beat-only anchor: create a tonal boundary without a transient segment.
                 pos = tonal_end;
                 continue;
             }
+            let strength = strength_raw.clamp(0.0, 1.0);
 
             // Adaptive transient region: scale by onset strength
             // region = min + (max - min) * (0.3 + 0.7 * strength)
@@ -1053,21 +1401,36 @@ fn enforce_exact_output_length(output: Vec<f32>, target_len: usize) -> Vec<f32> 
 }
 
 /// Adaptive crossfade durations in seconds, by segment transition type.
-/// Tonal→Transient: moderate transition to preserve onset while avoiding pops.
-const CROSSFADE_TONAL_TO_TRANSIENT_SECS: f64 = 0.011;
-/// Transient→Tonal: short crossfade to preserve attack crispness.
-const CROSSFADE_TRANSIENT_TO_TONAL_SECS: f64 = 0.009;
-/// Tonal→Tonal: longer crossfade for smooth blending.
-const CROSSFADE_TONAL_TO_TONAL_SECS: f64 = 0.017;
-/// Transient→Transient: minimal blending, but enough to avoid pops.
-const CROSSFADE_TRANSIENT_TO_TRANSIENT_SECS: f64 = 0.005;
+/// Tonal→Transient: short transition to preserve onset timing.
+const CROSSFADE_TONAL_TO_TRANSIENT_SECS: f64 = 0.005;
+/// Transient→Tonal: short handoff to keep attack edges crisp.
+const CROSSFADE_TRANSIENT_TO_TONAL_SECS: f64 = 0.004;
+/// Tonal→Tonal: moderately longer crossfade for smooth blending.
+const CROSSFADE_TONAL_TO_TONAL_SECS: f64 = 0.012;
+/// Transient→Transient: minimal blending, just enough to avoid clicks.
+const CROSSFADE_TRANSIENT_TO_TRANSIENT_SECS: f64 = 0.003;
 /// Lowest frequency (Hz) for fixed/tonal crossfade minimum duration.
 const CROSSFADE_MIN_FREQ_HZ_TONAL: f64 = 60.0;
 /// Lowest frequency (Hz) for transient-boundary crossfades.
 ///
 /// Using a higher floor frequency shortens transient boundary overlaps so kick
 /// attacks are not smeared by long blends.
-const CROSSFADE_MIN_FREQ_HZ_TRANSIENT: f64 = 180.0;
+const CROSSFADE_MIN_FREQ_HZ_TRANSIENT: f64 = 320.0;
+/// Base crossfade-shape exponent for tonal boundaries.
+///
+/// `1.0` maps to the standard raised-cosine shape.
+const CROSSFADE_SHAPE_TONAL: f32 = 1.0;
+/// Sharper crossfade-shape exponent for tonal↔transient boundaries.
+///
+/// Values >1.0 keep more of the left segment early in the overlap and switch
+/// later toward the right segment, reducing attack smearing.
+const CROSSFADE_SHAPE_TRANSIENT_BOUNDARY: f32 = 1.7;
+/// Crossfade-shape exponent for transient↔transient boundaries.
+const CROSSFADE_SHAPE_TRANSIENT_TO_TRANSIENT: f32 = 1.4;
+/// Safety clamp for adaptive curve exponents.
+const CROSSFADE_SHAPE_MIN: f32 = 0.5;
+/// Safety clamp for adaptive curve exponents.
+const CROSSFADE_SHAPE_MAX: f32 = 3.0;
 
 /// Computes per-boundary crossfade lengths based on segment transitions.
 ///
@@ -1075,8 +1438,13 @@ const CROSSFADE_MIN_FREQ_HZ_TRANSIENT: f64 = 180.0;
 /// (length = segments.len() - 1).
 ///
 /// Each crossfade is at least 2 cycles of a transition-dependent minimum
-/// frequency (shorter at transient boundaries, longer for tonal boundaries),
-/// and at most 25% of the shorter adjacent segment's output length.
+/// frequency (shorter at transient boundaries, longer for tonal boundaries).
+///
+/// The upper cap is 25% of a boundary reference length:
+/// - default: shorter adjacent segment output length
+/// - low-confidence transient boundaries: a blend toward the longer adjacent
+///   segment so uncertain micro-transients can be smoothed more aggressively
+///   instead of being strictly limited by a tiny region length.
 fn compute_adaptive_crossfade_lens(segments: &[Segment], sample_rate: u32) -> Vec<usize> {
     if segments.len() <= 1 {
         return vec![];
@@ -1087,29 +1455,46 @@ fn compute_adaptive_crossfade_lens(segments: &[Segment], sample_rate: u32) -> Ve
         let prev = &segments[i - 1];
         let cur = &segments[i];
 
-        let secs = match (prev.is_transient, cur.is_transient) {
+        let mut secs = match (prev.is_transient, cur.is_transient) {
             (false, true) => CROSSFADE_TONAL_TO_TRANSIENT_SECS,
             (true, false) => CROSSFADE_TRANSIENT_TO_TONAL_SECS,
             (false, false) => CROSSFADE_TONAL_TO_TONAL_SECS,
             (true, true) => CROSSFADE_TRANSIENT_TO_TRANSIENT_SECS,
         };
+        let low_conf = low_confidence_boundary_factor(prev, cur, sample_rate);
+        if low_conf > 0.0 {
+            secs += (CROSSFADE_TONAL_TO_TONAL_SECS - secs) * LOW_CONF_TRANSITION_BLEND * low_conf;
+        }
         let mut crossfade_samples = (sample_rate as f64 * secs) as usize;
 
         // Enforce transition-dependent minimum:
         // transient boundaries can use shorter overlaps than tonal boundaries.
         let min_freq_hz = if prev.is_transient || cur.is_transient {
             CROSSFADE_MIN_FREQ_HZ_TRANSIENT
+                - (CROSSFADE_MIN_FREQ_HZ_TRANSIENT - CROSSFADE_MIN_FREQ_HZ_TONAL)
+                    * LOW_CONF_TRANSITION_BLEND
+                    * low_conf
         } else {
             CROSSFADE_MIN_FREQ_HZ_TONAL
         };
         let min_crossfade_samples = (2.0 * sample_rate as f64 / min_freq_hz) as usize;
         crossfade_samples = crossfade_samples.max(min_crossfade_samples);
 
-        // Cap at 25% of the shorter adjacent segment's output length
+        // Cap at 25% of a boundary reference output length.
         let prev_out_len = ((prev.end - prev.start) as f64 * prev.stretch_ratio).round() as usize;
         let cur_out_len = ((cur.end - cur.start) as f64 * cur.stretch_ratio).round() as usize;
         let shortest_segment_len = prev_out_len.min(cur_out_len);
-        let max_crossfade = shortest_segment_len / 4;
+        let longest_segment_len = prev_out_len.max(cur_out_len);
+        let cap_basis = if low_conf > 0.0 && (prev.is_transient || cur.is_transient) {
+            let blended = shortest_segment_len as f64
+                + (longest_segment_len - shortest_segment_len) as f64
+                    * LOW_CONF_TRANSITION_BLEND
+                    * low_conf;
+            blended.round() as usize
+        } else {
+            shortest_segment_len
+        };
+        let max_crossfade = cap_basis / 4;
         crossfade_samples = crossfade_samples.min(max_crossfade);
 
         lens.push(crossfade_samples);
@@ -1118,13 +1503,73 @@ fn compute_adaptive_crossfade_lens(segments: &[Segment], sample_rate: u32) -> Ve
     lens
 }
 
+/// Computes per-boundary crossfade shape exponents for adaptive mode.
+///
+/// Shape `1.0` is standard raised-cosine.
+/// Transient boundaries use sharper curves (>1.0) to preserve attacks by
+/// delaying the handoff, while low-confidence transient boundaries relax back
+/// toward tonal (`1.0`) to avoid abrupt switching around uncertain anchors.
+fn compute_adaptive_crossfade_shapes(segments: &[Segment], sample_rate: u32) -> Vec<f32> {
+    if segments.len() <= 1 {
+        return vec![];
+    }
+
+    let mut shapes = Vec::with_capacity(segments.len() - 1);
+    for i in 1..segments.len() {
+        let prev = &segments[i - 1];
+        let cur = &segments[i];
+        let low_conf = low_confidence_boundary_factor(prev, cur, sample_rate) as f32;
+
+        let base = match (prev.is_transient, cur.is_transient) {
+            (false, false) => CROSSFADE_SHAPE_TONAL,
+            (true, true) => CROSSFADE_SHAPE_TRANSIENT_TO_TRANSIENT,
+            _ => CROSSFADE_SHAPE_TRANSIENT_BOUNDARY,
+        };
+
+        let shape = if prev.is_transient || cur.is_transient {
+            let relax =
+                (base - CROSSFADE_SHAPE_TONAL) * LOW_CONF_TRANSITION_BLEND as f32 * low_conf;
+            base - relax
+        } else {
+            base
+        };
+        shapes.push(shape.clamp(CROSSFADE_SHAPE_MIN, CROSSFADE_SHAPE_MAX));
+    }
+
+    shapes
+}
+
+#[inline]
+fn low_confidence_boundary_factor(prev: &Segment, cur: &Segment, sample_rate: u32) -> f64 {
+    let threshold = (sample_rate as f64 * LOW_CONF_TRANSIENT_REGION_SECS).round() as usize;
+    if threshold == 0 {
+        return 0.0;
+    }
+
+    let mut factor = 0.0f64;
+    if prev.is_transient {
+        let len = prev.end.saturating_sub(prev.start);
+        if len < threshold {
+            factor = factor.max(1.0 - len as f64 / threshold as f64);
+        }
+    }
+    if cur.is_transient {
+        let len = cur.end.saturating_sub(cur.start);
+        if len < threshold {
+            factor = factor.max(1.0 - len as f64 / threshold as f64);
+        }
+    }
+    factor.clamp(0.0, 1.0)
+}
+
 /// Concatenates segments with per-boundary crossfade lengths and reports
 /// the actual overlap used at each boundary.
 fn concatenate_with_adaptive_crossfade_report(
     segments: &[Vec<f32>],
     crossfade_lens: &[usize],
+    crossfade_shapes: Option<&[f32]>,
 ) -> (Vec<f32>, Vec<usize>) {
-    concatenate_with_boundary_crossfades(segments, crossfade_lens)
+    concatenate_with_boundary_crossfades(segments, crossfade_lens, crossfade_shapes)
 }
 
 /// Concatenates segments using one overlap value per boundary.
@@ -1134,6 +1579,7 @@ fn concatenate_with_adaptive_crossfade_report(
 fn concatenate_with_boundary_crossfades(
     segments: &[Vec<f32>],
     crossfade_lens: &[usize],
+    crossfade_shapes: Option<&[f32]>,
 ) -> (Vec<f32>, Vec<usize>) {
     match segments.len() {
         0 => return (vec![], vec![]),
@@ -1156,11 +1602,17 @@ fn concatenate_with_boundary_crossfades(
         let fade_len = requested.min(output.len()).min(segment.len());
         actual_overlaps.push(fade_len);
         let output_start = output.len() - fade_len;
+        let shape = crossfade_shapes
+            .and_then(|shapes| shapes.get(idx - 1))
+            .copied()
+            .unwrap_or(CROSSFADE_SHAPE_TONAL)
+            .clamp(CROSSFADE_SHAPE_MIN, CROSSFADE_SHAPE_MAX);
 
         // Crossfade overlap region with raised cosine
         for i in 0..fade_len {
             let t = i as f32 / fade_len as f32;
-            let fade_out = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
+            let shaped_t = t.powf(shape);
+            let fade_out = 0.5 * (1.0 + (std::f32::consts::PI * shaped_t).cos());
             let fade_in = 1.0 - fade_out;
             output[output_start + i] = output[output_start + i] * fade_out + segment[i] * fade_in;
         }
@@ -1510,9 +1962,14 @@ fn generate_subdivision_grid_with_phase(
     }
 
     let phase = (phase_offset_samples as f64).rem_euclid(sub_interval);
-    let mut grid = Vec::new();
+    let estimated_count = (total_samples as f64 / sub_interval).ceil() as usize + 1;
+    let max_points = estimated_count.min(MAX_SUBDIVISION_GRID_POINTS);
+    let mut grid = Vec::with_capacity(max_points);
     let mut pos = phase;
-    while pos < total_samples as f64 {
+    for _ in 0..max_points {
+        if pos >= total_samples as f64 {
+            break;
+        }
         grid.push(pos);
         pos += sub_interval;
     }
@@ -1523,7 +1980,7 @@ fn generate_subdivision_grid_with_phase(
 #[cfg(test)]
 fn concatenate_with_crossfade(segments: &[Vec<f32>], crossfade_len: usize) -> Vec<f32> {
     let crossfade_lens = vec![crossfade_len; segments.len().saturating_sub(1)];
-    concatenate_with_boundary_crossfades(segments, &crossfade_lens).0
+    concatenate_with_boundary_crossfades(segments, &crossfade_lens, None).0
 }
 
 /// Concatenates segments with provided crossfade lengths and reports boundary usage.
@@ -1531,7 +1988,7 @@ fn concatenate_with_crossfade_report(
     segments: &[Vec<f32>],
     crossfade_lens: &[usize],
 ) -> (Vec<f32>, Vec<usize>) {
-    concatenate_with_boundary_crossfades(segments, crossfade_lens)
+    concatenate_with_boundary_crossfades(segments, crossfade_lens, None)
 }
 
 #[cfg(test)]
@@ -1591,6 +2048,135 @@ mod tests {
         let stretcher = HybridStretcher::new(params);
         let output = stretcher.process(&input).unwrap();
         assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_is_sparse_impulsive_detects_impulse_train_like_content() {
+        let sample_rate = 44_100usize;
+        let len = sample_rate * 2;
+        let mut input = vec![0.0f32; len];
+        for onset in [
+            0usize,
+            sample_rate / 2,
+            sample_rate,
+            sample_rate + sample_rate / 2,
+        ] {
+            for i in 0..(sample_rate / 100) {
+                let idx = onset + i;
+                if idx >= len {
+                    break;
+                }
+                let env = (-6.0 * i as f32 / (sample_rate / 100) as f32).exp();
+                input[idx] += 0.95 * env;
+            }
+        }
+
+        assert!(is_sparse_impulsive(&input));
+    }
+
+    #[test]
+    fn test_is_sparse_impulsive_rejects_dense_tonal_content() {
+        let sample_rate = 44_100usize;
+        let len = sample_rate * 2;
+        let input: Vec<f32> = (0..len)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                0.7 * (2.0 * std::f32::consts::PI * 110.0 * t).sin()
+                    + 0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+            })
+            .collect();
+
+        assert!(!is_sparse_impulsive(&input));
+    }
+
+    #[test]
+    fn test_is_sparse_impulsive_detects_sparse_noise_bursts() {
+        let sample_rate = 44_100usize;
+        let len = sample_rate * 2;
+        let mut input = vec![0.0f32; len];
+        let burst_len = sample_rate / 33; // ~30ms
+        let spacing = sample_rate * 3 / 4; // 750ms
+        let mut seed = 0x1f2e_3d4cu32;
+
+        let mut pos = 0usize;
+        while pos < len {
+            for i in 0..burst_len {
+                let idx = pos + i;
+                if idx >= len {
+                    break;
+                }
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let noise = ((seed >> 8) as f32 / (u32::MAX >> 8) as f32) * 2.0 - 1.0;
+                let env =
+                    0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / burst_len as f32).cos();
+                input[idx] += 0.8 * noise * env;
+            }
+            pos = pos.saturating_add(spacing);
+        }
+
+        assert!(is_sparse_impulsive(&input));
+    }
+
+    #[test]
+    fn test_should_use_live_beat_aware_anchors_requires_reliable_count() {
+        let weak = vec![0.05, 0.1, 0.15, 0.19];
+        assert!(!should_use_live_beat_aware_anchors(&weak));
+
+        let one_strong = vec![0.1, 0.25, 0.05];
+        assert!(!should_use_live_beat_aware_anchors(&one_strong));
+
+        let two_strong = vec![0.22, 0.35, 0.1];
+        assert!(should_use_live_beat_aware_anchors(&two_strong));
+    }
+
+    #[test]
+    fn test_should_force_tonal_render_for_tiny_single_transient() {
+        let segments = vec![
+            Segment {
+                start: 0,
+                end: 1000,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 1000,
+                end: 1020,
+                is_transient: true,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 1020,
+                end: 10_000,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+        ];
+        assert!(should_force_tonal_render(&segments, 10_000));
+    }
+
+    #[test]
+    fn test_should_not_force_tonal_render_for_multi_transient_content() {
+        let segments = vec![
+            Segment {
+                start: 0,
+                end: 400,
+                is_transient: true,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 400,
+                end: 2_000,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 2_000,
+                end: 2_500,
+                is_transient: true,
+                stretch_ratio: 1.0,
+            },
+        ];
+        assert!(!should_force_tonal_render(&segments, 10_000));
     }
 
     #[test]
@@ -2112,16 +2698,18 @@ mod tests {
 
     #[test]
     fn test_segment_audio_onset_at_zero() {
-        // Onset at position 0: onset <= pos (0 <= 0) so it's skipped.
-        // Entire input becomes a single tonal segment.
+        // Onset at position 0 should create an initial transient segment.
         let params = StretchParams::new(1.5).with_sample_rate(44100);
         let stretcher = HybridStretcher::new(params);
         let segments = stretcher.segment_audio(44100, &[0], &[]);
 
-        assert_eq!(segments.len(), 1);
-        assert!(!segments[0].is_transient);
+        assert!(segments.len() >= 2);
+        assert!(segments[0].is_transient);
         assert_eq!(segments[0].start, 0);
-        assert_eq!(segments[0].end, 44100);
+        assert!(segments[0].end > 0);
+        let last = segments.last().unwrap();
+        assert!(!last.is_transient);
+        assert_eq!(last.end, 44100);
     }
 
     #[test]
@@ -2204,6 +2792,93 @@ mod tests {
         assert!(!segments[1].is_transient);
         assert_eq!(segments[2].start, 20000);
         assert!(segments[2].is_transient);
+    }
+
+    #[test]
+    fn test_compute_anchored_attack_samples_extends_for_late_center() {
+        let sample_rate = 44_100u32;
+        let base_attack =
+            ((sample_rate as f64 * TRANSIENT_ATTACK_COPY_SECS).round() as usize).max(1);
+        let mut seg = vec![0.0f32; 4096];
+        let late_center = (base_attack + 180).min(seg.len() - 1);
+        seg[late_center] = 1.0;
+
+        let attack_samples =
+            compute_anchored_attack_samples(&seg, sample_rate, TRANSIENT_ATTACK_COPY_SECS);
+        assert!(
+            attack_samples > base_attack,
+            "Anchored attack should extend beyond base window for late centers"
+        );
+        assert!(
+            attack_samples > late_center,
+            "Anchored attack must include detected late center"
+        );
+    }
+
+    #[test]
+    fn test_compute_anchored_attack_samples_stays_near_base_for_early_center() {
+        let sample_rate = 44_100u32;
+        let base_attack =
+            ((sample_rate as f64 * TRANSIENT_ATTACK_COPY_SECS).round() as usize).max(1);
+        let mut seg = vec![0.0f32; 4096];
+        seg[24] = 1.0;
+
+        let attack_samples =
+            compute_anchored_attack_samples(&seg, sample_rate, TRANSIENT_ATTACK_COPY_SECS);
+        assert!(
+            attack_samples >= base_attack,
+            "Anchored attack should never shrink below base attack"
+        );
+        assert!(
+            attack_samples <= base_attack + 2,
+            "Early center should keep anchored attack close to base length"
+        );
+    }
+
+    #[test]
+    fn test_classify_transient_segment_kick_like() {
+        let sample_rate = 44_100u32;
+        let len = 2048usize;
+        let signal: Vec<f32> = (0..len)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                let env = (-35.0 * t).exp();
+                env * (2.0 * std::f32::consts::PI * 75.0 * t).sin()
+            })
+            .collect();
+        assert_eq!(
+            classify_transient_segment(&signal, sample_rate),
+            TransientClass::Kick
+        );
+    }
+
+    #[test]
+    fn test_classify_transient_segment_hat_like() {
+        let sample_rate = 44_100u32;
+        let len = 2048usize;
+        let signal: Vec<f32> = (0..len)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                let env = (-80.0 * t).exp();
+                let carrier = if i % 2 == 0 { 1.0 } else { -1.0 };
+                env * carrier
+            })
+            .collect();
+        assert_eq!(
+            classify_transient_segment(&signal, sample_rate),
+            TransientClass::Hat
+        );
+    }
+
+    #[test]
+    fn test_transient_wsola_profile_ranges() {
+        let kick = transient_wsola_profile(TransientClass::Kick);
+        let snare = transient_wsola_profile(TransientClass::Snare);
+        let hat = transient_wsola_profile(TransientClass::Hat);
+        assert!(kick.attack_copy_secs > snare.attack_copy_secs);
+        assert!(hat.attack_copy_secs < snare.attack_copy_secs);
+        assert!(kick.search_boost > snare.search_boost);
+        assert!(hat.search_boost < snare.search_boost);
     }
 
     // --- concatenate_with_crossfade edge cases ---
@@ -2337,6 +3012,171 @@ mod tests {
     }
 
     #[test]
+    fn test_adaptive_crossfade_low_confidence_boundary_gets_more_blend() {
+        let confident = vec![
+            Segment {
+                start: 0,
+                end: 12000,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 12000,
+                end: 22000, // confident (long) transient
+                is_transient: true,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 22000,
+                end: 32000,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+        ];
+
+        let low_conf = vec![
+            Segment {
+                start: 0,
+                end: 12000,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 12000,
+                end: 12200, // very short transient -> low confidence proxy
+                is_transient: true,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 12200,
+                end: 22200,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+        ];
+
+        let lens_confident = compute_adaptive_crossfade_lens(&confident, 44100);
+        let lens_low_conf = compute_adaptive_crossfade_lens(&low_conf, 44100);
+        assert_eq!(lens_confident.len(), 2);
+        assert_eq!(lens_low_conf.len(), 2);
+        assert!(
+            lens_low_conf[0] >= lens_confident[0],
+            "Low-confidence tonal→transient boundary should not be shorter"
+        );
+        assert!(
+            lens_low_conf[1] >= lens_confident[1],
+            "Low-confidence transient→tonal boundary should not be shorter"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_crossfade_shapes_sharper_on_transient_boundaries() {
+        let segments = vec![
+            Segment {
+                start: 0,
+                end: 10000,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 10000,
+                end: 20000,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 20000,
+                end: 30000,
+                is_transient: true,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 30000,
+                end: 40000,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+        ];
+
+        let shapes = compute_adaptive_crossfade_shapes(&segments, 44100);
+        assert_eq!(shapes.len(), 3);
+        assert!(
+            shapes[1] > shapes[0],
+            "Tonal→transient boundary should use a sharper curve than tonal→tonal"
+        );
+        assert!(
+            shapes[2] > shapes[0],
+            "Transient→tonal boundary should use a sharper curve than tonal→tonal"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_crossfade_shapes_relax_when_low_confidence() {
+        let confident = vec![
+            Segment {
+                start: 0,
+                end: 12000,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 12000,
+                end: 22000,
+                is_transient: true,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 22000,
+                end: 32000,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+        ];
+
+        let low_conf = vec![
+            Segment {
+                start: 0,
+                end: 12000,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 12000,
+                end: 12200,
+                is_transient: true,
+                stretch_ratio: 1.0,
+            },
+            Segment {
+                start: 12200,
+                end: 22200,
+                is_transient: false,
+                stretch_ratio: 1.0,
+            },
+        ];
+
+        let shapes_confident = compute_adaptive_crossfade_shapes(&confident, 44100);
+        let shapes_low_conf = compute_adaptive_crossfade_shapes(&low_conf, 44100);
+        assert_eq!(shapes_confident.len(), 2);
+        assert_eq!(shapes_low_conf.len(), 2);
+        assert!(
+            shapes_low_conf[0] < shapes_confident[0],
+            "Low-confidence tonal→transient boundary should relax curve sharpness"
+        );
+        assert!(
+            shapes_low_conf[1] < shapes_confident[1],
+            "Low-confidence transient→tonal boundary should relax curve sharpness"
+        );
+        assert!(
+            shapes_low_conf[0] >= CROSSFADE_SHAPE_TONAL,
+            "Low-confidence shape should stay at or above tonal baseline"
+        );
+        assert!(
+            shapes_low_conf[1] >= CROSSFADE_SHAPE_TONAL,
+            "Low-confidence shape should stay at or above tonal baseline"
+        );
+    }
+
+    #[test]
     fn test_reconcile_total_segment_targets_hits_desired_sum() {
         let mut targets = vec![100usize, 200, 300];
         reconcile_total_segment_targets(&mut targets, 700);
@@ -2424,6 +3264,53 @@ mod tests {
         let output = stretcher.process(&input).unwrap();
         assert!(!output.is_empty());
         assert!(output.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn test_hpss_residual_branch_toggle_affects_output() {
+        let sample_rate = 44_100u32;
+        let len = sample_rate as usize * 2;
+        let mut seed = 0x1234ABCDu32;
+        let input: Vec<f32> = (0..len)
+            .map(|i| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = ((seed >> 8) as f32 / (u32::MAX >> 8) as f32) * 2.0 - 1.0;
+                let t = i as f32 / sample_rate as f32;
+                0.45 * (2.0 * PI * 220.0 * t).sin()
+                    + 0.20 * (2.0 * PI * 1760.0 * t).sin()
+                    + 0.05 * noise
+            })
+            .collect();
+
+        let base = StretchParams::new(1.35)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_hpss(true)
+            .with_multi_resolution(false)
+            .with_band_split(false)
+            .with_residual_mix(1.0);
+
+        let on = HybridStretcher::new(base.clone().with_residual_branch(true))
+            .process(&input)
+            .unwrap();
+        let off = HybridStretcher::new(base.with_residual_branch(false))
+            .process(&input)
+            .unwrap();
+
+        assert_eq!(on.len(), off.len());
+        assert!(on.iter().all(|s| s.is_finite()));
+        assert!(off.iter().all(|s| s.is_finite()));
+
+        let mean_abs_diff = on
+            .iter()
+            .zip(off.iter())
+            .map(|(a, b)| (a - b).abs() as f64)
+            .sum::<f64>()
+            / on.len().max(1) as f64;
+        assert!(
+            mean_abs_diff > 1e-4,
+            "Expected residual branch to affect output, got mean abs diff {mean_abs_diff}"
+        );
     }
 
     // --- BPM-aware transient snapping tests ---

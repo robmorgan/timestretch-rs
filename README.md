@@ -136,16 +136,25 @@ println!("Duration: {:.2}s -> {:.2}s", buffer.duration_secs(), output.duration_s
 ### Pitch Shifting
 
 ```rust
-use timestretch::StretchParams;
+use timestretch::{EnvelopePreset, StretchParams};
 
 let params = StretchParams::new(1.0)
     .with_sample_rate(44100)
-    .with_channels(1);
+    .with_channels(1)
+    .with_envelope_preset(EnvelopePreset::Vocal) // stronger formant retention
+    .with_envelope_strength(1.4)
+    .with_adaptive_envelope_order(true);
 
 // Shift up one octave (2x frequency), preserving duration
 let output = timestretch::pitch_shift(&input, &params, 2.0).unwrap();
 assert_eq!(output.len(), input.len());
 ```
+
+Envelope control quick guide:
+- Default profile is `EnvelopePreset::Balanced` (`envelope_strength = 1.0`, adaptive order enabled).
+- Use `.with_envelope_preset(EnvelopePreset::Off)` for classic behavior with no formant correction.
+- Use `.with_envelope_preset(EnvelopePreset::Vocal)` for stronger vocal formant retention.
+- Use `.with_envelope_strength(x)` to scale correction (`0.0..=2.0`), and `.with_adaptive_envelope_order(true)` for content-adaptive cepstral detail.
 
 ### BPM-Based Stretching
 
@@ -289,11 +298,23 @@ cargo test --release --test benchmarks -- --nocapture
 # Quality-gate benchmark subset (CI-enforced)
 cargo test --test quality_gates -- --nocapture
 
+# Strict callback-budget gate (same mode used in CI quality-gates job)
+TIMESTRETCH_STRICT_CALLBACK_BUDGET=1 cargo test --release --test quality_gates -- --nocapture
+
+# Emit quality dashboard CSV artifacts (one file per quality gate)
+TIMESTRETCH_QUALITY_DASHBOARD_DIR=target/quality_dashboard cargo test --test quality_gates -- --nocapture
+
 # Reference-quality comparison (strict corpus required)
 TIMESTRETCH_STRICT_REFERENCE_BENCHMARK=1 TIMESTRETCH_REFERENCE_MAX_SECONDS=30 cargo test --test reference_quality -- --nocapture
 
 # Ad-hoc reference-quality run (non-strict, short window)
 TIMESTRETCH_REFERENCE_MAX_SECONDS=5 cargo test --test reference_quality -- --nocapture
+
+# Single-scenario comparison against an external Rubber Band render
+TIMESTRETCH_RUBBERBAND_ORIGINAL_WAV=benchmarks/audio/originals/loop.wav \
+TIMESTRETCH_RUBBERBAND_REFERENCE_WAV=benchmarks/audio/references/loop_rubberband.wav \
+TIMESTRETCH_RUBBERBAND_RATIO=1.113043478 \
+cargo test --test rubberband_comparison -- --nocapture
 ```
 
 See `benchmarks/README.md` for corpus setup and manifest/checksum requirements.
@@ -308,7 +329,8 @@ See `benchmarks/README.md` for corpus setup and manifest/checksum requirements.
 - **`AudioBuffer`** — holds interleaved sample data with metadata (sample rate,
   channel layout)
 - **`EdmPreset`** — enum of tuned parameter sets for EDM workflows
-- **`QualityMode`** — explicit streaming profile: `LowLatency`, `Balanced`, `MaxQuality`
+- **`EnvelopePreset`** — formant/envelope profile (`Off`, `Balanced`, `Vocal`)
+- **`QualityMode`** — explicit streaming profile: `LowLatency` (lean path, HPSS off), `Balanced`, `MaxQuality` (HPSS + adaptive crossfade/phase-lock enabled)
 - **`StreamProcessor`** — chunked real-time processor with on-the-fly ratio/tempo
   changes, `from_tempo()`/`set_tempo()`, `process_into()`, and optional persistent hybrid mode
 - **`PreAnalysisArtifact`** — serializable offline beat/onset analysis artifact
