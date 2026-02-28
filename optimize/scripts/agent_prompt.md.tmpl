@@ -18,30 +18,64 @@ ${WORST_CASES}
 - **MFCC Distance**: Measures timbral similarity. High distance means the "character" of the sound has changed.
 - **Transient Preservation**: Measures how well onsets (drum hits, etc.) are preserved. Low scores mean transients are "softened" or "doubled".
 
+## Previous Attempts (DO NOT REPEAT THESE)
+${PREVIOUS_ATTEMPTS}
+
+${DIVERSITY_HINTS}
+
 ## CRITICAL RULES
-- **Do NOT spend more than 5 turns reading code.** You must start editing quickly.
-- **Do NOT use Task/subagent tools.** Work directly — read, edit, build, score.
+- **Do NOT spend more than 5 turns reading code.** The key source code is provided below — start editing quickly.
+- **Do NOT use Task/subagent tools.** Work directly — edit, build, score.
 - **You MUST run scoring and commit if improved before your turns run out.**
+- **The Python venv is already activated.** Just run python3/pip directly — do NOT run `source optimize/.venv/bin/activate`.
+- **After each failed attempt**, append a one-line summary to `optimize/logs/attempts.log` describing what you tried and the result (e.g., "Disabled HPSS -> score dropped to 59.79, reverted").
+
+## Key Source Code (DO NOT re-read these files — they are provided here)
+
+### src/stretch/hybrid.rs (lines 1-200: core structs and config)
+```rust
+${HYBRID_HEAD}
+```
+
+### src/stretch/hybrid.rs (stretch_tonal_core method)
+```rust
+${HYBRID_STRETCH_CORE}
+```
+
+### src/stretch/phase_vocoder.rs (process method and phase logic)
+```rust
+${PV_PROCESS}
+```
+
+### src/stretch/wsola.rs (correlation and overlap-add)
+```rust
+${WSOLA_CORE}
+```
 
 ## Instructions
-1. **Quickly analyze** the relevant Rust source files in `src/stretch/` (hybrid.rs, phase_vocoder.rs, wsola.rs are the key files). Do not read every file — focus on the worst performing areas.
+1. **Review the scores and source code above.** Do not re-read these files.
 2. **Diagnose**: Look at the worst performing cases. Are they transients (drums)? Are they harmonic (sine/vocals)?
-3. **Modify**: Make **ONE** targeted change to the DSP logic to improve the scores.
+3. **If you need to read additional code** (e.g., a helper function not shown above), you may — but limit to 3 reads max.
+4. **Modify**: Make **ONE** targeted change to the DSP logic to improve the scores.
    - Focus on: window functions, overlap-add logic, phase advancement, transient detection, or cross-correlation (WSOLA).
    - Do NOT refactor or reorganize. Only modify DSP math/logic.
-4. **Build**: Run `cargo build --release` to verify compilation.
-5. **Score**: Re-run the scoring pipeline to measure the impact:
+   - Do NOT repeat any approach listed in "Previous Attempts" above.
+5. **Build**: Run `cargo build --release` to verify compilation.
+6. **Score**: Re-run the scoring pipeline to measure the impact:
    ```bash
-   source optimize/.venv/bin/activate
    ./optimize/scripts/run_test_suite.py
    ./optimize/scripts/score.py --batch optimize/logs/scores_verify.json
    ```
-6. **Commit if improved**: If the new average score is higher than **${AVG_SCORE}**, you MUST commit:
+7. **Log the attempt**: Append a one-line summary to `optimize/logs/attempts.log`:
+   ```bash
+   echo "iter=${ITERATION}: <what you changed> -> score=<new_score> (was ${AVG_SCORE})" >> optimize/logs/attempts.log
+   ```
+8. **Commit if improved**: If the new average score is higher than **${AVG_SCORE}**, you MUST commit:
    ```bash
    git add src/
    git commit -m "opt: <brief description of change>, score=<new_score>"
    ```
    If the score did not improve, revert with `git checkout -- src/` and try a different approach. You may attempt up to 3 changes per session.
-7. **Explain**: Briefly explain what you changed and why.
+9. **Explain**: Briefly explain what you changed and why.
 
 **Your goal is to reach ${TARGET_SCORE}. Current score: ${AVG_SCORE}. Always commit improvements.**

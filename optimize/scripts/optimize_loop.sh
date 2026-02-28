@@ -134,13 +134,62 @@ for item in sorted_data:
     SCORE_HISTORY=$(tail -n 3 "$PROGRESS_CSV" | cut -d',' -f3 | tr '
 ' ' ' | xargs)
     JSON_SCORES=$(cat "$SCORES_JSON")
-    
+
+    # Load previous attempts log (if it exists)
+    ATTEMPTS_FILE="$LOG_DIR/attempts.log"
+    if [ -f "$ATTEMPTS_FILE" ] && [ -s "$ATTEMPTS_FILE" ]; then
+        PREVIOUS_ATTEMPTS=$(tail -n 20 "$ATTEMPTS_FILE")
+    else
+        PREVIOUS_ATTEMPTS="No previous attempts logged yet. You are the first agent."
+    fi
+
+    # Extract key source code sections for the prompt
+    HYBRID_HEAD=$(sed -n '1,200p' src/stretch/hybrid.rs)
+    HYBRID_STRETCH_CORE=$(sed -n '585,677p' src/stretch/hybrid.rs)
+    PV_PROCESS=$(sed -n '299,500p' src/stretch/phase_vocoder.rs)
+    WSOLA_CORE=$(sed -n '99,465p' src/stretch/wsola.rs)
+
+    # Diversity pressure: if score unchanged for 3+ iterations, suggest new directions
+    STALE_COUNT=$(tail -n 5 "$PROGRESS_CSV" | cut -d',' -f3 | sort -u | wc -l | tr -d ' ')
+    if [ "$STALE_COUNT" -eq 1 ] && [ "$i" -gt 3 ]; then
+        DIVERSITY_HINTS=$(python3 -c "
+import random
+hints = [
+    'Try adjusting the overlap factor or hop size ratio in the phase vocoder.',
+    'Try modifying the crossfade duration between WSOLA and PV segments in hybrid.rs.',
+    'Try changing the transient detection threshold or sensitivity in transient.rs.',
+    'Try adjusting the WSOLA search range or segment size for better correlation matches.',
+    'Try modifying the phase locking strategy (identity vs ROI) in the phase vocoder.',
+    'Try adjusting the sub-bass rigid phase locking cutoff frequency.',
+    'Try changing the window function (Hann vs Blackman-Harris) or its parameters.',
+    'Try adjusting the spectral envelope preservation (cepstral order) in the phase vocoder.',
+    'Try modifying the HPSS separation parameters (kernel sizes, power) in hybrid.rs.',
+    'Try adjusting the band-split crossover frequency or filter slopes.',
+    'Try improving the overlap-add normalization (window sum handling) in the phase vocoder.',
+    'Try adjusting the min gap enforcement in transient detection to better preserve onsets.',
+]
+random.shuffle(hints)
+print('## Diversity Suggestions (score has been flat — try something NEW)')
+print('The following are areas that have NOT been explored recently. Pick one:')
+for h in hints[:4]:
+    print(f'- {h}')
+")
+    else
+        DIVERSITY_HINTS=""
+    fi
+
     # Export vars for envsubst
     export ITERATION=$i
     export AVG_SCORE=$AVG_SCORE
     export TARGET_SCORE=$TARGET_SCORE
     export SCORE_HISTORY="$SCORE_HISTORY"
     export JSON_SCORES="$JSON_SCORES"
+    export PREVIOUS_ATTEMPTS="$PREVIOUS_ATTEMPTS"
+    export HYBRID_HEAD="$HYBRID_HEAD"
+    export HYBRID_STRETCH_CORE="$HYBRID_STRETCH_CORE"
+    export PV_PROCESS="$PV_PROCESS"
+    export WSOLA_CORE="$WSOLA_CORE"
+    export DIVERSITY_HINTS="$DIVERSITY_HINTS"
     export WORST_CASES=$(python3 -c "
 import json
 data = json.load(open('$SCORES_JSON'))
@@ -148,8 +197,9 @@ sorted_data = sorted(data, key=lambda x: x['total_score'])[:3]
 for d in sorted_data:
     print(f'- {d[\"description\"]}: {d[\"total_score\"]:.2f}')
 ")
-    
-    envsubst < "optimize/scripts/agent_prompt.md.tmpl" > "$PROMPT_FILE"
+
+    envsubst '$ITERATION $AVG_SCORE $TARGET_SCORE $SCORE_HISTORY $JSON_SCORES $PREVIOUS_ATTEMPTS $HYBRID_HEAD $HYBRID_STRETCH_CORE $PV_PROCESS $WSOLA_CORE $DIVERSITY_HINTS $WORST_CASES' \
+        < "optimize/scripts/agent_prompt.md.tmpl" > "$PROMPT_FILE"
     
     # 5. Run Agent (agent self-scores and commits if improved)
     AGENT_OK=1
