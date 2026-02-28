@@ -1,4 +1,4 @@
-use timestretch::{EdmPreset, StretchParams, WindowType};
+use timestretch::{EdmPreset, StreamProcessor, StretchParams, WindowType};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -23,6 +23,8 @@ fn main() {
     let mut verbose = false;
     let mut window_type: Option<WindowType> = None;
     let mut normalize = false;
+    let mut streaming = false;
+    let mut chunk_size: usize = 1024;
 
     let mut i = 3;
     while i < args.len() {
@@ -52,6 +54,11 @@ fn main() {
             "--float" => format_float = true,
             "--verbose" | "-v" => verbose = true,
             "--normalize" | "-n" => normalize = true,
+            "--streaming" => streaming = true,
+            "--chunk-size" => {
+                i += 1;
+                chunk_size = parse_usize(&args, i, "chunk-size");
+            }
             "--window" | "-w" => {
                 i += 1;
                 window_type = Some(parse_window(&args, i));
@@ -159,7 +166,35 @@ fn main() {
     let start = std::time::Instant::now();
 
     // Process
-    let output = if let Some(pf) = pitch_factor {
+    let output = if streaming {
+        eprintln!("Streaming mode (chunk size: {} frames)", chunk_size);
+        let mut processor = StreamProcessor::new(params.clone());
+        processor.set_hybrid_mode(true);
+
+        let num_channels = buffer.channels.count();
+        let samples_per_chunk = chunk_size * num_channels;
+        let mut all_output: Vec<f32> = Vec::new();
+
+        for chunk in buffer.data.chunks(samples_per_chunk) {
+            match processor.process(chunk) {
+                Ok(out) => all_output.extend_from_slice(&out),
+                Err(e) => {
+                    eprintln!("ERROR: Streaming process failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        match processor.flush() {
+            Ok(flushed) => all_output.extend_from_slice(&flushed),
+            Err(e) => {
+                eprintln!("ERROR: Streaming flush failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+
+        timestretch::AudioBuffer::new(all_output, buffer.sample_rate, buffer.channels)
+    } else if let Some(pf) = pitch_factor {
         eprintln!("Pitch shift factor: {:.4}", pf);
         match timestretch::pitch_shift_buffer(&buffer, &params, pf) {
             Ok(o) => o,
@@ -230,6 +265,8 @@ fn print_usage() {
     eprintln!("Options:");
     eprintln!("  --preset <name>   dj, house, halftime, ambient, vocal");
     eprintln!("  --window <type>   hann (default), blackman-harris, kaiser:<beta>");
+    eprintln!("  --streaming       Use streaming (chunked) processor instead of batch");
+    eprintln!("  --chunk-size <N>  Frames per streaming chunk (default: 1024)");
     eprintln!("  --normalize, -n   Match output RMS to input (consistent loudness)");
     eprintln!("  --24bit           Write 24-bit PCM output (default: 16-bit)");
     eprintln!("  --float           Write 32-bit float output");
@@ -245,6 +282,20 @@ fn print_usage() {
 }
 
 fn parse_f64(args: &[String], idx: usize, name: &str) -> f64 {
+    if idx >= args.len() {
+        eprintln!("ERROR: --{} requires a value", name);
+        std::process::exit(1);
+    }
+    match args[idx].parse() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("ERROR: Invalid {}: {}", name, args[idx]);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn parse_usize(args: &[String], idx: usize, name: &str) -> usize {
     if idx >= args.len() {
         eprintln!("ERROR: --{} requires a value", name);
         std::process::exit(1);

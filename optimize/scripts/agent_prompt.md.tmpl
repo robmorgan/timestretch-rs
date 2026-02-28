@@ -4,6 +4,8 @@ You are an expert DSP engineer. Your goal is to optimize the time-stretching qua
 
 ## Current Performance Summary
 - **Average Score:** ${AVG_SCORE} / 100 (Target: ${TARGET_SCORE})
+- **Batch Average:** ${BATCH_AVG_SCORE} / 100
+- **Streaming Average:** ${STREAM_AVG_SCORE} / 100
 - **Score Trend (Last 3):** ${SCORE_HISTORY}
 
 ## Detailed Metrics per Test Case
@@ -22,6 +24,13 @@ ${WORST_CASES}
 ${PREVIOUS_ATTEMPTS}
 
 ${DIVERSITY_HINTS}
+
+## Scoring Modes
+Tests are scored in two modes:
+- **Batch** — uses `stretch_buffer()` (full-file processing). This is the traditional code path through `src/stretch/hybrid.rs`.
+- **Streaming** — uses `StreamProcessor` with hybrid mode enabled (chunked real-time processing). This code path lives in `src/stream/processor.rs`.
+
+If streaming scores lag behind batch scores, look at `src/stream/processor.rs` for phase vocoder state management, ring buffer handling, or hybrid mode transitions. Both modes share the underlying WSOLA and phase vocoder engines, but streaming adds chunked buffering and ratio smoothing.
 
 ## CRITICAL RULES
 - **Do NOT spend more than 5 turns reading code.** The key source code is provided below — start editing quickly.

@@ -28,19 +28,39 @@ def main():
         ratio = item['ratio']
         source_base = os.path.basename(item['source']).replace('.wav', '')
         output = os.path.join(output_dir, f"{source_base}_test_{ratio}.wav")
-        
+
         if not os.path.exists(source):
             print(f"Warning: Source file not found: {source}")
             continue
-            
+
         print(f"Processing {item['description']} (ratio: {ratio})...")
-        
+
         cmd = [binary, source, output, "--ratio", str(ratio)]
         try:
             subprocess.run(cmd, check=True, capture_output=True)
         except subprocess.CalledProcessError as e:
             print(f"Error processing {source}: {e.stderr.decode()}")
-            
+
+    # Streaming mode
+    print(f"\nRunning streaming mode against {len(manifest)} test cases...")
+    for item in manifest:
+        source = os.path.join(repo_root, "optimize", item['source'])
+        ratio = item['ratio']
+        source_base = os.path.basename(item['source']).replace('.wav', '')
+        output = os.path.join(output_dir, f"{source_base}_stream_{ratio}.wav")
+
+        if not os.path.exists(source):
+            print(f"Warning: Source file not found: {source}")
+            continue
+
+        print(f"Processing [streaming] {item['description']} (ratio: {ratio})...")
+
+        cmd = [binary, source, output, "--ratio", str(ratio), "--streaming"]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Error processing [streaming] {source}: {e.stderr.decode()}")
+
     print("Test suite completed.")
 
 if __name__ == "__main__":

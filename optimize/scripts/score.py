@@ -226,28 +226,49 @@ def main():
         if not os.path.exists(args.manifest):
             print(f"Error: Manifest {args.manifest} not found.")
             sys.exit(1)
-            
+
         with open(args.manifest, 'r') as f:
             manifest = json.load(f)
-            
+
         results = []
         repo_root = os.getcwd()
+
+        # Score batch outputs
         for item in manifest:
             ratio = item['ratio']
             source_base = os.path.basename(item['source']).replace('.wav', '')
             ref_path = os.path.join(repo_root, "optimize/references", f"{source_base}_ref_{ratio}.wav")
             test_path = os.path.join(repo_root, "optimize/outputs", f"{source_base}_test_{ratio}.wav")
-            
+
             if not os.path.exists(ref_path) or not os.path.exists(test_path):
                 print(f"Warning: Skipping {item['description']}, missing files.")
                 continue
-                
+
             print(f"Scoring {item['description']}...", file=sys.stderr)
             res = score_pair(ref_path, test_path, weights)
             res['description'] = item['description']
             res['ratio'] = ratio
+            res['mode'] = 'batch'
             results.append(res)
-            
+
+        # Score streaming outputs
+        for item in manifest:
+            ratio = item['ratio']
+            source_base = os.path.basename(item['source']).replace('.wav', '')
+            ref_path = os.path.join(repo_root, "optimize/references", f"{source_base}_ref_{ratio}.wav")
+            test_path = os.path.join(repo_root, "optimize/outputs", f"{source_base}_stream_{ratio}.wav")
+
+            if not os.path.exists(ref_path) or not os.path.exists(test_path):
+                print(f"Warning: Skipping [streaming] {item['description']}, missing files.")
+                continue
+
+            print(f"Scoring [streaming] {item['description']}...", file=sys.stderr)
+            res = score_pair(ref_path, test_path, weights)
+            res['description'] = f"{item['description']} [streaming]"
+            res['ratio'] = ratio
+            res['mode'] = 'streaming'
+            results.append(res)
+
         class NumpyEncoder(json.JSONEncoder):
             def default(self, obj):
                 if isinstance(obj, (np.floating,)):
@@ -260,9 +281,15 @@ def main():
 
         with open(args.batch, 'w') as f:
             json.dump(results, f, indent=2, cls=NumpyEncoder)
-            
+
         avg_score = np.mean([r['total_score'] for r in results])
+        batch_scores = [r['total_score'] for r in results if r.get('mode') == 'batch']
+        stream_scores = [r['total_score'] for r in results if r.get('mode') == 'streaming']
         print(f"\nBatch completed. Average Score: {avg_score:.2f}", file=sys.stderr)
+        if batch_scores:
+            print(f"  Batch avg: {np.mean(batch_scores):.2f}", file=sys.stderr)
+        if stream_scores:
+            print(f"  Streaming avg: {np.mean(stream_scores):.2f}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()

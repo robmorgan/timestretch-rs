@@ -94,8 +94,10 @@ for (( i=START_ITER; i<=MAX_ITERATIONS; i++ )); do
     AVG_SCORE=$(python3 -c "import json; data=json.load(open('$SCORES_JSON')); print(sum(r['total_score'] for r in data)/len(data))")
     WORST_SCORE=$(python3 -c "import json; data=json.load(open('$SCORES_JSON')); print(min(r['total_score'] for r in data))")
     WORST_CASE=$(python3 -c "import json; data=json.load(open('$SCORES_JSON')); print(min(data, key=lambda x: x['total_score'])['description'])")
-    
-    echo "Iteration $i Average Score: $AVG_SCORE (Worst: $WORST_SCORE - $WORST_CASE)"
+    BATCH_AVG_SCORE=$(python3 -c "import json; data=json.load(open('$SCORES_JSON')); b=[r['total_score'] for r in data if r.get('mode')=='batch']; print(sum(b)/len(b) if b else 0)")
+    STREAM_AVG_SCORE=$(python3 -c "import json; data=json.load(open('$SCORES_JSON')); s=[r['total_score'] for r in data if r.get('mode')=='streaming']; print(sum(s)/len(s) if s else 0)")
+
+    echo "Iteration $i Average Score: $AVG_SCORE (Batch: $BATCH_AVG_SCORE, Streaming: $STREAM_AVG_SCORE, Worst: $WORST_SCORE - $WORST_CASE)"
     
     # Log progress
     GIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "no-git")
@@ -182,6 +184,8 @@ for h in hints[:4]:
     export ITERATION=$i
     export AVG_SCORE=$AVG_SCORE
     export TARGET_SCORE=$TARGET_SCORE
+    export BATCH_AVG_SCORE=$BATCH_AVG_SCORE
+    export STREAM_AVG_SCORE=$STREAM_AVG_SCORE
     export SCORE_HISTORY="$SCORE_HISTORY"
     export JSON_SCORES="$JSON_SCORES"
     export PREVIOUS_ATTEMPTS="$PREVIOUS_ATTEMPTS"
@@ -198,7 +202,7 @@ for d in sorted_data:
     print(f'- {d[\"description\"]}: {d[\"total_score\"]:.2f}')
 ")
 
-    envsubst '$ITERATION $AVG_SCORE $TARGET_SCORE $SCORE_HISTORY $JSON_SCORES $PREVIOUS_ATTEMPTS $HYBRID_HEAD $HYBRID_STRETCH_CORE $PV_PROCESS $WSOLA_CORE $DIVERSITY_HINTS $WORST_CASES' \
+    envsubst '$ITERATION $AVG_SCORE $TARGET_SCORE $BATCH_AVG_SCORE $STREAM_AVG_SCORE $SCORE_HISTORY $JSON_SCORES $PREVIOUS_ATTEMPTS $HYBRID_HEAD $HYBRID_STRETCH_CORE $PV_PROCESS $WSOLA_CORE $DIVERSITY_HINTS $WORST_CASES' \
         < "optimize/scripts/agent_prompt.md.tmpl" > "$PROMPT_FILE"
     
     # 5. Run Agent (agent self-scores and commits if improved)
