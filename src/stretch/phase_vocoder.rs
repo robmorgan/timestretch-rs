@@ -411,7 +411,7 @@ impl PhaseVocoder {
         // samples lets the overlap-add window sum reach its steady-state
         // value before processing actual content, eliminating edge
         // artifacts that degrade spectral metrics.
-        let pad = (self.hop_analysis * 4).min(input.len());
+        let pad = (self.hop_analysis * 8).min(input.len());
         if pad > 0 && input.len() >= self.fft_size {
             let padded_len = input.len() + 2 * pad;
             let mut padded = vec![0.0f32; padded_len];
