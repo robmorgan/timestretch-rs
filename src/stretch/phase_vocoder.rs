@@ -411,19 +411,26 @@ impl PhaseVocoder {
         // samples lets the overlap-add window sum reach its steady-state
         // value before processing actual content, eliminating edge
         // artifacts that degrade spectral metrics.
-        let pad = (self.hop_analysis * 8).min(input.len());
-        if pad > 0 && input.len() >= self.fft_size {
-            let padded_len = input.len() + 2 * pad;
+        //
+        // Asymmetric padding: the start uses a shorter mirror (hop*2) so
+        // that onsets at t=0 remain distinct — longer mirrors pre-condition
+        // the phase state with identical spectral content and mask the
+        // amplitude transition, causing onset detectors to miss it.
+        // The end keeps a longer mirror (hop*8) for full spectral quality.
+        let end_pad = (self.hop_analysis * 8).min(input.len());
+        let start_pad = (self.hop_analysis * 4).min(input.len());
+        if start_pad > 0 && input.len() >= self.fft_size {
+            let padded_len = input.len() + start_pad + end_pad;
             let mut padded = vec![0.0f32; padded_len];
-            // Reflect start
-            for i in 0..pad {
-                padded[i] = input[pad - 1 - i];
+            // Reflect start (shorter — preserves onset sharpness)
+            for i in 0..start_pad {
+                padded[i] = input[start_pad - 1 - i];
             }
             // Copy original
-            padded[pad..pad + input.len()].copy_from_slice(input);
-            // Reflect end
-            for i in 0..pad {
-                padded[pad + input.len() + i] = input[input.len() - 1 - i];
+            padded[start_pad..start_pad + input.len()].copy_from_slice(input);
+            // Reflect end (longer — full spectral quality)
+            for i in 0..end_pad {
+                padded[start_pad + input.len() + i] = input[input.len() - 1 - i];
             }
 
             let (_num_frames, output_len) = self.process_core(&padded, true)?;
@@ -435,7 +442,7 @@ impl PhaseVocoder {
             );
 
             // Trim output to remove padding artifacts.
-            let trim_start = (pad as f64 * self.stretch_ratio).round() as usize;
+            let trim_start = (start_pad as f64 * self.stretch_ratio).round() as usize;
             let expected_len = (input.len() as f64 * self.stretch_ratio).round() as usize;
             let trim_end = (trim_start + expected_len).min(output.len());
             if trim_start < output.len() {
