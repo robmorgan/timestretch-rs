@@ -673,7 +673,7 @@ impl PhaseVocoder {
             // At ratio near 1.0, phase locking is very accurate so we trust it fully.
             // As the ratio increases, IF estimates become more valuable for preserving
             // frequency accuracy, so we blend in up to 10% IF (reduced from 30% to improve coherence).
-            let if_blend = (0.1 * ((hop_ratio - 1.0).abs() / 0.5).min(1.0)).min(0.1);
+            let if_blend = (0.05 * ((hop_ratio - 1.0).abs() / 0.5).min(1.0)).min(0.05);
             if if_blend > 1e-6 {
                 for bin in self.sub_bass_bin..num_bins {
                     if self.peaks.binary_search(&bin).is_ok() {
