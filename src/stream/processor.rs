@@ -826,7 +826,14 @@ impl StreamProcessor {
             // absolute phase of the rendered output may differ between
             // consecutive calls for the overlapping tail region. Without
             // cross-fading, this creates clicks at chunk boundaries.
-            let xfade = HYBRID_STREAM_CROSSFADE_SAMPLES
+            //
+            // Scale crossfade with the stretch ratio: larger ratios produce
+            // synthesis frames farther apart, amplifying phase divergence
+            // between consecutive PV renderings.
+            let ratio_scale = self.hybrid_state.last_ratio.max(1.0);
+            let xfade_base = (HYBRID_STREAM_CROSSFADE_SAMPLES as f64 * ratio_scale)
+                .round() as usize;
+            let xfade = xfade_base
                 .min(skip)
                 .min(delta_len / 2);
             let held = &self.hybrid_state.crossfade_held[ch];
