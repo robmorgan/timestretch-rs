@@ -13,6 +13,7 @@ const CHUNK_FRAMES: usize = 1024;
 const CHANNELS: u32 = 2;
 
 /// Start the processing thread. Returns a stop flag handle.
+#[allow(clippy::too_many_arguments)]
 pub fn start_processing_thread(
     state: SharedStateHandle,
     source_audio: Arc<Vec<f32>>,

@@ -40,7 +40,7 @@ impl PresetChoice {
         }
     }
 
-    pub fn to_edm_preset(&self) -> Option<EdmPreset> {
+    pub fn to_edm_preset(self) -> Option<EdmPreset> {
         match self {
             PresetChoice::None => None,
             PresetChoice::DjBeatmatch => Some(EdmPreset::DjBeatmatch),
