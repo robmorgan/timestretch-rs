@@ -1,8 +1,8 @@
 //! Phase locking algorithms for the phase vocoder.
 //!
 //! Provides identity phase locking (Laroche & Dolson 1999) with full-spectrum
-//! trough-bounded influence regions, and the improved region-of-influence
-//! algorithm with adaptive SNR-weighted phase clamping as a safety net.
+//! trough-bounded influence regions, region-of-influence locking with adaptive
+//! SNR-weighted phase clamping, and a selective confidence-weighted blend mode.
 //!
 //! ## Full Identity Phase Locking
 //!
@@ -37,6 +37,14 @@ pub enum PhaseLockingMode {
     /// Uses full identity rotation first, then clamps runaway phase deviations
     /// in noisy regions. Best quality for polyphonic material.
     RegionOfInfluence,
+    /// Selective phase locking:
+    /// strongly lock bins near confident peaks while blending/noise bins
+    /// toward their independent PV phase.
+    ///
+    /// This is a middle ground between full identity locking and ROI:
+    /// cleaner than raw PV in harmonic regions, with less over-locking on
+    /// noisy/transient-rich frames.
+    Selective,
 }
 
 /// SNR threshold above which a bin is considered a strong harmonic peak.
@@ -46,6 +54,14 @@ const SNR_STRONG: f32 = 3.0;
 const SNR_MEDIUM: f32 = 1.5;
 /// Half-width of the local neighborhood for SNR estimation (total window = 2*SNR_RADIUS + 1).
 const SNR_RADIUS: usize = 2;
+/// Minimum selective-lock strength required to adjust a bin.
+const SELECTIVE_MIN_LOCK_STRENGTH: f32 = 0.05;
+/// Weight of relative magnitude around a confident peak in selective mode.
+const SELECTIVE_PEAK_WEIGHT: f32 = 0.7;
+/// Weight of local SNR confidence in selective mode.
+const SELECTIVE_BIN_SNR_WEIGHT: f32 = 0.3;
+/// Floor for relative-magnitude normalization in selective mode.
+const SELECTIVE_RELATIVE_MAG_EPS: f32 = 1e-12;
 
 /// Applies the selected phase locking algorithm.
 pub fn apply_phase_locking(
@@ -78,6 +94,62 @@ pub fn apply_phase_locking(
                 peaks,
             );
         }
+        PhaseLockingMode::Selective => {
+            selective_phase_lock(
+                magnitudes,
+                analysis_phases,
+                synthesis_phases,
+                num_bins,
+                start_bin,
+                peaks,
+            );
+        }
+    }
+}
+
+/// Real-time-safe phase-locking variant that reuses caller-provided scratch
+/// buffers to avoid per-frame allocations.
+pub fn apply_phase_locking_realtime(
+    mode: PhaseLockingMode,
+    magnitudes: &[f32],
+    analysis_phases: &[f32],
+    synthesis_phases: &mut [f32],
+    num_bins: usize,
+    start_bin: usize,
+    peaks: &mut Vec<usize>,
+    troughs_scratch: &mut Vec<usize>,
+    pv_phases_scratch: &mut Vec<f32>,
+) {
+    match mode {
+        PhaseLockingMode::Identity => identity_phase_lock_realtime(
+            magnitudes,
+            analysis_phases,
+            synthesis_phases,
+            num_bins,
+            start_bin,
+            peaks,
+            troughs_scratch,
+        ),
+        PhaseLockingMode::RegionOfInfluence => roi_phase_lock_realtime(
+            magnitudes,
+            analysis_phases,
+            synthesis_phases,
+            num_bins,
+            start_bin,
+            peaks,
+            troughs_scratch,
+            pv_phases_scratch,
+        ),
+        PhaseLockingMode::Selective => selective_phase_lock_realtime(
+            magnitudes,
+            analysis_phases,
+            synthesis_phases,
+            num_bins,
+            start_bin,
+            peaks,
+            troughs_scratch,
+            pv_phases_scratch,
+        ),
     }
 }
 
@@ -89,16 +161,8 @@ pub fn apply_phase_locking(
 ///
 /// Only bins at or above `start_bin` are searched.
 pub fn find_spectral_peaks(magnitudes: &[f32], num_bins: usize, start_bin: usize) -> Vec<usize> {
-    let mut peaks = Vec::new();
-    if num_bins < 3 || start_bin >= num_bins {
-        return peaks;
-    }
-    let search_start = start_bin.max(1);
-    for k in search_start..num_bins - 1 {
-        if magnitudes[k] > magnitudes[k - 1] && magnitudes[k] > magnitudes[k + 1] {
-            peaks.push(k);
-        }
-    }
+    let mut peaks = Vec::with_capacity(num_bins / 4);
+    fill_spectral_peaks(magnitudes, num_bins, start_bin, &mut peaks);
     peaks
 }
 
@@ -111,29 +175,59 @@ pub fn find_spectral_peaks(magnitudes: &[f32], num_bins: usize, start_bin: usize
 /// Only bins at or above `start_bin` are searched for interior troughs.
 /// `start_bin` itself is always included as a boundary trough.
 pub fn find_spectral_troughs(magnitudes: &[f32], num_bins: usize, start_bin: usize) -> Vec<usize> {
-    let mut troughs = Vec::new();
+    let mut troughs = Vec::with_capacity(num_bins / 2);
+    fill_spectral_troughs(magnitudes, num_bins, start_bin, &mut troughs);
+    troughs
+}
+
+#[inline]
+fn fill_spectral_peaks(
+    magnitudes: &[f32],
+    num_bins: usize,
+    start_bin: usize,
+    peaks_out: &mut Vec<usize>,
+) {
+    peaks_out.clear();
+    if num_bins < 3 || start_bin >= num_bins {
+        return;
+    }
+    let search_start = start_bin.max(1);
+    for k in search_start..num_bins - 1 {
+        if magnitudes[k] > magnitudes[k - 1] && magnitudes[k] > magnitudes[k + 1] {
+            peaks_out.push(k);
+        }
+    }
+}
+
+#[inline]
+fn fill_spectral_troughs(
+    magnitudes: &[f32],
+    num_bins: usize,
+    start_bin: usize,
+    troughs_out: &mut Vec<usize>,
+) {
+    troughs_out.clear();
     if num_bins < 2 {
         if num_bins == 1 {
-            troughs.push(0);
+            troughs_out.push(0);
         }
-        return troughs;
+        return;
     }
 
-    // Always include start_bin as a boundary
-    troughs.push(start_bin);
+    // Always include start_bin as a boundary.
+    troughs_out.push(start_bin);
 
     let search_start = (start_bin + 1).max(1);
     for k in search_start..num_bins - 1 {
         if magnitudes[k] <= magnitudes[k - 1] && magnitudes[k] <= magnitudes[k + 1] {
-            troughs.push(k);
+            troughs_out.push(k);
         }
     }
 
-    // Always include last bin as a boundary (if it's beyond start_bin)
+    // Always include last bin as a boundary (if it's beyond start_bin).
     if num_bins - 1 > start_bin {
-        troughs.push(num_bins - 1);
+        troughs_out.push(num_bins - 1);
     }
-    troughs
 }
 
 /// Finds the influence region for a peak, bounded by adjacent troughs.
@@ -188,25 +282,15 @@ fn identity_phase_lock(
         return;
     }
 
-    // Find peaks and troughs
-    peaks.clear();
-    let found_peaks = find_spectral_peaks(magnitudes, num_bins, start_bin);
-    peaks.extend_from_slice(&found_peaks);
-
-    if peaks.is_empty() {
-        return;
-    }
-
-    let troughs = find_spectral_troughs(magnitudes, num_bins, start_bin);
-
-    // Apply identity phase locking using trough-bounded influence regions
-    apply_identity_phase_locking(
+    let mut troughs = Vec::new();
+    identity_phase_lock_realtime(
+        magnitudes,
         analysis_phases,
         synthesis_phases,
-        &found_peaks,
-        &troughs,
-        start_bin,
         num_bins,
+        start_bin,
+        peaks,
+        &mut troughs,
     );
 }
 
@@ -237,39 +321,205 @@ fn roi_phase_lock(
         return;
     }
 
-    // Find peaks and troughs
-    peaks.clear();
-    let found_peaks = find_spectral_peaks(magnitudes, num_bins, start_bin);
-    peaks.extend_from_slice(&found_peaks);
+    let mut troughs = Vec::new();
+    let mut pv_phases = Vec::new();
+    roi_phase_lock_realtime(
+        magnitudes,
+        analysis_phases,
+        synthesis_phases,
+        num_bins,
+        start_bin,
+        peaks,
+        &mut troughs,
+        &mut pv_phases,
+    );
+}
 
-    if peaks.is_empty() {
+/// Selective phase locking with confidence-weighted blending.
+///
+/// Selective mode keeps the standard PV phase as a baseline and applies
+/// identity-style phase propagation only around confident peaks, blending the
+/// amount of locking per-bin by:
+/// - peak confidence (local SNR),
+/// - relative magnitude in the peak's influence region,
+/// - local bin SNR.
+///
+/// This reduces over-locking in noisy bins while preserving coherent harmonic
+/// lobes around strong peaks.
+fn selective_phase_lock(
+    magnitudes: &[f32],
+    analysis_phases: &[f32],
+    synthesis_phases: &mut [f32],
+    num_bins: usize,
+    start_bin: usize,
+    peaks: &mut Vec<usize>,
+) {
+    if num_bins < 3 || start_bin >= num_bins {
         return;
     }
 
-    let troughs = find_spectral_troughs(magnitudes, num_bins, start_bin);
+    let mut troughs = Vec::new();
+    let mut pv_phases = Vec::new();
+    selective_phase_lock_realtime(
+        magnitudes,
+        analysis_phases,
+        synthesis_phases,
+        num_bins,
+        start_bin,
+        peaks,
+        &mut troughs,
+        &mut pv_phases,
+    );
+}
 
-    // Save the standard PV phases before identity locking (for clamping reference)
-    // We only need phases for the start_bin..num_bins range.
-    let pv_phases: Vec<f32> = synthesis_phases[start_bin..num_bins].to_vec();
+fn identity_phase_lock_realtime(
+    magnitudes: &[f32],
+    analysis_phases: &[f32],
+    synthesis_phases: &mut [f32],
+    num_bins: usize,
+    start_bin: usize,
+    peaks: &mut Vec<usize>,
+    troughs_scratch: &mut Vec<usize>,
+) {
+    if num_bins < 3 || start_bin >= num_bins {
+        return;
+    }
 
-    // Step 1: Apply full identity phase locking
+    fill_spectral_peaks(magnitudes, num_bins, start_bin, peaks);
+    if peaks.is_empty() {
+        return;
+    }
+    fill_spectral_troughs(magnitudes, num_bins, start_bin, troughs_scratch);
     apply_identity_phase_locking(
         analysis_phases,
         synthesis_phases,
-        &found_peaks,
-        &troughs,
+        peaks,
+        troughs_scratch,
+        start_bin,
+        num_bins,
+    );
+}
+
+fn roi_phase_lock_realtime(
+    magnitudes: &[f32],
+    analysis_phases: &[f32],
+    synthesis_phases: &mut [f32],
+    num_bins: usize,
+    start_bin: usize,
+    peaks: &mut Vec<usize>,
+    troughs_scratch: &mut Vec<usize>,
+    pv_phases_scratch: &mut Vec<f32>,
+) {
+    if num_bins < 3 || start_bin >= num_bins {
+        return;
+    }
+
+    fill_spectral_peaks(magnitudes, num_bins, start_bin, peaks);
+    if peaks.is_empty() {
+        return;
+    }
+    fill_spectral_troughs(magnitudes, num_bins, start_bin, troughs_scratch);
+
+    // Save standard PV phases before locking for clamping reference.
+    pv_phases_scratch.clear();
+    pv_phases_scratch.extend_from_slice(&synthesis_phases[start_bin..num_bins]);
+
+    // Step 1: full identity locking.
+    apply_identity_phase_locking(
+        analysis_phases,
+        synthesis_phases,
+        peaks,
+        troughs_scratch,
         start_bin,
         num_bins,
     );
 
-    // Step 2: Adaptive clamping as safety net for noisy bins
+    // Step 2: SNR-weighted clamping on non-peak bins.
     for bin in start_bin..num_bins {
-        if found_peaks.binary_search(&bin).is_ok() {
-            continue; // Peak bins are anchors; don't clamp them
+        if peaks.binary_search(&bin).is_ok() {
+            continue;
         }
 
         let max_dev = compute_adaptive_max_deviation(magnitudes, bin, num_bins);
-        let expected = pv_phases[bin - start_bin]; // phase from standard PV advance
+        let expected = pv_phases_scratch[bin - start_bin];
+        let deviation = wrap_phase(synthesis_phases[bin] - expected);
+        if deviation.abs() > max_dev {
+            let clamped_dev = deviation.clamp(-max_dev, max_dev);
+            synthesis_phases[bin] = expected + clamped_dev;
+        }
+    }
+}
+
+fn selective_phase_lock_realtime(
+    magnitudes: &[f32],
+    analysis_phases: &[f32],
+    synthesis_phases: &mut [f32],
+    num_bins: usize,
+    start_bin: usize,
+    peaks: &mut Vec<usize>,
+    troughs_scratch: &mut Vec<usize>,
+    pv_phases_scratch: &mut Vec<f32>,
+) {
+    if num_bins < 3 || start_bin >= num_bins {
+        return;
+    }
+
+    fill_spectral_peaks(magnitudes, num_bins, start_bin, peaks);
+    if peaks.is_empty() {
+        return;
+    }
+    fill_spectral_troughs(magnitudes, num_bins, start_bin, troughs_scratch);
+
+    // Save independent PV phases as blending baseline and clamp reference.
+    pv_phases_scratch.clear();
+    pv_phases_scratch.extend_from_slice(&synthesis_phases[start_bin..num_bins]);
+
+    // Blend locking around confident peaks.
+    for &peak in peaks.iter() {
+        let peak_snr = estimate_local_snr(magnitudes, peak, num_bins);
+        let peak_conf = snr_to_lock_confidence(peak_snr);
+        if peak_conf <= 0.0 {
+            continue;
+        }
+
+        let peak_mag = magnitudes[peak].max(SELECTIVE_RELATIVE_MAG_EPS);
+        let phase_rotation = synthesis_phases[peak] - analysis_phases[peak];
+        let (region_start, region_end) =
+            find_influence_region(peak, troughs_scratch, start_bin, num_bins);
+        let end = region_end.min(num_bins.saturating_sub(1));
+
+        for bin in region_start..=end {
+            if bin == peak || bin < start_bin || bin >= num_bins {
+                continue;
+            }
+
+            let rel_mag = (magnitudes[bin].max(0.0) / peak_mag).clamp(0.0, 1.0);
+            if rel_mag <= 0.0 {
+                continue;
+            }
+            let bin_snr = estimate_local_snr(magnitudes, bin, num_bins);
+            let bin_conf = snr_to_lock_confidence(bin_snr);
+            let local_weight =
+                SELECTIVE_PEAK_WEIGHT * rel_mag.sqrt() + SELECTIVE_BIN_SNR_WEIGHT * bin_conf;
+            let lock_strength = (peak_conf * local_weight).clamp(0.0, 1.0);
+            if lock_strength < SELECTIVE_MIN_LOCK_STRENGTH {
+                continue;
+            }
+
+            let pv_phase = pv_phases_scratch[bin - start_bin];
+            let locked_phase = analysis_phases[bin] + phase_rotation;
+            let delta = wrap_phase(locked_phase - pv_phase);
+            synthesis_phases[bin] = pv_phase + lock_strength * delta;
+        }
+    }
+
+    // Safety net: cap runaway phase deviation versus independent PV phase.
+    for bin in start_bin..num_bins {
+        if peaks.binary_search(&bin).is_ok() {
+            continue;
+        }
+        let max_dev = compute_adaptive_max_deviation(magnitudes, bin, num_bins);
+        let expected = pv_phases_scratch[bin - start_bin];
         let deviation = wrap_phase(synthesis_phases[bin] - expected);
         if deviation.abs() > max_dev {
             let clamped_dev = deviation.clamp(-max_dev, max_dev);
@@ -343,6 +593,12 @@ fn compute_adaptive_max_deviation(magnitudes: &[f32], bin: usize, num_bins: usiz
     let min_dev = PI / 4.0; // noise floor: same as prior fixed threshold
     let max_dev = PI / 3.0; // strong peaks: wider allowance
     min_dev + t * (max_dev - min_dev)
+}
+
+/// Maps local SNR into a [0, 1] confidence used by selective locking.
+#[inline]
+fn snr_to_lock_confidence(local_snr: f32) -> f32 {
+    ((local_snr - SNR_MEDIUM) / (SNR_STRONG - SNR_MEDIUM)).clamp(0.0, 1.0)
 }
 
 /// Estimates the local SNR for a bin by comparing its magnitude to the median
@@ -464,6 +720,61 @@ mod tests {
 
         // Non-peak bins should have been adjusted
         assert_eq!(peaks, vec![5, 15]);
+    }
+
+    #[test]
+    fn test_selective_no_peaks() {
+        let magnitudes = vec![1.0; 10];
+        let analysis_phases = vec![0.0; 10];
+        let mut synthesis_phases = vec![0.5; 10];
+        let original = synthesis_phases.clone();
+        let mut peaks = Vec::new();
+
+        selective_phase_lock(
+            &magnitudes,
+            &analysis_phases,
+            &mut synthesis_phases,
+            10,
+            1,
+            &mut peaks,
+        );
+        assert_eq!(synthesis_phases, original);
+    }
+
+    #[test]
+    fn test_selective_moves_bins_toward_locked_phase() {
+        let num_bins = 32;
+        let start_bin = 1;
+        let mut magnitudes = vec![0.01f32; num_bins];
+        magnitudes[11] = 0.06;
+        magnitudes[12] = 1.0; // confident peak
+        magnitudes[13] = 0.05;
+
+        let analysis_phases: Vec<f32> = (0..num_bins).map(|i| i as f32 * 0.12).collect();
+        let mut synthesis_phases: Vec<f32> = (0..num_bins).map(|i| i as f32 * 0.19).collect();
+        let original = synthesis_phases.clone();
+
+        let mut peaks = Vec::new();
+        selective_phase_lock(
+            &magnitudes,
+            &analysis_phases,
+            &mut synthesis_phases,
+            num_bins,
+            start_bin,
+            &mut peaks,
+        );
+
+        assert!(peaks.contains(&12), "Expected detected peak at bin 12");
+        let rotation = original[12] - analysis_phases[12];
+        let locked = analysis_phases[13] + rotation;
+        let before_err = wrap_phase(original[13] - locked).abs();
+        let after_err = wrap_phase(synthesis_phases[13] - locked).abs();
+        assert!(
+            after_err < before_err,
+            "Selective locking should move bin 13 toward locked phase (before={}, after={})",
+            before_err,
+            after_err
+        );
     }
 
     #[test]

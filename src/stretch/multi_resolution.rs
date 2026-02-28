@@ -173,6 +173,27 @@ impl MultiResolutionStretcher {
         self.high_pv.set_stretch_ratio(ratio);
     }
 
+    /// Enables or disables adaptive phase-lock mode switching on all band vocoders.
+    pub fn set_adaptive_phase_locking(&mut self, enabled: bool) {
+        self.sub_bass_pv.set_adaptive_phase_locking(enabled);
+        self.mid_pv.set_adaptive_phase_locking(enabled);
+        self.high_pv.set_adaptive_phase_locking(enabled);
+    }
+
+    /// Sets envelope correction strength on all band vocoders.
+    pub fn set_envelope_strength(&mut self, strength: f32) {
+        self.sub_bass_pv.set_envelope_strength(strength);
+        self.mid_pv.set_envelope_strength(strength);
+        self.high_pv.set_envelope_strength(strength);
+    }
+
+    /// Enables/disables adaptive envelope-order selection on all band vocoders.
+    pub fn set_adaptive_envelope_order(&mut self, enabled: bool) {
+        self.sub_bass_pv.set_adaptive_envelope_order(enabled);
+        self.mid_pv.set_adaptive_envelope_order(enabled);
+        self.high_pv.set_adaptive_envelope_order(enabled);
+    }
+
     /// Resets the phase state of all three phase vocoders.
     pub fn reset_phase_state(&mut self) {
         self.sub_bass_pv.reset_phase_state();

@@ -7,7 +7,7 @@
 //! natural phase relationship.
 
 use crate::analysis::beat::detect_beats;
-use crate::analysis::transient::detect_transients;
+use crate::analysis::transient::{detect_transients_with_options, TransientDetectionOptions};
 use crate::core::types::StretchParams;
 use crate::error::StretchError;
 use crate::stretch::hybrid::{merge_onsets_and_beats, HybridStretcher};
@@ -96,12 +96,13 @@ pub fn stretch_mid_side(
 
 /// Builds a shared transient/beat map from the Mid channel.
 fn build_shared_onset_map(mid: &[f32], params: &StretchParams) -> (Vec<usize>, Vec<f32>) {
-    let transient_map = detect_transients(
+    let transient_map = detect_transients_with_options(
         mid,
         params.sample_rate,
         params.fft_size.min(STEREO_TRANSIENT_MAX_FFT),
         params.hop_size.min(STEREO_TRANSIENT_MAX_HOP),
         params.transient_sensitivity,
+        TransientDetectionOptions::from_stretch_params(params),
     );
 
     let onsets = transient_map.onsets.clone();

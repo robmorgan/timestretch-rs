@@ -72,7 +72,8 @@ pub fn start_processing_thread(
                     let factor = 2.0_f64.powf(pitch_semi as f64 / 12.0);
                     let params = StretchParams::new(1.0)
                         .with_sample_rate(sample_rate)
-                        .with_channels(CHANNELS);
+                        .with_channels(CHANNELS)
+                        .with_normalize(true);
                     match timestretch::pitch_shift(&source_audio, &params, factor) {
                         Ok(shifted) => {
                             working_audio = shifted;
@@ -171,7 +172,8 @@ fn build_processor(state: &SharedStateHandle, sample_rate: u32) -> StreamProcess
     let st = state.lock().unwrap();
     let mut params = StretchParams::new(st.stretch_ratio)
         .with_sample_rate(sample_rate)
-        .with_channels(CHANNELS);
+        .with_channels(CHANNELS)
+        .with_normalize(true);
     if let Some(preset) = st.preset.to_edm_preset() {
         params = params.with_preset(preset);
     }

@@ -187,7 +187,8 @@ impl TimeStretchApp {
             let factor = 2.0_f64.powf(self.pitch_semitones as f64 / 12.0);
             let params = timestretch::StretchParams::new(1.0)
                 .with_sample_rate(sample_rate)
-                .with_channels(2);
+                .with_channels(2)
+                .with_normalize(true);
             match timestretch::pitch_shift(&source, &params, factor) {
                 Ok(shifted) => shifted,
                 Err(e) => {

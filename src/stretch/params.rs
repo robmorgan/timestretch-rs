@@ -44,6 +44,54 @@ pub fn validate_params(params: &StretchParams) -> Result<(), String> {
             params.sample_rate, SAMPLE_RATE_MIN, SAMPLE_RATE_MAX
         ));
     }
+    if !(0.0..=1.0).contains(&params.transient_lookahead_threshold_relax) {
+        return Err(format!(
+            "Transient lookahead threshold relax must be in [0,1], got {}",
+            params.transient_lookahead_threshold_relax
+        ));
+    }
+    if !(0.0..=1.0).contains(&params.transient_lookahead_peak_retain_ratio) {
+        return Err(format!(
+            "Transient lookahead peak retain ratio must be in [0,1], got {}",
+            params.transient_lookahead_peak_retain_ratio
+        ));
+    }
+    if !params.transient_strong_spike_bypass_multiplier.is_finite()
+        || params.transient_strong_spike_bypass_multiplier < 1.0
+    {
+        return Err(format!(
+            "Transient strong-spike bypass multiplier must be finite and >=1, got {}",
+            params.transient_strong_spike_bypass_multiplier
+        ));
+    }
+    if params.transient_lookahead_frames > 16 {
+        return Err(format!(
+            "Transient lookahead frames must be <= 16, got {}",
+            params.transient_lookahead_frames
+        ));
+    }
+    let policy = params.transient_threshold_policy.sanitized();
+    if policy != params.transient_threshold_policy {
+        return Err(format!(
+            "Transient threshold policy is invalid: {:?}",
+            params.transient_threshold_policy
+        ));
+    }
+    if !params.residual_mix.is_finite() || !(0.0..=1.5).contains(&params.residual_mix) {
+        return Err(format!(
+            "Residual mix must be finite and in [0,1.5], got {}",
+            params.residual_mix
+        ));
+    }
+    if !params.envelope_strength.is_finite() || !(0.0..=2.0).contains(&params.envelope_strength) {
+        return Err(format!(
+            "Envelope strength must be finite and in [0,2], got {}",
+            params.envelope_strength
+        ));
+    }
+    if params.envelope_order == 0 {
+        return Err("Envelope order must be >= 1".to_string());
+    }
     Ok(())
 }
 
@@ -81,6 +129,41 @@ mod tests {
 
         params.fft_size = 256;
         params.hop_size = 0;
+        assert!(validate_params(&params).is_err());
+    }
+
+    #[test]
+    fn test_validate_params_bad_transient_lookahead() {
+        let mut params = StretchParams::new(1.0);
+        params.transient_lookahead_threshold_relax = 1.2;
+        assert!(validate_params(&params).is_err());
+
+        params = StretchParams::new(1.0);
+        params.transient_lookahead_peak_retain_ratio = -0.1;
+        assert!(validate_params(&params).is_err());
+
+        params = StretchParams::new(1.0);
+        params.transient_strong_spike_bypass_multiplier = 0.9;
+        assert!(validate_params(&params).is_err());
+
+        params = StretchParams::new(1.0);
+        params.transient_lookahead_frames = 17;
+        assert!(validate_params(&params).is_err());
+
+        params = StretchParams::new(1.0);
+        params.transient_threshold_policy.median_window_frames = 0;
+        assert!(validate_params(&params).is_err());
+
+        params = StretchParams::new(1.0);
+        params.residual_mix = f32::INFINITY;
+        assert!(validate_params(&params).is_err());
+
+        params = StretchParams::new(1.0);
+        params.envelope_strength = -0.1;
+        assert!(validate_params(&params).is_err());
+
+        params = StretchParams::new(1.0);
+        params.envelope_order = 0;
         assert!(validate_params(&params).is_err());
     }
 
