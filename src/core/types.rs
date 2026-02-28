@@ -3613,8 +3613,8 @@ mod tests {
     }
 
     #[test]
-    fn test_default_hop_size_is_fft_div_4() {
+    fn test_default_hop_size_is_fft_div_8() {
         let params = StretchParams::new(1.0);
-        assert_eq!(params.hop_size, params.fft_size / 4);
+        assert_eq!(params.hop_size, params.fft_size / 8);
     }
 }

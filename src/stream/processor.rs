@@ -441,7 +441,7 @@ impl StreamProcessor {
         if correction > 0 {
             let need = correction as usize;
             output.reserve(need);
-            extend_with_tonal_tail(output, need);
+            extend_with_tonal_tail(output, need, before);
             self.total_output_emitted_samples += need;
         } else if correction < 0 {
             // Only trim samples emitted in this flush call, never samples
@@ -1143,7 +1143,7 @@ fn fit_tonal_tail(samples: &[f32], global_start: usize, period: usize) -> Option
 ///
 /// This keeps end-of-stream length correction from introducing flat or noisy
 /// tails that would skew chunk-level pitch and envelope checks.
-fn extend_with_tonal_tail(output: &mut Vec<f32>, count: usize) {
+fn extend_with_tonal_tail(output: &mut Vec<f32>, count: usize, floor: usize) {
     if count == 0 {
         return;
     }
@@ -1152,10 +1152,11 @@ fn extend_with_tonal_tail(output: &mut Vec<f32>, count: usize) {
         return;
     }
 
-    let backoff = count.max(512).min(output.len() / 3);
-    let synth_start = output.len().saturating_sub(backoff);
-    let analysis_end = synth_start.max(1);
-    let analysis_len = analysis_end.min(8192);
+    let region_len = output.len().saturating_sub(floor);
+    let backoff = count.max(512).min(region_len / 3);
+    let synth_start = output.len().saturating_sub(backoff).max(floor);
+    let analysis_end = synth_start.max(floor.max(1));
+    let analysis_len = (analysis_end - floor).min(8192);
     let analysis_start = analysis_end - analysis_len;
     let analysis = &output[analysis_start..analysis_end];
     if let Some(period) = estimate_period_from_tail(analysis) {
