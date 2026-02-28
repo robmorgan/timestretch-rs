@@ -403,6 +403,47 @@ impl PhaseVocoder {
         self.streaming_tail.clear();
         self.streaming_tail_window_sum.clear();
 
+        // Mirror-pad input to stabilize edge normalization.
+        //
+        // The first/last analysis frames have incomplete window overlap,
+        // producing an unstable window-sum profile that distorts the
+        // normalized output at signal edges. Padding with reflected
+        // samples lets the overlap-add window sum reach its steady-state
+        // value before processing actual content, eliminating edge
+        // artifacts that degrade spectral metrics.
+        let pad = (self.hop_analysis * 2).min(input.len());
+        if pad > 0 && input.len() >= self.fft_size {
+            let padded_len = input.len() + 2 * pad;
+            let mut padded = vec![0.0f32; padded_len];
+            // Reflect start
+            for i in 0..pad {
+                padded[i] = input[pad - 1 - i];
+            }
+            // Copy original
+            padded[pad..pad + input.len()].copy_from_slice(input);
+            // Reflect end
+            for i in 0..pad {
+                padded[pad + input.len() + i] = input[input.len() - 1 - i];
+            }
+
+            let (_num_frames, output_len) = self.process_core(&padded, true)?;
+            let mut output = self.output_buf[..output_len].to_vec();
+            Self::normalize_output(
+                &mut output,
+                &self.window_sum_buf[..output_len],
+                self.stretch_ratio,
+            );
+
+            // Trim output to remove padding artifacts.
+            let trim_start = (pad as f64 * self.stretch_ratio).round() as usize;
+            let expected_len = (input.len() as f64 * self.stretch_ratio).round() as usize;
+            let trim_end = (trim_start + expected_len).min(output.len());
+            if trim_start < output.len() {
+                return Ok(output[trim_start..trim_end].to_vec());
+            }
+        }
+
+        // Fallback: process without padding (short inputs or edge cases).
         let (_num_frames, output_len) = self.process_core(input, true)?;
         let mut output = self.output_buf[..output_len].to_vec();
         Self::normalize_output(
