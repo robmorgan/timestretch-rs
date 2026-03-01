@@ -492,9 +492,11 @@ impl PhaseVocoder {
                         if edge_rms < ss_rms * 0.7 && edge_rms > 1e-8 {
                             let gain = (ss_rms / edge_rms).min(4.0) as f32;
                             for i in 0..correction_len {
-                                // Smooth ramp: full correction at start, tapering to 1.0
+                                // Cubic Hermite ramp: zero derivative at both
+                                // endpoints for smoother spectral transition.
                                 let t = i as f32 / correction_len as f32;
-                                let g = 1.0 + (gain - 1.0) * (1.0 - t) * (1.0 - t);
+                                let g = 1.0
+                                    + (gain - 1.0) * (1.0 - 3.0 * t * t + 2.0 * t * t * t);
                                 result[i] *= g;
                             }
                         }
@@ -520,8 +522,11 @@ impl PhaseVocoder {
                             let gain = (ss_rms / end_rms).min(4.0) as f32;
                             let rlen = result.len();
                             for i in 0..correction_len {
+                                // Cubic Hermite ramp: zero derivative at both
+                                // endpoints (matches start correction shape).
                                 let t = i as f32 / correction_len as f32;
-                                let g = 1.0 + (gain - 1.0) * t * t;
+                                let g = 1.0
+                                    + (gain - 1.0) * (3.0 * t * t - 2.0 * t * t * t);
                                 result[rlen - correction_len + i] *= g;
                             }
                         }
