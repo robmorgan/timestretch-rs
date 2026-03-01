@@ -875,12 +875,61 @@ impl StreamProcessor {
                 // with the current rendering's prediction of that region
                 // (rendered[skip-xfade..skip]).
                 let overlap = &rendered[skip - xfade..skip];
-                let actual_xfade = held.len().min(xfade).min(overlap.len());
+                let n = held.len().min(xfade).min(overlap.len());
+
+                // Adaptive crossfade: when held and overlap have very
+                // different content (low correlation), a transient likely
+                // appeared in one region but not the other.  A long
+                // crossfade would smear the transient's attack, hurting
+                // TP.  Shorten the crossfade to preserve sharpness while
+                // still preventing clicks.
+                let actual_xfade = if n >= 128 && ratio_scale > 1.1 {
+                    let check = n.min(256);
+                    let (mut dot, mut he, mut oe) = (0.0f64, 0.0f64, 0.0f64);
+                    for i in 0..check {
+                        let h = held[i] as f64;
+                        let o = overlap[i] as f64;
+                        dot += h * o;
+                        he += h * h;
+                        oe += o * o;
+                    }
+                    let denom = (he * oe).sqrt();
+                    let corr =
+                        if denom > 1e-12 { (dot / denom).clamp(-1.0, 1.0) } else { 1.0 };
+
+                    if corr < 0.3 {
+                        // Also require an energy imbalance to distinguish
+                        // a genuine transient onset (one region loud, the
+                        // other quiet) from normal PV phase divergence on
+                        // tonal content (both regions similarly loud but
+                        // phase-shifted).
+                        let h_rms = (he / check as f64).sqrt();
+                        let o_rms = (oe / check as f64).sqrt();
+                        let imbalance = h_rms.max(o_rms) / (h_rms.min(o_rms) + 1e-12);
+                        if imbalance > 4.0 {
+                            // Transient onset — shorten crossfade
+                            (n / 4).max(64)
+                        } else {
+                            n
+                        }
+                    } else {
+                        n
+                    }
+                } else {
+                    n
+                };
+
                 for i in 0..actual_xfade {
                     let t = (i as f32 + 0.5) / actual_xfade as f32;
                     let s = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
                     self.channel_output_buffers[ch]
                         .push(held[i] * (1.0 - s) + overlap[i] * s);
+                }
+                // If crossfade was shortened, emit the remaining held
+                // samples directly to avoid dropping the transient tail.
+                if actual_xfade < n {
+                    self.channel_output_buffers[ch]
+                        .extend_from_slice(&overlap[actual_xfade..n]);
                 }
             }
 
