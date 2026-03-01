@@ -1,0 +1,4 @@
+interface:
+  display_name: "Timestretch Arch/Perf Reviewer"
+  short_description: "Review DSP architecture and realtime performance"
+  default_prompt: "Use $timestretch-arch-perf-review to perform a tiered architecture/performance review for this repo."
