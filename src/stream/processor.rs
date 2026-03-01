@@ -117,10 +117,13 @@ impl HybridStreamingState {
         per_channel.stretch_ratio = ratio;
         // Keep a generous tail so that transient detection and HPSS have
         // enough context to produce results consistent with full-batch
-        // processing.  Thirty-two FFT windows (~3 s at 4096/44100) gives
+        // processing.  Fifty-six FFT windows (~5.2 s at 4096/44100) gives
         // the PV enough warmup frames and the transient detector enough
         // beat-level context for stable segmentation across chunks.
-        let max_tail_frames = params.fft_size * 32;
+        // The larger window also ensures full signal context is
+        // available for short clips (≤5 s), closing the quality gap
+        // between streaming and batch rendering.
+        let max_tail_frames = params.fft_size * 56;
         // The rolling buffer must hold the retained tail context PLUS a full
         // input batch so that tail samples are not discarded prematurely.
         let rolling_capacity = capacity_frames + max_tail_frames;
