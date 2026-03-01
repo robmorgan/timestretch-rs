@@ -1022,12 +1022,36 @@ impl HybridStretcher {
             .effective_wsola_search_range()
             .min(perc_seg_size / 2)
             .max(MIN_WSOLA_SEARCH);
-        let percussive_stretched = {
+        let mut percussive_stretched = {
             let mut wsola = Wsola::new(perc_seg_size, perc_search, seg_ratio);
             wsola.process(&percussive).unwrap_or_else(|_| {
                 crate::core::resample::resample_linear(&percussive, percussive_out_len.max(1))
             })
         };
+
+        // Global RMS matching for percussive WSOLA expansion.
+        //
+        // WSOLA expansion can alter the overall energy level of the
+        // percussive component due to crossfade overlap patterns and gap
+        // regions. Apply a single global gain to match the input
+        // percussive RMS, preserving the relative energy balance between
+        // harmonic and percussive components.
+        if seg_ratio > 1.05 && !percussive.is_empty() && !percussive_stretched.is_empty() {
+            let input_rms = (percussive.iter().map(|&s| s * s).sum::<f32>()
+                / percussive.len() as f32)
+                .sqrt();
+            let output_rms = (percussive_stretched.iter().map(|&s| s * s).sum::<f32>()
+                / percussive_stretched.len() as f32)
+                .sqrt();
+            if output_rms > 1e-8 && input_rms > 1e-8 {
+                let gain = (input_rms / output_rms).clamp(0.5, 2.0);
+                if (gain - 1.0).abs() > 0.02 {
+                    for s in &mut percussive_stretched {
+                        *s *= gain;
+                    }
+                }
+            }
+        }
 
         // Optional explicit residual/noise branch:
         // residual = input - (harmonic + percussive).
