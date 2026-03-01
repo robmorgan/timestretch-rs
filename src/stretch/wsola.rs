@@ -527,10 +527,22 @@ impl Wsola {
             overlap_len
         };
 
-        // Crossfade region: raised-cosine fade where previous content exists
+        // Crossfade region: raised-cosine fade where previous content exists.
+        // For expansion, valid_overlap < overlap_size, so we rescale the
+        // crossfade to span the full 0→1 range within valid_overlap samples.
+        // Without rescaling, the crossfade only reaches ~50% at the gap
+        // boundary, creating a hard amplitude jump that produces comb-filtering
+        // artifacts on broadband (noise-like) percussive content.
+        let need_rescale = valid_overlap > 0 && valid_overlap < overlap_len;
+        let inv_valid = 1.0 / valid_overlap.max(1) as f32;
         for i in 0..valid_overlap {
-            let fade_in = self.crossfade_in[i];
-            let fade_out = self.crossfade_out[i];
+            let (fade_in, fade_out) = if need_rescale {
+                let t = i as f32 * inv_valid;
+                let fi = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
+                (fi, 1.0 - fi)
+            } else {
+                (self.crossfade_in[i], self.crossfade_out[i])
+            };
             let in_sample = if use_interp {
                 subsample_interpolate(input, input_pos, i, fractional_offset)
             } else {
