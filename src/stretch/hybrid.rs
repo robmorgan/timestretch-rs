@@ -999,13 +999,35 @@ impl HybridStretcher {
             crate::core::resample::resample_linear(&harmonic, out_len.max(1))
         };
 
-        // WSOLA-stretch percussive component
+        // WSOLA-stretch percussive component. For compression ratios
+        // (ratio < 1.0), use a smaller WSOLA segment (half the default)
+        // because percussive content has short-duration broadband events
+        // and the smaller segment better tracks rapid changes when
+        // *removing* content. For expansion ratios (ratio >= 1.0), keep
+        // the default segment size — larger segments produce smoother
+        // repetitions when *adding* content.
         let percussive_out_len = (percussive.len() as f64 * seg_ratio).round() as usize;
-        let percussive_stretched = self
-            .stretch_with_wsola_ratio(&percussive, seg_ratio)
-            .unwrap_or_else(|_| {
+        let perc_seg_size = if seg_ratio < 1.0 {
+            (self.params.wsola_segment_size / 2)
+                .min(percussive.len() / 2)
+                .max(MIN_WSOLA_SEGMENT)
+        } else {
+            self.params
+                .wsola_segment_size
+                .min(percussive.len() / 2)
+                .max(MIN_WSOLA_SEGMENT)
+        };
+        let perc_search = self
+            .params
+            .effective_wsola_search_range()
+            .min(perc_seg_size / 2)
+            .max(MIN_WSOLA_SEARCH);
+        let percussive_stretched = {
+            let mut wsola = Wsola::new(perc_seg_size, perc_search, seg_ratio);
+            wsola.process(&percussive).unwrap_or_else(|_| {
                 crate::core::resample::resample_linear(&percussive, percussive_out_len.max(1))
-            });
+            })
+        };
 
         // Optional explicit residual/noise branch:
         // residual = input - (harmonic + percussive).
