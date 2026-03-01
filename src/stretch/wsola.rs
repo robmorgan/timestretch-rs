@@ -509,8 +509,26 @@ impl Wsola {
         let overlap_len = self.overlap_size.min(len);
         let use_interp = fractional_offset.abs() > 1e-10;
 
-        // Crossfade region: raised-cosine fade for smoother transitions
-        for i in 0..overlap_len {
+        // For expansion (ratio > 1.0), the output advance exceeds the segment's
+        // non-overlap region, so the tail of the crossfade zone overlaps with
+        // zero-filled output (the previous segment didn't reach this far).
+        // Crossfading new content with zeros would create an amplitude dip.
+        // Only crossfade where real previous content exists; write full-amplitude
+        // new content in the gap region.
+        let valid_overlap = if self.stretch_ratio > 1.0 {
+            let advance_input = self.segment_size - self.overlap_size;
+            let advance_output = (advance_input as f64 * self.stretch_ratio).round() as usize;
+            if advance_output < self.segment_size {
+                (self.segment_size - advance_output).min(overlap_len)
+            } else {
+                0
+            }
+        } else {
+            overlap_len
+        };
+
+        // Crossfade region: raised-cosine fade where previous content exists
+        for i in 0..valid_overlap {
             let fade_in = self.crossfade_in[i];
             let fade_out = self.crossfade_out[i];
             let in_sample = if use_interp {
@@ -519,6 +537,18 @@ impl Wsola {
                 input[input_pos + i]
             };
             output[output_pos + i] = output[output_pos + i] * fade_out + in_sample * fade_in;
+        }
+
+        // Gap region: previous segment didn't reach here (output is zero).
+        // Write new content at full amplitude to avoid the dip artifact.
+        if use_interp {
+            for i in valid_overlap..overlap_len {
+                output[output_pos + i] =
+                    subsample_interpolate(input, input_pos, i, fractional_offset);
+            }
+        } else if valid_overlap < overlap_len {
+            output[output_pos + valid_overlap..output_pos + overlap_len]
+                .copy_from_slice(&input[input_pos + valid_overlap..input_pos + overlap_len]);
         }
 
         // Non-overlap region
