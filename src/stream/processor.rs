@@ -836,7 +836,7 @@ impl StreamProcessor {
                 .round() as usize;
             let xfade = xfade_base
                 .min(skip)
-                .min(delta_len * 3 / 4);
+                .min(delta_len * 7 / 8);
             let held = &self.hybrid_state.crossfade_held[ch];
             if !held.is_empty() && xfade > 0 {
                 // Cross-fade: blend the held-back samples (previous delta end)
