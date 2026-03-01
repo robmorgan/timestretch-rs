@@ -14,6 +14,8 @@ ${JSON_SCORES}
 ## Worst Performing Cases
 ${WORST_CASES}
 
+${IMPACT_ANALYSIS}
+
 ### Understanding the Metrics
 - **Spectral Convergence**: Measures magnitude similarity in the frequency domain. Low scores mean frequency content is distorted or "smeared".
 - **Log Spectral Distance**: Measures spectral difference in dB. High values indicate tonal coloration or gain issues.
@@ -65,10 +67,12 @@ ${WSOLA_CORE}
 1. **Review the scores and source code above.** Do not re-read these files.
 2. **Diagnose**: Look at the worst performing cases. Are they transients (drums)? Are they harmonic (sine/vocals)?
 3. **If you need to read additional code** (e.g., a helper function not shown above), you may — but limit to 3 reads max.
-4. **Modify**: Make **ONE** targeted change to the DSP logic to improve the scores.
+4. **Modify**: Make a **targeted, coherent change** to the DSP logic to improve the scores.
+   - You may change multiple files if the changes are logically related (e.g., adjusting PV hop AND compensating crossfade length).
    - Focus on: window functions, overlap-add logic, phase advancement, transient detection, or cross-correlation (WSOLA).
    - Do NOT refactor or reorganize. Only modify DSP math/logic.
    - Do NOT repeat any approach listed in "Previous Attempts" above.
+   - Use the **Impact Analysis** table above to target the highest-leverage metric+case combinations.
 5. **Build**: Run `cargo build --release` to verify compilation.
 6. **Score**: Re-run the scoring pipeline to measure the impact:
    ```bash

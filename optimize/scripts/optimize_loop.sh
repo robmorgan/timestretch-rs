@@ -76,21 +76,27 @@ if [ ! -f "$PROGRESS_CSV" ]; then
 fi
 
 START_ITER=1
+PLATEAU_LIMIT=8  # Break after this many consecutive non-improving iterations
+STALE_COUNT=0
+BEST_SCORE="0"
+
 if [ $RESUME -eq 1 ]; then
     START_ITER=$(tail -n +2 "$PROGRESS_CSV" | wc -l | xargs -I{} echo "{}+1" | bc || echo 1)
-    echo "Resuming from iteration $START_ITER"
+    # Recover best score from progress CSV
+    BEST_SCORE=$(tail -n +2 "$PROGRESS_CSV" | cut -d',' -f3 | sort -rn | head -1 || echo "0")
+    echo "Resuming from iteration $START_ITER (best score so far: $BEST_SCORE)"
 fi
 
 for (( i=START_ITER; i<=MAX_ITERATIONS; i++ )); do
     echo "--- Iteration $i ---"
-    
+
     # 1. Run timestretch-rs
     ./optimize/scripts/run_test_suite.py
-    
+
     # 2. Score
     SCORES_JSON="$LOG_DIR/scores_$i.json"
     ./optimize/scripts/score.py --batch "$SCORES_JSON"
-    
+
     AVG_SCORE=$(python3 -c "import json; data=json.load(open('$SCORES_JSON')); print(sum(r['total_score'] for r in data)/len(data))")
     WORST_SCORE=$(python3 -c "import json; data=json.load(open('$SCORES_JSON')); print(min(r['total_score'] for r in data))")
     WORST_CASE=$(python3 -c "import json; data=json.load(open('$SCORES_JSON')); print(min(data, key=lambda x: x['total_score'])['description'])")
@@ -98,7 +104,16 @@ for (( i=START_ITER; i<=MAX_ITERATIONS; i++ )); do
     STREAM_AVG_SCORE=$(python3 -c "import json; data=json.load(open('$SCORES_JSON')); s=[r['total_score'] for r in data if r.get('mode')=='streaming']; print(sum(s)/len(s) if s else 0)")
 
     echo "Iteration $i Average Score: $AVG_SCORE (Batch: $BATCH_AVG_SCORE, Streaming: $STREAM_AVG_SCORE, Worst: $WORST_SCORE - $WORST_CASE)"
-    
+
+    # Plateau detection: track consecutive non-improving iterations
+    if python3 -c "import sys; sys.exit(0 if float('$AVG_SCORE') > float('$BEST_SCORE') + 0.01 else 1)" 2>/dev/null; then
+        BEST_SCORE="$AVG_SCORE"
+        STALE_COUNT=0
+    else
+        STALE_COUNT=$((STALE_COUNT + 1))
+        echo "  [plateau: $STALE_COUNT/$PLATEAU_LIMIT consecutive non-improving iterations]"
+    fi
+
     # Log progress
     GIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "no-git")
     echo "$i,$(date -u +%Y-%m-%dT%H:%M:%SZ),$AVG_SCORE,$WORST_SCORE,"$WORST_CASE",$(get_config "general.agent"),$GIT_SHA" >> "$PROGRESS_CSV"
@@ -107,7 +122,13 @@ for (( i=START_ITER; i<=MAX_ITERATIONS; i++ )); do
         echo "Target score reached! Converged at iteration $i."
         break
     fi
-    
+
+    if [ $STALE_COUNT -ge $PLATEAU_LIMIT ]; then
+        echo "Plateau detected: no improvement in $PLATEAU_LIMIT consecutive iterations (best: $BEST_SCORE). Stopping."
+        echo "Consider: adjusting the algorithm architecture, changing the scoring methodology, or targeting specific weak test cases."
+        break
+    fi
+
     if [ $DRY_RUN -eq 1 ]; then
         echo "Dry run enabled. Stopping."
         break
@@ -137,10 +158,11 @@ for item in sorted_data:
 ' ' ' | xargs)
     JSON_SCORES=$(cat "$SCORES_JSON")
 
-    # Load previous attempts log (if it exists)
+    # Load previous attempts log (if it exists) — show ALL attempts so the
+    # agent doesn't repeat approaches from early iterations
     ATTEMPTS_FILE="$LOG_DIR/attempts.log"
     if [ -f "$ATTEMPTS_FILE" ] && [ -s "$ATTEMPTS_FILE" ]; then
-        PREVIOUS_ATTEMPTS=$(tail -n 20 "$ATTEMPTS_FILE")
+        PREVIOUS_ATTEMPTS=$(cat "$ATTEMPTS_FILE")
     else
         PREVIOUS_ATTEMPTS="No previous attempts logged yet. You are the first agent."
     fi
@@ -151,34 +173,119 @@ for item in sorted_data:
     PV_PROCESS=$(sed -n '299,500p' src/stretch/phase_vocoder.rs)
     WSOLA_CORE=$(sed -n '99,465p' src/stretch/wsola.rs)
 
-    # Diversity pressure: if score unchanged for 3+ iterations, suggest new directions
-    STALE_COUNT=$(tail -n 5 "$PROGRESS_CSV" | cut -d',' -f3 | sort -u | wc -l | tr -d ' ')
-    if [ "$STALE_COUNT" -eq 1 ] && [ "$i" -gt 3 ]; then
+    # Diversity pressure: if score unchanged for 3+ iterations, analyse the
+    # attempts log to suggest directions that have NOT been tried or that
+    # showed partial promise (small regressions that might work differently)
+    DIVERSITY_STALE=$(tail -n 5 "$PROGRESS_CSV" | cut -d',' -f3 | sort -u | wc -l | tr -d ' ')
+    if [ "$DIVERSITY_STALE" -eq 1 ] && [ "$i" -gt 3 ]; then
         DIVERSITY_HINTS=$(python3 -c "
-import random
-hints = [
-    'Try adjusting the overlap factor or hop size ratio in the phase vocoder.',
-    'Try modifying the crossfade duration between WSOLA and PV segments in hybrid.rs.',
-    'Try changing the transient detection threshold or sensitivity in transient.rs.',
-    'Try adjusting the WSOLA search range or segment size for better correlation matches.',
-    'Try modifying the phase locking strategy (identity vs ROI) in the phase vocoder.',
-    'Try adjusting the sub-bass rigid phase locking cutoff frequency.',
-    'Try changing the window function (Hann vs Blackman-Harris) or its parameters.',
-    'Try adjusting the spectral envelope preservation (cepstral order) in the phase vocoder.',
-    'Try modifying the HPSS separation parameters (kernel sizes, power) in hybrid.rs.',
-    'Try adjusting the band-split crossover frequency or filter slopes.',
-    'Try improving the overlap-add normalization (window sum handling) in the phase vocoder.',
-    'Try adjusting the min gap enforcement in transient detection to better preserve onsets.',
-]
-random.shuffle(hints)
+import re, collections
+
+# Read all attempts
+attempts = open('$ATTEMPTS_FILE').read() if '$ATTEMPTS_FILE' != '' else ''
+
+# Categorize past attempts by area
+categories = {
+    'PV hop/overlap': ['hop', 'overlap', 'hop_size', 'fft/'],
+    'HPSS params': ['hpss', 'harmonic_width', 'percussive_width', 'wiener', 'mask power'],
+    'Window function': ['window', 'hann', 'blackman'],
+    'Crossfade/blending': ['crossfade', 'fade', 'blend', 'taper'],
+    'Mirror padding': ['mirror', 'padding', 'pad_mult', 'start_pad', 'end_pad'],
+    'Phase locking': ['phase lock', 'phase_gradient', 'adaptive phase', 'roi', 'identity'],
+    'Transient detection': ['transient', 'sensitivity', 'onset'],
+    'WSOLA search/overlap': ['wsola', 'search_ms', 'seg_size', 'wsola overlap'],
+    'Edge correction': ['edge correct', 'gain ramp', 'correction_len', 'cubic hermite'],
+    'Sub-bass handling': ['sub.bass', 'cutoff', '120hz', '85hz'],
+    'Multi-resolution': ['multi_res', 'multi.resolution', '3-band'],
+    'Normalization': ['normaliz', 'window_sum', 'floor_ratio'],
+    'Spectral envelope': ['cepstr', 'spectral envelope'],
+    'Band-split': ['band.split', 'crossover'],
+    'Streaming chunk size': ['chunk_size', 'streaming chunk'],
+}
+
+# Count attempts per category
+cat_counts = collections.Counter()
+cat_results = collections.defaultdict(list)
+lines = attempts.strip().split('\\n')
+for line in lines:
+    lower = line.lower()
+    for cat, keywords in categories.items():
+        if any(kw in lower for kw in keywords):
+            cat_counts[cat] += 1
+            # Extract score delta if possible
+            m = re.search(r'score=([\\d.]+)\\s*\\(was\\s*([\\d.]+)', line)
+            if m:
+                delta = float(m.group(1)) - float(m.group(2))
+                cat_results[cat].append(delta)
+
+# Find under-explored and unexplored areas
+all_cats = list(categories.keys())
+unexplored = [c for c in all_cats if cat_counts[c] == 0]
+under_explored = [(c, cat_counts[c]) for c in all_cats if 0 < cat_counts[c] <= 2]
+# Near-misses: categories where at least one attempt was close to improving
+near_miss = [(c, max(cat_results[c])) for c in all_cats
+             if cat_results[c] and max(cat_results[c]) > -0.5]
+
 print('## Diversity Suggestions (score has been flat — try something NEW)')
-print('The following are areas that have NOT been explored recently. Pick one:')
-for h in hints[:4]:
-    print(f'- {h}')
+print()
+if unexplored:
+    print('### Unexplored Areas (never tried):')
+    for c in unexplored[:4]:
+        print(f'- **{c}**')
+    print()
+if under_explored:
+    print('### Under-Explored Areas (tried only 1-2x):')
+    for c, n in sorted(under_explored, key=lambda x: x[1])[:4]:
+        print(f'- **{c}** ({n} attempt(s))')
+    print()
+if near_miss:
+    print('### Near-Misses (small regressions — might work with a different angle):')
+    for c, delta in sorted(near_miss, key=lambda x: x[1], reverse=True)[:3]:
+        print(f'- **{c}** (best delta: {delta:+.2f})')
+    print()
+# Over-explored warning
+over_explored = [(c, cat_counts[c]) for c in all_cats if cat_counts[c] >= 5]
+if over_explored:
+    print('### Over-Explored (diminishing returns — AVOID these):')
+    for c, n in sorted(over_explored, key=lambda x: x[1], reverse=True)[:4]:
+        print(f'- ~~{c}~~ ({n} attempts, none successful recently)')
 ")
     else
         DIVERSITY_HINTS=""
     fi
+
+    # Calculate per-metric impact analysis: which metric+case has the most
+    # leverage on the overall average score
+    IMPACT_ANALYSIS=$(python3 -c "
+import json
+
+data = json.load(open('$SCORES_JSON'))
+n = len(data)
+weights = {'spectral_convergence': 0.30, 'log_spectral_distance': 0.25,
+           'mfcc_distance': 0.20, 'transient_preservation': 0.25}
+
+# For each test case and metric, compute how much the overall average
+# would improve if that metric reached 100
+impacts = []
+for item in data:
+    for metric, weight in weights.items():
+        current = item['metrics'][metric]
+        headroom = 100.0 - current
+        # Impact on overall average = (headroom * weight) / n
+        impact = (headroom * weight) / n
+        if impact > 0.3:  # Only show meaningful opportunities
+            impacts.append((impact, item['description'], metric, current))
+
+impacts.sort(reverse=True)
+print('## Highest-Impact Opportunities')
+print('Improving these specific metrics would have the largest effect on the overall score:')
+print('| Impact | Test Case | Metric | Current | Headroom |')
+print('|--------|-----------|--------|---------|----------|')
+for impact, desc, metric, current in impacts[:8]:
+    print(f'| +{impact:.2f} | {desc} | {metric} | {current:.1f} | {100-current:.1f} |')
+print()
+print('**Focus on the top 2-3 rows** — these are where your changes will move the needle most.')
+")
 
     # Export vars for envsubst
     export ITERATION=$i
@@ -194,6 +301,7 @@ for h in hints[:4]:
     export PV_PROCESS="$PV_PROCESS"
     export WSOLA_CORE="$WSOLA_CORE"
     export DIVERSITY_HINTS="$DIVERSITY_HINTS"
+    export IMPACT_ANALYSIS="$IMPACT_ANALYSIS"
     export WORST_CASES=$(python3 -c "
 import json
 data = json.load(open('$SCORES_JSON'))
@@ -202,7 +310,7 @@ for d in sorted_data:
     print(f'- {d[\"description\"]}: {d[\"total_score\"]:.2f}')
 ")
 
-    envsubst '$ITERATION $AVG_SCORE $TARGET_SCORE $BATCH_AVG_SCORE $STREAM_AVG_SCORE $SCORE_HISTORY $JSON_SCORES $PREVIOUS_ATTEMPTS $HYBRID_HEAD $HYBRID_STRETCH_CORE $PV_PROCESS $WSOLA_CORE $DIVERSITY_HINTS $WORST_CASES' \
+    envsubst '$ITERATION $AVG_SCORE $TARGET_SCORE $BATCH_AVG_SCORE $STREAM_AVG_SCORE $SCORE_HISTORY $JSON_SCORES $PREVIOUS_ATTEMPTS $HYBRID_HEAD $HYBRID_STRETCH_CORE $PV_PROCESS $WSOLA_CORE $DIVERSITY_HINTS $IMPACT_ANALYSIS $WORST_CASES' \
         < "optimize/scripts/agent_prompt.md.tmpl" > "$PROMPT_FILE"
     
     # 5. Run Agent (agent self-scores and commits if improved)

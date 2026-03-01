@@ -112,8 +112,11 @@ def score_pair(ref_path, test_path, weights):
     # Map raw metrics to 0-100 scores
     # SC: 0 is perfect, >1 is bad. 1 - SC is roughly 0-1.
     sc_score = max(0, 100 * (1.0 - sc))
-    # LSD: 0 is perfect, 10-20 is quite different. 
-    lsd_score = max(0, 100 * (1.0 - lsd/15.0))
+    # LSD: 0 is perfect. Use exponential decay so pathological values
+    # (e.g. silence-to-transient with 128dB) still get a non-zero score
+    # instead of clamping to 0 at 15dB. Gives ~60 at 5dB, ~37 at 10dB,
+    # ~22 at 15dB, ~5 at 30dB, ~0 at 50dB+.
+    lsd_score = 100 * np.exp(-lsd / 10.0)
     # MFCC dist: 0 is perfect, 1 is total difference.
     mfcc_score = max(0, 100 * (1.0 - mfcc_dist))
     # TP: 1.0 is perfect.
