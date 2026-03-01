@@ -193,6 +193,28 @@ fn main() {
             }
         }
 
+        // Streaming mode doesn't apply global RMS normalization (the batch
+        // path normalizes inside stretch()). Apply it here so streaming
+        // output matches batch-level loudness and the reference level used
+        // by quality scoring.
+        if normalize && !all_output.is_empty() && !buffer.data.is_empty() {
+            let input_rms = {
+                let sum_sq: f64 = buffer.data.iter().map(|&s| (s as f64) * (s as f64)).sum();
+                (sum_sq / buffer.data.len() as f64).sqrt()
+            };
+            let output_rms = {
+                let sum_sq: f64 =
+                    all_output.iter().map(|&s| (s as f64) * (s as f64)).sum();
+                (sum_sq / all_output.len() as f64).sqrt()
+            };
+            if output_rms > 1e-8 && input_rms > 1e-8 {
+                let gain = (input_rms / output_rms) as f32;
+                for s in &mut all_output {
+                    *s *= gain;
+                }
+            }
+        }
+
         timestretch::AudioBuffer::new(all_output, buffer.sample_rate, buffer.channels)
     } else if let Some(pf) = pitch_factor {
         eprintln!("Pitch shift factor: {:.4}", pf);
