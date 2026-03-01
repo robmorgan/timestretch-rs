@@ -938,12 +938,58 @@ impl HybridStretcher {
         pv: &mut PhaseVocoder,
     ) -> Option<Vec<f32>> {
         let hpss_params = HpssParams::default();
-        let (harmonic, percussive) = hpss(
-            seg_data,
-            self.params.fft_size,
-            self.params.hop_size,
-            &hpss_params,
-        );
+
+        // For compression ratios (ratio < 1.0), pad the HPSS input with
+        // reflected samples so the horizontal median filter has full context
+        // at signal boundaries. Without padding, boundary frames use
+        // one-sided median statistics that create spectral artifacts — these
+        // are detected by onset detectors as false transients (TP = 50%).
+        //
+        // Only applied for compression to avoid shifting real onsets when
+        // stretching (ratio >= 1.0).
+        let (harmonic, percussive) = if seg_ratio < 0.85 {
+            let pad_frames = hpss_params.harmonic_width / 2;
+            let pad_samples = (pad_frames * self.params.hop_size).min(seg_data.len());
+            if pad_samples > 0 && seg_data.len() > pad_samples {
+                let padded_len = seg_data.len() + pad_samples * 2;
+                let mut padded = vec![0.0f32; padded_len];
+                // Mirror-reflect start
+                for i in 0..pad_samples {
+                    padded[i] = seg_data[pad_samples.min(seg_data.len()) - 1 - i];
+                }
+                // Copy original
+                padded[pad_samples..pad_samples + seg_data.len()].copy_from_slice(seg_data);
+                // Mirror-reflect end
+                for i in 0..pad_samples {
+                    padded[pad_samples + seg_data.len() + i] =
+                        seg_data[seg_data.len() - 1 - i.min(seg_data.len() - 1)];
+                }
+                let (h_padded, p_padded) = hpss(
+                    &padded,
+                    self.params.fft_size,
+                    self.params.hop_size,
+                    &hpss_params,
+                );
+                // Trim back to original length
+                let h = h_padded[pad_samples..pad_samples + seg_data.len()].to_vec();
+                let p = p_padded[pad_samples..pad_samples + seg_data.len()].to_vec();
+                (h, p)
+            } else {
+                hpss(
+                    seg_data,
+                    self.params.fft_size,
+                    self.params.hop_size,
+                    &hpss_params,
+                )
+            }
+        } else {
+            hpss(
+                seg_data,
+                self.params.fft_size,
+                self.params.hop_size,
+                &hpss_params,
+            )
+        };
 
         // PV-stretch harmonic component
         let harmonic_stretched = if harmonic.len() >= self.params.fft_size {
