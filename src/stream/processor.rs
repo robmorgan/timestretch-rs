@@ -99,6 +99,15 @@ struct HybridStreamingState {
     /// used for cross-fading at chunk boundaries to smooth phase
     /// discontinuities from fresh PV state on each re-render.
     crossfade_held: Vec<Vec<f32>>,
+    /// Input samples accumulated (per channel) since the last hybrid render.
+    ///
+    /// Starts at `usize::MAX` so the very first render triggers immediately
+    /// once the minimum-latency threshold is met. After each render it resets
+    /// to zero, and subsequent renders are deferred until at least `fft_size`
+    /// new samples have accumulated. This prevents tiny per-chunk deltas
+    /// whose crossfade regions dominate the output and create spectral-flux
+    /// artifacts (false onsets).
+    input_accumulated: usize,
 }
 
 impl HybridStreamingState {
@@ -130,6 +139,7 @@ impl HybridStreamingState {
             last_ratio: ratio,
             max_tail_frames,
             crossfade_held: (0..num_channels).map(|_| Vec::new()).collect(),
+            input_accumulated: usize::MAX,
         }
     }
 
@@ -160,6 +170,7 @@ impl HybridStreamingState {
     fn rebase_after_ratio_change(&mut self) {
         self.retain_tail();
         self.tail_output_lens.fill(0);
+        self.input_accumulated = usize::MAX;
     }
 
     fn update_tail_output_estimates_from_rendered(
@@ -583,7 +594,8 @@ impl StreamProcessor {
         self.collect_channel_inputs(total_frames, num_channels)?;
 
         if self.use_hybrid {
-            let min_output_len = self.process_hybrid_persistent_channels(num_channels)?;
+            let min_output_len =
+                self.process_hybrid_persistent_channels(num_channels, require_min_latency)?;
             let consumed = total_frames * num_channels;
             self.input_ring.discard(consumed);
 
@@ -760,6 +772,7 @@ impl StreamProcessor {
     }
 
     fn append_hybrid_input(&mut self, num_channels: usize) -> Result<(), StretchError> {
+        let mut first_ch_pushed = 0;
         for ch in 0..num_channels {
             let input = &self.channel_input_buffers[ch];
             let rb = &mut self.hybrid_state.rolling_inputs[ch];
@@ -774,13 +787,21 @@ impl StreamProcessor {
                     available: pushed,
                 });
             }
+            if ch == 0 {
+                first_ch_pushed = pushed;
+            }
         }
+        self.hybrid_state.input_accumulated = self
+            .hybrid_state
+            .input_accumulated
+            .saturating_add(first_ch_pushed);
         Ok(())
     }
 
     fn process_hybrid_persistent_channels(
         &mut self,
         num_channels: usize,
+        allow_defer: bool,
     ) -> Result<usize, StretchError> {
         if self.hybrid_pending_rebase {
             self.hybrid_state.rebase_after_ratio_change();
@@ -789,6 +810,17 @@ impl StreamProcessor {
         self.hybrid_state.update_ratio(self.current_ratio);
 
         self.append_hybrid_input(num_channels)?;
+
+        // Accumulate enough new input before re-rendering.  With small
+        // input chunks (e.g. 1024 samples) the output delta per render is
+        // tiny and almost entirely consumed by the crossfade, producing
+        // spectral-flux spikes at chunk boundaries that manifest as false
+        // onsets.  Batching input to at least fft_size new samples per
+        // render makes each delta large enough for the crossfade to be a
+        // minor fraction, eliminating these artifacts.
+        if allow_defer && self.hybrid_state.input_accumulated < self.params.fft_size {
+            return Ok(0);
+        }
 
         let mut min_output_len = usize::MAX;
         let mut pre_trim_lens = vec![0usize; num_channels];
@@ -852,8 +884,17 @@ impl StreamProcessor {
                 }
             }
 
+            // Always hold back a crossfade-sized tail, even on the first
+            // render (when skip=0 and xfade=0).  Without this, the first
+            // render emits all output with no holdback, creating a raw
+            // waveform splice at the render-1→render-2 boundary.  That
+            // discontinuity triggers false onset detection in spectral-
+            // flux-based metrics.  By holding back on every render, the
+            // next render always has crossfade material available.
+            let holdback = xfade_base.min(delta_len * 7 / 8);
+
             // Emit the new delta, holding back the tail for next cross-fade.
-            let emit_end = delta_len.saturating_sub(xfade);
+            let emit_end = delta_len.saturating_sub(holdback);
             self.channel_output_buffers[ch]
                 .extend_from_slice(&rendered[skip..skip + emit_end]);
 
@@ -864,6 +905,7 @@ impl StreamProcessor {
             min_output_len = min_output_len.min(self.channel_output_buffers[ch].len());
         }
 
+        self.hybrid_state.input_accumulated = 0;
         self.hybrid_state.retain_tail();
         self.hybrid_state
             .update_tail_output_estimates_from_rendered(&pre_trim_lens, &rendered_lens);
