@@ -25,6 +25,7 @@ pub fn start_processing_thread(
     position: Arc<AtomicPosition>,
     stream_active: Arc<AtomicBool>,
     stop_flag: Arc<StopFlag>,
+    flush_ring: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut processor = build_processor(&state, sample_rate);
@@ -32,6 +33,7 @@ pub fn start_processing_thread(
         let chunk_samples = CHUNK_FRAMES * CHANNELS as usize;
         let mut stream_started = false;
         let preroll_target_samples = startup_preroll_target_samples(&processor);
+        let mut prev_ratio: f64 = state.lock().unwrap().stretch_ratio;
 
         // Keep output muted until enough stretched samples are buffered.
         stream_active.store(false, Ordering::Relaxed);
@@ -58,9 +60,13 @@ pub fn start_processing_thread(
                 (t, r, s, pc, prc, ps)
             };
 
-            // Handle preset change - rebuild processor
+            // Handle preset change - rebuild processor and flush stale audio
             if preset_changed {
                 processor = build_processor(&state, sample_rate);
+                flush_ring.store(true, Ordering::Release);
+                stream_active.store(false, Ordering::Relaxed);
+                stream_started = false;
+                prev_ratio = stretch_ratio;
             }
 
             // Handle pitch change - re-process entire source
@@ -105,12 +111,13 @@ pub fn start_processing_thread(
                 }
             }
 
-            // Handle seek
+            // Handle seek - flush stale audio and re-enter preroll
             if let Some(seek_frame) = seek_req {
                 src_pos = (seek_frame * CHANNELS as usize).min(working_audio.len());
                 processor.reset();
-                // Drain ring buffer by waiting for it to empty
-                // (the audio thread will consume what's there)
+                flush_ring.store(true, Ordering::Release);
+                stream_active.store(false, Ordering::Relaxed);
+                stream_started = false;
             }
 
             // Only process if playing
@@ -119,8 +126,13 @@ pub fn start_processing_thread(
                 continue;
             }
 
-            // Update stretch ratio
+            // Update stretch ratio; flush stale ring-buffer audio when it changes
+            // but keep the processor running (set_stretch_ratio handles interpolation).
             processor.set_stretch_ratio(stretch_ratio);
+            if (stretch_ratio - prev_ratio).abs() > 1e-6 {
+                prev_ratio = stretch_ratio;
+                flush_ring.store(true, Ordering::Release);
+            }
 
             // Check if we have audio to process
             if src_pos >= working_audio.len() {

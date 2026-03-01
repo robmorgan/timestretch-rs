@@ -51,8 +51,9 @@ impl TimeStretchApp {
         let position = Arc::new(AtomicPosition::new());
 
         // Try to create audio engine to detect default sample rate
+        let dummy_flush = Arc::new(AtomicBool::new(false));
         let (audio_engine, output_sample_rate) =
-            match AudioEngine::new(state.clone(), stream_active.clone(), None) {
+            match AudioEngine::new(state.clone(), stream_active.clone(), None, dummy_flush) {
                 Ok((engine, _producer)) => {
                     let sr = engine.output_sample_rate;
                     // We'll create a new engine when loading a file
@@ -80,7 +81,7 @@ impl TimeStretchApp {
             stretch_ratio: 1.0,
             pitch_semitones: 0.0,
             volume: 0.8,
-            preset: PresetChoice::None,
+            preset: PresetChoice::DjBeatmatch,
             target_bpm_text: String::new(),
             error_message: None,
         }
@@ -170,14 +171,19 @@ impl TimeStretchApp {
 
         // Create audio engine with ring buffer, matching the source file's sample rate
         // so playback speed is correct regardless of the device's native rate.
-        let (engine, producer) =
-            match AudioEngine::new(self.state.clone(), self.stream_active.clone(), Some(sample_rate)) {
-                Ok((e, p)) => (e, p),
-                Err(e) => {
-                    self.error_message = Some(format!("Audio error: {e}"));
-                    return;
-                }
-            };
+        let flush_ring = Arc::new(AtomicBool::new(false));
+        let (engine, producer) = match AudioEngine::new(
+            self.state.clone(),
+            self.stream_active.clone(),
+            Some(sample_rate),
+            flush_ring.clone(),
+        ) {
+            Ok((e, p)) => (e, p),
+            Err(e) => {
+                self.error_message = Some(format!("Audio error: {e}"));
+                return;
+            }
+        };
         self.audio_engine = Some(engine);
 
         // Prepare working audio (with pitch shift if needed)
@@ -217,6 +223,7 @@ impl TimeStretchApp {
             self.position.clone(),
             self.stream_active.clone(),
             stop_flag,
+            flush_ring,
         );
 
         self.processing_handle = Some(handle);
