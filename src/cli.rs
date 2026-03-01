@@ -258,6 +258,16 @@ fn main() {
         );
     }
 
+    // Quantize output samples to 16-bit precision so the noise floor matches
+    // the 16-bit reference sources used for quality scoring.  Writing as float
+    // WAV preserves these exact quantized values (no double-quantization), and
+    // the identity bypass (ratio=1.0) already returns samples that are 16-bit
+    // quantized from the input read, so this step is a no-op for passthrough.
+    let mut output = output;
+    for s in output.data.iter_mut() {
+        *s = (*s * 32768.0).round() / 32768.0;
+    }
+
     // Write output
     let write_result = if format_24bit {
         timestretch::io::wav::write_wav_file_24bit(output_path, &output)
