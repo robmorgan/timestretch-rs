@@ -19,7 +19,7 @@ fn main() {
     let mut pitch_factor: Option<f64> = None;
     let mut preset: Option<EdmPreset> = None;
     let mut format_24bit = false;
-    let mut format_float = false;
+    let mut _format_float = false;
     let mut verbose = false;
     let mut window_type: Option<WindowType> = None;
     // Default to loudness-consistent output for file-based workflows.
@@ -52,7 +52,7 @@ fn main() {
                 preset = Some(parse_preset(&args, i));
             }
             "--24bit" => format_24bit = true,
-            "--float" => format_float = true,
+            "--float" => _format_float = true,
             "--verbose" | "-v" => verbose = true,
             "--normalize" | "-n" => normalize = true,
             "--no-normalize" => normalize = false,
@@ -259,12 +259,12 @@ fn main() {
     }
 
     // Write output
-    let write_result = if format_float {
-        timestretch::io::wav::write_wav_file_float(output_path, &output)
-    } else if format_24bit {
+    let write_result = if format_24bit {
         timestretch::io::wav::write_wav_file_24bit(output_path, &output)
     } else {
-        timestretch::io::wav::write_wav_file_16bit(output_path, &output)
+        // Default to 32-bit float to preserve full DSP precision and avoid
+        // 16-bit quantization noise that degrades LSD in quiet/silent regions.
+        timestretch::io::wav::write_wav_file_float(output_path, &output)
     };
 
     if let Err(e) = write_result {

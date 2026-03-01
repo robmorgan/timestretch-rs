@@ -372,6 +372,16 @@ impl StreamProcessor {
         }
 
         self.initialized = true;
+
+        // Fast passthrough for unity ratio: skip PV/WSOLA processing to
+        // produce bit-exact output and eliminate windowing/overlap-add drift.
+        if (self.target_ratio - 1.0).abs() < RATIO_SNAP_THRESHOLD
+            && (self.current_ratio - 1.0).abs() < RATIO_SNAP_THRESHOLD
+        {
+            output.extend_from_slice(input);
+            return Ok(());
+        }
+
         let num_channels = self.params.channels.count().max(1);
         let mut offset = 0usize;
         let mut iterations = 0usize;
