@@ -11,6 +11,8 @@ use crate::state::{AtomicPosition, SharedStateHandle, StopFlag, Transport};
 /// Chunk size for feeding into StreamProcessor (in frames, stereo = 2x samples).
 const CHUNK_FRAMES: usize = 1024;
 const CHANNELS: u32 = 2;
+/// Extra callback cushion to absorb scheduling jitter at stream start.
+const START_PREROLL_CALLBACKS: usize = 2;
 
 /// Start the processing thread. Returns a stop flag handle.
 #[allow(clippy::too_many_arguments)]
@@ -28,8 +30,11 @@ pub fn start_processing_thread(
         let mut processor = build_processor(&state, sample_rate);
         let mut src_pos: usize = 0; // position in working_audio samples (interleaved)
         let chunk_samples = CHUNK_FRAMES * CHANNELS as usize;
+        let mut stream_started = false;
+        let preroll_target_samples = startup_preroll_target_samples(&processor);
 
-        stream_active.store(true, Ordering::Relaxed);
+        // Keep output muted until enough stretched samples are buffered.
+        stream_active.store(false, Ordering::Relaxed);
 
         loop {
             if stop_flag.is_set() {
@@ -124,6 +129,12 @@ pub fn start_processing_thread(
                 if let Ok(flushed) = processor.flush() {
                     push_to_ring(&mut producer, &flushed);
                 }
+                // Short clips can end before reaching the normal preroll target.
+                // If we have anything buffered, start the stream so the tail can play.
+                if !stream_started && producer.occupied_len() > 0 {
+                    stream_started = true;
+                    stream_active.store(true, Ordering::Relaxed);
+                }
                 // Signal stop
                 {
                     let mut st = state.lock().unwrap();
@@ -157,6 +168,10 @@ pub fn start_processing_thread(
                     if !output.is_empty() {
                         push_to_ring(&mut producer, &output);
                     }
+                    if !stream_started && producer.occupied_len() >= preroll_target_samples {
+                        stream_started = true;
+                        stream_active.store(true, Ordering::Relaxed);
+                    }
                 }
                 Err(e) => {
                     log::error!("Stream processing error: {e}");
@@ -178,6 +193,14 @@ fn build_processor(state: &SharedStateHandle, sample_rate: u32) -> StreamProcess
         params = params.with_preset(preset);
     }
     StreamProcessor::new(params)
+}
+
+fn startup_preroll_target_samples(processor: &StreamProcessor) -> usize {
+    let latency_frames = processor.latency_samples();
+    let callback_cushion_samples = CHUNK_FRAMES * CHANNELS as usize * START_PREROLL_CALLBACKS;
+    latency_frames
+        .saturating_mul(CHANNELS as usize)
+        .max(callback_cushion_samples)
 }
 
 fn push_to_ring(producer: &mut RingProducer, data: &[f32]) {
