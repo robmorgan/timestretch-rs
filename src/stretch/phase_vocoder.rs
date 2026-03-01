@@ -440,9 +440,16 @@ impl PhaseVocoder {
             }
             // Copy original
             padded[start_pad..start_pad + input.len()].copy_from_slice(input);
-            // Reflect end (longer — full spectral quality)
+            // Reflect end with cosine taper: the reflected samples fade
+            // smoothly to zero so the PV sees a gradually decaying
+            // continuation instead of a cusp.  This reduces phase
+            // interference at the boundary and eliminates the sharp
+            // amplitude droop in the last few output frames that causes
+            // false onset detection at the signal end.
             for i in 0..end_pad {
-                padded[start_pad + input.len() + i] = input[input.len() - 1 - i];
+                let t = (i + 1) as f32 / end_pad as f32;
+                let fade = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
+                padded[start_pad + input.len() + i] = input[input.len() - 1 - i] * fade;
             }
 
             let (_num_frames, output_len) = self.process_core(&padded, true)?;
