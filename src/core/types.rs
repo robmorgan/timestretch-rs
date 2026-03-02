@@ -1664,7 +1664,7 @@ const DEFAULT_RESIDUAL_BRANCH: bool = true;
 const DEFAULT_RESIDUAL_MIX: f32 = 0.25;
 
 /// Default transient region duration in seconds (~10ms around each onset).
-const DEFAULT_TRANSIENT_REGION_SECS: f64 = 0.010;
+const DEFAULT_TRANSIENT_REGION_SECS: f64 = 0.015;
 /// Default minimum confidence required for beat-grid snapping decisions.
 const DEFAULT_BEAT_SNAP_CONFIDENCE_THRESHOLD: f32 = 0.35;
 /// Default transient-to-grid snap tolerance in milliseconds.
