@@ -113,20 +113,57 @@ pub fn hpss(
     let mut h_buf = vec![COMPLEX_ZERO; fft_size];
     let mut p_buf = vec![COMPLEX_ZERO; fft_size];
 
+    // Buffers for content-adaptive mask smoothing.  For frames with
+    // significant percussive energy the raw Wiener masks can have
+    // sharp bin-to-bin transitions that create spectral notches in the
+    // recombined output.  A small frequency-axis moving-average softens
+    // these notches.  Tonal frames (sine, vocal) keep raw masks to
+    // prevent harmonic leakage into the percussive WSOLA path.
+    let mut h_mask_buf = vec![0.0f32; num_bins];
+    let mut h_mask_smooth = vec![0.0f32; num_bins];
+    const MASK_SMOOTH_RADIUS: usize = 2; // 5-bin window
+    const PERC_FRACTION_THRESHOLD: f32 = 0.3;
+
     for frame_idx in 0..num_frames {
         let pos = frame_idx * hop_size;
         let frame_end = (pos + fft_size).min(output_len);
         let frame_len = frame_end - pos;
 
-        // Apply Wiener masks to complex spectrum
+        // Compute raw Wiener masks
+        let mut h_energy = 0.0f32;
+        let mut p_energy = 0.0f32;
         for bin in 0..num_bins {
             let h = harmonic_mags[frame_idx][bin];
             let p = percussive_mags[frame_idx][bin];
             let h2 = h * h;
             let p2 = p * p;
+            h_energy += h2;
+            p_energy += p2;
             let denom = h2 + p2 + eps;
-            let h_mask = h2 / denom;
-            let p_mask = p2 / denom;
+            h_mask_buf[bin] = h2 / denom;
+        }
+
+        // Only smooth in frames with significant percussive content.
+        let perc_fraction = p_energy / (h_energy + p_energy + eps);
+        let use_smooth = perc_fraction > PERC_FRACTION_THRESHOLD;
+
+        if use_smooth {
+            for bin in 0..num_bins {
+                let start = bin.saturating_sub(MASK_SMOOTH_RADIUS);
+                let end = (bin + MASK_SMOOTH_RADIUS + 1).min(num_bins);
+                let sum: f32 = h_mask_buf[start..end].iter().sum();
+                h_mask_smooth[bin] = sum / (end - start) as f32;
+            }
+        }
+
+        // Apply masks to complex spectrum
+        for bin in 0..num_bins {
+            let h_mask = if use_smooth {
+                h_mask_smooth[bin]
+            } else {
+                h_mask_buf[bin]
+            };
+            let p_mask = 1.0 - h_mask;
 
             h_buf[bin] = spectrogram[frame_idx][bin] * h_mask;
             p_buf[bin] = spectrogram[frame_idx][bin] * p_mask;
