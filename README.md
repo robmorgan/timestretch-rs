@@ -96,7 +96,7 @@ loop {
 }
 
 // Change ratio on the fly (e.g. DJ pitch fader)
-processor.set_stretch_ratio(1.05);
+processor.set_stretch_ratio(1.05).expect("valid ratio");
 
 // Flush remaining samples when done
 let mut remaining = Vec::with_capacity(8192);

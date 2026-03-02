@@ -31,6 +31,15 @@ fn generate_gate_signal(sample_rate: u32, bpm: f64, duration_secs: f64) -> Vec<f
     out
 }
 
+fn mono_to_stereo_interleaved(mono: &[f32]) -> Vec<f32> {
+    let mut stereo = Vec::with_capacity(mono.len() * 2);
+    for &s in mono {
+        stereo.push(s);
+        stereo.push(s);
+    }
+    stereo
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct BoundaryArtifactStats {
     max_ratio: f64,
@@ -504,6 +513,134 @@ fn quality_gate_streaming_worst_case_callback_budget() {
     assert!(
         max_ratio <= multiplier,
         "callback budget gate failed: max callback ratio {:.3} > {:.3} (max callback {:.3}ms, budget {:.3}ms). Set {}=0 for relaxed mode or {} to tune.",
+        max_ratio,
+        multiplier,
+        max_callback_ms,
+        max_budget_ms,
+        STRICT_CALLBACK_BUDGET_ENV,
+        CALLBACK_BUDGET_MULTIPLIER_ENV
+    );
+}
+
+#[test]
+fn quality_gate_streaming_callback_budget_tempo_and_pitch_modulation() {
+    let sample_rate = 44_100u32;
+    let source_bpm = 126.0;
+    let callback_frames = 256usize;
+    let input = mono_to_stereo_interleaved(&generate_gate_signal(sample_rate, source_bpm, 10.0));
+    let Some(multiplier) = callback_budget_multiplier() else {
+        println!(
+            "Skipping tempo+pitch callback budget gate: set {}=1 (strict) or {}=<value> to enable",
+            STRICT_CALLBACK_BUDGET_ENV, CALLBACK_BUDGET_MULTIPLIER_ENV
+        );
+        write_quality_dashboard_csv(
+            "quality_gate_streaming_callback_budget_tempo_and_pitch_modulation",
+            "status,max_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
+            "skipped,NaN,NaN,NaN,NaN,0,NaN,false",
+        );
+        return;
+    };
+
+    let mut processor =
+        StreamProcessor::try_from_tempo_low_latency(source_bpm, source_bpm, sample_rate, 2)
+            .expect("valid low-latency tempo constructor");
+    let mut output = Vec::with_capacity((input.len() as f64 * 1.40) as usize + 65_536);
+
+    // Warm up so one-time initialization effects don't dominate.
+    for (idx, chunk) in input.chunks(callback_frames * 2).take(8).enumerate() {
+        let phase = idx as f64 / 8.0;
+        let target_bpm = source_bpm + 2.0 * (2.0 * std::f64::consts::PI * phase).sin();
+        let pitch_scale = 1.0 + 0.03 * (2.0 * std::f64::consts::PI * phase * 1.3).sin();
+        assert!(processor.set_tempo(target_bpm));
+        processor
+            .set_pitch_scale(pitch_scale)
+            .expect("valid warmup pitch scale");
+        processor
+            .process_into(chunk, &mut output)
+            .expect("warmup process_into failed");
+    }
+    output.clear();
+
+    let chunks: Vec<&[f32]> = input.chunks(callback_frames * 2).skip(8).collect();
+    let mut measured_callbacks = 0usize;
+    let mut max_ratio = 0.0f64;
+    let mut max_callback_ms = 0.0f64;
+    let mut max_budget_ms = 0.0f64;
+    let mut total_process_ms = 0.0f64;
+    let mut total_audio_ms = 0.0f64;
+
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let phase = idx as f64 / chunks.len().max(1) as f64;
+        let target_bpm = source_bpm + 3.0 * (2.0 * std::f64::consts::PI * phase).sin();
+        let pitch_scale = 1.0 + 0.05 * (2.0 * std::f64::consts::PI * phase * 1.7).sin();
+        assert!(processor.set_tempo(target_bpm));
+        processor
+            .set_pitch_scale(pitch_scale)
+            .expect("valid modulation pitch scale");
+
+        let chunk_frames = (chunk.len() / 2).max(1);
+        let callback_audio_ms = chunk_frames as f64 * 1000.0 / sample_rate as f64;
+        let allowed_ms = callback_audio_ms * multiplier;
+
+        let start = Instant::now();
+        processor
+            .process_into(chunk, &mut output)
+            .expect("measured process_into failed");
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        measured_callbacks += 1;
+        total_process_ms += elapsed_ms;
+        total_audio_ms += callback_audio_ms;
+
+        let ratio = elapsed_ms / callback_audio_ms.max(1e-9);
+        if ratio > max_ratio {
+            max_ratio = ratio;
+            max_callback_ms = elapsed_ms;
+            max_budget_ms = allowed_ms;
+        }
+    }
+
+    processor
+        .flush_into(&mut output)
+        .expect("flush_into failed for tempo+pitch callback budget gate");
+
+    assert!(
+        measured_callbacks > 0,
+        "tempo+pitch callback budget gate measured no callbacks"
+    );
+    assert!(
+        !output.is_empty(),
+        "tempo+pitch callback budget gate produced empty output"
+    );
+
+    let avg_ratio = total_process_ms / total_audio_ms.max(1e-9);
+    println!(
+        "callback-budget-tempo-pitch: callbacks={} max_ratio={:.3} avg_ratio={:.3} max_ms={:.3} budget_ms={:.3} strict_mode={}",
+        measured_callbacks,
+        max_ratio,
+        avg_ratio,
+        max_callback_ms,
+        max_budget_ms,
+        strict_callback_budget_mode()
+    );
+    write_quality_dashboard_csv(
+        "quality_gate_streaming_callback_budget_tempo_and_pitch_modulation",
+        "status,max_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
+        &format!(
+            "ok,{:.6},{:.6},{:.6},{:.6},{},{:.6},{}",
+            max_ratio,
+            avg_ratio,
+            max_callback_ms,
+            max_budget_ms,
+            measured_callbacks,
+            multiplier,
+            strict_callback_budget_mode()
+        ),
+    );
+
+    assert!(
+        max_ratio <= multiplier,
+        "tempo+pitch callback budget gate failed: max callback ratio {:.3} > {:.3} (max callback {:.3}ms, budget {:.3}ms). Set {}=0 for relaxed mode or {} to tune.",
         max_ratio,
         multiplier,
         max_callback_ms,

@@ -3,10 +3,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use timestretch::{StretchParams, StreamProcessor};
+use timestretch::{QualityMode, StretchParams, StreamProcessor};
 
 use crate::audio_engine::RingProducer;
-use crate::state::{AtomicPosition, SharedStateHandle, StopFlag, Transport};
+use crate::state::{AtomicPosition, PresetChoice, SharedStateHandle, StopFlag, Transport};
 
 /// Chunk size for feeding into StreamProcessor (in frames, stereo = 2x samples).
 const CHUNK_FRAMES: usize = 1024;
@@ -128,7 +128,11 @@ pub fn start_processing_thread(
 
             // Update stretch ratio; flush stale ring-buffer audio when it changes
             // but keep the processor running (set_stretch_ratio handles interpolation).
-            processor.set_stretch_ratio(stretch_ratio);
+            if let Err(err) = processor.set_stretch_ratio(stretch_ratio) {
+                log::error!("Invalid stretch ratio {stretch_ratio}: {err}");
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
             if (stretch_ratio - prev_ratio).abs() > 1e-6 {
                 prev_ratio = stretch_ratio;
                 flush_ring.store(true, Ordering::Release);
@@ -197,6 +201,43 @@ pub fn start_processing_thread(
 
 fn build_processor(state: &SharedStateHandle, sample_rate: u32) -> StreamProcessor {
     let st = state.lock().unwrap();
+
+    if st.preset == PresetChoice::DjBeatmatch {
+        let detected_bpm = st.detected_bpm;
+        let target_bpm = if st.target_bpm.is_finite() && st.target_bpm > 0.0 {
+            st.target_bpm
+        } else {
+            detected_bpm
+        };
+        if detected_bpm.is_finite() && detected_bpm > 0.0 && target_bpm.is_finite() && target_bpm > 0.0
+        {
+            if let Ok(mut processor) = StreamProcessor::try_from_tempo_low_latency(
+                detected_bpm,
+                target_bpm,
+                sample_rate,
+                CHANNELS,
+            ) {
+                if let Err(err) = processor.set_stretch_ratio(st.stretch_ratio) {
+                    log::warn!(
+                        "failed to apply slider ratio {} to low-latency DJ processor: {}",
+                        st.stretch_ratio,
+                        err
+                    );
+                }
+                return processor;
+            }
+        }
+
+        // Fallback to a low-latency profile if BPM metadata is unavailable.
+        let params = StretchParams::new(st.stretch_ratio)
+            .with_sample_rate(sample_rate)
+            .with_channels(CHANNELS)
+            .with_quality_mode(QualityMode::LowLatency)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        return StreamProcessor::new(params);
+    }
+
     let mut params = StretchParams::new(st.stretch_ratio)
         .with_sample_rate(sample_rate)
         .with_channels(CHANNELS)

@@ -355,6 +355,11 @@ pub struct StreamProcessor {
     hybrid_state: HybridStreamingState,
     /// Indicates that hybrid rolling buffers should rebase on the next process call.
     hybrid_pending_rebase: bool,
+    /// When enabled, hybrid mode uses the allocation-free realtime-safe path.
+    ///
+    /// This trades hybrid transient rendering quality for hard-RT callback
+    /// behavior by routing through the preallocated PV streaming path.
+    hybrid_realtime_strict: bool,
     /// Reusable mono mixdown buffer for stereo phase coherence.
     mid_buffer: Vec<f32>,
     /// Cached FFT for spectral-flux transient detection.
@@ -390,6 +395,7 @@ impl std::fmt::Debug for StreamProcessor {
             .field("target_ratio", &self.target_ratio)
             .field("vocoder_ratio", &self.vocoder_ratio)
             .field("pitch_scale", &self.pitch_scale)
+            .field("hybrid_realtime_strict", &self.hybrid_realtime_strict)
             .field("initialized", &self.initialized)
             .field("source_bpm", &self.source_bpm)
             .field("input_ring_len", &self.input_ring.len())
@@ -445,6 +451,7 @@ impl StreamProcessor {
             use_hybrid: false,
             hybrid_state,
             hybrid_pending_rebase: false,
+            hybrid_realtime_strict: false,
             mid_buffer: Vec::with_capacity(capacity_frames_per_channel),
             transient_fft,
             transient_fft_buffer,
@@ -755,7 +762,7 @@ impl StreamProcessor {
 
         self.collect_channel_inputs(total_frames, num_channels)?;
 
-        if self.use_hybrid {
+        if self.use_hybrid && !self.hybrid_realtime_strict {
             let min_output_len =
                 self.process_hybrid_persistent_channels(num_channels, require_min_latency)?;
             let consumed = total_frames * num_channels;
@@ -1299,8 +1306,11 @@ impl StreamProcessor {
     }
 
     /// Changes the stretch ratio for subsequent processing.
-    pub fn set_stretch_ratio(&mut self, ratio: f64) {
-        let _ = self.try_set_stretch_ratio(ratio);
+    ///
+    /// Returns [`StretchError::InvalidRatio`] when `ratio` is non-finite or
+    /// not strictly positive.
+    pub fn set_stretch_ratio(&mut self, ratio: f64) -> Result<(), StretchError> {
+        self.try_set_stretch_ratio(ratio)
     }
 
     /// Changes the stretch ratio for subsequent processing, returning an error
@@ -1333,6 +1343,23 @@ impl StreamProcessor {
     /// Returns whether hybrid processing mode is enabled.
     pub fn is_hybrid_mode(&self) -> bool {
         self.use_hybrid
+    }
+
+    /// Enables or disables strict realtime-safe behavior while hybrid mode is on.
+    ///
+    /// Strict mode routes processing through the preallocated PV stream path to
+    /// guarantee no heap growth in callbacks.
+    pub fn set_hybrid_realtime_strict(&mut self, enabled: bool) {
+        if self.hybrid_realtime_strict != enabled {
+            self.hybrid_pending_rebase = true;
+            self.reset_pitch_resamplers();
+        }
+        self.hybrid_realtime_strict = enabled;
+    }
+
+    /// Returns whether strict realtime-safe hybrid mode is enabled.
+    pub fn is_hybrid_realtime_strict(&self) -> bool {
+        self.hybrid_realtime_strict
     }
 
     /// Changes the target BPM, smoothly adjusting the stretch ratio.
@@ -1797,7 +1824,7 @@ mod tests {
         let mut proc = StreamProcessor::new(params);
         assert!((proc.current_stretch_ratio() - 1.0).abs() < 1e-6);
 
-        proc.set_stretch_ratio(1.05);
+        proc.set_stretch_ratio(1.05).unwrap();
         // After a few interpolation steps, ratio should change
         for _ in 0..100 {
             proc.interpolate_ratio();
@@ -1824,7 +1851,7 @@ mod tests {
             .with_channels(1);
 
         let mut proc = StreamProcessor::new(params);
-        proc.set_stretch_ratio(2.0);
+        proc.set_stretch_ratio(2.0).unwrap();
         proc.reset();
 
         assert!((proc.current_stretch_ratio() - 1.5).abs() < 1e-6);
@@ -1854,7 +1881,7 @@ mod tests {
         }
 
         // Change ratio to 1.05 (DJ pitch adjustment)
-        proc.set_stretch_ratio(1.05);
+        proc.set_stretch_ratio(1.05).unwrap();
         // Force interpolation to converge
         for _ in 0..50 {
             proc.interpolate_ratio();
@@ -2014,6 +2041,7 @@ mod tests {
         let initial = proc.target_stretch_ratio();
         assert!(proc.try_set_stretch_ratio(0.0).is_err());
         assert!(proc.try_set_stretch_ratio(f64::INFINITY).is_err());
+        assert!(proc.set_stretch_ratio(f64::NAN).is_err());
         assert_eq!(proc.target_stretch_ratio(), initial);
     }
 
@@ -2150,6 +2178,43 @@ mod tests {
 
         proc.set_hybrid_mode(false);
         assert!(!proc.is_hybrid_mode());
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_realtime_strict_toggle() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        assert!(!proc.is_hybrid_realtime_strict());
+
+        proc.set_hybrid_realtime_strict(true);
+        assert!(proc.is_hybrid_realtime_strict());
+
+        proc.set_hybrid_realtime_strict(false);
+        assert!(!proc.is_hybrid_realtime_strict());
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_realtime_strict_produces_output() {
+        let params = StretchParams::new(1.15)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+        proc.set_hybrid_realtime_strict(true);
+
+        let signal: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44100.0).sin() * 0.8)
+            .collect();
+
+        let mut out = Vec::new();
+        for chunk in signal.chunks(1024) {
+            proc.process_into(chunk, &mut out).unwrap();
+        }
+        proc.flush_into(&mut out).unwrap();
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|s| s.is_finite()));
     }
 
     #[test]
@@ -2506,7 +2571,7 @@ mod tests {
         let mut proc = StreamProcessor::new(params);
         assert!((proc.target_stretch_ratio() - 1.0).abs() < 1e-6);
 
-        proc.set_stretch_ratio(1.5);
+        proc.set_stretch_ratio(1.5).unwrap();
         assert!((proc.target_stretch_ratio() - 1.5).abs() < 1e-6);
         // Current ratio hasn't converged yet
         assert!((proc.current_stretch_ratio() - 1.0).abs() < 0.1);
@@ -2574,7 +2639,7 @@ mod tests {
         let mut proc = StreamProcessor::new(params);
 
         // First ratio change
-        proc.set_stretch_ratio(1.1);
+        proc.set_stretch_ratio(1.1).unwrap();
         for _ in 0..200 {
             proc.interpolate_ratio();
         }
@@ -2585,7 +2650,7 @@ mod tests {
         );
 
         // Second ratio change
-        proc.set_stretch_ratio(0.9);
+        proc.set_stretch_ratio(0.9).unwrap();
         for _ in 0..200 {
             proc.interpolate_ratio();
         }

@@ -892,7 +892,7 @@ mod stream_processor_edges {
             .collect();
         let _ = proc.process(&signal).unwrap();
 
-        proc.set_stretch_ratio(2.0);
+        proc.set_stretch_ratio(2.0).expect("valid stretch ratio");
         for _ in 0..100 {
             let _ = proc.process(&[]).unwrap();
         }
@@ -1021,7 +1021,8 @@ mod stream_processor_edges {
         let chunk_size = signal.len() / ratios.len();
 
         for (idx, &ratio) in ratios.iter().enumerate() {
-            proc.set_stretch_ratio(ratio);
+            proc.set_stretch_ratio(ratio)
+                .expect("valid rapid-change ratio");
             let start = idx * chunk_size;
             let end = (start + chunk_size).min(signal.len());
             let chunk = &signal[start..end];

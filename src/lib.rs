@@ -39,7 +39,7 @@
 //!
 //! let mut processor = StreamProcessor::new(params);
 //! // processor.process(&chunk) for each audio buffer
-//! // processor.set_stretch_ratio(1.05) to change on the fly
+//! // processor.set_stretch_ratio(1.05).unwrap() to change on the fly
 //! ```
 
 use rustfft::{num_complex::Complex, FftPlanner};

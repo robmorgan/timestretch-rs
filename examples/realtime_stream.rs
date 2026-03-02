@@ -111,7 +111,9 @@ fn main() {
         chunk_count += 1;
         let progress = chunk_count as f64 / total_chunks as f64;
         let ratio = 1.0 + 0.05 * progress;
-        processor.set_stretch_ratio(ratio);
+        processor
+            .set_stretch_ratio(ratio)
+            .expect("valid realtime ratio");
 
         let output = processor.process(chunk).expect("process failed");
         total_output_samples += output.len();

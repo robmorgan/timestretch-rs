@@ -98,7 +98,9 @@ fn test_streaming_ratio_change() {
 
     for (chunk_idx, chunk) in input.chunks(chunk_size).enumerate() {
         if chunk_idx == input.len() / chunk_size / 2 {
-            processor.set_stretch_ratio(1.5);
+            processor
+                .set_stretch_ratio(1.5)
+                .expect("valid stretch ratio");
         }
         if let Ok(out) = processor.process(chunk) {
             output.extend_from_slice(&out);
@@ -683,7 +685,9 @@ fn test_streaming_window_ratio_change() {
     }
 
     // Change ratio mid-stream
-    processor.set_stretch_ratio(1.05);
+    processor
+        .set_stretch_ratio(1.05)
+        .expect("valid stretch ratio");
 
     // Process second half
     for chunk in signal[signal.len() / 2..].chunks(4096) {
