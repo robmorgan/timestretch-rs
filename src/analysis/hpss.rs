@@ -121,8 +121,10 @@ pub fn hpss(
     // prevent harmonic leakage into the percussive WSOLA path.
     let mut h_mask_buf = vec![0.0f32; num_bins];
     let mut h_mask_smooth = vec![0.0f32; num_bins];
-    const MASK_SMOOTH_RADIUS: usize = 2; // 5-bin window
+    const MASK_SMOOTH_RADIUS: usize = 2; // 5-bin window (moderate percussive)
+    const MASK_SMOOTH_RADIUS_HEAVY: usize = 3; // 7-bin window (heavy percussive)
     const PERC_FRACTION_THRESHOLD: f32 = 0.3;
+    const PERC_FRACTION_HEAVY: f32 = 0.55;
 
     for frame_idx in 0..num_frames {
         let pos = frame_idx * hop_size;
@@ -144,13 +146,20 @@ pub fn hpss(
         }
 
         // Only smooth in frames with significant percussive content.
+        // Use wider smoothing for very percussive frames where spectral
+        // notches from mask transitions are most severe.
         let perc_fraction = p_energy / (h_energy + p_energy + eps);
         let use_smooth = perc_fraction > PERC_FRACTION_THRESHOLD;
+        let smooth_radius = if perc_fraction > PERC_FRACTION_HEAVY {
+            MASK_SMOOTH_RADIUS_HEAVY
+        } else {
+            MASK_SMOOTH_RADIUS
+        };
 
         if use_smooth {
             for bin in 0..num_bins {
-                let start = bin.saturating_sub(MASK_SMOOTH_RADIUS);
-                let end = (bin + MASK_SMOOTH_RADIUS + 1).min(num_bins);
+                let start = bin.saturating_sub(smooth_radius);
+                let end = (bin + smooth_radius + 1).min(num_bins);
                 let sum: f32 = h_mask_buf[start..end].iter().sum();
                 h_mask_smooth[bin] = sum / (end - start) as f32;
             }
