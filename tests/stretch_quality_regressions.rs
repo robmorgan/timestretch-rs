@@ -442,5 +442,49 @@ fn test_ratio_sweep_click_pad_transient_survival() {
 }
 
 #[test]
-#[ignore = "TODO: StreamProcessor needs realtime pitch-scale control to enable streaming pitch-scale sweeps"]
-fn test_realtime_pitch_scale_sweep_requires_new_hook() {}
+fn test_realtime_pitch_scale_changes_pitch_without_tempo_drift() {
+    let params = StretchParams::new(1.0)
+        .with_sample_rate(44_100)
+        .with_channels(1)
+        .with_fft_size(1024)
+        .with_hop_size(256);
+    let mut processor = StreamProcessor::new(params);
+
+    assert!((processor.pitch_scale() - 1.0).abs() < 1e-9);
+    processor
+        .set_pitch_scale(0.97)
+        .expect("valid pitch scale should be accepted");
+    assert!((processor.pitch_scale() - 0.97).abs() < 1e-9);
+    assert!(processor.set_pitch_scale(0.0).is_err());
+
+    let input = gen_sine(440.0, SR, SR as usize, |_| 0.8);
+    let mut output = Vec::with_capacity(input.len() * 2);
+    for chunk in input.chunks(1024) {
+        processor
+            .process_into(chunk, &mut output)
+            .expect("pitch-scaled stream process failed");
+    }
+    processor
+        .flush_into(&mut output)
+        .expect("pitch-scaled stream flush failed");
+
+    let expected_len = input.len() as isize;
+    let len_diff = (output.len() as isize - expected_len).abs();
+    assert!(
+        len_diff <= 96,
+        "tempo drift too high under pitch scaling: expected={} got={} diff={}",
+        expected_len,
+        output.len(),
+        len_diff
+    );
+
+    let trim = 4096usize.min(output.len() / 4);
+    let start = trim;
+    let end = output.len().saturating_sub(trim).max(start + 2);
+    let measured = estimate_freq_zero_crossings(&output, SR, start, end);
+    assert!(
+        measured < 430.0,
+        "expected pitch-down shift from scale=0.97, got {:.3}Hz",
+        measured
+    );
+}

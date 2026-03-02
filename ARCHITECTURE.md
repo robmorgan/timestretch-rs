@@ -151,8 +151,9 @@ Input RingBuffer (interleaved)
 - Capacity formula:
   - `capacity_frames >= lookahead + max_callback + fft_size`.
 - Worst-case latency target:
-  - low-latency mode: `<10 ms` practical path at 44.1 kHz for DJ control surfaces,
-  - balanced/high-quality modes trade latency for quality.
+  - low-latency mode: `~35 ms` at 44.1 kHz when using a 1024-point FFT profile,
+  - default beatmatch profile: `~139 ms` at 44.1 kHz (4096-point FFT),
+  - balanced/high-quality modes intentionally trade latency for quality.
 
 ## 3.8 SIMD / Hot Loop Targets
 - Window multiply + overlap-add kernels.
@@ -177,10 +178,10 @@ Input RingBuffer (interleaved)
 
 | Preset | FFT / Hop | Detector Sensitivity | WSOLA Search | Phase Locking | Intended Content |
 |---|---|---|---|---|---|
-| `DjBeatmatch` | 2048 / 512 | Low-Med | Short | Strong low-band ROI | House/techno live sync |
+| `DjBeatmatch` | 4096 / 1024 | Low-Med | Short | Strong low-band ROI | House/techno live sync |
 | `EDM Percussive` | 2048 / 512 | High | Medium | Medium | Drum-forward EDM |
 | `Vocal Formant` | 4096 / 1024 | Med | Short | ROI + envelope preserve | Vocals and hooks |
-| `Speech LowLatency` | 1024 / 256 | Med | Medium | Light locking | MC/talkover |
+| `Speech LowLatency` | 1024 / 256 | Med | Medium | Light locking | MC/talkover (via low-latency stream constructor) |
 | `Ambient MaxQuality` | 4096 / 1024 | Low | Long | Adaptive relaxed highs | Pads, transitions |
 
 ---

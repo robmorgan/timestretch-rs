@@ -121,6 +121,26 @@ println!(
 );
 ```
 
+### Low-Latency Tempo Constructor
+
+```rust
+use timestretch::StreamProcessor;
+
+let mut processor = StreamProcessor::try_from_tempo_low_latency(126.0, 128.0, 44100, 2)
+    .expect("valid BPM inputs");
+assert!(processor.latency_secs() * 1000.0 < 40.0);
+```
+
+### Realtime Pitch Control
+
+```rust
+use timestretch::StreamProcessor;
+
+let mut processor = StreamProcessor::from_tempo(126.0, 128.0, 44100, 2);
+processor.set_pitch_scale(1.05).expect("valid pitch scale");
+println!("Current pitch scale control: {:.3}", processor.pitch_scale());
+```
+
 ### AudioBuffer API
 
 ```rust

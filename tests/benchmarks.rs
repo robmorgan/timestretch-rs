@@ -228,9 +228,9 @@ fn bench_streaming() {
     let signal = generate_sine(sample_rate, 440.0, 10.0);
 
     for (label, chunk_size, ratio) in &[
-        ("Stream 1024-sample chunks, 1.0x", 1024usize, 1.0),
+        ("Stream 256-sample callbacks, 1.02x", 256usize, 1.02),
+        ("Stream 1024-sample chunks, 1.02x", 1024, 1.02),
         ("Stream 1024-sample chunks, 1.5x", 1024, 1.5),
-        ("Stream 4096-sample chunks, 1.0x", 4096, 1.0),
         ("Stream 4096-sample chunks, 1.5x", 4096, 1.5),
     ] {
         let params = StretchParams::new(*ratio)
@@ -238,19 +238,20 @@ fn bench_streaming() {
             .with_channels(1);
 
         let mut processor = timestretch::StreamProcessor::new(params);
+        let mut callback_output = Vec::with_capacity(signal.len().saturating_mul(3));
 
         let start = Instant::now();
         let mut total_output = 0usize;
 
         for chunk in signal.chunks(*chunk_size) {
-            if let Ok(output) = processor.process(chunk) {
-                total_output += output.len();
-            }
+            callback_output.clear();
+            processor.process_into(chunk, &mut callback_output).unwrap();
+            total_output += callback_output.len();
         }
 
-        if let Ok(remaining) = processor.flush() {
-            total_output += remaining.len();
-        }
+        callback_output.clear();
+        processor.flush_into(&mut callback_output).unwrap();
+        total_output += callback_output.len();
 
         let elapsed = start.elapsed();
         let process_ms = elapsed.as_secs_f64() * 1000.0;

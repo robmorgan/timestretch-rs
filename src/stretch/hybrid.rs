@@ -1037,9 +1037,8 @@ impl HybridStretcher {
         // percussive RMS, preserving the relative energy balance between
         // harmonic and percussive components.
         if seg_ratio > 1.05 && !percussive.is_empty() && !percussive_stretched.is_empty() {
-            let input_rms = (percussive.iter().map(|&s| s * s).sum::<f32>()
-                / percussive.len() as f32)
-                .sqrt();
+            let input_rms =
+                (percussive.iter().map(|&s| s * s).sum::<f32>() / percussive.len() as f32).sqrt();
             let output_rms = (percussive_stretched.iter().map(|&s| s * s).sum::<f32>()
                 / percussive_stretched.len() as f32)
                 .sqrt();

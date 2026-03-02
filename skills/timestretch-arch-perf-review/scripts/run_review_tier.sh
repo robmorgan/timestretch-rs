@@ -35,12 +35,14 @@ run_cmd() {
   local name="$1"
   local command_text="$2"
   local required_bin="${3:-}"
+  local timeout_secs="${TIMESTRETCH_REVIEW_CMD_TIMEOUT_SECS:-0}"
   local log_file="${RUN_DIR}/${name}.log"
   local start_ts
   local end_ts
   local duration_sec
   local exit_code
   local status
+  local note=""
 
   if [[ -n "${required_bin}" ]] && ! command -v "${required_bin}" >/dev/null 2>&1; then
     echo "Skipping: missing dependency '${required_bin}'" > "${log_file}"
@@ -51,8 +53,35 @@ run_cmd() {
   fi
 
   start_ts="$(date +%s)"
-  bash -lc "cd \"${REPO_ROOT}\" && ${command_text}" > "${log_file}" 2>&1
-  exit_code="$?"
+  if [[ "${timeout_secs}" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk "BEGIN { exit !(${timeout_secs} > 0) }"; then
+    if command -v python3 >/dev/null 2>&1; then
+      python3 - "${timeout_secs}" "${REPO_ROOT}" "${command_text}" > "${log_file}" 2>&1 <<'PY'
+import subprocess
+import sys
+
+timeout = float(sys.argv[1])
+repo_root = sys.argv[2]
+command_text = sys.argv[3]
+cmd = ["bash", "-lc", f'cd "{repo_root}" && {command_text}']
+try:
+    completed = subprocess.run(cmd, check=False, timeout=timeout)
+except subprocess.TimeoutExpired:
+    print(f"ERROR: command timed out after {timeout:.0f}s", file=sys.stderr)
+    sys.exit(124)
+sys.exit(completed.returncode)
+PY
+      exit_code="$?"
+      if [[ "${exit_code}" -eq 124 ]]; then
+        note="timed out after ${timeout_secs}s"
+      fi
+    else
+      bash -lc "cd \"${REPO_ROOT}\" && ${command_text}" > "${log_file}" 2>&1
+      exit_code="$?"
+    fi
+  else
+    bash -lc "cd \"${REPO_ROOT}\" && ${command_text}" > "${log_file}" 2>&1
+    exit_code="$?"
+  fi
   end_ts="$(date +%s)"
   duration_sec="$((end_ts - start_ts))"
 
@@ -62,9 +91,13 @@ run_cmd() {
     status="FAIL"
   fi
 
-  printf "%s\t%s\t%s\t%s\t%s\t\n" \
-    "${name}" "${status}" "${exit_code}" "${duration_sec}" "${command_text}" >> "${STATUS_FILE}"
-  echo "[${status}] ${name} (exit=${exit_code}, ${duration_sec}s)"
+  printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
+    "${name}" "${status}" "${exit_code}" "${duration_sec}" "${command_text}" "${note}" >> "${STATUS_FILE}"
+  if [[ -n "${note}" ]]; then
+    echo "[${status}] ${name} (exit=${exit_code}, ${duration_sec}s, ${note})"
+  else
+    echo "[${status}] ${name} (exit=${exit_code}, ${duration_sec}s)"
+  fi
 }
 
 skip_cmd() {

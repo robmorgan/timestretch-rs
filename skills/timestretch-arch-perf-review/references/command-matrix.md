@@ -28,3 +28,5 @@ Only run when explicitly requested:
 2. `./benchmarks/run_m0_baseline.sh`
 
 Deep tier may require external corpus/dependencies; if missing, mark command as skipped with reason.
+Optional timeout guard:
+1. `TIMESTRETCH_REVIEW_CMD_TIMEOUT_SECS=<seconds> bash skills/timestretch-arch-perf-review/scripts/run_review_tier.sh deep`

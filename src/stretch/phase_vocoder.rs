@@ -479,8 +479,10 @@ impl PhaseVocoder {
                     let ss_start = correction_len;
                     let ss_end = (correction_len * 3).min(result.len());
                     let ss_len = ss_end - ss_start;
-                    let ss_energy: f64 =
-                        result[ss_start..ss_end].iter().map(|&s| (s as f64) * (s as f64)).sum();
+                    let ss_energy: f64 = result[ss_start..ss_end]
+                        .iter()
+                        .map(|&s| (s as f64) * (s as f64))
+                        .sum();
                     let ss_rms = (ss_energy / ss_len as f64).sqrt();
                     if ss_rms > 1e-6 {
                         let edge_energy: f64 = result[..correction_len]
@@ -495,8 +497,7 @@ impl PhaseVocoder {
                                 // Cubic Hermite ramp: zero derivative at both
                                 // endpoints for smoother spectral transition.
                                 let t = i as f32 / correction_len as f32;
-                                let g = 1.0
-                                    + (gain - 1.0) * (1.0 - 3.0 * t * t + 2.0 * t * t * t);
+                                let g = 1.0 + (gain - 1.0) * (1.0 - 3.0 * t * t + 2.0 * t * t * t);
                                 result[i] *= g;
                             }
                         }
@@ -508,8 +509,10 @@ impl PhaseVocoder {
                     let ss_start = result.len() / 4;
                     let ss_end = result.len() * 3 / 4;
                     let ss_len = ss_end - ss_start;
-                    let ss_energy: f64 =
-                        result[ss_start..ss_end].iter().map(|&s| (s as f64) * (s as f64)).sum();
+                    let ss_energy: f64 = result[ss_start..ss_end]
+                        .iter()
+                        .map(|&s| (s as f64) * (s as f64))
+                        .sum();
                     let ss_rms = (ss_energy / ss_len as f64).sqrt();
                     if ss_rms > 1e-6 {
                         let end_start = result.len() - correction_len;
@@ -525,8 +528,7 @@ impl PhaseVocoder {
                                 // Cubic Hermite ramp: zero derivative at both
                                 // endpoints (matches start correction shape).
                                 let t = i as f32 / correction_len as f32;
-                                let g = 1.0
-                                    + (gain - 1.0) * (3.0 * t * t - 2.0 * t * t * t);
+                                let g = 1.0 + (gain - 1.0) * (3.0 * t * t - 2.0 * t * t * t);
                                 result[rlen - correction_len + i] *= g;
                             }
                         }

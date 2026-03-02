@@ -21,6 +21,18 @@ const MAX_SECONDS_ENV_VAR: &str = "TIMESTRETCH_REFERENCE_MAX_SECONDS";
 const M0_BASELINE_PATH: &str = "benchmarks/baselines/m0_baseline_latest.json";
 /// Allowed spectral regression slack against M0 baseline.
 const M0_SPECTRAL_REGRESSION_TOLERANCE: f64 = 0.01;
+/// Absolute minimum best-per-track spectral similarity in strict mode.
+const ABS_MIN_BEST_SPECTRAL_SIMILARITY: f64 = 0.75;
+/// Absolute minimum best-per-track perceptual spectral similarity in strict mode.
+const ABS_MIN_BEST_PERCEPTUAL_SIMILARITY: f64 = 0.75;
+/// Absolute maximum best-per-track loudness deviation in strict mode.
+const ABS_MAX_BEST_LUFS_DIFF_DB: f64 = 3.0;
+/// Absolute maximum best-per-track output length drift in strict mode.
+const ABS_MAX_BEST_LENGTH_DIFF_PCT: f64 = 10.0;
+/// Absolute minimum best-per-track cross-correlation peak in strict mode.
+const ABS_MIN_BEST_XCORR_PEAK: f64 = 0.10;
+/// Absolute minimum best-per-track spectral flux similarity in strict mode.
+const ABS_MIN_BEST_SPECTRAL_FLUX_SIMILARITY: f64 = 0.60;
 
 // ---------------------------------------------------------------------------
 // Manifest types
@@ -648,6 +660,7 @@ fn reference_quality_benchmark() {
             report.summary.skipped, 0,
             "Strict mode does not allow skipped tracks/references"
         );
+        assert_absolute_quality_floors(&report);
         assert_not_worse_than_m0_baseline(&report);
     }
 
@@ -817,6 +830,70 @@ fn assert_not_worse_than_m0_baseline(report: &Report) {
             current_track.spectral_similarity,
             baseline_track.spectral_similarity,
             M0_SPECTRAL_REGRESSION_TOLERANCE
+        );
+    }
+}
+
+/// Ensures strict reference runs satisfy absolute quality floors.
+fn assert_absolute_quality_floors(report: &Report) {
+    for track in &report.tracks {
+        let mut best: Option<&PresetReport> = None;
+        for reference in &track.references {
+            for preset in &reference.presets {
+                if best
+                    .as_ref()
+                    .map(|candidate| preset.spectral_similarity > candidate.spectral_similarity)
+                    .unwrap_or(true)
+                {
+                    best = Some(preset);
+                }
+            }
+        }
+        let Some(best) = best else {
+            continue;
+        };
+
+        assert!(
+            best.spectral_similarity >= ABS_MIN_BEST_SPECTRAL_SIMILARITY,
+            "Track '{}' below absolute spectral floor: {:.4} < {:.4}",
+            track.id,
+            best.spectral_similarity,
+            ABS_MIN_BEST_SPECTRAL_SIMILARITY
+        );
+        assert!(
+            best.perceptual_spectral_similarity >= ABS_MIN_BEST_PERCEPTUAL_SIMILARITY,
+            "Track '{}' below absolute perceptual floor: {:.4} < {:.4}",
+            track.id,
+            best.perceptual_spectral_similarity,
+            ABS_MIN_BEST_PERCEPTUAL_SIMILARITY
+        );
+        assert!(
+            best.lufs_difference.abs() <= ABS_MAX_BEST_LUFS_DIFF_DB,
+            "Track '{}' exceeds absolute LUFS floor: {:.4} dB > {:.4} dB",
+            track.id,
+            best.lufs_difference.abs(),
+            ABS_MAX_BEST_LUFS_DIFF_DB
+        );
+        assert!(
+            best.length_diff_pct.abs() <= ABS_MAX_BEST_LENGTH_DIFF_PCT,
+            "Track '{}' exceeds absolute length floor: {:.4}% > {:.4}%",
+            track.id,
+            best.length_diff_pct.abs(),
+            ABS_MAX_BEST_LENGTH_DIFF_PCT
+        );
+        assert!(
+            best.cross_correlation_peak >= ABS_MIN_BEST_XCORR_PEAK,
+            "Track '{}' below absolute xcorr floor: {:.4} < {:.4}",
+            track.id,
+            best.cross_correlation_peak,
+            ABS_MIN_BEST_XCORR_PEAK
+        );
+        assert!(
+            best.spectral_flux_similarity >= ABS_MIN_BEST_SPECTRAL_FLUX_SIMILARITY,
+            "Track '{}' below absolute spectral-flux floor: {:.4} < {:.4}",
+            track.id,
+            best.spectral_flux_similarity,
+            ABS_MIN_BEST_SPECTRAL_FLUX_SIMILARITY
         );
     }
 }

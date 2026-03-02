@@ -21,6 +21,10 @@ const RATIO_SMOOTHING_TIME_SECS: f64 = 0.050;
 const LATENCY_FFT_NUMERATOR: usize = 3;
 /// Denominator for the FFT-size latency fraction.
 const LATENCY_FFT_DENOMINATOR: usize = 2;
+/// FFT size used by the low-latency tempo constructor.
+const LOW_LATENCY_TEMPO_FFT_SIZE: usize = 1024;
+/// Hop size used by the low-latency tempo constructor.
+const LOW_LATENCY_TEMPO_HOP_SIZE: usize = LOW_LATENCY_TEMPO_FFT_SIZE / 4;
 
 /// Callback size assumptions for real-time capacity planning.
 const MAX_CALLBACK_FRAMES: usize = 1024;
@@ -67,6 +71,24 @@ fn effective_min_frames(fft_size: usize, ratio: f64) -> usize {
 }
 
 #[inline]
+fn validate_positive_finite_ratio(value: f64, label: &'static str) -> Result<f64, StretchError> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(StretchError::InvalidRatio(format!(
+            "{} must be finite and > 0.0, got {}",
+            label, value
+        )));
+    }
+    Ok(value)
+}
+
+#[inline]
+fn ratio_from_tempo(source_bpm: f64, target_bpm: f64) -> Result<f64, StretchError> {
+    let source = validate_positive_finite_ratio(source_bpm, "source BPM")?;
+    let target = validate_positive_finite_ratio(target_bpm, "target BPM")?;
+    validate_positive_finite_ratio(source / target, "stretch ratio from BPM values")
+}
+
+#[inline]
 fn analysis_lookahead_frames(fft_size: usize, quality_mode: QualityMode) -> usize {
     match quality_mode {
         QualityMode::LowLatency => fft_size,
@@ -108,6 +130,10 @@ struct HybridStreamingState {
     /// whose crossfade regions dominate the output and create spectral-flux
     /// artifacts (false onsets).
     input_accumulated: usize,
+    /// Reused scratch for pre-trim input lengths per channel.
+    pre_trim_lens: Vec<usize>,
+    /// Reused scratch for rendered output lengths per channel.
+    rendered_lens: Vec<usize>,
 }
 
 impl HybridStreamingState {
@@ -127,6 +153,8 @@ impl HybridStreamingState {
         // The rolling buffer must hold the retained tail context PLUS a full
         // input batch so that tail samples are not discarded prematurely.
         let rolling_capacity = capacity_frames + max_tail_frames;
+        let crossfade_capacity =
+            (params.fft_size.saturating_mul(8)).max(HYBRID_STREAM_CROSSFADE_SAMPLES);
 
         Self {
             stretchers: (0..num_channels)
@@ -141,8 +169,12 @@ impl HybridStreamingState {
             tail_output_lens: vec![0; num_channels],
             last_ratio: ratio,
             max_tail_frames,
-            crossfade_held: (0..num_channels).map(|_| Vec::new()).collect(),
+            crossfade_held: (0..num_channels)
+                .map(|_| Vec::with_capacity(crossfade_capacity))
+                .collect(),
             input_accumulated: usize::MAX,
+            pre_trim_lens: vec![0; num_channels],
+            rendered_lens: vec![0; num_channels],
         }
     }
 
@@ -176,24 +208,114 @@ impl HybridStreamingState {
         self.input_accumulated = usize::MAX;
     }
 
-    fn update_tail_output_estimates_from_rendered(
-        &mut self,
-        pre_trim_lens: &[usize],
-        rendered_lens: &[usize],
-    ) {
+    fn update_tail_output_estimates_from_rendered(&mut self) {
         for (idx, input) in self.rolling_inputs.iter().enumerate() {
             let tail_len = input.len();
-            if pre_trim_lens[idx] > 0 {
+            if self.pre_trim_lens[idx] > 0 {
                 // Scale the actual rendered length by the proportion of input
                 // retained as tail — more accurate than `tail_len * ratio`
                 // because it reflects real PV hop quantisation.
-                self.tail_output_lens[idx] = ((rendered_lens[idx] as f64) * tail_len as f64
-                    / pre_trim_lens[idx] as f64)
+                self.tail_output_lens[idx] = ((self.rendered_lens[idx] as f64) * tail_len as f64
+                    / self.pre_trim_lens[idx] as f64)
                     .round() as usize;
             } else {
                 self.tail_output_lens[idx] = 0;
             }
         }
+    }
+}
+
+/// Stateful linear resampler used for realtime pitch control in stream mode.
+///
+/// Maintains one-sample look-behind and a fractional source cursor so
+/// resampling remains continuous across callbacks.
+#[derive(Debug, Clone)]
+struct LinearResamplerState {
+    prev_sample: f32,
+    has_prev: bool,
+    next_pos: f64,
+}
+
+impl LinearResamplerState {
+    fn new() -> Self {
+        Self {
+            prev_sample: 0.0,
+            has_prev: false,
+            next_pos: 0.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.prev_sample = 0.0;
+        self.has_prev = false;
+        self.next_pos = 0.0;
+    }
+
+    fn source_sample(&self, input: &[f32], idx: usize) -> f32 {
+        if self.has_prev {
+            if idx == 0 {
+                self.prev_sample
+            } else {
+                input[idx - 1]
+            }
+        } else {
+            input[idx]
+        }
+    }
+
+    fn process_into(
+        &mut self,
+        input: &[f32],
+        pitch_scale: f64,
+        output: &mut Vec<f32>,
+    ) -> Result<(), StretchError> {
+        output.clear();
+        if input.is_empty() {
+            return Ok(());
+        }
+
+        let source_len = input.len() + usize::from(self.has_prev);
+        if source_len < 2 {
+            self.prev_sample = input[input.len() - 1];
+            self.has_prev = true;
+            self.next_pos = 0.0;
+            return Ok(());
+        }
+
+        let mut pos = self.next_pos.max(0.0);
+        while pos + 1.0 < source_len as f64 {
+            if output.len() == output.capacity() {
+                return Err(StretchError::BufferOverflow {
+                    buffer: "stream_pitch_resample_output",
+                    requested: output.len().saturating_add(1),
+                    available: output.capacity(),
+                });
+            }
+
+            let i = pos.floor() as usize;
+            let frac = (pos - i as f64) as f32;
+            let a = self.source_sample(input, i);
+            let b = self.source_sample(input, i + 1);
+            output.push(a + (b - a) * frac);
+            pos += 1.0 / pitch_scale;
+        }
+
+        self.prev_sample = input[input.len() - 1];
+        self.has_prev = true;
+        let max_pos = source_len.saturating_sub(1) as f64;
+        self.next_pos = (pos - max_pos).max(0.0);
+        Ok(())
+    }
+
+    fn flush_into(&mut self, pitch_scale: f64, output: &mut Vec<f32>) -> Result<(), StretchError> {
+        if !self.has_prev {
+            output.clear();
+            return Ok(());
+        }
+        let tail = [self.prev_sample];
+        self.process_into(&tail, pitch_scale, output)?;
+        self.reset();
+        Ok(())
     }
 }
 
@@ -252,6 +374,12 @@ pub struct StreamProcessor {
     expected_total_output_samples: f64,
     /// Total output samples emitted to the caller for the current stream.
     total_output_emitted_samples: usize,
+    /// Realtime pitch scale applied in stream mode.
+    pitch_scale: f64,
+    /// Stateful per-channel resamplers for realtime pitch control.
+    pitch_resamplers: Vec<LinearResamplerState>,
+    /// Reusable per-channel output buffers for pitch-resampled data.
+    pitch_output_buffers: Vec<Vec<f32>>,
 }
 
 impl std::fmt::Debug for StreamProcessor {
@@ -261,6 +389,7 @@ impl std::fmt::Debug for StreamProcessor {
             .field("current_ratio", &self.current_ratio)
             .field("target_ratio", &self.target_ratio)
             .field("vocoder_ratio", &self.vocoder_ratio)
+            .field("pitch_scale", &self.pitch_scale)
             .field("initialized", &self.initialized)
             .field("source_bpm", &self.source_bpm)
             .field("input_ring_len", &self.input_ring.len())
@@ -282,6 +411,7 @@ impl StreamProcessor {
             .saturating_mul(4)
             .saturating_add(params.fft_size);
         let output_capacity_samples = output_capacity_frames.saturating_mul(num_channels);
+        let pitch_output_capacity_frames = output_capacity_frames.saturating_mul(2);
 
         let vocoders = Self::create_vocoders(&params, ratio);
         let channel_input_buffers = (0..num_channels)
@@ -323,6 +453,13 @@ impl StreamProcessor {
             transient_window,
             expected_total_output_samples: 0.0,
             total_output_emitted_samples: 0,
+            pitch_scale: 1.0,
+            pitch_resamplers: (0..num_channels)
+                .map(|_| LinearResamplerState::new())
+                .collect(),
+            pitch_output_buffers: (0..num_channels)
+                .map(|_| Vec::with_capacity(pitch_output_capacity_frames))
+                .collect(),
         }
     }
 
@@ -380,7 +517,16 @@ impl StreamProcessor {
         // produce bit-exact output and eliminate windowing/overlap-add drift.
         if (self.target_ratio - 1.0).abs() < RATIO_SNAP_THRESHOLD
             && (self.current_ratio - 1.0).abs() < RATIO_SNAP_THRESHOLD
+            && (self.pitch_scale - 1.0).abs() < RATIO_SNAP_THRESHOLD
         {
+            let available = output.capacity().saturating_sub(output.len());
+            if input.len() > available {
+                return Err(StretchError::BufferOverflow {
+                    buffer: "process_into_output",
+                    requested: input.len(),
+                    available,
+                });
+            }
             output.extend_from_slice(input);
             return Ok(());
         }
@@ -511,7 +657,7 @@ impl StreamProcessor {
                 }
             }
             if held_min_len != usize::MAX && held_min_len > 0 {
-                self.interleave_to_pending(held_min_len, num_channels)?;
+                self.emit_channel_output_to_pending(held_min_len, num_channels)?;
             }
 
             self.hybrid_state.reset(
@@ -521,6 +667,9 @@ impl StreamProcessor {
             );
             self.hybrid_pending_rebase = false;
         }
+
+        self.flush_pitch_resampler_to_pending(num_channels)?;
+        self.reset_pitch_resamplers();
 
         let _ = self.drain_pending_to_output(output)?;
 
@@ -598,7 +747,7 @@ impl StreamProcessor {
         }
 
         if require_min_latency {
-            let min_frames = effective_min_frames(self.params.fft_size, self.current_ratio);
+            let min_frames = effective_min_frames(self.params.fft_size, self.processing_ratio());
             if total_frames < min_frames {
                 return Ok(());
             }
@@ -613,7 +762,7 @@ impl StreamProcessor {
             self.input_ring.discard(consumed);
 
             if min_output_len > 0 {
-                self.interleave_to_pending(min_output_len, num_channels)?;
+                self.emit_channel_output_to_pending(min_output_len, num_channels)?;
             }
             return Ok(());
         }
@@ -627,7 +776,7 @@ impl StreamProcessor {
         self.consume_processed_input(total_frames, num_channels);
 
         if min_output_len > 0 {
-            self.interleave_to_pending(min_output_len, num_channels)?;
+            self.emit_channel_output_to_pending(min_output_len, num_channels)?;
         }
 
         Ok(())
@@ -740,6 +889,104 @@ impl StreamProcessor {
         Ok(())
     }
 
+    #[inline]
+    fn processing_ratio(&self) -> f64 {
+        self.current_ratio * self.pitch_scale
+    }
+
+    fn reset_pitch_resamplers(&mut self) {
+        for resampler in &mut self.pitch_resamplers {
+            resampler.reset();
+        }
+        for buf in &mut self.pitch_output_buffers {
+            buf.clear();
+        }
+    }
+
+    fn emit_channel_output_to_pending(
+        &mut self,
+        min_output_len: usize,
+        num_channels: usize,
+    ) -> Result<(), StretchError> {
+        if min_output_len == 0 {
+            return Ok(());
+        }
+
+        if (self.pitch_scale - 1.0).abs() < RATIO_SNAP_THRESHOLD {
+            return self.interleave_to_pending(min_output_len, num_channels);
+        }
+        let resample_ratio = 1.0 / self.pitch_scale;
+
+        let mut pitch_min_output_len = usize::MAX;
+        for ch in 0..num_channels {
+            if self.channel_output_buffers[ch].len() < min_output_len {
+                return Err(StretchError::InvalidState(
+                    "channel output shorter than requested interleave length",
+                ));
+            }
+
+            self.pitch_resamplers[ch].process_into(
+                &self.channel_output_buffers[ch][..min_output_len],
+                resample_ratio,
+                &mut self.pitch_output_buffers[ch],
+            )?;
+            pitch_min_output_len = pitch_min_output_len.min(self.pitch_output_buffers[ch].len());
+        }
+
+        if pitch_min_output_len == usize::MAX || pitch_min_output_len == 0 {
+            return Ok(());
+        }
+        self.interleave_pitch_to_pending(pitch_min_output_len, num_channels)
+    }
+
+    fn interleave_pitch_to_pending(
+        &mut self,
+        min_output_len: usize,
+        num_channels: usize,
+    ) -> Result<(), StretchError> {
+        let needed = min_output_len.saturating_mul(num_channels);
+        if needed > self.pending_output.available() {
+            return Err(StretchError::BufferOverflow {
+                buffer: "stream_pending_output",
+                requested: needed,
+                available: self.pending_output.available(),
+            });
+        }
+
+        for i in 0..min_output_len {
+            for ch in 0..num_channels {
+                if !self.pending_output.push(self.pitch_output_buffers[ch][i]) {
+                    return Err(StretchError::InvalidState(
+                        "pending output ring rejected pitch push despite capacity check",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_pitch_resampler_to_pending(
+        &mut self,
+        num_channels: usize,
+    ) -> Result<(), StretchError> {
+        if (self.pitch_scale - 1.0).abs() < RATIO_SNAP_THRESHOLD {
+            return Ok(());
+        }
+        let resample_ratio = 1.0 / self.pitch_scale;
+
+        let mut min_output_len = usize::MAX;
+        for ch in 0..num_channels {
+            self.pitch_resamplers[ch]
+                .flush_into(resample_ratio, &mut self.pitch_output_buffers[ch])?;
+            min_output_len = min_output_len.min(self.pitch_output_buffers[ch].len());
+        }
+
+        if min_output_len != usize::MAX && min_output_len > 0 {
+            self.interleave_pitch_to_pending(min_output_len, num_channels)?;
+        }
+        Ok(())
+    }
+
     fn drain_pending_to_output(&mut self, output: &mut Vec<f32>) -> Result<usize, StretchError> {
         let pending = self.pending_output.len();
         if pending == 0 {
@@ -820,7 +1067,7 @@ impl StreamProcessor {
             self.hybrid_state.rebase_after_ratio_change();
             self.hybrid_pending_rebase = false;
         }
-        self.hybrid_state.update_ratio(self.current_ratio);
+        self.hybrid_state.update_ratio(self.processing_ratio());
 
         self.append_hybrid_input(num_channels)?;
 
@@ -836,8 +1083,8 @@ impl StreamProcessor {
         }
 
         let mut min_output_len = usize::MAX;
-        let mut pre_trim_lens = vec![0usize; num_channels];
-        let mut rendered_lens = vec![0usize; num_channels];
+        self.hybrid_state.pre_trim_lens.fill(0);
+        self.hybrid_state.rendered_lens.fill(0);
         for ch in 0..num_channels {
             let len = self.hybrid_state.rolling_inputs[ch].len();
             self.hybrid_state.rolling_scratch[ch].resize(len, 0.0);
@@ -862,8 +1109,8 @@ impl StreamProcessor {
                 });
             }
 
-            pre_trim_lens[ch] = len;
-            rendered_lens[ch] = rendered.len();
+            self.hybrid_state.pre_trim_lens[ch] = len;
+            self.hybrid_state.rendered_lens[ch] = rendered.len();
 
             self.channel_output_buffers[ch].clear();
 
@@ -877,11 +1124,9 @@ impl StreamProcessor {
             // synthesis frames farther apart, amplifying phase divergence
             // between consecutive PV renderings.
             let ratio_scale = self.hybrid_state.last_ratio.max(1.0);
-            let xfade_base = (HYBRID_STREAM_CROSSFADE_SAMPLES as f64 * ratio_scale)
-                .round() as usize;
-            let xfade = xfade_base
-                .min(skip)
-                .min(delta_len * 7 / 8);
+            let xfade_base =
+                (HYBRID_STREAM_CROSSFADE_SAMPLES as f64 * ratio_scale).round() as usize;
+            let xfade = xfade_base.min(skip).min(delta_len * 7 / 8);
             let held = &self.hybrid_state.crossfade_held[ch];
             if !held.is_empty() && xfade > 0 {
                 // Cross-fade: blend the held-back samples (previous delta end)
@@ -907,8 +1152,11 @@ impl StreamProcessor {
                         oe += o * o;
                     }
                     let denom = (he * oe).sqrt();
-                    let corr =
-                        if denom > 1e-12 { (dot / denom).clamp(-1.0, 1.0) } else { 1.0 };
+                    let corr = if denom > 1e-12 {
+                        (dot / denom).clamp(-1.0, 1.0)
+                    } else {
+                        1.0
+                    };
 
                     if corr < 0.3 {
                         // Also require an energy imbalance to distinguish
@@ -935,14 +1183,12 @@ impl StreamProcessor {
                 for i in 0..actual_xfade {
                     let t = (i as f32 + 0.5) / actual_xfade as f32;
                     let s = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
-                    self.channel_output_buffers[ch]
-                        .push(held[i] * (1.0 - s) + overlap[i] * s);
+                    self.channel_output_buffers[ch].push(held[i] * (1.0 - s) + overlap[i] * s);
                 }
                 // If crossfade was shortened, emit the remaining held
                 // samples directly to avoid dropping the transient tail.
                 if actual_xfade < n {
-                    self.channel_output_buffers[ch]
-                        .extend_from_slice(&overlap[actual_xfade..n]);
+                    self.channel_output_buffers[ch].extend_from_slice(&overlap[actual_xfade..n]);
                 }
             }
 
@@ -957,12 +1203,12 @@ impl StreamProcessor {
 
             // Emit the new delta, holding back the tail for next cross-fade.
             let emit_end = delta_len.saturating_sub(holdback);
-            self.channel_output_buffers[ch]
-                .extend_from_slice(&rendered[skip..skip + emit_end]);
+            self.channel_output_buffers[ch].extend_from_slice(&rendered[skip..skip + emit_end]);
 
             // Save the tail for the next cross-fade.
-            self.hybrid_state.crossfade_held[ch] =
-                rendered[skip + emit_end..skip + delta_len].to_vec();
+            let held_tail = &mut self.hybrid_state.crossfade_held[ch];
+            held_tail.clear();
+            held_tail.extend_from_slice(&rendered[skip + emit_end..skip + delta_len]);
 
             min_output_len = min_output_len.min(self.channel_output_buffers[ch].len());
         }
@@ -970,7 +1216,7 @@ impl StreamProcessor {
         self.hybrid_state.input_accumulated = 0;
         self.hybrid_state.retain_tail();
         self.hybrid_state
-            .update_tail_output_estimates_from_rendered(&pre_trim_lens, &rendered_lens);
+            .update_tail_output_estimates_from_rendered();
 
         Ok(if min_output_len == usize::MAX {
             0
@@ -994,23 +1240,78 @@ impl StreamProcessor {
     }
 
     /// Creates a streaming processor configured for BPM matching.
+    ///
+    /// This constructor uses the `DjBeatmatch` preset for quality. For a
+    /// lower-latency control surface path, use
+    /// [`StreamProcessor::try_from_tempo_low_latency`].
     pub fn from_tempo(source_bpm: f64, target_bpm: f64, sample_rate: u32, channels: u32) -> Self {
-        let params = StretchParams::from_tempo(source_bpm, target_bpm)
+        Self::try_from_tempo(source_bpm, target_bpm, sample_rate, channels).unwrap_or_else(|_| {
+            let params = StretchParams::new(1.0)
+                .with_sample_rate(sample_rate)
+                .with_channels(channels)
+                .with_preset(crate::EdmPreset::DjBeatmatch);
+            Self::new(params)
+        })
+    }
+
+    /// Creates a BPM-matching stream processor, returning an error when tempo
+    /// inputs are invalid.
+    pub fn try_from_tempo(
+        source_bpm: f64,
+        target_bpm: f64,
+        sample_rate: u32,
+        channels: u32,
+    ) -> Result<Self, StretchError> {
+        let base = StretchParams::new(1.0)
             .with_sample_rate(sample_rate)
             .with_channels(channels)
-            .with_preset(crate::EdmPreset::DjBeatmatch)
-            .with_bpm(source_bpm);
-        let mut proc = Self::new(params);
+            .with_preset(crate::EdmPreset::DjBeatmatch);
+        Self::try_from_tempo_with_params(source_bpm, target_bpm, base)
+    }
+
+    /// Creates a low-latency BPM-matching stream processor.
+    pub fn try_from_tempo_low_latency(
+        source_bpm: f64,
+        target_bpm: f64,
+        sample_rate: u32,
+        channels: u32,
+    ) -> Result<Self, StretchError> {
+        let base = StretchParams::new(1.0)
+            .with_sample_rate(sample_rate)
+            .with_channels(channels)
+            .with_quality_mode(QualityMode::LowLatency)
+            .with_window_type(WindowType::Hann)
+            .with_fft_size(LOW_LATENCY_TEMPO_FFT_SIZE)
+            .with_hop_size(LOW_LATENCY_TEMPO_HOP_SIZE);
+        Self::try_from_tempo_with_params(source_bpm, target_bpm, base)
+    }
+
+    /// Creates a BPM-matching stream processor from caller-provided params.
+    pub fn try_from_tempo_with_params(
+        source_bpm: f64,
+        target_bpm: f64,
+        params: StretchParams,
+    ) -> Result<Self, StretchError> {
+        let ratio = ratio_from_tempo(source_bpm, target_bpm)?;
+        let mut proc = Self::new(params.with_stretch_ratio(ratio).with_bpm(source_bpm));
         proc.source_bpm = Some(source_bpm);
-        proc
+        Ok(proc)
     }
 
     /// Changes the stretch ratio for subsequent processing.
     pub fn set_stretch_ratio(&mut self, ratio: f64) {
+        let _ = self.try_set_stretch_ratio(ratio);
+    }
+
+    /// Changes the stretch ratio for subsequent processing, returning an error
+    /// for invalid values.
+    pub fn try_set_stretch_ratio(&mut self, ratio: f64) -> Result<(), StretchError> {
+        let ratio = validate_positive_finite_ratio(ratio, "stretch ratio")?;
         if (ratio - self.target_ratio).abs() > RATIO_SNAP_THRESHOLD {
             self.hybrid_pending_rebase = true;
         }
         self.target_ratio = ratio;
+        Ok(())
     }
 
     /// Enables or disables hybrid processing mode.
@@ -1023,6 +1324,9 @@ impl StreamProcessor {
             );
             self.hybrid_pending_rebase = false;
         }
+        if self.use_hybrid != enabled {
+            self.reset_pitch_resamplers();
+        }
         self.use_hybrid = enabled;
     }
 
@@ -1034,12 +1338,32 @@ impl StreamProcessor {
     /// Changes the target BPM, smoothly adjusting the stretch ratio.
     pub fn set_tempo(&mut self, target_bpm: f64) -> bool {
         if let Some(source) = self.source_bpm {
-            if target_bpm > 0.0 {
-                self.set_stretch_ratio(source / target_bpm);
-                return true;
-            }
+            let Ok(ratio) = ratio_from_tempo(source, target_bpm) else {
+                return false;
+            };
+            return self.try_set_stretch_ratio(ratio).is_ok();
         }
         false
+    }
+
+    /// Sets the realtime pitch-scale control value.
+    ///
+    /// Stream mode applies pitch scale by rendering with an internal stretch
+    /// ratio of `stretch_ratio * pitch_scale` and then resampling the rendered
+    /// stream per channel by `1.0 / pitch_scale` to preserve target tempo.
+    pub fn set_pitch_scale(&mut self, scale: f64) -> Result<(), StretchError> {
+        let scale = validate_positive_finite_ratio(scale, "pitch scale")?;
+        if (scale - self.pitch_scale).abs() > RATIO_SNAP_THRESHOLD {
+            self.hybrid_pending_rebase = true;
+            self.reset_pitch_resamplers();
+        }
+        self.pitch_scale = scale;
+        Ok(())
+    }
+
+    /// Returns the current realtime pitch-scale control value.
+    pub fn pitch_scale(&self) -> f64 {
+        self.pitch_scale
     }
 
     /// Returns the source BPM if available.
@@ -1114,14 +1438,17 @@ impl StreamProcessor {
         self.hybrid_pending_rebase = false;
         self.expected_total_output_samples = 0.0;
         self.total_output_emitted_samples = 0;
+        self.pitch_scale = 1.0;
+        self.reset_pitch_resamplers();
     }
 
     fn update_vocoder_ratio(&mut self) {
-        if (self.current_ratio - self.vocoder_ratio).abs() > RATIO_SNAP_THRESHOLD {
+        let processing_ratio = self.processing_ratio();
+        if (processing_ratio - self.vocoder_ratio).abs() > RATIO_SNAP_THRESHOLD {
             for voc in &mut self.vocoders {
-                voc.set_stretch_ratio(self.current_ratio);
+                voc.set_stretch_ratio(processing_ratio);
             }
-            self.vocoder_ratio = self.current_ratio;
+            self.vocoder_ratio = processing_ratio;
         }
     }
 
@@ -1417,6 +1744,19 @@ mod tests {
     use super::*;
     use std::f32::consts::PI;
 
+    fn estimate_freq_zero_crossings(samples: &[f32], sample_rate: u32) -> f64 {
+        if samples.len() < 2 {
+            return 0.0;
+        }
+        let mut crossings = 0usize;
+        for i in 1..samples.len() {
+            if samples[i - 1] <= 0.0 && samples[i] > 0.0 {
+                crossings += 1;
+            }
+        }
+        crossings as f64 * sample_rate as f64 / samples.len() as f64
+    }
+
     #[test]
     fn test_stream_processor_basic() {
         let params = StretchParams::new(1.0)
@@ -1608,6 +1948,25 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_processor_try_from_tempo_low_latency() {
+        let proc = StreamProcessor::try_from_tempo_low_latency(126.0, 128.0, 44100, 2).unwrap();
+        assert_eq!(proc.params().quality_mode, QualityMode::LowLatency);
+        assert_eq!(proc.params().fft_size, LOW_LATENCY_TEMPO_FFT_SIZE);
+        assert!(
+            proc.latency_secs() * 1000.0 < 40.0,
+            "Expected low-latency constructor under 40ms, got {:.2}ms",
+            proc.latency_secs() * 1000.0
+        );
+    }
+
+    #[test]
+    fn test_stream_processor_try_from_tempo_rejects_invalid_values() {
+        assert!(StreamProcessor::try_from_tempo(0.0, 128.0, 44100, 1).is_err());
+        assert!(StreamProcessor::try_from_tempo(126.0, -1.0, 44100, 1).is_err());
+        assert!(StreamProcessor::try_from_tempo(f64::NAN, 128.0, 44100, 1).is_err());
+    }
+
+    #[test]
     fn test_stream_processor_set_tempo() {
         let mut proc = StreamProcessor::from_tempo(126.0, 128.0, 44100, 1);
 
@@ -1644,6 +2003,94 @@ mod tests {
         // Zero or negative BPM should be rejected
         assert!(!proc.set_tempo(0.0));
         assert!(!proc.set_tempo(-100.0));
+    }
+
+    #[test]
+    fn test_stream_processor_try_set_stretch_ratio_rejects_invalid_values() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        let initial = proc.target_stretch_ratio();
+        assert!(proc.try_set_stretch_ratio(0.0).is_err());
+        assert!(proc.try_set_stretch_ratio(f64::INFINITY).is_err());
+        assert_eq!(proc.target_stretch_ratio(), initial);
+    }
+
+    #[test]
+    fn test_stream_processor_pitch_scale_validation() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        assert!((proc.pitch_scale() - 1.0).abs() < 1e-9);
+        assert!(proc.set_pitch_scale(1.25).is_ok());
+        assert!((proc.pitch_scale() - 1.25).abs() < 1e-9);
+        assert!(proc.set_pitch_scale(0.0).is_err());
+        assert!(proc.set_pitch_scale(f64::NAN).is_err());
+        assert!((proc.pitch_scale() - 1.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_stream_processor_pitch_scale_applies_frequency_shift() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_pitch_scale(1.08).unwrap();
+
+        let freq = 440.0f32;
+        let input: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * PI * freq * i as f32 / 44100.0).sin() * 0.8)
+            .collect();
+        let mut output = Vec::with_capacity(input.len() * 2);
+        for chunk in input.chunks(1024) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        proc.flush_into(&mut output).unwrap();
+
+        let trim = 4096usize.min(output.len() / 4);
+        let start = trim;
+        let end = output.len().saturating_sub(trim).max(start + 2);
+        let measured = estimate_freq_zero_crossings(&output[start..end], 44100);
+        assert!(
+            measured > 460.0,
+            "expected measurable pitch-up shift, got {:.3} Hz",
+            measured
+        );
+    }
+
+    #[test]
+    fn test_stream_processor_pitch_scale_preserves_tempo_ratio() {
+        let ratio = 1.2;
+        let params = StretchParams::new(ratio)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_pitch_scale(1.08).unwrap();
+
+        let input: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44100.0).sin() * 0.7)
+            .collect();
+        let mut output = Vec::with_capacity(input.len() * 3);
+        for chunk in input.chunks(1024) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        proc.flush_into(&mut output).unwrap();
+
+        let expected = (input.len() as f64 * ratio).round() as isize;
+        let diff = (output.len() as isize - expected).abs();
+        assert!(
+            diff <= 128,
+            "tempo ratio drift too high with pitch scaling: expected={} got={} diff={}",
+            expected,
+            output.len(),
+            diff
+        );
     }
 
     #[test]
@@ -1907,6 +2354,23 @@ mod tests {
             Err(crate::error::StretchError::NonFiniteInput)
         ));
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_process_into_unity_requires_output_capacity() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        let input = vec![0.1f32; 1024];
+        let mut output = Vec::new();
+        assert!(matches!(
+            proc.process_into(&input, &mut output),
+            Err(StretchError::BufferOverflow {
+                buffer: "process_into_output",
+                ..
+            })
+        ));
     }
 
     #[test]

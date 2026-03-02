@@ -203,8 +203,7 @@ fn main() {
                 (sum_sq / buffer.data.len() as f64).sqrt()
             };
             let output_rms = {
-                let sum_sq: f64 =
-                    all_output.iter().map(|&s| (s as f64) * (s as f64)).sum();
+                let sum_sq: f64 = all_output.iter().map(|&s| (s as f64) * (s as f64)).sum();
                 (sum_sq / all_output.len() as f64).sqrt()
             };
             if output_rms > 1e-8 && input_rms > 1e-8 {

@@ -253,6 +253,10 @@ fi
     echo "${action_index}. Resolve hybrid subset quality divergence before trusting deep-tier parity conclusions."
     action_index=$((action_index + 1))
   fi
+  if [[ "$(status_for m0_baseline)" == "FAIL" ]]; then
+    echo "${action_index}. Investigate reference baseline failure (including timeout/dependency conditions) and rerun deep tier."
+    action_index=$((action_index + 1))
+  fi
   if [[ "$(status_for m0_baseline)" == "SKIP" ]]; then
     echo "${action_index}. Provision external corpus/dependencies and rerun deep tier baseline."
     action_index=$((action_index + 1))

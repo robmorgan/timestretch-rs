@@ -1,5 +1,6 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use timestretch::{EdmPreset, StreamProcessor, StretchParams};
 
@@ -10,6 +11,7 @@ static ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
 static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
 static REALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
 static REALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+static ALLOC_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -85,6 +87,9 @@ fn test_chunk_stereo(frames: usize, sample_rate: f32) -> Vec<f32> {
 
 #[test]
 fn process_into_steady_state_no_heap_growth_after_warmup() {
+    let _guard = ALLOC_TEST_MUTEX
+        .lock()
+        .expect("allocation test mutex poisoned");
     const SAMPLE_RATE: u32 = 44_100;
     const CHANNELS: u32 = 2;
     const CHUNK_FRAMES: usize = 256;
@@ -127,5 +132,53 @@ fn process_into_steady_state_no_heap_growth_after_warmup() {
         realloc_calls,
         alloc_bytes,
         realloc_bytes
+    );
+}
+
+#[test]
+fn process_into_hybrid_mode_allocation_telemetry_present() {
+    let _guard = ALLOC_TEST_MUTEX
+        .lock()
+        .expect("allocation test mutex poisoned");
+    const SAMPLE_RATE: u32 = 44_100;
+    const CHANNELS: u32 = 2;
+    const CHUNK_FRAMES: usize = 256;
+    const WARMUP_ITERS: usize = 16;
+    const MEASURE_ITERS: usize = 24;
+
+    let params = StretchParams::new(1.05)
+        .with_sample_rate(SAMPLE_RATE)
+        .with_channels(CHANNELS)
+        .with_preset(EdmPreset::DjBeatmatch);
+    let mut processor = StreamProcessor::new(params);
+    processor.set_hybrid_mode(true);
+
+    let chunk = test_chunk_stereo(CHUNK_FRAMES, SAMPLE_RATE as f32);
+    let max_samples = chunk.len() * (WARMUP_ITERS + MEASURE_ITERS) * 8;
+    let mut output = Vec::with_capacity(max_samples);
+
+    for _ in 0..WARMUP_ITERS {
+        processor
+            .process_into(&chunk, &mut output)
+            .expect("warmup process_into should succeed");
+    }
+    output.clear();
+
+    begin_alloc_tracking();
+    for _ in 0..MEASURE_ITERS {
+        processor
+            .process_into(&chunk, &mut output)
+            .expect("measured process_into should succeed");
+    }
+    let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
+    let total_calls = alloc_calls + realloc_calls;
+
+    assert!(
+        total_calls > 0,
+        "expected non-zero allocation telemetry in hybrid mode; if this is now zero, update this test to enforce strict no-allocation behavior"
+    );
+    println!(
+        "hybrid allocation telemetry: alloc_calls={} realloc_calls={} alloc_bytes={} realloc_bytes={}",
+        alloc_calls, realloc_calls, alloc_bytes, realloc_bytes
     );
 }
