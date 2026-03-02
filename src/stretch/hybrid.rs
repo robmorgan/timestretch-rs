@@ -1024,6 +1024,12 @@ impl HybridStretcher {
             .max(MIN_WSOLA_SEARCH);
         let mut percussive_stretched = {
             let mut wsola = Wsola::new(perc_seg_size, perc_search, seg_ratio);
+            // Percussive content is noise-like (uncorrelated between overlap
+            // regions). Constant-amplitude crossfade creates ~3 dB energy dips
+            // at overlap midpoints for uncorrelated signals; equal-power
+            // (sin/cos) crossfade maintains constant energy, reducing spectral
+            // artifacts that degrade SC and LSD for transient-heavy content.
+            wsola.set_equal_power_crossfade();
             wsola.process(&percussive).unwrap_or_else(|_| {
                 crate::core::resample::resample_linear(&percussive, percussive_out_len.max(1))
             })

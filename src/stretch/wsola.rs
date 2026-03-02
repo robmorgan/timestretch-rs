@@ -56,6 +56,11 @@ pub struct Wsola {
     crossfade_in: Vec<f32>,
     /// Precomputed raised-cosine fade-out weights for overlap-add.
     crossfade_out: Vec<f32>,
+    /// When true, use equal-power (sin/cos) crossfade instead of
+    /// constant-amplitude (raised cosine). Equal-power is correct for
+    /// uncorrelated signals like percussive/noise content where
+    /// constant-amplitude creates a ~3 dB energy dip at crossfade midpoints.
+    equal_power: bool,
 }
 
 impl std::fmt::Debug for Wsola {
@@ -102,6 +107,28 @@ impl Wsola {
             norm_corr_values_buf: Vec::new(),
             crossfade_in,
             crossfade_out,
+            equal_power: false,
+        }
+    }
+
+    /// Switches to equal-power crossfade (sin/cos curves).
+    ///
+    /// For uncorrelated signals (noise, percussive content), constant-amplitude
+    /// crossfade (`fade_in + fade_out = 1`) creates a ~3 dB energy dip at the
+    /// midpoint because the powers don't sum to unity. Equal-power crossfade
+    /// (`fade_in² + fade_out² = 1`) maintains constant energy for uncorrelated
+    /// signals, eliminating periodic spectral dips at overlap boundaries.
+    pub fn set_equal_power_crossfade(&mut self) {
+        self.equal_power = true;
+        let n = self.overlap_size;
+        if n == 0 {
+            return;
+        }
+        let inv_n = 1.0 / n as f32;
+        for i in 0..n {
+            let t = i as f32 * inv_n;
+            self.crossfade_in[i] = (std::f32::consts::FRAC_PI_2 * t).sin();
+            self.crossfade_out[i] = (std::f32::consts::FRAC_PI_2 * t).cos();
         }
     }
 
@@ -538,8 +565,13 @@ impl Wsola {
         for i in 0..valid_overlap {
             let (fade_in, fade_out) = if need_rescale {
                 let t = i as f32 * inv_valid;
-                let fi = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
-                (fi, 1.0 - fi)
+                if self.equal_power {
+                    let fi = (std::f32::consts::FRAC_PI_2 * t).sin();
+                    (fi, (std::f32::consts::FRAC_PI_2 * t).cos())
+                } else {
+                    let fi = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
+                    (fi, 1.0 - fi)
+                }
             } else {
                 (self.crossfade_in[i], self.crossfade_out[i])
             };
