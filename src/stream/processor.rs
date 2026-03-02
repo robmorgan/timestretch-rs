@@ -1085,12 +1085,12 @@ impl StreamProcessor {
         // onsets.  Batching input to at least fft_size new samples per
         // render makes each delta large enough for the crossfade to be a
         // minor fraction, eliminating these artifacts.
-        // Use 4× the FFT size for expansion ratios (>1.1) to increase
-        // the delta-to-crossfade ratio.  At ratio 1.5 with 1× threshold,
-        // ~74% of the output is affected by inter-render crossfades.
-        // At 4× threshold this drops to ~19%, dramatically reducing
-        // spectral artifacts from blending divergent renderings.
-        let accum_threshold = if self.hybrid_state.last_ratio > 1.1 {
+        // Use 4× the FFT size for ratios far from unity (|r-1| > 0.1)
+        // to increase the delta-to-crossfade ratio.  With 1× threshold,
+        // crossfades affect 74-87% of each delta; at 4× this drops to
+        // ~19-25%, dramatically reducing spectral artifacts from
+        // blending divergent renderings in both expansion and compression.
+        let accum_threshold = if (self.hybrid_state.last_ratio - 1.0).abs() > 0.1 {
             self.params.fft_size * 4
         } else {
             self.params.fft_size
@@ -1158,7 +1158,9 @@ impl StreamProcessor {
                 // crossfade would smear the transient's attack, hurting
                 // TP.  Shorten the crossfade to preserve sharpness while
                 // still preventing clicks.
-                let actual_xfade = if n >= 128 && ratio_scale > 1.1 {
+                let actual_xfade = if n >= 128
+                    && (self.hybrid_state.last_ratio - 1.0).abs() > 0.1
+                {
                     let check = n.min(256);
                     let (mut dot, mut he, mut oe) = (0.0f64, 0.0f64, 0.0f64);
                     for i in 0..check {
