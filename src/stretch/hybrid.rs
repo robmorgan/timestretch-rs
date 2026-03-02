@@ -1026,7 +1026,7 @@ impl HybridStretcher {
             // create spectral artifacts at overlap boundaries.
             self.params
                 .effective_wsola_search_range()
-                .min(perc_seg_size / 3)
+                .min(perc_seg_size / 4)
                 .max(MIN_WSOLA_SEARCH)
         } else {
             self.params
