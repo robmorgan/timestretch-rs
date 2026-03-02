@@ -121,8 +121,10 @@ pub fn hpss(
     // prevent harmonic leakage into the percussive WSOLA path.
     let mut h_mask_buf = vec![0.0f32; num_bins];
     let mut h_mask_smooth = vec![0.0f32; num_bins];
+    const MASK_SMOOTH_RADIUS_LIGHT: usize = 1; // 3-bin window (lightly percussive)
     const MASK_SMOOTH_RADIUS: usize = 2; // 5-bin window (moderate percussive)
     const MASK_SMOOTH_RADIUS_HEAVY: usize = 3; // 7-bin window (heavy percussive)
+    const PERC_FRACTION_LIGHT: f32 = 0.15;
     const PERC_FRACTION_THRESHOLD: f32 = 0.3;
     const PERC_FRACTION_HEAVY: f32 = 0.55;
 
@@ -145,16 +147,23 @@ pub fn hpss(
             h_mask_buf[bin] = h2 / denom;
         }
 
-        // Only smooth in frames with significant percussive content.
-        // Use wider smoothing for very percussive frames where spectral
-        // notches from mask transitions are most severe.
+        // Graduated mask smoothing based on percussive energy fraction.
+        // Heavier percussive content needs wider smoothing to remove
+        // spectral notches, while lightly percussive frames (e.g., vocal
+        // consonants, drum attack/decay transitions) benefit from gentle
+        // 3-bin smoothing that reduces mask noise without blurring tonal
+        // peaks.  Purely tonal frames keep raw masks.
         let perc_fraction = p_energy / (h_energy + p_energy + eps);
-        let use_smooth = perc_fraction > PERC_FRACTION_THRESHOLD;
         let smooth_radius = if perc_fraction > PERC_FRACTION_HEAVY {
             MASK_SMOOTH_RADIUS_HEAVY
-        } else {
+        } else if perc_fraction > PERC_FRACTION_THRESHOLD {
             MASK_SMOOTH_RADIUS
+        } else if perc_fraction > PERC_FRACTION_LIGHT {
+            MASK_SMOOTH_RADIUS_LIGHT
+        } else {
+            0
         };
+        let use_smooth = smooth_radius > 0;
 
         if use_smooth {
             for bin in 0..num_bins {
