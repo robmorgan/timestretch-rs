@@ -1165,7 +1165,16 @@ impl StreamProcessor {
                         1.0
                     };
 
-                    if corr < 0.3 {
+                    if corr > 0.8 {
+                        // High-correlation tonal content: the two renderings
+                        // have similar magnitudes but potentially different PV
+                        // phases. A long crossfade blends two phase-mismatched
+                        // signals, creating FM artifacts (amplitude modulation
+                        // that broadens spectral peaks and increases LSD).
+                        // A shorter crossfade reduces the affected region while
+                        // remaining smooth enough to avoid clicks.
+                        (n / 2).max(128)
+                    } else if corr < 0.3 {
                         // Also require an energy imbalance to distinguish
                         // a genuine transient onset (one region loud, the
                         // other quiet) from normal PV phase divergence on
