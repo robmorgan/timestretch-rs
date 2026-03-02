@@ -424,7 +424,12 @@ impl PhaseVocoder {
         // beyond the scoring tolerance, so we use a shorter mirror.
         // Near unity the phase state is well-behaved and the longer
         // mirror gives better spectral metrics.
-        let end_pad = (self.hop_analysis * 8).min(input.len());
+        // Expansion ratios produce longer output, so the PV processes
+        // further into the tail padding region.  Extra end padding gives
+        // the window-sum normalization more frames to stabilise, reducing
+        // amplitude droop at the output tail that degrades LSD.
+        let end_pad_mult = if self.stretch_ratio > 1.1 { 10 } else { 8 };
+        let end_pad = (self.hop_analysis * end_pad_mult).min(input.len());
         let start_pad_mult = if (self.stretch_ratio - 1.0).abs() > 0.3 {
             4
         } else {
