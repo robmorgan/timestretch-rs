@@ -947,8 +947,17 @@ impl HybridStretcher {
         //
         // Only applied for compression to avoid shifting real onsets when
         // stretching (ratio >= 1.0).
-        let (harmonic, percussive) = if seg_ratio < 0.85 {
-            let pad_frames = hpss_params.harmonic_width / 2;
+        let (harmonic, percussive) = if seg_ratio < 1.0 {
+            // Scale padding amount with distance from unity: aggressive
+            // padding for strong compression, gentle for near-unity.
+            let pad_frames = if seg_ratio < 0.85 {
+                hpss_params.harmonic_width / 2
+            } else {
+                // Near-unity compression (0.85..1.0): use lighter padding
+                // to give the median filter boundary context without the
+                // risk of shifting onsets at stronger padding levels.
+                hpss_params.harmonic_width / 4
+            };
             let pad_samples = (pad_frames * self.params.hop_size).min(seg_data.len());
             if pad_samples > 0 && seg_data.len() > pad_samples {
                 let padded_len = seg_data.len() + pad_samples * 2;
