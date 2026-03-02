@@ -1017,11 +1017,23 @@ impl HybridStretcher {
                 .min(percussive.len() / 2)
                 .max(MIN_WSOLA_SEGMENT)
         };
-        let perc_search = self
-            .params
-            .effective_wsola_search_range()
-            .min(perc_seg_size / 2)
-            .max(MIN_WSOLA_SEARCH);
+        let perc_search = if seg_ratio > 1.0 {
+            // For expansion, constrain the search range to reduce temporal
+            // drift. For broadband percussive content the autocorrelation
+            // drops quickly, so the best match is usually close to the
+            // nominal position. A smaller search prevents WSOLA from
+            // jumping to distant (poorly correlated) positions that
+            // create spectral artifacts at overlap boundaries.
+            self.params
+                .effective_wsola_search_range()
+                .min(perc_seg_size / 3)
+                .max(MIN_WSOLA_SEARCH)
+        } else {
+            self.params
+                .effective_wsola_search_range()
+                .min(perc_seg_size / 2)
+                .max(MIN_WSOLA_SEARCH)
+        };
         let mut percussive_stretched = {
             let mut wsola = Wsola::new(perc_seg_size, perc_search, seg_ratio);
             // Percussive content is noise-like (uncorrelated between overlap
