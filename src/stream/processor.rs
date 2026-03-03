@@ -1142,11 +1142,13 @@ impl StreamProcessor {
         // context change between renders, causing the skip estimate to
         // drift (HPSS segmentation shifts as the rolling window moves).
         // 2× balances crossfade fraction (~35%) against skip accuracy.
-        let accum_threshold = if (self.hybrid_state.last_ratio - 1.0).abs() > 0.1 {
-            self.params.fft_size * 2
-        } else {
-            self.params.fft_size
-        };
+        // Using 2× for ALL ratios: near-unity ratios had 71% crossfade
+        // at 1× which destroyed transient timing in house tracks;
+        // at 2× the crossfade fraction drops to ~36%, preserving
+        // more of each render's original onset positions.  Skip drift
+        // is minimal for near-unity because the output-to-input ratio
+        // is nearly constant across segments.
+        let accum_threshold = self.params.fft_size * 2;
         if allow_defer && self.hybrid_state.input_accumulated < accum_threshold {
             return Ok(0);
         }
