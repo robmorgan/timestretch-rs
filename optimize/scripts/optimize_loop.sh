@@ -76,7 +76,6 @@ if [ ! -f "$PROGRESS_CSV" ]; then
 fi
 
 START_ITER=1
-PLATEAU_LIMIT=8  # Break after this many consecutive non-improving iterations
 STALE_COUNT=0
 BEST_SCORE="0"
 
@@ -85,6 +84,41 @@ if [ $RESUME -eq 1 ]; then
     # Recover best score from progress CSV
     BEST_SCORE=$(tail -n +2 "$PROGRESS_CSV" | cut -d',' -f3 | sort -rn | head -1 || echo "0")
     echo "Resuming from iteration $START_ITER (best score so far: $BEST_SCORE)"
+fi
+
+# Run rubberband baseline scoring once at startup
+BASELINE_JSON="$LOG_DIR/baseline.json"
+BASELINE_INFO=""
+if [ ! -f "$BASELINE_JSON" ]; then
+    echo "Running rubberband baseline scoring (HQ vs medium)..."
+    if ./optimize/scripts/score.py --baseline "$BASELINE_JSON" 2>&1; then
+        BASELINE_INFO=$(python3 -c "
+import json
+data = json.load(open('$BASELINE_JSON'))
+avg = sum(r['total_score'] for r in data) / len(data)
+sc = sum(r['metrics']['spectral_convergence'] for r in data) / len(data)
+lsd = sum(r['metrics']['log_spectral_distance'] for r in data) / len(data)
+raw_lsd = sum(r['raw']['lsd'] for r in data) / len(data)
+print(f'### Rubberband Baseline (HQ vs Medium)')
+print(f'This is the score rubberband R3 achieves against rubberband R2 — it represents the ceiling for parameter-level tuning.')
+print(f'- **Baseline Score:** {avg:.2f}')
+print(f'- **Baseline SC:** {sc:.1f}, **LSD:** {lsd:.1f} (raw {raw_lsd:.1f} dB)')
+" 2>/dev/null || echo "")
+    fi
+else
+    BASELINE_INFO=$(python3 -c "
+import json, os
+if os.path.exists('$BASELINE_JSON'):
+    data = json.load(open('$BASELINE_JSON'))
+    avg = sum(r['total_score'] for r in data) / len(data)
+    sc = sum(r['metrics']['spectral_convergence'] for r in data) / len(data)
+    lsd = sum(r['metrics']['log_spectral_distance'] for r in data) / len(data)
+    raw_lsd = sum(r['raw']['lsd'] for r in data) / len(data)
+    print(f'### Rubberband Baseline (HQ vs Medium)')
+    print(f'This is the score rubberband R3 achieves against rubberband R2 — it represents the ceiling for parameter-level tuning.')
+    print(f'- **Baseline Score:** {avg:.2f}')
+    print(f'- **Baseline SC:** {sc:.1f}, **LSD:** {lsd:.1f} (raw {raw_lsd:.1f} dB)')
+" 2>/dev/null || echo "")
 fi
 
 for (( i=START_ITER; i<=MAX_ITERATIONS; i++ )); do
@@ -106,6 +140,10 @@ for (( i=START_ITER; i<=MAX_ITERATIONS; i++ )); do
     echo "Iteration $i Average Score: $AVG_SCORE (Batch: $BATCH_AVG_SCORE, Streaming: $STREAM_AVG_SCORE, Worst: $WORST_SCORE - $WORST_CASE)"
 
     # Plateau detection: track consecutive non-improving iterations
+    # Dynamic plateau limit: shrinks as more attempts fail, saving compute
+    TOTAL_ATTEMPTS=$(wc -l < "$LOG_DIR/attempts.log" 2>/dev/null | tr -d ' ' || echo "0")
+    PLATEAU_LIMIT=$(python3 -c "print(max(3, 8 - int('$TOTAL_ATTEMPTS') // 20))" 2>/dev/null || echo "8")
+
     if python3 -c "import sys; sys.exit(0 if float('$AVG_SCORE') > float('$BEST_SCORE') + 0.01 else 1)" 2>/dev/null; then
         BEST_SCORE="$AVG_SCORE"
         STALE_COUNT=0
@@ -158,11 +196,66 @@ for item in sorted_data:
 ' ' ' | xargs)
     JSON_SCORES=$(cat "$SCORES_JSON")
 
-    # Load previous attempts log (if it exists) — show ALL attempts so the
-    # agent doesn't repeat approaches from early iterations
+    # Load previous attempts log — summarize categories + show last 20
     ATTEMPTS_FILE="$LOG_DIR/attempts.log"
     if [ -f "$ATTEMPTS_FILE" ] && [ -s "$ATTEMPTS_FILE" ]; then
-        PREVIOUS_ATTEMPTS=$(cat "$ATTEMPTS_FILE")
+        PREVIOUS_ATTEMPTS=$(python3 -c "
+import re, collections, sys
+
+lines = open('$ATTEMPTS_FILE').readlines()
+total = len(lines)
+
+categories = {
+    'PV hop/overlap': ['hop', 'overlap', 'hop_size', 'fft/'],
+    'HPSS params': ['hpss', 'harmonic_width', 'percussive_width', 'wiener', 'mask power', 'mask smooth'],
+    'Window function': ['window', 'hann', 'blackman'],
+    'Crossfade/blending': ['crossfade', 'fade', 'blend', 'taper'],
+    'Mirror padding': ['mirror', 'padding', 'pad_mult', 'start_pad', 'end_pad'],
+    'Phase locking': ['phase lock', 'phase_gradient', 'adaptive phase', 'roi', 'identity'],
+    'Transient detection': ['transient', 'sensitivity', 'onset'],
+    'WSOLA search/overlap': ['wsola', 'search_ms', 'seg_size', 'wsola overlap'],
+    'Edge correction': ['edge correct', 'gain ramp', 'correction_len', 'cubic hermite'],
+    'Sub-bass handling': ['sub.bass', 'cutoff', '120hz', '85hz'],
+    'Multi-resolution': ['multi_res', 'multi.resolution', '3-band'],
+    'Normalization/RMS': ['normaliz', 'window_sum', 'floor_ratio', 'rms'],
+    'Spectral envelope': ['cepstr', 'spectral envelope', 'spectral tilt'],
+    'Band-split': ['band.split', 'crossover'],
+    'Streaming chunk/accum': ['chunk_size', 'streaming chunk', 'accumulation'],
+    'Output format': ['float wav', 'pcm_16', '16-bit', 'quantiz'],
+}
+
+cat_counts = collections.Counter()
+cat_best = {}
+cat_last = {}
+for idx, line in enumerate(lines, 1):
+    lower = line.lower()
+    for cat, keywords in categories.items():
+        if any(kw in lower for kw in keywords):
+            cat_counts[cat] += 1
+            cat_last[cat] = idx
+            m = re.search(r'score=([\\d.]+)', line)
+            if m:
+                sc = float(m.group(1))
+                if cat not in cat_best or sc > cat_best[cat]:
+                    cat_best[cat] = sc
+
+# Print summary
+print(f'Total attempts: {total}')
+print()
+print('### Attempts by Category')
+print('| Category | Attempts | Best Score | Last Attempt |')
+print('|----------|----------|------------|-------------|')
+for cat in sorted(cat_counts, key=lambda c: cat_counts[c], reverse=True):
+    best = f'{cat_best[cat]:.2f}' if cat in cat_best else 'n/a'
+    print(f'| {cat} | {cat_counts[cat]} | {best} | #{cat_last[cat]} |')
+print()
+
+# Show last 20 attempts in full
+n = min(20, total)
+print(f'### Last {n} Attempts (full details)')
+for line in lines[-n:]:
+    print(line.rstrip())
+")
     else
         PREVIOUS_ATTEMPTS="No previous attempts logged yet. You are the first agent."
     fi
@@ -255,25 +348,51 @@ if over_explored:
     fi
 
     # Calculate per-metric impact analysis: which metric+case has the most
-    # leverage on the overall average score
+    # leverage on the overall average score (reads weights from config.toml)
     IMPACT_ANALYSIS=$(python3 -c "
-import json
+import json, os
 
 data = json.load(open('$SCORES_JSON'))
 n = len(data)
-weights = {'spectral_convergence': 0.30, 'log_spectral_distance': 0.25,
-           'mfcc_distance': 0.20, 'transient_preservation': 0.25}
+
+# Read weights from config.toml
+all_weights = {
+    'spectral_convergence': 0.30, 'log_spectral_distance': 0.25,
+    'mfcc_distance': 0.20, 'transient_preservation': 0.25,
+    'stereo_width': 0.10, 'interchannel_correlation': 0.10,
+    'panning_consistency': 0.05
+}
+config_path = '$CONFIG_PATH'
+if os.path.exists(config_path):
+    try:
+        import tomllib
+        with open(config_path, 'rb') as f:
+            config = tomllib.load(f)
+        if 'scoring' in config:
+            all_weights.update(config['scoring'])
+    except (ImportError, Exception):
+        pass
+
+mono_keys = ['spectral_convergence', 'log_spectral_distance', 'mfcc_distance', 'transient_preservation']
+stereo_keys = ['stereo_width', 'interchannel_correlation', 'panning_consistency']
 
 # For each test case and metric, compute how much the overall average
 # would improve if that metric reached 100
 impacts = []
 for item in data:
-    for metric, weight in weights.items():
-        current = item['metrics'][metric]
+    is_stereo = item.get('stereo', False)
+    active_keys = mono_keys + stereo_keys if is_stereo else mono_keys
+    raw_sum = sum(all_weights.get(k, 0) for k in active_keys)
+    if raw_sum <= 0:
+        continue
+    norm = {k: all_weights.get(k, 0) / raw_sum for k in active_keys}
+
+    for metric in active_keys:
+        current = item['metrics'].get(metric, 100.0)
         headroom = 100.0 - current
-        # Impact on overall average = (headroom * weight) / n
-        impact = (headroom * weight) / n
-        if impact > 0.3:  # Only show meaningful opportunities
+        w = norm.get(metric, 0)
+        impact = (headroom * w) / n
+        if impact > 0.2:
             impacts.append((impact, item['description'], metric, current))
 
 impacts.sort(reverse=True)
@@ -281,7 +400,7 @@ print('## Highest-Impact Opportunities')
 print('Improving these specific metrics would have the largest effect on the overall score:')
 print('| Impact | Test Case | Metric | Current | Headroom |')
 print('|--------|-----------|--------|---------|----------|')
-for impact, desc, metric, current in impacts[:8]:
+for impact, desc, metric, current in impacts[:10]:
     print(f'| +{impact:.2f} | {desc} | {metric} | {current:.1f} | {100-current:.1f} |')
 print()
 print('**Focus on the top 2-3 rows** — these are where your changes will move the needle most.')
@@ -302,6 +421,7 @@ print('**Focus on the top 2-3 rows** — these are where your changes will move 
     export WSOLA_CORE="$WSOLA_CORE"
     export DIVERSITY_HINTS="$DIVERSITY_HINTS"
     export IMPACT_ANALYSIS="$IMPACT_ANALYSIS"
+    export BASELINE_INFO="$BASELINE_INFO"
     export WORST_CASES=$(python3 -c "
 import json
 data = json.load(open('$SCORES_JSON'))
@@ -310,7 +430,7 @@ for d in sorted_data:
     print(f'- {d[\"description\"]}: {d[\"total_score\"]:.2f}')
 ")
 
-    envsubst '$ITERATION $AVG_SCORE $TARGET_SCORE $BATCH_AVG_SCORE $STREAM_AVG_SCORE $SCORE_HISTORY $JSON_SCORES $PREVIOUS_ATTEMPTS $HYBRID_HEAD $HYBRID_STRETCH_CORE $PV_PROCESS $WSOLA_CORE $DIVERSITY_HINTS $IMPACT_ANALYSIS $WORST_CASES' \
+    envsubst '$ITERATION $AVG_SCORE $TARGET_SCORE $BATCH_AVG_SCORE $STREAM_AVG_SCORE $SCORE_HISTORY $JSON_SCORES $PREVIOUS_ATTEMPTS $HYBRID_HEAD $HYBRID_STRETCH_CORE $PV_PROCESS $WSOLA_CORE $DIVERSITY_HINTS $IMPACT_ANALYSIS $WORST_CASES $BASELINE_INFO' \
         < "optimize/scripts/agent_prompt.md.tmpl" > "$PROMPT_FILE"
     
     # 5. Run Agent (agent self-scores and commits if improved)

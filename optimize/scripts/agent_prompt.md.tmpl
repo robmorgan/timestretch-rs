@@ -17,10 +17,19 @@ ${WORST_CASES}
 ${IMPACT_ANALYSIS}
 
 ### Understanding the Metrics
-- **Spectral Convergence**: Measures magnitude similarity in the frequency domain. Low scores mean frequency content is distorted or "smeared".
-- **Log Spectral Distance**: Measures spectral difference in dB. High values indicate tonal coloration or gain issues.
+- **Spectral Convergence (SC)**: Measures magnitude similarity in the frequency domain. Low scores mean frequency content is distorted or "smeared".
+- **Log Spectral Distance (LSD)**: Measures spectral difference in dB. High values indicate tonal coloration or gain issues. This is the largest contributor to the remaining gap — improving LSD has the highest leverage.
 - **MFCC Distance**: Measures timbral similarity. High distance means the "character" of the sound has changed.
-- **Transient Preservation**: Measures how well onsets (drum hits, etc.) are preserved. Low scores mean transients are "softened" or "doubled".
+- **Transient Preservation (TP)**: Measures how well onsets (drum hits, etc.) are preserved. Low scores mean transients are "softened" or "doubled".
+- **Stereo Width (SWP)**: Mid/side energy ratio preservation. Low scores mean the stereo image collapsed or widened relative to the reference.
+- **Interchannel Correlation (ICC)**: L-R phase relationship preservation. Low scores mean stereo decorrelation has changed.
+- **Panning Consistency (PP)**: Frame-by-frame L-R balance curve correlation. Low scores mean panning shifts have been introduced.
+
+### Strategy Guidance
+- **LSD is ~79% of the remaining gap** — prioritize spectral distance reduction over other metrics.
+- Parameter-level tweaks at score 84+ have only a ~13% success rate. Consider **architectural changes**: different PV implementations, overlap-save vs overlap-add, multi-resolution analysis.
+- For stereo cases: mid/side processing in `src/stretch/hybrid.rs` is the key code path. Stereo metrics (SWP, ICC, PP) measure how well the L-R relationship is preserved through stretching.
+${BASELINE_INFO}
 
 ## Previous Attempts (DO NOT REPEAT THESE)
 ${PREVIOUS_ATTEMPTS}

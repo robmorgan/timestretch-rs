@@ -211,7 +211,7 @@ def score_pair(ref_path, test_path, weights, stereo=False):
 
     # Map raw metrics to 0-100 scores
     sc_score = max(0, 100 * (1.0 - sc))
-    lsd_score = 100 * np.exp(-lsd / 10.0)
+    lsd_score = 100 * np.exp(-max(0, lsd - 3.0) / 7.0)
     mfcc_score = max(0, 100 * (1.0 - mfcc_dist))
     tp_score = 100 * tp
 
@@ -337,8 +337,9 @@ def main():
     parser.add_argument("--batch", metavar='OUTPUT_JSON', help="Batch score based on manifest")
     parser.add_argument("--manifest", default="test_manifest.json", help="Path to manifest")
     parser.add_argument("--spectrogram-diff", nargs=3, metavar=('REF', 'TEST', 'OUT'), help="Generate diff plot")
+    parser.add_argument("--baseline", metavar='OUTPUT_JSON', help="Score rubberband HQ vs medium refs (baseline)")
     parser.add_argument("--config", default="optimize/config.toml", help="Path to config.toml")
-    
+
     args = parser.parse_args()
     
     # Load weights from config
@@ -457,6 +458,56 @@ def main():
             icc_avg = np.mean([r['metrics'].get('interchannel_correlation', 0) for r in results if r.get('stereo')])
             pp_avg = np.mean([r['metrics'].get('panning_consistency', 0) for r in results if r.get('stereo')])
             print(f"  Stereo metrics: SWP={swp_avg:.1f}, ICC={icc_avg:.1f}, PP={pp_avg:.1f}", file=sys.stderr)
+
+    if args.baseline:
+        if not os.path.exists(args.manifest):
+            print(f"Error: Manifest {args.manifest} not found.", file=sys.stderr)
+            sys.exit(1)
+
+        with open(args.manifest, 'r') as f:
+            manifest = json.load(f)
+
+        repo_root = os.getcwd()
+        results = []
+
+        for item in manifest:
+            ratio = item['ratio']
+            is_stereo = item.get('stereo', False)
+            source_base = os.path.basename(item['source']).replace('.wav', '')
+            hq_path = os.path.join(repo_root, "optimize/references", f"{source_base}_ref_{ratio}.wav")
+            med_path = os.path.join(repo_root, "optimize/references", f"{source_base}_ref_{ratio}_med.wav")
+
+            if not os.path.exists(hq_path) or not os.path.exists(med_path):
+                continue
+
+            print(f"Baseline scoring {item['description']}...", file=sys.stderr)
+            res = score_pair(hq_path, med_path, weights, stereo=is_stereo)
+            res['description'] = item['description']
+            res['ratio'] = ratio
+            results.append(res)
+
+        if not results:
+            print("No baseline pairs found (need *_med.wav files from generate_references.sh).", file=sys.stderr)
+            sys.exit(1)
+
+        class NumpyEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, (np.floating,)):
+                    return float(obj)
+                if isinstance(obj, (np.integer,)):
+                    return int(obj)
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                return super().default(obj)
+
+        with open(args.baseline, 'w') as f:
+            json.dump(results, f, indent=2, cls=NumpyEncoder)
+
+        avg = np.mean([r['total_score'] for r in results])
+        sc_avg = np.mean([r['metrics']['spectral_convergence'] for r in results])
+        lsd_avg = np.mean([r['metrics']['log_spectral_distance'] for r in results])
+        raw_lsd_avg = np.mean([r['raw']['lsd'] for r in results])
+        print(f"\nBaseline (rubberband HQ vs medium): avg={avg:.2f}, SC={sc_avg:.1f}, LSD={lsd_avg:.1f} (raw {raw_lsd_avg:.1f} dB)", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
