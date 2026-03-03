@@ -25,11 +25,11 @@ the timestretch-rs library output against them.
 4. Set master tempo to 120 BPM (will be overwritten by scripts)
 5. Set warp mode on the audio track to **Complex Pro**
 6. Configure export settings: WAV, same sample rate, no normalization, no dithering
-7. Save as `template/base_template.als`
+7. Save as `template/base_template Project/base_template.als` (Ableton creates a project folder with " Project" suffix automatically)
 
 To inspect the template XML:
 ```bash
-python scripts/create_als_project.py decompress template/base_template.als template/base_template.xml
+python scripts/create_als_project.py decompress "template/base_template Project/base_template.als" template/base_template.xml
 ```
 
 ## Track Catalog
@@ -99,7 +99,8 @@ make manifest   # Print what would be rendered
 optimize/ableton/
 ├── track_catalog.json        # Input track definitions
 ├── template/
-│   └── base_template.als     # Manually created (gitignored)
+│   └── base_template Project/ # Ableton project folder (gitignored)
+│       └── base_template.als
 ├── scripts/
 │   ├── create_als_project.py # ALS XML manipulation
 │   ├── export_dialog.applescript

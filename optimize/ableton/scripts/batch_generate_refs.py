@@ -22,7 +22,7 @@ sys.path.insert(0, SCRIPT_DIR)
 
 from render_via_ableton import render_with_retries, is_ableton_running, quit_ableton
 
-DEFAULT_TEMPLATE = os.path.join(SCRIPT_DIR, "..", "template", "base_template.als")
+DEFAULT_TEMPLATE = os.path.join(SCRIPT_DIR, "..", "template", "base_template Project", "base_template.als")
 
 logging.basicConfig(
     level=logging.INFO,

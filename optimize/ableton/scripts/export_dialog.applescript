@@ -33,7 +33,7 @@ on run argv
 	delay 1
 
 	tell application "System Events"
-		tell process "Ableton Live 11 Suite"
+		tell process "Live"
 			-- Ensure Ableton is frontmost
 			set frontmost to true
 			delay 0.5
@@ -43,9 +43,6 @@ on run argv
 			delay dialogOpenDelay
 
 			-- The export dialog should now be open.
-			-- Click the "Export" button to trigger the save dialog.
-			-- First, we need to make sure the format settings are correct.
-
 			-- Click Export (or press Enter if Export is the default button)
 			keystroke return
 			delay dialogOpenDelay

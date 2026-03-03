@@ -25,7 +25,7 @@ panning_consistency = 0.05
 
 [ableton]
 # Ableton Live reference generation settings (macOS only)
-template = "ableton/template/base_template.als"
+template = "ableton/template/base_template Project/base_template.als"
 catalog = "ableton/track_catalog.json"
 ref_dir = "ableton/refs/ableton"
 library_dir = "ableton/refs/library"
