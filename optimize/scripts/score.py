@@ -338,6 +338,10 @@ def main():
     parser.add_argument("--manifest", default="test_manifest.json", help="Path to manifest")
     parser.add_argument("--spectrogram-diff", nargs=3, metavar=('REF', 'TEST', 'OUT'), help="Generate diff plot")
     parser.add_argument("--baseline", metavar='OUTPUT_JSON', help="Score rubberband HQ vs medium refs (baseline)")
+    parser.add_argument("--ref-source", choices=["rubberband", "ableton"], default="rubberband",
+                        help="Reference source: rubberband (default) or ableton")
+    parser.add_argument("--ableton-manifest", default=None,
+                        help="Path to ableton_manifest.json (for --ref-source ableton)")
     parser.add_argument("--config", default="optimize/config.toml", help="Path to config.toml")
 
     args = parser.parse_args()
@@ -378,53 +382,106 @@ def main():
         generate_spectrogram_diff(args.spectrogram_diff[0], args.spectrogram_diff[1], args.spectrogram_diff[2])
 
     if args.batch:
-        if not os.path.exists(args.manifest):
-            print(f"Error: Manifest {args.manifest} not found.")
-            sys.exit(1)
-
-        with open(args.manifest, 'r') as f:
-            manifest = json.load(f)
-
         results = []
         repo_root = os.getcwd()
 
-        # Score batch outputs
-        for item in manifest:
-            ratio = item['ratio']
-            is_stereo = item.get('stereo', False)
-            source_base = os.path.basename(item['source']).replace('.wav', '')
-            ref_path = os.path.join(repo_root, "optimize/references", f"{source_base}_ref_{ratio}.wav")
-            test_path = os.path.join(repo_root, "optimize/outputs", f"{source_base}_test_{ratio}.wav")
+        if args.ref_source == "ableton":
+            # Ableton reference mode: score library outputs against Ableton refs
+            ableton_manifest_path = args.ableton_manifest or os.path.join(
+                repo_root, "optimize", "ableton", "ableton_manifest.json")
+            if not os.path.exists(ableton_manifest_path):
+                print(f"Error: Ableton manifest not found: {ableton_manifest_path}", file=sys.stderr)
+                sys.exit(1)
 
-            if not os.path.exists(ref_path) or not os.path.exists(test_path):
-                print(f"Warning: Skipping {item['description']}, missing files.")
-                continue
+            with open(ableton_manifest_path, 'r') as f:
+                ableton_manifest = json.load(f)
 
-            print(f"Scoring {item['description']}...", file=sys.stderr)
-            res = score_pair(ref_path, test_path, weights, stereo=is_stereo)
-            res['description'] = item['description']
-            res['ratio'] = ratio
-            res['mode'] = 'batch'
-            results.append(res)
+            ableton_ref_dir = os.path.join(repo_root, "optimize", "ableton", "refs", "ableton")
+            library_ref_dir = os.path.join(repo_root, "optimize", "ableton", "refs", "library")
 
-        # Score streaming outputs
-        for item in manifest:
-            ratio = item['ratio']
-            is_stereo = item.get('stereo', False)
-            source_base = os.path.basename(item['source']).replace('.wav', '')
-            ref_path = os.path.join(repo_root, "optimize/references", f"{source_base}_ref_{ratio}.wav")
-            test_path = os.path.join(repo_root, "optimize/outputs", f"{source_base}_stream_{ratio}.wav")
+            for entry in ableton_manifest:
+                is_stereo = entry.get('stereo', False)
+                ratio = entry['ratio']
+                track_id = entry['track_id']
+                target_bpm = entry['target_bpm']
 
-            if not os.path.exists(ref_path) or not os.path.exists(test_path):
-                print(f"Warning: Skipping [streaming] {item['description']}, missing files.")
-                continue
+                ref_path = entry.get('ref_path',
+                    os.path.join(ableton_ref_dir, f"{track_id}_{target_bpm}bpm.wav"))
 
-            print(f"Scoring [streaming] {item['description']}...", file=sys.stderr)
-            res = score_pair(ref_path, test_path, weights, stereo=is_stereo)
-            res['description'] = f"{item['description']} [streaming]"
-            res['ratio'] = ratio
-            res['mode'] = 'streaming'
-            results.append(res)
+                # Score batch output
+                batch_test = os.path.join(library_ref_dir, f"{track_id}_{target_bpm}bpm_batch.wav")
+                if os.path.exists(ref_path) and os.path.exists(batch_test):
+                    desc = entry.get('description', f"{track_id} @ {target_bpm} BPM")
+                    print(f"Scoring [ableton] {desc}...", file=sys.stderr)
+                    res = score_pair(ref_path, batch_test, weights, stereo=is_stereo)
+                    res['description'] = desc
+                    res['ratio'] = ratio
+                    res['mode'] = 'batch'
+                    res['ref_source'] = 'ableton'
+                    results.append(res)
+                else:
+                    print(f"Warning: Skipping {track_id} batch (missing ref or test)", file=sys.stderr)
+
+                # Score streaming output
+                stream_test = os.path.join(library_ref_dir, f"{track_id}_{target_bpm}bpm_stream.wav")
+                if os.path.exists(ref_path) and os.path.exists(stream_test):
+                    desc = entry.get('description', f"{track_id} @ {target_bpm} BPM")
+                    print(f"Scoring [ableton/streaming] {desc}...", file=sys.stderr)
+                    res = score_pair(ref_path, stream_test, weights, stereo=is_stereo)
+                    res['description'] = f"{desc} [streaming]"
+                    res['ratio'] = ratio
+                    res['mode'] = 'streaming'
+                    res['ref_source'] = 'ableton'
+                    results.append(res)
+                else:
+                    print(f"Warning: Skipping {track_id} streaming (missing ref or test)", file=sys.stderr)
+
+        else:
+            # Default rubberband reference mode
+            if not os.path.exists(args.manifest):
+                print(f"Error: Manifest {args.manifest} not found.")
+                sys.exit(1)
+
+            with open(args.manifest, 'r') as f:
+                manifest = json.load(f)
+
+            # Score batch outputs
+            for item in manifest:
+                ratio = item['ratio']
+                is_stereo = item.get('stereo', False)
+                source_base = os.path.basename(item['source']).replace('.wav', '')
+                ref_path = os.path.join(repo_root, "optimize/references", f"{source_base}_ref_{ratio}.wav")
+                test_path = os.path.join(repo_root, "optimize/outputs", f"{source_base}_test_{ratio}.wav")
+
+                if not os.path.exists(ref_path) or not os.path.exists(test_path):
+                    print(f"Warning: Skipping {item['description']}, missing files.")
+                    continue
+
+                print(f"Scoring {item['description']}...", file=sys.stderr)
+                res = score_pair(ref_path, test_path, weights, stereo=is_stereo)
+                res['description'] = item['description']
+                res['ratio'] = ratio
+                res['mode'] = 'batch'
+                results.append(res)
+
+            # Score streaming outputs
+            for item in manifest:
+                ratio = item['ratio']
+                is_stereo = item.get('stereo', False)
+                source_base = os.path.basename(item['source']).replace('.wav', '')
+                ref_path = os.path.join(repo_root, "optimize/references", f"{source_base}_ref_{ratio}.wav")
+                test_path = os.path.join(repo_root, "optimize/outputs", f"{source_base}_stream_{ratio}.wav")
+
+                if not os.path.exists(ref_path) or not os.path.exists(test_path):
+                    print(f"Warning: Skipping [streaming] {item['description']}, missing files.")
+                    continue
+
+                print(f"Scoring [streaming] {item['description']}...", file=sys.stderr)
+                res = score_pair(ref_path, test_path, weights, stereo=is_stereo)
+                res['description'] = f"{item['description']} [streaming]"
+                res['ratio'] = ratio
+                res['mode'] = 'streaming'
+                results.append(res)
 
         class NumpyEncoder(json.JSONEncoder):
             def default(self, obj):

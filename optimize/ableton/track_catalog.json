@@ -1,0 +1,13 @@
+[
+  {
+    "id": "music-sounds-better",
+    "source": "../samples/house_1.wav",
+    "source_bpm": 124.0,
+    "targets": [
+      {"target_bpm": 115.0, "ratio": 0.9274},
+      {"target_bpm": 128.0, "ratio": 1.0323},
+      {"target_bpm": 100.0, "ratio": 0.8065}
+    ],
+    "stereo": true
+  }
+]

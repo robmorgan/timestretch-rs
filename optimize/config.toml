@@ -23,6 +23,17 @@ stereo_width = 0.10
 interchannel_correlation = 0.10
 panning_consistency = 0.05
 
+[ableton]
+# Ableton Live reference generation settings (macOS only)
+template = "ableton/template/base_template.als"
+catalog = "ableton/track_catalog.json"
+ref_dir = "ableton/refs/ableton"
+library_dir = "ableton/refs/library"
+app_path = "/Applications/Ableton Live 11 Suite.app"
+sample_rate = 44100
+# Warp mode: 0=Beats, 1=Tones, 2=Texture, 3=Re-Pitch, 4=Complex, 6=Complex Pro
+warp_mode = 6
+
 [agent.claude_code]
 max_turns = 60
 allowed_tools = ["Edit", "Write", "Bash", "Read", "Grep", "Glob"]
