@@ -33,7 +33,6 @@ pub fn start_processing_thread(
         let chunk_samples = CHUNK_FRAMES * CHANNELS as usize;
         let mut stream_started = false;
         let preroll_target_samples = startup_preroll_target_samples(&processor);
-        let mut prev_ratio: f64 = state.lock().unwrap().stretch_ratio;
 
         // Keep output muted until enough stretched samples are buffered.
         stream_active.store(false, Ordering::Relaxed);
@@ -66,7 +65,6 @@ pub fn start_processing_thread(
                 flush_ring.store(true, Ordering::Release);
                 stream_active.store(false, Ordering::Relaxed);
                 stream_started = false;
-                prev_ratio = stretch_ratio;
             }
 
             // Handle pitch change - re-process entire source
@@ -126,16 +124,11 @@ pub fn start_processing_thread(
                 continue;
             }
 
-            // Update stretch ratio; flush stale ring-buffer audio when it changes
-            // but keep the processor running (set_stretch_ratio handles interpolation).
+            // Update stretch ratio (set_stretch_ratio handles smooth interpolation).
             if let Err(err) = processor.set_stretch_ratio(stretch_ratio) {
                 log::error!("Invalid stretch ratio {stretch_ratio}: {err}");
                 thread::sleep(Duration::from_millis(5));
                 continue;
-            }
-            if (stretch_ratio - prev_ratio).abs() > 1e-6 {
-                prev_ratio = stretch_ratio;
-                flush_ring.store(true, Ordering::Release);
             }
 
             // Check if we have audio to process
