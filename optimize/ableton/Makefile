@@ -6,17 +6,18 @@ ABLETON_REF_DIR := refs/ableton
 LIBRARY_REF_DIR := refs/library
 LOG_DIR := logs
 MANIFEST := ableton_manifest.json
+PYTHON := ../.venv/bin/python
 
 ableton-refs:    ## Generate Ableton Complex Pro references (requires Ableton + macOS)
-	python3 $(SCRIPT_DIR)/batch_generate_refs.py $(CATALOG) $(ABLETON_REF_DIR) \
+	$(PYTHON) $(SCRIPT_DIR)/batch_generate_refs.py $(CATALOG) $(ABLETON_REF_DIR) \
 		--skip-existing --manifest-out $(MANIFEST)
 
 library-refs:    ## Generate library outputs for same tracks/ratios
-	python3 $(SCRIPT_DIR)/generate_library_refs.py $(CATALOG) $(LIBRARY_REF_DIR) \
+	$(PYTHON) $(SCRIPT_DIR)/generate_library_refs.py $(CATALOG) $(LIBRARY_REF_DIR) \
 		--skip-existing --manifest-out library_manifest.json
 
 score-ableton:   ## Score library outputs vs Ableton references
-	cd .. && python3 scripts/score.py --ref-source ableton \
+	cd .. && .venv/bin/python scripts/score.py --ref-source ableton \
 		--ableton-manifest ableton/$(MANIFEST) \
 		--batch ableton/$(LOG_DIR)/scores.json
 
@@ -29,7 +30,7 @@ full:            ## Full pipeline: Ableton refs + library refs + score
 	$(MAKE) compare
 
 manifest:        ## Generate Ableton manifest without rendering
-	python3 $(SCRIPT_DIR)/batch_generate_refs.py $(CATALOG) $(ABLETON_REF_DIR) \
+	$(PYTHON) $(SCRIPT_DIR)/batch_generate_refs.py $(CATALOG) $(ABLETON_REF_DIR) \
 		--dry-run --manifest-out $(MANIFEST)
 
 clean:           ## Clean generated outputs and logs

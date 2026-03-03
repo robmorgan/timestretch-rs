@@ -28,12 +28,13 @@ ABLETON_APP_PATH = f"/Applications/{ABLETON_APP}.app"
 EXPORT_APPLESCRIPT = os.path.join(SCRIPT_DIR, "export_dialog.applescript")
 
 # Timeouts and retries
-ABLETON_LOAD_TIMEOUT = 45  # seconds to wait for Ableton to load a project
-EXPORT_TIMEOUT = 300  # seconds to wait for export to complete (5 min)
+ABLETON_LOAD_TIMEOUT = 90  # seconds to wait for Ableton process to appear
+EXPORT_TIMEOUT = 600  # seconds to wait for export to complete (10 min)
 FILE_STABLE_CHECKS = 3  # number of stable size checks before considering done
 FILE_STABLE_INTERVAL = 2  # seconds between size checks
 MAX_RETRIES = 2
-OSC_READY_TIMEOUT = 30  # seconds to wait for AbletonOSC to become available
+OSC_READY_TIMEOUT = 60  # seconds to wait for AbletonOSC to become available
+POST_LOAD_DELAY = 15  # seconds to wait after OSC responds for clip warping
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,43 +94,51 @@ def wait_for_ableton_ready(timeout=ABLETON_LOAD_TIMEOUT):
     time.sleep(3)
     dismiss_startup_dialogs()
 
-    # Then poll AbletonOSC until it responds (means project is loaded)
+    # Then poll AbletonOSC until it responds (means app is loaded)
     try:
         from ableton_osc import is_osc_available
         log.info("Polling AbletonOSC for readiness...")
         osc_deadline = time.time() + OSC_READY_TIMEOUT
         while time.time() < osc_deadline:
             if is_osc_available(timeout=1.5):
-                log.info("AbletonOSC is responding — Ableton is ready")
-                return
+                log.info("AbletonOSC is responding — Ableton app is ready")
+                break
             time.sleep(2)
-        log.warning("AbletonOSC did not respond within timeout, "
-                     "proceeding with fixed delay")
+        else:
+            log.warning("AbletonOSC did not respond within timeout, "
+                         "proceeding with fixed delay")
     except ImportError:
         log.warning("python-osc not available, using fixed delay")
 
-    # Fallback: fixed wait
-    remaining = max(5, timeout - (time.time() - start))
-    wait_time = min(remaining, 15)
-    log.info(f"Fallback: waiting {wait_time}s...")
-    time.sleep(wait_time)
+    # Wait for clip loading/warping to complete.
+    # AbletonOSC responds as soon as the app loads, but long tracks
+    # (3-7 min) need additional time for analysis and warping.
+    log.info(f"Waiting {POST_LOAD_DELAY}s for clip loading and warping...")
+    time.sleep(POST_LOAD_DELAY)
 
 
-def configure_via_osc(target_bpm):
-    """Set tempo and disable loop via AbletonOSC. Returns True on success."""
+def configure_via_osc(target_bpm, max_attempts=3):
+    """Set tempo and disable loop via AbletonOSC. Retries on failure."""
     try:
         from ableton_osc import configure_session
     except ImportError:
         log.warning("python-osc not available, skipping OSC configuration")
         return False
 
-    log.info(f"Configuring session via OSC: tempo={target_bpm}, loop=off")
-    ok, details = configure_session(target_bpm, disable_loop=True)
-    if ok:
-        log.info(f"OSC configuration OK: {details}")
-    else:
+    for attempt in range(1, max_attempts + 1):
+        log.info(f"Configuring session via OSC (attempt {attempt}): "
+                 f"tempo={target_bpm}, loop=off")
+        ok, details = configure_session(target_bpm, disable_loop=True)
+        if ok:
+            log.info(f"OSC configuration OK: {details}")
+            return True
         log.warning(f"OSC configuration issues: {details}")
-    return ok
+        if attempt < max_attempts:
+            log.info("Retrying OSC configuration in 5s...")
+            time.sleep(5)
+
+    log.warning("OSC configuration failed after all attempts, proceeding anyway")
+    return False
 
 
 def run_export(output_dir, output_filename):
@@ -139,7 +148,7 @@ def run_export(output_dir, output_filename):
 
     result = subprocess.run(
         ["osascript", EXPORT_APPLESCRIPT, abs_output_dir, output_filename],
-        capture_output=True, text=True, timeout=60
+        capture_output=True, text=True, timeout=120
     )
 
     if result.returncode != 0:
@@ -150,7 +159,21 @@ def run_export(output_dir, output_filename):
     return True
 
 
-def wait_for_file(file_path, timeout=EXPORT_TIMEOUT):
+def ensure_fresh_output_path(file_path):
+    """Remove any pre-existing output file so stale renders cannot be reused."""
+    if not os.path.exists(file_path):
+        return True
+
+    try:
+        os.remove(file_path)
+        log.info(f"Removed stale output before export: {file_path}")
+        return True
+    except OSError as e:
+        log.error(f"Cannot remove stale output {file_path}: {e}")
+        return False
+
+
+def wait_for_file(file_path, timeout=EXPORT_TIMEOUT, min_mtime=None):
     """Wait for an output file to appear and stabilize (size stops growing)."""
     log.info(f"Waiting for output file: {file_path}")
     start = time.time()
@@ -158,7 +181,13 @@ def wait_for_file(file_path, timeout=EXPORT_TIMEOUT):
     # Wait for file to appear
     while time.time() - start < timeout:
         if os.path.exists(file_path):
-            break
+            if min_mtime is None:
+                break
+            try:
+                if os.path.getmtime(file_path) >= min_mtime:
+                    break
+            except OSError:
+                pass
         time.sleep(2)
     else:
         log.error(f"Timeout waiting for file to appear: {file_path}")
@@ -177,6 +206,16 @@ def wait_for_file(file_path, timeout=EXPORT_TIMEOUT):
         if current_size == last_size and current_size > 0:
             stable_count += 1
             if stable_count >= FILE_STABLE_CHECKS:
+                if min_mtime is not None:
+                    try:
+                        if os.path.getmtime(file_path) < min_mtime:
+                            stable_count = 0
+                            time.sleep(FILE_STABLE_INTERVAL)
+                            continue
+                    except OSError:
+                        stable_count = 0
+                        time.sleep(FILE_STABLE_INTERVAL)
+                        continue
                 log.info(f"File stabilized at {current_size} bytes")
                 return True
         else:
@@ -275,6 +314,11 @@ def render_single_track(template_path, wav_path, target_bpm, output_wav_path,
 
     # Step 5: Run export
     log.info("Step 5: Running export automation")
+    if not ensure_fresh_output_path(output_wav_path):
+        if close_after:
+            quit_ableton()
+        return False
+    export_start_time = time.time()
     if not run_export(output_dir, output_filename):
         if close_after:
             quit_ableton()
@@ -282,7 +326,7 @@ def render_single_track(template_path, wav_path, target_bpm, output_wav_path,
 
     # Step 6: Wait for output
     log.info("Step 6: Waiting for output file")
-    if not wait_for_file(output_wav_path):
+    if not wait_for_file(output_wav_path, min_mtime=export_start_time):
         if close_after:
             quit_ableton()
         return False

@@ -21,10 +21,11 @@ on run argv
 	set outputFilename to item 2 of argv
 
 	-- Configurable delays (seconds) -- increase for slower machines
-	set dialogOpenDelay to 3
-	set goToFolderDelay to 1.5
-	set navigationDelay to 1.5
-	set typeDelay to 0.5
+	-- These are generous to handle large projects under load
+	set dialogOpenDelay to 5
+	set goToFolderDelay to 2
+	set navigationDelay to 2
+	set typeDelay to 1
 
 	tell application "Ableton Live 11 Suite"
 		activate

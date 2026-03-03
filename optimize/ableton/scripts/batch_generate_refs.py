@@ -87,6 +87,15 @@ def generate_manifest(catalog, output_dir):
     return manifest
 
 
+def write_manifest(manifest, manifest_path):
+    """Write manifest JSON, creating parent directories as needed."""
+    abs_manifest = os.path.abspath(manifest_path)
+    os.makedirs(os.path.dirname(abs_manifest), exist_ok=True)
+    with open(abs_manifest, "w") as f:
+        json.dump(manifest, f, indent=2)
+    return abs_manifest
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Batch generate Ableton Complex Pro references"
@@ -160,12 +169,20 @@ def main():
             })
 
     if not queue:
+        if args.manifest_out:
+            manifest = generate_manifest(catalog, args.output_dir)
+            manifest_path = write_manifest(manifest, args.manifest_out)
+            log.info(f"Manifest written: {manifest_path}")
         log.info("Nothing to render (all files exist or no valid sources)")
         sys.exit(0)
 
     log.info(f"Render queue: {len(queue)} tracks")
 
     if args.dry_run:
+        if args.manifest_out:
+            manifest = generate_manifest(catalog, args.output_dir)
+            manifest_path = write_manifest(manifest, args.manifest_out)
+            log.info(f"Manifest written: {manifest_path}")
         for item in queue:
             print(f"  {item['filename']}: {item['source']} -> "
                   f"{item['target_bpm']} BPM (ratio={item['ratio']})")
@@ -213,9 +230,8 @@ def main():
     # Write manifest if requested
     if args.manifest_out:
         manifest = generate_manifest(catalog, args.output_dir)
-        with open(args.manifest_out, "w") as f:
-            json.dump(manifest, f, indent=2)
-        log.info(f"Manifest written: {args.manifest_out}")
+        manifest_path = write_manifest(manifest, args.manifest_out)
+        log.info(f"Manifest written: {manifest_path}")
 
     sys.exit(0 if not results["failed"] else 1)
 

@@ -88,6 +88,36 @@ def set_warping_enabled_raw(xml, enabled=True):
     return xml
 
 
+def set_warp_markers_raw(xml, source_bpm, wav_duration):
+    """Rewrite warp markers to reflect the source file's actual BPM.
+
+    Ableton uses warp markers to define the tempo mapping between real time
+    (SecTime) and musical time (BeatTime). Two markers are needed:
+      - Marker 0 at the origin (0, 0)
+      - Marker 1 at the end of the file
+    """
+    total_beats = wav_duration * source_bpm / 60.0
+
+    new_markers = (
+        '<WarpMarkers>\n'
+        '\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t'
+        '<WarpMarker Id="0" SecTime="0" BeatTime="0" />\n'
+        '\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t'
+        f'<WarpMarker Id="1" SecTime="{wav_duration}" '
+        f'BeatTime="{total_beats}" />\n'
+        '\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t'
+        '</WarpMarkers>'
+    )
+
+    xml = re.sub(
+        r'<WarpMarkers>.*?</WarpMarkers>',
+        new_markers,
+        xml,
+        flags=re.DOTALL,
+    )
+    return xml
+
+
 def disable_clip_loop_raw(xml):
     """Disable clip looping (inside Loop blocks), preserve Transport LoopOn."""
     # Only disable LoopOn inside <Loop>...</Loop> blocks (clip loops),
@@ -200,10 +230,11 @@ def create_project(template_path, wav_path, target_bpm, output_als_path,
     xml = disable_clip_loop_raw(xml)
     xml = insert_audio_clip_raw(xml, wav_path)
 
-    # Set clip length and arrangement loop to cover the full audio
+    # Set clip length, warp markers, and arrangement loop for full audio
     if source_bpm:
         wav_duration = get_wav_duration(wav_path)
         clip_beats = wav_duration * source_bpm / 60.0
+        xml = set_warp_markers_raw(xml, source_bpm, wav_duration)
         xml = set_clip_length_raw(xml, clip_beats)
         xml = set_arrangement_loop_raw(xml, 0, clip_beats)
 
@@ -277,7 +308,8 @@ def main():
         print(f"Decompressed: {args.als} -> {args.xml}")
 
     elif args.command == "compress":
-        xml = read_als_raw(args.xml.replace(".xml", ".als"))
+        with open(args.xml, "r", encoding="utf-8") as f:
+            xml = f.read()
         write_als_raw(xml, args.als)
         print(f"Compressed: {args.xml} -> {args.als}")
 

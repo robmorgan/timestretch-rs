@@ -11,6 +11,10 @@ try:
 except ImportError:
     plt = None
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OPTIMIZE_DIR = os.path.dirname(SCRIPT_DIR)
+REPO_ROOT = os.path.dirname(OPTIMIZE_DIR)
+
 def calculate_spectral_convergence(ref, test):
     """
     Measures how close the spectrogram magnitudes are.
@@ -383,12 +387,14 @@ def main():
 
     if args.batch:
         results = []
-        repo_root = os.getcwd()
+        repo_root = REPO_ROOT
 
         if args.ref_source == "ableton":
             # Ableton reference mode: score library outputs against Ableton refs
-            ableton_manifest_path = args.ableton_manifest or os.path.join(
-                repo_root, "optimize", "ableton", "ableton_manifest.json")
+            ableton_manifest_path = os.path.abspath(
+                args.ableton_manifest or os.path.join(
+                    repo_root, "optimize", "ableton", "ableton_manifest.json")
+            )
             if not os.path.exists(ableton_manifest_path):
                 print(f"Error: Ableton manifest not found: {ableton_manifest_path}", file=sys.stderr)
                 sys.exit(1)
@@ -396,8 +402,9 @@ def main():
             with open(ableton_manifest_path, 'r') as f:
                 ableton_manifest = json.load(f)
 
-            ableton_ref_dir = os.path.join(repo_root, "optimize", "ableton", "refs", "ableton")
-            library_ref_dir = os.path.join(repo_root, "optimize", "ableton", "refs", "library")
+            manifest_dir = os.path.dirname(ableton_manifest_path)
+            ableton_ref_dir = os.path.join(manifest_dir, "refs", "ableton")
+            library_ref_dir = os.path.join(manifest_dir, "refs", "library")
 
             for entry in ableton_manifest:
                 is_stereo = entry.get('stereo', False)
@@ -405,8 +412,13 @@ def main():
                 track_id = entry['track_id']
                 target_bpm = entry['target_bpm']
 
-                ref_path = entry.get('ref_path',
-                    os.path.join(ableton_ref_dir, f"{track_id}_{target_bpm}bpm.wav"))
+                ref_path = entry.get("ref_path")
+                if ref_path:
+                    if not os.path.isabs(ref_path):
+                        ref_path = os.path.normpath(os.path.join(manifest_dir, ref_path))
+                else:
+                    ref_path = os.path.join(
+                        ableton_ref_dir, f"{track_id}_{target_bpm}bpm.wav")
 
                 # Score batch output
                 batch_test = os.path.join(library_ref_dir, f"{track_id}_{target_bpm}bpm_batch.wav")
@@ -450,8 +462,8 @@ def main():
                 ratio = item['ratio']
                 is_stereo = item.get('stereo', False)
                 source_base = os.path.basename(item['source']).replace('.wav', '')
-                ref_path = os.path.join(repo_root, "optimize/references", f"{source_base}_ref_{ratio}.wav")
-                test_path = os.path.join(repo_root, "optimize/outputs", f"{source_base}_test_{ratio}.wav")
+                ref_path = os.path.join(repo_root, "optimize", "references", f"{source_base}_ref_{ratio}.wav")
+                test_path = os.path.join(repo_root, "optimize", "outputs", f"{source_base}_test_{ratio}.wav")
 
                 if not os.path.exists(ref_path) or not os.path.exists(test_path):
                     print(f"Warning: Skipping {item['description']}, missing files.")
@@ -469,8 +481,8 @@ def main():
                 ratio = item['ratio']
                 is_stereo = item.get('stereo', False)
                 source_base = os.path.basename(item['source']).replace('.wav', '')
-                ref_path = os.path.join(repo_root, "optimize/references", f"{source_base}_ref_{ratio}.wav")
-                test_path = os.path.join(repo_root, "optimize/outputs", f"{source_base}_stream_{ratio}.wav")
+                ref_path = os.path.join(repo_root, "optimize", "references", f"{source_base}_ref_{ratio}.wav")
+                test_path = os.path.join(repo_root, "optimize", "outputs", f"{source_base}_stream_{ratio}.wav")
 
                 if not os.path.exists(ref_path) or not os.path.exists(test_path):
                     print(f"Warning: Skipping [streaming] {item['description']}, missing files.")
@@ -524,15 +536,14 @@ def main():
         with open(args.manifest, 'r') as f:
             manifest = json.load(f)
 
-        repo_root = os.getcwd()
         results = []
 
         for item in manifest:
             ratio = item['ratio']
             is_stereo = item.get('stereo', False)
             source_base = os.path.basename(item['source']).replace('.wav', '')
-            hq_path = os.path.join(repo_root, "optimize/references", f"{source_base}_ref_{ratio}.wav")
-            med_path = os.path.join(repo_root, "optimize/references", f"{source_base}_ref_{ratio}_med.wav")
+            hq_path = os.path.join(REPO_ROOT, "optimize", "references", f"{source_base}_ref_{ratio}.wav")
+            med_path = os.path.join(REPO_ROOT, "optimize", "references", f"{source_base}_ref_{ratio}_med.wav")
 
             if not os.path.exists(hq_path) or not os.path.exists(med_path):
                 continue
