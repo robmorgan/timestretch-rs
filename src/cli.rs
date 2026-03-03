@@ -265,6 +265,10 @@ fn main() {
     let mut output = output;
     for s in output.data.iter_mut() {
         *s = (*s * 32768.0).round() / 32768.0;
+        // Clamp to [-1, 1] so float WAV output matches PCM-16 range used by
+        // reference encoders (rubberband).  Without this, overlap-add peaks
+        // that exceed full-scale inflate spectral energy vs the reference.
+        *s = s.clamp(-1.0, 1.0);
     }
 
     // Write output

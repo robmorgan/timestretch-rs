@@ -7,6 +7,7 @@ use crate::core::ring_buffer::RingBuffer;
 use crate::core::types::{QualityMode, StretchParams};
 use crate::core::window::{generate_window, WindowType};
 use crate::error::StretchError;
+use crate::analysis::transient::{detect_transients_with_options, TransientDetectionOptions};
 use crate::stretch::hybrid::HybridStretcher;
 use crate::stretch::phase_vocoder::PhaseVocoder;
 use crate::stretch::stereo::StereoMode;
@@ -1145,6 +1146,8 @@ impl StreamProcessor {
         let mut min_output_len = usize::MAX;
         self.hybrid_state.pre_trim_lens.fill(0);
         self.hybrid_state.rendered_lens.fill(0);
+
+        // Phase 1: Snapshot all channels from rolling buffers.
         for ch in 0..num_channels {
             let len = self.hybrid_state.rolling_inputs[ch].len();
             self.hybrid_state.rolling_scratch[ch].resize(len, 0.0);
@@ -1155,9 +1158,51 @@ impl StreamProcessor {
                     "failed to snapshot hybrid rolling ring",
                 ));
             }
+        }
 
-            let rendered =
-                self.hybrid_state.stretchers[ch].process(&self.hybrid_state.rolling_scratch[ch])?;
+        // Phase 2: For stereo M/S, detect shared transients from mid channel
+        // so both channels use identical segmentation. This prevents phase
+        // misalignment when decoded back to L/R, matching the batch path's
+        // shared onset detection in stretch_mid_side().
+        let shared_onsets: Option<(Vec<usize>, Vec<f32>)> =
+            if num_channels == 2
+                && self.params.stereo_mode == StereoMode::MidSide
+                && !self.hybrid_state.rolling_scratch[0].is_empty()
+            {
+                let mid = &self.hybrid_state.rolling_scratch[0];
+                let fft = self.params.fft_size.min(2048);
+                let hop = self.params.hop_size.min(512);
+                let map = detect_transients_with_options(
+                    mid,
+                    self.params.sample_rate,
+                    fft,
+                    hop,
+                    self.params.transient_sensitivity,
+                    TransientDetectionOptions::from_stretch_params(&self.params),
+                );
+                let onsets = map.onsets.clone();
+                let strengths = if map.strengths.len() == onsets.len() {
+                    map.strengths.clone()
+                } else {
+                    vec![1.0; onsets.len()]
+                };
+                Some((onsets, strengths))
+            } else {
+                None
+            };
+
+        // Phase 3: Process each channel and extract deltas.
+        for ch in 0..num_channels {
+            let rendered = if let Some((ref onsets, ref strengths)) = shared_onsets {
+                self.hybrid_state.stretchers[ch].process_with_onsets(
+                    &self.hybrid_state.rolling_scratch[ch],
+                    onsets,
+                    strengths,
+                )?
+            } else {
+                self.hybrid_state.stretchers[ch]
+                    .process(&self.hybrid_state.rolling_scratch[ch])?
+            };
             let skip = self.hybrid_state.tail_output_lens[ch].min(rendered.len());
             let delta_len = rendered.len().saturating_sub(skip);
 
@@ -1169,7 +1214,7 @@ impl StreamProcessor {
                 });
             }
 
-            self.hybrid_state.pre_trim_lens[ch] = len;
+            self.hybrid_state.pre_trim_lens[ch] = self.hybrid_state.rolling_scratch[ch].len();
             self.hybrid_state.rendered_lens[ch] = rendered.len();
 
             self.channel_output_buffers[ch].clear();
