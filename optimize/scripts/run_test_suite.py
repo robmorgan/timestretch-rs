@@ -35,7 +35,7 @@ def main():
 
         print(f"Processing {item['description']} (ratio: {ratio})...")
 
-        cmd = [binary, source, output, "--ratio", str(ratio)]
+        cmd = [binary, source, output, "--ratio", str(ratio), "--no-normalize"]
         try:
             subprocess.run(cmd, check=True, capture_output=True)
         except subprocess.CalledProcessError as e:
@@ -55,7 +55,7 @@ def main():
 
         print(f"Processing [streaming] {item['description']} (ratio: {ratio})...")
 
-        cmd = [binary, source, output, "--ratio", str(ratio), "--streaming"]
+        cmd = [binary, source, output, "--ratio", str(ratio), "--streaming", "--no-normalize"]
         try:
             subprocess.run(cmd, check=True, capture_output=True)
         except subprocess.CalledProcessError as e:

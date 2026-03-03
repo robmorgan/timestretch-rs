@@ -1,0 +1,247 @@
+{
+  "tracks": [
+    {
+      "id": "music-sounds-better-with-you",
+      "description": "Music Sounds Better With You (Original Mix), 124 BPM, stereo",
+      "bpm": 124.0,
+      "references": [
+        {
+          "software": "Ableton Live 11",
+          "algorithm": "Complex Pro",
+          "target_bpm": 115.0,
+          "ratio": 1.0782608695652174,
+          "presets": [
+            {
+              "preset": "DjBeatmatch",
+              "length_diff_samples": 207078,
+              "length_diff_pct": 7.82607709750567,
+              "rms_diff_db": -1.8793093811642798,
+              "spectral_similarity": 0.778415450491779,
+              "perceptual_spectral_similarity": 0.7702389478714219,
+              "band_similarity": {
+                "sub_bass": 0.8760650999562273,
+                "low": 0.8777208853054267,
+                "mid": 0.7736454612747776,
+                "high": 0.6495153405121806
+              },
+              "bark_band_similarity": {
+                "sub_bass": 0.8817102547905382,
+                "bass": 0.9552848552850539,
+                "low_mid": 0.8811599005559613,
+                "mid": 0.8350807346080608,
+                "upper_mid": 0.7770271809978206,
+                "presence": 0.7759384043680114,
+                "brilliance": 0.775096480013662,
+                "air": 0.7327302221722369,
+                "overall": 0.8267535040989181
+              },
+              "transient_match_rate": 0.0,
+              "transient_matched": 0,
+              "transient_total": 25,
+              "onset_timing": {
+                "mean_error_ms": 0.0,
+                "median_error_ms": 0.0,
+                "std_dev_ms": 0.0,
+                "max_error_ms": 0.0,
+                "within_5ms": 0,
+                "within_10ms": 0,
+                "within_20ms": 0,
+                "total_onsets": 0
+              },
+              "cross_correlation_peak": 0.10736354778859851,
+              "cross_correlation_offset": -180556,
+              "lufs_difference": -1.8793093811642834,
+              "spectral_flux_similarity": 0.639739327751809,
+              "overall_grade": "D"
+            },
+            {
+              "preset": "HouseLoop",
+              "length_diff_samples": 207078,
+              "length_diff_pct": 7.82607709750567,
+              "rms_diff_db": -1.672992221884729,
+              "spectral_similarity": 0.8305995753788403,
+              "perceptual_spectral_similarity": 0.830193075701619,
+              "band_similarity": {
+                "sub_bass": 0.8807380185946924,
+                "low": 0.8978455096445462,
+                "mid": 0.8351762345270909,
+                "high": 0.6691983611232838
+              },
+              "bark_band_similarity": {
+                "sub_bass": 0.8879123483358197,
+                "bass": 0.9601952737752708,
+                "low_mid": 0.8958835816118681,
+                "mid": 0.8698380012941552,
+                "upper_mid": 0.8316396118886829,
+                "presence": 0.8184473624868148,
+                "brilliance": 0.8011449162807405,
+                "air": 0.7436115332055825,
+                "overall": 0.8510840786098668
+              },
+              "transient_match_rate": 0.0,
+              "transient_matched": 0,
+              "transient_total": 25,
+              "onset_timing": {
+                "mean_error_ms": 0.0,
+                "median_error_ms": 0.0,
+                "std_dev_ms": 0.0,
+                "max_error_ms": 0.0,
+                "within_5ms": 0,
+                "within_10ms": 0,
+                "within_20ms": 0,
+                "total_onsets": 0
+              },
+              "cross_correlation_peak": 0.13766945016806664,
+              "cross_correlation_offset": 1434,
+              "lufs_difference": -1.6729922218847335,
+              "spectral_flux_similarity": 0.7756683282018848,
+              "overall_grade": "C"
+            },
+            {
+              "preset": "Halftime",
+              "length_diff_samples": 207078,
+              "length_diff_pct": 7.82607709750567,
+              "rms_diff_db": -1.6469479732074266,
+              "spectral_similarity": 0.8532455942257271,
+              "perceptual_spectral_similarity": 0.8648821187465133,
+              "band_similarity": {
+                "sub_bass": 0.8954062711405992,
+                "low": 0.9221990499030199,
+                "mid": 0.8778719279135466,
+                "high": 0.6750655695515827
+              },
+              "bark_band_similarity": {
+                "sub_bass": 0.8985269383249882,
+                "bass": 0.9553697661380063,
+                "low_mid": 0.9205570134975459,
+                "mid": 0.9040528019817315,
+                "upper_mid": 0.8693460900239209,
+                "presence": 0.8422737798383634,
+                "brilliance": 0.8237056571133387,
+                "air": 0.749018824782338,
+                "overall": 0.870356358962529
+              },
+              "transient_match_rate": 0.12,
+              "transient_matched": 3,
+              "transient_total": 25,
+              "onset_timing": {
+                "mean_error_ms": 1044.4335600907027,
+                "median_error_ms": 998.4580498866213,
+                "std_dev_ms": 1275.6971234548091,
+                "max_error_ms": 4167.981859410431,
+                "within_5ms": 3,
+                "within_10ms": 3,
+                "within_20ms": 10,
+                "total_onsets": 25
+              },
+              "cross_correlation_peak": 0.13730644356437688,
+              "cross_correlation_offset": 2376,
+              "lufs_difference": -1.646947973207432,
+              "spectral_flux_similarity": 0.8331925961072929,
+              "overall_grade": "F"
+            },
+            {
+              "preset": "Ambient",
+              "length_diff_samples": 207078,
+              "length_diff_pct": 7.82607709750567,
+              "rms_diff_db": -2.0595451860409546,
+              "spectral_similarity": 0.7812408455499619,
+              "perceptual_spectral_similarity": 0.7730300882235591,
+              "band_similarity": {
+                "sub_bass": 0.8332650319268385,
+                "low": 0.8774585416079852,
+                "mid": 0.7768973302436005,
+                "high": 0.64570753528347
+              },
+              "bark_band_similarity": {
+                "sub_bass": 0.8246295053124935,
+                "bass": 0.9572891197889944,
+                "low_mid": 0.8824166007592967,
+                "mid": 0.8337532511012341,
+                "upper_mid": 0.7948243365474973,
+                "presence": 0.7735992744961296,
+                "brilliance": 0.7831920993291052,
+                "air": 0.7355050055687046,
+                "overall": 0.823151149112932
+              },
+              "transient_match_rate": 0.0,
+              "transient_matched": 0,
+              "transient_total": 25,
+              "onset_timing": {
+                "mean_error_ms": 0.0,
+                "median_error_ms": 0.0,
+                "std_dev_ms": 0.0,
+                "max_error_ms": 0.0,
+                "within_5ms": 0,
+                "within_10ms": 0,
+                "within_20ms": 0,
+                "total_onsets": 0
+              },
+              "cross_correlation_peak": 0.12355105343279896,
+              "cross_correlation_offset": 187796,
+              "lufs_difference": -2.0595451860409604,
+              "spectral_flux_similarity": 0.744762102885026,
+              "overall_grade": "D"
+            },
+            {
+              "preset": "VocalChop",
+              "length_diff_samples": 207078,
+              "length_diff_pct": 7.82607709750567,
+              "rms_diff_db": -1.6109168860405418,
+              "spectral_similarity": 0.8408098322375857,
+              "perceptual_spectral_similarity": 0.8479885361989485,
+              "band_similarity": {
+                "sub_bass": 0.8890640867920296,
+                "low": 0.9093278628614182,
+                "mid": 0.8607630472042104,
+                "high": 0.6728268309391533
+              },
+              "bark_band_similarity": {
+                "sub_bass": 0.8969933409738385,
+                "bass": 0.9564382035439198,
+                "low_mid": 0.9078425832285368,
+                "mid": 0.8880407287622106,
+                "upper_mid": 0.8560970769859612,
+                "presence": 0.8330341569214122,
+                "brilliance": 0.8155782595792076,
+                "air": 0.7475019671443923,
+                "overall": 0.862690789642435
+              },
+              "transient_match_rate": 0.12,
+              "transient_matched": 3,
+              "transient_total": 25,
+              "onset_timing": {
+                "mean_error_ms": 1675.087528344671,
+                "median_error_ms": 1056.5079365079364,
+                "std_dev_ms": 1789.2493706854846,
+                "max_error_ms": 6292.607709750567,
+                "within_5ms": 3,
+                "within_10ms": 3,
+                "within_20ms": 6,
+                "total_onsets": 25
+              },
+              "cross_correlation_peak": 0.1837165893365173,
+              "cross_correlation_offset": 1214,
+              "lufs_difference": -1.6109168860405454,
+              "spectral_flux_similarity": 0.8170753531914051,
+              "overall_grade": "F"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "tracks_tested": 1,
+    "references_tested": 1,
+    "skipped": 0,
+    "average_spectral_similarity": 0.8168622595767788,
+    "best_preset_per_track": [
+      {
+        "track_id": "music-sounds-better-with-you",
+        "preset": "Halftime",
+        "spectral_similarity": 0.8532455942257271
+      }
+    ]
+  }
+}
