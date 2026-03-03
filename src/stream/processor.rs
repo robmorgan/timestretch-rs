@@ -143,6 +143,14 @@ impl HybridStreamingState {
         let num_channels = params.channels.count();
         let mut per_channel = params.clone();
         per_channel.stretch_ratio = ratio;
+        // Disable elastic timing in streaming: the re-rendering approach
+        // snapshots a rolling window and extracts a delta.  Elastic timing
+        // redistributes stretch ratios across beat-anchored segments, so
+        // shifting the rolling window changes the per-segment ratios for
+        // ALL segments, not just the new ones.  This makes the skip
+        // estimate (which assumes uniform stretch) unreliable, causing
+        // catastrophic spectral degradation for far-from-unity ratios.
+        per_channel.elastic_timing = false;
         // Keep a generous tail so that transient detection and HPSS have
         // enough context to produce results consistent with full-batch
         // processing.  Fifty-six FFT windows (~5.2 s at 4096/44100) gives
@@ -1129,13 +1137,13 @@ impl StreamProcessor {
         // onsets.  Batching input to at least fft_size new samples per
         // render makes each delta large enough for the crossfade to be a
         // minor fraction, eliminating these artifacts.
-        // Use 4× the FFT size for ratios far from unity (|r-1| > 0.1)
-        // to increase the delta-to-crossfade ratio.  With 1× threshold,
-        // crossfades affect 74-87% of each delta; at 4× this drops to
-        // ~19-25%, dramatically reducing spectral artifacts from
-        // blending divergent renderings in both expansion and compression.
+        // Use 2× the FFT size for ratios far from unity (|r-1| > 0.1).
+        // Higher thresholds reduce crossfade fraction but accumulate more
+        // context change between renders, causing the skip estimate to
+        // drift (HPSS segmentation shifts as the rolling window moves).
+        // 2× balances crossfade fraction (~35%) against skip accuracy.
         let accum_threshold = if (self.hybrid_state.last_ratio - 1.0).abs() > 0.1 {
-            self.params.fft_size * 4
+            self.params.fft_size * 2
         } else {
             self.params.fft_size
         };
