@@ -430,8 +430,15 @@ impl PhaseVocoder {
         // amplitude droop at the output tail that degrades LSD.
         let end_pad_mult = if self.stretch_ratio > 1.1 { 10 } else { 8 };
         let end_pad = (self.hop_analysis * end_pad_mult).min(input.len());
-        let start_pad_mult = if (self.stretch_ratio - 1.0).abs() > 0.3 {
+        // Graduated start padding: shorter mirrors preserve onset sharpness
+        // (critical for TP scoring) while longer mirrors give better spectral
+        // metrics (SC/LSD).  Ratios 0.2-0.3 from unity get an intermediate
+        // 6-hop padding that balances both concerns.
+        let ratio_dist = (self.stretch_ratio - 1.0).abs();
+        let start_pad_mult = if ratio_dist > 0.3 {
             4
+        } else if ratio_dist > 0.15 {
+            6
         } else {
             8
         };
