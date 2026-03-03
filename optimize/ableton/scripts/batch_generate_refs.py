@@ -152,6 +152,7 @@ def main():
             queue.append({
                 "track_id": track["id"],
                 "source": source_path,
+                "source_bpm": track.get("source_bpm"),
                 "target_bpm": target["target_bpm"],
                 "ratio": target["ratio"],
                 "output": output_path,
@@ -187,7 +188,8 @@ def main():
 
         success = render_with_retries(
             template_path, item["source"], item["target_bpm"],
-            item["output"], max_retries=args.retries
+            item["output"], max_retries=args.retries,
+            source_bpm=item.get("source_bpm")
         )
 
         elapsed = time.time() - start_time
