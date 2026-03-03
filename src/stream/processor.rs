@@ -9,6 +9,7 @@ use crate::core::window::{generate_window, WindowType};
 use crate::error::StretchError;
 use crate::stretch::hybrid::HybridStretcher;
 use crate::stretch::phase_vocoder::PhaseVocoder;
+use crate::stretch::stereo::StereoMode;
 
 /// Threshold below which ratio differences are considered negligible.
 const RATIO_SNAP_THRESHOLD: f64 = 0.0001;
@@ -654,6 +655,7 @@ impl StreamProcessor {
         self.input_ring.clear();
         if self.use_hybrid {
             // Emit any held-back cross-fade tails before resetting state.
+            // These tails are in M/S space and need decoding to L/R.
             let mut held_min_len = usize::MAX;
             for ch in 0..num_channels {
                 let held = &self.hybrid_state.crossfade_held[ch];
@@ -664,6 +666,7 @@ impl StreamProcessor {
                 }
             }
             if held_min_len != usize::MAX && held_min_len > 0 {
+                self.decode_output_mid_side(num_channels, held_min_len);
                 self.emit_channel_output_to_pending(held_min_len, num_channels)?;
             }
 
@@ -761,6 +764,7 @@ impl StreamProcessor {
         }
 
         self.collect_channel_inputs(total_frames, num_channels)?;
+        self.encode_input_mid_side(num_channels);
 
         if self.use_hybrid && !self.hybrid_realtime_strict {
             let min_output_len =
@@ -769,6 +773,7 @@ impl StreamProcessor {
             self.input_ring.discard(consumed);
 
             if min_output_len > 0 {
+                self.decode_output_mid_side(num_channels, min_output_len);
                 self.emit_channel_output_to_pending(min_output_len, num_channels)?;
             }
             return Ok(());
@@ -783,6 +788,7 @@ impl StreamProcessor {
         self.consume_processed_input(total_frames, num_channels);
 
         if min_output_len > 0 {
+            self.decode_output_mid_side(num_channels, min_output_len);
             self.emit_channel_output_to_pending(min_output_len, num_channels)?;
         }
 
@@ -829,6 +835,43 @@ impl StreamProcessor {
         }
 
         Ok(())
+    }
+
+    /// Converts `channel_input_buffers` from L/R to Mid/Side in-place.
+    ///
+    /// Only applies when `num_channels == 2` and `stereo_mode == MidSide`.
+    /// After this call, `channel_input_buffers[0]` holds Mid and `[1]` holds Side.
+    fn encode_input_mid_side(&mut self, num_channels: usize) {
+        if num_channels != 2 || self.params.stereo_mode != StereoMode::MidSide {
+            return;
+        }
+        let len = self.channel_input_buffers[0]
+            .len()
+            .min(self.channel_input_buffers[1].len());
+        for i in 0..len {
+            let l = self.channel_input_buffers[0][i];
+            let r = self.channel_input_buffers[1][i];
+            self.channel_input_buffers[0][i] = (l + r) * 0.5;
+            self.channel_input_buffers[1][i] = (l - r) * 0.5;
+        }
+    }
+
+    /// Converts `channel_output_buffers` from Mid/Side back to L/R in-place.
+    ///
+    /// Only applies when `num_channels == 2` and `stereo_mode == MidSide`.
+    fn decode_output_mid_side(&mut self, num_channels: usize, output_len: usize) {
+        if num_channels != 2 || self.params.stereo_mode != StereoMode::MidSide {
+            return;
+        }
+        let len = output_len
+            .min(self.channel_output_buffers[0].len())
+            .min(self.channel_output_buffers[1].len());
+        for i in 0..len {
+            let m = self.channel_output_buffers[0][i];
+            let s = self.channel_output_buffers[1][i];
+            self.channel_output_buffers[0][i] = m + s;
+            self.channel_output_buffers[1][i] = m - s;
+        }
     }
 
     fn process_channels(&mut self, num_channels: usize) -> Result<usize, StretchError> {
@@ -1158,9 +1201,7 @@ impl StreamProcessor {
                 // crossfade would smear the transient's attack, hurting
                 // TP.  Shorten the crossfade to preserve sharpness while
                 // still preventing clicks.
-                let actual_xfade = if n >= 128
-                    && (self.hybrid_state.last_ratio - 1.0).abs() > 0.1
-                {
+                let actual_xfade = if n >= 128 && (self.hybrid_state.last_ratio - 1.0).abs() > 0.1 {
                     let check = n.min(256);
                     let (mut dot, mut he, mut oe) = (0.0f64, 0.0f64, 0.0f64);
                     for i in 0..check {
@@ -1264,6 +1305,7 @@ impl StreamProcessor {
             return Ok(());
         }
 
+        self.decode_output_mid_side(num_channels, min_output_len);
         self.interleave_to_pending(min_output_len, num_channels)
     }
 

@@ -12,11 +12,16 @@ rubberband_quality = "-3 -F --pitch-hq"  # R3 + fine mode
 soundstretch_opts = ""
 
 [scoring]
-# weights for the final score
+# Weights for the final score. All weights are normalized to sum to 1.0.
+# Mono cases use SC+LSD+MFCC+TP only.
+# Stereo cases use all seven metrics, re-normalized so total = 1.0.
 spectral_convergence = 0.30
 log_spectral_distance = 0.25
 mfcc_distance = 0.20
 transient_preservation = 0.25
+stereo_width = 0.10
+interchannel_correlation = 0.10
+panning_consistency = 0.05
 
 [agent.claude_code]
 max_turns = 60

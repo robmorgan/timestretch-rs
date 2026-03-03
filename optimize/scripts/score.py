@@ -95,54 +95,202 @@ def calculate_transient_preservation(ref, test, sr, tolerance_ms=15):
             
     return matched / len(ref_times)
 
-def score_pair(ref_path, test_path, weights):
-    ref, sr_ref = librosa.load(ref_path, sr=None)
-    test, sr_test = librosa.load(test_path, sr=sr_ref) # Resample test to match ref if needed
-    
+def calculate_stereo_width_preservation(ref_L, ref_R, test_L, test_R):
+    """
+    Measures how well the mid/side energy ratio is preserved.
+    Compares the side-to-mid energy ratio between reference and test.
+    Score 0-1, higher is better (1 = identical stereo width).
+    """
+    eps = 1e-10
+    ref_mid = (ref_L + ref_R) / 2.0
+    ref_side = (ref_L - ref_R) / 2.0
+    test_mid = (test_L + test_R) / 2.0
+    test_side = (test_L - test_R) / 2.0
+
+    ref_mid_e = np.sum(ref_mid ** 2) + eps
+    ref_side_e = np.sum(ref_side ** 2) + eps
+    test_mid_e = np.sum(test_mid ** 2) + eps
+    test_side_e = np.sum(test_side ** 2) + eps
+
+    ref_ratio = ref_side_e / ref_mid_e
+    test_ratio = test_side_e / test_mid_e
+
+    # Ratio of ratios, capped. 1.0 = perfect preservation.
+    if ref_ratio > test_ratio:
+        preservation = test_ratio / ref_ratio
+    else:
+        preservation = ref_ratio / test_ratio
+
+    return float(np.clip(preservation, 0, 1))
+
+
+def calculate_interchannel_correlation_preservation(ref_L, ref_R, test_L, test_R):
+    """
+    Measures how well the L-R phase/correlation relationship is preserved.
+    Computes the normalized cross-correlation between L and R for both
+    reference and test, then compares them.
+    Score 0-1, higher is better.
+    """
+    eps = 1e-10
+
+    def icc(L, R):
+        norm_L = np.linalg.norm(L)
+        norm_R = np.linalg.norm(R)
+        if norm_L < eps or norm_R < eps:
+            return 0.0
+        return float(np.dot(L, R) / (norm_L * norm_R))
+
+    ref_icc = icc(ref_L, ref_R)
+    test_icc = icc(test_L, test_R)
+
+    # Both ICC values are in [-1, 1]. Compare how close they are.
+    # Max possible difference is 2.0.
+    diff = abs(ref_icc - test_icc)
+    return float(1.0 - diff / 2.0)
+
+
+def calculate_panning_consistency(ref_L, ref_R, test_L, test_R, sr, hop_length=512):
+    """
+    Measures frame-by-frame panning preservation.
+    Computes per-frame L-R energy balance for ref and test, then
+    measures correlation between the two balance curves.
+    Score 0-1, higher is better.
+    """
+    eps = 1e-10
+    frame_size = hop_length * 2
+
+    def pan_curve(L, R):
+        n_frames = len(L) // frame_size
+        if n_frames == 0:
+            return np.array([0.0])
+        balance = np.zeros(n_frames)
+        for i in range(n_frames):
+            start = i * frame_size
+            end = start + frame_size
+            l_e = np.sum(L[start:end] ** 2) + eps
+            r_e = np.sum(R[start:end] ** 2) + eps
+            balance[i] = (l_e - r_e) / (l_e + r_e)
+        return balance
+
+    ref_pan = pan_curve(ref_L, ref_R)
+    test_pan = pan_curve(test_L, test_R)
+
+    # Align lengths
+    min_len = min(len(ref_pan), len(test_pan))
+    if min_len == 0:
+        return 1.0
+    ref_pan = ref_pan[:min_len]
+    test_pan = test_pan[:min_len]
+
+    # Correlation of panning curves
+    ref_norm = np.linalg.norm(ref_pan)
+    test_norm = np.linalg.norm(test_pan)
+    if ref_norm < eps or test_norm < eps:
+        # Both nearly silent or center-panned — consider it a match
+        return 1.0 if (ref_norm < eps and test_norm < eps) else 0.5
+
+    correlation = np.dot(ref_pan, test_pan) / (ref_norm * test_norm)
+    # Map from [-1, 1] to [0, 1]
+    return float(np.clip((correlation + 1.0) / 2.0, 0, 1))
+
+
+def score_pair(ref_path, test_path, weights, stereo=False):
+    # Load mono-downmixed for standard metrics
+    ref, sr_ref = librosa.load(ref_path, sr=None, mono=True)
+    test, sr_test = librosa.load(test_path, sr=sr_ref, mono=True)
+
     # Trim to match
     min_len = min(len(ref), len(test))
     ref = ref[:min_len]
     test = test[:min_len]
-    
+
     sc = calculate_spectral_convergence(ref, test)
     lsd = calculate_log_spectral_distance(ref, test)
     mfcc_dist = calculate_mfcc_distance(ref, test, sr_ref)
     tp = calculate_transient_preservation(ref, test, sr_ref)
-    
+
     # Map raw metrics to 0-100 scores
-    # SC: 0 is perfect, >1 is bad. 1 - SC is roughly 0-1.
     sc_score = max(0, 100 * (1.0 - sc))
-    # LSD: 0 is perfect. Use exponential decay so pathological values
-    # (e.g. silence-to-transient with 128dB) still get a non-zero score
-    # instead of clamping to 0 at 15dB. Gives ~60 at 5dB, ~37 at 10dB,
-    # ~22 at 15dB, ~5 at 30dB, ~0 at 50dB+.
     lsd_score = 100 * np.exp(-lsd / 10.0)
-    # MFCC dist: 0 is perfect, 1 is total difference.
     mfcc_score = max(0, 100 * (1.0 - mfcc_dist))
-    # TP: 1.0 is perfect.
     tp_score = 100 * tp
-    
+
+    metrics = {
+        "spectral_convergence": sc_score,
+        "log_spectral_distance": lsd_score,
+        "mfcc_distance": mfcc_score,
+        "transient_preservation": tp_score
+    }
+    raw = {
+        "sc": float(sc),
+        "lsd": float(lsd),
+        "mfcc_dist": float(mfcc_dist),
+        "tp": float(tp)
+    }
+
+    # Stereo-specific metrics
+    if stereo:
+        ref_stereo, _ = librosa.load(ref_path, sr=sr_ref, mono=False)
+        test_stereo, _ = librosa.load(test_path, sr=sr_ref, mono=False)
+
+        # Ensure 2-channel; librosa returns (channels, samples)
+        if ref_stereo.ndim == 1:
+            ref_stereo = np.stack([ref_stereo, ref_stereo])
+        if test_stereo.ndim == 1:
+            test_stereo = np.stack([test_stereo, test_stereo])
+
+        min_stereo = min(ref_stereo.shape[1], test_stereo.shape[1])
+        ref_L, ref_R = ref_stereo[0, :min_stereo], ref_stereo[1, :min_stereo]
+        test_L, test_R = test_stereo[0, :min_stereo], test_stereo[1, :min_stereo]
+
+        swp = calculate_stereo_width_preservation(ref_L, ref_R, test_L, test_R)
+        icc = calculate_interchannel_correlation_preservation(ref_L, ref_R, test_L, test_R)
+        pp = calculate_panning_consistency(ref_L, ref_R, test_L, test_R, sr_ref)
+
+        swp_score = 100 * swp
+        icc_score = 100 * icc
+        pp_score = 100 * pp
+
+        metrics["stereo_width"] = swp_score
+        metrics["interchannel_correlation"] = icc_score
+        metrics["panning_consistency"] = pp_score
+        raw["swp"] = swp
+        raw["icc"] = icc
+        raw["pp"] = pp
+
+    # Compute total score with normalized weights (sum to 1.0)
+    mono_keys = ['spectral_convergence', 'log_spectral_distance', 'mfcc_distance', 'transient_preservation']
+    stereo_keys = ['stereo_width', 'interchannel_correlation', 'panning_consistency']
+
+    if stereo:
+        active_keys = mono_keys + stereo_keys
+    else:
+        active_keys = mono_keys
+
+    raw_sum = sum(weights.get(k, 0) for k in active_keys)
+    if raw_sum > 0:
+        norm = {k: weights.get(k, 0) / raw_sum for k in active_keys}
+    else:
+        norm = {k: 1.0 / len(active_keys) for k in active_keys}
+
     total_score = (
-        sc_score * weights['spectral_convergence'] +
-        lsd_score * weights['log_spectral_distance'] +
-        mfcc_score * weights['mfcc_distance'] +
-        tp_score * weights['transient_preservation']
+        sc_score * norm.get('spectral_convergence', 0) +
+        lsd_score * norm.get('log_spectral_distance', 0) +
+        mfcc_score * norm.get('mfcc_distance', 0) +
+        tp_score * norm.get('transient_preservation', 0)
     )
-    
+    if stereo:
+        total_score += (
+            swp_score * norm.get('stereo_width', 0) +
+            icc_score * norm.get('interchannel_correlation', 0) +
+            pp_score * norm.get('panning_consistency', 0)
+        )
+
     return {
         "total_score": total_score,
-        "metrics": {
-            "spectral_convergence": sc_score,
-            "log_spectral_distance": lsd_score,
-            "mfcc_distance": mfcc_score,
-            "transient_preservation": tp_score
-        },
-        "raw": {
-            "sc": float(sc),
-            "lsd": float(lsd),
-            "mfcc_dist": float(mfcc_dist),
-            "tp": float(tp)
-        }
+        "metrics": metrics,
+        "raw": raw,
+        "stereo": stereo
     }
 
 def generate_spectrogram_diff(ref_path, test_path, out_path):
@@ -198,7 +346,10 @@ def main():
         "spectral_convergence": 0.30,
         "log_spectral_distance": 0.25,
         "mfcc_distance": 0.20,
-        "transient_preservation": 0.25
+        "transient_preservation": 0.25,
+        "stereo_width": 0.10,
+        "interchannel_correlation": 0.10,
+        "panning_consistency": 0.05,
     }
     
     if os.path.exists(args.config):
@@ -239,6 +390,7 @@ def main():
         # Score batch outputs
         for item in manifest:
             ratio = item['ratio']
+            is_stereo = item.get('stereo', False)
             source_base = os.path.basename(item['source']).replace('.wav', '')
             ref_path = os.path.join(repo_root, "optimize/references", f"{source_base}_ref_{ratio}.wav")
             test_path = os.path.join(repo_root, "optimize/outputs", f"{source_base}_test_{ratio}.wav")
@@ -248,7 +400,7 @@ def main():
                 continue
 
             print(f"Scoring {item['description']}...", file=sys.stderr)
-            res = score_pair(ref_path, test_path, weights)
+            res = score_pair(ref_path, test_path, weights, stereo=is_stereo)
             res['description'] = item['description']
             res['ratio'] = ratio
             res['mode'] = 'batch'
@@ -257,6 +409,7 @@ def main():
         # Score streaming outputs
         for item in manifest:
             ratio = item['ratio']
+            is_stereo = item.get('stereo', False)
             source_base = os.path.basename(item['source']).replace('.wav', '')
             ref_path = os.path.join(repo_root, "optimize/references", f"{source_base}_ref_{ratio}.wav")
             test_path = os.path.join(repo_root, "optimize/outputs", f"{source_base}_stream_{ratio}.wav")
@@ -266,7 +419,7 @@ def main():
                 continue
 
             print(f"Scoring [streaming] {item['description']}...", file=sys.stderr)
-            res = score_pair(ref_path, test_path, weights)
+            res = score_pair(ref_path, test_path, weights, stereo=is_stereo)
             res['description'] = f"{item['description']} [streaming]"
             res['ratio'] = ratio
             res['mode'] = 'streaming'
@@ -288,11 +441,22 @@ def main():
         avg_score = np.mean([r['total_score'] for r in results])
         batch_scores = [r['total_score'] for r in results if r.get('mode') == 'batch']
         stream_scores = [r['total_score'] for r in results if r.get('mode') == 'streaming']
+        mono_scores = [r['total_score'] for r in results if not r.get('stereo', False)]
+        stereo_scores = [r['total_score'] for r in results if r.get('stereo', False)]
         print(f"\nBatch completed. Average Score: {avg_score:.2f}", file=sys.stderr)
         if batch_scores:
             print(f"  Batch avg: {np.mean(batch_scores):.2f}", file=sys.stderr)
         if stream_scores:
             print(f"  Streaming avg: {np.mean(stream_scores):.2f}", file=sys.stderr)
+        if mono_scores:
+            print(f"  Mono avg: {np.mean(mono_scores):.2f}", file=sys.stderr)
+        if stereo_scores:
+            print(f"  Stereo avg: {np.mean(stereo_scores):.2f}", file=sys.stderr)
+            # Show stereo metric averages
+            swp_avg = np.mean([r['metrics'].get('stereo_width', 0) for r in results if r.get('stereo')])
+            icc_avg = np.mean([r['metrics'].get('interchannel_correlation', 0) for r in results if r.get('stereo')])
+            pp_avg = np.mean([r['metrics'].get('panning_consistency', 0) for r in results if r.get('stereo')])
+            print(f"  Stereo metrics: SWP={swp_avg:.1f}, ICC={icc_avg:.1f}, PP={pp_avg:.1f}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()

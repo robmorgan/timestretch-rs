@@ -6,5 +6,10 @@
   {"source": "samples/vocal_phrase.wav", "ratio": 0.8, "description": "vocal slowdown"},
   {"source": "samples/vocal_phrase.wav", "ratio": 1.25, "description": "vocal speedup"},
   {"source": "samples/full_mix.wav", "ratio": 0.9, "description": "complex mix slight stretch"},
-  {"source": "samples/silence_transient.wav", "ratio": 1.0, "description": "silence to transient edge case"}
+  {"source": "samples/silence_transient.wav", "ratio": 1.0, "description": "silence to transient edge case"},
+  {"source": "samples/stereo_drums.wav", "ratio": 0.75, "description": "stereo drums slowdown", "stereo": true},
+  {"source": "samples/stereo_drums.wav", "ratio": 1.5, "description": "stereo drums speedup", "stereo": true},
+  {"source": "samples/stereo_vocal.wav", "ratio": 0.8, "description": "stereo vocal slowdown", "stereo": true},
+  {"source": "samples/stereo_vocal.wav", "ratio": 1.25, "description": "stereo vocal speedup", "stereo": true},
+  {"source": "samples/stereo_mix.wav", "ratio": 0.9, "description": "stereo mix slight stretch", "stereo": true}
 ]
