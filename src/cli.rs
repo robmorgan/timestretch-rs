@@ -1,4 +1,4 @@
-use timestretch::{EdmPreset, StreamProcessor, StretchParams, WindowType};
+use timestretch::{EdmPreset, QualityMode, StreamProcessor, StretchParams, WindowType};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -168,8 +168,33 @@ fn main() {
     // Process
     let output = if streaming {
         eprintln!("Streaming mode (chunk size: {} frames)", chunk_size);
-        let mut processor = StreamProcessor::new(params.clone());
-        processor.set_hybrid_mode(true);
+        // Align CLI streaming with desktop defaults:
+        // - Do not force hybrid mode.
+        // - Use low-latency DJ profile for DjBeatmatch.
+        let stream_params = if preset == Some(EdmPreset::DjBeatmatch) {
+            let mut p = StretchParams::new(stretch_ratio)
+                .with_sample_rate(buffer.sample_rate)
+                .with_channels(buffer.channels.count() as u32)
+                .with_quality_mode(QualityMode::LowLatency)
+                .with_fft_size(1024)
+                .with_hop_size(256)
+                .with_normalize(normalize);
+            if let Some(w) = window_type {
+                p = p.with_window_type(w);
+            }
+            p
+        } else {
+            params.clone()
+        };
+        if verbose {
+            if preset == Some(EdmPreset::DjBeatmatch) {
+                eprintln!("  Streaming profile: desktop-style DJ low-latency");
+            } else {
+                eprintln!("  Streaming profile: standard");
+            }
+            eprintln!("  Streaming params: {}", stream_params);
+        }
+        let mut processor = StreamProcessor::new(stream_params);
 
         let num_channels = buffer.channels.count();
         let samples_per_chunk = chunk_size * num_channels;
