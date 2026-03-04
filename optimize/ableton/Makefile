@@ -1,4 +1,4 @@
-.PHONY: ableton-refs library-refs score-ableton compare full manifest clean help
+.PHONY: ableton-refs library-refs score-ableton compare full manifest loop loop-dry loop-resume clean help
 
 SCRIPT_DIR := scripts
 CATALOG := track_catalog.json
@@ -32,6 +32,15 @@ full:            ## Full pipeline: Ableton refs + library refs + score
 manifest:        ## Generate Ableton manifest without rendering
 	$(PYTHON) $(SCRIPT_DIR)/batch_generate_refs.py $(CATALOG) $(ABLETON_REF_DIR) \
 		--dry-run --manifest-out $(MANIFEST)
+
+loop:            ## Run Ableton optimization loop
+	./scripts/optimize_loop.sh
+
+loop-dry:        ## Score only (no agent)
+	./scripts/optimize_loop.sh --dry-run
+
+loop-resume:     ## Resume interrupted Ableton optimization
+	./scripts/optimize_loop.sh --resume
 
 clean:           ## Clean generated outputs and logs
 	rm -rf $(LIBRARY_REF_DIR)/*.wav $(LOG_DIR)/* $(MANIFEST) library_manifest.json
