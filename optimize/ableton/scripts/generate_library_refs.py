@@ -10,6 +10,7 @@ Usage:
     python generate_library_refs.py track_catalog.json refs/library/ --streaming-only
 """
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
@@ -100,6 +101,8 @@ def main():
     parser.add_argument("--skip-existing", action="store_true",
                         help="Skip files that already exist")
     parser.add_argument("--cli-path", help="Path to timestretch-cli binary")
+    parser.add_argument("--parallel", type=int, default=1, metavar="N",
+                        help="Run N processes in parallel (default: 1)")
     parser.add_argument("--manifest-out",
                         help="Write library manifest JSON to this path")
 
@@ -122,6 +125,8 @@ def main():
     results = {"success": [], "failed": []}
     manifest = []
 
+    # Build list of jobs: (name, source_path, output_path, ratio, streaming)
+    jobs = []
     for track in catalog:
         source_path = resolve_source_path(track["source"], catalog_dir)
         if not os.path.exists(source_path):
@@ -132,53 +137,65 @@ def main():
             track_id = track["id"]
             target_bpm = target["target_bpm"]
             ratio = target["ratio"]
+            stereo = track.get("stereo", False)
 
-            # Batch mode output
             if do_batch:
                 batch_name = f"{track_id}_{target_bpm}bpm_batch.wav"
                 batch_path = os.path.join(args.output_dir, batch_name)
-
-                if args.skip_existing and os.path.exists(batch_path):
+                skip = args.skip_existing and os.path.exists(batch_path)
+                if skip:
                     log.info(f"Skipping (exists): {batch_name}")
                 else:
-                    if run_timestretch(cli_path, source_path, batch_path, ratio):
-                        results["success"].append(batch_name)
-                    else:
-                        results["failed"].append(batch_name)
-
+                    jobs.append((batch_name, source_path, batch_path, ratio, False))
                 manifest.append({
                     "track_id": track_id,
                     "target_bpm": target_bpm,
                     "ratio": ratio,
                     "mode": "batch",
                     "path": batch_path,
-                    "stereo": track.get("stereo", False),
+                    "stereo": stereo,
                     "description": f"{track_id} @ {target_bpm} BPM (batch)",
                 })
 
-            # Streaming mode output
             if do_streaming:
                 stream_name = f"{track_id}_{target_bpm}bpm_stream.wav"
                 stream_path = os.path.join(args.output_dir, stream_name)
-
-                if args.skip_existing and os.path.exists(stream_path):
+                skip = args.skip_existing and os.path.exists(stream_path)
+                if skip:
                     log.info(f"Skipping (exists): {stream_name}")
                 else:
-                    if run_timestretch(cli_path, source_path, stream_path,
-                                       ratio, streaming=True):
-                        results["success"].append(stream_name)
-                    else:
-                        results["failed"].append(stream_name)
-
+                    jobs.append((stream_name, source_path, stream_path, ratio, True))
                 manifest.append({
                     "track_id": track_id,
                     "target_bpm": target_bpm,
                     "ratio": ratio,
                     "mode": "streaming",
                     "path": stream_path,
-                    "stereo": track.get("stereo", False),
+                    "stereo": stereo,
                     "description": f"{track_id} @ {target_bpm} BPM (streaming)",
                 })
+
+    # Execute jobs (parallel or sequential)
+    parallel = max(1, args.parallel)
+    if parallel > 1 and len(jobs) > 1:
+        log.info(f"Running {len(jobs)} jobs with {parallel} workers")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
+            future_to_name = {}
+            for name, source, output, ratio, streaming in jobs:
+                f = executor.submit(run_timestretch, cli_path, source, output, ratio, streaming)
+                future_to_name[f] = name
+            for future in concurrent.futures.as_completed(future_to_name):
+                name = future_to_name[future]
+                if future.result():
+                    results["success"].append(name)
+                else:
+                    results["failed"].append(name)
+    else:
+        for name, source, output, ratio, streaming in jobs:
+            if run_timestretch(cli_path, source, output, ratio, streaming):
+                results["success"].append(name)
+            else:
+                results["failed"].append(name)
 
     # Summary
     total = len(results["success"]) + len(results["failed"])
