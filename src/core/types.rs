@@ -1625,7 +1625,7 @@ const DEFAULT_FFT_SIZE: usize = 4096;
 /// overlap), violating COLA and causing audible gain modulation.
 const DEFAULT_HOP_SIZE: usize = DEFAULT_FFT_SIZE / 8;
 /// Default transient detection sensitivity (0.0–1.0).
-const DEFAULT_TRANSIENT_SENSITIVITY: f32 = 0.25;
+const DEFAULT_TRANSIENT_SENSITIVITY: f32 = 0.32;
 /// Default transient lookahead-confirmation frame count.
 const DEFAULT_TRANSIENT_LOOKAHEAD_FRAMES: usize = 2;
 /// Default transient lookahead threshold relaxation factor.
