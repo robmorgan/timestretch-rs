@@ -1,0 +1,107 @@
+# Ableton Complex Pro Quality Optimization - Iteration ${ITERATION}
+
+You are an expert DSP engineer. Your goal is to optimize the time-stretching quality of the `timestretch-rs` library, scored against **Ableton Live 11 Complex Pro** references — the industry standard for high-quality time-stretching.
+
+## Current Performance Summary
+- **Average Score:** ${AVG_SCORE} / 100 (Target: ${TARGET_SCORE})
+- **Batch Average:** ${BATCH_AVG_SCORE} / 100
+- **Streaming Average:** ${STREAM_AVG_SCORE} / 100
+- **Score Trend (Last 3):** ${SCORE_HISTORY}
+
+## Detailed Metrics per Test Case
+${JSON_SCORES}
+
+## Worst Performing Cases
+${WORST_CASES}
+
+${IMPACT_ANALYSIS}
+
+### Understanding the Metrics
+These metrics compare our library output against Ableton Complex Pro output (not rubberband). Ableton Complex Pro is a significantly higher-quality reference, so scores will be lower than the rubberband optimization loop.
+
+- **Spectral Convergence (SC)**: Measures magnitude similarity in the frequency domain. Low scores mean frequency content is distorted or "smeared" compared to Ableton's output.
+- **Log Spectral Distance (LSD)**: Measures spectral difference in dB. High values indicate tonal coloration or gain issues versus Ableton's processing.
+- **MFCC Distance**: Measures timbral similarity. High distance means the "character" of the sound has changed relative to Ableton.
+- **Transient Preservation (TP)**: Measures how well onsets (drum hits, etc.) are preserved. Ableton Complex Pro has excellent transient handling, so low scores here indicate our transient processing differs significantly.
+- **Stereo Width (SWP)**: Mid/side energy ratio preservation. Low scores mean the stereo image collapsed or widened relative to Ableton's output.
+- **Interchannel Correlation (ICC)**: L-R phase relationship preservation. Low scores mean stereo decorrelation differs from Ableton.
+- **Panning Consistency (PP)**: Frame-by-frame L-R balance curve correlation. Low scores mean panning shifts relative to Ableton.
+
+### Strategy Guidance
+- Ableton Complex Pro is a much higher-quality target than rubberband. Scores of 35-50 are expected initially.
+- Focus on reducing the largest spectral differences first — SC and LSD are likely the biggest gaps.
+- Ableton's algorithm handles transients very differently (likely using sophisticated detection + separate processing), so TP improvements may require architectural changes.
+- For stereo cases: mid/side processing in `src/stretch/hybrid.rs` is the key code path.
+- Consider that Ableton may use different windowing, phase vocoder strategies, or multi-resolution approaches.
+
+## Previous Attempts (DO NOT REPEAT THESE)
+${PREVIOUS_ATTEMPTS}
+
+${DIVERSITY_HINTS}
+
+## Scoring Modes
+Tests are scored in two modes:
+- **Batch** — uses `stretch_buffer()` (full-file processing). This is the traditional code path through `src/stretch/hybrid.rs`.
+- **Streaming** — uses `StreamProcessor` with hybrid mode enabled (chunked real-time processing). This code path lives in `src/stream/processor.rs`.
+
+If streaming scores lag behind batch scores, look at `src/stream/processor.rs` for phase vocoder state management, ring buffer handling, or hybrid mode transitions. Both modes share the underlying WSOLA and phase vocoder engines, but streaming adds chunked buffering and ratio smoothing.
+
+## CRITICAL RULES
+- **Do NOT spend more than 5 turns reading code.** The key source code is provided below — start editing quickly.
+- **Do NOT use Task/subagent tools.** Work directly — edit, build, score.
+- **You MUST run scoring and commit if improved before your turns run out.**
+- **The Python venv is already activated.** Just run python3/pip directly — do NOT run `source optimize/.venv/bin/activate`.
+- **After each failed attempt**, append a one-line summary to `optimize/ableton/logs/attempts.log` describing what you tried and the result.
+
+## Key Source Code (DO NOT re-read these files — they are provided here)
+
+### src/stretch/hybrid.rs (lines 1-200: core structs and config)
+```rust
+${HYBRID_HEAD}
+```
+
+### src/stretch/hybrid.rs (stretch_tonal_core method)
+```rust
+${HYBRID_STRETCH_CORE}
+```
+
+### src/stretch/phase_vocoder.rs (process method and phase logic)
+```rust
+${PV_PROCESS}
+```
+
+### src/stretch/wsola.rs (correlation and overlap-add)
+```rust
+${WSOLA_CORE}
+```
+
+## Instructions
+1. **Review the scores and source code above.** Do not re-read these files.
+2. **Diagnose**: Look at the worst performing cases. Are they transients (drums)? Are they harmonic (sine/vocals)?
+3. **If you need to read additional code** (e.g., a helper function not shown above), you may — but limit to 3 reads max.
+4. **Modify**: Make a **targeted, coherent change** to the DSP logic to improve the scores.
+   - You may change multiple files if the changes are logically related (e.g., adjusting PV hop AND compensating crossfade length).
+   - Focus on: window functions, overlap-add logic, phase advancement, transient detection, or cross-correlation (WSOLA).
+   - Do NOT refactor or reorganize. Only modify DSP math/logic.
+   - Do NOT repeat any approach listed in "Previous Attempts" above.
+   - Use the **Impact Analysis** table above to target the highest-leverage metric+case combinations.
+5. **Build**: Run `cargo build --release` to verify compilation.
+6. **Score**: Re-run the scoring pipeline to measure the impact:
+   ```bash
+   rm -f optimize/ableton/refs/library/*.wav
+   python3 optimize/ableton/scripts/generate_library_refs.py optimize/ableton/track_catalog.json optimize/ableton/refs/library/ --manifest-out optimize/ableton/library_manifest.json
+   cd optimize && .venv/bin/python scripts/score.py --ref-source ableton --ableton-manifest ableton/ableton_manifest.json --batch ableton/logs/scores_verify.json && cd ..
+   ```
+7. **Log the attempt**: Append a one-line summary to `optimize/ableton/logs/attempts.log`:
+   ```bash
+   echo "iter=${ITERATION}: <what you changed> -> score=<new_score> (was ${AVG_SCORE})" >> optimize/ableton/logs/attempts.log
+   ```
+8. **Commit if improved**: If the new average score is higher than **${AVG_SCORE}**, you MUST commit:
+   ```bash
+   git add src/
+   git commit -m "opt(ableton): <brief description of change>, score=<new_score>"
+   ```
+   If the score did not improve, revert with `git checkout -- src/` and try a different approach. You may attempt up to 3 changes per session.
+9. **Explain**: Briefly explain what you changed and why.
+
+**Your goal is to reach ${TARGET_SCORE}. Current score: ${AVG_SCORE}. Always commit improvements.**
