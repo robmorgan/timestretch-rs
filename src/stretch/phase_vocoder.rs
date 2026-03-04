@@ -36,6 +36,8 @@ const ADAPTIVE_IDENTITY_RATIO_DISTANCE_MAX: f64 = 0.35;
 const ADAPTIVE_SELECTIVE_RATIO_DISTANCE_MAX: f64 = 0.65;
 /// Ratio-distance above this always prefers ROI for stability.
 const ADAPTIVE_FORCE_ROI_RATIO_DISTANCE: f64 = 0.75;
+/// Number of synthesis frames to keep transient-focused locking active.
+const TRANSIENT_FOCUS_FRAMES: usize = 3;
 
 /// Phase vocoder state for time stretching.
 pub struct PhaseVocoder {
@@ -53,6 +55,12 @@ pub struct PhaseVocoder {
     phase_accum: Vec<f64>,
     /// Previous analysis phase (f64 to match accumulator precision).
     prev_phase: Vec<f64>,
+    /// Marks bins that must be seeded from fresh analysis phase on next frame.
+    ///
+    /// Used by selective band resets so transient-triggered partial resets do
+    /// not compute an invalid instantaneous-frequency jump from zeroed phase
+    /// history.
+    phase_seed_pending: Vec<bool>,
     /// Pre-planned forward FFT for analysis frames.
     fft_forward: Arc<dyn rustfft::Fft<f32>>,
     /// Pre-planned inverse FFT for synthesis frames.
@@ -83,6 +91,8 @@ pub struct PhaseVocoder {
     phase_locking_mode: PhaseLockingMode,
     /// Enables confidence-driven adaptive phase-lock mode switching.
     adaptive_phase_locking: bool,
+    /// Short-lived state that tightens phase behavior right after a transient reset.
+    transient_focus_frames: usize,
     /// Whether spectral envelope preservation is enabled.
     envelope_preservation: bool,
     /// Envelope correction strength (0 = off, 1 = full, >1 stronger).
@@ -258,6 +268,7 @@ impl PhaseVocoder {
             window,
             phase_accum: vec![0.0f64; num_bins],
             prev_phase: vec![0.0f64; num_bins],
+            phase_seed_pending: vec![true; num_bins],
             fft_forward,
             fft_inverse,
             fft_forward_scratch: vec![COMPLEX_ZERO; fft_forward_scratch_len],
@@ -273,6 +284,7 @@ impl PhaseVocoder {
             sub_bass_bin,
             phase_locking_mode,
             adaptive_phase_locking: false,
+            transient_focus_frames: 0,
             envelope_preservation,
             envelope_strength: 1.0,
             adaptive_envelope_order: true,
@@ -341,6 +353,8 @@ impl PhaseVocoder {
     pub fn reset_phase_state(&mut self) {
         self.phase_accum.fill(0.0);
         self.prev_phase.fill(0.0);
+        self.phase_seed_pending.fill(true);
+        self.transient_focus_frames = 0;
     }
 
     /// Enables or disables confidence-driven adaptive phase-lock switching.
@@ -393,7 +407,14 @@ impl PhaseVocoder {
             if reset_mask[band_idx] {
                 self.phase_accum[bin] = 0.0;
                 self.prev_phase[bin] = 0.0;
+                self.phase_seed_pending[bin] = true;
             }
+        }
+
+        // Engage a short transient-focus window for audible bands so the
+        // first few post-reset frames favor tighter attack coherence.
+        if reset_mask[1] || reset_mask[2] || reset_mask[3] {
+            self.transient_focus_frames = self.transient_focus_frames.max(TRANSIENT_FOCUS_FRAMES);
         }
     }
 
@@ -710,6 +731,8 @@ impl PhaseVocoder {
         if reset_phase_state {
             self.phase_accum.fill(0.0);
             self.prev_phase.fill(0.0);
+            self.phase_seed_pending.fill(true);
+            self.transient_focus_frames = 0;
             self.synthesis_pos = 0.0;
             self.synthesis_emitted = 0;
         }
@@ -781,7 +804,12 @@ impl PhaseVocoder {
             // At ratio near 1.0, phase locking is very accurate so we trust it fully.
             // As the ratio increases, IF estimates become more valuable for preserving
             // frequency accuracy, so we blend in up to 10% IF (reduced from 30% to improve coherence).
-            let if_blend = (0.05 * ((hop_ratio - 1.0).abs() / 0.5).min(1.0)).min(0.05);
+            let transient_focus = self.transient_focus_active();
+            let if_blend = if transient_focus {
+                0.0
+            } else {
+                (0.05 * ((hop_ratio - 1.0).abs() / 0.5).min(1.0)).min(0.05)
+            };
             if if_blend > 1e-6 {
                 for bin in self.sub_bass_bin..num_bins {
                     if self.peaks.binary_search(&bin).is_ok() {
@@ -796,7 +824,7 @@ impl PhaseVocoder {
             // Spectral envelope preservation: correct magnitudes so formant
             // structure matches the original analysis frame, preventing
             // unnatural timbre shifts.
-            if self.envelope_preservation && self.envelope_strength > 0.0 {
+            if !transient_focus && self.envelope_preservation && self.envelope_strength > 0.0 {
                 let effective_order = if self.adaptive_envelope_order {
                     let centroid =
                         spectral_centroid(&self.magnitudes, self.sample_rate, self.fft_size);
@@ -878,6 +906,8 @@ impl PhaseVocoder {
                 }
             }
 
+            self.decay_transient_focus();
+
             synthesis_frame_pos = synthesis_pos + frame_advance;
         }
 
@@ -940,18 +970,6 @@ impl PhaseVocoder {
             self.analysis_phases[bin] = c.arg();
         }
 
-        // First frame after a full phase reset: seed synthesis phases directly
-        // from analysis to avoid a large bogus IF jump from zeroed prev_phase.
-        if self.prev_phase.iter().all(|&p| p == 0.0) && self.phase_accum.iter().all(|&p| p == 0.0) {
-            for bin in 0..num_bins {
-                let phase = self.analysis_phases[bin] as f64;
-                self.phase_accum[bin] = phase;
-                self.new_phases[bin] = phase as f32;
-                self.prev_phase[bin] = phase;
-            }
-            return;
-        }
-
         // --- Pass 2: Detect peaks for IF refinement + phase gradient ---
         let search_start = self.sub_bass_bin.max(1);
         self.peaks.clear();
@@ -979,6 +997,16 @@ impl PhaseVocoder {
         // accuracy vs ~5 Hz for integer-bin estimation).
         for bin in 0..num_bins {
             let phase = self.analysis_phases[bin] as f64;
+
+            // Seed bins that were explicitly reset (full or selective reset)
+            // from the current analysis phase to avoid a bogus first IF jump.
+            if self.phase_seed_pending[bin] {
+                self.phase_accum[bin] = phase;
+                self.new_phases[bin] = phase as f32;
+                self.prev_phase[bin] = phase;
+                self.phase_seed_pending[bin] = false;
+                continue;
+            }
 
             if bin < self.sub_bass_bin {
                 // Sub-bass IF estimation: same instantaneous-frequency approach
@@ -1156,6 +1184,10 @@ impl PhaseVocoder {
     /// - otherwise -> configured `phase_locking_mode`
     #[inline]
     fn select_phase_locking_mode(&self, num_bins: usize) -> PhaseLockingMode {
+        if self.transient_focus_active() {
+            return PhaseLockingMode::Identity;
+        }
+
         if !self.adaptive_phase_locking {
             return self.phase_locking_mode;
         }
@@ -1207,6 +1239,16 @@ impl PhaseVocoder {
         }
 
         self.phase_locking_mode
+    }
+
+    #[inline]
+    fn transient_focus_active(&self) -> bool {
+        self.transient_focus_frames > 0
+    }
+
+    #[inline]
+    fn decay_transient_focus(&mut self) {
+        self.transient_focus_frames = self.transient_focus_frames.saturating_sub(1);
     }
 }
 
@@ -1361,6 +1403,126 @@ mod tests {
         assert!(!pv.adaptive_envelope_order);
         pv.set_adaptive_envelope_order(true);
         assert!(pv.adaptive_envelope_order);
+    }
+
+    #[test]
+    fn test_reset_phase_state_bands_enables_transient_focus_for_audible_bands() {
+        let sample_rate = 44_100u32;
+        let mut pv = PhaseVocoder::new(1024, 256, 1.0, sample_rate, 120.0);
+        assert_eq!(pv.transient_focus_frames, 0);
+
+        pv.reset_phase_state_bands([false, false, true, false], sample_rate);
+        assert_eq!(
+            pv.transient_focus_frames, TRANSIENT_FOCUS_FRAMES,
+            "mid-band reset should engage transient focus"
+        );
+    }
+
+    #[test]
+    fn test_reset_phase_state_bands_sub_only_does_not_enable_transient_focus() {
+        let sample_rate = 44_100u32;
+        let mut pv = PhaseVocoder::new(1024, 256, 1.0, sample_rate, 120.0);
+        assert_eq!(pv.transient_focus_frames, 0);
+
+        pv.reset_phase_state_bands([true, false, false, false], sample_rate);
+        assert_eq!(
+            pv.transient_focus_frames, 0,
+            "sub-only reset should not engage transient focus"
+        );
+    }
+
+    #[test]
+    fn test_select_phase_locking_mode_forces_identity_during_transient_focus() {
+        let mut pv = PhaseVocoder::with_options(
+            1024,
+            256,
+            1.4,
+            44_100,
+            120.0,
+            WindowType::Hann,
+            PhaseLockingMode::RegionOfInfluence,
+        );
+        pv.transient_focus_frames = 1;
+        pv.set_adaptive_phase_locking(true);
+        pv.magnitudes.fill(1.0);
+
+        let mode = pv.select_phase_locking_mode(1024 / 2 + 1);
+        assert_eq!(
+            mode,
+            PhaseLockingMode::Identity,
+            "transient focus should force identity locking"
+        );
+    }
+
+    #[test]
+    fn test_reset_phase_state_bands_marks_only_target_band_for_seeding() {
+        let sample_rate = 44_100u32;
+        let mut pv = PhaseVocoder::new(1024, 256, 1.0, sample_rate, 120.0);
+        pv.phase_accum.fill(1.0);
+        pv.prev_phase.fill(1.0);
+        pv.phase_seed_pending.fill(false);
+
+        // Reset only the low band [100, 500) Hz.
+        pv.reset_phase_state_bands([false, true, false, false], sample_rate);
+
+        let bin_hz = sample_rate as f32 / pv.fft_size as f32;
+        for bin in 0..pv.phase_accum.len() {
+            let freq = bin as f32 * bin_hz;
+            let in_low_band = (100.0..500.0).contains(&freq);
+            if in_low_band {
+                assert_eq!(pv.phase_accum[bin], 0.0, "low-band phase_accum not reset");
+                assert_eq!(pv.prev_phase[bin], 0.0, "low-band prev_phase not reset");
+                assert!(
+                    pv.phase_seed_pending[bin],
+                    "low-band seed flag should be set"
+                );
+            } else {
+                assert_eq!(pv.phase_accum[bin], 1.0, "non-low-band phase_accum changed");
+                assert_eq!(pv.prev_phase[bin], 1.0, "non-low-band prev_phase changed");
+                assert!(
+                    !pv.phase_seed_pending[bin],
+                    "non-low-band seed flag should stay clear"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_advance_phases_seeds_pending_bins_without_if_jump() {
+        let sample_rate = 44_100u32;
+        let mut pv = PhaseVocoder::new(1024, 256, 1.0, sample_rate, 120.0);
+        let num_bins = pv.fft_size / 2 + 1;
+
+        // Simulate steady state where no bins are pending.
+        pv.phase_seed_pending.fill(false);
+        pv.phase_accum.fill(0.5);
+        pv.prev_phase.fill(0.5);
+
+        let target_bin = 64usize;
+        pv.phase_accum[target_bin] = 0.0;
+        pv.prev_phase[target_bin] = 0.0;
+        pv.phase_seed_pending[target_bin] = true;
+
+        for bin in 0..num_bins {
+            let phase = 0.2 + bin as f32 * 0.001;
+            pv.fft_buffer[bin] = Complex::from_polar(1.0, phase);
+        }
+
+        pv.advance_phases(num_bins, 1.0);
+
+        let seeded_phase = pv.analysis_phases[target_bin] as f64;
+        assert!(
+            (pv.phase_accum[target_bin] - seeded_phase).abs() < 1e-9,
+            "pending bin should seed directly from analysis phase"
+        );
+        assert!(
+            (pv.prev_phase[target_bin] - seeded_phase).abs() < 1e-9,
+            "pending bin prev phase should match seeded analysis phase"
+        );
+        assert!(
+            !pv.phase_seed_pending[target_bin],
+            "pending flag should clear after first seeded frame"
+        );
     }
 
     #[test]

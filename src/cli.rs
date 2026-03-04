@@ -1,4 +1,6 @@
-use timestretch::{EdmPreset, QualityMode, StreamProcessor, StretchParams, WindowType};
+use timestretch::{
+    EdmPreset, QualityMode, StreamProcessor, StretchParams, TransientResetStats, WindowType,
+};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -165,6 +167,8 @@ fn main() {
 
     let start = std::time::Instant::now();
 
+    let mut stream_reset_stats: Option<TransientResetStats> = None;
+
     // Process
     let output = if streaming {
         eprintln!("Streaming mode (chunk size: {} frames)", chunk_size);
@@ -218,6 +222,10 @@ fn main() {
             }
         }
 
+        if verbose {
+            stream_reset_stats = Some(processor.transient_reset_stats());
+        }
+
         // Streaming mode doesn't apply global RMS normalization (the batch
         // path normalizes inside stretch()). Apply it here so streaming
         // output matches batch-level loudness and the reference level used
@@ -269,6 +277,17 @@ fn main() {
     );
 
     if verbose {
+        if let Some(stats) = stream_reset_stats {
+            eprintln!(
+                "  Reset scheduler: events={} bands[sub,low,mid,high]=[{},{},{},{}] consumed_frames={}",
+                stats.events_detected_total,
+                stats.reset_band_counts_total[0],
+                stats.reset_band_counts_total[1],
+                stats.reset_band_counts_total[2],
+                stats.reset_band_counts_total[3],
+                stats.input_frames_consumed_total
+            );
+        }
         let input_duration = buffer.duration_secs();
         let processing_secs = elapsed.as_secs_f64();
         let realtime_factor = if processing_secs > 0.0 {

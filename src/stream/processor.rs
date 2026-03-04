@@ -1,13 +1,11 @@
 //! Real-time streaming time-stretch processor.
 
-use rustfft::{num_complex::Complex, FftPlanner};
-
-use crate::core::fft::COMPLEX_ZERO;
+use crate::analysis::transient::{detect_transients_with_options, TransientDetectionOptions};
 use crate::core::ring_buffer::RingBuffer;
 use crate::core::types::{QualityMode, StretchParams};
-use crate::core::window::{generate_window, WindowType};
+use crate::core::window::WindowType;
 use crate::error::StretchError;
-use crate::analysis::transient::{detect_transients_with_options, TransientDetectionOptions};
+use crate::stream::transient_scheduler::{TransientEventScheduler, TransientSchedulerStats};
 use crate::stretch::hybrid::HybridStretcher;
 use crate::stretch::phase_vocoder::PhaseVocoder;
 use crate::stretch::stereo::StereoMode;
@@ -34,27 +32,11 @@ const MIN_CALLBACK_FRAMES: usize = 64;
 const COMMON_CALLBACK_FRAMES: usize = 256;
 /// Iteration slack for bounded dynamic loops in the real-time path.
 const LOOP_GUARD_SLACK: usize = 8;
-/// Mid-band start for spectral-flux transient detection (Hz).
-const FLUX_MID_START_HZ: f64 = 500.0;
-/// High-band start for spectral-flux transient detection (Hz).
-const FLUX_HIGH_START_HZ: f64 = 4000.0;
-/// EMA coefficient for adaptive spectral-flux statistics.
-const FLUX_EMA_ALPHA: f64 = 0.2;
-/// Sigma multiplier for adaptive spectral-flux threshold.
-const FLUX_THRESHOLD_SIGMA: f64 = 2.5;
-/// Required jump versus previous frame flux to classify a transient.
-const FLUX_SPIKE_RATIO: f64 = 1.6;
 /// Cross-fade length (in samples) at hybrid streaming chunk boundaries.
 ///
 /// Smooths phase discontinuities caused by re-rendering overlapping audio
 /// with fresh PV phase state on each call.
 const HYBRID_STREAM_CROSSFADE_SAMPLES: usize = 3072;
-/// Absolute guard to suppress near-silence false triggers.
-const FLUX_ABS_MIN: f64 = 1e-4;
-/// Extra emphasis on high-band flux.
-const FLUX_HIGH_WEIGHT: f64 = 1.25;
-/// Number of flux frames to observe before trigger checks.
-const FLUX_WARMUP_FRAMES: usize = 3;
 
 /// Computes the minimum number of frames required before processing can begin.
 #[inline]
@@ -335,6 +317,33 @@ impl LinearResamplerState {
 /// - no `Vec::drain`
 /// - no front-removal shifts
 /// - deterministic memory bounds
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingEngine {
+    /// Default deterministic stream engine with bounded per-callback work.
+    ///
+    /// This engine uses persistent phase-vocoder state and avoids full rolling
+    /// re-renders of historical context in callback paths.
+    Deterministic,
+    /// Legacy rolling-window hybrid re-render engine.
+    ///
+    /// This mode can provide stronger transient handling for selected content,
+    /// but has higher callback-cost variability and is intended as opt-in.
+    LegacyHybridRerender,
+}
+
+/// Aggregated transient-reset telemetry from deterministic stream processing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransientResetStats {
+    /// Number of transient events detected by the scheduler.
+    pub events_detected_total: u64,
+    /// Number of times each reset band was selected across all events.
+    ///
+    /// Layout: `[sub_bass, low, mid, high]`.
+    pub reset_band_counts_total: [u64; 4],
+    /// Absolute per-channel input frames consumed from the stream so far.
+    pub input_frames_consumed_total: usize,
+}
+
 pub struct StreamProcessor {
     params: StretchParams,
     capacity_frames_per_channel: usize,
@@ -358,8 +367,11 @@ pub struct StreamProcessor {
     interleaved_scratch: Vec<f32>,
     /// Source BPM (set when created via `from_tempo`, enables `set_tempo`).
     source_bpm: Option<f64>,
-    /// When true, use the full hybrid algorithm (transient detection + WSOLA + PV)
-    /// instead of PV-only. Higher quality for EDM but higher latency.
+    /// Enables the legacy rolling-window hybrid re-render engine.
+    ///
+    /// Prefer [`StreamingEngine::Deterministic`] for real-time callback
+    /// stability. Keep this flag only as a compatibility bridge for callers
+    /// still opting into historical hybrid streaming behavior.
     use_hybrid: bool,
     /// Persistent hybrid streaming state (rolling bounded tail + incremental output).
     hybrid_state: HybridStreamingState,
@@ -370,18 +382,12 @@ pub struct StreamProcessor {
     /// This trades hybrid transient rendering quality for hard-RT callback
     /// behavior by routing through the preallocated PV streaming path.
     hybrid_realtime_strict: bool,
-    /// Reusable mono mixdown buffer for stereo phase coherence.
-    mid_buffer: Vec<f32>,
-    /// Cached FFT for spectral-flux transient detection.
-    transient_fft: std::sync::Arc<dyn rustfft::Fft<f32>>,
-    /// Reusable FFT buffer for spectral-flux detection.
-    transient_fft_buffer: Vec<Complex<f32>>,
-    /// Scratch buffer for spectral-flux FFT execution.
-    transient_fft_scratch: Vec<Complex<f32>>,
-    /// Reusable previous magnitudes for spectral-flux detection.
-    transient_prev_magnitudes: Vec<f32>,
-    /// Analysis window used by spectral-flux detection.
-    transient_window: Vec<f32>,
+    /// Persistent transient event scheduler for deterministic stream mode.
+    transient_scheduler: TransientEventScheduler,
+    /// Absolute count of per-channel input frames consumed from `input_ring`.
+    ///
+    /// This provides a stable timeline for incremental transient scheduling.
+    input_frames_consumed_total: usize,
     /// Expected total output samples across the current stream.
     ///
     /// Accumulated from input samples and the effective interpolated ratio,
@@ -437,12 +443,12 @@ impl StreamProcessor {
             .map(|_| Vec::with_capacity(output_capacity_frames))
             .collect();
         let hybrid_state = HybridStreamingState::new(&params, ratio, capacity_frames_per_channel);
-        let mut planner = FftPlanner::new();
-        let transient_fft = planner.plan_fft_forward(params.fft_size);
-        let transient_fft_scratch = vec![COMPLEX_ZERO; transient_fft.get_inplace_scratch_len()];
-        let transient_fft_buffer = vec![COMPLEX_ZERO; params.fft_size];
-        let transient_prev_magnitudes = vec![0.0; params.fft_size / 2 + 1];
-        let transient_window = generate_window(WindowType::Hann, params.fft_size);
+        let transient_scheduler = TransientEventScheduler::new(
+            params.fft_size,
+            params.hop_size,
+            params.sample_rate,
+            capacity_frames_per_channel,
+        );
 
         Self {
             params,
@@ -462,12 +468,8 @@ impl StreamProcessor {
             hybrid_state,
             hybrid_pending_rebase: false,
             hybrid_realtime_strict: false,
-            mid_buffer: Vec::with_capacity(capacity_frames_per_channel),
-            transient_fft,
-            transient_fft_buffer,
-            transient_fft_scratch,
-            transient_prev_magnitudes,
-            transient_window,
+            transient_scheduler,
+            input_frames_consumed_total: 0,
             expected_total_output_samples: 0.0,
             total_output_emitted_samples: 0,
             pitch_scale: 1.0,
@@ -661,6 +663,10 @@ impl StreamProcessor {
             self.flush_vocoder_tails_to_pending(num_channels)?;
         }
 
+        let remaining_frames = self.input_ring.len() / num_channels.max(1);
+        self.input_frames_consumed_total = self
+            .input_frames_consumed_total
+            .saturating_add(remaining_frames);
         self.input_ring.clear();
         if self.use_hybrid {
             // Emit any held-back cross-fade tails before resetting state.
@@ -780,6 +786,9 @@ impl StreamProcessor {
                 self.process_hybrid_persistent_channels(num_channels, require_min_latency)?;
             let consumed = total_frames * num_channels;
             self.input_ring.discard(consumed);
+            self.input_frames_consumed_total = self
+                .input_frames_consumed_total
+                .saturating_add(total_frames);
 
             if min_output_len > 0 {
                 self.decode_output_mid_side(num_channels, min_output_len);
@@ -790,11 +799,14 @@ impl StreamProcessor {
 
         self.update_vocoder_ratio();
         if num_channels == 2 {
-            self.sync_stereo_phase_reset(total_frames);
+            self.apply_transient_scheduled_phase_reset(total_frames);
         }
 
         let min_output_len = self.process_channels(num_channels)?;
-        self.consume_processed_input(total_frames, num_channels);
+        let consumed_frames = self.consume_processed_input(total_frames, num_channels);
+        self.input_frames_consumed_total = self
+            .input_frames_consumed_total
+            .saturating_add(consumed_frames);
 
         if min_output_len > 0 {
             self.decode_output_mid_side(num_channels, min_output_len);
@@ -901,10 +913,10 @@ impl StreamProcessor {
         })
     }
 
-    fn consume_processed_input(&mut self, total_frames: usize, num_channels: usize) {
+    fn consume_processed_input(&mut self, total_frames: usize, num_channels: usize) -> usize {
         let hop = self.params.hop_size;
         if hop == 0 {
-            return;
+            return 0;
         }
         let num_frames_processed = if total_frames >= self.params.fft_size {
             (total_frames - self.params.fft_size) / hop + 1
@@ -919,6 +931,7 @@ impl StreamProcessor {
         if samples_consumed > 0 {
             self.input_ring.discard(samples_consumed);
         }
+        num_frames_processed.saturating_mul(hop)
     }
 
     fn interleave_to_pending(
@@ -1174,32 +1187,31 @@ impl StreamProcessor {
         // so both channels use identical segmentation. This prevents phase
         // misalignment when decoded back to L/R, matching the batch path's
         // shared onset detection in stretch_mid_side().
-        let shared_onsets: Option<(Vec<usize>, Vec<f32>)> =
-            if num_channels == 2
-                && self.params.stereo_mode == StereoMode::MidSide
-                && !self.hybrid_state.rolling_scratch[0].is_empty()
-            {
-                let mid = &self.hybrid_state.rolling_scratch[0];
-                let fft = self.params.fft_size.min(2048);
-                let hop = self.params.hop_size.min(512);
-                let map = detect_transients_with_options(
-                    mid,
-                    self.params.sample_rate,
-                    fft,
-                    hop,
-                    self.params.transient_sensitivity,
-                    TransientDetectionOptions::from_stretch_params(&self.params),
-                );
-                let onsets = map.onsets.clone();
-                let strengths = if map.strengths.len() == onsets.len() {
-                    map.strengths.clone()
-                } else {
-                    vec![1.0; onsets.len()]
-                };
-                Some((onsets, strengths))
+        let shared_onsets: Option<(Vec<usize>, Vec<f32>)> = if num_channels == 2
+            && self.params.stereo_mode == StereoMode::MidSide
+            && !self.hybrid_state.rolling_scratch[0].is_empty()
+        {
+            let mid = &self.hybrid_state.rolling_scratch[0];
+            let fft = self.params.fft_size.min(2048);
+            let hop = self.params.hop_size.min(512);
+            let map = detect_transients_with_options(
+                mid,
+                self.params.sample_rate,
+                fft,
+                hop,
+                self.params.transient_sensitivity,
+                TransientDetectionOptions::from_stretch_params(&self.params),
+            );
+            let onsets = map.onsets.clone();
+            let strengths = if map.strengths.len() == onsets.len() {
+                map.strengths.clone()
             } else {
-                None
+                vec![1.0; onsets.len()]
             };
+            Some((onsets, strengths))
+        } else {
+            None
+        };
 
         // Phase 3: Process each channel and extract deltas.
         for ch in 0..num_channels {
@@ -1210,8 +1222,7 @@ impl StreamProcessor {
                     strengths,
                 )?
             } else {
-                self.hybrid_state.stretchers[ch]
-                    .process(&self.hybrid_state.rolling_scratch[ch])?
+                self.hybrid_state.stretchers[ch].process(&self.hybrid_state.rolling_scratch[ch])?
             };
             let skip = self.hybrid_state.tail_output_lens[ch].min(rendered.len());
             let delta_len = rendered.len().saturating_sub(skip);
@@ -1442,7 +1453,11 @@ impl StreamProcessor {
         Ok(())
     }
 
-    /// Enables or disables hybrid processing mode.
+    /// Enables or disables the legacy rolling-window hybrid re-render mode.
+    ///
+    /// This is equivalent to selecting
+    /// [`StreamingEngine::LegacyHybridRerender`] when enabled and
+    /// [`StreamingEngine::Deterministic`] when disabled.
     pub fn set_hybrid_mode(&mut self, enabled: bool) {
         if enabled && !self.use_hybrid {
             self.hybrid_state.reset(
@@ -1463,10 +1478,45 @@ impl StreamProcessor {
         self.use_hybrid
     }
 
+    /// Selects the streaming engine implementation.
+    ///
+    /// [`StreamingEngine::Deterministic`] is the recommended real-time path.
+    /// [`StreamingEngine::LegacyHybridRerender`] keeps the previous
+    /// rolling-window hybrid behavior as an explicit opt-in mode.
+    pub fn set_streaming_engine(&mut self, engine: StreamingEngine) {
+        match engine {
+            StreamingEngine::Deterministic => self.set_hybrid_mode(false),
+            StreamingEngine::LegacyHybridRerender => self.set_hybrid_mode(true),
+        }
+    }
+
+    /// Returns the currently selected streaming engine.
+    pub fn streaming_engine(&self) -> StreamingEngine {
+        if self.use_hybrid {
+            StreamingEngine::LegacyHybridRerender
+        } else {
+            StreamingEngine::Deterministic
+        }
+    }
+
+    /// Returns cumulative transient-reset telemetry for the current stream.
+    pub fn transient_reset_stats(&self) -> TransientResetStats {
+        let TransientSchedulerStats {
+            events_detected_total,
+            reset_band_counts_total,
+        } = self.transient_scheduler.stats();
+        TransientResetStats {
+            events_detected_total,
+            reset_band_counts_total,
+            input_frames_consumed_total: self.input_frames_consumed_total,
+        }
+    }
+
     /// Enables or disables strict realtime-safe behavior while hybrid mode is on.
     ///
     /// Strict mode routes processing through the preallocated PV stream path to
-    /// guarantee no heap growth in callbacks.
+    /// guarantee no heap growth in callbacks. This flag only matters when
+    /// [`StreamingEngine::LegacyHybridRerender`] is selected.
     pub fn set_hybrid_realtime_strict(&mut self, enabled: bool) {
         if self.hybrid_realtime_strict != enabled {
             self.hybrid_pending_rebase = true;
@@ -1560,7 +1610,6 @@ impl StreamProcessor {
     pub fn reset(&mut self) {
         self.input_ring.clear();
         self.pending_output.clear();
-        self.mid_buffer.clear();
         for buf in &mut self.channel_input_buffers {
             buf.clear();
         }
@@ -1572,7 +1621,8 @@ impl StreamProcessor {
         self.target_ratio = self.params.stretch_ratio;
         self.vocoder_ratio = self.params.stretch_ratio;
         self.initialized = false;
-        self.transient_prev_magnitudes.fill(0.0);
+        self.transient_scheduler.reset();
+        self.input_frames_consumed_total = 0;
 
         self.vocoders = Self::create_vocoders(&self.params, self.params.stretch_ratio);
         self.hybrid_state.reset(
@@ -1597,117 +1647,35 @@ impl StreamProcessor {
         }
     }
 
-    fn sync_stereo_phase_reset(&mut self, total_frames: usize) {
+    fn apply_transient_scheduled_phase_reset(&mut self, total_frames: usize) {
         if total_frames < self.params.fft_size {
             return;
         }
 
-        self.mid_buffer.clear();
-        if self.mid_buffer.capacity() < total_frames {
+        let total_samples = total_frames.saturating_mul(2);
+        if total_samples == 0 || total_samples > self.interleaved_scratch.len() {
             return;
         }
 
-        for i in 0..total_frames {
-            let left = self.interleaved_scratch[i * 2];
-            let right = self.interleaved_scratch[i * 2 + 1];
-            self.mid_buffer.push((left + right) * 0.5);
-        }
+        let stereo = &self.interleaved_scratch[..total_samples];
+        let Some(reset_mask) = self
+            .transient_scheduler
+            .detect_stereo_reset_mask(stereo, self.input_frames_consumed_total)
+        else {
+            return;
+        };
 
-        let hop = self.params.hop_size;
-        if hop == 0 || total_frames < self.params.fft_size + hop {
+        if self.params.stereo_mode == StereoMode::MidSide && self.vocoders.len() == 2 {
+            let (mid_mask, side_mask) = stereo_channel_reset_masks(reset_mask);
+            self.vocoders[0].reset_phase_state_bands(mid_mask, self.params.sample_rate);
+            if side_mask.iter().any(|&b| b) {
+                self.vocoders[1].reset_phase_state_bands(side_mask, self.params.sample_rate);
+            }
             return;
         }
 
-        let fft_size = self.params.fft_size;
-        let num_frames = (total_frames - fft_size) / hop + 1;
-        if num_frames < 2 {
-            return;
-        }
-
-        let num_bins = fft_size / 2 + 1;
-        if self.transient_fft_buffer.len() < fft_size
-            || self.transient_prev_magnitudes.len() < num_bins
-            || self.transient_window.len() < fft_size
-        {
-            return;
-        }
-        let transient_fft = std::sync::Arc::clone(&self.transient_fft);
-
-        let bin_hz = self.params.sample_rate as f64 / fft_size as f64;
-        let mid_start_bin = ((FLUX_MID_START_HZ / bin_hz).floor() as usize)
-            .max(1)
-            .min(num_bins.saturating_sub(1));
-        let high_start_bin = ((FLUX_HIGH_START_HZ / bin_hz).floor() as usize).min(num_bins);
-        self.transient_prev_magnitudes[..num_bins].fill(0.0);
-
-        // Prime previous magnitudes with the first analysis frame.
-        for i in 0..fft_size {
-            self.transient_fft_buffer[i] =
-                Complex::new(self.mid_buffer[i] * self.transient_window[i], 0.0);
-        }
-        transient_fft.process_with_scratch(
-            &mut self.transient_fft_buffer,
-            &mut self.transient_fft_scratch,
-        );
-        for bin in mid_start_bin..num_bins {
-            self.transient_prev_magnitudes[bin] = self.transient_fft_buffer[bin].norm();
-        }
-
-        let mut mean_flux = 0.0f64;
-        let mut var_flux = 0.0f64;
-        let mut prev_flux = 0.0f64;
-        let mut transient_detected = false;
-
-        for frame_idx in 1..num_frames {
-            let start = frame_idx * hop;
-            let frame = &self.mid_buffer[start..start + fft_size];
-            for (buf, (&s, &w)) in self.transient_fft_buffer[..fft_size]
-                .iter_mut()
-                .zip(frame.iter().zip(self.transient_window.iter()))
-            {
-                *buf = Complex::new(s * w, 0.0);
-            }
-            transient_fft.process_with_scratch(
-                &mut self.transient_fft_buffer,
-                &mut self.transient_fft_scratch,
-            );
-
-            let mut mid_flux = 0.0f64;
-            let mut high_flux = 0.0f64;
-            for bin in mid_start_bin..num_bins {
-                let mag = self.transient_fft_buffer[bin].norm();
-                let diff = (mag - self.transient_prev_magnitudes[bin]).max(0.0) as f64;
-                if bin >= high_start_bin {
-                    high_flux += diff;
-                } else {
-                    mid_flux += diff;
-                }
-                self.transient_prev_magnitudes[bin] = mag;
-            }
-
-            let flux = mid_flux + high_flux * FLUX_HIGH_WEIGHT;
-            if frame_idx >= FLUX_WARMUP_FRAMES {
-                let sigma = var_flux.max(0.0).sqrt();
-                let threshold = mean_flux + FLUX_THRESHOLD_SIGMA * sigma;
-                if flux > threshold
-                    && flux > prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
-                    && flux > FLUX_ABS_MIN
-                {
-                    transient_detected = true;
-                    break;
-                }
-            }
-
-            let delta = flux - mean_flux;
-            mean_flux += FLUX_EMA_ALPHA * delta;
-            var_flux += FLUX_EMA_ALPHA * (delta * delta - var_flux);
-            prev_flux = flux;
-        }
-
-        if transient_detected {
-            for voc in &mut self.vocoders {
-                voc.reset_phase_state_bands([false, false, true, true], self.params.sample_rate);
-            }
+        for vocoder in &mut self.vocoders {
+            vocoder.reset_phase_state_bands(reset_mask, self.params.sample_rate);
         }
     }
 
@@ -1732,6 +1700,17 @@ impl StreamProcessor {
     fn interpolate_ratio(&mut self) {
         self.interpolate_ratio_for_frames(COMMON_CALLBACK_FRAMES);
     }
+}
+
+/// Per-channel reset policy for stereo Mid/Side deterministic streaming.
+///
+/// Mid channel gets full transient reset mask. Side channel gets only
+/// mid/high resets to avoid unnecessary low-band phase disruption in width
+/// content while still allowing panned upper transients to re-lock.
+#[inline]
+fn stereo_channel_reset_masks(full_mask: [bool; 4]) -> ([bool; 4], [bool; 4]) {
+    let side_mask = [false, false, full_mask[2], full_mask[3]];
+    (full_mask, side_mask)
 }
 
 #[inline]
@@ -2296,6 +2275,62 @@ mod tests {
 
         proc.set_hybrid_mode(false);
         assert!(!proc.is_hybrid_mode());
+    }
+
+    #[test]
+    fn test_stream_processor_streaming_engine_default() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let proc = StreamProcessor::new(params);
+        assert_eq!(proc.streaming_engine(), StreamingEngine::Deterministic);
+    }
+
+    #[test]
+    fn test_stream_processor_streaming_engine_toggle() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+
+        proc.set_streaming_engine(StreamingEngine::LegacyHybridRerender);
+        assert_eq!(
+            proc.streaming_engine(),
+            StreamingEngine::LegacyHybridRerender
+        );
+        assert!(proc.is_hybrid_mode());
+
+        proc.set_streaming_engine(StreamingEngine::Deterministic);
+        assert_eq!(proc.streaming_engine(), StreamingEngine::Deterministic);
+        assert!(!proc.is_hybrid_mode());
+    }
+
+    #[test]
+    fn test_transient_reset_stats_start_zero() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44_100)
+            .with_channels(2);
+        let proc = StreamProcessor::new(params);
+        let stats = proc.transient_reset_stats();
+        assert_eq!(stats.events_detected_total, 0);
+        assert_eq!(stats.reset_band_counts_total, [0, 0, 0, 0]);
+        assert_eq!(stats.input_frames_consumed_total, 0);
+    }
+
+    #[test]
+    fn test_stereo_channel_reset_masks_mid_full_side_mid_high() {
+        let full = [true, true, true, true];
+        let (mid, side) = stereo_channel_reset_masks(full);
+        assert_eq!(mid, full);
+        assert_eq!(side, [false, false, true, true]);
+    }
+
+    #[test]
+    fn test_stereo_channel_reset_masks_preserves_selective_band_mask() {
+        let full = [false, true, false, true];
+        let (mid, side) = stereo_channel_reset_masks(full);
+        assert_eq!(mid, full);
+        assert_eq!(side, [false, false, false, true]);
     }
 
     #[test]

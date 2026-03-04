@@ -30,7 +30,7 @@
 //! For real-time use, feed audio in chunks via [`StreamProcessor`]:
 //!
 //! ```
-//! use timestretch::{StreamProcessor, StretchParams, EdmPreset};
+//! use timestretch::{EdmPreset, StreamProcessor, StreamingEngine, StretchParams};
 //!
 //! let params = StretchParams::new(1.0)
 //!     .with_preset(EdmPreset::DjBeatmatch)
@@ -38,6 +38,7 @@
 //!     .with_channels(1);
 //!
 //! let mut processor = StreamProcessor::new(params);
+//! processor.set_streaming_engine(StreamingEngine::Deterministic); // default
 //! // processor.process(&chunk) for each audio buffer
 //! // processor.set_stretch_ratio(1.05).unwrap() to change on the fly
 //! ```
@@ -60,7 +61,7 @@ pub use core::types::{
 };
 pub use core::window::WindowType;
 pub use error::StretchError;
-pub use stream::StreamProcessor;
+pub use stream::{StreamProcessor, StreamingEngine, TransientResetStats};
 pub use stretch::phase_locking::PhaseLockingMode;
 pub use stretch::stereo::StereoMode;
 

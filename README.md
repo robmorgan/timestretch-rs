@@ -75,7 +75,7 @@ let output = timestretch::stretch(&input, &params).unwrap();
 ### Real-Time Streaming
 
 ```rust
-use timestretch::{QualityMode, StreamProcessor, StretchParams, EdmPreset};
+use timestretch::{EdmPreset, QualityMode, StreamProcessor, StreamingEngine, StretchParams};
 
 let params = StretchParams::new(1.02)
     .with_preset(EdmPreset::DjBeatmatch)
@@ -84,7 +84,8 @@ let params = StretchParams::new(1.02)
     .with_quality_mode(QualityMode::Balanced);
 
 let mut processor = StreamProcessor::new(params);
-processor.set_hybrid_mode(true); // optional: persistent hybrid streaming path
+processor.set_streaming_engine(StreamingEngine::Deterministic); // default realtime path
+// processor.set_streaming_engine(StreamingEngine::LegacyHybridRerender); // optional legacy hybrid path
 let mut output_chunk = Vec::with_capacity(8192); // pre-allocate once
 
 // Feed chunks as they arrive from your audio driver
@@ -106,10 +107,11 @@ processor.flush_into(&mut remaining).unwrap();
 ### Tempo-Aware Streaming (DJ)
 
 ```rust
-use timestretch::StreamProcessor;
+use timestretch::{StreamProcessor, StreamingEngine};
 
 let mut processor = StreamProcessor::from_tempo(126.0, 128.0, 44100, 2);
-processor.set_hybrid_mode(true); // optional: higher-quality hybrid stream path
+processor.set_streaming_engine(StreamingEngine::Deterministic); // default
+// processor.set_streaming_engine(StreamingEngine::LegacyHybridRerender); // optional legacy path
 
 // Move the target deck tempo during playback
 processor.set_tempo(130.0);
@@ -351,8 +353,9 @@ See `benchmarks/README.md` for corpus setup and manifest/checksum requirements.
 - **`EdmPreset`** — enum of tuned parameter sets for EDM workflows
 - **`EnvelopePreset`** — formant/envelope profile (`Off`, `Balanced`, `Vocal`)
 - **`QualityMode`** — explicit streaming profile: `LowLatency` (lean path, HPSS off), `Balanced`, `MaxQuality` (HPSS + adaptive crossfade/phase-lock enabled)
+- **`StreamingEngine`** — streaming execution model: `Deterministic` (default) or `LegacyHybridRerender` (opt-in)
 - **`StreamProcessor`** — chunked real-time processor with on-the-fly ratio/tempo
-  changes, `from_tempo()`/`set_tempo()`, `process_into()`, and optional persistent hybrid mode
+  changes, `from_tempo()`/`set_tempo()`, `set_streaming_engine()`, and `process_into()`
 - **`PreAnalysisArtifact`** — serializable offline beat/onset analysis artifact
 - **`StretchError`** — error type covering invalid parameters, I/O failures,
   and input-too-short conditions

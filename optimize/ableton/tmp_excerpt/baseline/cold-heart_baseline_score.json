@@ -1,0 +1,16 @@
+{
+  "total_score": 57.174293518066406,
+  "metrics": {
+    "spectral_convergence": 49.21260070800781,
+    "log_spectral_distance": 34.342864990234375,
+    "mfcc_distance": 97.69541931152344,
+    "transient_preservation": 57.14285714285714
+  },
+  "raw": {
+    "sc": 0.5078740119934082,
+    "lsd": 10.481431007385254,
+    "mfcc_dist": 0.023045778274536133,
+    "tp": 0.5714285714285714
+  },
+  "stereo": false
+}

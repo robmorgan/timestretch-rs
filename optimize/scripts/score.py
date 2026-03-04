@@ -14,6 +14,50 @@ except ImportError:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OPTIMIZE_DIR = os.path.dirname(SCRIPT_DIR)
 REPO_ROOT = os.path.dirname(OPTIMIZE_DIR)
+ALIGN_ESTIMATE_MAX_POINTS = 6000
+
+
+def estimate_lag_samples(ref, test, max_lag_samples):
+    """
+    Estimate test-vs-ref lag in samples using downsampled cross-correlation.
+
+    Positive lag means `test` is delayed relative to `ref`.
+    """
+    n = min(len(ref), len(test))
+    if n <= 1 or max_lag_samples <= 0:
+        return 0, 1
+
+    stride = max(1, int(np.ceil(n / ALIGN_ESTIMATE_MAX_POINTS)))
+    ref_ds = ref[::stride]
+    test_ds = test[::stride]
+    if len(ref_ds) <= 1 or len(test_ds) <= 1:
+        return 0, stride
+
+    max_lag_ds = max(1, int(np.ceil(max_lag_samples / stride)))
+    corr = np.correlate(test_ds, ref_ds, mode='full')
+    center = len(ref_ds) - 1
+    lo = max(0, center - max_lag_ds)
+    hi = min(len(corr), center + max_lag_ds + 1)
+    if lo >= hi:
+        return 0, stride
+
+    lag_ds = int(np.argmax(corr[lo:hi]) + lo - center)
+    return int(lag_ds * stride), stride
+
+
+def align_pair_by_lag(ref, test, lag_samples):
+    """
+    Align `ref` and `test` by trimming heads based on lag sign.
+    """
+    if lag_samples > 0:
+        # test lags behind ref: drop lag from test
+        test = test[lag_samples:]
+    elif lag_samples < 0:
+        # test leads ref: drop lead from ref
+        ref = ref[-lag_samples:]
+
+    min_len = min(len(ref), len(test))
+    return ref[:min_len], test[:min_len]
 
 def calculate_spectral_convergence(ref, test):
     """
@@ -198,12 +242,20 @@ def calculate_panning_consistency(ref_L, ref_R, test_L, test_R, sr, hop_length=5
     return float(np.clip((correlation + 1.0) / 2.0, 0, 1))
 
 
-def score_pair(ref_path, test_path, weights, stereo=False):
+def score_pair(ref_path, test_path, weights, stereo=False, align_ms=0.0):
     # Load mono-downmixed for standard metrics
     ref, sr_ref = librosa.load(ref_path, sr=None, mono=True)
     test, sr_test = librosa.load(test_path, sr=sr_ref, mono=True)
 
-    # Trim to match
+    max_lag_samples = max(0, int(round(sr_ref * align_ms / 1000.0)))
+    lag_samples = 0
+    align_stride = 1
+    if max_lag_samples > 0:
+        lag_samples, align_stride = estimate_lag_samples(ref, test, max_lag_samples)
+        lag_samples = int(np.clip(lag_samples, -max_lag_samples, max_lag_samples))
+        ref, test = align_pair_by_lag(ref, test, lag_samples)
+
+    # Trim to final match
     min_len = min(len(ref), len(test))
     ref = ref[:min_len]
     test = test[:min_len]
@@ -291,10 +343,17 @@ def score_pair(ref_path, test_path, weights, stereo=False):
         )
 
     return {
-        "total_score": total_score,
-        "metrics": metrics,
-        "raw": raw,
-        "stereo": stereo
+        "total_score": float(total_score),
+        "metrics": {k: float(v) for k, v in metrics.items()},
+        "raw": {k: float(v) for k, v in raw.items()},
+        "stereo": bool(stereo),
+        "alignment": {
+            "enabled": bool(max_lag_samples > 0),
+            "lag_samples": int(lag_samples),
+            "lag_ms": float(1000.0 * lag_samples / sr_ref),
+            "max_lag_ms": float(align_ms),
+            "downsample_stride": int(align_stride),
+        },
     }
 
 def generate_spectrogram_diff(ref_path, test_path, out_path):
@@ -342,6 +401,8 @@ def main():
     parser.add_argument("--manifest", default="test_manifest.json", help="Path to manifest")
     parser.add_argument("--spectrogram-diff", nargs=3, metavar=('REF', 'TEST', 'OUT'), help="Generate diff plot")
     parser.add_argument("--baseline", metavar='OUTPUT_JSON', help="Score rubberband HQ vs medium refs (baseline)")
+    parser.add_argument("--align-ms", type=float, default=0.0,
+                        help="Optional max absolute lag (ms) for pair pre-alignment before scoring")
     parser.add_argument("--ref-source", choices=["rubberband", "ableton"], default="rubberband",
                         help="Reference source: rubberband (default) or ableton")
     parser.add_argument("--ableton-manifest", default=None,
@@ -379,7 +440,7 @@ def main():
                             weights[k] = float(v.split('#')[0].strip().replace(',', ''))
 
     if args.pair:
-        result = score_pair(args.pair[0], args.pair[1], weights)
+        result = score_pair(args.pair[0], args.pair[1], weights, align_ms=args.align_ms)
         print(json.dumps(result, indent=2))
         
     if args.spectrogram_diff:
@@ -425,7 +486,9 @@ def main():
                 if os.path.exists(ref_path) and os.path.exists(batch_test):
                     desc = entry.get('description', f"{track_id} @ {target_bpm} BPM")
                     print(f"Scoring [ableton] {desc}...", file=sys.stderr)
-                    res = score_pair(ref_path, batch_test, weights, stereo=is_stereo)
+                    res = score_pair(
+                        ref_path, batch_test, weights, stereo=is_stereo, align_ms=args.align_ms
+                    )
                     res['description'] = desc
                     res['ratio'] = ratio
                     res['mode'] = 'batch'
@@ -439,7 +502,9 @@ def main():
                 if os.path.exists(ref_path) and os.path.exists(stream_test):
                     desc = entry.get('description', f"{track_id} @ {target_bpm} BPM")
                     print(f"Scoring [ableton/streaming] {desc}...", file=sys.stderr)
-                    res = score_pair(ref_path, stream_test, weights, stereo=is_stereo)
+                    res = score_pair(
+                        ref_path, stream_test, weights, stereo=is_stereo, align_ms=args.align_ms
+                    )
                     res['description'] = f"{desc} [streaming]"
                     res['ratio'] = ratio
                     res['mode'] = 'streaming'
@@ -470,7 +535,9 @@ def main():
                     continue
 
                 print(f"Scoring {item['description']}...", file=sys.stderr)
-                res = score_pair(ref_path, test_path, weights, stereo=is_stereo)
+                res = score_pair(
+                    ref_path, test_path, weights, stereo=is_stereo, align_ms=args.align_ms
+                )
                 res['description'] = item['description']
                 res['ratio'] = ratio
                 res['mode'] = 'batch'
@@ -489,7 +556,9 @@ def main():
                     continue
 
                 print(f"Scoring [streaming] {item['description']}...", file=sys.stderr)
-                res = score_pair(ref_path, test_path, weights, stereo=is_stereo)
+                res = score_pair(
+                    ref_path, test_path, weights, stereo=is_stereo, align_ms=args.align_ms
+                )
                 res['description'] = f"{item['description']} [streaming]"
                 res['ratio'] = ratio
                 res['mode'] = 'streaming'
@@ -549,7 +618,9 @@ def main():
                 continue
 
             print(f"Baseline scoring {item['description']}...", file=sys.stderr)
-            res = score_pair(hq_path, med_path, weights, stereo=is_stereo)
+            res = score_pair(
+                hq_path, med_path, weights, stereo=is_stereo, align_ms=args.align_ms
+            )
             res['description'] = item['description']
             res['ratio'] = ratio
             results.append(res)
