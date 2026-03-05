@@ -2,7 +2,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use timestretch::{EdmPreset, StreamProcessor, StretchParams};
+use timestretch::{EdmPreset, RtConfig, RtProcessor, StreamProcessor, StretchParams};
 
 struct CountingAllocator;
 
@@ -225,6 +225,59 @@ fn process_into_hybrid_realtime_strict_no_heap_growth_after_warmup() {
         alloc_calls + realloc_calls,
         0,
         "strict hybrid process_into allocated: alloc_calls={}, realloc_calls={}, alloc_bytes={}, realloc_bytes={}",
+        alloc_calls,
+        realloc_calls,
+        alloc_bytes,
+        realloc_bytes
+    );
+}
+
+#[test]
+fn dual_plane_rt_process_block_no_heap_growth_after_warmup() {
+    let _guard = ALLOC_TEST_MUTEX
+        .lock()
+        .expect("allocation test mutex poisoned");
+    const SAMPLE_RATE: u32 = 44_100;
+    const CHANNELS: u32 = 2;
+    const CHUNK_FRAMES: usize = 256;
+    const WARMUP_ITERS: usize = 192;
+    const MEASURE_ITERS: usize = 96;
+
+    let params = StretchParams::new(1.04)
+        .with_sample_rate(SAMPLE_RATE)
+        .with_channels(CHANNELS)
+        .with_fft_size(1024)
+        .with_hop_size(256)
+        .with_preset(EdmPreset::DjBeatmatch);
+    let cfg = RtConfig::new(params, CHUNK_FRAMES);
+    let mut rt = RtProcessor::prepare(cfg).expect("rt prepare should succeed");
+
+    let chunk = test_chunk_stereo(CHUNK_FRAMES, SAMPLE_RATE as f32);
+    let max_samples = chunk.len() * (WARMUP_ITERS + MEASURE_ITERS) * 10;
+    let mut output = Vec::with_capacity(max_samples);
+
+    for _ in 0..WARMUP_ITERS {
+        output.clear();
+        rt.process_block(&chunk, &mut output)
+            .expect("warmup rt process_block should succeed");
+    }
+    output.clear();
+
+    begin_alloc_tracking();
+    for _ in 0..MEASURE_ITERS {
+        output.clear();
+        rt.process_block(&chunk, &mut output)
+            .expect("measured rt process_block should succeed");
+    }
+    output.clear();
+    rt.flush(&mut output)
+        .expect("rt flush after measured process should succeed");
+    let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
+
+    assert_eq!(
+        alloc_calls + realloc_calls,
+        0,
+        "dual-plane rt process_block allocated: alloc_calls={}, realloc_calls={}, alloc_bytes={}, realloc_bytes={}",
         alloc_calls,
         realloc_calls,
         alloc_bytes,

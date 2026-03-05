@@ -44,16 +44,24 @@ fn mono_to_stereo_interleaved(mono: &[f32]) -> Vec<f32> {
 struct BoundaryArtifactStats {
     max_ratio: f64,
     mean_ratio: f64,
+    p95_ratio: f64,
+    p98_ratio: f64,
+    p99_ratio: f64,
     evaluated_boundaries: usize,
 }
 
-fn p95(mut values: Vec<f64>) -> f64 {
+fn percentile(mut values: Vec<f64>, quantile: f64) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
     values.sort_by(f64::total_cmp);
-    let idx = (((values.len() - 1) as f64) * 0.95).round() as usize;
+    let q = quantile.clamp(0.0, 1.0);
+    let idx = (((values.len() - 1) as f64) * q).round() as usize;
     values[idx.min(values.len() - 1)]
+}
+
+fn p95(values: Vec<f64>) -> f64 {
+    percentile(values, 0.95)
 }
 
 fn boundary_artifact_stats(
@@ -69,6 +77,7 @@ fn boundary_artifact_stats(
     let mut max_ratio = 0.0f64;
     let mut sum_ratio = 0.0f64;
     let mut evaluated = 0usize;
+    let mut ratios = Vec::with_capacity(boundaries.len());
 
     for &boundary in boundaries {
         if boundary <= 1 || boundary >= signal.len() - 1 {
@@ -102,6 +111,7 @@ fn boundary_artifact_stats(
         max_ratio = max_ratio.max(ratio);
         sum_ratio += ratio;
         evaluated += 1;
+        ratios.push(ratio);
     }
 
     if evaluated == 0 {
@@ -111,6 +121,9 @@ fn boundary_artifact_stats(
     BoundaryArtifactStats {
         max_ratio,
         mean_ratio: sum_ratio / evaluated as f64,
+        p95_ratio: percentile(ratios.clone(), 0.95),
+        p98_ratio: percentile(ratios.clone(), 0.98),
+        p99_ratio: percentile(ratios, 0.99),
         evaluated_boundaries: evaluated,
     }
 }
@@ -420,8 +433,8 @@ fn quality_gate_streaming_worst_case_callback_budget() {
         );
         write_quality_dashboard_csv(
             "quality_gate_streaming_worst_case_callback_budget",
-            "status,max_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
-            "skipped,NaN,NaN,NaN,NaN,0,NaN,false",
+            "status,max_ratio,p99_ratio,p999_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
+            "skipped,NaN,NaN,NaN,NaN,NaN,NaN,0,NaN,false",
         );
         return;
     };
@@ -448,6 +461,7 @@ fn quality_gate_streaming_worst_case_callback_budget() {
     let mut max_budget_ms = 0.0f64;
     let mut total_process_ms = 0.0f64;
     let mut total_audio_ms = 0.0f64;
+    let mut callback_ratios = Vec::new();
 
     for chunk in input.chunks(callback_frames * 2).skip(8) {
         let chunk_frames = (chunk.len() / 2).max(1);
@@ -465,6 +479,7 @@ fn quality_gate_streaming_worst_case_callback_budget() {
         total_audio_ms += callback_audio_ms;
 
         let ratio = elapsed_ms / callback_audio_ms.max(1e-9);
+        callback_ratios.push(ratio);
         if ratio > max_ratio {
             max_ratio = ratio;
             max_callback_ms = elapsed_ms;
@@ -486,10 +501,14 @@ fn quality_gate_streaming_worst_case_callback_budget() {
     );
 
     let avg_ratio = total_process_ms / total_audio_ms.max(1e-9);
+    let p99_ratio = percentile(callback_ratios.clone(), 0.99);
+    let p999_ratio = percentile(callback_ratios, 0.999);
     println!(
-        "callback-budget: callbacks={} max_ratio={:.3} avg_ratio={:.3} max_ms={:.3} budget_ms={:.3} strict_mode={}",
+        "callback-budget: callbacks={} max_ratio={:.3} p99={:.3} p999={:.3} avg_ratio={:.3} max_ms={:.3} budget_ms={:.3} strict_mode={}",
         measured_callbacks,
         max_ratio,
+        p99_ratio,
+        p999_ratio,
         avg_ratio,
         max_callback_ms,
         max_budget_ms,
@@ -497,10 +516,12 @@ fn quality_gate_streaming_worst_case_callback_budget() {
     );
     write_quality_dashboard_csv(
         "quality_gate_streaming_worst_case_callback_budget",
-        "status,max_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
+        "status,max_ratio,p99_ratio,p999_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
         &format!(
-            "ok,{:.6},{:.6},{:.6},{:.6},{},{:.6},{}",
+            "ok,{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{}",
             max_ratio,
+            p99_ratio,
+            p999_ratio,
             avg_ratio,
             max_callback_ms,
             max_budget_ms,
@@ -510,6 +531,18 @@ fn quality_gate_streaming_worst_case_callback_budget() {
         ),
     );
 
+    assert!(
+        p99_ratio <= multiplier,
+        "callback budget p99 gate failed: p99 ratio {:.3} > {:.3}",
+        p99_ratio,
+        multiplier
+    );
+    assert!(
+        p999_ratio <= multiplier,
+        "callback budget p999 gate failed: p999 ratio {:.3} > {:.3}",
+        p999_ratio,
+        multiplier
+    );
     assert!(
         max_ratio <= multiplier,
         "callback budget gate failed: max callback ratio {:.3} > {:.3} (max callback {:.3}ms, budget {:.3}ms). Set {}=0 for relaxed mode or {} to tune.",
@@ -535,8 +568,8 @@ fn quality_gate_streaming_callback_budget_tempo_and_pitch_modulation() {
         );
         write_quality_dashboard_csv(
             "quality_gate_streaming_callback_budget_tempo_and_pitch_modulation",
-            "status,max_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
-            "skipped,NaN,NaN,NaN,NaN,0,NaN,false",
+            "status,max_ratio,p99_ratio,p999_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
+            "skipped,NaN,NaN,NaN,NaN,NaN,NaN,0,NaN,false",
         );
         return;
     };
@@ -568,6 +601,7 @@ fn quality_gate_streaming_callback_budget_tempo_and_pitch_modulation() {
     let mut max_budget_ms = 0.0f64;
     let mut total_process_ms = 0.0f64;
     let mut total_audio_ms = 0.0f64;
+    let mut callback_ratios = Vec::new();
 
     for (idx, chunk) in chunks.iter().enumerate() {
         let phase = idx as f64 / chunks.len().max(1) as f64;
@@ -593,6 +627,7 @@ fn quality_gate_streaming_callback_budget_tempo_and_pitch_modulation() {
         total_audio_ms += callback_audio_ms;
 
         let ratio = elapsed_ms / callback_audio_ms.max(1e-9);
+        callback_ratios.push(ratio);
         if ratio > max_ratio {
             max_ratio = ratio;
             max_callback_ms = elapsed_ms;
@@ -614,10 +649,14 @@ fn quality_gate_streaming_callback_budget_tempo_and_pitch_modulation() {
     );
 
     let avg_ratio = total_process_ms / total_audio_ms.max(1e-9);
+    let p99_ratio = percentile(callback_ratios.clone(), 0.99);
+    let p999_ratio = percentile(callback_ratios, 0.999);
     println!(
-        "callback-budget-tempo-pitch: callbacks={} max_ratio={:.3} avg_ratio={:.3} max_ms={:.3} budget_ms={:.3} strict_mode={}",
+        "callback-budget-tempo-pitch: callbacks={} max_ratio={:.3} p99={:.3} p999={:.3} avg_ratio={:.3} max_ms={:.3} budget_ms={:.3} strict_mode={}",
         measured_callbacks,
         max_ratio,
+        p99_ratio,
+        p999_ratio,
         avg_ratio,
         max_callback_ms,
         max_budget_ms,
@@ -625,10 +664,12 @@ fn quality_gate_streaming_callback_budget_tempo_and_pitch_modulation() {
     );
     write_quality_dashboard_csv(
         "quality_gate_streaming_callback_budget_tempo_and_pitch_modulation",
-        "status,max_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
+        "status,max_ratio,p99_ratio,p999_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
         &format!(
-            "ok,{:.6},{:.6},{:.6},{:.6},{},{:.6},{}",
+            "ok,{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{}",
             max_ratio,
+            p99_ratio,
+            p999_ratio,
             avg_ratio,
             max_callback_ms,
             max_budget_ms,
@@ -639,6 +680,18 @@ fn quality_gate_streaming_callback_budget_tempo_and_pitch_modulation() {
     );
 
     assert!(
+        p99_ratio <= multiplier,
+        "tempo+pitch callback budget p99 gate failed: p99 ratio {:.3} > {:.3}",
+        p99_ratio,
+        multiplier
+    );
+    assert!(
+        p999_ratio <= multiplier,
+        "tempo+pitch callback budget p999 gate failed: p999 ratio {:.3} > {:.3}",
+        p999_ratio,
+        multiplier
+    );
+    assert!(
         max_ratio <= multiplier,
         "tempo+pitch callback budget gate failed: max callback ratio {:.3} > {:.3} (max callback {:.3}ms, budget {:.3}ms). Set {}=0 for relaxed mode or {} to tune.",
         max_ratio,
@@ -647,5 +700,230 @@ fn quality_gate_streaming_callback_budget_tempo_and_pitch_modulation() {
         max_budget_ms,
         STRICT_CALLBACK_BUDGET_ENV,
         CALLBACK_BUDGET_MULTIPLIER_ENV
+    );
+}
+
+fn extract_left_channel(stereo_interleaved: &[f32]) -> Vec<f32> {
+    stereo_interleaved
+        .chunks_exact(2)
+        .map(|frame| frame[0])
+        .collect()
+}
+
+fn run_dual_plane_deterministic_with_ratio_modulation(
+    input: &[f32],
+    sample_rate: u32,
+    callback_frames: usize,
+    modulate: bool,
+) -> (Vec<f32>, Vec<usize>) {
+    let params = StretchParams::new(1.0)
+        .with_sample_rate(sample_rate)
+        .with_channels(2)
+        .with_fft_size(1024)
+        .with_hop_size(256)
+        .with_preset(EdmPreset::DjBeatmatch);
+    let mut processor = StreamProcessor::new(params);
+    processor
+        .set_dual_plane_deterministic(true)
+        .expect("dual-plane deterministic enable should succeed");
+
+    let chunk_samples = callback_frames * 2;
+    let chunks: Vec<&[f32]> = input.chunks(chunk_samples).collect();
+    let total_chunks = chunks.len().max(1);
+    let mut output = Vec::with_capacity((input.len() as f64 * 1.20) as usize + 32_768);
+    let mut boundaries = Vec::with_capacity(total_chunks + 1);
+
+    for (idx, chunk) in chunks.iter().enumerate() {
+        if modulate {
+            let phase = idx as f64 / total_chunks as f64;
+            let ratio = 1.0 + 0.04 * (2.0 * std::f64::consts::PI * phase * 11.0).sin();
+            processor
+                .set_stretch_ratio(ratio)
+                .expect("ratio modulation must stay in valid range");
+        }
+        processor
+            .process_into(chunk, &mut output)
+            .expect("dual-plane stream process_into failed");
+        boundaries.push(output.len() / 2);
+    }
+    processor
+        .flush_into(&mut output)
+        .expect("dual-plane stream flush_into failed");
+    boundaries.push(output.len() / 2);
+
+    (output, boundaries)
+}
+
+#[test]
+fn quality_gate_dual_plane_deterministic_long_run_drift() {
+    let sample_rate = 44_100u32;
+    let bpm = 126.0;
+    let ratio = 1.018;
+    let callback_frames = 256usize;
+
+    let mono = generate_gate_signal(sample_rate, bpm, 30.0);
+    let input = mono_to_stereo_interleaved(&mono);
+    let params = StretchParams::new(ratio)
+        .with_sample_rate(sample_rate)
+        .with_channels(2)
+        .with_fft_size(1024)
+        .with_hop_size(256)
+        .with_preset(EdmPreset::DjBeatmatch);
+    let mut processor = StreamProcessor::new(params.clone());
+    processor
+        .set_dual_plane_deterministic(true)
+        .expect("dual-plane deterministic enable should succeed");
+
+    let mut output = Vec::with_capacity((input.len() as f64 * (ratio + 0.2)) as usize + 65_536);
+    for chunk in input.chunks(callback_frames * 2) {
+        processor
+            .process_into(chunk, &mut output)
+            .expect("dual-plane long-run process_into failed");
+    }
+    processor
+        .flush_into(&mut output)
+        .expect("dual-plane long-run flush_into failed");
+
+    let expected_frames = params.output_length(input.len() / 2);
+    let actual_frames = output.len() / 2;
+    let drift_frames = actual_frames.abs_diff(expected_frames);
+    let drift_pct = drift_frames as f64 / expected_frames.max(1) as f64 * 100.0;
+
+    write_quality_dashboard_csv(
+        "quality_gate_dual_plane_deterministic_long_run_drift",
+        "expected_frames,actual_frames,drift_frames,drift_pct",
+        &format!(
+            "{},{},{},{:.6}",
+            expected_frames, actual_frames, drift_frames, drift_pct
+        ),
+    );
+
+    assert!(
+        drift_pct <= 0.25,
+        "dual-plane deterministic long-run drift gate failed: drift {:.4}% (expected_frames={}, actual_frames={})",
+        drift_pct,
+        expected_frames,
+        actual_frames
+    );
+}
+
+#[test]
+fn quality_gate_dual_plane_fast_modulation_artifacts() {
+    let sample_rate = 44_100u32;
+    let bpm = 126.0;
+    let callback_frames = 256usize;
+    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
+    let input = mono_to_stereo_interleaved(&mono);
+
+    let (baseline_out, baseline_boundaries) = run_dual_plane_deterministic_with_ratio_modulation(
+        &input,
+        sample_rate,
+        callback_frames,
+        false,
+    );
+    let (modulated_out, modulated_boundaries) = run_dual_plane_deterministic_with_ratio_modulation(
+        &input,
+        sample_rate,
+        callback_frames,
+        true,
+    );
+
+    assert!(
+        baseline_out.iter().all(|s| s.is_finite()),
+        "baseline dual-plane modulation gate produced non-finite samples"
+    );
+    assert!(
+        modulated_out.iter().all(|s| s.is_finite()),
+        "modulated dual-plane modulation gate produced non-finite samples"
+    );
+    assert!(
+        !baseline_out.is_empty() && !modulated_out.is_empty(),
+        "dual-plane modulation gate produced empty output"
+    );
+
+    let baseline_left = extract_left_channel(&baseline_out);
+    let modulated_left = extract_left_channel(&modulated_out);
+    let trim = 16usize;
+    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
+        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
+    } else {
+        baseline_boundaries.clone()
+    }
+    .into_iter()
+    .filter(|&p| p > 1 && p + 1 < baseline_left.len())
+    .collect();
+    let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
+        modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
+    } else {
+        modulated_boundaries.clone()
+    }
+    .into_iter()
+    .filter(|&p| p > 1 && p + 1 < modulated_left.len())
+    .collect();
+    let window = (sample_rate as f64 * 0.008).round() as usize; // +/-8ms
+    let guard = (sample_rate as f64 * 0.001).round() as usize; // +/-1ms
+    let baseline_stats =
+        boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
+    let modulated_stats =
+        boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
+    println!(
+        "dual-plane-fast-mod gate: baseline(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={})",
+        baseline_stats.max_ratio,
+        baseline_stats.p95_ratio,
+        baseline_stats.p98_ratio,
+        baseline_stats.p99_ratio,
+        baseline_stats.mean_ratio,
+        baseline_stats.evaluated_boundaries,
+        modulated_stats.max_ratio,
+        modulated_stats.p95_ratio,
+        modulated_stats.p98_ratio,
+        modulated_stats.p99_ratio,
+        modulated_stats.mean_ratio,
+        modulated_stats.evaluated_boundaries
+    );
+
+    write_quality_dashboard_csv(
+        "quality_gate_dual_plane_fast_modulation_artifacts",
+        "baseline_max,baseline_p95,baseline_p98,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_p99,modulated_mean,modulated_n",
+        &format!(
+            "{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
+            baseline_stats.max_ratio,
+            baseline_stats.p95_ratio,
+            baseline_stats.p98_ratio,
+            baseline_stats.p99_ratio,
+            baseline_stats.mean_ratio,
+            baseline_stats.evaluated_boundaries,
+            modulated_stats.max_ratio,
+            modulated_stats.p95_ratio,
+            modulated_stats.p98_ratio,
+            modulated_stats.p99_ratio,
+            modulated_stats.mean_ratio,
+            modulated_stats.evaluated_boundaries
+        ),
+    );
+
+    assert!(
+        baseline_stats.evaluated_boundaries >= 32 && modulated_stats.evaluated_boundaries >= 32,
+        "dual-plane modulation artifact gate evaluated too few boundaries (baseline={}, modulated={})",
+        baseline_stats.evaluated_boundaries,
+        modulated_stats.evaluated_boundaries
+    );
+    assert!(
+        modulated_stats.p95_ratio <= baseline_stats.p95_ratio * 2.2 + 0.8,
+        "dual-plane modulation artifact gate failed (p95): modulated {:.3} vs baseline {:.3}",
+        modulated_stats.p95_ratio,
+        baseline_stats.p95_ratio
+    );
+    assert!(
+        modulated_stats.p98_ratio <= baseline_stats.p98_ratio * 2.6 + 1.1,
+        "dual-plane modulation artifact gate failed (p98): modulated {:.3} vs baseline {:.3}",
+        modulated_stats.p98_ratio,
+        baseline_stats.p98_ratio
+    );
+    assert!(
+        modulated_stats.mean_ratio <= baseline_stats.mean_ratio * 2.0 + 0.9,
+        "dual-plane modulation artifact gate failed (mean): modulated {:.3} vs baseline {:.3}",
+        modulated_stats.mean_ratio,
+        baseline_stats.mean_ratio
     );
 }

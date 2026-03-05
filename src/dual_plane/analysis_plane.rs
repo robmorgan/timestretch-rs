@@ -3,9 +3,7 @@
 //! This worker performs heavier transient/beat/tonal analysis off the callback
 //! thread and publishes immutable snapshots to the RT plane.
 
-use crate::analysis::beat::detect_beats;
-use crate::analysis::frequency::{compute_band_energy, FrequencyBands};
-use crate::analysis::transient::{detect_transients_with_options, TransientDetectionOptions};
+use crate::analysis::adaptive_snapshot::analyze_adaptive_snapshot_mono;
 use crate::core::types::StretchParams;
 use crate::dual_plane::hints::RenderHints;
 use crate::dual_plane::rt::RtControlSender;
@@ -120,66 +118,18 @@ fn analyze_block(
         };
     }
 
-    let analysis_fft = params.fft_size.min(2048).max(256);
-    let analysis_hop = params.hop_size.min(512).max(64);
-    let transient_map = detect_transients_with_options(
-        &mono,
-        params.sample_rate,
-        analysis_fft,
-        analysis_hop,
-        params.transient_sensitivity,
-        TransientDetectionOptions::from_stretch_params(params),
-    );
-    let transient_mask = build_transient_mask(
-        mono.len(),
-        params.sample_rate,
-        params.transient_region_secs,
-        &transient_map.onsets,
-        &transient_map.strengths,
-    );
-    let duration_secs = mono.len() as f32 / params.sample_rate.max(1) as f32;
-    let transient_density = transient_map.onsets.len() as f32 / duration_secs.max(1e-3);
-    let transient_confidence = (transient_density / 8.0).clamp(0.0, 1.0);
-
-    let beat_confidence = if mono.len() >= params.sample_rate as usize {
-        let grid = detect_beats(&mono, params.sample_rate);
-        if grid.bpm > 0.0 && grid.beats.len() > 1 {
-            let beat_count = (grid.beats.len().min(16) as f32) / 16.0;
-            let bpm_center_error = ((grid.bpm - 128.0).abs() / 96.0).clamp(0.0, 1.0) as f32;
-            (beat_count * (1.0 - bpm_center_error)).clamp(0.0, 1.0)
-        } else {
-            0.0
-        }
-    } else {
-        0.0
-    };
-
-    let tonal_confidence = if mono.len() >= analysis_fft {
-        let (sub, low, mid, high) = compute_band_energy(
-            &mono[..analysis_fft],
-            analysis_fft,
-            params.sample_rate,
-            &FrequencyBands::default(),
-        );
-        let total = sub + low + mid + high + 1e-9;
-        ((sub + low + mid) / total).clamp(0.0, 1.0)
-    } else {
-        0.5
-    };
-    let noise_confidence = (1.0 - tonal_confidence).clamp(0.0, 1.0);
-    let lane_bias = [transient_confidence, tonal_confidence, noise_confidence];
+    let adaptive = analyze_adaptive_snapshot_mono(&mono, params);
 
     RenderHints {
         sequence,
         at_input_frame,
-        transient_confidence,
-        beat_confidence,
-        tonal_confidence,
-        noise_confidence,
-        lane_bias,
-        ratio_bias: ((beat_confidence as f64 - transient_confidence as f64) * 0.04)
-            .clamp(-0.08, 0.08),
-        transient_mask,
+        transient_confidence: adaptive.transient_confidence,
+        beat_confidence: adaptive.beat_confidence,
+        tonal_confidence: adaptive.tonal_confidence,
+        noise_confidence: adaptive.noise_confidence,
+        lane_bias: adaptive.lane_bias,
+        ratio_bias: adaptive.ratio_bias,
+        transient_mask: adaptive.transient_mask,
     }
 }
 
@@ -193,48 +143,9 @@ fn mix_to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
         .collect()
 }
 
-fn build_transient_mask(
-    input_len: usize,
-    sample_rate: u32,
-    transient_region_secs: f64,
-    onsets: &[usize],
-    strengths: &[f32],
-) -> Vec<f32> {
-    if input_len == 0 {
-        return Vec::new();
-    }
-
-    let mut mask = vec![0.0f32; input_len];
-    if onsets.is_empty() {
-        return mask;
-    }
-
-    let region_samples = (transient_region_secs * f64::from(sample_rate)).round() as usize;
-    let half_width = (region_samples / 2).max(8) as isize;
-
-    for (idx, &onset) in onsets.iter().enumerate() {
-        let center = onset.min(input_len.saturating_sub(1)) as isize;
-        let strength = strengths.get(idx).copied().unwrap_or(1.0).clamp(0.0, 1.0);
-        let start = (center - half_width).max(0) as usize;
-        let end = (center + half_width).min(input_len.saturating_sub(1) as isize) as usize;
-        for i in start..=end {
-            let dist = (i as isize - center).unsigned_abs() as f32 / half_width as f32;
-            let tri = (1.0 - dist).max(0.0) * strength;
-            mask[i] = mask[i].max(tri);
-        }
-    }
-
-    for i in 1..input_len {
-        let prev = mask[i - 1];
-        let cur = mask[i];
-        mask[i] = (0.7 * prev + 0.3 * cur).clamp(0.0, 1.0);
-    }
-    mask
-}
-
 #[cfg(test)]
 mod tests {
-    use super::build_transient_mask;
+    use crate::analysis::adaptive_snapshot::build_transient_mask;
 
     #[test]
     fn transient_mask_marks_onset_regions() {
