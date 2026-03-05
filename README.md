@@ -104,6 +104,31 @@ let mut remaining = Vec::with_capacity(8192);
 processor.flush_into(&mut remaining).unwrap();
 ```
 
+### Dual-Plane RT API
+
+```rust
+use std::sync::Arc;
+use timestretch::{RtConfig, RtProcessor, StretchParams, TimeWarpMap};
+
+let params = StretchParams::new(1.0)
+    .with_sample_rate(48_000)
+    .with_channels(2)
+    .with_fft_size(1024)
+    .with_hop_size(256);
+let cfg = RtConfig::new(params, 256); // fixed callback size
+let mut rt = RtProcessor::prepare(cfg).unwrap();
+let control = rt.control_sender();
+
+// Publish a warp-curve snapshot from a control thread.
+let warp = Arc::new(TimeWarpMap::from_ratio(1.02, 48_000).unwrap());
+let _ = control.publish_warp_map(warp);
+
+let mut out = Vec::with_capacity(8192);
+let in_block = vec![0.0_f32; 256 * 2];
+rt.process_block(&in_block, &mut out).unwrap();
+rt.flush(&mut out).unwrap();
+```
+
 ### Tempo-Aware Streaming (DJ)
 
 ```rust

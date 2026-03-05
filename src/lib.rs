@@ -47,6 +47,7 @@ use rustfft::{num_complex::Complex, FftPlanner};
 
 pub mod analysis;
 pub mod core;
+pub mod dual_plane;
 pub mod error;
 pub mod io;
 pub mod stream;
@@ -60,6 +61,10 @@ pub use core::types::{
     Sample, StretchParams, TransientThresholdPolicy,
 };
 pub use core::window::WindowType;
+pub use dual_plane::{
+    DualPlaneProcessor, LatencyProfile, QualityTier, RenderHints, RtConfig, RtControlSender,
+    RtProcessor, TimeWarpMap, WarpAnchor,
+};
 pub use error::StretchError;
 pub use stream::{StreamProcessor, StreamingEngine, TransientResetStats};
 pub use stretch::phase_locking::PhaseLockingMode;

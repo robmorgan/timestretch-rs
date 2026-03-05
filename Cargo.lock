@@ -269,6 +269,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "timestretch_rt"
+version = "0.1.0"
+dependencies = [
+ "timestretch",
+]
+
+[[package]]
 name = "toml"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"

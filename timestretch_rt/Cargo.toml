@@ -1,0 +1,10 @@
+[package]
+name = "timestretch_rt"
+version = "0.1.0"
+edition = "2021"
+description = "Hard-RT dual-plane facade for timestretch"
+license = "MIT"
+repository = "https://github.com/robmorgan/timestretch-rs"
+
+[dependencies]
+timestretch = { path = ".." }

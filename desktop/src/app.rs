@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use timestretch::{LatencyProfile, QualityTier};
 
 use crate::audio_engine::AudioEngine;
 use crate::decoder;
@@ -38,6 +39,7 @@ pub struct TimeStretchApp {
     pitch_semitones: f32,
     volume: f32,
     preset: PresetChoice,
+    latency_profile: LatencyProfile,
     target_bpm_text: String,
 
     // Error messages
@@ -82,6 +84,7 @@ impl TimeStretchApp {
             pitch_semitones: 0.0,
             volume: 0.8,
             preset: PresetChoice::DjBeatmatch,
+            latency_profile: LatencyProfile::Mix,
             target_bpm_text: String::new(),
             error_message: None,
         }
@@ -141,6 +144,8 @@ impl TimeStretchApp {
                     st.pitch_semitones = self.pitch_semitones;
                     st.volume = self.volume;
                     st.preset = self.preset;
+                    st.latency_profile = self.latency_profile;
+                    st.current_quality_tier = self.latency_profile.initial_tier();
                 }
 
                 self.source_audio = Some(samples);
@@ -266,6 +271,24 @@ impl TimeStretchApp {
         let mins = (secs / 60.0) as u32;
         let s = secs % 60.0;
         format!("{mins}:{s:05.2}")
+    }
+
+    fn latency_profile_label(profile: LatencyProfile) -> &'static str {
+        match profile {
+            LatencyProfile::Scratch => "Scratch",
+            LatencyProfile::Mix => "Mix",
+            LatencyProfile::Render => "Render",
+        }
+    }
+
+    fn quality_tier_label(tier: QualityTier) -> &'static str {
+        match tier {
+            QualityTier::Q0 => "Q0",
+            QualityTier::Q1 => "Q1",
+            QualityTier::Q2 => "Q2",
+            QualityTier::Q3 => "Q3",
+            QualityTier::Q4 => "Q4",
+        }
     }
 }
 
@@ -500,6 +523,47 @@ impl TimeStretchApp {
                         st.preset = self.preset;
                         st.preset_changed = true;
                     }
+                });
+                ui.end_row();
+
+                // Latency profile
+                ui.label("Latency Profile:");
+                ui.horizontal(|ui| {
+                    let old_profile = self.latency_profile;
+                    egui::ComboBox::from_id_salt("latency_profile_combo")
+                        .selected_text(Self::latency_profile_label(self.latency_profile))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.latency_profile,
+                                LatencyProfile::Scratch,
+                                Self::latency_profile_label(LatencyProfile::Scratch),
+                            );
+                            ui.selectable_value(
+                                &mut self.latency_profile,
+                                LatencyProfile::Mix,
+                                Self::latency_profile_label(LatencyProfile::Mix),
+                            );
+                            ui.selectable_value(
+                                &mut self.latency_profile,
+                                LatencyProfile::Render,
+                                Self::latency_profile_label(LatencyProfile::Render),
+                            );
+                        });
+                    if self.latency_profile != old_profile {
+                        let mut st = self.state.lock().unwrap();
+                        st.latency_profile = self.latency_profile;
+                        st.latency_profile_changed = true;
+                        st.current_quality_tier = self.latency_profile.initial_tier();
+                    }
+                });
+                ui.end_row();
+
+                // Current governor quality tier
+                let current_quality_tier = self.state.lock().unwrap().current_quality_tier;
+                ui.label("Quality Tier:");
+                ui.horizontal(|ui| {
+                    ui.monospace(Self::quality_tier_label(current_quality_tier));
+                    ui.label("(live)");
                 });
                 ui.end_row();
 
