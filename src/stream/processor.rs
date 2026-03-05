@@ -4,7 +4,7 @@ use crate::analysis::transient::{detect_transients_with_options, TransientDetect
 use crate::core::ring_buffer::RingBuffer;
 use crate::core::types::{QualityMode, StretchParams};
 use crate::core::window::WindowType;
-use crate::dual_plane::{DualPlaneProcessor, LatencyProfile, RtConfig, TimeWarpMap};
+use crate::dual_plane::{DualPlaneProcessor, LatencyProfile, RtConfig, RtProfileTelemetry};
 use crate::error::StretchError;
 use crate::stream::transient_scheduler::{TransientEventScheduler, TransientSchedulerStats};
 use crate::stretch::hybrid::HybridStretcher;
@@ -31,7 +31,6 @@ const LOW_LATENCY_TEMPO_HOP_SIZE: usize = LOW_LATENCY_TEMPO_FFT_SIZE / 4;
 const MAX_CALLBACK_FRAMES: usize = 1024;
 const MIN_CALLBACK_FRAMES: usize = 64;
 const COMMON_CALLBACK_FRAMES: usize = 256;
-const DUAL_PLANE_WARP_HORIZON_FRAMES: usize = 8192;
 /// Iteration slack for bounded dynamic loops in the real-time path.
 const LOOP_GUARD_SLACK: usize = 8;
 /// Cross-fade length (in samples) at hybrid streaming chunk boundaries.
@@ -106,14 +105,14 @@ fn apply_dual_plane_ratio(
     processor: &mut DualPlaneProcessor,
     ratio: f64,
 ) -> Result<(), StretchError> {
-    let map = std::sync::Arc::new(TimeWarpMap::from_ratio(
-        ratio,
-        DUAL_PLANE_WARP_HORIZON_FRAMES,
-    )?);
-    if !processor.publish_warp_map(map.clone()) {
-        processor.rt_mut().set_warp_map_snapshot(map);
-    }
+    let ratio = validate_positive_finite_ratio(ratio, "dual-plane ratio")?;
+    processor.rt_mut().set_constant_ratio(ratio);
     Ok(())
+}
+
+#[inline]
+fn dual_plane_supports_pitch_scale(scale: f64) -> bool {
+    scale.is_finite() && scale > 0.0
 }
 
 /// Persistent hybrid-streaming state.
@@ -376,6 +375,7 @@ struct DualPlaneDeterministicState {
     block_frames: usize,
     input_planar: Vec<Vec<f32>>,
     output_planar: Vec<Vec<f32>>,
+    flush_interleaved: Vec<f32>,
     last_ratio: f64,
 }
 
@@ -384,6 +384,8 @@ impl DualPlaneDeterministicState {
         let block_frames = COMMON_CALLBACK_FRAMES;
         let mut rt_cfg = RtConfig::new(params.clone(), block_frames);
         rt_cfg.latency_profile = latency_profile_for_quality(params.quality_mode);
+        rt_cfg.auto_profile_switching = true;
+        rt_cfg.profile_switch_hysteresis_blocks = 6;
         rt_cfg.min_ratio = 0.05;
         rt_cfg.max_ratio = 8.0;
         let max_output_frames = ((rt_cfg.kernel_frames as f64 * rt_cfg.max_ratio).ceil() as usize)
@@ -401,6 +403,7 @@ impl DualPlaneDeterministicState {
             output_planar: (0..num_channels)
                 .map(|_| vec![0.0; max_output_frames])
                 .collect(),
+            flush_interleaved: Vec::with_capacity(max_output_frames.saturating_mul(num_channels)),
             last_ratio: ratio,
         })
     }
@@ -463,7 +466,9 @@ pub struct StreamProcessor {
     pitch_resamplers: Vec<LinearResamplerState>,
     /// Reusable per-channel output buffers for pitch-resampled data.
     pitch_output_buffers: Vec<Vec<f32>>,
-    /// Optional dual-plane deterministic backend state.
+    /// Whether deterministic mode prefers the dual-plane backend.
+    dual_plane_preferred: bool,
+    /// Optional active dual-plane deterministic backend state.
     dual_plane_deterministic: Option<DualPlaneDeterministicState>,
 }
 
@@ -481,6 +486,7 @@ impl std::fmt::Debug for StreamProcessor {
                 "dual_plane_deterministic",
                 &self.dual_plane_deterministic.is_some(),
             )
+            .field("dual_plane_preferred", &self.dual_plane_preferred)
             .field("source_bpm", &self.source_bpm)
             .field("input_ring_len", &self.input_ring.len())
             .field("pending_output_len", &self.pending_output.len())
@@ -518,7 +524,7 @@ impl StreamProcessor {
             capacity_frames_per_channel,
         );
 
-        Self {
+        let mut me = Self {
             params,
             capacity_frames_per_channel,
             input_ring: RingBuffer::with_capacity(capacity_samples),
@@ -547,7 +553,36 @@ impl StreamProcessor {
             pitch_output_buffers: (0..num_channels)
                 .map(|_| Vec::with_capacity(pitch_output_capacity_frames))
                 .collect(),
+            dual_plane_preferred: true,
             dual_plane_deterministic: None,
+        };
+        me.ensure_default_dual_plane_backend();
+        me
+    }
+
+    #[inline]
+    fn is_fresh_stream(&self) -> bool {
+        !self.initialized && self.input_ring.is_empty() && self.pending_output.is_empty()
+    }
+
+    #[inline]
+    fn should_activate_dual_plane(&self) -> bool {
+        self.dual_plane_preferred
+            && !self.use_hybrid
+            && dual_plane_supports_pitch_scale(self.pitch_scale)
+    }
+
+    fn ensure_default_dual_plane_backend(&mut self) {
+        if self.dual_plane_deterministic.is_some() || !self.should_activate_dual_plane() {
+            return;
+        }
+        if !self.is_fresh_stream() {
+            return;
+        }
+        if let Ok(state) =
+            DualPlaneDeterministicState::from_params(&self.params, self.processing_ratio())
+        {
+            self.dual_plane_deterministic = Some(state);
         }
     }
 
@@ -602,11 +637,6 @@ impl StreamProcessor {
         self.initialized = true;
 
         if self.dual_plane_deterministic.is_some() && !self.use_hybrid {
-            if (self.pitch_scale - 1.0).abs() > RATIO_SNAP_THRESHOLD {
-                return Err(StretchError::InvalidState(
-                    "dual-plane deterministic backend does not support pitch_scale != 1.0",
-                ));
-            }
             return self.process_into_dual_plane(input, output);
         }
 
@@ -685,11 +715,6 @@ impl StreamProcessor {
     pub fn flush_into(&mut self, output: &mut Vec<f32>) -> Result<usize, StretchError> {
         let before = output.len();
         if self.dual_plane_deterministic.is_some() && !self.use_hybrid {
-            if (self.pitch_scale - 1.0).abs() > RATIO_SNAP_THRESHOLD {
-                return Err(StretchError::InvalidState(
-                    "dual-plane deterministic backend does not support pitch_scale != 1.0",
-                ));
-            }
             let written = self.flush_into_dual_plane(output)?;
             self.expected_total_output_samples = 0.0;
             self.total_output_emitted_samples = 0;
@@ -853,8 +878,13 @@ impl StreamProcessor {
             self.interpolate_ratio_for_frames(frames);
             self.expected_total_output_samples +=
                 (frames * num_channels) as f64 * self.current_ratio;
+            let processing_ratio = self.processing_ratio();
             let produced_frames = {
-                let Some(state) = self.dual_plane_deterministic.as_mut() else {
+                let (channel_output_buffers, dual_plane_state) = (
+                    &mut self.channel_output_buffers,
+                    &mut self.dual_plane_deterministic,
+                );
+                let Some(state) = dual_plane_state.as_mut() else {
                     return Err(StretchError::InvalidState(
                         "dual-plane deterministic state became unavailable",
                     ));
@@ -866,9 +896,14 @@ impl StreamProcessor {
                         "dual-plane planar buffers do not match channel count",
                     ));
                 }
-                if (self.current_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
-                    apply_dual_plane_ratio(&mut state.processor, self.current_ratio)?;
-                    state.last_ratio = self.current_ratio;
+                if channel_output_buffers.len() < num_channels {
+                    return Err(StretchError::InvalidState(
+                        "channel output buffers do not match channel count",
+                    ));
+                }
+                if (processing_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
+                    apply_dual_plane_ratio(&mut state.processor, processing_ratio)?;
+                    state.last_ratio = processing_ratio;
                 }
 
                 for frame in 0..frames {
@@ -878,11 +913,13 @@ impl StreamProcessor {
                     }
                 }
 
-                if num_channels == 1 {
+                let produced_frames = if num_channels == 1 {
                     let input_refs = [&state.input_planar[0][..frames]];
                     let mut output_refs = [state.output_planar[0].as_mut_slice()];
-                    let (_consumed, produced) =
-                        state.processor.process(&input_refs, &mut output_refs);
+                    let (_consumed, produced) = state
+                        .processor
+                        .rt_mut()
+                        .process(&input_refs, &mut output_refs);
                     produced
                 } else if num_channels == 2 {
                     let input_refs = [
@@ -891,8 +928,10 @@ impl StreamProcessor {
                     ];
                     let (left_out, right_out) = state.output_planar.split_at_mut(1);
                     let mut output_refs = [left_out[0].as_mut_slice(), right_out[0].as_mut_slice()];
-                    let (_consumed, produced) =
-                        state.processor.process(&input_refs, &mut output_refs);
+                    let (_consumed, produced) = state
+                        .processor
+                        .rt_mut()
+                        .process(&input_refs, &mut output_refs);
                     produced
                 } else {
                     let input_refs: Vec<&[f32]> = state
@@ -907,48 +946,52 @@ impl StreamProcessor {
                         .take(num_channels)
                         .map(|channel| channel.as_mut_slice())
                         .collect();
-                    let (_consumed, produced) =
-                        state.processor.process(&input_refs, &mut output_refs);
+                    let (_consumed, produced) = state
+                        .processor
+                        .rt_mut()
+                        .process(&input_refs, &mut output_refs);
                     produced
-                }
-            };
+                };
 
-            let produced_samples = produced_frames.saturating_mul(num_channels);
-            let available = output.capacity().saturating_sub(output.len());
-            if produced_samples > available {
-                return Err(StretchError::BufferOverflow {
-                    buffer: "process_into_output",
-                    requested: produced_samples,
-                    available,
-                });
-            }
-            let Some(state) = self.dual_plane_deterministic.as_ref() else {
-                return Err(StretchError::InvalidState(
-                    "dual-plane deterministic state became unavailable",
-                ));
-            };
-            for frame in 0..produced_frames {
                 for ch in 0..num_channels {
-                    output.push(state.output_planar[ch][frame]);
+                    if channel_output_buffers[ch].capacity() < produced_frames {
+                        return Err(StretchError::BufferOverflow {
+                            buffer: "stream_channel_output",
+                            requested: produced_frames,
+                            available: channel_output_buffers[ch].capacity(),
+                        });
+                    }
+                    if state.output_planar[ch].len() < produced_frames {
+                        return Err(StretchError::InvalidState(
+                            "dual-plane output planar shorter than produced frame count",
+                        ));
+                    }
+                    channel_output_buffers[ch].clear();
+                    channel_output_buffers[ch]
+                        .extend_from_slice(&state.output_planar[ch][..produced_frames]);
                 }
-            }
-            self.total_output_emitted_samples = self
-                .total_output_emitted_samples
-                .saturating_add(produced_samples);
+                produced_frames
+            };
 
+            if produced_frames > 0 {
+                self.emit_channel_output_to_pending(produced_frames, num_channels)?;
+                let _ = self.drain_pending_to_output(output)?;
+            }
             offset += frames * num_channels;
         }
 
         if input.is_empty() {
             self.interpolate_ratio_for_frames(COMMON_CALLBACK_FRAMES);
+            let processing_ratio = self.processing_ratio();
             if let Some(state) = self.dual_plane_deterministic.as_mut() {
-                if (self.current_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
-                    apply_dual_plane_ratio(&mut state.processor, self.current_ratio)?;
-                    state.last_ratio = self.current_ratio;
+                if (processing_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
+                    apply_dual_plane_ratio(&mut state.processor, processing_ratio)?;
+                    state.last_ratio = processing_ratio;
                 }
             }
         }
 
+        let _ = self.drain_pending_to_output(output)?;
         Ok(())
     }
 
@@ -959,19 +1002,102 @@ impl StreamProcessor {
             ));
         };
 
+        let num_channels = self.params.channels.count().max(1);
         let before = output.len();
-        {
+        let flushed_samples = {
             let Some(state) = self.dual_plane_deterministic.as_mut() else {
                 return Err(StretchError::InvalidState(
                     "dual-plane deterministic state became unavailable",
                 ));
             };
-            state.processor.flush(output)?;
+            state.flush_interleaved.clear();
+            state.processor.flush(&mut state.flush_interleaved)?;
+            state.flush_interleaved.len()
+        };
+
+        if !flushed_samples.is_multiple_of(num_channels) {
+            return Err(StretchError::InvalidState(
+                "dual-plane flush emitted non-interleaved sample count",
+            ));
         }
-        let written = output.len().saturating_sub(before);
-        self.total_output_emitted_samples =
-            self.total_output_emitted_samples.saturating_add(written);
-        Ok(written)
+
+        let max_chunk_frames = self
+            .channel_output_buffers
+            .iter()
+            .take(num_channels)
+            .map(|buf| buf.capacity())
+            .min()
+            .unwrap_or(0);
+        if max_chunk_frames == 0 && flushed_samples > 0 {
+            return Err(StretchError::BufferOverflow {
+                buffer: "stream_channel_output",
+                requested: 1,
+                available: 0,
+            });
+        }
+
+        let total_frames = flushed_samples / num_channels;
+        let mut offset = 0usize;
+        let mut iterations = 0usize;
+        let max_iterations = total_frames
+            .saturating_add(max_chunk_frames.saturating_sub(1))
+            .saturating_div(max_chunk_frames.max(1))
+            .saturating_add(LOOP_GUARD_SLACK);
+        while offset < flushed_samples {
+            iterations = iterations.saturating_add(1);
+            if iterations > max_iterations {
+                return Err(StretchError::InvalidState(
+                    "dual-plane flush chunking iteration bound exceeded",
+                ));
+            }
+
+            let remaining_frames = (flushed_samples - offset) / num_channels;
+            let chunk_frames = remaining_frames.min(max_chunk_frames.max(1));
+            if chunk_frames == 0 {
+                return Err(StretchError::InvalidState(
+                    "dual-plane flush chunking made zero progress",
+                ));
+            }
+
+            {
+                let (channel_output_buffers, dual_plane_state) = (
+                    &mut self.channel_output_buffers,
+                    &mut self.dual_plane_deterministic,
+                );
+                let Some(state) = dual_plane_state.as_mut() else {
+                    return Err(StretchError::InvalidState(
+                        "dual-plane deterministic state became unavailable",
+                    ));
+                };
+
+                for ch in 0..num_channels {
+                    if channel_output_buffers[ch].capacity() < chunk_frames {
+                        return Err(StretchError::BufferOverflow {
+                            buffer: "stream_channel_output",
+                            requested: chunk_frames,
+                            available: channel_output_buffers[ch].capacity(),
+                        });
+                    }
+                    channel_output_buffers[ch].clear();
+                }
+
+                for frame in 0..chunk_frames {
+                    let base = offset + frame * num_channels;
+                    for ch in 0..num_channels {
+                        channel_output_buffers[ch].push(state.flush_interleaved[base + ch]);
+                    }
+                }
+            }
+
+            self.emit_channel_output_to_pending(chunk_frames, num_channels)?;
+            let _ = self.drain_pending_to_output(output)?;
+            offset += chunk_frames * num_channels;
+        }
+
+        self.flush_pitch_resampler_to_pending(num_channels)?;
+        self.reset_pitch_resamplers();
+        let _ = self.drain_pending_to_output(output)?;
+        Ok(output.len().saturating_sub(before))
     }
 
     fn push_input_samples(&mut self, input: &[f32]) -> Result<(), StretchError> {
@@ -1715,6 +1841,9 @@ impl StreamProcessor {
             self.reset_pitch_resamplers();
         }
         self.use_hybrid = enabled;
+        if !enabled {
+            self.ensure_default_dual_plane_backend();
+        }
     }
 
     /// Returns whether hybrid processing mode is enabled.
@@ -1743,27 +1872,25 @@ impl StreamProcessor {
         }
     }
 
-    /// Enables or disables the dual-plane backend for deterministic mode.
+    /// Explicitly enables or disables dual-plane backend preference for deterministic mode.
     ///
-    /// This opt-in currently supports stretch-ratio control with
-    /// `pitch_scale == 1.0` only. Enable before streaming begins.
+    /// Change before streaming begins.
     pub fn set_dual_plane_deterministic(&mut self, enabled: bool) -> Result<(), StretchError> {
-        if enabled == self.dual_plane_deterministic.is_some() {
-            return Ok(());
-        }
-        if self.initialized || !self.input_ring.is_empty() || !self.pending_output.is_empty() {
+        if !self.is_fresh_stream() {
             return Err(StretchError::InvalidState(
                 "set_dual_plane_deterministic requires a fresh stream (call reset first)",
             ));
         }
 
+        self.dual_plane_preferred = enabled;
         if enabled {
-            if (self.pitch_scale - 1.0).abs() > RATIO_SNAP_THRESHOLD {
+            if !dual_plane_supports_pitch_scale(self.pitch_scale) {
                 return Err(StretchError::InvalidState(
-                    "dual-plane deterministic backend requires pitch_scale == 1.0",
+                    "dual-plane deterministic backend requires finite positive pitch_scale",
                 ));
             }
-            let state = DualPlaneDeterministicState::from_params(&self.params, self.target_ratio)?;
+            let state =
+                DualPlaneDeterministicState::from_params(&self.params, self.processing_ratio())?;
             self.dual_plane_deterministic = Some(state);
         } else {
             self.dual_plane_deterministic = None;
@@ -1774,6 +1901,53 @@ impl StreamProcessor {
     /// Returns whether deterministic processing is delegated to dual-plane RT.
     pub fn is_dual_plane_deterministic(&self) -> bool {
         self.dual_plane_deterministic.is_some()
+    }
+
+    /// Sets the deterministic dual-plane latency profile.
+    pub fn set_deterministic_latency_profile(
+        &mut self,
+        profile: LatencyProfile,
+    ) -> Result<(), StretchError> {
+        if self.use_hybrid {
+            return Err(StretchError::InvalidState(
+                "deterministic latency profile is unavailable in legacy hybrid mode",
+            ));
+        }
+        self.ensure_default_dual_plane_backend();
+        let Some(state) = self.dual_plane_deterministic.as_mut() else {
+            return Err(StretchError::InvalidState(
+                "dual-plane deterministic backend is unavailable",
+            ));
+        };
+        state.processor.set_latency_profile(profile);
+        Ok(())
+    }
+
+    /// Enables or disables deterministic dual-plane auto profile switching.
+    pub fn set_deterministic_auto_profile_switching(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), StretchError> {
+        if self.use_hybrid {
+            return Err(StretchError::InvalidState(
+                "deterministic auto profile switching is unavailable in legacy hybrid mode",
+            ));
+        }
+        self.ensure_default_dual_plane_backend();
+        let Some(state) = self.dual_plane_deterministic.as_mut() else {
+            return Err(StretchError::InvalidState(
+                "dual-plane deterministic backend is unavailable",
+            ));
+        };
+        state.processor.set_auto_profile_switching(enabled);
+        Ok(())
+    }
+
+    /// Returns deterministic dual-plane profile telemetry when active.
+    pub fn deterministic_profile_telemetry(&self) -> Option<RtProfileTelemetry> {
+        self.dual_plane_deterministic
+            .as_ref()
+            .map(|state| state.processor.profile_telemetry())
     }
 
     /// Returns cumulative transient-reset telemetry for the current stream.
@@ -1825,16 +1999,14 @@ impl StreamProcessor {
     /// stream per channel by `1.0 / pitch_scale` to preserve target tempo.
     pub fn set_pitch_scale(&mut self, scale: f64) -> Result<(), StretchError> {
         let scale = validate_positive_finite_ratio(scale, "pitch scale")?;
-        if self.dual_plane_deterministic.is_some() && (scale - 1.0).abs() > RATIO_SNAP_THRESHOLD {
-            return Err(StretchError::InvalidState(
-                "dual-plane deterministic backend does not support pitch_scale != 1.0",
-            ));
-        }
         if (scale - self.pitch_scale).abs() > RATIO_SNAP_THRESHOLD {
             self.hybrid_pending_rebase = true;
             self.reset_pitch_resamplers();
         }
         self.pitch_scale = scale;
+        if dual_plane_supports_pitch_scale(scale) {
+            self.ensure_default_dual_plane_backend();
+        }
         Ok(())
     }
 
@@ -1918,11 +2090,8 @@ impl StreamProcessor {
         self.pitch_scale = 1.0;
         self.reset_pitch_resamplers();
 
-        if self.dual_plane_deterministic.is_some() {
-            self.dual_plane_deterministic =
-                DualPlaneDeterministicState::from_params(&self.params, self.params.stretch_ratio)
-                    .ok();
-        }
+        self.dual_plane_deterministic = None;
+        self.ensure_default_dual_plane_backend();
     }
 
     fn update_vocoder_ratio(&mut self) {
@@ -2574,6 +2743,7 @@ mod tests {
             .with_channels(1);
         let proc = StreamProcessor::new(params);
         assert_eq!(proc.streaming_engine(), StreamingEngine::Deterministic);
+        assert!(proc.is_dual_plane_deterministic());
     }
 
     #[test]
@@ -2601,11 +2771,11 @@ mod tests {
             .with_sample_rate(44_100)
             .with_channels(2);
         let mut proc = StreamProcessor::new(params);
-        assert!(!proc.is_dual_plane_deterministic());
-        proc.set_dual_plane_deterministic(true).unwrap();
         assert!(proc.is_dual_plane_deterministic());
         proc.set_dual_plane_deterministic(false).unwrap();
         assert!(!proc.is_dual_plane_deterministic());
+        proc.set_dual_plane_deterministic(true).unwrap();
+        assert!(proc.is_dual_plane_deterministic());
     }
 
     #[test]
@@ -2621,14 +2791,54 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_processor_dual_plane_deterministic_rejects_pitch_scale() {
+    fn test_stream_processor_dual_plane_deterministic_accepts_pitch_scale() {
         let params = StretchParams::new(1.02)
             .with_sample_rate(44_100)
             .with_channels(2);
         let mut proc = StreamProcessor::new(params);
-        proc.set_dual_plane_deterministic(true).unwrap();
-        let err = proc.set_pitch_scale(1.05).unwrap_err();
-        assert!(matches!(err, StretchError::InvalidState(_)));
+        assert!(proc.is_dual_plane_deterministic());
+        proc.set_pitch_scale(1.05).unwrap();
+        assert!(proc.is_dual_plane_deterministic());
+    }
+
+    #[test]
+    fn test_stream_processor_dual_plane_deterministic_keeps_backend_on_pitch_scale_after_stream_start(
+    ) {
+        let params = StretchParams::new(1.02)
+            .with_sample_rate(44_100)
+            .with_channels(2);
+        let mut proc = StreamProcessor::new(params);
+        let input = vec![0.0f32; 256 * 2];
+        let _ = proc.process(&input).unwrap();
+        proc.set_pitch_scale(1.05).unwrap();
+        assert!(proc.is_dual_plane_deterministic());
+    }
+
+    #[test]
+    fn test_stream_processor_dual_plane_profile_telemetry_available() {
+        let params = StretchParams::new(1.02)
+            .with_sample_rate(44_100)
+            .with_channels(2);
+        let proc = StreamProcessor::new(params);
+        let telemetry = proc
+            .deterministic_profile_telemetry()
+            .expect("dual-plane telemetry should be available by default");
+        assert!(telemetry.auto_switching_enabled);
+    }
+
+    #[test]
+    fn test_stream_processor_set_deterministic_latency_profile() {
+        let params = StretchParams::new(1.02)
+            .with_sample_rate(44_100)
+            .with_channels(2);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_deterministic_latency_profile(LatencyProfile::Scratch)
+            .unwrap();
+        let telemetry = proc
+            .deterministic_profile_telemetry()
+            .expect("dual-plane telemetry should be available");
+        assert_eq!(telemetry.target_profile, LatencyProfile::Scratch);
+        assert!(!telemetry.auto_switching_enabled);
     }
 
     #[test]

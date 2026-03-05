@@ -11,7 +11,8 @@
   - Hard-RT callback plane.
   - Strict API: `prepare()`, `process_block()`, `flush()`.
   - Fixed-capacity rings and preallocated lane buffers.
-  - Poll-only control updates (`try_recv`) and no blocking calls.
+  - Lock-free control snapshot reads (RCU-style latest-value) and no blocking calls.
+  - Optional stem-aware lane weighting path (feature-gated in `RtConfig`, off by default).
 - `src/dual_plane/analysis_plane.rs`
   - Async analysis workers.
   - Computes transient, beat, tonal/noise confidence and publishes snapshots.
@@ -29,7 +30,7 @@
 - Audio callback thread:
   - Calls `RtProcessor::process_block`.
   - Runs fixed-size kernel pass at most once per callback.
-  - Consumes latest snapshots via lock-free `try_recv`.
+  - Consumes latest snapshots via lock-free atomic `Arc` loads.
 - Analysis worker thread(s):
   - Receives copied analysis jobs.
   - Computes hints and publishes immutable `Arc<RenderHints>`.

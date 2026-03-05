@@ -63,7 +63,7 @@ pub use core::types::{
 pub use core::window::WindowType;
 pub use dual_plane::{
     DualPlaneProcessor, LatencyProfile, QualityTier, RenderHints, RtConfig, RtControlSender,
-    RtProcessor, TimeWarpMap, WarpAnchor,
+    RtProcessor, RtProfileTelemetry, TimeWarpMap, WarpAnchor,
 };
 pub use error::StretchError;
 pub use stream::{StreamProcessor, StreamingEngine, TransientResetStats};

@@ -1,6 +1,7 @@
 # Implementation Plan
 
 Date: 2026-02-28
+Last Updated: 2026-03-05
 
 ## Goals
 - Reach professional-grade hybrid time-stretch quality for EDM/house and DJ beatmatching.
@@ -128,3 +129,68 @@ Notes:
 ## Next Tasks
 - [x] Reduce remaining transient timing deltas on `tone_stack` cases (especially 0.50x and 4.00x) in `quality_report.csv`.
 - [x] Tighten high-band leakage in vocal envelope mode (`delta_unexpected_energy_vocal_minus_off`).
+
+## Phase D - Dual-Plane Migration Completion (Open)
+
+### D1. Make Dual-Plane Deterministic the Default Runtime
+- [x] Route `StreamingEngine::Deterministic` through `DualPlaneProcessor` by default (remove opt-in toggle requirement).
+- [x] Preserve legacy path only behind explicit `StreamingEngine::LegacyHybridRerender`.
+- [x] Keep behavior-compatible fallback for unsupported deterministic features until parity is complete.
+
+Acceptance:
+- New `StreamProcessor` instances use dual-plane deterministic backend without calling `set_dual_plane_deterministic(true)`.
+- Existing callers can still explicitly select legacy rerender mode.
+
+### D2. Complete Callback/Control Decoupling
+- [x] Replace callback-time `Mutex<Receiver<...>>` snapshot polling with lock-free snapshot handoff (RCU-style latest-value read).
+- [x] Keep control-plane publish semantics non-blocking and drop-oldest-safe under bursty control updates.
+- [x] Document RT-thread invariants and enforce them in tests.
+
+Acceptance:
+- RT callback path contains no locks and no blocking synchronization primitives.
+- Control snapshot updates remain wait-free for RT reads.
+
+### D3. Close Feature Gaps in Dual-Plane Deterministic Path
+- [x] Add deterministic-path support for `pitch_scale != 1.0` with bounded per-callback cost.
+- [x] Align tempo + pitch modulation behavior and quality with existing deterministic stream guarantees.
+- [x] Add parity tests versus current deterministic stream output under tempo/pitch modulation sweeps.
+
+Acceptance:
+- `set_pitch_scale(...)` works when deterministic dual-plane backend is active.
+- Modulation quality/callback gates pass in strict mode for deterministic dual-plane path.
+
+### D4. Expand Multi-Lane Engine Beyond 3 Lanes
+- [x] Add optional stem-aware lane plumbing (feature-gated/off by default initially).
+- [x] Integrate stem/noise confidence into lane weighting policy without callback branching explosions.
+- [x] Add deterministic blend/crossfade tests for lane transitions and tier changes.
+
+Acceptance:
+- Stem-aware lane can be enabled without RT reallocations after warmup.
+- Lane mixing remains deterministic and artifact-gated at modulation boundaries.
+
+### D5. Finish Policy Extraction from Legacy Hybrid Path
+- [x] Continue moving adaptive policy logic from `src/stretch/hybrid.rs` into reusable analysis snapshots consumed by dual-plane.
+- [x] Minimize duplicated adaptive decisions between legacy hybrid and dual-plane paths.
+- [x] Keep `src/stretch/phase_vocoder.rs` as tonal core while policy stays outside callback.
+
+Acceptance:
+- Shared adaptive analysis module is the single source for transient/beat/tonal confidence and hint generation.
+- Legacy path uses shared policy where practical; no callback-only policy divergence in deterministic mode.
+
+### D6. Latency Profiles as First-Class Runtime Products
+- [x] Add context-aware profile switching policy (`Scratch`, `Mix`, `Render`) with smooth transitions.
+- [x] Define and enforce profile-specific callback budgets and tier crossfade settings.
+- [x] Expose profile state/telemetry in API for host integration.
+
+Acceptance:
+- Automatic profile switching can occur without audible zipper artifacts.
+- Profile transitions remain within callback-budget gates in CI.
+
+### D7. Production Gates and Rollout Guardrails
+- [x] Make dual-plane deterministic quality gates mandatory in CI for default stream path.
+- [x] Add explicit CI assertions for long-run drift + fast-mod artifacts on the default deterministic route.
+- [x] Add a release checklist for retiring the opt-in deterministic toggle and documenting migration.
+
+Acceptance:
+- CI fails if default deterministic path regresses on p99/p999, drift, allocation, or artifact gates.
+- Release notes document default-route switch and legacy compatibility behavior.

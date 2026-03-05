@@ -42,6 +42,39 @@ fn run_stream_deterministic(
     out
 }
 
+fn run_stream_deterministic_modulated(
+    input_interleaved: &[f32],
+    params: StretchParams,
+    chunk_frames: usize,
+    dual_plane: bool,
+) -> Vec<f32> {
+    let channels = params.channels.count().max(1);
+    let mut processor = StreamProcessor::new(params);
+    processor.set_streaming_engine(StreamingEngine::Deterministic);
+    processor
+        .set_dual_plane_deterministic(dual_plane)
+        .expect("fresh-stream dual-plane toggle should succeed");
+
+    let mut out = Vec::with_capacity(input_interleaved.len() * 2);
+    for (chunk_idx, chunk) in input_interleaved
+        .chunks(chunk_frames * channels)
+        .enumerate()
+    {
+        let phase = chunk_idx as f64 * 0.15;
+        let ratio = (1.0 + 0.22 * phase.sin()).clamp(0.75, 1.40);
+        let pitch = (1.0 + 0.09 * phase.cos()).clamp(0.85, 1.20);
+        processor
+            .set_stretch_ratio(ratio)
+            .expect("ratio sweep value should be valid");
+        processor
+            .set_pitch_scale(pitch)
+            .expect("pitch sweep value should be valid");
+        processor.process_into(chunk, &mut out).unwrap();
+    }
+    processor.flush_into(&mut out).unwrap();
+    out
+}
+
 fn run_rt_plane(input_interleaved: &[f32], params: StretchParams, block_frames: usize) -> Vec<f32> {
     let channels = params.channels.count().max(1);
     let cfg = RtConfig::new(params, block_frames);
@@ -191,5 +224,61 @@ fn deterministic_stream_and_rt_plane_parity_under_ratio_change() {
         rms_ratio,
         stream_rms,
         rt_rms
+    );
+}
+
+#[test]
+fn deterministic_dual_plane_matches_legacy_under_tempo_pitch_modulation_sweeps() {
+    let sample_rate = 44_100u32;
+    let input = synth_stereo_signal(sample_rate as usize * 10, sample_rate);
+    let params = StretchParams::new(1.0)
+        .with_sample_rate(sample_rate)
+        .with_channels(2)
+        .with_fft_size(1024)
+        .with_hop_size(256);
+
+    let legacy = run_stream_deterministic_modulated(&input, params.clone(), 256, false);
+    let dual_plane = run_stream_deterministic_modulated(&input, params, 256, true);
+
+    assert!(!legacy.is_empty());
+    assert!(!dual_plane.is_empty());
+
+    let len_diff_pct =
+        legacy.len().abs_diff(dual_plane.len()) as f64 / legacy.len().max(1) as f64 * 100.0;
+    assert!(
+        len_diff_pct <= 1.0,
+        "legacy-vs-dual modulation sweep length diff too high: {:.4}% (legacy={}, dual={})",
+        len_diff_pct,
+        legacy.len(),
+        dual_plane.len()
+    );
+
+    let compare_len = legacy.len().min(dual_plane.len()).min(44_100 * 2 * 8);
+    let xcorr = comparison::cross_correlation(&legacy[..compare_len], &dual_plane[..compare_len]);
+    let (legacy_aligned, dual_aligned) = align_by_offset(
+        &legacy[..compare_len],
+        &dual_plane[..compare_len],
+        xcorr.peak_offset,
+    );
+    assert!(
+        !legacy_aligned.is_empty() && !dual_aligned.is_empty(),
+        "legacy-vs-dual modulation sweep alignment window is empty"
+    );
+
+    let legacy_rms = rms(legacy_aligned).max(1e-9);
+    let dual_rms = rms(dual_aligned).max(1e-9);
+    let rms_ratio = (legacy_rms / dual_rms).max(dual_rms / legacy_rms);
+
+    assert!(
+        xcorr.peak_value >= 0.30,
+        "legacy-vs-dual modulation sweep correlation too low: {:.4}",
+        xcorr.peak_value
+    );
+    assert!(
+        rms_ratio <= 1.45,
+        "legacy-vs-dual modulation sweep RMS drift too high: ratio={:.4} legacy_rms={:.6} dual_rms={:.6}",
+        rms_ratio,
+        legacy_rms,
+        dual_rms
     );
 }

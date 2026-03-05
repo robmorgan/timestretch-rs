@@ -74,6 +74,42 @@ impl LatencyProfile {
             LatencyProfile::Render => 8,
         }
     }
+
+    /// Default callback budget target for this profile.
+    #[inline]
+    pub fn callback_budget(self) -> Duration {
+        match self {
+            LatencyProfile::Scratch => Duration::from_micros(2_000),
+            LatencyProfile::Mix => Duration::from_micros(2_500),
+            LatencyProfile::Render => Duration::from_micros(3_200),
+        }
+    }
+
+    /// Applies profile-specific governor defaults in-place.
+    #[inline]
+    pub fn apply_governor_defaults(self, cfg: &mut RtGovernorConfig) {
+        cfg.callback_budget = self.callback_budget();
+        match self {
+            LatencyProfile::Scratch => {
+                cfg.upgrade_load_ratio = 0.62;
+                cfg.downgrade_load_ratio = 0.94;
+                cfg.promote_after_blocks = 14;
+                cfg.demote_after_blocks = 2;
+            }
+            LatencyProfile::Mix => {
+                cfg.upgrade_load_ratio = 0.55;
+                cfg.downgrade_load_ratio = 0.90;
+                cfg.promote_after_blocks = 24;
+                cfg.demote_after_blocks = 2;
+            }
+            LatencyProfile::Render => {
+                cfg.upgrade_load_ratio = 0.48;
+                cfg.downgrade_load_ratio = 0.86;
+                cfg.promote_after_blocks = 34;
+                cfg.demote_after_blocks = 3;
+            }
+        }
+    }
 }
 
 /// Runtime governor configuration.
@@ -171,6 +207,19 @@ impl QualityGovernor {
         self.tier = clamp_tier(self.tier.downgraded(), self.cfg.min_tier, self.cfg.max_tier);
         self.tier
     }
+
+    pub fn set_config(&mut self, cfg: RtGovernorConfig) {
+        self.cfg = cfg;
+        self.tier = clamp_tier(self.tier, self.cfg.min_tier, self.cfg.max_tier);
+        self.promote_streak = 0;
+        self.demote_streak = 0;
+    }
+
+    pub fn set_tier(&mut self, tier: QualityTier) {
+        self.tier = clamp_tier(tier, self.cfg.min_tier, self.cfg.max_tier);
+        self.promote_streak = 0;
+        self.demote_streak = 0;
+    }
 }
 
 #[inline]
@@ -194,6 +243,8 @@ mod tests {
         assert_eq!(LatencyProfile::Scratch.initial_tier(), QualityTier::Q1);
         assert_eq!(LatencyProfile::Mix.initial_tier(), QualityTier::Q2);
         assert_eq!(LatencyProfile::Render.initial_tier(), QualityTier::Q4);
+        assert!(LatencyProfile::Scratch.callback_budget() < LatencyProfile::Mix.callback_budget());
+        assert!(LatencyProfile::Mix.callback_budget() < LatencyProfile::Render.callback_budget());
     }
 
     #[test]
@@ -236,5 +287,17 @@ mod tests {
             gov.observe_block(Duration::from_micros(100)),
             QualityTier::Q2
         );
+    }
+
+    #[test]
+    fn profile_governor_defaults_override_budget_and_thresholds() {
+        let mut cfg = RtGovernorConfig::default();
+        LatencyProfile::Scratch.apply_governor_defaults(&mut cfg);
+        assert_eq!(cfg.callback_budget, Duration::from_micros(2_000));
+        assert!(cfg.upgrade_load_ratio > 0.60);
+
+        LatencyProfile::Render.apply_governor_defaults(&mut cfg);
+        assert_eq!(cfg.callback_budget, Duration::from_micros(3_200));
+        assert!(cfg.upgrade_load_ratio < 0.50);
     }
 }

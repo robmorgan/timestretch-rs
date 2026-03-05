@@ -13,13 +13,66 @@ use crate::dual_plane::warp_map::TimeWarpMap;
 use crate::error::StretchError;
 use crate::stretch::phase_vocoder::PhaseVocoder;
 use crate::stretch::wsola::Wsola;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use arc_swap::ArcSwap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-const CONTROL_QUEUE_CAPACITY: usize = 8;
 const RATIO_SNAP_EPS: f64 = 1e-6;
 const UNITY_BYPASS_RATIO_EPS: f64 = 1e-6;
+
+/// Lock-free snapshot mailbox shared between control producers and RT callback.
+///
+/// Publishers always replace the previously visible snapshot in-place.
+/// RT reads are wait-free: one atomic sequence load and one `Arc` load per
+/// updated snapshot kind.
+struct RtControlMailbox {
+    warp_map: ArcSwap<TimeWarpMap>,
+    hints: ArcSwap<RenderHints>,
+    warp_sequence: AtomicU64,
+    hints_sequence: AtomicU64,
+}
+
+impl RtControlMailbox {
+    fn new(warp_map: Arc<TimeWarpMap>, hints: Arc<RenderHints>) -> Self {
+        Self {
+            warp_map: ArcSwap::from(warp_map),
+            hints: ArcSwap::from(hints),
+            warp_sequence: AtomicU64::new(0),
+            hints_sequence: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn publish_warp_map(&self, map: Arc<TimeWarpMap>) {
+        self.warp_map.store(map);
+        self.warp_sequence.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    fn publish_hints(&self, hints: Arc<RenderHints>) {
+        self.hints.store(hints);
+        self.hints_sequence.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    fn latest_warp_map_if_updated(&self, seen_sequence: u64) -> Option<(u64, Arc<TimeWarpMap>)> {
+        let sequence = self.warp_sequence.load(Ordering::Acquire);
+        if sequence == seen_sequence {
+            return None;
+        }
+        Some((sequence, self.warp_map.load_full()))
+    }
+
+    #[inline]
+    fn latest_hints_if_updated(&self, seen_sequence: u64) -> Option<(u64, Arc<RenderHints>)> {
+        let sequence = self.hints_sequence.load(Ordering::Acquire);
+        if sequence == seen_sequence {
+            return None;
+        }
+        Some((sequence, self.hints.load_full()))
+    }
+}
 
 /// Configuration for the hard-RT processor.
 #[derive(Debug, Clone)]
@@ -38,6 +91,18 @@ pub struct RtConfig {
     pub min_ratio: f64,
     /// Upper clamp for warp slope.
     pub max_ratio: f64,
+    /// Enables context-aware profile switching policy.
+    pub auto_profile_switching: bool,
+    /// Required consecutive blocks before applying an auto profile change.
+    pub profile_switch_hysteresis_blocks: usize,
+    /// Optional stem-aware lane weighting in RT mixer.
+    ///
+    /// Off by default for conservative rollout.
+    pub stem_aware_lanes: bool,
+    /// Strength of stem-aware lane biasing in `[0, 1]`.
+    ///
+    /// Effective only when `stem_aware_lanes` is enabled.
+    pub stem_lane_hint_strength: f32,
     pub governor: RtGovernorConfig,
 }
 
@@ -53,6 +118,10 @@ impl RtConfig {
             output_ring_blocks: 24,
             min_ratio: 0.25,
             max_ratio: 4.0,
+            auto_profile_switching: false,
+            profile_switch_hysteresis_blocks: 8,
+            stem_aware_lanes: false,
+            stem_lane_hint_strength: 0.65,
             governor: RtGovernorConfig::default(),
         }
     }
@@ -120,32 +189,52 @@ impl RtConfig {
                 "output capacity contract undersized".to_string(),
             ));
         }
+        if self.profile_switch_hysteresis_blocks == 0 {
+            return Err(StretchError::InvalidFormat(
+                "profile_switch_hysteresis_blocks must be > 0".to_string(),
+            ));
+        }
+        if !self.stem_lane_hint_strength.is_finite()
+            || self.stem_lane_hint_strength < 0.0
+            || self.stem_lane_hint_strength > 1.0
+        {
+            return Err(StretchError::InvalidFormat(format!(
+                "stem_lane_hint_strength must be in [0, 1], got {}",
+                self.stem_lane_hint_strength
+            )));
+        }
         Ok(())
     }
+}
+
+/// Runtime profile state exported for host integration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtProfileTelemetry {
+    pub auto_switching_enabled: bool,
+    pub current_profile: LatencyProfile,
+    pub target_profile: LatencyProfile,
+    pub policy_profile: LatencyProfile,
+    pub transition_blocks_left: usize,
+    pub callback_budget: Duration,
+    pub current_tier: QualityTier,
+    pub target_tier: QualityTier,
 }
 
 /// Sender handle for publishing control-plane snapshots without blocking RT.
 #[derive(Clone)]
 pub struct RtControlSender {
-    warp_tx: SyncSender<Arc<TimeWarpMap>>,
-    hints_tx: SyncSender<Arc<RenderHints>>,
+    mailbox: Arc<RtControlMailbox>,
 }
 
 impl RtControlSender {
     pub fn publish_warp_map(&self, map: Arc<TimeWarpMap>) -> bool {
-        match self.warp_tx.try_send(map) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => false,
-            Err(TrySendError::Disconnected(_)) => false,
-        }
+        self.mailbox.publish_warp_map(map);
+        true
     }
 
     pub fn publish_hints(&self, hints: Arc<RenderHints>) -> bool {
-        match self.hints_tx.try_send(hints) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => false,
-            Err(TrySendError::Disconnected(_)) => false,
-        }
+        self.mailbox.publish_hints(hints);
+        true
     }
 }
 
@@ -166,11 +255,20 @@ pub struct RtProcessor {
     vocoders: Vec<PhaseVocoder>,
     transient_stretchers: Vec<Wsola>,
     warp_map: Arc<TimeWarpMap>,
+    constant_ratio_override: Option<f64>,
     hints: Arc<RenderHints>,
     control: RtControlSender,
-    warp_rx: Mutex<Receiver<Arc<TimeWarpMap>>>,
-    hints_rx: Mutex<Receiver<Arc<RenderHints>>>,
+    control_warp_sequence: u64,
+    control_hints_sequence: u64,
     governor: QualityGovernor,
+    auto_profile_switching: bool,
+    profile_switch_hysteresis_blocks: usize,
+    current_profile: LatencyProfile,
+    target_profile: LatencyProfile,
+    policy_profile: LatencyProfile,
+    profile_candidate: LatencyProfile,
+    profile_candidate_streak: usize,
+    profile_transition_blocks_left: usize,
     current_tier: QualityTier,
     target_tier: QualityTier,
     blend_weights: [f32; 3],
@@ -186,6 +284,9 @@ impl std::fmt::Debug for RtProcessor {
             .field("block_frames", &self.config.block_frames)
             .field("kernel_frames", &self.config.kernel_frames)
             .field("num_channels", &self.num_channels)
+            .field("auto_profile_switching", &self.auto_profile_switching)
+            .field("current_profile", &self.current_profile)
+            .field("target_profile", &self.target_profile)
             .field("current_tier", &self.current_tier)
             .field("target_tier", &self.target_tier)
             .field("active_ratio", &self.active_ratio)
@@ -197,7 +298,10 @@ impl std::fmt::Debug for RtProcessor {
 
 impl RtProcessor {
     /// Prepares the RT plane and allocates all fixed-capacity state.
-    pub fn prepare(config: RtConfig) -> Result<Self, StretchError> {
+    pub fn prepare(mut config: RtConfig) -> Result<Self, StretchError> {
+        config
+            .latency_profile
+            .apply_governor_defaults(&mut config.governor);
         config.validate()?;
         let num_channels = config.params.channels.count().max(1);
         let block_samples = config.block_frames.saturating_mul(num_channels);
@@ -275,15 +379,21 @@ impl RtProcessor {
             })
             .collect::<Vec<_>>();
 
-        let (warp_tx, warp_rx) = sync_channel(CONTROL_QUEUE_CAPACITY);
-        let (hints_tx, hints_rx) = sync_channel(CONTROL_QUEUE_CAPACITY);
-        let control = RtControlSender { warp_tx, hints_tx };
         let warp_map = Arc::new(
             TimeWarpMap::from_ratio(config.params.stretch_ratio, config.kernel_frames)
                 .unwrap_or_default(),
         );
         let hints = Arc::new(RenderHints::default());
+        let control = RtControlSender {
+            mailbox: Arc::new(RtControlMailbox::new(
+                Arc::clone(&warp_map),
+                Arc::clone(&hints),
+            )),
+        };
         let active_ratio = config.params.stretch_ratio;
+        let initial_profile = config.latency_profile;
+        let auto_profile_switching = config.auto_profile_switching;
+        let profile_switch_hysteresis_blocks = config.profile_switch_hysteresis_blocks.max(1);
 
         let blend = initial_tier.lane_weights();
         Self {
@@ -310,11 +420,20 @@ impl RtProcessor {
             vocoders,
             transient_stretchers,
             warp_map,
+            constant_ratio_override: None,
             hints,
             control,
-            warp_rx: Mutex::new(warp_rx),
-            hints_rx: Mutex::new(hints_rx),
+            control_warp_sequence: 0,
+            control_hints_sequence: 0,
             governor,
+            auto_profile_switching,
+            profile_switch_hysteresis_blocks,
+            current_profile: initial_profile,
+            target_profile: initial_profile,
+            policy_profile: initial_profile,
+            profile_candidate: initial_profile,
+            profile_candidate_streak: 0,
+            profile_transition_blocks_left: 0,
             current_tier: initial_tier,
             target_tier: initial_tier,
             blend_weights: blend,
@@ -334,12 +453,27 @@ impl RtProcessor {
     /// Sets warp map directly on this thread.
     #[inline]
     pub fn set_warp_map_snapshot(&mut self, warp_map: Arc<TimeWarpMap>) {
+        self.control.publish_warp_map(Arc::clone(&warp_map));
+        self.control_warp_sequence = self.control.mailbox.warp_sequence.load(Ordering::Acquire);
+        self.constant_ratio_override = None;
         self.warp_map = warp_map;
+    }
+
+    /// Sets a constant-ratio override without publishing a warp-map snapshot.
+    ///
+    /// This is intended for fast scalar tempo control where callback-time map
+    /// allocation would be unnecessary overhead.
+    #[inline]
+    pub fn set_constant_ratio(&mut self, ratio: f64) {
+        self.constant_ratio_override =
+            Some(ratio.clamp(self.config.min_ratio, self.config.max_ratio));
     }
 
     /// Sets hint snapshot directly on this thread.
     #[inline]
     pub fn set_hint_snapshot(&mut self, hints: Arc<RenderHints>) {
+        self.control.publish_hints(Arc::clone(&hints));
+        self.control_hints_sequence = self.control.mailbox.hints_sequence.load(Ordering::Acquire);
         self.hints = hints;
     }
 
@@ -347,6 +481,39 @@ impl RtProcessor {
     #[inline]
     pub fn quality_tier(&self) -> QualityTier {
         self.current_tier
+    }
+
+    /// Sets a fixed latency profile and disables auto profile switching.
+    pub fn set_latency_profile(&mut self, profile: LatencyProfile) {
+        self.auto_profile_switching = false;
+        self.policy_profile = profile;
+        self.profile_candidate = profile;
+        self.profile_candidate_streak = 0;
+        self.set_latency_profile_internal(profile);
+    }
+
+    /// Enables or disables context-aware profile switching.
+    pub fn set_auto_profile_switching(&mut self, enabled: bool) {
+        self.auto_profile_switching = enabled;
+        if !enabled {
+            self.policy_profile = self.target_profile;
+            self.profile_candidate = self.target_profile;
+            self.profile_candidate_streak = 0;
+        }
+    }
+
+    /// Returns current profile telemetry for host integration.
+    pub fn profile_telemetry(&self) -> RtProfileTelemetry {
+        RtProfileTelemetry {
+            auto_switching_enabled: self.auto_profile_switching,
+            current_profile: self.current_profile,
+            target_profile: self.target_profile,
+            policy_profile: self.policy_profile,
+            transition_blocks_left: self.profile_transition_blocks_left,
+            callback_budget: self.config.governor.callback_budget,
+            current_tier: self.current_tier,
+            target_tier: self.target_tier,
+        }
     }
 
     /// Current warp ratio consumed by kernels.
@@ -384,6 +551,8 @@ impl RtProcessor {
     ) -> Result<(usize, usize), StretchError> {
         let start = Instant::now();
         self.poll_control_updates();
+        self.update_profile_policy();
+        self.advance_profile_transition();
         self.advance_tier_crossfade();
 
         if input_slices.len() != self.num_channels || output_slices.len() != self.num_channels {
@@ -477,6 +646,8 @@ impl RtProcessor {
     ) -> Result<(), StretchError> {
         let start = Instant::now();
         self.poll_control_updates();
+        self.update_profile_policy();
+        self.advance_profile_transition();
         self.advance_tier_crossfade();
 
         if input.len() != self.block_samples {
@@ -528,6 +699,9 @@ impl RtProcessor {
     /// Flushes all pending RT state.
     pub fn flush(&mut self, output: &mut Vec<f32>) -> Result<(), StretchError> {
         self.poll_control_updates();
+        self.update_profile_policy();
+        self.advance_profile_transition();
+        self.advance_tier_crossfade();
 
         let fft_samples = self
             .config
@@ -591,21 +765,28 @@ impl RtProcessor {
     }
 
     fn poll_control_updates(&mut self) {
-        if let Ok(warp_rx) = self.warp_rx.lock() {
-            loop {
-                match warp_rx.try_recv() {
-                    Ok(map) => self.warp_map = map,
-                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-                }
-            }
+        // RT-thread invariant:
+        // - callback reads only atomics + `Arc` pointers here.
+        // - no locks, no blocking channels, no syscalls.
+        // Control-plane invariant:
+        // - publishers are non-blocking and overwrite older snapshots.
+        // - RT always converges to latest published snapshot.
+        if let Some((sequence, map)) = self
+            .control
+            .mailbox
+            .latest_warp_map_if_updated(self.control_warp_sequence)
+        {
+            self.control_warp_sequence = sequence;
+            self.constant_ratio_override = None;
+            self.warp_map = map;
         }
-        if let Ok(hints_rx) = self.hints_rx.lock() {
-            loop {
-                match hints_rx.try_recv() {
-                    Ok(hints) => self.hints = hints,
-                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-                }
-            }
+        if let Some((sequence, hints)) = self
+            .control
+            .mailbox
+            .latest_hints_if_updated(self.control_hints_sequence)
+        {
+            self.control_hints_sequence = sequence;
+            self.hints = hints;
         }
     }
 
@@ -628,8 +809,82 @@ impl RtProcessor {
 
         let start = self.input_timeline_frames;
         let end = start + input_frames as f64;
-        let base_ratio = self.warp_map.ratio_over_range(start, end);
+        let base_ratio = self.base_ratio_over_range(start, end);
         (base_ratio - 1.0).abs() <= UNITY_BYPASS_RATIO_EPS
+    }
+
+    fn set_latency_profile_internal(&mut self, profile: LatencyProfile) {
+        if self.target_profile == profile && self.current_profile == profile {
+            return;
+        }
+        self.target_profile = profile;
+        self.profile_transition_blocks_left = self
+            .current_profile
+            .tier_crossfade_blocks()
+            .max(profile.tier_crossfade_blocks());
+        self.config.latency_profile = profile;
+        profile.apply_governor_defaults(&mut self.config.governor);
+        self.governor.set_config(self.config.governor);
+        self.governor.set_tier(profile.initial_tier());
+        self.set_target_tier(profile.initial_tier());
+    }
+
+    #[inline]
+    fn suggest_profile(&self) -> LatencyProfile {
+        let ratio_delta = (self.active_ratio - 1.0).abs();
+        let transient = self.hints.transient_confidence.clamp(0.0, 1.0);
+        let tonal = self.hints.tonal_confidence.clamp(0.0, 1.0);
+        let noise = self.hints.noise_confidence.clamp(0.0, 1.0);
+
+        if ratio_delta >= 0.42 || transient >= 0.72 {
+            LatencyProfile::Scratch
+        } else if ratio_delta <= 0.12 && tonal >= 0.70 && noise <= 0.35 {
+            LatencyProfile::Render
+        } else {
+            LatencyProfile::Mix
+        }
+    }
+
+    fn update_profile_policy(&mut self) {
+        if !self.auto_profile_switching {
+            self.policy_profile = self.target_profile;
+            return;
+        }
+
+        let suggested = self.suggest_profile();
+        self.policy_profile = suggested;
+        if suggested == self.target_profile {
+            self.profile_candidate = suggested;
+            self.profile_candidate_streak = 0;
+            return;
+        }
+
+        if suggested == self.profile_candidate {
+            self.profile_candidate_streak = self.profile_candidate_streak.saturating_add(1);
+        } else {
+            self.profile_candidate = suggested;
+            self.profile_candidate_streak = 1;
+        }
+
+        if self.profile_candidate_streak >= self.profile_switch_hysteresis_blocks {
+            self.profile_candidate_streak = 0;
+            self.set_latency_profile_internal(suggested);
+        }
+    }
+
+    fn advance_profile_transition(&mut self) {
+        if self.current_profile == self.target_profile {
+            self.profile_transition_blocks_left = 0;
+            return;
+        }
+        if self.profile_transition_blocks_left == 0 {
+            self.current_profile = self.target_profile;
+            return;
+        }
+        self.profile_transition_blocks_left = self.profile_transition_blocks_left.saturating_sub(1);
+        if self.profile_transition_blocks_left == 0 {
+            self.current_profile = self.target_profile;
+        }
     }
 
     fn set_target_tier(&mut self, tier: QualityTier) {
@@ -994,24 +1249,45 @@ impl RtProcessor {
     fn current_kernel_ratio(&self, frames: usize) -> f64 {
         let start = self.input_timeline_frames;
         let end = start + frames as f64;
-        let base = self.warp_map.ratio_over_range(start, end);
+        let base = self.base_ratio_over_range(start, end);
         let bias = self.hints.ratio_bias.clamp(-0.25, 0.25);
         let hinted = base * (1.0 + bias);
         hinted.clamp(self.config.min_ratio, self.config.max_ratio)
     }
 
+    #[inline]
+    fn base_ratio_over_range(&self, start: f64, end: f64) -> f64 {
+        if let Some(ratio) = self.constant_ratio_override {
+            ratio
+        } else {
+            self.warp_map.ratio_over_range(start, end)
+        }
+    }
+
     fn effective_lane_weights(&self) -> [f32; 3] {
         let hints = &self.hints;
         let bias = hints.normalized_lane_bias();
+        let stem = hints.normalized_stem_lane_confidence();
+        let stem_gate = if self.config.stem_aware_lanes {
+            1.0
+        } else {
+            0.0
+        };
+        let stem_strength = self.config.stem_lane_hint_strength * stem_gate;
+        let noise_conf = hints.noise_confidence.clamp(0.0, 1.0);
         let transient = self.blend_weights[0]
             + 0.20 * hints.transient_confidence.clamp(0.0, 1.0)
-            + 0.15 * bias[0];
+            + 0.15 * bias[0]
+            + stem_strength * (0.28 * stem[0] + 0.04 * (1.0 - noise_conf));
         let tonal = self.blend_weights[1]
             + 0.20 * hints.tonal_confidence.clamp(0.0, 1.0)
             + 0.10 * hints.beat_confidence.clamp(0.0, 1.0)
-            + 0.10 * bias[1];
-        let residual =
-            self.blend_weights[2] + 0.20 * hints.noise_confidence.clamp(0.0, 1.0) + 0.15 * bias[2];
+            + 0.10 * bias[1]
+            + stem_strength * 0.30 * stem[1];
+        let residual = self.blend_weights[2]
+            + 0.20 * noise_conf
+            + 0.15 * bias[2]
+            + stem_strength * (0.24 * stem[2] + 0.12 * noise_conf);
 
         let sum = (transient + tonal + residual).max(1e-6);
         [transient / sum, tonal / sum, residual / sum]
@@ -1035,8 +1311,11 @@ impl RtProcessor {
 
 #[cfg(test)]
 mod tests {
-    use super::{LatencyProfile, RtConfig, RtProcessor};
+    use super::{LatencyProfile, QualityTier, RtConfig, RtProcessor};
     use crate::core::types::StretchParams;
+    use crate::dual_plane::hints::RenderHints;
+    use crate::dual_plane::warp_map::TimeWarpMap;
+    use std::sync::Arc;
 
     fn stereo_sine_block(frames: usize, sample_rate: u32, hz: f32, phase: f32) -> Vec<f32> {
         let mut out = Vec::with_capacity(frames * 2);
@@ -1131,5 +1410,295 @@ mod tests {
         assert_eq!(out, input);
         assert!(rt.input_ring.is_empty());
         assert!(rt.pending_output.is_empty());
+    }
+
+    fn assert_weights_close(a: [f32; 3], b: [f32; 3], eps: f32) {
+        for idx in 0..3 {
+            assert!(
+                (a[idx] - b[idx]).abs() <= eps,
+                "lane weight mismatch at index {idx}: {} vs {} (eps={eps})",
+                a[idx],
+                b[idx]
+            );
+        }
+    }
+
+    #[test]
+    fn control_publish_is_non_blocking_under_bursty_updates() {
+        let params = StretchParams::new(1.35)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let cfg = RtConfig::new(params, 128);
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+        let control = rt.control_sender();
+
+        let mut expected = 1.0f64;
+        for i in 0..4_096usize {
+            expected = 0.60 + (i as f64 * 0.0005);
+            let map = Arc::new(TimeWarpMap::from_ratio(expected, 256).unwrap());
+            assert!(
+                control.publish_warp_map(map),
+                "control publish must not block or reject under burst load"
+            );
+        }
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+
+        let actual = rt.active_ratio();
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "rt should converge to latest published warp ratio (expected {expected}, got {actual})"
+        );
+    }
+
+    #[test]
+    fn control_hints_latest_value_wins_for_rt_ratio_bias() {
+        let params = StretchParams::new(1.20)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let cfg = RtConfig::new(params, 128);
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+        let control = rt.control_sender();
+
+        let mut final_bias = 0.0f64;
+        for i in 0..1_024usize {
+            final_bias = if (i & 1) == 0 { -0.20 } else { 0.15 };
+            let hints = RenderHints {
+                sequence: i as u64,
+                ratio_bias: final_bias,
+                ..RenderHints::default()
+            };
+            assert!(control.publish_hints(Arc::new(hints)));
+        }
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+
+        let expected = 1.20 * (1.0 + final_bias);
+        let actual = rt.active_ratio();
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "rt should consume latest hint snapshot bias (expected {expected}, got {actual})"
+        );
+    }
+
+    #[test]
+    fn stem_aware_lane_weighting_is_feature_gated_off_by_default() {
+        let params = StretchParams::new(1.20)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let cfg = RtConfig::new(params, 128);
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let baseline = RenderHints {
+            tonal_confidence: 0.6,
+            noise_confidence: 0.1,
+            lane_bias: [0.1, 0.2, 0.1],
+            ..RenderHints::default()
+        };
+        let stem_heavy = RenderHints {
+            stem_lane_confidence: [1.0, 0.0, 0.0],
+            ..baseline.clone()
+        };
+
+        rt.set_hint_snapshot(Arc::new(baseline));
+        let w0 = rt.effective_lane_weights();
+        rt.set_hint_snapshot(Arc::new(stem_heavy));
+        let w1 = rt.effective_lane_weights();
+
+        assert_weights_close(w0, w1, 1e-6);
+    }
+
+    #[test]
+    fn stem_aware_lane_weighting_changes_blend_when_enabled() {
+        let params = StretchParams::new(1.20)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.stem_aware_lanes = true;
+        cfg.stem_lane_hint_strength = 1.0;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let percussive = RenderHints {
+            stem_lane_confidence: [1.0, 0.0, 0.0],
+            transient_confidence: 0.8,
+            tonal_confidence: 0.1,
+            noise_confidence: 0.1,
+            ..RenderHints::default()
+        };
+        let harmonic = RenderHints {
+            stem_lane_confidence: [0.0, 1.0, 0.0],
+            transient_confidence: 0.1,
+            tonal_confidence: 0.8,
+            noise_confidence: 0.1,
+            ..RenderHints::default()
+        };
+
+        rt.set_hint_snapshot(Arc::new(percussive));
+        let wp = rt.effective_lane_weights();
+        rt.set_hint_snapshot(Arc::new(harmonic));
+        let wh = rt.effective_lane_weights();
+
+        assert!(
+            wp[0] > wh[0],
+            "percussive stem confidence should increase transient lane weight"
+        );
+        assert!(
+            wh[1] > wp[1],
+            "harmonic stem confidence should increase tonal lane weight"
+        );
+    }
+
+    #[test]
+    fn lane_transitions_and_tier_crossfades_are_deterministic() {
+        let params = StretchParams::new(1.12)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.stem_aware_lanes = true;
+        cfg.stem_lane_hint_strength = 0.85;
+        cfg.latency_profile = LatencyProfile::Mix;
+        let mut a = RtProcessor::prepare(cfg.clone()).unwrap();
+        let mut b = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut out_a = [0.0f32; 512];
+        let mut out_b = [0.0f32; 512];
+        let input_refs = [&input[..]];
+
+        for step in 0..12usize {
+            let hints = if step < 4 {
+                RenderHints {
+                    stem_lane_confidence: [1.0, 0.0, 0.0],
+                    transient_confidence: 0.9,
+                    tonal_confidence: 0.1,
+                    noise_confidence: 0.1,
+                    ..RenderHints::default()
+                }
+            } else if step < 8 {
+                RenderHints {
+                    stem_lane_confidence: [0.0, 1.0, 0.0],
+                    transient_confidence: 0.1,
+                    tonal_confidence: 0.9,
+                    noise_confidence: 0.1,
+                    ..RenderHints::default()
+                }
+            } else {
+                RenderHints {
+                    stem_lane_confidence: [0.0, 0.0, 1.0],
+                    transient_confidence: 0.2,
+                    tonal_confidence: 0.2,
+                    noise_confidence: 0.9,
+                    ..RenderHints::default()
+                }
+            };
+
+            a.set_hint_snapshot(Arc::new(hints.clone()));
+            b.set_hint_snapshot(Arc::new(hints));
+            if step == 3 {
+                a.set_target_tier(QualityTier::Q4);
+                b.set_target_tier(QualityTier::Q4);
+            }
+
+            let mut out_refs_a = [&mut out_a[..]];
+            let mut out_refs_b = [&mut out_b[..]];
+            let (consumed_a, produced_a) = a.process(&input_refs, &mut out_refs_a);
+            let (consumed_b, produced_b) = b.process(&input_refs, &mut out_refs_b);
+
+            assert_eq!(consumed_a, consumed_b);
+            assert_eq!(produced_a, produced_b);
+            assert_eq!(&out_a[..produced_a], &out_b[..produced_b]);
+            assert_weights_close(a.effective_lane_weights(), b.effective_lane_weights(), 1e-6);
+            assert_eq!(a.quality_tier(), b.quality_tier());
+        }
+    }
+
+    #[test]
+    fn manual_latency_profile_switch_disables_auto_and_updates_budget() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.auto_profile_switching = true;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        rt.set_latency_profile(LatencyProfile::Scratch);
+        let telemetry = rt.profile_telemetry();
+        assert!(!telemetry.auto_switching_enabled);
+        assert_eq!(telemetry.target_profile, LatencyProfile::Scratch);
+        assert_eq!(
+            telemetry.callback_budget,
+            LatencyProfile::Scratch.callback_budget()
+        );
+    }
+
+    #[test]
+    fn auto_profile_switching_changes_profiles_with_hysteresis() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+
+        // Render-favoring policy: near-unity ratio + strong tonal confidence.
+        rt.set_constant_ratio(1.0);
+        rt.set_hint_snapshot(Arc::new(RenderHints {
+            transient_confidence: 0.05,
+            tonal_confidence: 0.95,
+            noise_confidence: 0.05,
+            ..RenderHints::default()
+        }));
+        for _ in 0..3 {
+            let mut output_refs = [&mut output[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+        }
+        assert_eq!(
+            rt.profile_telemetry().target_profile,
+            LatencyProfile::Render
+        );
+
+        // Scratch-favoring policy: large ratio delta or strong transient confidence.
+        rt.set_constant_ratio(1.70);
+        rt.set_hint_snapshot(Arc::new(RenderHints {
+            transient_confidence: 0.90,
+            tonal_confidence: 0.10,
+            noise_confidence: 0.20,
+            ..RenderHints::default()
+        }));
+        for _ in 0..3 {
+            let mut output_refs = [&mut output[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+        }
+        assert_eq!(
+            rt.profile_telemetry().target_profile,
+            LatencyProfile::Scratch
+        );
     }
 }

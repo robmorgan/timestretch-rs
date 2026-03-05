@@ -15,6 +15,11 @@ pub struct RenderHints {
     pub tonal_confidence: f32,
     /// Confidence that residual/noise lane should contribute.
     pub noise_confidence: f32,
+    /// Optional stem-lane confidences `[percussive, harmonic, noise]`.
+    ///
+    /// This is consumed only when stem-aware lane weighting is enabled in
+    /// `RtConfig`. Default remains disabled to preserve current behavior.
+    pub stem_lane_confidence: [f32; 3],
     /// Lane bias correction `[transient, tonal, residual]`.
     pub lane_bias: [f32; 3],
     /// Short-horizon multiplicative ratio bias applied to warp-map slope.
@@ -35,6 +40,7 @@ impl Default for RenderHints {
             beat_confidence: 0.0,
             tonal_confidence: 0.5,
             noise_confidence: 0.0,
+            stem_lane_confidence: [0.0, 0.0, 0.0],
             lane_bias: [0.0, 0.0, 0.0],
             ratio_bias: 0.0,
             transient_mask: Vec::new(),
@@ -54,5 +60,18 @@ impl RenderHints {
             return [0.0, 0.0, 0.0];
         }
         [t / sum, o / sum, r / sum]
+    }
+
+    /// Returns normalized stem-lane confidences.
+    #[inline]
+    pub fn normalized_stem_lane_confidence(&self) -> [f32; 3] {
+        let p = self.stem_lane_confidence[0].max(0.0);
+        let h = self.stem_lane_confidence[1].max(0.0);
+        let n = self.stem_lane_confidence[2].max(0.0);
+        let sum = p + h + n;
+        if sum <= f32::EPSILON {
+            return [0.0, 0.0, 0.0];
+        }
+        [p / sum, h / sum, n / sum]
     }
 }

@@ -127,6 +127,12 @@ fn analyze_block(
         beat_confidence: adaptive.beat_confidence,
         tonal_confidence: adaptive.tonal_confidence,
         noise_confidence: adaptive.noise_confidence,
+        stem_lane_confidence: [
+            (0.70 * adaptive.transient_confidence + 0.30 * adaptive.beat_confidence)
+                .clamp(0.0, 1.0),
+            adaptive.tonal_confidence.clamp(0.0, 1.0),
+            adaptive.noise_confidence.clamp(0.0, 1.0),
+        ],
         lane_bias: adaptive.lane_bias,
         ratio_bias: adaptive.ratio_bias,
         transient_mask: adaptive.transient_mask,

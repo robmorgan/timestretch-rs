@@ -24,6 +24,14 @@ const MAX_SUBDIVISION_GRID_POINTS: usize = 1_000_000;
 const MIN_LIVE_BEAT_ANCHORS: usize = 2;
 /// Minimum anchor strength considered "reliable" for live beat-grid merging.
 const MIN_LIVE_BEAT_ANCHOR_STRENGTH: f32 = 0.2;
+/// Minimum transient region used for weak onsets in shared segmentation.
+const MIN_TRANSIENT_REGION_SECS: f64 = 0.005;
+/// Upper bound for ratio-based transient region scaling.
+const TRANSIENT_REGION_RATIO_SCALE_MAX: f64 = 1.6;
+/// Maximum transient coverage ratio before forcing tonal-only render.
+const TONAL_FORCE_MAX_TRANSIENT_COVERAGE: f64 = 0.03;
+/// Maximum transient segment count before disabling tonal-force fallback.
+const TONAL_FORCE_MAX_TRANSIENT_SEGMENTS: usize = 1;
 
 /// Shared adaptive analysis result for a mono horizon.
 #[derive(Debug, Clone)]
@@ -38,6 +46,14 @@ pub(crate) struct AdaptiveAnalysisSnapshot {
     pub lane_bias: [f32; 3],
     pub ratio_bias: f64,
     pub transient_mask: Vec<f32>,
+}
+
+/// Shared segmentation primitive used by legacy hybrid and dual-plane policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AdaptiveSegment {
+    pub start: usize,
+    pub end: usize,
+    pub is_transient: bool,
 }
 
 /// Builds a shared adaptive snapshot for mono content.
@@ -322,6 +338,100 @@ pub(crate) fn merge_onsets_and_beats(
     (out_onsets, out_strengths)
 }
 
+/// Builds shared transient/tonal segment ranges from adaptive anchors.
+pub(crate) fn build_adaptive_segments(
+    input_len: usize,
+    onsets: &[usize],
+    strengths: &[f32],
+    params: &StretchParams,
+    global_ratio: f64,
+) -> Vec<AdaptiveSegment> {
+    if onsets.is_empty() {
+        return vec![AdaptiveSegment {
+            start: 0,
+            end: input_len,
+            is_transient: false,
+        }];
+    }
+
+    let transient_ratio_scale = global_ratio.clamp(1.0, TRANSIENT_REGION_RATIO_SCALE_MAX);
+    let min_transient_size =
+        (params.sample_rate as f64 * MIN_TRANSIENT_REGION_SECS).round() as usize;
+    let max_transient_size =
+        ((params.sample_rate as f64 * params.transient_region_secs * transient_ratio_scale).round()
+            as usize)
+            .max(min_transient_size);
+
+    let mut segments = Vec::new();
+    let mut pos = 0usize;
+
+    for (i, &onset) in onsets.iter().enumerate() {
+        if onset < pos {
+            continue;
+        }
+
+        let tonal_end = onset.min(input_len);
+        if tonal_end > pos {
+            segments.push(AdaptiveSegment {
+                start: pos,
+                end: tonal_end,
+                is_transient: false,
+            });
+        }
+
+        let strength_raw = strengths.get(i).copied().unwrap_or(1.0);
+        if !strength_marks_transient(strength_raw) {
+            // Beat-only anchor: tonal split without transient region.
+            pos = tonal_end;
+            continue;
+        }
+
+        let strength = strength_raw.clamp(0.0, 1.0);
+        let scale = 0.3 + 0.7 * strength as f64;
+        let transient_size = min_transient_size
+            + ((max_transient_size - min_transient_size) as f64 * scale) as usize;
+        let trans_end = (onset + transient_size).min(input_len);
+        if trans_end > onset {
+            segments.push(AdaptiveSegment {
+                start: onset,
+                end: trans_end,
+                is_transient: true,
+            });
+        }
+        pos = trans_end;
+    }
+
+    if pos < input_len {
+        segments.push(AdaptiveSegment {
+            start: pos,
+            end: input_len,
+            is_transient: false,
+        });
+    }
+
+    segments
+}
+
+/// Returns true when sparse transient coverage should force tonal-only render.
+pub(crate) fn should_force_tonal_render(segments: &[AdaptiveSegment], input_len: usize) -> bool {
+    if input_len == 0 || segments.is_empty() {
+        return false;
+    }
+
+    let transient_count = segments.iter().filter(|s| s.is_transient).count();
+    if transient_count == 0 || transient_count > TONAL_FORCE_MAX_TRANSIENT_SEGMENTS {
+        return false;
+    }
+
+    let transient_samples: usize = segments
+        .iter()
+        .filter(|s| s.is_transient)
+        .map(|s| s.end.saturating_sub(s.start))
+        .sum();
+    let coverage = transient_samples as f64 / input_len as f64;
+    coverage <= TONAL_FORCE_MAX_TRANSIENT_COVERAGE
+}
+
 /// Generates a subdivision grid with a phase/downbeat offset.
 pub(crate) fn generate_subdivision_grid_with_phase(
     bpm: f64,
@@ -393,4 +503,59 @@ pub(crate) fn build_transient_mask(
         mask[i] = (0.7 * prev + 0.3 * cur).clamp(0.0, 1.0);
     }
     mask
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_adaptive_segments, should_force_tonal_render, AdaptiveSegment, BEAT_ANCHOR_STRENGTH,
+    };
+    use crate::core::types::StretchParams;
+
+    #[test]
+    fn build_adaptive_segments_creates_tonal_and_transient_regions() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44_100)
+            .with_transient_region_secs(0.020);
+        let segments = build_adaptive_segments(44_100, &[10_000], &[1.0], &params, 1.0);
+        assert!(segments.len() >= 2, "expected tonal + transient regions");
+        assert!(!segments[0].is_transient);
+        assert!(segments.iter().any(|s| s.is_transient));
+    }
+
+    #[test]
+    fn build_adaptive_segments_treats_beat_only_anchor_as_tonal_split() {
+        let params = StretchParams::new(1.0).with_sample_rate(44_100);
+        let segments = build_adaptive_segments(
+            44_100,
+            &[12_000, 20_000],
+            &[BEAT_ANCHOR_STRENGTH, 1.0],
+            &params,
+            1.0,
+        );
+        assert!(segments.iter().any(|s| !s.is_transient && s.end == 12_000));
+        assert!(segments.iter().any(|s| s.is_transient && s.start == 20_000));
+    }
+
+    #[test]
+    fn should_force_tonal_render_for_single_tiny_transient() {
+        let segments = vec![
+            AdaptiveSegment {
+                start: 0,
+                end: 20_000,
+                is_transient: false,
+            },
+            AdaptiveSegment {
+                start: 20_000,
+                end: 20_300,
+                is_transient: true,
+            },
+            AdaptiveSegment {
+                start: 20_300,
+                end: 44_100,
+                is_transient: false,
+            },
+        ];
+        assert!(should_force_tonal_render(&segments, 44_100));
+    }
 }

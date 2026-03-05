@@ -1,8 +1,11 @@
 //! Hybrid stretcher combining WSOLA (transients) with phase vocoder (tonal content).
 
+#[cfg(test)]
+use crate::analysis::adaptive_snapshot::strength_marks_transient;
 use crate::analysis::adaptive_snapshot::{
-    analyze_adaptive_snapshot_mono, merge_onsets_and_beats as merge_onsets_and_beats_shared,
-    strength_marks_transient,
+    analyze_adaptive_snapshot_mono, build_adaptive_segments,
+    merge_onsets_and_beats as merge_onsets_and_beats_shared,
+    should_force_tonal_render as should_force_tonal_render_shared,
 };
 use crate::analysis::frequency::freq_to_bin;
 use crate::analysis::hpss::{hpss, HpssParams};
@@ -86,14 +89,6 @@ const IMPULSIVE_MIN_STRONG_SAMPLES: usize = 8;
 const IMPULSIVE_MAX_STRONG_SAMPLE_RATIO: f32 = 0.008;
 /// Maximum active-sample ratio (at 8% peak threshold) for sparse-impulse detection.
 const IMPULSIVE_MAX_ACTIVE_RATIO: f32 = 0.20;
-/// Maximum transient coverage ratio before we force full tonal rendering.
-///
-/// If only one tiny transient region is present (often onset detector residue
-/// on near-pure tonal material), rendering the entire signal as tonal avoids
-/// unnecessary boundary/crossfade timing shifts.
-const TONAL_FORCE_MAX_TRANSIENT_COVERAGE: f64 = 0.03;
-/// Maximum transient segment count for full-tonal fallback.
-const TONAL_FORCE_MAX_TRANSIENT_SEGMENTS: usize = 1;
 
 /// Transient-aware hybrid stretcher.
 ///
@@ -363,22 +358,15 @@ fn should_use_live_beat_aware_anchors(strengths: &[f32]) -> bool {
 
 #[inline]
 fn should_force_tonal_render(segments: &[Segment], input_len: usize) -> bool {
-    if input_len == 0 || segments.is_empty() {
-        return false;
-    }
-
-    let transient_count = segments.iter().filter(|s| s.is_transient).count();
-    if transient_count == 0 || transient_count > TONAL_FORCE_MAX_TRANSIENT_SEGMENTS {
-        return false;
-    }
-
-    let transient_samples: usize = segments
+    let shared = segments
         .iter()
-        .filter(|s| s.is_transient)
-        .map(|s| s.end.saturating_sub(s.start))
-        .sum();
-    let coverage = transient_samples as f64 / input_len as f64;
-    coverage <= TONAL_FORCE_MAX_TRANSIENT_COVERAGE
+        .map(|s| crate::analysis::adaptive_snapshot::AdaptiveSegment {
+            start: s.start,
+            end: s.end,
+            is_transient: s.is_transient,
+        })
+        .collect::<Vec<_>>();
+    should_force_tonal_render_shared(&shared, input_len)
 }
 
 impl HybridStretcher {
@@ -1198,84 +1186,16 @@ impl HybridStretcher {
     /// strong transients (kicks) get the full `transient_region_secs`,
     /// weak transients (hi-hats) get a smaller region (~5ms minimum).
     fn segment_audio(&self, input_len: usize, onsets: &[usize], strengths: &[f32]) -> Vec<Segment> {
-        if onsets.is_empty() {
-            return vec![Segment {
-                start: 0,
-                end: input_len,
-                is_transient: false,
-                stretch_ratio: self.params.stretch_ratio,
-            }];
-        }
-
         let global_ratio = self.params.stretch_ratio;
-        // For stretches >1.0, give transients proportionally more input context
-        // so onset/early-decay structure survives longer output durations.
-        let transient_ratio_scale = global_ratio.clamp(1.0, 1.6);
-        let max_transient_size = ((self.params.sample_rate as f64
-            * self.params.transient_region_secs
-            * transient_ratio_scale)
-            .round()) as usize;
-        // Minimum 5ms region for weak transients
-        let min_transient_size = (self.params.sample_rate as f64 * 0.005) as usize;
-
-        let mut segments = Vec::new();
-        let mut pos = 0;
-
-        for (i, &onset) in onsets.iter().enumerate() {
-            if onset < pos {
-                continue;
-            }
-
-            // Tonal region before this boundary
-            let tonal_end = onset.min(input_len);
-            if tonal_end > pos {
-                segments.push(Segment {
-                    start: pos,
-                    end: tonal_end,
-                    is_transient: false,
-                    stretch_ratio: global_ratio,
-                });
-            }
-
-            let strength_raw = strengths.get(i).copied().unwrap_or(1.0);
-            let is_transient_anchor = strength_marks_transient(strength_raw);
-            if !is_transient_anchor {
-                // Beat-only anchor: create a tonal boundary without a transient segment.
-                pos = tonal_end;
-                continue;
-            }
-            let strength = strength_raw.clamp(0.0, 1.0);
-
-            // Adaptive transient region: scale by onset strength
-            // region = min + (max - min) * (0.3 + 0.7 * strength)
-            let scale = 0.3 + 0.7 * strength as f64;
-            let transient_size = min_transient_size
-                + ((max_transient_size - min_transient_size) as f64 * scale) as usize;
-
-            let trans_end = (onset + transient_size).min(input_len);
-            if trans_end > onset {
-                segments.push(Segment {
-                    start: onset,
-                    end: trans_end,
-                    is_transient: true,
-                    stretch_ratio: global_ratio,
-                });
-            }
-
-            pos = trans_end;
-        }
-
-        // Remaining tonal region
-        if pos < input_len {
-            segments.push(Segment {
-                start: pos,
-                end: input_len,
-                is_transient: false,
+        build_adaptive_segments(input_len, onsets, strengths, &self.params, global_ratio)
+            .into_iter()
+            .map(|seg| Segment {
+                start: seg.start,
+                end: seg.end,
+                is_transient: seg.is_transient,
                 stretch_ratio: global_ratio,
-            });
-        }
-
-        segments
+            })
+            .collect()
     }
 }
 

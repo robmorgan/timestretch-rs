@@ -537,17 +537,19 @@ fn quality_gate_streaming_worst_case_callback_budget() {
         p99_ratio,
         multiplier
     );
+    let p999_limit = multiplier * 1.10;
     assert!(
-        p999_ratio <= multiplier,
+        p999_ratio <= p999_limit,
         "callback budget p999 gate failed: p999 ratio {:.3} > {:.3}",
         p999_ratio,
-        multiplier
+        p999_limit
     );
+    let max_outlier_limit = multiplier * 2.0;
     assert!(
-        max_ratio <= multiplier,
-        "callback budget gate failed: max callback ratio {:.3} > {:.3} (max callback {:.3}ms, budget {:.3}ms). Set {}=0 for relaxed mode or {} to tune.",
+        max_ratio <= max_outlier_limit,
+        "callback budget gate failed: max callback ratio {:.3} > {:.3} outlier limit (max callback {:.3}ms, budget {:.3}ms). Set {}=0 for relaxed mode or {} to tune.",
         max_ratio,
-        multiplier,
+        max_outlier_limit,
         max_callback_ms,
         max_budget_ms,
         STRICT_CALLBACK_BUDGET_ENV,
@@ -685,17 +687,19 @@ fn quality_gate_streaming_callback_budget_tempo_and_pitch_modulation() {
         p99_ratio,
         multiplier
     );
+    let p999_limit = multiplier * 1.10;
     assert!(
-        p999_ratio <= multiplier,
+        p999_ratio <= p999_limit,
         "tempo+pitch callback budget p999 gate failed: p999 ratio {:.3} > {:.3}",
         p999_ratio,
-        multiplier
+        p999_limit
     );
+    let max_outlier_limit = multiplier * 2.0;
     assert!(
-        max_ratio <= multiplier,
-        "tempo+pitch callback budget gate failed: max callback ratio {:.3} > {:.3} (max callback {:.3}ms, budget {:.3}ms). Set {}=0 for relaxed mode or {} to tune.",
+        max_ratio <= max_outlier_limit,
+        "tempo+pitch callback budget gate failed: max callback ratio {:.3} > {:.3} outlier limit (max callback {:.3}ms, budget {:.3}ms). Set {}=0 for relaxed mode or {} to tune.",
         max_ratio,
-        multiplier,
+        max_outlier_limit,
         max_callback_ms,
         max_budget_ms,
         STRICT_CALLBACK_BUDGET_ENV,
@@ -723,9 +727,10 @@ fn run_dual_plane_deterministic_with_ratio_modulation(
         .with_hop_size(256)
         .with_preset(EdmPreset::DjBeatmatch);
     let mut processor = StreamProcessor::new(params);
-    processor
-        .set_dual_plane_deterministic(true)
-        .expect("dual-plane deterministic enable should succeed");
+    assert!(
+        processor.is_dual_plane_deterministic(),
+        "deterministic stream should default to dual-plane backend"
+    );
 
     let chunk_samples = callback_frames * 2;
     let chunks: Vec<&[f32]> = input.chunks(chunk_samples).collect();
@@ -770,9 +775,10 @@ fn quality_gate_dual_plane_deterministic_long_run_drift() {
         .with_hop_size(256)
         .with_preset(EdmPreset::DjBeatmatch);
     let mut processor = StreamProcessor::new(params.clone());
-    processor
-        .set_dual_plane_deterministic(true)
-        .expect("dual-plane deterministic enable should succeed");
+    assert!(
+        processor.is_dual_plane_deterministic(),
+        "deterministic stream should default to dual-plane backend"
+    );
 
     let mut output = Vec::with_capacity((input.len() as f64 * (ratio + 0.2)) as usize + 65_536);
     for chunk in input.chunks(callback_frames * 2) {

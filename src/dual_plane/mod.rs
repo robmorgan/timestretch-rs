@@ -14,5 +14,5 @@ pub mod warp_map;
 pub use engine::DualPlaneProcessor;
 pub use hints::RenderHints;
 pub use quality::{LatencyProfile, QualityGovernor, QualityTier, RtGovernorConfig};
-pub use rt::{RtConfig, RtControlSender, RtProcessor};
+pub use rt::{RtConfig, RtControlSender, RtProcessor, RtProfileTelemetry};
 pub use warp_map::{TimeWarpMap, WarpAnchor};
