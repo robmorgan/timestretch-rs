@@ -19,6 +19,11 @@ pub struct RenderHints {
     pub lane_bias: [f32; 3],
     /// Short-horizon multiplicative ratio bias applied to warp-map slope.
     pub ratio_bias: f64,
+    /// Input-domain transient mask for this snapshot horizon.
+    ///
+    /// Values are in `[0, 1]`, aligned to input-frame positions starting at
+    /// `at_input_frame`.
+    pub transient_mask: Vec<f32>,
 }
 
 impl Default for RenderHints {
@@ -32,6 +37,7 @@ impl Default for RenderHints {
             noise_confidence: 0.0,
             lane_bias: [0.0, 0.0, 0.0],
             ratio_bias: 0.0,
+            transient_mask: Vec::new(),
         }
     }
 }

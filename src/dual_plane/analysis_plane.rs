@@ -130,6 +130,13 @@ fn analyze_block(
         params.transient_sensitivity,
         TransientDetectionOptions::from_stretch_params(params),
     );
+    let transient_mask = build_transient_mask(
+        mono.len(),
+        params.sample_rate,
+        params.transient_region_secs,
+        &transient_map.onsets,
+        &transient_map.strengths,
+    );
     let duration_secs = mono.len() as f32 / params.sample_rate.max(1) as f32;
     let transient_density = transient_map.onsets.len() as f32 / duration_secs.max(1e-3);
     let transient_confidence = (transient_density / 8.0).clamp(0.0, 1.0);
@@ -172,6 +179,7 @@ fn analyze_block(
         lane_bias,
         ratio_bias: ((beat_confidence as f64 - transient_confidence as f64) * 0.04)
             .clamp(-0.08, 0.08),
+        transient_mask,
     }
 }
 
@@ -183,4 +191,57 @@ fn mix_to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
         .chunks_exact(channels)
         .map(|frame| frame.iter().copied().sum::<f32>() / channels as f32)
         .collect()
+}
+
+fn build_transient_mask(
+    input_len: usize,
+    sample_rate: u32,
+    transient_region_secs: f64,
+    onsets: &[usize],
+    strengths: &[f32],
+) -> Vec<f32> {
+    if input_len == 0 {
+        return Vec::new();
+    }
+
+    let mut mask = vec![0.0f32; input_len];
+    if onsets.is_empty() {
+        return mask;
+    }
+
+    let region_samples = (transient_region_secs * f64::from(sample_rate)).round() as usize;
+    let half_width = (region_samples / 2).max(8) as isize;
+
+    for (idx, &onset) in onsets.iter().enumerate() {
+        let center = onset.min(input_len.saturating_sub(1)) as isize;
+        let strength = strengths.get(idx).copied().unwrap_or(1.0).clamp(0.0, 1.0);
+        let start = (center - half_width).max(0) as usize;
+        let end = (center + half_width).min(input_len.saturating_sub(1) as isize) as usize;
+        for i in start..=end {
+            let dist = (i as isize - center).unsigned_abs() as f32 / half_width as f32;
+            let tri = (1.0 - dist).max(0.0) * strength;
+            mask[i] = mask[i].max(tri);
+        }
+    }
+
+    for i in 1..input_len {
+        let prev = mask[i - 1];
+        let cur = mask[i];
+        mask[i] = (0.7 * prev + 0.3 * cur).clamp(0.0, 1.0);
+    }
+    mask
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_transient_mask;
+
+    #[test]
+    fn transient_mask_marks_onset_regions() {
+        let mask = build_transient_mask(128, 48_000, 0.001, &[32, 96], &[1.0, 0.5]);
+        assert_eq!(mask.len(), 128);
+        assert!(mask[32] > 0.9);
+        assert!(mask[96] > 0.4);
+        assert!(mask[0] < 0.1);
+    }
 }

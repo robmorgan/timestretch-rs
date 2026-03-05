@@ -150,8 +150,50 @@ impl Wsola {
         self.stretch_ratio
     }
 
+    /// Updates the stretch ratio for subsequent processing.
+    ///
+    /// This also reconfigures overlap/crossfade geometry so near-unity ratios
+    /// use a tighter overlap and farther-from-unity ratios use a longer overlap.
+    pub fn set_stretch_ratio(&mut self, stretch_ratio: f64) {
+        self.stretch_ratio = stretch_ratio;
+        self.overlap_size = if (stretch_ratio - 1.0).abs() < 0.15 {
+            self.segment_size / 4
+        } else {
+            self.segment_size / 2
+        };
+        let (crossfade_in, crossfade_out) = build_crossfade_tables(self.overlap_size);
+        self.crossfade_in = crossfade_in;
+        self.crossfade_out = crossfade_out;
+        if self.equal_power {
+            self.set_equal_power_crossfade();
+        }
+    }
+
     /// Stretches a mono audio signal using WSOLA.
     pub fn process(&mut self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
+        let mut out = Vec::new();
+        self.process_into_internal(input, &mut out, true)?;
+        Ok(out)
+    }
+
+    /// Stretches a mono signal into a caller-provided output buffer.
+    ///
+    /// This variant never grows `output`; if capacity is insufficient it returns
+    /// `StretchError::BufferOverflow`.
+    pub fn process_into(
+        &mut self,
+        input: &[f32],
+        output: &mut Vec<f32>,
+    ) -> Result<(), StretchError> {
+        self.process_into_internal(input, output, false)
+    }
+
+    fn process_into_internal(
+        &mut self,
+        input: &[f32],
+        out: &mut Vec<f32>,
+        allow_output_growth: bool,
+    ) -> Result<(), StretchError> {
         if self.segment_size == 0 {
             return Err(StretchError::InvalidState("WSOLA segment_size must be > 0"));
         }
@@ -187,21 +229,21 @@ impl Wsola {
 
         // Take the reusable buffer out of self to avoid borrow conflicts
         // (find_best_position borrows &mut self while output is also needed)
-        let mut output = std::mem::take(&mut self.output_buf);
+        let mut work = std::mem::take(&mut self.output_buf);
 
         // Grow if needed, zero the portion we'll use; never shrink
         let estimated_output_len = target_output_len + self.segment_size * 2;
-        if output.len() < estimated_output_len {
-            output.resize(estimated_output_len, 0.0);
+        if work.len() < estimated_output_len {
+            work.resize(estimated_output_len, 0.0);
         } else {
-            for s in &mut output[..estimated_output_len] {
+            for s in &mut work[..estimated_output_len] {
                 *s = 0.0;
             }
         }
 
         // Copy first segment
         let first_len = self.segment_size.min(input.len());
-        output[..first_len].copy_from_slice(&input[..first_len]);
+        work[..first_len].copy_from_slice(&input[..first_len]);
 
         let mut input_pos: f64 = advance_input as f64;
         // Track output position fractionally to avoid cumulative rounding error
@@ -217,7 +259,7 @@ impl Wsola {
         while (input_pos as usize) + self.segment_size <= input.len() {
             iterations = iterations.saturating_add(1);
             if iterations > max_iterations {
-                self.output_buf = output;
+                self.output_buf = work;
                 return Err(StretchError::InvalidState(
                     "WSOLA main loop iteration bound exceeded",
                 ));
@@ -232,27 +274,35 @@ impl Wsola {
 
             // Ensure we have room in the output buffer
             let needed = output_pos + self.segment_size;
-            if needed > output.len() {
-                output.resize(needed, 0.0);
+            if needed > work.len() {
+                work.resize(needed, 0.0);
             }
 
             // Search for best matching position around nominal position
             let (best_pos, fractional_offset) =
-                self.find_best_position(input, &output, nominal_pos, output_pos);
+                self.find_best_position(input, &work, nominal_pos, output_pos);
 
             // Overlap-add with cross-fade (using sub-sample offset for precision)
-            self.overlap_add(input, &mut output, best_pos, output_pos, fractional_offset);
+            self.overlap_add(input, &mut work, best_pos, output_pos, fractional_offset);
             actual_output_len = (output_pos + self.segment_size).max(actual_output_len);
 
             input_pos += advance_input as f64;
             output_pos_f += advance_output_f;
         }
 
-        // Return a copy of the result; put the buffer back for reuse
         let final_len = actual_output_len.min(target_output_len);
-        let result = output[..final_len].to_vec();
-        self.output_buf = output;
-        Ok(result)
+        if !allow_output_growth && out.capacity() < final_len {
+            self.output_buf = work;
+            return Err(StretchError::BufferOverflow {
+                buffer: "wsola_process_into_output",
+                requested: final_len,
+                available: out.capacity(),
+            });
+        }
+        out.clear();
+        out.extend_from_slice(&work[..final_len]);
+        self.output_buf = work;
+        Ok(())
     }
 
     /// Finds the best matching position within the search range using FFT-accelerated
@@ -1444,5 +1494,27 @@ mod tests {
             "Zero segment size must fail with InvalidState, got: {:?}",
             result
         );
+    }
+
+    #[test]
+    fn test_process_into_reuses_caller_buffer() {
+        let segment_size = 256;
+        let search_range = 64;
+        let mut wsola = Wsola::new(segment_size, search_range, 1.25);
+        let input: Vec<f32> = (0..2048).map(|i| ((i as f32) * 0.01).sin()).collect();
+        let mut out = Vec::with_capacity(4096);
+        let initial_capacity = out.capacity();
+        wsola.process_into(&input, &mut out).unwrap();
+        assert!(!out.is_empty());
+        assert_eq!(out.capacity(), initial_capacity);
+    }
+
+    #[test]
+    fn test_process_into_rejects_small_capacity() {
+        let mut wsola = Wsola::new(256, 64, 1.5);
+        let input: Vec<f32> = (0..2048).map(|i| ((i as f32) * 0.01).sin()).collect();
+        let mut out = Vec::with_capacity(8);
+        let err = wsola.process_into(&input, &mut out).unwrap_err();
+        assert!(matches!(err, StretchError::BufferOverflow { .. }));
     }
 }

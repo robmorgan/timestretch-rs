@@ -12,12 +12,12 @@ use crate::dual_plane::quality::{LatencyProfile, QualityGovernor, QualityTier, R
 use crate::dual_plane::warp_map::TimeWarpMap;
 use crate::error::StretchError;
 use crate::stretch::phase_vocoder::PhaseVocoder;
+use crate::stretch::wsola::Wsola;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::time::Instant;
 
 const CONTROL_QUEUE_CAPACITY: usize = 8;
-const RESIDUAL_HPF_ALPHA: f32 = 0.08;
 const RATIO_SNAP_EPS: f64 = 1e-6;
 
 /// Configuration for the hard-RT processor.
@@ -161,9 +161,9 @@ pub struct RtProcessor {
     tonal_output: Vec<Vec<f32>>,
     transient_output: Vec<Vec<f32>>,
     residual_output: Vec<Vec<f32>>,
-    residual_source: Vec<Vec<f32>>,
-    residual_lp_state: Vec<f32>,
+    transient_mask: Vec<f32>,
     vocoders: Vec<PhaseVocoder>,
+    transient_stretchers: Vec<Wsola>,
     warp_map: Arc<TimeWarpMap>,
     hints: Arc<RenderHints>,
     control: RtControlSender,
@@ -254,6 +254,24 @@ impl RtProcessor {
             pv.set_adaptive_envelope_order(config.params.adaptive_envelope_order);
             vocoders.push(pv);
         }
+        let transient_segment = config
+            .params
+            .hop_size
+            .saturating_mul(4)
+            .max(64)
+            .min(config.kernel_frames.max(64));
+        let transient_search = (transient_segment / 2).max(8);
+        let transient_stretchers = (0..num_channels)
+            .map(|_| {
+                let mut wsola = Wsola::new(
+                    transient_segment,
+                    transient_search,
+                    config.params.stretch_ratio,
+                );
+                wsola.set_equal_power_crossfade();
+                wsola
+            })
+            .collect::<Vec<_>>();
 
         let (warp_tx, warp_rx) = sync_channel(CONTROL_QUEUE_CAPACITY);
         let (hints_tx, hints_rx) = sync_channel(CONTROL_QUEUE_CAPACITY);
@@ -286,11 +304,9 @@ impl RtProcessor {
             residual_output: (0..num_channels)
                 .map(|_| Vec::with_capacity(max_output_frames))
                 .collect(),
-            residual_source: (0..num_channels)
-                .map(|_| Vec::with_capacity(kernel_samples / num_channels))
-                .collect(),
-            residual_lp_state: vec![0.0; num_channels],
+            transient_mask: vec![0.0; max_output_frames],
             vocoders,
+            transient_stretchers,
             warp_map,
             hints,
             control,
@@ -499,7 +515,6 @@ impl RtProcessor {
         self.input_ring.clear();
         self.pending_output.clear();
         self.input_timeline_frames = 0.0;
-        self.residual_lp_state.fill(0.0);
         for vocoder in &mut self.vocoders {
             vocoder.reset_phase_state();
         }
@@ -518,12 +533,24 @@ impl RtProcessor {
                     available: self.tonal_output[ch].capacity(),
                 });
             }
+            if self.transient_output[ch].capacity() < max_output {
+                return Err(StretchError::BufferOverflow {
+                    buffer: "rt_transient_output_capacity",
+                    requested: max_output,
+                    available: self.transient_output[ch].capacity(),
+                });
+            }
             self.tonal_output[ch].clear();
             self.vocoders[ch].process_streaming_into(&zero_kernel, &mut self.tonal_output[ch])?;
             self.tonal_output[ch].clear();
             self.vocoders[ch].flush_streaming_into(&mut self.tonal_output[ch])?;
             self.tonal_output[ch].clear();
             self.vocoders[ch].reset_phase_state();
+
+            self.transient_output[ch].clear();
+            self.transient_stretchers[ch]
+                .process_into(&zero_kernel, &mut self.transient_output[ch])?;
+            self.transient_output[ch].clear();
         }
         Ok(())
     }
@@ -632,6 +659,7 @@ impl RtProcessor {
     }
 
     fn render_fixed_kernel(&mut self) -> Result<(), StretchError> {
+        let kernel_start_frame = self.input_timeline_frames;
         let copied = self
             .input_ring
             .peek_slice(&mut self.interleaved_scratch[..self.kernel_samples]);
@@ -651,9 +679,12 @@ impl RtProcessor {
                 });
             }
             self.channel_input[ch].clear();
-            for frame in 0..frames {
-                self.channel_input[ch]
-                    .push(self.interleaved_scratch[frame * self.num_channels + ch]);
+        }
+        for frame in 0..frames {
+            let base = frame * self.num_channels;
+            for ch in 0..self.num_channels {
+                let sample = self.interleaved_scratch[base + ch];
+                self.channel_input[ch].push(sample);
             }
         }
 
@@ -661,6 +692,9 @@ impl RtProcessor {
         if (ratio - self.active_ratio).abs() > RATIO_SNAP_EPS {
             for vocoder in &mut self.vocoders {
                 vocoder.set_stretch_ratio(ratio);
+            }
+            for stretcher in &mut self.transient_stretchers {
+                stretcher.set_stretch_ratio(ratio);
             }
             self.active_ratio = ratio;
         }
@@ -671,19 +705,19 @@ impl RtProcessor {
             self.vocoders[ch]
                 .process_streaming_into(&self.channel_input[ch], &mut self.tonal_output[ch])?;
             min_output_len = min_output_len.min(self.tonal_output[ch].len());
+
+            self.transient_output[ch].clear();
+            self.transient_stretchers[ch]
+                .process_into(&self.channel_input[ch], &mut self.transient_output[ch])?;
+            min_output_len = min_output_len.min(self.transient_output[ch].len());
         }
         if min_output_len == usize::MAX || min_output_len == 0 {
             self.consume_kernel_input();
             return Ok(());
         }
 
+        self.build_transient_mask_from_hints(min_output_len, ratio, kernel_start_frame);
         for ch in 0..self.num_channels {
-            resample_linear_to_len(
-                &self.channel_input[ch],
-                &mut self.transient_output[ch],
-                min_output_len,
-                "rt_transient_lane",
-            )?;
             self.render_residual_lane(ch, min_output_len)?;
         }
 
@@ -693,35 +727,56 @@ impl RtProcessor {
         Ok(())
     }
 
+    fn build_transient_mask_from_hints(&mut self, out_len: usize, ratio: f64, kernel_start: f64) {
+        if out_len == 0 {
+            self.transient_mask.clear();
+            return;
+        }
+        if self.transient_mask.len() < out_len {
+            self.transient_mask.resize(out_len, 0.0);
+        } else {
+            for sample in self.transient_mask[..out_len].iter_mut() {
+                *sample = 0.0;
+            }
+        }
+
+        if matches!(self.current_tier, QualityTier::Q0) {
+            return;
+        }
+        let hint_mask = &self.hints.transient_mask;
+        if hint_mask.is_empty() {
+            return;
+        }
+        let hint_start = self.hints.at_input_frame as f64;
+        let hint_end = hint_start + hint_mask.len() as f64;
+        let inv_ratio = 1.0 / ratio.max(1e-6);
+
+        for out_idx in 0..out_len {
+            let input_pos = kernel_start + out_idx as f64 * inv_ratio;
+            if input_pos < hint_start || input_pos >= hint_end {
+                continue;
+            }
+            let hint_idx = (input_pos - hint_start) as usize;
+            self.transient_mask[out_idx] = hint_mask[hint_idx].clamp(0.0, 1.0);
+        }
+    }
+
     fn render_residual_lane(&mut self, ch: usize, out_len: usize) -> Result<(), StretchError> {
-        let src = &self.channel_input[ch];
-        let residual_src = &mut self.residual_source[ch];
-        if residual_src.capacity() < src.len() {
+        let output = &mut self.residual_output[ch];
+        if output.capacity() < out_len {
             return Err(StretchError::BufferOverflow {
-                buffer: "rt_residual_source",
-                requested: src.len(),
-                available: residual_src.capacity(),
+                buffer: "rt_residual_lane",
+                requested: out_len,
+                available: output.capacity(),
             });
         }
-        residual_src.clear();
-
-        let mut lp = self.residual_lp_state[ch];
-        for &sample in src {
-            lp += RESIDUAL_HPF_ALPHA * (sample - lp);
-            residual_src.push(sample - lp);
-        }
-        self.residual_lp_state[ch] = lp;
-
-        resample_linear_to_len(
-            residual_src,
-            &mut self.residual_output[ch],
-            out_len,
-            "rt_residual_lane",
-        )?;
-        for (idx, sample) in self.residual_output[ch].iter_mut().enumerate() {
+        output.clear();
+        for idx in 0..out_len {
+            let mut sample = self.transient_output[ch][idx] - self.tonal_output[ch][idx];
             if (idx & 1) == 1 {
-                *sample = -*sample;
+                sample = -sample;
             }
+            output.push(sample * 0.5);
         }
         Ok(())
     }
@@ -735,11 +790,25 @@ impl RtProcessor {
         }
 
         for frame in 0..frames {
+            let transient_gate = self
+                .transient_mask
+                .get(frame)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            let transient_w = weights[0] * (0.30 + 0.70 * transient_gate);
+            let tonal_w = weights[1] * (1.0 - 0.55 * transient_gate);
+            let residual_w = weights[2] * (0.20 + 0.80 * transient_gate);
+            let norm = (transient_w + tonal_w + residual_w).max(1e-6);
+            let tw = transient_w / norm;
+            let tow = tonal_w / norm;
+            let rw = residual_w / norm;
+
             for ch in 0..self.num_channels {
                 let tonal = self.tonal_output[ch][frame];
                 let transient = self.transient_output[ch][frame];
                 let residual = self.residual_output[ch][frame];
-                let mixed = transient * weights[0] + tonal * weights[1] + residual * weights[2];
+                let mixed = transient * tw + tonal * tow + residual * rw;
                 if !self.pending_output.push(mixed) {
                     return Err(StretchError::InvalidState(
                         "rt pending output rejected push after capacity check",
@@ -908,42 +977,6 @@ impl RtProcessor {
         self.input_ring.discard(consumed_samples);
         self.input_timeline_frames += consumed_frames as f64;
     }
-}
-
-fn resample_linear_to_len(
-    input: &[f32],
-    output: &mut Vec<f32>,
-    output_len: usize,
-    buffer_name: &'static str,
-) -> Result<(), StretchError> {
-    output.clear();
-    if output_len == 0 || input.is_empty() {
-        return Ok(());
-    }
-    if output.capacity() < output_len {
-        return Err(StretchError::BufferOverflow {
-            buffer: buffer_name,
-            requested: output_len,
-            available: output.capacity(),
-        });
-    }
-
-    if input.len() == 1 {
-        output.resize(output_len, input[0]);
-        return Ok(());
-    }
-
-    let src_max = (input.len() - 1) as f64;
-    let denom = (output_len - 1).max(1) as f64;
-    for i in 0..output_len {
-        let pos = (i as f64 / denom) * src_max;
-        let idx = pos.floor() as usize;
-        let frac = (pos - idx as f64) as f32;
-        let a = input[idx];
-        let b = input[(idx + 1).min(input.len() - 1)];
-        output.push(a + (b - a) * frac);
-    }
-    Ok(())
 }
 
 #[cfg(test)]

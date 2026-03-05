@@ -39,11 +39,11 @@ impl QualityTier {
     #[inline]
     pub fn lane_weights(self) -> [f32; 3] {
         match self {
-            QualityTier::Q0 => [0.05, 0.95, 0.0],
-            QualityTier::Q1 => [0.12, 0.83, 0.05],
-            QualityTier::Q2 => [0.18, 0.72, 0.10],
-            QualityTier::Q3 => [0.24, 0.64, 0.12],
-            QualityTier::Q4 => [0.30, 0.58, 0.12],
+            QualityTier::Q0 => [0.02, 0.98, 0.0],
+            QualityTier::Q1 => [0.08, 0.90, 0.02],
+            QualityTier::Q2 => [0.14, 0.82, 0.04],
+            QualityTier::Q3 => [0.20, 0.75, 0.05],
+            QualityTier::Q4 => [0.24, 0.70, 0.06],
         }
     }
 }
