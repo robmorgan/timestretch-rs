@@ -7,10 +7,11 @@
 //! natural phase relationship.
 
 use crate::analysis::beat::detect_beats;
-use crate::analysis::transient::detect_transients;
+use crate::analysis::transient::{detect_transients_with_options, TransientDetectionOptions};
 use crate::core::types::StretchParams;
 use crate::error::StretchError;
 use crate::stretch::hybrid::{merge_onsets_and_beats, HybridStretcher};
+use crate::stretch::phase_vocoder::PhaseVocoder;
 
 /// Maximum FFT size used for shared transient detection.
 const STEREO_TRANSIENT_MAX_FFT: usize = 2048;
@@ -65,9 +66,11 @@ pub fn decode_mid_side(mid: &[f32], side: &[f32]) -> (Vec<f32>, Vec<f32>) {
 
 /// Stretches stereo audio using Mid/Side processing.
 ///
-/// Converts L/R to M/S, processes each through the hybrid stretcher,
-/// then converts back to L/R. This preserves the stereo image because
-/// the shared spectral content (Mid) is processed as a coherent signal.
+/// Converts L/R to M/S, processes Mid through the hybrid stretcher (preserving
+/// transient/tonal segmentation for the center image), and processes Side
+/// through a pure phase vocoder (the stereo difference signal — reverb, effects,
+/// panning — has no meaningful transients; WSOLA temporal searching on the Side
+/// channel shifts it relative to Mid and collapses stereo width).
 pub fn stretch_mid_side(
     left: &[f32],
     right: &[f32],
@@ -76,14 +79,30 @@ pub fn stretch_mid_side(
     let (mid, side) = encode_mid_side(left, right);
     let (shared_onsets, shared_strengths) = build_shared_onset_map(&mid, params);
 
-    // Process Mid and Side using the same segmentation anchors.
+    // Process Mid with hybrid stretcher (transient-aware).
     let mid_stretcher = HybridStretcher::new(params.clone());
     let mid_stretched =
         mid_stretcher.process_with_onsets(&mid, &shared_onsets, &shared_strengths)?;
 
-    let side_stretcher = HybridStretcher::new(params.clone());
-    let side_stretched =
-        side_stretcher.process_with_onsets(&side, &shared_onsets, &shared_strengths)?;
+    // Process Side with pure phase vocoder — no WSOLA temporal search.
+    // The Side channel (L-R difference) is mostly reverb, stereo effects,
+    // and decorrelated content. Applying WSOLA's cross-correlation search
+    // shifts it temporally relative to Mid, destroying the stereo image.
+    // A pure PV preserves the spectral content and temporal structure.
+    let side_stretched = if side.len() >= params.fft_size {
+        let mut side_pv = PhaseVocoder::new(
+            params.fft_size,
+            params.hop_size,
+            params.stretch_ratio,
+            params.sample_rate,
+            params.sub_bass_cutoff,
+        );
+        side_pv.process(&side)?
+    } else {
+        // Side channel too short for PV — fall back to linear resampling
+        let out_len = (side.len() as f64 * params.stretch_ratio).round() as usize;
+        crate::core::resample::resample_linear(&side, out_len.max(1))
+    };
 
     // Deterministic channel length agreement before decode.
     let target_len = params.output_length(mid.len());
@@ -96,12 +115,13 @@ pub fn stretch_mid_side(
 
 /// Builds a shared transient/beat map from the Mid channel.
 fn build_shared_onset_map(mid: &[f32], params: &StretchParams) -> (Vec<usize>, Vec<f32>) {
-    let transient_map = detect_transients(
+    let transient_map = detect_transients_with_options(
         mid,
         params.sample_rate,
         params.fft_size.min(STEREO_TRANSIENT_MAX_FFT),
         params.hop_size.min(STEREO_TRANSIENT_MAX_HOP),
         params.transient_sensitivity,
+        TransientDetectionOptions::from_stretch_params(params),
     );
 
     let onsets = transient_map.onsets.clone();

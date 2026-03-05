@@ -75,7 +75,7 @@ let output = timestretch::stretch(&input, &params).unwrap();
 ### Real-Time Streaming
 
 ```rust
-use timestretch::{QualityMode, StreamProcessor, StretchParams, EdmPreset};
+use timestretch::{EdmPreset, QualityMode, StreamProcessor, StreamingEngine, StretchParams};
 
 let params = StretchParams::new(1.02)
     .with_preset(EdmPreset::DjBeatmatch)
@@ -84,7 +84,8 @@ let params = StretchParams::new(1.02)
     .with_quality_mode(QualityMode::Balanced);
 
 let mut processor = StreamProcessor::new(params);
-processor.set_hybrid_mode(true); // optional: persistent hybrid streaming path
+processor.set_streaming_engine(StreamingEngine::Deterministic); // default realtime path
+// processor.set_streaming_engine(StreamingEngine::LegacyHybridRerender); // optional legacy hybrid path
 let mut output_chunk = Vec::with_capacity(8192); // pre-allocate once
 
 // Feed chunks as they arrive from your audio driver
@@ -96,20 +97,46 @@ loop {
 }
 
 // Change ratio on the fly (e.g. DJ pitch fader)
-processor.set_stretch_ratio(1.05);
+processor.set_stretch_ratio(1.05).expect("valid ratio");
 
 // Flush remaining samples when done
 let mut remaining = Vec::with_capacity(8192);
 processor.flush_into(&mut remaining).unwrap();
 ```
 
+### Dual-Plane RT API
+
+```rust
+use std::sync::Arc;
+use timestretch::{RtConfig, RtProcessor, StretchParams, TimeWarpMap};
+
+let params = StretchParams::new(1.0)
+    .with_sample_rate(48_000)
+    .with_channels(2)
+    .with_fft_size(1024)
+    .with_hop_size(256);
+let cfg = RtConfig::new(params, 256); // fixed callback size
+let mut rt = RtProcessor::prepare(cfg).unwrap();
+let control = rt.control_sender();
+
+// Publish a warp-curve snapshot from a control thread.
+let warp = Arc::new(TimeWarpMap::from_ratio(1.02, 48_000).unwrap());
+let _ = control.publish_warp_map(warp);
+
+let mut out = Vec::with_capacity(8192);
+let in_block = vec![0.0_f32; 256 * 2];
+rt.process_block(&in_block, &mut out).unwrap();
+rt.flush(&mut out).unwrap();
+```
+
 ### Tempo-Aware Streaming (DJ)
 
 ```rust
-use timestretch::StreamProcessor;
+use timestretch::{StreamProcessor, StreamingEngine};
 
 let mut processor = StreamProcessor::from_tempo(126.0, 128.0, 44100, 2);
-processor.set_hybrid_mode(true); // optional: higher-quality hybrid stream path
+processor.set_streaming_engine(StreamingEngine::Deterministic); // default
+// processor.set_streaming_engine(StreamingEngine::LegacyHybridRerender); // optional legacy path
 
 // Move the target deck tempo during playback
 processor.set_tempo(130.0);
@@ -119,6 +146,26 @@ println!(
     processor.target_bpm().unwrap_or(0.0),
     processor.latency_secs() * 1000.0
 );
+```
+
+### Low-Latency Tempo Constructor
+
+```rust
+use timestretch::StreamProcessor;
+
+let mut processor = StreamProcessor::try_from_tempo_low_latency(126.0, 128.0, 44100, 2)
+    .expect("valid BPM inputs");
+assert!(processor.latency_secs() * 1000.0 < 40.0);
+```
+
+### Realtime Pitch Control
+
+```rust
+use timestretch::StreamProcessor;
+
+let mut processor = StreamProcessor::from_tempo(126.0, 128.0, 44100, 2);
+processor.set_pitch_scale(1.05).expect("valid pitch scale");
+println!("Current pitch scale control: {:.3}", processor.pitch_scale());
 ```
 
 ### AudioBuffer API
@@ -136,16 +183,25 @@ println!("Duration: {:.2}s -> {:.2}s", buffer.duration_secs(), output.duration_s
 ### Pitch Shifting
 
 ```rust
-use timestretch::StretchParams;
+use timestretch::{EnvelopePreset, StretchParams};
 
 let params = StretchParams::new(1.0)
     .with_sample_rate(44100)
-    .with_channels(1);
+    .with_channels(1)
+    .with_envelope_preset(EnvelopePreset::Vocal) // stronger formant retention
+    .with_envelope_strength(1.4)
+    .with_adaptive_envelope_order(true);
 
 // Shift up one octave (2x frequency), preserving duration
 let output = timestretch::pitch_shift(&input, &params, 2.0).unwrap();
 assert_eq!(output.len(), input.len());
 ```
+
+Envelope control quick guide:
+- Default profile is `EnvelopePreset::Balanced` (`envelope_strength = 1.0`, adaptive order enabled).
+- Use `.with_envelope_preset(EnvelopePreset::Off)` for classic behavior with no formant correction.
+- Use `.with_envelope_preset(EnvelopePreset::Vocal)` for stronger vocal formant retention.
+- Use `.with_envelope_strength(x)` to scale correction (`0.0..=2.0`), and `.with_adaptive_envelope_order(true)` for content-adaptive cepstral detail.
 
 ### BPM-Based Stretching
 
@@ -289,11 +345,23 @@ cargo test --release --test benchmarks -- --nocapture
 # Quality-gate benchmark subset (CI-enforced)
 cargo test --test quality_gates -- --nocapture
 
+# Strict callback-budget gate (same mode used in CI quality-gates job)
+TIMESTRETCH_STRICT_CALLBACK_BUDGET=1 cargo test --release --test quality_gates -- --nocapture
+
+# Emit quality dashboard CSV artifacts (one file per quality gate)
+TIMESTRETCH_QUALITY_DASHBOARD_DIR=target/quality_dashboard cargo test --test quality_gates -- --nocapture
+
 # Reference-quality comparison (strict corpus required)
 TIMESTRETCH_STRICT_REFERENCE_BENCHMARK=1 TIMESTRETCH_REFERENCE_MAX_SECONDS=30 cargo test --test reference_quality -- --nocapture
 
 # Ad-hoc reference-quality run (non-strict, short window)
 TIMESTRETCH_REFERENCE_MAX_SECONDS=5 cargo test --test reference_quality -- --nocapture
+
+# Single-scenario comparison against an external Rubber Band render
+TIMESTRETCH_RUBBERBAND_ORIGINAL_WAV=benchmarks/audio/originals/loop.wav \
+TIMESTRETCH_RUBBERBAND_REFERENCE_WAV=benchmarks/audio/references/loop_rubberband.wav \
+TIMESTRETCH_RUBBERBAND_RATIO=1.113043478 \
+cargo test --test rubberband_comparison -- --nocapture
 ```
 
 See `benchmarks/README.md` for corpus setup and manifest/checksum requirements.
@@ -308,9 +376,11 @@ See `benchmarks/README.md` for corpus setup and manifest/checksum requirements.
 - **`AudioBuffer`** — holds interleaved sample data with metadata (sample rate,
   channel layout)
 - **`EdmPreset`** — enum of tuned parameter sets for EDM workflows
-- **`QualityMode`** — explicit streaming profile: `LowLatency`, `Balanced`, `MaxQuality`
+- **`EnvelopePreset`** — formant/envelope profile (`Off`, `Balanced`, `Vocal`)
+- **`QualityMode`** — explicit streaming profile: `LowLatency` (lean path, HPSS off), `Balanced`, `MaxQuality` (HPSS + adaptive crossfade/phase-lock enabled)
+- **`StreamingEngine`** — streaming execution model: `Deterministic` (default) or `LegacyHybridRerender` (opt-in)
 - **`StreamProcessor`** — chunked real-time processor with on-the-fly ratio/tempo
-  changes, `from_tempo()`/`set_tempo()`, `process_into()`, and optional persistent hybrid mode
+  changes, `from_tempo()`/`set_tempo()`, `set_streaming_engine()`, and `process_into()`
 - **`PreAnalysisArtifact`** — serializable offline beat/onset analysis artifact
 - **`StretchError`** — error type covering invalid parameters, I/O failures,
   and input-too-short conditions

@@ -478,7 +478,9 @@ fn test_hybrid_streaming_ratio_change() {
     }
 
     // Change to ratio 1.25 mid-stream
-    processor.set_stretch_ratio(1.25);
+    processor
+        .set_stretch_ratio(1.25)
+        .expect("valid stretch ratio");
 
     // Process second half — ratio interpolation happens inside process()
     for chunk in input[half..].chunks(chunk_size) {

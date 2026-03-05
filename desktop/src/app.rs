@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use timestretch::{LatencyProfile, QualityTier};
 
 use crate::audio_engine::AudioEngine;
 use crate::decoder;
@@ -38,6 +39,7 @@ pub struct TimeStretchApp {
     pitch_semitones: f32,
     volume: f32,
     preset: PresetChoice,
+    latency_profile: LatencyProfile,
     target_bpm_text: String,
 
     // Error messages
@@ -51,8 +53,9 @@ impl TimeStretchApp {
         let position = Arc::new(AtomicPosition::new());
 
         // Try to create audio engine to detect default sample rate
+        let dummy_flush = Arc::new(AtomicBool::new(false));
         let (audio_engine, output_sample_rate) =
-            match AudioEngine::new(state.clone(), stream_active.clone(), None) {
+            match AudioEngine::new(state.clone(), stream_active.clone(), None, dummy_flush) {
                 Ok((engine, _producer)) => {
                     let sr = engine.output_sample_rate;
                     // We'll create a new engine when loading a file
@@ -80,7 +83,8 @@ impl TimeStretchApp {
             stretch_ratio: 1.0,
             pitch_semitones: 0.0,
             volume: 0.8,
-            preset: PresetChoice::None,
+            preset: PresetChoice::DjBeatmatch,
+            latency_profile: LatencyProfile::Mix,
             target_bpm_text: String::new(),
             error_message: None,
         }
@@ -140,6 +144,8 @@ impl TimeStretchApp {
                     st.pitch_semitones = self.pitch_semitones;
                     st.volume = self.volume;
                     st.preset = self.preset;
+                    st.latency_profile = self.latency_profile;
+                    st.current_quality_tier = self.latency_profile.initial_tier();
                 }
 
                 self.source_audio = Some(samples);
@@ -170,14 +176,19 @@ impl TimeStretchApp {
 
         // Create audio engine with ring buffer, matching the source file's sample rate
         // so playback speed is correct regardless of the device's native rate.
-        let (engine, producer) =
-            match AudioEngine::new(self.state.clone(), self.stream_active.clone(), Some(sample_rate)) {
-                Ok((e, p)) => (e, p),
-                Err(e) => {
-                    self.error_message = Some(format!("Audio error: {e}"));
-                    return;
-                }
-            };
+        let flush_ring = Arc::new(AtomicBool::new(false));
+        let (engine, producer) = match AudioEngine::new(
+            self.state.clone(),
+            self.stream_active.clone(),
+            Some(sample_rate),
+            flush_ring.clone(),
+        ) {
+            Ok((e, p)) => (e, p),
+            Err(e) => {
+                self.error_message = Some(format!("Audio error: {e}"));
+                return;
+            }
+        };
         self.audio_engine = Some(engine);
 
         // Prepare working audio (with pitch shift if needed)
@@ -187,7 +198,8 @@ impl TimeStretchApp {
             let factor = 2.0_f64.powf(self.pitch_semitones as f64 / 12.0);
             let params = timestretch::StretchParams::new(1.0)
                 .with_sample_rate(sample_rate)
-                .with_channels(2);
+                .with_channels(2)
+                .with_normalize(true);
             match timestretch::pitch_shift(&source, &params, factor) {
                 Ok(shifted) => shifted,
                 Err(e) => {
@@ -216,6 +228,7 @@ impl TimeStretchApp {
             self.position.clone(),
             self.stream_active.clone(),
             stop_flag,
+            flush_ring,
         );
 
         self.processing_handle = Some(handle);
@@ -258,6 +271,24 @@ impl TimeStretchApp {
         let mins = (secs / 60.0) as u32;
         let s = secs % 60.0;
         format!("{mins}:{s:05.2}")
+    }
+
+    fn latency_profile_label(profile: LatencyProfile) -> &'static str {
+        match profile {
+            LatencyProfile::Scratch => "Scratch",
+            LatencyProfile::Mix => "Mix",
+            LatencyProfile::Render => "Render",
+        }
+    }
+
+    fn quality_tier_label(tier: QualityTier) -> &'static str {
+        match tier {
+            QualityTier::Q0 => "Q0",
+            QualityTier::Q1 => "Q1",
+            QualityTier::Q2 => "Q2",
+            QualityTier::Q3 => "Q3",
+            QualityTier::Q4 => "Q4",
+        }
     }
 }
 
@@ -492,6 +523,47 @@ impl TimeStretchApp {
                         st.preset = self.preset;
                         st.preset_changed = true;
                     }
+                });
+                ui.end_row();
+
+                // Latency profile
+                ui.label("Latency Profile:");
+                ui.horizontal(|ui| {
+                    let old_profile = self.latency_profile;
+                    egui::ComboBox::from_id_salt("latency_profile_combo")
+                        .selected_text(Self::latency_profile_label(self.latency_profile))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.latency_profile,
+                                LatencyProfile::Scratch,
+                                Self::latency_profile_label(LatencyProfile::Scratch),
+                            );
+                            ui.selectable_value(
+                                &mut self.latency_profile,
+                                LatencyProfile::Mix,
+                                Self::latency_profile_label(LatencyProfile::Mix),
+                            );
+                            ui.selectable_value(
+                                &mut self.latency_profile,
+                                LatencyProfile::Render,
+                                Self::latency_profile_label(LatencyProfile::Render),
+                            );
+                        });
+                    if self.latency_profile != old_profile {
+                        let mut st = self.state.lock().unwrap();
+                        st.latency_profile = self.latency_profile;
+                        st.latency_profile_changed = true;
+                        st.current_quality_tier = self.latency_profile.initial_tier();
+                    }
+                });
+                ui.end_row();
+
+                // Current governor quality tier
+                let current_quality_tier = self.state.lock().unwrap().current_quality_tier;
+                ui.label("Quality Tier:");
+                ui.horizontal(|ui| {
+                    ui.monospace(Self::quality_tier_label(current_quality_tier));
+                    ui.label("(live)");
                 });
                 ui.end_row();
 

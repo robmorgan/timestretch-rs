@@ -11,6 +11,54 @@ try:
 except ImportError:
     plt = None
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OPTIMIZE_DIR = os.path.dirname(SCRIPT_DIR)
+REPO_ROOT = os.path.dirname(OPTIMIZE_DIR)
+ALIGN_ESTIMATE_MAX_POINTS = 6000
+
+
+def estimate_lag_samples(ref, test, max_lag_samples):
+    """
+    Estimate test-vs-ref lag in samples using downsampled cross-correlation.
+
+    Positive lag means `test` is delayed relative to `ref`.
+    """
+    n = min(len(ref), len(test))
+    if n <= 1 or max_lag_samples <= 0:
+        return 0, 1
+
+    stride = max(1, int(np.ceil(n / ALIGN_ESTIMATE_MAX_POINTS)))
+    ref_ds = ref[::stride]
+    test_ds = test[::stride]
+    if len(ref_ds) <= 1 or len(test_ds) <= 1:
+        return 0, stride
+
+    max_lag_ds = max(1, int(np.ceil(max_lag_samples / stride)))
+    corr = np.correlate(test_ds, ref_ds, mode='full')
+    center = len(ref_ds) - 1
+    lo = max(0, center - max_lag_ds)
+    hi = min(len(corr), center + max_lag_ds + 1)
+    if lo >= hi:
+        return 0, stride
+
+    lag_ds = int(np.argmax(corr[lo:hi]) + lo - center)
+    return int(lag_ds * stride), stride
+
+
+def align_pair_by_lag(ref, test, lag_samples):
+    """
+    Align `ref` and `test` by trimming heads based on lag sign.
+    """
+    if lag_samples > 0:
+        # test lags behind ref: drop lag from test
+        test = test[lag_samples:]
+    elif lag_samples < 0:
+        # test leads ref: drop lead from ref
+        ref = ref[-lag_samples:]
+
+    min_len = min(len(ref), len(test))
+    return ref[:min_len], test[:min_len]
+
 def calculate_spectral_convergence(ref, test):
     """
     Measures how close the spectrogram magnitudes are.
@@ -95,51 +143,217 @@ def calculate_transient_preservation(ref, test, sr, tolerance_ms=15):
             
     return matched / len(ref_times)
 
-def score_pair(ref_path, test_path, weights):
-    ref, sr_ref = librosa.load(ref_path, sr=None)
-    test, sr_test = librosa.load(test_path, sr=sr_ref) # Resample test to match ref if needed
-    
-    # Trim to match
+def calculate_stereo_width_preservation(ref_L, ref_R, test_L, test_R):
+    """
+    Measures how well the mid/side energy ratio is preserved.
+    Compares the side-to-mid energy ratio between reference and test.
+    Score 0-1, higher is better (1 = identical stereo width).
+    """
+    eps = 1e-10
+    ref_mid = (ref_L + ref_R) / 2.0
+    ref_side = (ref_L - ref_R) / 2.0
+    test_mid = (test_L + test_R) / 2.0
+    test_side = (test_L - test_R) / 2.0
+
+    ref_mid_e = np.sum(ref_mid ** 2) + eps
+    ref_side_e = np.sum(ref_side ** 2) + eps
+    test_mid_e = np.sum(test_mid ** 2) + eps
+    test_side_e = np.sum(test_side ** 2) + eps
+
+    ref_ratio = ref_side_e / ref_mid_e
+    test_ratio = test_side_e / test_mid_e
+
+    # Ratio of ratios, capped. 1.0 = perfect preservation.
+    if ref_ratio > test_ratio:
+        preservation = test_ratio / ref_ratio
+    else:
+        preservation = ref_ratio / test_ratio
+
+    return float(np.clip(preservation, 0, 1))
+
+
+def calculate_interchannel_correlation_preservation(ref_L, ref_R, test_L, test_R):
+    """
+    Measures how well the L-R phase/correlation relationship is preserved.
+    Computes the normalized cross-correlation between L and R for both
+    reference and test, then compares them.
+    Score 0-1, higher is better.
+    """
+    eps = 1e-10
+
+    def icc(L, R):
+        norm_L = np.linalg.norm(L)
+        norm_R = np.linalg.norm(R)
+        if norm_L < eps or norm_R < eps:
+            return 0.0
+        return float(np.dot(L, R) / (norm_L * norm_R))
+
+    ref_icc = icc(ref_L, ref_R)
+    test_icc = icc(test_L, test_R)
+
+    # Both ICC values are in [-1, 1]. Compare how close they are.
+    # Max possible difference is 2.0.
+    diff = abs(ref_icc - test_icc)
+    return float(1.0 - diff / 2.0)
+
+
+def calculate_panning_consistency(ref_L, ref_R, test_L, test_R, sr, hop_length=512):
+    """
+    Measures frame-by-frame panning preservation.
+    Computes per-frame L-R energy balance for ref and test, then
+    measures correlation between the two balance curves.
+    Score 0-1, higher is better.
+    """
+    eps = 1e-10
+    frame_size = hop_length * 2
+
+    def pan_curve(L, R):
+        n_frames = len(L) // frame_size
+        if n_frames == 0:
+            return np.array([0.0])
+        balance = np.zeros(n_frames)
+        for i in range(n_frames):
+            start = i * frame_size
+            end = start + frame_size
+            l_e = np.sum(L[start:end] ** 2) + eps
+            r_e = np.sum(R[start:end] ** 2) + eps
+            balance[i] = (l_e - r_e) / (l_e + r_e)
+        return balance
+
+    ref_pan = pan_curve(ref_L, ref_R)
+    test_pan = pan_curve(test_L, test_R)
+
+    # Align lengths
+    min_len = min(len(ref_pan), len(test_pan))
+    if min_len == 0:
+        return 1.0
+    ref_pan = ref_pan[:min_len]
+    test_pan = test_pan[:min_len]
+
+    # Correlation of panning curves
+    ref_norm = np.linalg.norm(ref_pan)
+    test_norm = np.linalg.norm(test_pan)
+    if ref_norm < eps or test_norm < eps:
+        # Both nearly silent or center-panned — consider it a match
+        return 1.0 if (ref_norm < eps and test_norm < eps) else 0.5
+
+    correlation = np.dot(ref_pan, test_pan) / (ref_norm * test_norm)
+    # Map from [-1, 1] to [0, 1]
+    return float(np.clip((correlation + 1.0) / 2.0, 0, 1))
+
+
+def score_pair(ref_path, test_path, weights, stereo=False, align_ms=0.0):
+    # Load mono-downmixed for standard metrics
+    ref, sr_ref = librosa.load(ref_path, sr=None, mono=True)
+    test, sr_test = librosa.load(test_path, sr=sr_ref, mono=True)
+
+    max_lag_samples = max(0, int(round(sr_ref * align_ms / 1000.0)))
+    lag_samples = 0
+    align_stride = 1
+    if max_lag_samples > 0:
+        lag_samples, align_stride = estimate_lag_samples(ref, test, max_lag_samples)
+        lag_samples = int(np.clip(lag_samples, -max_lag_samples, max_lag_samples))
+        ref, test = align_pair_by_lag(ref, test, lag_samples)
+
+    # Trim to final match
     min_len = min(len(ref), len(test))
     ref = ref[:min_len]
     test = test[:min_len]
-    
+
     sc = calculate_spectral_convergence(ref, test)
     lsd = calculate_log_spectral_distance(ref, test)
     mfcc_dist = calculate_mfcc_distance(ref, test, sr_ref)
     tp = calculate_transient_preservation(ref, test, sr_ref)
-    
+
     # Map raw metrics to 0-100 scores
-    # SC: 0 is perfect, >1 is bad. 1 - SC is roughly 0-1.
     sc_score = max(0, 100 * (1.0 - sc))
-    # LSD: 0 is perfect, 10-20 is quite different. 
-    lsd_score = max(0, 100 * (1.0 - lsd/15.0))
-    # MFCC dist: 0 is perfect, 1 is total difference.
+    lsd_score = 100 * np.exp(-max(0, lsd - 3.0) / 7.0)
     mfcc_score = max(0, 100 * (1.0 - mfcc_dist))
-    # TP: 1.0 is perfect.
     tp_score = 100 * tp
-    
+
+    metrics = {
+        "spectral_convergence": sc_score,
+        "log_spectral_distance": lsd_score,
+        "mfcc_distance": mfcc_score,
+        "transient_preservation": tp_score
+    }
+    raw = {
+        "sc": float(sc),
+        "lsd": float(lsd),
+        "mfcc_dist": float(mfcc_dist),
+        "tp": float(tp)
+    }
+
+    # Stereo-specific metrics
+    if stereo:
+        ref_stereo, _ = librosa.load(ref_path, sr=sr_ref, mono=False)
+        test_stereo, _ = librosa.load(test_path, sr=sr_ref, mono=False)
+
+        # Ensure 2-channel; librosa returns (channels, samples)
+        if ref_stereo.ndim == 1:
+            ref_stereo = np.stack([ref_stereo, ref_stereo])
+        if test_stereo.ndim == 1:
+            test_stereo = np.stack([test_stereo, test_stereo])
+
+        min_stereo = min(ref_stereo.shape[1], test_stereo.shape[1])
+        ref_L, ref_R = ref_stereo[0, :min_stereo], ref_stereo[1, :min_stereo]
+        test_L, test_R = test_stereo[0, :min_stereo], test_stereo[1, :min_stereo]
+
+        swp = calculate_stereo_width_preservation(ref_L, ref_R, test_L, test_R)
+        icc = calculate_interchannel_correlation_preservation(ref_L, ref_R, test_L, test_R)
+        pp = calculate_panning_consistency(ref_L, ref_R, test_L, test_R, sr_ref)
+
+        swp_score = 100 * swp
+        icc_score = 100 * icc
+        pp_score = 100 * pp
+
+        metrics["stereo_width"] = swp_score
+        metrics["interchannel_correlation"] = icc_score
+        metrics["panning_consistency"] = pp_score
+        raw["swp"] = swp
+        raw["icc"] = icc
+        raw["pp"] = pp
+
+    # Compute total score with normalized weights (sum to 1.0)
+    mono_keys = ['spectral_convergence', 'log_spectral_distance', 'mfcc_distance', 'transient_preservation']
+    stereo_keys = ['stereo_width', 'interchannel_correlation', 'panning_consistency']
+
+    if stereo:
+        active_keys = mono_keys + stereo_keys
+    else:
+        active_keys = mono_keys
+
+    raw_sum = sum(weights.get(k, 0) for k in active_keys)
+    if raw_sum > 0:
+        norm = {k: weights.get(k, 0) / raw_sum for k in active_keys}
+    else:
+        norm = {k: 1.0 / len(active_keys) for k in active_keys}
+
     total_score = (
-        sc_score * weights['spectral_convergence'] +
-        lsd_score * weights['log_spectral_distance'] +
-        mfcc_score * weights['mfcc_distance'] +
-        tp_score * weights['transient_preservation']
+        sc_score * norm.get('spectral_convergence', 0) +
+        lsd_score * norm.get('log_spectral_distance', 0) +
+        mfcc_score * norm.get('mfcc_distance', 0) +
+        tp_score * norm.get('transient_preservation', 0)
     )
-    
+    if stereo:
+        total_score += (
+            swp_score * norm.get('stereo_width', 0) +
+            icc_score * norm.get('interchannel_correlation', 0) +
+            pp_score * norm.get('panning_consistency', 0)
+        )
+
     return {
-        "total_score": total_score,
-        "metrics": {
-            "spectral_convergence": sc_score,
-            "log_spectral_distance": lsd_score,
-            "mfcc_distance": mfcc_score,
-            "transient_preservation": tp_score
+        "total_score": float(total_score),
+        "metrics": {k: float(v) for k, v in metrics.items()},
+        "raw": {k: float(v) for k, v in raw.items()},
+        "stereo": bool(stereo),
+        "alignment": {
+            "enabled": bool(max_lag_samples > 0),
+            "lag_samples": int(lag_samples),
+            "lag_ms": float(1000.0 * lag_samples / sr_ref),
+            "max_lag_ms": float(align_ms),
+            "downsample_stride": int(align_stride),
         },
-        "raw": {
-            "sc": float(sc),
-            "lsd": float(lsd),
-            "mfcc_dist": float(mfcc_dist),
-            "tp": float(tp)
-        }
     }
 
 def generate_spectrogram_diff(ref_path, test_path, out_path):
@@ -186,8 +400,15 @@ def main():
     parser.add_argument("--batch", metavar='OUTPUT_JSON', help="Batch score based on manifest")
     parser.add_argument("--manifest", default="test_manifest.json", help="Path to manifest")
     parser.add_argument("--spectrogram-diff", nargs=3, metavar=('REF', 'TEST', 'OUT'), help="Generate diff plot")
+    parser.add_argument("--baseline", metavar='OUTPUT_JSON', help="Score rubberband HQ vs medium refs (baseline)")
+    parser.add_argument("--align-ms", type=float, default=0.0,
+                        help="Optional max absolute lag (ms) for pair pre-alignment before scoring")
+    parser.add_argument("--ref-source", choices=["rubberband", "ableton"], default="rubberband",
+                        help="Reference source: rubberband (default) or ableton")
+    parser.add_argument("--ableton-manifest", default=None,
+                        help="Path to ableton_manifest.json (for --ref-source ableton)")
     parser.add_argument("--config", default="optimize/config.toml", help="Path to config.toml")
-    
+
     args = parser.parse_args()
     
     # Load weights from config
@@ -195,7 +416,10 @@ def main():
         "spectral_convergence": 0.30,
         "log_spectral_distance": 0.25,
         "mfcc_distance": 0.20,
-        "transient_preservation": 0.25
+        "transient_preservation": 0.25,
+        "stereo_width": 0.10,
+        "interchannel_correlation": 0.10,
+        "panning_consistency": 0.05,
     }
     
     if os.path.exists(args.config):
@@ -216,58 +440,129 @@ def main():
                             weights[k] = float(v.split('#')[0].strip().replace(',', ''))
 
     if args.pair:
-        result = score_pair(args.pair[0], args.pair[1], weights)
+        result = score_pair(args.pair[0], args.pair[1], weights, align_ms=args.align_ms)
         print(json.dumps(result, indent=2))
         
     if args.spectrogram_diff:
         generate_spectrogram_diff(args.spectrogram_diff[0], args.spectrogram_diff[1], args.spectrogram_diff[2])
 
     if args.batch:
-        if not os.path.exists(args.manifest):
-            print(f"Error: Manifest {args.manifest} not found.")
-            sys.exit(1)
-
-        with open(args.manifest, 'r') as f:
-            manifest = json.load(f)
-
         results = []
-        repo_root = os.getcwd()
+        repo_root = REPO_ROOT
 
-        # Score batch outputs
-        for item in manifest:
-            ratio = item['ratio']
-            source_base = os.path.basename(item['source']).replace('.wav', '')
-            ref_path = os.path.join(repo_root, "optimize/references", f"{source_base}_ref_{ratio}.wav")
-            test_path = os.path.join(repo_root, "optimize/outputs", f"{source_base}_test_{ratio}.wav")
+        if args.ref_source == "ableton":
+            # Ableton reference mode: score library outputs against Ableton refs
+            ableton_manifest_path = os.path.abspath(
+                args.ableton_manifest or os.path.join(
+                    repo_root, "optimize", "ableton", "ableton_manifest.json")
+            )
+            if not os.path.exists(ableton_manifest_path):
+                print(f"Error: Ableton manifest not found: {ableton_manifest_path}", file=sys.stderr)
+                sys.exit(1)
 
-            if not os.path.exists(ref_path) or not os.path.exists(test_path):
-                print(f"Warning: Skipping {item['description']}, missing files.")
-                continue
+            with open(ableton_manifest_path, 'r') as f:
+                ableton_manifest = json.load(f)
 
-            print(f"Scoring {item['description']}...", file=sys.stderr)
-            res = score_pair(ref_path, test_path, weights)
-            res['description'] = item['description']
-            res['ratio'] = ratio
-            res['mode'] = 'batch'
-            results.append(res)
+            manifest_dir = os.path.dirname(ableton_manifest_path)
+            ableton_ref_dir = os.path.join(manifest_dir, "refs", "ableton")
+            library_ref_dir = os.path.join(manifest_dir, "refs", "library")
 
-        # Score streaming outputs
-        for item in manifest:
-            ratio = item['ratio']
-            source_base = os.path.basename(item['source']).replace('.wav', '')
-            ref_path = os.path.join(repo_root, "optimize/references", f"{source_base}_ref_{ratio}.wav")
-            test_path = os.path.join(repo_root, "optimize/outputs", f"{source_base}_stream_{ratio}.wav")
+            for entry in ableton_manifest:
+                is_stereo = entry.get('stereo', False)
+                ratio = entry['ratio']
+                track_id = entry['track_id']
+                target_bpm = entry['target_bpm']
 
-            if not os.path.exists(ref_path) or not os.path.exists(test_path):
-                print(f"Warning: Skipping [streaming] {item['description']}, missing files.")
-                continue
+                ref_path = entry.get("ref_path")
+                if ref_path:
+                    if not os.path.isabs(ref_path):
+                        ref_path = os.path.normpath(os.path.join(manifest_dir, ref_path))
+                else:
+                    ref_path = os.path.join(
+                        ableton_ref_dir, f"{track_id}_{target_bpm}bpm.wav")
 
-            print(f"Scoring [streaming] {item['description']}...", file=sys.stderr)
-            res = score_pair(ref_path, test_path, weights)
-            res['description'] = f"{item['description']} [streaming]"
-            res['ratio'] = ratio
-            res['mode'] = 'streaming'
-            results.append(res)
+                # Score batch output
+                batch_test = os.path.join(library_ref_dir, f"{track_id}_{target_bpm}bpm_batch.wav")
+                if os.path.exists(ref_path) and os.path.exists(batch_test):
+                    desc = entry.get('description', f"{track_id} @ {target_bpm} BPM")
+                    print(f"Scoring [ableton] {desc}...", file=sys.stderr)
+                    res = score_pair(
+                        ref_path, batch_test, weights, stereo=is_stereo, align_ms=args.align_ms
+                    )
+                    res['description'] = desc
+                    res['ratio'] = ratio
+                    res['mode'] = 'batch'
+                    res['ref_source'] = 'ableton'
+                    results.append(res)
+                else:
+                    print(f"Warning: Skipping {track_id} batch (missing ref or test)", file=sys.stderr)
+
+                # Score streaming output
+                stream_test = os.path.join(library_ref_dir, f"{track_id}_{target_bpm}bpm_stream.wav")
+                if os.path.exists(ref_path) and os.path.exists(stream_test):
+                    desc = entry.get('description', f"{track_id} @ {target_bpm} BPM")
+                    print(f"Scoring [ableton/streaming] {desc}...", file=sys.stderr)
+                    res = score_pair(
+                        ref_path, stream_test, weights, stereo=is_stereo, align_ms=args.align_ms
+                    )
+                    res['description'] = f"{desc} [streaming]"
+                    res['ratio'] = ratio
+                    res['mode'] = 'streaming'
+                    res['ref_source'] = 'ableton'
+                    results.append(res)
+                else:
+                    print(f"Warning: Skipping {track_id} streaming (missing ref or test)", file=sys.stderr)
+
+        else:
+            # Default rubberband reference mode
+            if not os.path.exists(args.manifest):
+                print(f"Error: Manifest {args.manifest} not found.")
+                sys.exit(1)
+
+            with open(args.manifest, 'r') as f:
+                manifest = json.load(f)
+
+            # Score batch outputs
+            for item in manifest:
+                ratio = item['ratio']
+                is_stereo = item.get('stereo', False)
+                source_base = os.path.basename(item['source']).replace('.wav', '')
+                ref_path = os.path.join(repo_root, "optimize", "references", f"{source_base}_ref_{ratio}.wav")
+                test_path = os.path.join(repo_root, "optimize", "outputs", f"{source_base}_test_{ratio}.wav")
+
+                if not os.path.exists(ref_path) or not os.path.exists(test_path):
+                    print(f"Warning: Skipping {item['description']}, missing files.")
+                    continue
+
+                print(f"Scoring {item['description']}...", file=sys.stderr)
+                res = score_pair(
+                    ref_path, test_path, weights, stereo=is_stereo, align_ms=args.align_ms
+                )
+                res['description'] = item['description']
+                res['ratio'] = ratio
+                res['mode'] = 'batch'
+                results.append(res)
+
+            # Score streaming outputs
+            for item in manifest:
+                ratio = item['ratio']
+                is_stereo = item.get('stereo', False)
+                source_base = os.path.basename(item['source']).replace('.wav', '')
+                ref_path = os.path.join(repo_root, "optimize", "references", f"{source_base}_ref_{ratio}.wav")
+                test_path = os.path.join(repo_root, "optimize", "outputs", f"{source_base}_stream_{ratio}.wav")
+
+                if not os.path.exists(ref_path) or not os.path.exists(test_path):
+                    print(f"Warning: Skipping [streaming] {item['description']}, missing files.")
+                    continue
+
+                print(f"Scoring [streaming] {item['description']}...", file=sys.stderr)
+                res = score_pair(
+                    ref_path, test_path, weights, stereo=is_stereo, align_ms=args.align_ms
+                )
+                res['description'] = f"{item['description']} [streaming]"
+                res['ratio'] = ratio
+                res['mode'] = 'streaming'
+                results.append(res)
 
         class NumpyEncoder(json.JSONEncoder):
             def default(self, obj):
@@ -285,11 +580,73 @@ def main():
         avg_score = np.mean([r['total_score'] for r in results])
         batch_scores = [r['total_score'] for r in results if r.get('mode') == 'batch']
         stream_scores = [r['total_score'] for r in results if r.get('mode') == 'streaming']
+        mono_scores = [r['total_score'] for r in results if not r.get('stereo', False)]
+        stereo_scores = [r['total_score'] for r in results if r.get('stereo', False)]
         print(f"\nBatch completed. Average Score: {avg_score:.2f}", file=sys.stderr)
         if batch_scores:
             print(f"  Batch avg: {np.mean(batch_scores):.2f}", file=sys.stderr)
         if stream_scores:
             print(f"  Streaming avg: {np.mean(stream_scores):.2f}", file=sys.stderr)
+        if mono_scores:
+            print(f"  Mono avg: {np.mean(mono_scores):.2f}", file=sys.stderr)
+        if stereo_scores:
+            print(f"  Stereo avg: {np.mean(stereo_scores):.2f}", file=sys.stderr)
+            # Show stereo metric averages
+            swp_avg = np.mean([r['metrics'].get('stereo_width', 0) for r in results if r.get('stereo')])
+            icc_avg = np.mean([r['metrics'].get('interchannel_correlation', 0) for r in results if r.get('stereo')])
+            pp_avg = np.mean([r['metrics'].get('panning_consistency', 0) for r in results if r.get('stereo')])
+            print(f"  Stereo metrics: SWP={swp_avg:.1f}, ICC={icc_avg:.1f}, PP={pp_avg:.1f}", file=sys.stderr)
+
+    if args.baseline:
+        if not os.path.exists(args.manifest):
+            print(f"Error: Manifest {args.manifest} not found.", file=sys.stderr)
+            sys.exit(1)
+
+        with open(args.manifest, 'r') as f:
+            manifest = json.load(f)
+
+        results = []
+
+        for item in manifest:
+            ratio = item['ratio']
+            is_stereo = item.get('stereo', False)
+            source_base = os.path.basename(item['source']).replace('.wav', '')
+            hq_path = os.path.join(REPO_ROOT, "optimize", "references", f"{source_base}_ref_{ratio}.wav")
+            med_path = os.path.join(REPO_ROOT, "optimize", "references", f"{source_base}_ref_{ratio}_med.wav")
+
+            if not os.path.exists(hq_path) or not os.path.exists(med_path):
+                continue
+
+            print(f"Baseline scoring {item['description']}...", file=sys.stderr)
+            res = score_pair(
+                hq_path, med_path, weights, stereo=is_stereo, align_ms=args.align_ms
+            )
+            res['description'] = item['description']
+            res['ratio'] = ratio
+            results.append(res)
+
+        if not results:
+            print("No baseline pairs found (need *_med.wav files from generate_references.sh).", file=sys.stderr)
+            sys.exit(1)
+
+        class NumpyEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, (np.floating,)):
+                    return float(obj)
+                if isinstance(obj, (np.integer,)):
+                    return int(obj)
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                return super().default(obj)
+
+        with open(args.baseline, 'w') as f:
+            json.dump(results, f, indent=2, cls=NumpyEncoder)
+
+        avg = np.mean([r['total_score'] for r in results])
+        sc_avg = np.mean([r['metrics']['spectral_convergence'] for r in results])
+        lsd_avg = np.mean([r['metrics']['log_spectral_distance'] for r in results])
+        raw_lsd_avg = np.mean([r['raw']['lsd'] for r in results])
+        print(f"\nBaseline (rubberband HQ vs medium): avg={avg:.2f}, SC={sc_avg:.1f}, LSD={lsd_avg:.1f} (raw {raw_lsd_avg:.1f} dB)", file=sys.stderr)
 
 if __name__ == "__main__":
     main()

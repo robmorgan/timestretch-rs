@@ -28,6 +28,7 @@ impl AudioEngine {
         state: SharedStateHandle,
         stream_active: Arc<AtomicBool>,
         desired_sample_rate: Option<u32>,
+        flush_ring: Arc<AtomicBool>,
     ) -> Result<(Self, RingProducer), String> {
         let host = cpal::default_host();
         let device = host
@@ -50,11 +51,19 @@ impl AudioEngine {
 
         let state_clone = state.clone();
         let stream_active_clone = stream_active.clone();
+        let flush_clone = flush_ring;
 
         let stream = device
             .build_output_stream(
                 &config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    // Discard stale samples when the processing thread signals a flush.
+                    if flush_clone.load(Ordering::Acquire) {
+                        let stale = consumer.occupied_len();
+                        consumer.skip(stale);
+                        flush_clone.store(false, Ordering::Relaxed);
+                    }
+
                     if !stream_active_clone.load(Ordering::Relaxed) {
                         data.fill(0.0);
                         return;

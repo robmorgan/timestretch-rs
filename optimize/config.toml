@@ -1,7 +1,7 @@
 [general]
 max_iterations = 50
 target_score = 92.0
-agent = "claude_code"  # or "codex"
+agent = "codex"  # or "claude_code"
 
 [reference_tool]
 # Preference order: rubberband > soundstretch > sox
@@ -12,11 +12,27 @@ rubberband_quality = "-3 -F --pitch-hq"  # R3 + fine mode
 soundstretch_opts = ""
 
 [scoring]
-# weights for the final score
+# Weights for the final score. All weights are normalized to sum to 1.0.
+# Mono cases use SC+LSD+MFCC+TP only.
+# Stereo cases use all seven metrics, re-normalized so total = 1.0.
 spectral_convergence = 0.30
 log_spectral_distance = 0.25
 mfcc_distance = 0.20
 transient_preservation = 0.25
+stereo_width = 0.10
+interchannel_correlation = 0.10
+panning_consistency = 0.05
+
+[ableton]
+# Ableton Live reference generation settings (macOS only)
+template = "ableton/template/base_template Project/base_template.als"
+catalog = "ableton/track_catalog.json"
+ref_dir = "ableton/refs/ableton"
+library_dir = "ableton/refs/library"
+app_path = "/Applications/Ableton Live 11 Suite.app"
+sample_rate = 44100
+# Warp mode: 0=Beats, 1=Tones, 2=Texture, 3=Re-Pitch, 4=Complex, 6=Complex Pro
+warp_mode = 6
 
 [agent.claude_code]
 max_turns = 60

@@ -25,7 +25,7 @@ This suite adds strict, signal-driven regression gates modeled after established
 - `test_ratio_sweep_two_tone_peak_bins`
 - `test_ratio_sweep_impulse_train_transient_count_and_sharpness`
 - `test_ratio_sweep_click_pad_transient_survival`
-- `test_realtime_pitch_scale_sweep_requires_new_hook` (`#[ignore]`)
+- `test_realtime_pitch_scale_changes_pitch_without_tempo_drift`
 
 ## Failure Signal Meaning
 
@@ -34,4 +34,3 @@ This suite adds strict, signal-driven regression gates modeled after established
 - Chunk-size sensitivity: streaming state/latency compensation dependence on callback size.
 - Large-block failures: buffering/length accounting edge conditions.
 - Transient losses: onset handling, WSOLA boundary decisions, or crossfade behavior.
-

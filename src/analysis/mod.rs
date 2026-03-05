@@ -1,5 +1,6 @@
 //! Audio analysis: transient detection, beat tracking, frequency analysis, and HPSS.
 
+pub(crate) mod adaptive_snapshot;
 pub mod beat;
 pub mod comparison;
 pub mod frequency;

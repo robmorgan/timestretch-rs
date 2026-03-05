@@ -127,7 +127,9 @@ fn realtime_midstream_ratio_changes_every_500ms() {
 
     for chunk in input.chunks(callback_frames * 2) {
         if processed_frames >= next_change {
-            processor.set_stretch_ratio(ratios[ratio_idx % ratios.len()]);
+            processor
+                .set_stretch_ratio(ratios[ratio_idx % ratios.len()])
+                .expect("valid automated ratio");
             ratio_idx += 1;
             next_change += change_interval_frames;
         }

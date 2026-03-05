@@ -6,9 +6,26 @@ cd "$ROOT_DIR"
 
 export TIMESTRETCH_STRICT_REFERENCE_BENCHMARK=1
 export TIMESTRETCH_REFERENCE_MAX_SECONDS=30
+TIMEOUT_SECS="${TIMESTRETCH_REFERENCE_TIMEOUT_SECS:-900}"
 
 echo "Running strict reference-quality benchmark..."
-cargo test --test reference_quality -- --nocapture
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$TIMEOUT_SECS" <<'PY'
+import subprocess
+import sys
+
+timeout = float(sys.argv[1])
+cmd = ["cargo", "test", "--release", "--test", "reference_quality", "--", "--nocapture"]
+try:
+    completed = subprocess.run(cmd, check=False, timeout=timeout)
+except subprocess.TimeoutExpired:
+    print(f"ERROR: reference_quality timed out after {timeout:.0f}s", file=sys.stderr)
+    sys.exit(124)
+sys.exit(completed.returncode)
+PY
+else
+  cargo test --release --test reference_quality -- --nocapture
+fi
 
 REPORT_PATH="$ROOT_DIR/benchmarks/audio/output/report.json"
 if [[ ! -f "$REPORT_PATH" ]]; then

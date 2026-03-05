@@ -120,6 +120,70 @@ pub fn extract_envelope(
     }
 }
 
+/// Allocation-free envelope extraction variant for real-time paths.
+///
+/// Uses preplanned FFT handles plus caller-provided scratch buffers, avoiding
+/// heap work in steady-state audio callbacks.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_envelope_with_fft_scratch(
+    magnitudes: &[f32],
+    num_bins: usize,
+    order: usize,
+    fft_forward: &std::sync::Arc<dyn rustfft::Fft<f32>>,
+    fft_inverse: &std::sync::Arc<dyn rustfft::Fft<f32>>,
+    fft_forward_scratch: &mut Vec<Complex<f32>>,
+    fft_inverse_scratch: &mut Vec<Complex<f32>>,
+    cepstrum_buf: &mut Vec<Complex<f32>>,
+    envelope_out: &mut Vec<f32>,
+) {
+    let fft_size = (num_bins - 1) * 2;
+
+    // Resize buffers
+    cepstrum_buf.resize(fft_size, Complex::new(0.0, 0.0));
+    envelope_out.resize(num_bins, 1.0);
+
+    // Step 1: Log magnitude spectrum (mirror for full FFT)
+    for i in 0..num_bins {
+        let log_mag = magnitudes[i].max(LOG_FLOOR).ln();
+        cepstrum_buf[i] = Complex::new(log_mag, 0.0);
+    }
+    // Mirror negative frequencies
+    for i in 1..num_bins - 1 {
+        cepstrum_buf[fft_size - i] = cepstrum_buf[i];
+    }
+
+    // Step 2: IFFT to get cepstrum
+    let inv_need = fft_inverse.get_inplace_scratch_len();
+    if fft_inverse_scratch.len() < inv_need {
+        fft_inverse_scratch.resize(inv_need, Complex::new(0.0, 0.0));
+    }
+    fft_inverse.process_with_scratch(cepstrum_buf, &mut fft_inverse_scratch[..inv_need]);
+
+    let norm = 1.0 / fft_size as f32;
+
+    // Step 3: Lifter - keep only low-quefrency components
+    let effective_order = order.min(fft_size / 2);
+    for (i, c) in cepstrum_buf.iter_mut().enumerate().take(fft_size) {
+        if i > effective_order && i < fft_size - effective_order {
+            *c = Complex::new(0.0, 0.0);
+        } else {
+            *c *= norm;
+        }
+    }
+
+    // Step 4: FFT back to get smoothed log-spectrum
+    let fwd_need = fft_forward.get_inplace_scratch_len();
+    if fft_forward_scratch.len() < fwd_need {
+        fft_forward_scratch.resize(fwd_need, Complex::new(0.0, 0.0));
+    }
+    fft_forward.process_with_scratch(cepstrum_buf, &mut fft_forward_scratch[..fwd_need]);
+
+    // Step 5: Exponentiate to get envelope
+    for i in 0..num_bins {
+        envelope_out[i] = cepstrum_buf[i].re.exp();
+    }
+}
+
 /// Extracts the spectral envelope using an adaptive cepstral order.
 ///
 /// Computes the spectral centroid of the current frame's magnitudes and selects
@@ -162,22 +226,29 @@ pub fn extract_envelope_adaptive(
 /// Sorts a copy of the magnitudes and returns the value at the 10th percentile
 /// position. This provides a robust noise floor estimate that is not affected
 /// by strong spectral peaks.
-fn estimate_noise_floor(magnitudes: &[f32], start_bin: usize, num_bins: usize) -> f32 {
+fn estimate_noise_floor(
+    magnitudes: &[f32],
+    start_bin: usize,
+    num_bins: usize,
+    scratch: &mut Vec<f32>,
+) -> f32 {
     if start_bin >= num_bins {
         return LOG_FLOOR;
     }
-    let mut sorted: Vec<f32> = magnitudes[start_bin..num_bins]
-        .iter()
-        .copied()
-        .filter(|&m| m > LOG_FLOOR)
-        .collect();
-    if sorted.is_empty() {
+    scratch.clear();
+    scratch.extend(
+        magnitudes[start_bin..num_bins]
+            .iter()
+            .copied()
+            .filter(|&m| m > LOG_FLOOR),
+    );
+    if scratch.is_empty() {
         return LOG_FLOOR;
     }
-    sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    scratch.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     // 10th percentile
-    let idx = (sorted.len() as f64 * 0.10) as usize;
-    sorted[idx.min(sorted.len() - 1)]
+    let idx = (scratch.len() as f64 * 0.10) as usize;
+    scratch[idx.min(scratch.len() - 1)]
 }
 
 /// Computes a per-bin SNR-aware correction clamp.
@@ -226,7 +297,31 @@ pub fn apply_envelope_correction(
     num_bins: usize,
     start_bin: usize,
 ) {
-    let noise_floor = estimate_noise_floor(magnitudes, start_bin, num_bins);
+    let mut scratch = Vec::new();
+    apply_envelope_correction_with_scratch(
+        magnitudes,
+        analysis_envelope,
+        synthesis_envelope,
+        num_bins,
+        start_bin,
+        &mut scratch,
+    );
+}
+
+/// Allocation-free variant of [`apply_envelope_correction`] for real-time paths.
+///
+/// Uses caller-provided scratch storage to estimate the noise floor without
+/// heap allocations.
+#[inline]
+pub fn apply_envelope_correction_with_scratch(
+    magnitudes: &mut [f32],
+    analysis_envelope: &[f32],
+    synthesis_envelope: &[f32],
+    num_bins: usize,
+    start_bin: usize,
+    noise_floor_scratch: &mut Vec<f32>,
+) {
+    let noise_floor = estimate_noise_floor(magnitudes, start_bin, num_bins, noise_floor_scratch);
 
     for bin in start_bin..num_bins {
         let synth_env = synthesis_envelope[bin].max(LOG_FLOOR);
@@ -513,7 +608,8 @@ mod tests {
         magnitudes[51] = 0.8;
         magnitudes[52] = 0.6;
 
-        let floor = estimate_noise_floor(&magnitudes, 0, 100);
+        let mut scratch = Vec::new();
+        let floor = estimate_noise_floor(&magnitudes, 0, 100, &mut scratch);
         assert!(
             floor < 0.05,
             "Noise floor should be near 0.01, got {}",

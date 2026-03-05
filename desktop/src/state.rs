@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use timestretch::EdmPreset;
+use timestretch::{EdmPreset, LatencyProfile, QualityTier};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Transport {
@@ -59,6 +59,8 @@ pub struct SharedState {
     pub pitch_semitones: f32,
     pub volume: f32,
     pub preset: PresetChoice,
+    pub latency_profile: LatencyProfile,
+    pub current_quality_tier: QualityTier,
 
     /// Current playback position in source frames.
     pub position_frames: usize,
@@ -77,6 +79,8 @@ pub struct SharedState {
     pub pitch_changed: bool,
     /// Set by UI when preset changes (requires rebuilding processor).
     pub preset_changed: bool,
+    /// Set by UI when latency profile changes (requires rebuilding processor).
+    pub latency_profile_changed: bool,
     /// Set by processing thread when it finishes loading pitch-shifted audio.
     pub pitch_processing: bool,
 }
@@ -88,7 +92,9 @@ impl SharedState {
             stretch_ratio: 1.0,
             pitch_semitones: 0.0,
             volume: 0.8,
-            preset: PresetChoice::None,
+            preset: PresetChoice::DjBeatmatch,
+            latency_profile: LatencyProfile::Mix,
+            current_quality_tier: LatencyProfile::Mix.initial_tier(),
             position_frames: 0,
             total_frames: 0,
             sample_rate: 44100,
@@ -97,6 +103,7 @@ impl SharedState {
             seek_request: None,
             pitch_changed: false,
             preset_changed: false,
+            latency_profile_changed: false,
             pitch_processing: false,
         }
     }

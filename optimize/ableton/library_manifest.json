@@ -1,0 +1,272 @@
+[
+  {
+    "track_id": "music-sounds-better",
+    "target_bpm": 115.0,
+    "ratio": 1.0783,
+    "mode": "batch",
+    "path": "optimize/ableton/refs/library/music-sounds-better_115.0bpm_batch.wav",
+    "stereo": true,
+    "description": "music-sounds-better @ 115.0 BPM (batch)"
+  },
+  {
+    "track_id": "music-sounds-better",
+    "target_bpm": 115.0,
+    "ratio": 1.0783,
+    "mode": "streaming",
+    "path": "optimize/ableton/refs/library/music-sounds-better_115.0bpm_stream.wav",
+    "stereo": true,
+    "description": "music-sounds-better @ 115.0 BPM (streaming)"
+  },
+  {
+    "track_id": "music-sounds-better",
+    "target_bpm": 128.0,
+    "ratio": 0.9688,
+    "mode": "batch",
+    "path": "optimize/ableton/refs/library/music-sounds-better_128.0bpm_batch.wav",
+    "stereo": true,
+    "description": "music-sounds-better @ 128.0 BPM (batch)"
+  },
+  {
+    "track_id": "music-sounds-better",
+    "target_bpm": 128.0,
+    "ratio": 0.9688,
+    "mode": "streaming",
+    "path": "optimize/ableton/refs/library/music-sounds-better_128.0bpm_stream.wav",
+    "stereo": true,
+    "description": "music-sounds-better @ 128.0 BPM (streaming)"
+  },
+  {
+    "track_id": "music-sounds-better",
+    "target_bpm": 100.0,
+    "ratio": 1.24,
+    "mode": "batch",
+    "path": "optimize/ableton/refs/library/music-sounds-better_100.0bpm_batch.wav",
+    "stereo": true,
+    "description": "music-sounds-better @ 100.0 BPM (batch)"
+  },
+  {
+    "track_id": "music-sounds-better",
+    "target_bpm": 100.0,
+    "ratio": 1.24,
+    "mode": "streaming",
+    "path": "optimize/ableton/refs/library/music-sounds-better_100.0bpm_stream.wav",
+    "stereo": true,
+    "description": "music-sounds-better @ 100.0 BPM (streaming)"
+  },
+  {
+    "track_id": "gimme-gimme-gimme",
+    "target_bpm": 115.0,
+    "ratio": 1.0696,
+    "mode": "batch",
+    "path": "optimize/ableton/refs/library/gimme-gimme-gimme_115.0bpm_batch.wav",
+    "stereo": true,
+    "description": "gimme-gimme-gimme @ 115.0 BPM (batch)"
+  },
+  {
+    "track_id": "gimme-gimme-gimme",
+    "target_bpm": 115.0,
+    "ratio": 1.0696,
+    "mode": "streaming",
+    "path": "optimize/ableton/refs/library/gimme-gimme-gimme_115.0bpm_stream.wav",
+    "stereo": true,
+    "description": "gimme-gimme-gimme @ 115.0 BPM (streaming)"
+  },
+  {
+    "track_id": "gimme-gimme-gimme",
+    "target_bpm": 128.0,
+    "ratio": 0.9609,
+    "mode": "batch",
+    "path": "optimize/ableton/refs/library/gimme-gimme-gimme_128.0bpm_batch.wav",
+    "stereo": true,
+    "description": "gimme-gimme-gimme @ 128.0 BPM (batch)"
+  },
+  {
+    "track_id": "gimme-gimme-gimme",
+    "target_bpm": 128.0,
+    "ratio": 0.9609,
+    "mode": "streaming",
+    "path": "optimize/ableton/refs/library/gimme-gimme-gimme_128.0bpm_stream.wav",
+    "stereo": true,
+    "description": "gimme-gimme-gimme @ 128.0 BPM (streaming)"
+  },
+  {
+    "track_id": "gimme-gimme-gimme",
+    "target_bpm": 100.0,
+    "ratio": 1.23,
+    "mode": "batch",
+    "path": "optimize/ableton/refs/library/gimme-gimme-gimme_100.0bpm_batch.wav",
+    "stereo": true,
+    "description": "gimme-gimme-gimme @ 100.0 BPM (batch)"
+  },
+  {
+    "track_id": "gimme-gimme-gimme",
+    "target_bpm": 100.0,
+    "ratio": 1.23,
+    "mode": "streaming",
+    "path": "optimize/ableton/refs/library/gimme-gimme-gimme_100.0bpm_stream.wav",
+    "stereo": true,
+    "description": "gimme-gimme-gimme @ 100.0 BPM (streaming)"
+  },
+  {
+    "track_id": "hot-stuff",
+    "target_bpm": 115.0,
+    "ratio": 1.0435,
+    "mode": "batch",
+    "path": "optimize/ableton/refs/library/hot-stuff_115.0bpm_batch.wav",
+    "stereo": true,
+    "description": "hot-stuff @ 115.0 BPM (batch)"
+  },
+  {
+    "track_id": "hot-stuff",
+    "target_bpm": 115.0,
+    "ratio": 1.0435,
+    "mode": "streaming",
+    "path": "optimize/ableton/refs/library/hot-stuff_115.0bpm_stream.wav",
+    "stereo": true,
+    "description": "hot-stuff @ 115.0 BPM (streaming)"
+  },
+  {
+    "track_id": "hot-stuff",
+    "target_bpm": 128.0,
+    "ratio": 0.9375,
+    "mode": "batch",
+    "path": "optimize/ableton/refs/library/hot-stuff_128.0bpm_batch.wav",
+    "stereo": true,
+    "description": "hot-stuff @ 128.0 BPM (batch)"
+  },
+  {
+    "track_id": "hot-stuff",
+    "target_bpm": 128.0,
+    "ratio": 0.9375,
+    "mode": "streaming",
+    "path": "optimize/ableton/refs/library/hot-stuff_128.0bpm_stream.wav",
+    "stereo": true,
+    "description": "hot-stuff @ 128.0 BPM (streaming)"
+  },
+  {
+    "track_id": "hot-stuff",
+    "target_bpm": 100.0,
+    "ratio": 1.2,
+    "mode": "batch",
+    "path": "optimize/ableton/refs/library/hot-stuff_100.0bpm_batch.wav",
+    "stereo": true,
+    "description": "hot-stuff @ 100.0 BPM (batch)"
+  },
+  {
+    "track_id": "hot-stuff",
+    "target_bpm": 100.0,
+    "ratio": 1.2,
+    "mode": "streaming",
+    "path": "optimize/ableton/refs/library/hot-stuff_100.0bpm_stream.wav",
+    "stereo": true,
+    "description": "hot-stuff @ 100.0 BPM (streaming)"
+  },
+  {
+    "track_id": "somebody-to-love",
+    "target_bpm": 115.0,
+    "ratio": 1.113,
+    "mode": "batch",
+    "path": "optimize/ableton/refs/library/somebody-to-love_115.0bpm_batch.wav",
+    "stereo": true,
+    "description": "somebody-to-love @ 115.0 BPM (batch)"
+  },
+  {
+    "track_id": "somebody-to-love",
+    "target_bpm": 115.0,
+    "ratio": 1.113,
+    "mode": "streaming",
+    "path": "optimize/ableton/refs/library/somebody-to-love_115.0bpm_stream.wav",
+    "stereo": true,
+    "description": "somebody-to-love @ 115.0 BPM (streaming)"
+  },
+  {
+    "track_id": "somebody-to-love",
+    "target_bpm": 135.0,
+    "ratio": 0.9481,
+    "mode": "batch",
+    "path": "optimize/ableton/refs/library/somebody-to-love_135.0bpm_batch.wav",
+    "stereo": true,
+    "description": "somebody-to-love @ 135.0 BPM (batch)"
+  },
+  {
+    "track_id": "somebody-to-love",
+    "target_bpm": 135.0,
+    "ratio": 0.9481,
+    "mode": "streaming",
+    "path": "optimize/ableton/refs/library/somebody-to-love_135.0bpm_stream.wav",
+    "stereo": true,
+    "description": "somebody-to-love @ 135.0 BPM (streaming)"
+  },
+  {
+    "track_id": "somebody-to-love",
+    "target_bpm": 100.0,
+    "ratio": 1.28,
+    "mode": "batch",
+    "path": "optimize/ableton/refs/library/somebody-to-love_100.0bpm_batch.wav",
+    "stereo": true,
+    "description": "somebody-to-love @ 100.0 BPM (batch)"
+  },
+  {
+    "track_id": "somebody-to-love",
+    "target_bpm": 100.0,
+    "ratio": 1.28,
+    "mode": "streaming",
+    "path": "optimize/ableton/refs/library/somebody-to-love_100.0bpm_stream.wav",
+    "stereo": true,
+    "description": "somebody-to-love @ 100.0 BPM (streaming)"
+  },
+  {
+    "track_id": "cold-heart",
+    "target_bpm": 124.0,
+    "ratio": 0.9355,
+    "mode": "batch",
+    "path": "optimize/ableton/refs/library/cold-heart_124.0bpm_batch.wav",
+    "stereo": true,
+    "description": "cold-heart @ 124.0 BPM (batch)"
+  },
+  {
+    "track_id": "cold-heart",
+    "target_bpm": 124.0,
+    "ratio": 0.9355,
+    "mode": "streaming",
+    "path": "optimize/ableton/refs/library/cold-heart_124.0bpm_stream.wav",
+    "stereo": true,
+    "description": "cold-heart @ 124.0 BPM (streaming)"
+  },
+  {
+    "track_id": "cold-heart",
+    "target_bpm": 128.0,
+    "ratio": 0.9063,
+    "mode": "batch",
+    "path": "optimize/ableton/refs/library/cold-heart_128.0bpm_batch.wav",
+    "stereo": true,
+    "description": "cold-heart @ 128.0 BPM (batch)"
+  },
+  {
+    "track_id": "cold-heart",
+    "target_bpm": 128.0,
+    "ratio": 0.9063,
+    "mode": "streaming",
+    "path": "optimize/ableton/refs/library/cold-heart_128.0bpm_stream.wav",
+    "stereo": true,
+    "description": "cold-heart @ 128.0 BPM (streaming)"
+  },
+  {
+    "track_id": "cold-heart",
+    "target_bpm": 100.0,
+    "ratio": 1.16,
+    "mode": "batch",
+    "path": "optimize/ableton/refs/library/cold-heart_100.0bpm_batch.wav",
+    "stereo": true,
+    "description": "cold-heart @ 100.0 BPM (batch)"
+  },
+  {
+    "track_id": "cold-heart",
+    "target_bpm": 100.0,
+    "ratio": 1.16,
+    "mode": "streaming",
+    "path": "optimize/ableton/refs/library/cold-heart_100.0bpm_stream.wav",
+    "stereo": true,
+    "description": "cold-heart @ 100.0 BPM (streaming)"
+  }
+]

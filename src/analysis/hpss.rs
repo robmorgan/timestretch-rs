@@ -113,20 +113,75 @@ pub fn hpss(
     let mut h_buf = vec![COMPLEX_ZERO; fft_size];
     let mut p_buf = vec![COMPLEX_ZERO; fft_size];
 
+    // Buffers for content-adaptive mask smoothing.  For frames with
+    // significant percussive energy the raw Wiener masks can have
+    // sharp bin-to-bin transitions that create spectral notches in the
+    // recombined output.  A small frequency-axis moving-average softens
+    // these notches.  Tonal frames (sine, vocal) keep raw masks to
+    // prevent harmonic leakage into the percussive WSOLA path.
+    let mut h_mask_buf = vec![0.0f32; num_bins];
+    let mut h_mask_smooth = vec![0.0f32; num_bins];
+    const MASK_SMOOTH_RADIUS_LIGHT: usize = 1; // 3-bin window (lightly percussive)
+    const MASK_SMOOTH_RADIUS: usize = 2; // 5-bin window (moderate percussive)
+    const MASK_SMOOTH_RADIUS_HEAVY: usize = 3; // 7-bin window (heavy percussive)
+    const PERC_FRACTION_LIGHT: f32 = 0.15;
+    const PERC_FRACTION_THRESHOLD: f32 = 0.3;
+    const PERC_FRACTION_HEAVY: f32 = 0.55;
+
     for frame_idx in 0..num_frames {
         let pos = frame_idx * hop_size;
         let frame_end = (pos + fft_size).min(output_len);
         let frame_len = frame_end - pos;
 
-        // Apply Wiener masks to complex spectrum
+        // Compute raw Wiener masks
+        let mut h_energy = 0.0f32;
+        let mut p_energy = 0.0f32;
         for bin in 0..num_bins {
             let h = harmonic_mags[frame_idx][bin];
             let p = percussive_mags[frame_idx][bin];
             let h2 = h * h;
             let p2 = p * p;
+            h_energy += h2;
+            p_energy += p2;
             let denom = h2 + p2 + eps;
-            let h_mask = h2 / denom;
-            let p_mask = p2 / denom;
+            h_mask_buf[bin] = h2 / denom;
+        }
+
+        // Graduated mask smoothing based on percussive energy fraction.
+        // Heavier percussive content needs wider smoothing to remove
+        // spectral notches, while lightly percussive frames (e.g., vocal
+        // consonants, drum attack/decay transitions) benefit from gentle
+        // 3-bin smoothing that reduces mask noise without blurring tonal
+        // peaks.  Purely tonal frames keep raw masks.
+        let perc_fraction = p_energy / (h_energy + p_energy + eps);
+        let smooth_radius = if perc_fraction > PERC_FRACTION_HEAVY {
+            MASK_SMOOTH_RADIUS_HEAVY
+        } else if perc_fraction > PERC_FRACTION_THRESHOLD {
+            MASK_SMOOTH_RADIUS
+        } else if perc_fraction > PERC_FRACTION_LIGHT {
+            MASK_SMOOTH_RADIUS_LIGHT
+        } else {
+            0
+        };
+        let use_smooth = smooth_radius > 0;
+
+        if use_smooth {
+            for bin in 0..num_bins {
+                let start = bin.saturating_sub(smooth_radius);
+                let end = (bin + smooth_radius + 1).min(num_bins);
+                let sum: f32 = h_mask_buf[start..end].iter().sum();
+                h_mask_smooth[bin] = sum / (end - start) as f32;
+            }
+        }
+
+        // Apply masks to complex spectrum
+        for bin in 0..num_bins {
+            let h_mask = if use_smooth {
+                h_mask_smooth[bin]
+            } else {
+                h_mask_buf[bin]
+            };
+            let p_mask = 1.0 - h_mask;
 
             h_buf[bin] = spectrogram[frame_idx][bin] * h_mask;
             p_buf[bin] = spectrogram[frame_idx][bin] * p_mask;

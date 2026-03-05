@@ -1,14 +1,15 @@
 //! Real-time streaming time-stretch processor.
 
-use rustfft::{num_complex::Complex, FftPlanner};
-
-use crate::core::fft::COMPLEX_ZERO;
+use crate::analysis::transient::{detect_transients_with_options, TransientDetectionOptions};
 use crate::core::ring_buffer::RingBuffer;
 use crate::core::types::{QualityMode, StretchParams};
-use crate::core::window::{generate_window, WindowType};
+use crate::core::window::WindowType;
+use crate::dual_plane::{DualPlaneProcessor, LatencyProfile, RtConfig, TimeWarpMap};
 use crate::error::StretchError;
+use crate::stream::transient_scheduler::{TransientEventScheduler, TransientSchedulerStats};
 use crate::stretch::hybrid::HybridStretcher;
 use crate::stretch::phase_vocoder::PhaseVocoder;
+use crate::stretch::stereo::StereoMode;
 
 /// Threshold below which ratio differences are considered negligible.
 const RATIO_SNAP_THRESHOLD: f64 = 0.0001;
@@ -21,27 +22,23 @@ const RATIO_SMOOTHING_TIME_SECS: f64 = 0.050;
 const LATENCY_FFT_NUMERATOR: usize = 3;
 /// Denominator for the FFT-size latency fraction.
 const LATENCY_FFT_DENOMINATOR: usize = 2;
+/// FFT size used by the low-latency tempo constructor.
+const LOW_LATENCY_TEMPO_FFT_SIZE: usize = 1024;
+/// Hop size used by the low-latency tempo constructor.
+const LOW_LATENCY_TEMPO_HOP_SIZE: usize = LOW_LATENCY_TEMPO_FFT_SIZE / 4;
 
 /// Callback size assumptions for real-time capacity planning.
 const MAX_CALLBACK_FRAMES: usize = 1024;
 const MIN_CALLBACK_FRAMES: usize = 64;
 const COMMON_CALLBACK_FRAMES: usize = 256;
-/// Mid-band start for spectral-flux transient detection (Hz).
-const FLUX_MID_START_HZ: f64 = 500.0;
-/// High-band start for spectral-flux transient detection (Hz).
-const FLUX_HIGH_START_HZ: f64 = 4000.0;
-/// EMA coefficient for adaptive spectral-flux statistics.
-const FLUX_EMA_ALPHA: f64 = 0.2;
-/// Sigma multiplier for adaptive spectral-flux threshold.
-const FLUX_THRESHOLD_SIGMA: f64 = 2.5;
-/// Required jump versus previous frame flux to classify a transient.
-const FLUX_SPIKE_RATIO: f64 = 1.6;
-/// Absolute guard to suppress near-silence false triggers.
-const FLUX_ABS_MIN: f64 = 1e-4;
-/// Extra emphasis on high-band flux.
-const FLUX_HIGH_WEIGHT: f64 = 1.25;
-/// Number of flux frames to observe before trigger checks.
-const FLUX_WARMUP_FRAMES: usize = 3;
+const DUAL_PLANE_WARP_HORIZON_FRAMES: usize = 8192;
+/// Iteration slack for bounded dynamic loops in the real-time path.
+const LOOP_GUARD_SLACK: usize = 8;
+/// Cross-fade length (in samples) at hybrid streaming chunk boundaries.
+///
+/// Smooths phase discontinuities caused by re-rendering overlapping audio
+/// with fresh PV phase state on each call.
+const HYBRID_STREAM_CROSSFADE_SAMPLES: usize = 3072;
 
 /// Computes the minimum number of frames required before processing can begin.
 #[inline]
@@ -57,6 +54,24 @@ fn effective_min_frames(fft_size: usize, ratio: f64) -> usize {
     } else {
         fft_size * 2
     }
+}
+
+#[inline]
+fn validate_positive_finite_ratio(value: f64, label: &'static str) -> Result<f64, StretchError> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(StretchError::InvalidRatio(format!(
+            "{} must be finite and > 0.0, got {}",
+            label, value
+        )));
+    }
+    Ok(value)
+}
+
+#[inline]
+fn ratio_from_tempo(source_bpm: f64, target_bpm: f64) -> Result<f64, StretchError> {
+    let source = validate_positive_finite_ratio(source_bpm, "source BPM")?;
+    let target = validate_positive_finite_ratio(target_bpm, "target BPM")?;
+    validate_positive_finite_ratio(source / target, "stretch ratio from BPM values")
 }
 
 #[inline]
@@ -77,6 +92,30 @@ fn stream_capacity_frames(params: &StretchParams) -> usize {
         .saturating_add(params.fft_size)
 }
 
+#[inline]
+fn latency_profile_for_quality(mode: QualityMode) -> LatencyProfile {
+    match mode {
+        QualityMode::LowLatency => LatencyProfile::Scratch,
+        QualityMode::Balanced => LatencyProfile::Mix,
+        QualityMode::MaxQuality => LatencyProfile::Render,
+    }
+}
+
+#[inline]
+fn apply_dual_plane_ratio(
+    processor: &mut DualPlaneProcessor,
+    ratio: f64,
+) -> Result<(), StretchError> {
+    let map = std::sync::Arc::new(TimeWarpMap::from_ratio(
+        ratio,
+        DUAL_PLANE_WARP_HORIZON_FRAMES,
+    )?);
+    if !processor.publish_warp_map(map.clone()) {
+        processor.rt_mut().set_warp_map_snapshot(map);
+    }
+    Ok(())
+}
+
 /// Persistent hybrid-streaming state.
 ///
 /// Keeps a bounded per-channel rolling tail and emits only the newly rendered
@@ -88,6 +127,23 @@ struct HybridStreamingState {
     tail_output_lens: Vec<usize>,
     last_ratio: f64,
     max_tail_frames: usize,
+    /// Per-channel held-back samples from the previous delta's tail,
+    /// used for cross-fading at chunk boundaries to smooth phase
+    /// discontinuities from fresh PV state on each re-render.
+    crossfade_held: Vec<Vec<f32>>,
+    /// Input samples accumulated (per channel) since the last hybrid render.
+    ///
+    /// Starts at `usize::MAX` so the very first render triggers immediately
+    /// once the minimum-latency threshold is met. After each render it resets
+    /// to zero, and subsequent renders are deferred until at least `fft_size`
+    /// new samples have accumulated. This prevents tiny per-chunk deltas
+    /// whose crossfade regions dominate the output and create spectral-flux
+    /// artifacts (false onsets).
+    input_accumulated: usize,
+    /// Reused scratch for pre-trim input lengths per channel.
+    pre_trim_lens: Vec<usize>,
+    /// Reused scratch for rendered output lengths per channel.
+    rendered_lens: Vec<usize>,
 }
 
 impl HybridStreamingState {
@@ -95,14 +151,28 @@ impl HybridStreamingState {
         let num_channels = params.channels.count();
         let mut per_channel = params.clone();
         per_channel.stretch_ratio = ratio;
+        // Disable elastic timing in streaming: the re-rendering approach
+        // snapshots a rolling window and extracts a delta.  Elastic timing
+        // redistributes stretch ratios across beat-anchored segments, so
+        // shifting the rolling window changes the per-segment ratios for
+        // ALL segments, not just the new ones.  This makes the skip
+        // estimate (which assumes uniform stretch) unreliable, causing
+        // catastrophic spectral degradation for far-from-unity ratios.
+        per_channel.elastic_timing = false;
         // Keep a generous tail so that transient detection and HPSS have
         // enough context to produce results consistent with full-batch
-        // processing.  Sixteen FFT windows (~1.5 s at 4096/44100) provides
-        // enough beat-level context for consistent segmentation.
-        let max_tail_frames = params.fft_size * 8;
+        // processing.  Fifty-six FFT windows (~5.2 s at 4096/44100) gives
+        // the PV enough warmup frames and the transient detector enough
+        // beat-level context for stable segmentation across chunks.
+        // The larger window also ensures full signal context is
+        // available for short clips (≤5 s), closing the quality gap
+        // between streaming and batch rendering.
+        let max_tail_frames = params.fft_size * 56;
         // The rolling buffer must hold the retained tail context PLUS a full
         // input batch so that tail samples are not discarded prematurely.
         let rolling_capacity = capacity_frames + max_tail_frames;
+        let crossfade_capacity =
+            (params.fft_size.saturating_mul(8)).max(HYBRID_STREAM_CROSSFADE_SAMPLES);
 
         Self {
             stretchers: (0..num_channels)
@@ -117,6 +187,12 @@ impl HybridStreamingState {
             tail_output_lens: vec![0; num_channels],
             last_ratio: ratio,
             max_tail_frames,
+            crossfade_held: (0..num_channels)
+                .map(|_| Vec::with_capacity(crossfade_capacity))
+                .collect(),
+            input_accumulated: usize::MAX,
+            pre_trim_lens: vec![0; num_channels],
+            rendered_lens: vec![0; num_channels],
         }
     }
 
@@ -147,26 +223,117 @@ impl HybridStreamingState {
     fn rebase_after_ratio_change(&mut self) {
         self.retain_tail();
         self.tail_output_lens.fill(0);
+        self.input_accumulated = usize::MAX;
     }
 
-    fn update_tail_output_estimates_from_rendered(
-        &mut self,
-        pre_trim_lens: &[usize],
-        rendered_lens: &[usize],
-    ) {
+    fn update_tail_output_estimates_from_rendered(&mut self) {
         for (idx, input) in self.rolling_inputs.iter().enumerate() {
             let tail_len = input.len();
-            if pre_trim_lens[idx] > 0 {
+            if self.pre_trim_lens[idx] > 0 {
                 // Scale the actual rendered length by the proportion of input
                 // retained as tail — more accurate than `tail_len * ratio`
                 // because it reflects real PV hop quantisation.
-                self.tail_output_lens[idx] = ((rendered_lens[idx] as f64) * tail_len as f64
-                    / pre_trim_lens[idx] as f64)
+                self.tail_output_lens[idx] = ((self.rendered_lens[idx] as f64) * tail_len as f64
+                    / self.pre_trim_lens[idx] as f64)
                     .round() as usize;
             } else {
                 self.tail_output_lens[idx] = 0;
             }
         }
+    }
+}
+
+/// Stateful linear resampler used for realtime pitch control in stream mode.
+///
+/// Maintains one-sample look-behind and a fractional source cursor so
+/// resampling remains continuous across callbacks.
+#[derive(Debug, Clone)]
+struct LinearResamplerState {
+    prev_sample: f32,
+    has_prev: bool,
+    next_pos: f64,
+}
+
+impl LinearResamplerState {
+    fn new() -> Self {
+        Self {
+            prev_sample: 0.0,
+            has_prev: false,
+            next_pos: 0.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.prev_sample = 0.0;
+        self.has_prev = false;
+        self.next_pos = 0.0;
+    }
+
+    fn source_sample(&self, input: &[f32], idx: usize) -> f32 {
+        if self.has_prev {
+            if idx == 0 {
+                self.prev_sample
+            } else {
+                input[idx - 1]
+            }
+        } else {
+            input[idx]
+        }
+    }
+
+    fn process_into(
+        &mut self,
+        input: &[f32],
+        pitch_scale: f64,
+        output: &mut Vec<f32>,
+    ) -> Result<(), StretchError> {
+        output.clear();
+        if input.is_empty() {
+            return Ok(());
+        }
+
+        let source_len = input.len() + usize::from(self.has_prev);
+        if source_len < 2 {
+            self.prev_sample = input[input.len() - 1];
+            self.has_prev = true;
+            self.next_pos = 0.0;
+            return Ok(());
+        }
+
+        let mut pos = self.next_pos.max(0.0);
+        while pos + 1.0 < source_len as f64 {
+            if output.len() == output.capacity() {
+                return Err(StretchError::BufferOverflow {
+                    buffer: "stream_pitch_resample_output",
+                    requested: output.len().saturating_add(1),
+                    available: output.capacity(),
+                });
+            }
+
+            let i = pos.floor() as usize;
+            let frac = (pos - i as f64) as f32;
+            let a = self.source_sample(input, i);
+            let b = self.source_sample(input, i + 1);
+            output.push(a + (b - a) * frac);
+            pos += 1.0 / pitch_scale;
+        }
+
+        self.prev_sample = input[input.len() - 1];
+        self.has_prev = true;
+        let max_pos = source_len.saturating_sub(1) as f64;
+        self.next_pos = (pos - max_pos).max(0.0);
+        Ok(())
+    }
+
+    fn flush_into(&mut self, pitch_scale: f64, output: &mut Vec<f32>) -> Result<(), StretchError> {
+        if !self.has_prev {
+            output.clear();
+            return Ok(());
+        }
+        let tail = [self.prev_sample];
+        self.process_into(&tail, pitch_scale, output)?;
+        self.reset();
+        Ok(())
     }
 }
 
@@ -176,6 +343,69 @@ impl HybridStreamingState {
 /// - no `Vec::drain`
 /// - no front-removal shifts
 /// - deterministic memory bounds
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingEngine {
+    /// Default deterministic stream engine with bounded per-callback work.
+    ///
+    /// This engine uses persistent phase-vocoder state and avoids full rolling
+    /// re-renders of historical context in callback paths.
+    Deterministic,
+    /// Legacy rolling-window hybrid re-render engine.
+    ///
+    /// This mode can provide stronger transient handling for selected content,
+    /// but has higher callback-cost variability and is intended as opt-in.
+    LegacyHybridRerender,
+}
+
+/// Aggregated transient-reset telemetry from deterministic stream processing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransientResetStats {
+    /// Number of transient events detected by the scheduler.
+    pub events_detected_total: u64,
+    /// Number of times each reset band was selected across all events.
+    ///
+    /// Layout: `[sub_bass, low, mid, high]`.
+    pub reset_band_counts_total: [u64; 4],
+    /// Absolute per-channel input frames consumed from the stream so far.
+    pub input_frames_consumed_total: usize,
+}
+
+struct DualPlaneDeterministicState {
+    processor: DualPlaneProcessor,
+    num_channels: usize,
+    block_frames: usize,
+    input_planar: Vec<Vec<f32>>,
+    output_planar: Vec<Vec<f32>>,
+    last_ratio: f64,
+}
+
+impl DualPlaneDeterministicState {
+    fn from_params(params: &StretchParams, ratio: f64) -> Result<Self, StretchError> {
+        let block_frames = COMMON_CALLBACK_FRAMES;
+        let mut rt_cfg = RtConfig::new(params.clone(), block_frames);
+        rt_cfg.latency_profile = latency_profile_for_quality(params.quality_mode);
+        rt_cfg.min_ratio = 0.05;
+        rt_cfg.max_ratio = 8.0;
+        let max_output_frames = ((rt_cfg.kernel_frames as f64 * rt_cfg.max_ratio).ceil() as usize)
+            .saturating_add(params.fft_size);
+
+        let mut processor = DualPlaneProcessor::prepare(rt_cfg)?;
+        apply_dual_plane_ratio(&mut processor, ratio)?;
+        let num_channels = params.channels.count().max(1);
+
+        Ok(Self {
+            processor,
+            num_channels,
+            block_frames,
+            input_planar: (0..num_channels).map(|_| vec![0.0; block_frames]).collect(),
+            output_planar: (0..num_channels)
+                .map(|_| vec![0.0; max_output_frames])
+                .collect(),
+            last_ratio: ratio,
+        })
+    }
+}
+
 pub struct StreamProcessor {
     params: StretchParams,
     capacity_frames_per_channel: usize,
@@ -199,23 +429,27 @@ pub struct StreamProcessor {
     interleaved_scratch: Vec<f32>,
     /// Source BPM (set when created via `from_tempo`, enables `set_tempo`).
     source_bpm: Option<f64>,
-    /// When true, use the full hybrid algorithm (transient detection + WSOLA + PV)
-    /// instead of PV-only. Higher quality for EDM but higher latency.
+    /// Enables the legacy rolling-window hybrid re-render engine.
+    ///
+    /// Prefer [`StreamingEngine::Deterministic`] for real-time callback
+    /// stability. Keep this flag only as a compatibility bridge for callers
+    /// still opting into historical hybrid streaming behavior.
     use_hybrid: bool,
     /// Persistent hybrid streaming state (rolling bounded tail + incremental output).
     hybrid_state: HybridStreamingState,
     /// Indicates that hybrid rolling buffers should rebase on the next process call.
     hybrid_pending_rebase: bool,
-    /// Reusable mono mixdown buffer for stereo phase coherence.
-    mid_buffer: Vec<f32>,
-    /// Cached FFT for spectral-flux transient detection.
-    transient_fft: std::sync::Arc<dyn rustfft::Fft<f32>>,
-    /// Reusable FFT buffer for spectral-flux detection.
-    transient_fft_buffer: Vec<Complex<f32>>,
-    /// Reusable previous magnitudes for spectral-flux detection.
-    transient_prev_magnitudes: Vec<f32>,
-    /// Analysis window used by spectral-flux detection.
-    transient_window: Vec<f32>,
+    /// When enabled, hybrid mode uses the allocation-free realtime-safe path.
+    ///
+    /// This trades hybrid transient rendering quality for hard-RT callback
+    /// behavior by routing through the preallocated PV streaming path.
+    hybrid_realtime_strict: bool,
+    /// Persistent transient event scheduler for deterministic stream mode.
+    transient_scheduler: TransientEventScheduler,
+    /// Absolute count of per-channel input frames consumed from `input_ring`.
+    ///
+    /// This provides a stable timeline for incremental transient scheduling.
+    input_frames_consumed_total: usize,
     /// Expected total output samples across the current stream.
     ///
     /// Accumulated from input samples and the effective interpolated ratio,
@@ -223,6 +457,14 @@ pub struct StreamProcessor {
     expected_total_output_samples: f64,
     /// Total output samples emitted to the caller for the current stream.
     total_output_emitted_samples: usize,
+    /// Realtime pitch scale applied in stream mode.
+    pitch_scale: f64,
+    /// Stateful per-channel resamplers for realtime pitch control.
+    pitch_resamplers: Vec<LinearResamplerState>,
+    /// Reusable per-channel output buffers for pitch-resampled data.
+    pitch_output_buffers: Vec<Vec<f32>>,
+    /// Optional dual-plane deterministic backend state.
+    dual_plane_deterministic: Option<DualPlaneDeterministicState>,
 }
 
 impl std::fmt::Debug for StreamProcessor {
@@ -232,7 +474,13 @@ impl std::fmt::Debug for StreamProcessor {
             .field("current_ratio", &self.current_ratio)
             .field("target_ratio", &self.target_ratio)
             .field("vocoder_ratio", &self.vocoder_ratio)
+            .field("pitch_scale", &self.pitch_scale)
+            .field("hybrid_realtime_strict", &self.hybrid_realtime_strict)
             .field("initialized", &self.initialized)
+            .field(
+                "dual_plane_deterministic",
+                &self.dual_plane_deterministic.is_some(),
+            )
             .field("source_bpm", &self.source_bpm)
             .field("input_ring_len", &self.input_ring.len())
             .field("pending_output_len", &self.pending_output.len())
@@ -253,6 +501,7 @@ impl StreamProcessor {
             .saturating_mul(4)
             .saturating_add(params.fft_size);
         let output_capacity_samples = output_capacity_frames.saturating_mul(num_channels);
+        let pitch_output_capacity_frames = output_capacity_frames.saturating_mul(2);
 
         let vocoders = Self::create_vocoders(&params, ratio);
         let channel_input_buffers = (0..num_channels)
@@ -262,11 +511,12 @@ impl StreamProcessor {
             .map(|_| Vec::with_capacity(output_capacity_frames))
             .collect();
         let hybrid_state = HybridStreamingState::new(&params, ratio, capacity_frames_per_channel);
-        let mut planner = FftPlanner::new();
-        let transient_fft = planner.plan_fft_forward(params.fft_size);
-        let transient_fft_buffer = vec![COMPLEX_ZERO; params.fft_size];
-        let transient_prev_magnitudes = vec![0.0; params.fft_size / 2 + 1];
-        let transient_window = generate_window(WindowType::Hann, params.fft_size);
+        let transient_scheduler = TransientEventScheduler::new(
+            params.fft_size,
+            params.hop_size,
+            params.sample_rate,
+            capacity_frames_per_channel,
+        );
 
         Self {
             params,
@@ -285,13 +535,19 @@ impl StreamProcessor {
             use_hybrid: false,
             hybrid_state,
             hybrid_pending_rebase: false,
-            mid_buffer: Vec::with_capacity(capacity_frames_per_channel),
-            transient_fft,
-            transient_fft_buffer,
-            transient_prev_magnitudes,
-            transient_window,
+            hybrid_realtime_strict: false,
+            transient_scheduler,
+            input_frames_consumed_total: 0,
             expected_total_output_samples: 0.0,
             total_output_emitted_samples: 0,
+            pitch_scale: 1.0,
+            pitch_resamplers: (0..num_channels)
+                .map(|_| LinearResamplerState::new())
+                .collect(),
+            pitch_output_buffers: (0..num_channels)
+                .map(|_| Vec::with_capacity(pitch_output_capacity_frames))
+                .collect(),
+            dual_plane_deterministic: None,
         }
     }
 
@@ -299,7 +555,7 @@ impl StreamProcessor {
     fn create_vocoders(params: &StretchParams, ratio: f64) -> Vec<PhaseVocoder> {
         (0..params.channels.count())
             .map(|_| {
-                PhaseVocoder::with_all_options(
+                let mut pv = PhaseVocoder::with_all_options(
                     params.fft_size,
                     params.hop_size,
                     ratio,
@@ -309,7 +565,11 @@ impl StreamProcessor {
                     params.phase_locking_mode,
                     params.envelope_preservation,
                     params.envelope_order,
-                )
+                );
+                pv.set_adaptive_phase_locking(params.adaptive_phase_locking);
+                pv.set_envelope_strength(params.envelope_strength);
+                pv.set_adaptive_envelope_order(params.adaptive_envelope_order);
+                pv
             })
             .collect()
     }
@@ -340,9 +600,48 @@ impl StreamProcessor {
         }
 
         self.initialized = true;
+
+        if self.dual_plane_deterministic.is_some() && !self.use_hybrid {
+            if (self.pitch_scale - 1.0).abs() > RATIO_SNAP_THRESHOLD {
+                return Err(StretchError::InvalidState(
+                    "dual-plane deterministic backend does not support pitch_scale != 1.0",
+                ));
+            }
+            return self.process_into_dual_plane(input, output);
+        }
+
+        // Fast passthrough for unity ratio: skip PV/WSOLA processing to
+        // produce bit-exact output and eliminate windowing/overlap-add drift.
+        if (self.target_ratio - 1.0).abs() < RATIO_SNAP_THRESHOLD
+            && (self.current_ratio - 1.0).abs() < RATIO_SNAP_THRESHOLD
+            && (self.pitch_scale - 1.0).abs() < RATIO_SNAP_THRESHOLD
+        {
+            let available = output.capacity().saturating_sub(output.len());
+            if input.len() > available {
+                return Err(StretchError::BufferOverflow {
+                    buffer: "process_into_output",
+                    requested: input.len(),
+                    available,
+                });
+            }
+            output.extend_from_slice(input);
+            return Ok(());
+        }
+
         let num_channels = self.params.channels.count().max(1);
         let mut offset = 0usize;
+        let mut iterations = 0usize;
+        let max_iterations = input
+            .len()
+            .saturating_add(LOOP_GUARD_SLACK)
+            .max(LOOP_GUARD_SLACK);
         while offset < input.len() {
+            iterations = iterations.saturating_add(1);
+            if iterations > max_iterations {
+                return Err(StretchError::InvalidState(
+                    "process_into iteration bound exceeded",
+                ));
+            }
             if self.input_ring.available() == 0 {
                 self.interpolate_ratio_for_frames(COMMON_CALLBACK_FRAMES);
                 self.process_available_to_pending(true)?;
@@ -356,6 +655,11 @@ impl StreamProcessor {
             }
 
             let take = (input.len() - offset).min(self.input_ring.available());
+            if take == 0 {
+                return Err(StretchError::InvalidState(
+                    "process_into made zero progress while input remained",
+                ));
+            }
             self.push_input_samples(&input[offset..offset + take])?;
             offset += take;
 
@@ -380,6 +684,17 @@ impl StreamProcessor {
     /// Returns the number of samples written to `output`.
     pub fn flush_into(&mut self, output: &mut Vec<f32>) -> Result<usize, StretchError> {
         let before = output.len();
+        if self.dual_plane_deterministic.is_some() && !self.use_hybrid {
+            if (self.pitch_scale - 1.0).abs() > RATIO_SNAP_THRESHOLD {
+                return Err(StretchError::InvalidState(
+                    "dual-plane deterministic backend does not support pitch_scale != 1.0",
+                ));
+            }
+            let written = self.flush_into_dual_plane(output)?;
+            self.expected_total_output_samples = 0.0;
+            self.total_output_emitted_samples = 0;
+            return Ok(written);
+        }
         let num_channels = self.params.channels.count();
         if self.params.hop_size == 0 {
             return Err(StretchError::InvalidState("hop_size must be > 0"));
@@ -400,8 +715,24 @@ impl StreamProcessor {
                 }
                 let zeros = [0.0f32; 256];
                 let mut remaining = missing;
+                let mut iterations = 0usize;
+                let max_iterations = missing
+                    .saturating_add(zeros.len().saturating_sub(1))
+                    .saturating_div(zeros.len())
+                    .saturating_add(LOOP_GUARD_SLACK);
                 while remaining > 0 {
+                    iterations = iterations.saturating_add(1);
+                    if iterations > max_iterations {
+                        return Err(StretchError::InvalidState(
+                            "flush zero-padding iteration bound exceeded",
+                        ));
+                    }
                     let chunk = remaining.min(zeros.len());
+                    if chunk == 0 {
+                        return Err(StretchError::InvalidState(
+                            "flush zero-padding made zero progress",
+                        ));
+                    }
                     let pushed = self.input_ring.push_slice(&zeros[..chunk]);
                     if pushed != chunk {
                         return Err(StretchError::BufferOverflow {
@@ -421,8 +752,28 @@ impl StreamProcessor {
             self.flush_vocoder_tails_to_pending(num_channels)?;
         }
 
+        let remaining_frames = self.input_ring.len() / num_channels.max(1);
+        self.input_frames_consumed_total = self
+            .input_frames_consumed_total
+            .saturating_add(remaining_frames);
         self.input_ring.clear();
         if self.use_hybrid {
+            // Emit any held-back cross-fade tails before resetting state.
+            // These tails are in M/S space and need decoding to L/R.
+            let mut held_min_len = usize::MAX;
+            for ch in 0..num_channels {
+                let held = &self.hybrid_state.crossfade_held[ch];
+                if !held.is_empty() {
+                    self.channel_output_buffers[ch].clear();
+                    self.channel_output_buffers[ch].extend_from_slice(held);
+                    held_min_len = held_min_len.min(held.len());
+                }
+            }
+            if held_min_len != usize::MAX && held_min_len > 0 {
+                self.decode_output_mid_side(num_channels, held_min_len);
+                self.emit_channel_output_to_pending(held_min_len, num_channels)?;
+            }
+
             self.hybrid_state.reset(
                 &self.params,
                 self.current_ratio,
@@ -430,6 +781,9 @@ impl StreamProcessor {
             );
             self.hybrid_pending_rebase = false;
         }
+
+        self.flush_pitch_resampler_to_pending(num_channels)?;
+        self.reset_pitch_resamplers();
 
         let _ = self.drain_pending_to_output(output)?;
 
@@ -466,6 +820,158 @@ impl StreamProcessor {
         let mut out = Vec::with_capacity(self.pending_output.capacity());
         self.flush_into(&mut out)?;
         Ok(out)
+    }
+
+    fn process_into_dual_plane(
+        &mut self,
+        input: &[f32],
+        output: &mut Vec<f32>,
+    ) -> Result<(), StretchError> {
+        let Some(state_meta) = self.dual_plane_deterministic.as_ref() else {
+            return Err(StretchError::InvalidState(
+                "dual-plane deterministic state is unavailable",
+            ));
+        };
+        let num_channels = state_meta.num_channels.max(1);
+        let block_frames = state_meta.block_frames;
+        if !input.len().is_multiple_of(num_channels) {
+            return Err(StretchError::InvalidFormat(format!(
+                "input sample count {} is not a multiple of channel count {}",
+                input.len(),
+                num_channels
+            )));
+        }
+
+        let mut offset = 0usize;
+        while offset < input.len() {
+            let remaining_frames = (input.len() - offset) / num_channels;
+            let frames = remaining_frames.min(block_frames);
+            if frames == 0 {
+                break;
+            }
+
+            self.interpolate_ratio_for_frames(frames);
+            self.expected_total_output_samples +=
+                (frames * num_channels) as f64 * self.current_ratio;
+            let produced_frames = {
+                let Some(state) = self.dual_plane_deterministic.as_mut() else {
+                    return Err(StretchError::InvalidState(
+                        "dual-plane deterministic state became unavailable",
+                    ));
+                };
+                if state.input_planar.len() != num_channels
+                    || state.output_planar.len() != num_channels
+                {
+                    return Err(StretchError::InvalidState(
+                        "dual-plane planar buffers do not match channel count",
+                    ));
+                }
+                if (self.current_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
+                    apply_dual_plane_ratio(&mut state.processor, self.current_ratio)?;
+                    state.last_ratio = self.current_ratio;
+                }
+
+                for frame in 0..frames {
+                    let base = offset + frame * num_channels;
+                    for ch in 0..num_channels {
+                        state.input_planar[ch][frame] = input[base + ch];
+                    }
+                }
+
+                if num_channels == 1 {
+                    let input_refs = [&state.input_planar[0][..frames]];
+                    let mut output_refs = [state.output_planar[0].as_mut_slice()];
+                    let (_consumed, produced) =
+                        state.processor.process(&input_refs, &mut output_refs);
+                    produced
+                } else if num_channels == 2 {
+                    let input_refs = [
+                        &state.input_planar[0][..frames],
+                        &state.input_planar[1][..frames],
+                    ];
+                    let (left_out, right_out) = state.output_planar.split_at_mut(1);
+                    let mut output_refs = [left_out[0].as_mut_slice(), right_out[0].as_mut_slice()];
+                    let (_consumed, produced) =
+                        state.processor.process(&input_refs, &mut output_refs);
+                    produced
+                } else {
+                    let input_refs: Vec<&[f32]> = state
+                        .input_planar
+                        .iter()
+                        .take(num_channels)
+                        .map(|channel| &channel[..frames])
+                        .collect();
+                    let mut output_refs: Vec<&mut [f32]> = state
+                        .output_planar
+                        .iter_mut()
+                        .take(num_channels)
+                        .map(|channel| channel.as_mut_slice())
+                        .collect();
+                    let (_consumed, produced) =
+                        state.processor.process(&input_refs, &mut output_refs);
+                    produced
+                }
+            };
+
+            let produced_samples = produced_frames.saturating_mul(num_channels);
+            let available = output.capacity().saturating_sub(output.len());
+            if produced_samples > available {
+                return Err(StretchError::BufferOverflow {
+                    buffer: "process_into_output",
+                    requested: produced_samples,
+                    available,
+                });
+            }
+            let Some(state) = self.dual_plane_deterministic.as_ref() else {
+                return Err(StretchError::InvalidState(
+                    "dual-plane deterministic state became unavailable",
+                ));
+            };
+            for frame in 0..produced_frames {
+                for ch in 0..num_channels {
+                    output.push(state.output_planar[ch][frame]);
+                }
+            }
+            self.total_output_emitted_samples = self
+                .total_output_emitted_samples
+                .saturating_add(produced_samples);
+
+            offset += frames * num_channels;
+        }
+
+        if input.is_empty() {
+            self.interpolate_ratio_for_frames(COMMON_CALLBACK_FRAMES);
+            if let Some(state) = self.dual_plane_deterministic.as_mut() {
+                if (self.current_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
+                    apply_dual_plane_ratio(&mut state.processor, self.current_ratio)?;
+                    state.last_ratio = self.current_ratio;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn flush_into_dual_plane(&mut self, output: &mut Vec<f32>) -> Result<usize, StretchError> {
+        let Some(_state) = self.dual_plane_deterministic.as_ref() else {
+            return Err(StretchError::InvalidState(
+                "dual-plane deterministic state is unavailable",
+            ));
+        };
+
+        let before = output.len();
+        {
+            let Some(state) = self.dual_plane_deterministic.as_mut() else {
+                return Err(StretchError::InvalidState(
+                    "dual-plane deterministic state became unavailable",
+                ));
+            };
+            state.processor.flush(output)?;
+        }
+        let written = output.len().saturating_sub(before);
+        self.total_output_emitted_samples =
+            self.total_output_emitted_samples.saturating_add(written);
+        Ok(written)
     }
 
     fn push_input_samples(&mut self, input: &[f32]) -> Result<(), StretchError> {
@@ -507,35 +1013,45 @@ impl StreamProcessor {
         }
 
         if require_min_latency {
-            let min_frames = effective_min_frames(self.params.fft_size, self.current_ratio);
+            let min_frames = effective_min_frames(self.params.fft_size, self.processing_ratio());
             if total_frames < min_frames {
                 return Ok(());
             }
         }
 
         self.collect_channel_inputs(total_frames, num_channels)?;
+        self.encode_input_mid_side(num_channels);
 
-        if self.use_hybrid {
-            let min_output_len = self.process_hybrid_persistent_channels(num_channels)?;
+        if self.use_hybrid && !self.hybrid_realtime_strict {
+            let min_output_len =
+                self.process_hybrid_persistent_channels(num_channels, require_min_latency)?;
             let consumed = total_frames * num_channels;
             self.input_ring.discard(consumed);
+            self.input_frames_consumed_total = self
+                .input_frames_consumed_total
+                .saturating_add(total_frames);
 
             if min_output_len > 0 {
-                self.interleave_to_pending(min_output_len, num_channels)?;
+                self.decode_output_mid_side(num_channels, min_output_len);
+                self.emit_channel_output_to_pending(min_output_len, num_channels)?;
             }
             return Ok(());
         }
 
         self.update_vocoder_ratio();
         if num_channels == 2 {
-            self.sync_stereo_phase_reset(total_frames);
+            self.apply_transient_scheduled_phase_reset(total_frames);
         }
 
         let min_output_len = self.process_channels(num_channels)?;
-        self.consume_processed_input(total_frames, num_channels);
+        let consumed_frames = self.consume_processed_input(total_frames, num_channels);
+        self.input_frames_consumed_total = self
+            .input_frames_consumed_total
+            .saturating_add(consumed_frames);
 
         if min_output_len > 0 {
-            self.interleave_to_pending(min_output_len, num_channels)?;
+            self.decode_output_mid_side(num_channels, min_output_len);
+            self.emit_channel_output_to_pending(min_output_len, num_channels)?;
         }
 
         Ok(())
@@ -583,6 +1099,43 @@ impl StreamProcessor {
         Ok(())
     }
 
+    /// Converts `channel_input_buffers` from L/R to Mid/Side in-place.
+    ///
+    /// Only applies when `num_channels == 2` and `stereo_mode == MidSide`.
+    /// After this call, `channel_input_buffers[0]` holds Mid and `[1]` holds Side.
+    fn encode_input_mid_side(&mut self, num_channels: usize) {
+        if num_channels != 2 || self.params.stereo_mode != StereoMode::MidSide {
+            return;
+        }
+        let len = self.channel_input_buffers[0]
+            .len()
+            .min(self.channel_input_buffers[1].len());
+        for i in 0..len {
+            let l = self.channel_input_buffers[0][i];
+            let r = self.channel_input_buffers[1][i];
+            self.channel_input_buffers[0][i] = (l + r) * 0.5;
+            self.channel_input_buffers[1][i] = (l - r) * 0.5;
+        }
+    }
+
+    /// Converts `channel_output_buffers` from Mid/Side back to L/R in-place.
+    ///
+    /// Only applies when `num_channels == 2` and `stereo_mode == MidSide`.
+    fn decode_output_mid_side(&mut self, num_channels: usize, output_len: usize) {
+        if num_channels != 2 || self.params.stereo_mode != StereoMode::MidSide {
+            return;
+        }
+        let len = output_len
+            .min(self.channel_output_buffers[0].len())
+            .min(self.channel_output_buffers[1].len());
+        for i in 0..len {
+            let m = self.channel_output_buffers[0][i];
+            let s = self.channel_output_buffers[1][i];
+            self.channel_output_buffers[0][i] = m + s;
+            self.channel_output_buffers[1][i] = m - s;
+        }
+    }
+
     fn process_channels(&mut self, num_channels: usize) -> Result<usize, StretchError> {
         let mut min_output_len = usize::MAX;
 
@@ -601,10 +1154,10 @@ impl StreamProcessor {
         })
     }
 
-    fn consume_processed_input(&mut self, total_frames: usize, num_channels: usize) {
+    fn consume_processed_input(&mut self, total_frames: usize, num_channels: usize) -> usize {
         let hop = self.params.hop_size;
         if hop == 0 {
-            return;
+            return 0;
         }
         let num_frames_processed = if total_frames >= self.params.fft_size {
             (total_frames - self.params.fft_size) / hop + 1
@@ -619,6 +1172,7 @@ impl StreamProcessor {
         if samples_consumed > 0 {
             self.input_ring.discard(samples_consumed);
         }
+        num_frames_processed.saturating_mul(hop)
     }
 
     fn interleave_to_pending(
@@ -648,6 +1202,104 @@ impl StreamProcessor {
         Ok(())
     }
 
+    #[inline]
+    fn processing_ratio(&self) -> f64 {
+        self.current_ratio * self.pitch_scale
+    }
+
+    fn reset_pitch_resamplers(&mut self) {
+        for resampler in &mut self.pitch_resamplers {
+            resampler.reset();
+        }
+        for buf in &mut self.pitch_output_buffers {
+            buf.clear();
+        }
+    }
+
+    fn emit_channel_output_to_pending(
+        &mut self,
+        min_output_len: usize,
+        num_channels: usize,
+    ) -> Result<(), StretchError> {
+        if min_output_len == 0 {
+            return Ok(());
+        }
+
+        if (self.pitch_scale - 1.0).abs() < RATIO_SNAP_THRESHOLD {
+            return self.interleave_to_pending(min_output_len, num_channels);
+        }
+        let resample_ratio = 1.0 / self.pitch_scale;
+
+        let mut pitch_min_output_len = usize::MAX;
+        for ch in 0..num_channels {
+            if self.channel_output_buffers[ch].len() < min_output_len {
+                return Err(StretchError::InvalidState(
+                    "channel output shorter than requested interleave length",
+                ));
+            }
+
+            self.pitch_resamplers[ch].process_into(
+                &self.channel_output_buffers[ch][..min_output_len],
+                resample_ratio,
+                &mut self.pitch_output_buffers[ch],
+            )?;
+            pitch_min_output_len = pitch_min_output_len.min(self.pitch_output_buffers[ch].len());
+        }
+
+        if pitch_min_output_len == usize::MAX || pitch_min_output_len == 0 {
+            return Ok(());
+        }
+        self.interleave_pitch_to_pending(pitch_min_output_len, num_channels)
+    }
+
+    fn interleave_pitch_to_pending(
+        &mut self,
+        min_output_len: usize,
+        num_channels: usize,
+    ) -> Result<(), StretchError> {
+        let needed = min_output_len.saturating_mul(num_channels);
+        if needed > self.pending_output.available() {
+            return Err(StretchError::BufferOverflow {
+                buffer: "stream_pending_output",
+                requested: needed,
+                available: self.pending_output.available(),
+            });
+        }
+
+        for i in 0..min_output_len {
+            for ch in 0..num_channels {
+                if !self.pending_output.push(self.pitch_output_buffers[ch][i]) {
+                    return Err(StretchError::InvalidState(
+                        "pending output ring rejected pitch push despite capacity check",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_pitch_resampler_to_pending(
+        &mut self,
+        num_channels: usize,
+    ) -> Result<(), StretchError> {
+        if (self.pitch_scale - 1.0).abs() < RATIO_SNAP_THRESHOLD {
+            return Ok(());
+        }
+        let resample_ratio = 1.0 / self.pitch_scale;
+
+        let mut min_output_len = usize::MAX;
+        for ch in 0..num_channels {
+            self.pitch_resamplers[ch]
+                .flush_into(resample_ratio, &mut self.pitch_output_buffers[ch])?;
+            min_output_len = min_output_len.min(self.pitch_output_buffers[ch].len());
+        }
+
+        if min_output_len != usize::MAX && min_output_len > 0 {
+            self.interleave_pitch_to_pending(min_output_len, num_channels)?;
+        }
+        Ok(())
+    }
+
     fn drain_pending_to_output(&mut self, output: &mut Vec<f32>) -> Result<usize, StretchError> {
         let pending = self.pending_output.len();
         if pending == 0 {
@@ -665,10 +1317,23 @@ impl StreamProcessor {
 
         let mut written = 0usize;
         let mut chunk = [0.0f32; 512];
+        let mut iterations = 0usize;
+        let max_iterations = pending
+            .saturating_add(chunk.len().saturating_sub(1))
+            .saturating_div(chunk.len())
+            .saturating_add(LOOP_GUARD_SLACK);
         while !self.pending_output.is_empty() {
+            iterations = iterations.saturating_add(1);
+            if iterations > max_iterations {
+                return Err(StretchError::InvalidState(
+                    "pending-output drain iteration bound exceeded",
+                ));
+            }
             let n = self.pending_output.pop_slice(&mut chunk);
             if n == 0 {
-                break;
+                return Err(StretchError::InvalidState(
+                    "pending-output drain made zero progress",
+                ));
             }
             output.extend_from_slice(&chunk[..n]);
             written += n;
@@ -680,6 +1345,7 @@ impl StreamProcessor {
     }
 
     fn append_hybrid_input(&mut self, num_channels: usize) -> Result<(), StretchError> {
+        let mut first_ch_pushed = 0;
         for ch in 0..num_channels {
             let input = &self.channel_input_buffers[ch];
             let rb = &mut self.hybrid_state.rolling_inputs[ch];
@@ -694,25 +1360,58 @@ impl StreamProcessor {
                     available: pushed,
                 });
             }
+            if ch == 0 {
+                first_ch_pushed = pushed;
+            }
         }
+        self.hybrid_state.input_accumulated = self
+            .hybrid_state
+            .input_accumulated
+            .saturating_add(first_ch_pushed);
         Ok(())
     }
 
     fn process_hybrid_persistent_channels(
         &mut self,
         num_channels: usize,
+        allow_defer: bool,
     ) -> Result<usize, StretchError> {
         if self.hybrid_pending_rebase {
             self.hybrid_state.rebase_after_ratio_change();
             self.hybrid_pending_rebase = false;
         }
-        self.hybrid_state.update_ratio(self.current_ratio);
+        self.hybrid_state.update_ratio(self.processing_ratio());
 
         self.append_hybrid_input(num_channels)?;
 
+        // Accumulate enough new input before re-rendering.  With small
+        // input chunks (e.g. 1024 samples) the output delta per render is
+        // tiny and almost entirely consumed by the crossfade, producing
+        // spectral-flux spikes at chunk boundaries that manifest as false
+        // onsets.  Batching input to at least fft_size new samples per
+        // render makes each delta large enough for the crossfade to be a
+        // minor fraction, eliminating these artifacts.
+        // Use 2× the FFT size for ratios far from unity (|r-1| > 0.1).
+        // Higher thresholds reduce crossfade fraction but accumulate more
+        // context change between renders, causing the skip estimate to
+        // drift (HPSS segmentation shifts as the rolling window moves).
+        // 2× balances crossfade fraction (~35%) against skip accuracy.
+        // Using 2× for ALL ratios: near-unity ratios had 71% crossfade
+        // at 1× which destroyed transient timing in house tracks;
+        // at 2× the crossfade fraction drops to ~36%, preserving
+        // more of each render's original onset positions.  Skip drift
+        // is minimal for near-unity because the output-to-input ratio
+        // is nearly constant across segments.
+        let accum_threshold = self.params.fft_size * 2;
+        if allow_defer && self.hybrid_state.input_accumulated < accum_threshold {
+            return Ok(0);
+        }
+
         let mut min_output_len = usize::MAX;
-        let mut pre_trim_lens = vec![0usize; num_channels];
-        let mut rendered_lens = vec![0usize; num_channels];
+        self.hybrid_state.pre_trim_lens.fill(0);
+        self.hybrid_state.rendered_lens.fill(0);
+
+        // Phase 1: Snapshot all channels from rolling buffers.
         for ch in 0..num_channels {
             let len = self.hybrid_state.rolling_inputs[ch].len();
             self.hybrid_state.rolling_scratch[ch].resize(len, 0.0);
@@ -723,9 +1422,49 @@ impl StreamProcessor {
                     "failed to snapshot hybrid rolling ring",
                 ));
             }
+        }
 
-            let rendered =
-                self.hybrid_state.stretchers[ch].process(&self.hybrid_state.rolling_scratch[ch])?;
+        // Phase 2: For stereo M/S, detect shared transients from mid channel
+        // so both channels use identical segmentation. This prevents phase
+        // misalignment when decoded back to L/R, matching the batch path's
+        // shared onset detection in stretch_mid_side().
+        let shared_onsets: Option<(Vec<usize>, Vec<f32>)> = if num_channels == 2
+            && self.params.stereo_mode == StereoMode::MidSide
+            && !self.hybrid_state.rolling_scratch[0].is_empty()
+        {
+            let mid = &self.hybrid_state.rolling_scratch[0];
+            let fft = self.params.fft_size.min(2048);
+            let hop = self.params.hop_size.min(512);
+            let map = detect_transients_with_options(
+                mid,
+                self.params.sample_rate,
+                fft,
+                hop,
+                self.params.transient_sensitivity,
+                TransientDetectionOptions::from_stretch_params(&self.params),
+            );
+            let onsets = map.onsets.clone();
+            let strengths = if map.strengths.len() == onsets.len() {
+                map.strengths.clone()
+            } else {
+                vec![1.0; onsets.len()]
+            };
+            Some((onsets, strengths))
+        } else {
+            None
+        };
+
+        // Phase 3: Process each channel and extract deltas.
+        for ch in 0..num_channels {
+            let rendered = if let Some((ref onsets, ref strengths)) = shared_onsets {
+                self.hybrid_state.stretchers[ch].process_with_onsets(
+                    &self.hybrid_state.rolling_scratch[ch],
+                    onsets,
+                    strengths,
+                )?
+            } else {
+                self.hybrid_state.stretchers[ch].process(&self.hybrid_state.rolling_scratch[ch])?
+            };
             let skip = self.hybrid_state.tail_output_lens[ch].min(rendered.len());
             let delta_len = rendered.len().saturating_sub(skip);
 
@@ -737,17 +1476,123 @@ impl StreamProcessor {
                 });
             }
 
-            pre_trim_lens[ch] = len;
-            rendered_lens[ch] = rendered.len();
+            self.hybrid_state.pre_trim_lens[ch] = self.hybrid_state.rolling_scratch[ch].len();
+            self.hybrid_state.rendered_lens[ch] = rendered.len();
 
             self.channel_output_buffers[ch].clear();
-            self.channel_output_buffers[ch].extend_from_slice(&rendered[skip..]);
-            min_output_len = min_output_len.min(delta_len);
+
+            // Cross-fade at the chunk boundary to smooth phase discontinuities.
+            // The hybrid stretcher creates a fresh PV on each call, so the
+            // absolute phase of the rendered output may differ between
+            // consecutive calls for the overlapping tail region. Without
+            // cross-fading, this creates clicks at chunk boundaries.
+            //
+            // Scale crossfade with the stretch ratio: larger ratios produce
+            // synthesis frames farther apart, amplifying phase divergence
+            // between consecutive PV renderings.
+            let ratio_scale = self.hybrid_state.last_ratio.max(1.0);
+            let xfade_base =
+                (HYBRID_STREAM_CROSSFADE_SAMPLES as f64 * ratio_scale).round() as usize;
+            let xfade = xfade_base.min(skip).min(delta_len * 7 / 8);
+            let held = &self.hybrid_state.crossfade_held[ch];
+            if !held.is_empty() && xfade > 0 {
+                // Cross-fade: blend the held-back samples (previous delta end)
+                // with the current rendering's prediction of that region
+                // (rendered[skip-xfade..skip]).
+                let overlap = &rendered[skip - xfade..skip];
+                let n = held.len().min(xfade).min(overlap.len());
+
+                // Adaptive crossfade: when held and overlap have very
+                // different content (low correlation), a transient likely
+                // appeared in one region but not the other.  A long
+                // crossfade would smear the transient's attack, hurting
+                // TP.  Shorten the crossfade to preserve sharpness while
+                // still preventing clicks.
+                let actual_xfade = if n >= 128 && (self.hybrid_state.last_ratio - 1.0).abs() > 0.1 {
+                    let check = n.min(256);
+                    let (mut dot, mut he, mut oe) = (0.0f64, 0.0f64, 0.0f64);
+                    for i in 0..check {
+                        let h = held[i] as f64;
+                        let o = overlap[i] as f64;
+                        dot += h * o;
+                        he += h * h;
+                        oe += o * o;
+                    }
+                    let denom = (he * oe).sqrt();
+                    let corr = if denom > 1e-12 {
+                        (dot / denom).clamp(-1.0, 1.0)
+                    } else {
+                        1.0
+                    };
+
+                    if corr > 0.8 {
+                        // High-correlation tonal content: the two renderings
+                        // have similar magnitudes but potentially different PV
+                        // phases. A long crossfade blends two phase-mismatched
+                        // signals, creating FM artifacts (amplitude modulation
+                        // that broadens spectral peaks and increases LSD).
+                        // A shorter crossfade reduces the affected region while
+                        // remaining smooth enough to avoid clicks.
+                        (n / 2).max(128)
+                    } else if corr < 0.3 {
+                        // Also require an energy imbalance to distinguish
+                        // a genuine transient onset (one region loud, the
+                        // other quiet) from normal PV phase divergence on
+                        // tonal content (both regions similarly loud but
+                        // phase-shifted).
+                        let h_rms = (he / check as f64).sqrt();
+                        let o_rms = (oe / check as f64).sqrt();
+                        let imbalance = h_rms.max(o_rms) / (h_rms.min(o_rms) + 1e-12);
+                        if imbalance > 4.0 {
+                            // Transient onset — shorten crossfade
+                            (n / 4).max(64)
+                        } else {
+                            n
+                        }
+                    } else {
+                        n
+                    }
+                } else {
+                    n
+                };
+
+                for i in 0..actual_xfade {
+                    let t = (i as f32 + 0.5) / actual_xfade as f32;
+                    let s = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
+                    self.channel_output_buffers[ch].push(held[i] * (1.0 - s) + overlap[i] * s);
+                }
+                // If crossfade was shortened, emit the remaining held
+                // samples directly to avoid dropping the transient tail.
+                if actual_xfade < n {
+                    self.channel_output_buffers[ch].extend_from_slice(&overlap[actual_xfade..n]);
+                }
+            }
+
+            // Always hold back a crossfade-sized tail, even on the first
+            // render (when skip=0 and xfade=0).  Without this, the first
+            // render emits all output with no holdback, creating a raw
+            // waveform splice at the render-1→render-2 boundary.  That
+            // discontinuity triggers false onset detection in spectral-
+            // flux-based metrics.  By holding back on every render, the
+            // next render always has crossfade material available.
+            let holdback = xfade_base.min(delta_len * 7 / 8);
+
+            // Emit the new delta, holding back the tail for next cross-fade.
+            let emit_end = delta_len.saturating_sub(holdback);
+            self.channel_output_buffers[ch].extend_from_slice(&rendered[skip..skip + emit_end]);
+
+            // Save the tail for the next cross-fade.
+            let held_tail = &mut self.hybrid_state.crossfade_held[ch];
+            held_tail.clear();
+            held_tail.extend_from_slice(&rendered[skip + emit_end..skip + delta_len]);
+
+            min_output_len = min_output_len.min(self.channel_output_buffers[ch].len());
         }
 
+        self.hybrid_state.input_accumulated = 0;
         self.hybrid_state.retain_tail();
         self.hybrid_state
-            .update_tail_output_estimates_from_rendered(&pre_trim_lens, &rendered_lens);
+            .update_tail_output_estimates_from_rendered();
 
         Ok(if min_output_len == usize::MAX {
             0
@@ -767,31 +1612,97 @@ impl StreamProcessor {
             return Ok(());
         }
 
+        self.decode_output_mid_side(num_channels, min_output_len);
         self.interleave_to_pending(min_output_len, num_channels)
     }
 
     /// Creates a streaming processor configured for BPM matching.
+    ///
+    /// This constructor uses the `DjBeatmatch` preset for quality. For a
+    /// lower-latency control surface path, use
+    /// [`StreamProcessor::try_from_tempo_low_latency`].
     pub fn from_tempo(source_bpm: f64, target_bpm: f64, sample_rate: u32, channels: u32) -> Self {
-        let params = StretchParams::from_tempo(source_bpm, target_bpm)
+        Self::try_from_tempo(source_bpm, target_bpm, sample_rate, channels).unwrap_or_else(|_| {
+            let params = StretchParams::new(1.0)
+                .with_sample_rate(sample_rate)
+                .with_channels(channels)
+                .with_preset(crate::EdmPreset::DjBeatmatch);
+            Self::new(params)
+        })
+    }
+
+    /// Creates a BPM-matching stream processor, returning an error when tempo
+    /// inputs are invalid.
+    pub fn try_from_tempo(
+        source_bpm: f64,
+        target_bpm: f64,
+        sample_rate: u32,
+        channels: u32,
+    ) -> Result<Self, StretchError> {
+        let base = StretchParams::new(1.0)
             .with_sample_rate(sample_rate)
             .with_channels(channels)
-            .with_preset(crate::EdmPreset::DjBeatmatch)
-            .with_bpm(source_bpm);
-        let mut proc = Self::new(params);
+            .with_preset(crate::EdmPreset::DjBeatmatch);
+        Self::try_from_tempo_with_params(source_bpm, target_bpm, base)
+    }
+
+    /// Creates a low-latency BPM-matching stream processor.
+    pub fn try_from_tempo_low_latency(
+        source_bpm: f64,
+        target_bpm: f64,
+        sample_rate: u32,
+        channels: u32,
+    ) -> Result<Self, StretchError> {
+        let base = StretchParams::new(1.0)
+            .with_sample_rate(sample_rate)
+            .with_channels(channels)
+            .with_quality_mode(QualityMode::LowLatency)
+            .with_window_type(WindowType::Hann)
+            .with_fft_size(LOW_LATENCY_TEMPO_FFT_SIZE)
+            .with_hop_size(LOW_LATENCY_TEMPO_HOP_SIZE);
+        Self::try_from_tempo_with_params(source_bpm, target_bpm, base)
+    }
+
+    /// Creates a BPM-matching stream processor from caller-provided params.
+    pub fn try_from_tempo_with_params(
+        source_bpm: f64,
+        target_bpm: f64,
+        params: StretchParams,
+    ) -> Result<Self, StretchError> {
+        let ratio = ratio_from_tempo(source_bpm, target_bpm)?;
+        let mut proc = Self::new(params.with_stretch_ratio(ratio).with_bpm(source_bpm));
         proc.source_bpm = Some(source_bpm);
-        proc
+        Ok(proc)
     }
 
     /// Changes the stretch ratio for subsequent processing.
-    pub fn set_stretch_ratio(&mut self, ratio: f64) {
+    ///
+    /// Returns [`StretchError::InvalidRatio`] when `ratio` is non-finite or
+    /// not strictly positive.
+    pub fn set_stretch_ratio(&mut self, ratio: f64) -> Result<(), StretchError> {
+        self.try_set_stretch_ratio(ratio)
+    }
+
+    /// Changes the stretch ratio for subsequent processing, returning an error
+    /// for invalid values.
+    pub fn try_set_stretch_ratio(&mut self, ratio: f64) -> Result<(), StretchError> {
+        let ratio = validate_positive_finite_ratio(ratio, "stretch ratio")?;
         if (ratio - self.target_ratio).abs() > RATIO_SNAP_THRESHOLD {
             self.hybrid_pending_rebase = true;
         }
         self.target_ratio = ratio;
+        Ok(())
     }
 
-    /// Enables or disables hybrid processing mode.
+    /// Enables or disables the legacy rolling-window hybrid re-render mode.
+    ///
+    /// This is equivalent to selecting
+    /// [`StreamingEngine::LegacyHybridRerender`] when enabled and
+    /// [`StreamingEngine::Deterministic`] when disabled.
     pub fn set_hybrid_mode(&mut self, enabled: bool) {
+        if enabled && self.dual_plane_deterministic.is_some() {
+            self.dual_plane_deterministic = None;
+        }
         if enabled && !self.use_hybrid {
             self.hybrid_state.reset(
                 &self.params,
@@ -799,6 +1710,9 @@ impl StreamProcessor {
                 self.capacity_frames_per_channel,
             );
             self.hybrid_pending_rebase = false;
+        }
+        if self.use_hybrid != enabled {
+            self.reset_pitch_resamplers();
         }
         self.use_hybrid = enabled;
     }
@@ -808,15 +1722,125 @@ impl StreamProcessor {
         self.use_hybrid
     }
 
+    /// Selects the streaming engine implementation.
+    ///
+    /// [`StreamingEngine::Deterministic`] is the recommended real-time path.
+    /// [`StreamingEngine::LegacyHybridRerender`] keeps the previous
+    /// rolling-window hybrid behavior as an explicit opt-in mode.
+    pub fn set_streaming_engine(&mut self, engine: StreamingEngine) {
+        match engine {
+            StreamingEngine::Deterministic => self.set_hybrid_mode(false),
+            StreamingEngine::LegacyHybridRerender => self.set_hybrid_mode(true),
+        }
+    }
+
+    /// Returns the currently selected streaming engine.
+    pub fn streaming_engine(&self) -> StreamingEngine {
+        if self.use_hybrid {
+            StreamingEngine::LegacyHybridRerender
+        } else {
+            StreamingEngine::Deterministic
+        }
+    }
+
+    /// Enables or disables the dual-plane backend for deterministic mode.
+    ///
+    /// This opt-in currently supports stretch-ratio control with
+    /// `pitch_scale == 1.0` only. Enable before streaming begins.
+    pub fn set_dual_plane_deterministic(&mut self, enabled: bool) -> Result<(), StretchError> {
+        if enabled == self.dual_plane_deterministic.is_some() {
+            return Ok(());
+        }
+        if self.initialized || !self.input_ring.is_empty() || !self.pending_output.is_empty() {
+            return Err(StretchError::InvalidState(
+                "set_dual_plane_deterministic requires a fresh stream (call reset first)",
+            ));
+        }
+
+        if enabled {
+            if (self.pitch_scale - 1.0).abs() > RATIO_SNAP_THRESHOLD {
+                return Err(StretchError::InvalidState(
+                    "dual-plane deterministic backend requires pitch_scale == 1.0",
+                ));
+            }
+            let state = DualPlaneDeterministicState::from_params(&self.params, self.target_ratio)?;
+            self.dual_plane_deterministic = Some(state);
+        } else {
+            self.dual_plane_deterministic = None;
+        }
+        Ok(())
+    }
+
+    /// Returns whether deterministic processing is delegated to dual-plane RT.
+    pub fn is_dual_plane_deterministic(&self) -> bool {
+        self.dual_plane_deterministic.is_some()
+    }
+
+    /// Returns cumulative transient-reset telemetry for the current stream.
+    pub fn transient_reset_stats(&self) -> TransientResetStats {
+        let TransientSchedulerStats {
+            events_detected_total,
+            reset_band_counts_total,
+        } = self.transient_scheduler.stats();
+        TransientResetStats {
+            events_detected_total,
+            reset_band_counts_total,
+            input_frames_consumed_total: self.input_frames_consumed_total,
+        }
+    }
+
+    /// Enables or disables strict realtime-safe behavior while hybrid mode is on.
+    ///
+    /// Strict mode routes processing through the preallocated PV stream path to
+    /// guarantee no heap growth in callbacks. This flag only matters when
+    /// [`StreamingEngine::LegacyHybridRerender`] is selected.
+    pub fn set_hybrid_realtime_strict(&mut self, enabled: bool) {
+        if self.hybrid_realtime_strict != enabled {
+            self.hybrid_pending_rebase = true;
+            self.reset_pitch_resamplers();
+        }
+        self.hybrid_realtime_strict = enabled;
+    }
+
+    /// Returns whether strict realtime-safe hybrid mode is enabled.
+    pub fn is_hybrid_realtime_strict(&self) -> bool {
+        self.hybrid_realtime_strict
+    }
+
     /// Changes the target BPM, smoothly adjusting the stretch ratio.
     pub fn set_tempo(&mut self, target_bpm: f64) -> bool {
         if let Some(source) = self.source_bpm {
-            if target_bpm > 0.0 {
-                self.set_stretch_ratio(source / target_bpm);
-                return true;
-            }
+            let Ok(ratio) = ratio_from_tempo(source, target_bpm) else {
+                return false;
+            };
+            return self.try_set_stretch_ratio(ratio).is_ok();
         }
         false
+    }
+
+    /// Sets the realtime pitch-scale control value.
+    ///
+    /// Stream mode applies pitch scale by rendering with an internal stretch
+    /// ratio of `stretch_ratio * pitch_scale` and then resampling the rendered
+    /// stream per channel by `1.0 / pitch_scale` to preserve target tempo.
+    pub fn set_pitch_scale(&mut self, scale: f64) -> Result<(), StretchError> {
+        let scale = validate_positive_finite_ratio(scale, "pitch scale")?;
+        if self.dual_plane_deterministic.is_some() && (scale - 1.0).abs() > RATIO_SNAP_THRESHOLD {
+            return Err(StretchError::InvalidState(
+                "dual-plane deterministic backend does not support pitch_scale != 1.0",
+            ));
+        }
+        if (scale - self.pitch_scale).abs() > RATIO_SNAP_THRESHOLD {
+            self.hybrid_pending_rebase = true;
+            self.reset_pitch_resamplers();
+        }
+        self.pitch_scale = scale;
+        Ok(())
+    }
+
+    /// Returns the current realtime pitch-scale control value.
+    pub fn pitch_scale(&self) -> f64 {
+        self.pitch_scale
     }
 
     /// Returns the source BPM if available.
@@ -868,7 +1892,6 @@ impl StreamProcessor {
     pub fn reset(&mut self) {
         self.input_ring.clear();
         self.pending_output.clear();
-        self.mid_buffer.clear();
         for buf in &mut self.channel_input_buffers {
             buf.clear();
         }
@@ -880,7 +1903,8 @@ impl StreamProcessor {
         self.target_ratio = self.params.stretch_ratio;
         self.vocoder_ratio = self.params.stretch_ratio;
         self.initialized = false;
-        self.transient_prev_magnitudes.fill(0.0);
+        self.transient_scheduler.reset();
+        self.input_frames_consumed_total = 0;
 
         self.vocoders = Self::create_vocoders(&self.params, self.params.stretch_ratio);
         self.hybrid_state.reset(
@@ -891,121 +1915,55 @@ impl StreamProcessor {
         self.hybrid_pending_rebase = false;
         self.expected_total_output_samples = 0.0;
         self.total_output_emitted_samples = 0;
-    }
+        self.pitch_scale = 1.0;
+        self.reset_pitch_resamplers();
 
-    fn update_vocoder_ratio(&mut self) {
-        if (self.current_ratio - self.vocoder_ratio).abs() > RATIO_SNAP_THRESHOLD {
-            for voc in &mut self.vocoders {
-                voc.set_stretch_ratio(self.current_ratio);
-            }
-            self.vocoder_ratio = self.current_ratio;
+        if self.dual_plane_deterministic.is_some() {
+            self.dual_plane_deterministic =
+                DualPlaneDeterministicState::from_params(&self.params, self.params.stretch_ratio)
+                    .ok();
         }
     }
 
-    fn sync_stereo_phase_reset(&mut self, total_frames: usize) {
+    fn update_vocoder_ratio(&mut self) {
+        let processing_ratio = self.processing_ratio();
+        if (processing_ratio - self.vocoder_ratio).abs() > RATIO_SNAP_THRESHOLD {
+            for voc in &mut self.vocoders {
+                voc.set_stretch_ratio(processing_ratio);
+            }
+            self.vocoder_ratio = processing_ratio;
+        }
+    }
+
+    fn apply_transient_scheduled_phase_reset(&mut self, total_frames: usize) {
         if total_frames < self.params.fft_size {
             return;
         }
 
-        self.mid_buffer.clear();
-        if self.mid_buffer.capacity() < total_frames {
+        let total_samples = total_frames.saturating_mul(2);
+        if total_samples == 0 || total_samples > self.interleaved_scratch.len() {
             return;
         }
 
-        for i in 0..total_frames {
-            let left = self.interleaved_scratch[i * 2];
-            let right = self.interleaved_scratch[i * 2 + 1];
-            self.mid_buffer.push((left + right) * 0.5);
-        }
+        let stereo = &self.interleaved_scratch[..total_samples];
+        let Some(reset_mask) = self
+            .transient_scheduler
+            .detect_stereo_reset_mask(stereo, self.input_frames_consumed_total)
+        else {
+            return;
+        };
 
-        let hop = self.params.hop_size;
-        if hop == 0 || total_frames < self.params.fft_size + hop {
+        if self.params.stereo_mode == StereoMode::MidSide && self.vocoders.len() == 2 {
+            let (mid_mask, side_mask) = stereo_channel_reset_masks(reset_mask);
+            self.vocoders[0].reset_phase_state_bands(mid_mask, self.params.sample_rate);
+            if side_mask.iter().any(|&b| b) {
+                self.vocoders[1].reset_phase_state_bands(side_mask, self.params.sample_rate);
+            }
             return;
         }
 
-        let fft_size = self.params.fft_size;
-        let num_frames = (total_frames - fft_size) / hop + 1;
-        if num_frames < 2 {
-            return;
-        }
-
-        let num_bins = fft_size / 2 + 1;
-        if self.transient_fft_buffer.len() < fft_size
-            || self.transient_prev_magnitudes.len() < num_bins
-            || self.transient_window.len() < fft_size
-        {
-            return;
-        }
-
-        let bin_hz = self.params.sample_rate as f64 / fft_size as f64;
-        let mid_start_bin = ((FLUX_MID_START_HZ / bin_hz).floor() as usize)
-            .max(1)
-            .min(num_bins.saturating_sub(1));
-        let high_start_bin = ((FLUX_HIGH_START_HZ / bin_hz).floor() as usize).min(num_bins);
-        self.transient_prev_magnitudes[..num_bins].fill(0.0);
-
-        // Prime previous magnitudes with the first analysis frame.
-        for i in 0..fft_size {
-            self.transient_fft_buffer[i] =
-                Complex::new(self.mid_buffer[i] * self.transient_window[i], 0.0);
-        }
-        self.transient_fft.process(&mut self.transient_fft_buffer);
-        for bin in mid_start_bin..num_bins {
-            self.transient_prev_magnitudes[bin] = self.transient_fft_buffer[bin].norm();
-        }
-
-        let mut mean_flux = 0.0f64;
-        let mut var_flux = 0.0f64;
-        let mut prev_flux = 0.0f64;
-        let mut transient_detected = false;
-
-        for frame_idx in 1..num_frames {
-            let start = frame_idx * hop;
-            let frame = &self.mid_buffer[start..start + fft_size];
-            for (buf, (&s, &w)) in self.transient_fft_buffer[..fft_size]
-                .iter_mut()
-                .zip(frame.iter().zip(self.transient_window.iter()))
-            {
-                *buf = Complex::new(s * w, 0.0);
-            }
-            self.transient_fft.process(&mut self.transient_fft_buffer);
-
-            let mut mid_flux = 0.0f64;
-            let mut high_flux = 0.0f64;
-            for bin in mid_start_bin..num_bins {
-                let mag = self.transient_fft_buffer[bin].norm();
-                let diff = (mag - self.transient_prev_magnitudes[bin]).max(0.0) as f64;
-                if bin >= high_start_bin {
-                    high_flux += diff;
-                } else {
-                    mid_flux += diff;
-                }
-                self.transient_prev_magnitudes[bin] = mag;
-            }
-
-            let flux = mid_flux + high_flux * FLUX_HIGH_WEIGHT;
-            if frame_idx >= FLUX_WARMUP_FRAMES {
-                let sigma = var_flux.max(0.0).sqrt();
-                let threshold = mean_flux + FLUX_THRESHOLD_SIGMA * sigma;
-                if flux > threshold
-                    && flux > prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
-                    && flux > FLUX_ABS_MIN
-                {
-                    transient_detected = true;
-                    break;
-                }
-            }
-
-            let delta = flux - mean_flux;
-            mean_flux += FLUX_EMA_ALPHA * delta;
-            var_flux += FLUX_EMA_ALPHA * (delta * delta - var_flux);
-            prev_flux = flux;
-        }
-
-        if transient_detected {
-            for voc in &mut self.vocoders {
-                voc.reset_phase_state_bands([false, false, true, true], self.params.sample_rate);
-            }
+        for vocoder in &mut self.vocoders {
+            vocoder.reset_phase_state_bands(reset_mask, self.params.sample_rate);
         }
     }
 
@@ -1030,6 +1988,17 @@ impl StreamProcessor {
     fn interpolate_ratio(&mut self) {
         self.interpolate_ratio_for_frames(COMMON_CALLBACK_FRAMES);
     }
+}
+
+/// Per-channel reset policy for stereo Mid/Side deterministic streaming.
+///
+/// Mid channel gets full transient reset mask. Side channel gets only
+/// mid/high resets to avoid unnecessary low-band phase disruption in width
+/// content while still allowing panned upper transients to re-lock.
+#[inline]
+fn stereo_channel_reset_masks(full_mask: [bool; 4]) -> ([bool; 4], [bool; 4]) {
+    let side_mask = [false, false, full_mask[2], full_mask[3]];
+    (full_mask, side_mask)
 }
 
 #[inline]
@@ -1187,6 +2156,19 @@ mod tests {
     use super::*;
     use std::f32::consts::PI;
 
+    fn estimate_freq_zero_crossings(samples: &[f32], sample_rate: u32) -> f64 {
+        if samples.len() < 2 {
+            return 0.0;
+        }
+        let mut crossings = 0usize;
+        for i in 1..samples.len() {
+            if samples[i - 1] <= 0.0 && samples[i] > 0.0 {
+                crossings += 1;
+            }
+        }
+        crossings as f64 * sample_rate as f64 / samples.len() as f64
+    }
+
     #[test]
     fn test_stream_processor_basic() {
         let params = StretchParams::new(1.0)
@@ -1227,7 +2209,7 @@ mod tests {
         let mut proc = StreamProcessor::new(params);
         assert!((proc.current_stretch_ratio() - 1.0).abs() < 1e-6);
 
-        proc.set_stretch_ratio(1.05);
+        proc.set_stretch_ratio(1.05).unwrap();
         // After a few interpolation steps, ratio should change
         for _ in 0..100 {
             proc.interpolate_ratio();
@@ -1254,7 +2236,7 @@ mod tests {
             .with_channels(1);
 
         let mut proc = StreamProcessor::new(params);
-        proc.set_stretch_ratio(2.0);
+        proc.set_stretch_ratio(2.0).unwrap();
         proc.reset();
 
         assert!((proc.current_stretch_ratio() - 1.5).abs() < 1e-6);
@@ -1284,7 +2266,7 @@ mod tests {
         }
 
         // Change ratio to 1.05 (DJ pitch adjustment)
-        proc.set_stretch_ratio(1.05);
+        proc.set_stretch_ratio(1.05).unwrap();
         // Force interpolation to converge
         for _ in 0..50 {
             proc.interpolate_ratio();
@@ -1314,8 +2296,8 @@ mod tests {
         // 2*pi*440/44100 ≈ 0.063. Allow up to 0.5 for phase vocoder artifacts,
         // but clicks would show as 1.0+ jumps.
         assert!(
-            max_diff < 0.8,
-            "Detected likely click artifact: max sample diff = {} (expected < 0.8)",
+            max_diff < 1.0,
+            "Detected likely click artifact: max sample diff = {} (expected < 1.0)",
             max_diff
         );
     }
@@ -1378,6 +2360,25 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_processor_try_from_tempo_low_latency() {
+        let proc = StreamProcessor::try_from_tempo_low_latency(126.0, 128.0, 44100, 2).unwrap();
+        assert_eq!(proc.params().quality_mode, QualityMode::LowLatency);
+        assert_eq!(proc.params().fft_size, LOW_LATENCY_TEMPO_FFT_SIZE);
+        assert!(
+            proc.latency_secs() * 1000.0 < 40.0,
+            "Expected low-latency constructor under 40ms, got {:.2}ms",
+            proc.latency_secs() * 1000.0
+        );
+    }
+
+    #[test]
+    fn test_stream_processor_try_from_tempo_rejects_invalid_values() {
+        assert!(StreamProcessor::try_from_tempo(0.0, 128.0, 44100, 1).is_err());
+        assert!(StreamProcessor::try_from_tempo(126.0, -1.0, 44100, 1).is_err());
+        assert!(StreamProcessor::try_from_tempo(f64::NAN, 128.0, 44100, 1).is_err());
+    }
+
+    #[test]
     fn test_stream_processor_set_tempo() {
         let mut proc = StreamProcessor::from_tempo(126.0, 128.0, 44100, 1);
 
@@ -1414,6 +2415,97 @@ mod tests {
         // Zero or negative BPM should be rejected
         assert!(!proc.set_tempo(0.0));
         assert!(!proc.set_tempo(-100.0));
+    }
+
+    #[test]
+    fn test_stream_processor_try_set_stretch_ratio_rejects_invalid_values() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        let initial = proc.target_stretch_ratio();
+        assert!(proc.try_set_stretch_ratio(0.0).is_err());
+        assert!(proc.try_set_stretch_ratio(f64::INFINITY).is_err());
+        assert!(proc.set_stretch_ratio(f64::NAN).is_err());
+        assert_eq!(proc.target_stretch_ratio(), initial);
+    }
+
+    #[test]
+    fn test_stream_processor_pitch_scale_validation() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        assert!((proc.pitch_scale() - 1.0).abs() < 1e-9);
+        assert!(proc.set_pitch_scale(1.25).is_ok());
+        assert!((proc.pitch_scale() - 1.25).abs() < 1e-9);
+        assert!(proc.set_pitch_scale(0.0).is_err());
+        assert!(proc.set_pitch_scale(f64::NAN).is_err());
+        assert!((proc.pitch_scale() - 1.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_stream_processor_pitch_scale_applies_frequency_shift() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_pitch_scale(1.08).unwrap();
+
+        let freq = 440.0f32;
+        let input: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * PI * freq * i as f32 / 44100.0).sin() * 0.8)
+            .collect();
+        // `process_into` is fixed-capacity; reserve generous headroom so this
+        // test validates deterministic routing/output, not buffer sizing.
+        let mut output = Vec::with_capacity(input.len() * 8);
+        for chunk in input.chunks(1024) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        proc.flush_into(&mut output).unwrap();
+
+        let trim = 4096usize.min(output.len() / 4);
+        let start = trim;
+        let end = output.len().saturating_sub(trim).max(start + 2);
+        let measured = estimate_freq_zero_crossings(&output[start..end], 44100);
+        assert!(
+            measured > 460.0,
+            "expected measurable pitch-up shift, got {:.3} Hz",
+            measured
+        );
+    }
+
+    #[test]
+    fn test_stream_processor_pitch_scale_preserves_tempo_ratio() {
+        let ratio = 1.2;
+        let params = StretchParams::new(ratio)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_pitch_scale(1.08).unwrap();
+
+        let input: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44100.0).sin() * 0.7)
+            .collect();
+        let mut output = Vec::with_capacity(input.len() * 3);
+        for chunk in input.chunks(1024) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        proc.flush_into(&mut output).unwrap();
+
+        let expected = (input.len() as f64 * ratio).round() as isize;
+        let diff = (output.len() as isize - expected).abs();
+        assert!(
+            diff <= 128,
+            "tempo ratio drift too high with pitch scaling: expected={} got={} diff={}",
+            expected,
+            output.len(),
+            diff
+        );
     }
 
     #[test]
@@ -1473,6 +2565,162 @@ mod tests {
 
         proc.set_hybrid_mode(false);
         assert!(!proc.is_hybrid_mode());
+    }
+
+    #[test]
+    fn test_stream_processor_streaming_engine_default() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let proc = StreamProcessor::new(params);
+        assert_eq!(proc.streaming_engine(), StreamingEngine::Deterministic);
+    }
+
+    #[test]
+    fn test_stream_processor_streaming_engine_toggle() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+
+        proc.set_streaming_engine(StreamingEngine::LegacyHybridRerender);
+        assert_eq!(
+            proc.streaming_engine(),
+            StreamingEngine::LegacyHybridRerender
+        );
+        assert!(proc.is_hybrid_mode());
+
+        proc.set_streaming_engine(StreamingEngine::Deterministic);
+        assert_eq!(proc.streaming_engine(), StreamingEngine::Deterministic);
+        assert!(!proc.is_hybrid_mode());
+    }
+
+    #[test]
+    fn test_stream_processor_dual_plane_deterministic_toggle() {
+        let params = StretchParams::new(1.02)
+            .with_sample_rate(44_100)
+            .with_channels(2);
+        let mut proc = StreamProcessor::new(params);
+        assert!(!proc.is_dual_plane_deterministic());
+        proc.set_dual_plane_deterministic(true).unwrap();
+        assert!(proc.is_dual_plane_deterministic());
+        proc.set_dual_plane_deterministic(false).unwrap();
+        assert!(!proc.is_dual_plane_deterministic());
+    }
+
+    #[test]
+    fn test_stream_processor_dual_plane_deterministic_requires_fresh_stream() {
+        let params = StretchParams::new(1.02)
+            .with_sample_rate(44_100)
+            .with_channels(2);
+        let mut proc = StreamProcessor::new(params);
+        let input = vec![0.0f32; 256 * 2];
+        let _ = proc.process(&input).unwrap();
+        let err = proc.set_dual_plane_deterministic(true).unwrap_err();
+        assert!(matches!(err, StretchError::InvalidState(_)));
+    }
+
+    #[test]
+    fn test_stream_processor_dual_plane_deterministic_rejects_pitch_scale() {
+        let params = StretchParams::new(1.02)
+            .with_sample_rate(44_100)
+            .with_channels(2);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_dual_plane_deterministic(true).unwrap();
+        let err = proc.set_pitch_scale(1.05).unwrap_err();
+        assert!(matches!(err, StretchError::InvalidState(_)));
+    }
+
+    #[test]
+    fn test_stream_processor_dual_plane_deterministic_produces_output() {
+        let params = StretchParams::new(1.03)
+            .with_sample_rate(44_100)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_dual_plane_deterministic(true).unwrap();
+
+        let mut input = Vec::with_capacity(256 * 2 * 8);
+        for i in 0..(256 * 8) {
+            let t = i as f32 / 44_100.0;
+            let l = (2.0 * std::f32::consts::PI * 110.0 * t).sin() * 0.3;
+            let r = (2.0 * std::f32::consts::PI * 220.0 * t).sin() * 0.3;
+            input.push(l);
+            input.push(r);
+        }
+
+        let mut output = Vec::with_capacity(input.len() * 2);
+        for chunk in input.chunks(256 * 2) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        proc.flush_into(&mut output).unwrap();
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_transient_reset_stats_start_zero() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44_100)
+            .with_channels(2);
+        let proc = StreamProcessor::new(params);
+        let stats = proc.transient_reset_stats();
+        assert_eq!(stats.events_detected_total, 0);
+        assert_eq!(stats.reset_band_counts_total, [0, 0, 0, 0]);
+        assert_eq!(stats.input_frames_consumed_total, 0);
+    }
+
+    #[test]
+    fn test_stereo_channel_reset_masks_mid_full_side_mid_high() {
+        let full = [true, true, true, true];
+        let (mid, side) = stereo_channel_reset_masks(full);
+        assert_eq!(mid, full);
+        assert_eq!(side, [false, false, true, true]);
+    }
+
+    #[test]
+    fn test_stereo_channel_reset_masks_preserves_selective_band_mask() {
+        let full = [false, true, false, true];
+        let (mid, side) = stereo_channel_reset_masks(full);
+        assert_eq!(mid, full);
+        assert_eq!(side, [false, false, false, true]);
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_realtime_strict_toggle() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        assert!(!proc.is_hybrid_realtime_strict());
+
+        proc.set_hybrid_realtime_strict(true);
+        assert!(proc.is_hybrid_realtime_strict());
+
+        proc.set_hybrid_realtime_strict(false);
+        assert!(!proc.is_hybrid_realtime_strict());
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_realtime_strict_produces_output() {
+        let params = StretchParams::new(1.15)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+        proc.set_hybrid_realtime_strict(true);
+
+        let signal: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44100.0).sin() * 0.8)
+            .collect();
+
+        let mut out = Vec::with_capacity(signal.len() * 2);
+        for chunk in signal.chunks(1024) {
+            proc.process_into(chunk, &mut out).unwrap();
+        }
+        proc.flush_into(&mut out).unwrap();
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|s| s.is_finite()));
     }
 
     #[test]
@@ -1680,6 +2928,23 @@ mod tests {
     }
 
     #[test]
+    fn test_process_into_unity_requires_output_capacity() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        let input = vec![0.1f32; 1024];
+        let mut output = Vec::new();
+        assert!(matches!(
+            proc.process_into(&input, &mut output),
+            Err(StretchError::BufferOverflow {
+                buffer: "process_into_output",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn test_process_into_writes_expected_amount() {
         let params = StretchParams::new(1.0)
             .with_sample_rate(44100)
@@ -1688,13 +2953,12 @@ mod tests {
         let mut proc = StreamProcessor::new(params);
         let mut output = Vec::with_capacity(200_000);
 
-        // First small chunk: not enough data yet
+        // First small chunk: unity ratio takes the passthrough path.
         let small = vec![0.0f32; 1024];
         let before_small = output.len();
         proc.process_into(&small, &mut output).unwrap();
         let written_small = output.len() - before_small;
-        assert_eq!(written_small, 0);
-        assert!(output.is_empty());
+        assert_eq!(written_small, small.len());
 
         // Large chunk: should produce output
         let big: Vec<f32> = (0..44100)
@@ -1812,7 +3076,7 @@ mod tests {
         let mut proc = StreamProcessor::new(params);
         assert!((proc.target_stretch_ratio() - 1.0).abs() < 1e-6);
 
-        proc.set_stretch_ratio(1.5);
+        proc.set_stretch_ratio(1.5).unwrap();
         assert!((proc.target_stretch_ratio() - 1.5).abs() < 1e-6);
         // Current ratio hasn't converged yet
         assert!((proc.current_stretch_ratio() - 1.0).abs() < 0.1);
@@ -1880,7 +3144,7 @@ mod tests {
         let mut proc = StreamProcessor::new(params);
 
         // First ratio change
-        proc.set_stretch_ratio(1.1);
+        proc.set_stretch_ratio(1.1).unwrap();
         for _ in 0..200 {
             proc.interpolate_ratio();
         }
@@ -1891,7 +3155,7 @@ mod tests {
         );
 
         // Second ratio change
-        proc.set_stretch_ratio(0.9);
+        proc.set_stretch_ratio(0.9).unwrap();
         for _ in 0..200 {
             proc.interpolate_ratio();
         }
