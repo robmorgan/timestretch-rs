@@ -2815,6 +2815,41 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_processor_dual_plane_unity_passthrough_reengages_after_ratio_roundtrip() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        assert!(proc.is_dual_plane_deterministic());
+
+        let frames = 256usize;
+        let mut input = vec![0.0f32; frames * 2];
+        for i in 0..frames {
+            input[i * 2] = (i as f32 * 0.011).sin() * 0.35;
+            input[i * 2 + 1] = (i as f32 * 0.019).cos() * 0.28;
+        }
+
+        let mut output = Vec::with_capacity(input.len() * 16);
+        proc.set_stretch_ratio(1.35).unwrap();
+        for _ in 0..8 {
+            proc.process_into(&input, &mut output).unwrap();
+        }
+
+        proc.set_stretch_ratio(1.0).unwrap();
+        for _ in 0..300 {
+            proc.interpolate_ratio();
+        }
+
+        let before = output.len();
+        proc.process_into(&input, &mut output).unwrap();
+        let produced = &output[before..];
+        assert_eq!(produced.len(), input.len());
+        assert_eq!(produced, &input[..]);
+    }
+
+    #[test]
     fn test_stream_processor_dual_plane_profile_telemetry_available() {
         let params = StretchParams::new(1.02)
             .with_sample_rate(44_100)

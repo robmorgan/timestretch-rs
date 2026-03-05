@@ -5,6 +5,7 @@
 //! - [`RtProcessor::process_block`]
 //! - [`RtProcessor::flush`]
 
+use crate::core::crossover::LR4Crossover;
 use crate::core::ring_buffer::RingBuffer;
 use crate::core::types::StretchParams;
 use crate::dual_plane::hints::RenderHints;
@@ -248,9 +249,10 @@ pub struct RtProcessor {
     pending_output: RingBuffer<f32>,
     interleaved_scratch: Vec<f32>,
     channel_input: Vec<Vec<f32>>,
+    pv_channel_input: Vec<Vec<f32>>,
+    sub_bass_crossovers: Vec<LR4Crossover>,
     tonal_output: Vec<Vec<f32>>,
     transient_output: Vec<Vec<f32>>,
-    residual_output: Vec<Vec<f32>>,
     transient_mask: Vec<f32>,
     vocoders: Vec<PhaseVocoder>,
     transient_stretchers: Vec<Wsola>,
@@ -271,8 +273,8 @@ pub struct RtProcessor {
     profile_transition_blocks_left: usize,
     current_tier: QualityTier,
     target_tier: QualityTier,
-    blend_weights: [f32; 3],
-    target_weights: [f32; 3],
+    blend_weights: [f32; 2],
+    target_weights: [f32; 2],
     crossfade_blocks_left: usize,
     input_timeline_frames: f64,
     active_ratio: f64,
@@ -394,6 +396,8 @@ impl RtProcessor {
         let initial_profile = config.latency_profile;
         let auto_profile_switching = config.auto_profile_switching;
         let profile_switch_hysteresis_blocks = config.profile_switch_hysteresis_blocks.max(1);
+        let sub_bass_cutoff = config.params.sub_bass_cutoff as f64;
+        let sample_rate = config.params.sample_rate;
 
         let blend = initial_tier.lane_weights();
         Self {
@@ -406,6 +410,12 @@ impl RtProcessor {
             interleaved_scratch: vec![0.0; kernel_samples],
             channel_input: (0..num_channels)
                 .map(|_| Vec::with_capacity(kernel_samples / num_channels))
+                .collect(),
+            pv_channel_input: (0..num_channels)
+                .map(|_| Vec::with_capacity(kernel_samples / num_channels))
+                .collect(),
+            sub_bass_crossovers: (0..num_channels)
+                .map(|_| LR4Crossover::new(sub_bass_cutoff, sample_rate))
                 .collect(),
             tonal_output: (0..num_channels)
                 .map(|_| Vec::with_capacity(max_output_frames))
@@ -798,19 +808,42 @@ impl RtProcessor {
             .saturating_mul(self.num_channels)
     }
 
-    #[inline]
-    fn can_unity_passthrough(&self, input_frames: usize, output_frames_capacity: usize) -> bool {
-        if input_frames == 0 || output_frames_capacity < input_frames {
-            return false;
+    fn reset_state_for_unity_passthrough(&mut self) {
+        self.input_ring.clear();
+        self.pending_output.clear();
+        for out in &mut self.tonal_output {
+            out.clear();
         }
-        if !self.input_ring.is_empty() || !self.pending_output.is_empty() {
+        for out in &mut self.transient_output {
+            out.clear();
+        }
+        for out in &mut self.residual_output {
+            out.clear();
+        }
+        for vocoder in &mut self.vocoders {
+            vocoder.reset_phase_state();
+        }
+    }
+
+    #[inline]
+    fn can_unity_passthrough(&mut self, input_frames: usize, output_frames_capacity: usize) -> bool {
+        if input_frames == 0 || output_frames_capacity < input_frames {
             return false;
         }
 
         let start = self.input_timeline_frames;
         let end = start + input_frames as f64;
         let base_ratio = self.base_ratio_over_range(start, end);
-        (base_ratio - 1.0).abs() <= UNITY_BYPASS_RATIO_EPS
+        if (base_ratio - 1.0).abs() > UNITY_BYPASS_RATIO_EPS {
+            return false;
+        }
+
+        // Re-arm bit-exact passthrough after non-unity runs by dropping any
+        // buffered overlap context when the host returns to unity ratio.
+        if !self.input_ring.is_empty() || !self.pending_output.is_empty() {
+            self.reset_state_for_unity_passthrough();
+        }
+        true
     }
 
     fn set_latency_profile_internal(&mut self, profile: LatencyProfile) {
@@ -1008,11 +1041,26 @@ impl RtProcessor {
             self.active_ratio = ratio;
         }
 
+        // Build PV input: highpass to remove sub-bass, then mask transients.
+        // Sub-bass occupies 1-2 FFT bins at typical sizes; PV smears them.
+        // WSOLA receives the full signal (including sub-bass) since it's
+        // time-domain and handles low frequencies without phase artifacts.
+        // Transient masking prevents phase smearing of percussive content.
+        for ch in 0..self.num_channels {
+            self.pv_channel_input[ch].clear();
+            for frame in 0..frames {
+                let (_low, high) =
+                    self.sub_bass_crossovers[ch].process_sample(self.channel_input[ch][frame]);
+                self.pv_channel_input[ch].push(high);
+            }
+        }
+        self.apply_input_domain_transient_mask(frames, kernel_start_frame);
+
         let mut min_output_len = usize::MAX;
         for ch in 0..self.num_channels {
             self.tonal_output[ch].clear();
             self.vocoders[ch]
-                .process_streaming_into(&self.channel_input[ch], &mut self.tonal_output[ch])?;
+                .process_streaming_into(&self.pv_channel_input[ch], &mut self.tonal_output[ch])?;
             min_output_len = min_output_len.min(self.tonal_output[ch].len());
 
             self.transient_output[ch].clear();
@@ -1067,6 +1115,39 @@ impl RtProcessor {
             }
             let hint_idx = (input_pos - hint_start) as usize;
             self.transient_mask[out_idx] = hint_mask[hint_idx].clamp(0.0, 1.0);
+        }
+    }
+
+    /// Attenuate transient content in `pv_channel_input` using the hint mask
+    /// mapped directly to input-domain frames (no ratio scaling). This prevents
+    /// transient energy from entering the phase vocoder where it would cause
+    /// phase smearing artifacts.
+    fn apply_input_domain_transient_mask(&mut self, input_frames: usize, kernel_start: f64) {
+        if matches!(self.current_tier, QualityTier::Q0) {
+            return;
+        }
+        let hint_mask = &self.hints.transient_mask;
+        if hint_mask.is_empty() {
+            return;
+        }
+        let hint_start = self.hints.at_input_frame as f64;
+        let hint_end = hint_start + hint_mask.len() as f64;
+
+        for frame in 0..input_frames {
+            let input_pos = kernel_start + frame as f64;
+            if input_pos < hint_start || input_pos >= hint_end {
+                continue;
+            }
+            let hint_idx = (input_pos - hint_start) as usize;
+            let mask_val = hint_mask[hint_idx].clamp(0.0, 1.0);
+            if mask_val < 1e-6 {
+                continue;
+            }
+            // Attenuate transient content: multiply by (1 - mask)
+            let scale = 1.0 - mask_val;
+            for ch in 0..self.num_channels {
+                self.pv_channel_input[ch][frame] *= scale;
+            }
         }
     }
 
@@ -1408,6 +1489,52 @@ mod tests {
         rt.process_block(&input, &mut out).unwrap();
 
         assert_eq!(out, input);
+        assert!(rt.input_ring.is_empty());
+        assert!(rt.pending_output.is_empty());
+    }
+
+    #[test]
+    fn unity_passthrough_reengages_after_non_unity_ratio_roundtrip() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut cfg = RtConfig::new(params, 256);
+        cfg.latency_profile = LatencyProfile::Scratch;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let frames = 256usize;
+        let mut left = vec![0.0f32; frames];
+        let mut right = vec![0.0f32; frames];
+        for i in 0..frames {
+            left[i] = (i as f32 * 0.013).sin() * 0.4;
+            right[i] = (i as f32 * 0.017).cos() * 0.3;
+        }
+        let input_refs = [&left[..], &right[..]];
+
+        rt.set_constant_ratio(1.35);
+        for _ in 0..4 {
+            let mut out_left = vec![0.0f32; frames * 4];
+            let mut out_right = vec![0.0f32; frames * 4];
+            let mut output_refs = [&mut out_left[..], &mut out_right[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+        }
+        assert!(
+            !rt.input_ring.is_empty() || !rt.pending_output.is_empty(),
+            "non-unity warmup should leave buffered processing context"
+        );
+
+        rt.set_constant_ratio(1.0);
+        let mut out_left = vec![0.0f32; frames];
+        let mut out_right = vec![0.0f32; frames];
+        let mut output_refs = [&mut out_left[..], &mut out_right[..]];
+        let (consumed, produced) = rt.process(&input_refs, &mut output_refs);
+
+        assert_eq!(consumed, frames);
+        assert_eq!(produced, frames);
+        assert_eq!(out_left, left);
+        assert_eq!(out_right, right);
         assert!(rt.input_ring.is_empty());
         assert!(rt.pending_output.is_empty());
     }
