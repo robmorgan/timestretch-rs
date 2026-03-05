@@ -81,12 +81,14 @@ impl Wsola {
     /// region (`segment_size / 4`) to reduce transient smearing. Larger ratios
     /// use the standard `segment_size / 2` overlap for better continuity.
     pub fn new(segment_size: usize, search_range: usize, stretch_ratio: f64) -> Self {
-        let overlap_size = if (stretch_ratio - 1.0).abs() < 0.15 {
-            segment_size / 4
-        } else {
-            segment_size / 2
-        };
-        let (crossfade_in, crossfade_out) = build_crossfade_tables(overlap_size);
+        let overlap_size = overlap_for_ratio(segment_size, stretch_ratio);
+        let max_overlap = segment_size / 2;
+        let mut crossfade_in = vec![0.0; max_overlap];
+        let mut crossfade_out = vec![0.0; max_overlap];
+        fill_raised_cosine_crossfade(
+            &mut crossfade_in[..overlap_size],
+            &mut crossfade_out[..overlap_size],
+        );
         Self {
             segment_size,
             overlap_size,
@@ -156,23 +158,33 @@ impl Wsola {
     /// use a tighter overlap and farther-from-unity ratios use a longer overlap.
     pub fn set_stretch_ratio(&mut self, stretch_ratio: f64) {
         self.stretch_ratio = stretch_ratio;
-        self.overlap_size = if (stretch_ratio - 1.0).abs() < 0.15 {
-            self.segment_size / 4
-        } else {
-            self.segment_size / 2
-        };
-        let (crossfade_in, crossfade_out) = build_crossfade_tables(self.overlap_size);
-        self.crossfade_in = crossfade_in;
-        self.crossfade_out = crossfade_out;
+        self.overlap_size = overlap_for_ratio(self.segment_size, stretch_ratio);
+        self.rebuild_crossfade_tables();
         if self.equal_power {
             self.set_equal_power_crossfade();
+        }
+    }
+
+    /// Reserves internal overlap-add storage for RT no-growth processing.
+    ///
+    /// This should be called during non-RT setup with worst-case `(input_len, ratio)`.
+    pub fn reserve_output_capacity(&mut self, input_len: usize, max_ratio: f64) {
+        let ratio = max_ratio.max(self.stretch_ratio).max(1.0);
+        let target_output_len = (input_len as f64 * ratio).ceil() as usize;
+        let needed = target_output_len.saturating_add(self.segment_size.saturating_mul(2));
+        if self.output_buf.capacity() < needed {
+            self.output_buf
+                .reserve(needed.saturating_sub(self.output_buf.capacity()));
+        }
+        if self.output_buf.len() < needed {
+            self.output_buf.resize(needed, 0.0);
         }
     }
 
     /// Stretches a mono audio signal using WSOLA.
     pub fn process(&mut self, input: &[f32]) -> Result<Vec<f32>, StretchError> {
         let mut out = Vec::new();
-        self.process_into_internal(input, &mut out, true)?;
+        self.process_into_internal(input, &mut out, true, true)?;
         Ok(out)
     }
 
@@ -185,7 +197,19 @@ impl Wsola {
         input: &[f32],
         output: &mut Vec<f32>,
     ) -> Result<(), StretchError> {
-        self.process_into_internal(input, output, false)
+        self.process_into_internal(input, output, false, true)
+    }
+
+    /// RT-focused variant that never grows internal buffers.
+    ///
+    /// Caller must pre-reserve internal capacity via
+    /// [`Wsola::reserve_output_capacity`].
+    pub fn process_into_no_grow(
+        &mut self,
+        input: &[f32],
+        output: &mut Vec<f32>,
+    ) -> Result<(), StretchError> {
+        self.process_into_internal(input, output, false, false)
     }
 
     fn process_into_internal(
@@ -193,6 +217,7 @@ impl Wsola {
         input: &[f32],
         out: &mut Vec<f32>,
         allow_output_growth: bool,
+        allow_internal_growth: bool,
     ) -> Result<(), StretchError> {
         if self.segment_size == 0 {
             return Err(StretchError::InvalidState("WSOLA segment_size must be > 0"));
@@ -233,6 +258,18 @@ impl Wsola {
 
         // Grow if needed, zero the portion we'll use; never shrink
         let estimated_output_len = target_output_len + self.segment_size * 2;
+        if work.capacity() < estimated_output_len {
+            if allow_internal_growth {
+                work.reserve(estimated_output_len.saturating_sub(work.capacity()));
+            } else {
+                self.output_buf = work;
+                return Err(StretchError::BufferOverflow {
+                    buffer: "wsola_internal_output_buf",
+                    requested: estimated_output_len,
+                    available: self.output_buf.capacity(),
+                });
+            }
+        }
         if work.len() < estimated_output_len {
             work.resize(estimated_output_len, 0.0);
         } else {
@@ -274,6 +311,18 @@ impl Wsola {
 
             // Ensure we have room in the output buffer
             let needed = output_pos + self.segment_size;
+            if needed > work.capacity() {
+                if allow_internal_growth {
+                    work.reserve(needed.saturating_sub(work.capacity()));
+                } else {
+                    self.output_buf = work;
+                    return Err(StretchError::BufferOverflow {
+                        buffer: "wsola_internal_output_buf",
+                        requested: needed,
+                        available: self.output_buf.capacity(),
+                    });
+                }
+            }
             if needed > work.len() {
                 work.resize(needed, 0.0);
             }
@@ -659,23 +708,44 @@ impl Wsola {
                 .copy_from_slice(&input[input_pos + copy_start..input_pos + len]);
         }
     }
+
+    #[inline]
+    fn rebuild_crossfade_tables(&mut self) {
+        if self.overlap_size == 0 {
+            return;
+        }
+        debug_assert!(self.overlap_size <= self.crossfade_in.len());
+        debug_assert!(self.overlap_size <= self.crossfade_out.len());
+        fill_raised_cosine_crossfade(
+            &mut self.crossfade_in[..self.overlap_size],
+            &mut self.crossfade_out[..self.overlap_size],
+        );
+    }
 }
 
-fn build_crossfade_tables(overlap_size: usize) -> (Vec<f32>, Vec<f32>) {
-    let mut fade_in = Vec::with_capacity(overlap_size);
-    let mut fade_out = Vec::with_capacity(overlap_size);
+#[inline]
+fn overlap_for_ratio(segment_size: usize, stretch_ratio: f64) -> usize {
+    if (stretch_ratio - 1.0).abs() < 0.15 {
+        segment_size / 4
+    } else {
+        segment_size / 2
+    }
+}
+
+fn fill_raised_cosine_crossfade(fade_in: &mut [f32], fade_out: &mut [f32]) {
+    debug_assert_eq!(fade_in.len(), fade_out.len());
+    let overlap_size = fade_in.len();
     if overlap_size == 0 {
-        return (fade_in, fade_out);
+        return;
     }
 
     let inv_overlap = 1.0 / overlap_size as f32;
     for i in 0..overlap_size {
         let t = i as f32 * inv_overlap;
         let fi = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
-        fade_in.push(fi);
-        fade_out.push(1.0 - fi);
+        fade_in[i] = fi;
+        fade_out[i] = 1.0 - fi;
     }
-    (fade_in, fade_out)
 }
 
 /// Finds the best correlation candidate using prefix-sum energy normalization.
@@ -1516,5 +1586,42 @@ mod tests {
         let mut out = Vec::with_capacity(8);
         let err = wsola.process_into(&input, &mut out).unwrap_err();
         assert!(matches!(err, StretchError::BufferOverflow { .. }));
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_keeps_crossfade_storage() {
+        let mut wsola = Wsola::new(882, 441, 1.0);
+        let in_ptr = wsola.crossfade_in.as_ptr();
+        let out_ptr = wsola.crossfade_out.as_ptr();
+        let in_cap = wsola.crossfade_in.capacity();
+        let out_cap = wsola.crossfade_out.capacity();
+
+        wsola.set_stretch_ratio(2.0);
+        wsola.set_stretch_ratio(0.75);
+        wsola.set_stretch_ratio(1.0);
+
+        assert_eq!(wsola.crossfade_in.as_ptr(), in_ptr);
+        assert_eq!(wsola.crossfade_out.as_ptr(), out_ptr);
+        assert_eq!(wsola.crossfade_in.capacity(), in_cap);
+        assert_eq!(wsola.crossfade_out.capacity(), out_cap);
+        assert!(wsola.overlap_size <= wsola.crossfade_in.len());
+    }
+
+    #[test]
+    fn test_process_into_no_grow_requires_preallocation() {
+        let mut wsola = Wsola::new(256, 64, 2.0);
+        let input: Vec<f32> = (0..1024).map(|i| ((i as f32) * 0.01).sin()).collect();
+        let mut out = Vec::with_capacity(4096);
+
+        let err = wsola
+            .process_into_no_grow(&input, &mut out)
+            .expect_err("expected internal buffer overflow without pre-reserve");
+        assert!(matches!(err, StretchError::BufferOverflow { .. }));
+
+        wsola.reserve_output_capacity(1024, 2.0);
+        wsola
+            .process_into_no_grow(&input, &mut out)
+            .expect("no-grow should succeed after reserve");
+        assert!(!out.is_empty());
     }
 }

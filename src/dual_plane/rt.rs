@@ -14,11 +14,12 @@ use crate::error::StretchError;
 use crate::stretch::phase_vocoder::PhaseVocoder;
 use crate::stretch::wsola::Wsola;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const CONTROL_QUEUE_CAPACITY: usize = 8;
 const RATIO_SNAP_EPS: f64 = 1e-6;
+const UNITY_BYPASS_RATIO_EPS: f64 = 1e-6;
 
 /// Configuration for the hard-RT processor.
 #[derive(Debug, Clone)]
@@ -167,8 +168,8 @@ pub struct RtProcessor {
     warp_map: Arc<TimeWarpMap>,
     hints: Arc<RenderHints>,
     control: RtControlSender,
-    warp_rx: Receiver<Arc<TimeWarpMap>>,
-    hints_rx: Receiver<Arc<RenderHints>>,
+    warp_rx: Mutex<Receiver<Arc<TimeWarpMap>>>,
+    hints_rx: Mutex<Receiver<Arc<RenderHints>>>,
     governor: QualityGovernor,
     current_tier: QualityTier,
     target_tier: QualityTier,
@@ -268,6 +269,7 @@ impl RtProcessor {
                     transient_search,
                     config.params.stretch_ratio,
                 );
+                wsola.reserve_output_capacity(config.kernel_frames, config.max_ratio);
                 wsola.set_equal_power_crossfade();
                 wsola
             })
@@ -310,8 +312,8 @@ impl RtProcessor {
             warp_map,
             hints,
             control,
-            warp_rx,
-            hints_rx,
+            warp_rx: Mutex::new(warp_rx),
+            hints_rx: Mutex::new(hints_rx),
             governor,
             current_tier: initial_tier,
             target_tier: initial_tier,
@@ -422,6 +424,18 @@ impl RtProcessor {
             .min()
             .unwrap_or(0);
 
+        if self.can_unity_passthrough(input_frames, output_frames_capacity) {
+            for ch in 0..self.num_channels {
+                output_slices[ch][..input_frames]
+                    .copy_from_slice(&input_slices[ch][..input_frames]);
+            }
+            self.input_timeline_frames += input_frames as f64;
+            self.active_ratio = 1.0;
+            let tier = self.governor.observe_block(start.elapsed());
+            self.set_target_tier(tier);
+            return Ok((input_frames, input_frames));
+        }
+
         if input_frames > 0 {
             let needed_samples = input_frames.saturating_mul(self.num_channels);
             if needed_samples > self.interleaved_scratch.len() {
@@ -476,6 +490,27 @@ impl RtProcessor {
         }
         if input.iter().any(|s| !s.is_finite()) {
             return Err(StretchError::NonFiniteInput);
+        }
+
+        let available_output_frames = output
+            .capacity()
+            .saturating_sub(output.len())
+            .saturating_div(self.num_channels.max(1));
+        if self.can_unity_passthrough(self.config.block_frames, available_output_frames) {
+            let available_samples = output.capacity().saturating_sub(output.len());
+            if input.len() > available_samples {
+                return Err(StretchError::BufferOverflow {
+                    buffer: "rt_process_block_output",
+                    requested: input.len(),
+                    available: available_samples,
+                });
+            }
+            output.extend_from_slice(input);
+            self.input_timeline_frames += self.config.block_frames as f64;
+            self.active_ratio = 1.0;
+            let tier = self.governor.observe_block(start.elapsed());
+            self.set_target_tier(tier);
+            return Ok(());
         }
 
         self.push_input_with_overload_policy(input)?;
@@ -549,23 +584,27 @@ impl RtProcessor {
 
             self.transient_output[ch].clear();
             self.transient_stretchers[ch]
-                .process_into(&zero_kernel, &mut self.transient_output[ch])?;
+                .process_into_no_grow(&zero_kernel, &mut self.transient_output[ch])?;
             self.transient_output[ch].clear();
         }
         Ok(())
     }
 
     fn poll_control_updates(&mut self) {
-        loop {
-            match self.warp_rx.try_recv() {
-                Ok(map) => self.warp_map = map,
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        if let Ok(warp_rx) = self.warp_rx.lock() {
+            loop {
+                match warp_rx.try_recv() {
+                    Ok(map) => self.warp_map = map,
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                }
             }
         }
-        loop {
-            match self.hints_rx.try_recv() {
-                Ok(hints) => self.hints = hints,
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        if let Ok(hints_rx) = self.hints_rx.lock() {
+            loop {
+                match hints_rx.try_recv() {
+                    Ok(hints) => self.hints = hints,
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                }
             }
         }
     }
@@ -576,6 +615,21 @@ impl RtProcessor {
             .max_output_frames_per_kernel()
             .max((self.config.block_frames as f64 * self.config.max_ratio).ceil() as usize)
             .saturating_mul(self.num_channels)
+    }
+
+    #[inline]
+    fn can_unity_passthrough(&self, input_frames: usize, output_frames_capacity: usize) -> bool {
+        if input_frames == 0 || output_frames_capacity < input_frames {
+            return false;
+        }
+        if !self.input_ring.is_empty() || !self.pending_output.is_empty() {
+            return false;
+        }
+
+        let start = self.input_timeline_frames;
+        let end = start + input_frames as f64;
+        let base_ratio = self.warp_map.ratio_over_range(start, end);
+        (base_ratio - 1.0).abs() <= UNITY_BYPASS_RATIO_EPS
     }
 
     fn set_target_tier(&mut self, tier: QualityTier) {
@@ -708,7 +762,7 @@ impl RtProcessor {
 
             self.transient_output[ch].clear();
             self.transient_stretchers[ch]
-                .process_into(&self.channel_input[ch], &mut self.transient_output[ch])?;
+                .process_into_no_grow(&self.channel_input[ch], &mut self.transient_output[ch])?;
             min_output_len = min_output_len.min(self.transient_output[ch].len());
         }
         if min_output_len == usize::MAX || min_output_len == 0 {
@@ -1024,5 +1078,58 @@ mod tests {
             rt.process_block(&block, &mut out).unwrap();
         }
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn process_slice_unity_ratio_is_bit_exact_passthrough() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut cfg = RtConfig::new(params, 256);
+        cfg.latency_profile = LatencyProfile::Scratch;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let frames = 256usize;
+        let mut left = vec![0.0f32; frames];
+        let mut right = vec![0.0f32; frames];
+        for i in 0..frames {
+            left[i] = (i as f32 * 0.01).sin() * 0.5;
+            right[i] = (i as f32 * 0.02).cos() * 0.4;
+        }
+        let input_refs = [&left[..], &right[..]];
+
+        let mut out_left = vec![0.0f32; frames];
+        let mut out_right = vec![0.0f32; frames];
+        let mut output_refs = [&mut out_left[..], &mut out_right[..]];
+
+        let (consumed, produced) = rt.process(&input_refs, &mut output_refs);
+        assert_eq!(consumed, frames);
+        assert_eq!(produced, frames);
+        assert_eq!(out_left, left);
+        assert_eq!(out_right, right);
+        assert!(rt.input_ring.is_empty());
+        assert!(rt.pending_output.is_empty());
+    }
+
+    #[test]
+    fn process_block_unity_ratio_is_bit_exact_passthrough() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut cfg = RtConfig::new(params, 256);
+        cfg.latency_profile = LatencyProfile::Scratch;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = stereo_sine_block(256, 48_000, 330.0, 0.37);
+        let mut out = Vec::with_capacity(input.len() + 64);
+        rt.process_block(&input, &mut out).unwrap();
+
+        assert_eq!(out, input);
+        assert!(rt.input_ring.is_empty());
+        assert!(rt.pending_output.is_empty());
     }
 }
