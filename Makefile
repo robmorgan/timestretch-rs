@@ -1,5 +1,5 @@
 MODEL ?= gpt-5.4
-ITERATIONS ?= 5
+ITERATIONS ?= 50
 STATE_DIR ?= .codex-loop
 TEST_CMD ?= cargo test --test dual_plane_rt --test realtime_allocations --test realtime_dj_conditions
 
