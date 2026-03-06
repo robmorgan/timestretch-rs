@@ -221,6 +221,17 @@ pub struct RtProfileTelemetry {
     pub target_tier: QualityTier,
 }
 
+/// Realtime runtime telemetry exported for host integration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RtRuntimeTelemetry {
+    pub input_overflow_events: u64,
+    pub input_dropped_samples: u64,
+    pub output_overflow_events: u64,
+    pub output_dropped_samples: u64,
+    pub quality_demotions_due_to_overload: u64,
+    pub process_error_count: u64,
+}
+
 /// Sender handle for publishing control-plane snapshots without blocking RT.
 #[derive(Clone)]
 pub struct RtControlSender {
@@ -273,6 +284,7 @@ pub struct RtProcessor {
     profile_transition_blocks_left: usize,
     current_tier: QualityTier,
     target_tier: QualityTier,
+    runtime_telemetry: RtRuntimeTelemetry,
     blend_weights: [f32; 2],
     target_weights: [f32; 2],
     crossfade_blocks_left: usize,
@@ -423,9 +435,6 @@ impl RtProcessor {
             transient_output: (0..num_channels)
                 .map(|_| Vec::with_capacity(max_output_frames))
                 .collect(),
-            residual_output: (0..num_channels)
-                .map(|_| Vec::with_capacity(max_output_frames))
-                .collect(),
             transient_mask: vec![0.0; max_output_frames],
             vocoders,
             transient_stretchers,
@@ -446,6 +455,7 @@ impl RtProcessor {
             profile_transition_blocks_left: 0,
             current_tier: initial_tier,
             target_tier: initial_tier,
+            runtime_telemetry: RtRuntimeTelemetry::default(),
             blend_weights: blend,
             target_weights: blend,
             crossfade_blocks_left: 0,
@@ -526,6 +536,11 @@ impl RtProcessor {
         }
     }
 
+    /// Returns cumulative realtime runtime telemetry.
+    pub fn runtime_telemetry(&self) -> RtRuntimeTelemetry {
+        self.runtime_telemetry
+    }
+
     /// Current warp ratio consumed by kernels.
     #[inline]
     pub fn active_ratio(&self) -> f64 {
@@ -559,93 +574,96 @@ impl RtProcessor {
         input_slices: &[&[f32]],
         output_slices: &mut [&mut [f32]],
     ) -> Result<(usize, usize), StretchError> {
-        let start = Instant::now();
-        self.poll_control_updates();
-        self.update_profile_policy();
-        self.advance_profile_transition();
-        self.advance_tier_crossfade();
+        let result = (|| -> Result<(usize, usize), StretchError> {
+            let start = Instant::now();
+            self.poll_control_updates();
+            self.update_profile_policy();
+            self.advance_profile_transition();
+            self.advance_tier_crossfade();
 
-        if input_slices.len() != self.num_channels || output_slices.len() != self.num_channels {
-            return Err(StretchError::InvalidFormat(format!(
-                "process expects {} input and {} output channel slices, got {} and {}",
-                self.num_channels,
-                self.num_channels,
-                input_slices.len(),
-                output_slices.len()
-            )));
-        }
-
-        let input_frames = input_slices.first().map_or(0, |ch| ch.len());
-        if input_frames > self.config.block_frames {
-            return Err(StretchError::InvalidFormat(format!(
-                "process input frame count {} exceeds configured block_frames {}",
-                input_frames, self.config.block_frames
-            )));
-        }
-
-        for (ch, slice) in input_slices.iter().enumerate() {
-            if slice.len() != input_frames {
+            if input_slices.len() != self.num_channels || output_slices.len() != self.num_channels {
                 return Err(StretchError::InvalidFormat(format!(
-                    "channel {} input length {} does not match channel 0 length {}",
-                    ch,
-                    slice.len(),
-                    input_frames
+                    "process expects {} input and {} output channel slices, got {} and {}",
+                    self.num_channels,
+                    self.num_channels,
+                    input_slices.len(),
+                    output_slices.len()
                 )));
             }
-            if slice.iter().any(|s| !s.is_finite()) {
-                return Err(StretchError::NonFiniteInput);
-            }
-        }
 
-        let output_frames_capacity = output_slices
-            .iter()
-            .map(|slice| slice.len())
-            .min()
-            .unwrap_or(0);
-
-        if self.can_unity_passthrough(input_frames, output_frames_capacity) {
-            for ch in 0..self.num_channels {
-                output_slices[ch][..input_frames]
-                    .copy_from_slice(&input_slices[ch][..input_frames]);
-            }
-            self.input_timeline_frames += input_frames as f64;
-            self.active_ratio = 1.0;
-            let tier = self.governor.observe_block(start.elapsed());
-            self.set_target_tier(tier);
-            return Ok((input_frames, input_frames));
-        }
-
-        if input_frames > 0 {
-            let needed_samples = input_frames.saturating_mul(self.num_channels);
-            if needed_samples > self.interleaved_scratch.len() {
-                return Err(StretchError::BufferOverflow {
-                    buffer: "rt_interleaved_input_scratch",
-                    requested: needed_samples,
-                    available: self.interleaved_scratch.len(),
-                });
+            let input_frames = input_slices.first().map_or(0, |ch| ch.len());
+            if input_frames > self.config.block_frames {
+                return Err(StretchError::InvalidFormat(format!(
+                    "process input frame count {} exceeds configured block_frames {}",
+                    input_frames, self.config.block_frames
+                )));
             }
 
-            for frame in 0..input_frames {
-                for ch in 0..self.num_channels {
-                    self.interleaved_scratch[frame * self.num_channels + ch] =
-                        input_slices[ch][frame];
+            for (ch, slice) in input_slices.iter().enumerate() {
+                if slice.len() != input_frames {
+                    return Err(StretchError::InvalidFormat(format!(
+                        "channel {} input length {} does not match channel 0 length {}",
+                        ch,
+                        slice.len(),
+                        input_frames
+                    )));
+                }
+                if slice.iter().any(|s| !s.is_finite()) {
+                    return Err(StretchError::NonFiniteInput);
                 }
             }
 
-            self.push_input_from_scratch_with_overload_policy(needed_samples)?;
+            let output_frames_capacity = output_slices
+                .iter()
+                .map(|slice| slice.len())
+                .min()
+                .unwrap_or(0);
 
-            // Fixed-cost callback kernel: render at most one kernel per call.
-            if self.input_ring.len() >= self.kernel_samples {
-                self.render_fixed_kernel()?;
+            if self.can_unity_passthrough(input_frames, output_frames_capacity) {
+                for ch in 0..self.num_channels {
+                    output_slices[ch][..input_frames]
+                        .copy_from_slice(&input_slices[ch][..input_frames]);
+                }
+                self.input_timeline_frames += input_frames as f64;
+                self.active_ratio = 1.0;
+                let tier = self.governor.observe_block(start.elapsed());
+                self.set_target_tier(tier);
+                return Ok((input_frames, input_frames));
             }
-        }
 
-        let produced_frames =
-            self.drain_pending_to_slices(output_slices, output_frames_capacity)?;
+            if input_frames > 0 {
+                let needed_samples = input_frames.saturating_mul(self.num_channels);
+                if needed_samples > self.interleaved_scratch.len() {
+                    return Err(StretchError::BufferOverflow {
+                        buffer: "rt_interleaved_input_scratch",
+                        requested: needed_samples,
+                        available: self.interleaved_scratch.len(),
+                    });
+                }
 
-        let tier = self.governor.observe_block(start.elapsed());
-        self.set_target_tier(tier);
-        Ok((input_frames, produced_frames))
+                for frame in 0..input_frames {
+                    for ch in 0..self.num_channels {
+                        self.interleaved_scratch[frame * self.num_channels + ch] =
+                            input_slices[ch][frame];
+                    }
+                }
+
+                self.push_input_from_scratch_with_overload_policy(needed_samples)?;
+
+                // Fixed-cost callback kernel: render at most one kernel per call.
+                if self.input_ring.len() >= self.kernel_samples {
+                    self.render_fixed_kernel()?;
+                }
+            }
+
+            let produced_frames =
+                self.drain_pending_to_slices(output_slices, output_frames_capacity)?;
+
+            let tier = self.governor.observe_block(start.elapsed());
+            self.set_target_tier(tier);
+            Ok((input_frames, produced_frames))
+        })();
+        self.record_rt_result(result)
     }
 
     /// Processes one callback block.
@@ -654,91 +672,97 @@ impl RtProcessor {
         input: &[f32],
         output: &mut Vec<f32>,
     ) -> Result<(), StretchError> {
-        let start = Instant::now();
-        self.poll_control_updates();
-        self.update_profile_policy();
-        self.advance_profile_transition();
-        self.advance_tier_crossfade();
+        let result = (|| -> Result<(), StretchError> {
+            let start = Instant::now();
+            self.poll_control_updates();
+            self.update_profile_policy();
+            self.advance_profile_transition();
+            self.advance_tier_crossfade();
 
-        if input.len() != self.block_samples {
-            return Err(StretchError::InvalidFormat(format!(
-                "process_block requires exactly {} samples ({} frames x {} channels), got {}",
-                self.block_samples,
-                self.config.block_frames,
-                self.num_channels,
-                input.len()
-            )));
-        }
-        if input.iter().any(|s| !s.is_finite()) {
-            return Err(StretchError::NonFiniteInput);
-        }
-
-        let available_output_frames = output
-            .capacity()
-            .saturating_sub(output.len())
-            .saturating_div(self.num_channels.max(1));
-        if self.can_unity_passthrough(self.config.block_frames, available_output_frames) {
-            let available_samples = output.capacity().saturating_sub(output.len());
-            if input.len() > available_samples {
-                return Err(StretchError::BufferOverflow {
-                    buffer: "rt_process_block_output",
-                    requested: input.len(),
-                    available: available_samples,
-                });
+            if input.len() != self.block_samples {
+                return Err(StretchError::InvalidFormat(format!(
+                    "process_block requires exactly {} samples ({} frames x {} channels), got {}",
+                    self.block_samples,
+                    self.config.block_frames,
+                    self.num_channels,
+                    input.len()
+                )));
             }
-            output.extend_from_slice(input);
-            self.input_timeline_frames += self.config.block_frames as f64;
-            self.active_ratio = 1.0;
+            if input.iter().any(|s| !s.is_finite()) {
+                return Err(StretchError::NonFiniteInput);
+            }
+
+            let available_output_frames = output
+                .capacity()
+                .saturating_sub(output.len())
+                .saturating_div(self.num_channels.max(1));
+            if self.can_unity_passthrough(self.config.block_frames, available_output_frames) {
+                let available_samples = output.capacity().saturating_sub(output.len());
+                if input.len() > available_samples {
+                    return Err(StretchError::BufferOverflow {
+                        buffer: "rt_process_block_output",
+                        requested: input.len(),
+                        available: available_samples,
+                    });
+                }
+                output.extend_from_slice(input);
+                self.input_timeline_frames += self.config.block_frames as f64;
+                self.active_ratio = 1.0;
+                let tier = self.governor.observe_block(start.elapsed());
+                self.set_target_tier(tier);
+                return Ok(());
+            }
+
+            self.push_input_with_overload_policy(input)?;
+            if self.input_ring.len() >= self.kernel_samples {
+                self.render_fixed_kernel()?;
+            }
+            let max_emit = self.max_output_samples_per_callback();
+            let _ = self.drain_pending_to_output(output, max_emit)?;
+
             let tier = self.governor.observe_block(start.elapsed());
             self.set_target_tier(tier);
-            return Ok(());
-        }
-
-        self.push_input_with_overload_policy(input)?;
-        if self.input_ring.len() >= self.kernel_samples {
-            self.render_fixed_kernel()?;
-        }
-        let max_emit = self.max_output_samples_per_callback();
-        let _ = self.drain_pending_to_output(output, max_emit)?;
-
-        let tier = self.governor.observe_block(start.elapsed());
-        self.set_target_tier(tier);
-        Ok(())
+            Ok(())
+        })();
+        self.record_rt_result(result)
     }
 
     /// Flushes all pending RT state.
     pub fn flush(&mut self, output: &mut Vec<f32>) -> Result<(), StretchError> {
-        self.poll_control_updates();
-        self.update_profile_policy();
-        self.advance_profile_transition();
-        self.advance_tier_crossfade();
+        let result = (|| -> Result<(), StretchError> {
+            self.poll_control_updates();
+            self.update_profile_policy();
+            self.advance_profile_transition();
+            self.advance_tier_crossfade();
 
-        let fft_samples = self
-            .config
-            .params
-            .fft_size
-            .saturating_mul(self.num_channels);
-        while self.input_ring.len() >= self.kernel_samples {
-            self.render_fixed_kernel()?;
-        }
+            let fft_samples = self
+                .config
+                .params
+                .fft_size
+                .saturating_mul(self.num_channels);
+            while self.input_ring.len() >= self.kernel_samples {
+                self.render_fixed_kernel()?;
+            }
 
-        if self.input_ring.len() >= fft_samples && self.input_ring.len() < self.kernel_samples {
-            let need = self.kernel_samples.saturating_sub(self.input_ring.len());
-            self.push_zeros(need)?;
-            self.render_fixed_kernel()?;
-        }
+            if self.input_ring.len() >= fft_samples && self.input_ring.len() < self.kernel_samples {
+                let need = self.kernel_samples.saturating_sub(self.input_ring.len());
+                self.push_zeros(need)?;
+                self.render_fixed_kernel()?;
+            }
 
-        self.flush_tonal_tails_to_pending()?;
-        let _ = self.drain_pending_to_output(output, usize::MAX)?;
+            self.flush_tonal_tails_to_pending()?;
+            let _ = self.drain_pending_to_output(output, usize::MAX)?;
 
-        self.input_ring.clear();
-        self.pending_output.clear();
-        self.input_timeline_frames = 0.0;
-        for vocoder in &mut self.vocoders {
-            vocoder.reset_phase_state();
-        }
+            self.input_ring.clear();
+            self.pending_output.clear();
+            self.input_timeline_frames = 0.0;
+            for vocoder in &mut self.vocoders {
+                vocoder.reset_phase_state();
+            }
 
-        Ok(())
+            Ok(())
+        })();
+        self.record_rt_result(result)
     }
 
     fn prewarm_vocoders(&mut self) -> Result<(), StretchError> {
@@ -817,16 +841,17 @@ impl RtProcessor {
         for out in &mut self.transient_output {
             out.clear();
         }
-        for out in &mut self.residual_output {
-            out.clear();
-        }
         for vocoder in &mut self.vocoders {
             vocoder.reset_phase_state();
         }
     }
 
     #[inline]
-    fn can_unity_passthrough(&mut self, input_frames: usize, output_frames_capacity: usize) -> bool {
+    fn can_unity_passthrough(
+        &mut self,
+        input_frames: usize,
+        output_frames_capacity: usize,
+    ) -> bool {
         if input_frames == 0 || output_frames_capacity < input_frames {
             return false;
         }
@@ -936,7 +961,7 @@ impl RtProcessor {
             return;
         }
         let denom = self.crossfade_blocks_left as f32;
-        for i in 0..3 {
+        for i in 0..2 {
             self.blend_weights[i] += (self.target_weights[i] - self.blend_weights[i]) / denom;
         }
         self.crossfade_blocks_left = self.crossfade_blocks_left.saturating_sub(1);
@@ -947,13 +972,57 @@ impl RtProcessor {
     }
 
     fn force_tier_demote(&mut self) {
+        self.runtime_telemetry.quality_demotions_due_to_overload = self
+            .runtime_telemetry
+            .quality_demotions_due_to_overload
+            .saturating_add(1);
         let next = self.governor.force_demote_once();
         self.set_target_tier(next);
+    }
+
+    #[inline]
+    fn record_input_overflow(&mut self, dropped_samples: usize) {
+        if dropped_samples == 0 {
+            return;
+        }
+        self.runtime_telemetry.input_overflow_events = self
+            .runtime_telemetry
+            .input_overflow_events
+            .saturating_add(1);
+        self.runtime_telemetry.input_dropped_samples = self
+            .runtime_telemetry
+            .input_dropped_samples
+            .saturating_add(dropped_samples as u64);
+    }
+
+    #[inline]
+    fn record_output_overflow(&mut self, dropped_samples: usize) {
+        if dropped_samples == 0 {
+            return;
+        }
+        self.runtime_telemetry.output_overflow_events = self
+            .runtime_telemetry
+            .output_overflow_events
+            .saturating_add(1);
+        self.runtime_telemetry.output_dropped_samples = self
+            .runtime_telemetry
+            .output_dropped_samples
+            .saturating_add(dropped_samples as u64);
+    }
+
+    #[inline]
+    fn record_rt_result<T>(&mut self, result: Result<T, StretchError>) -> Result<T, StretchError> {
+        if result.is_err() {
+            self.runtime_telemetry.process_error_count =
+                self.runtime_telemetry.process_error_count.saturating_add(1);
+        }
+        result
     }
 
     fn push_input_with_overload_policy(&mut self, input: &[f32]) -> Result<(), StretchError> {
         let overflow = input.len().saturating_sub(self.input_ring.available());
         if overflow > 0 {
+            self.record_input_overflow(overflow);
             self.input_ring.discard(overflow);
             self.force_tier_demote();
         }
@@ -981,6 +1050,7 @@ impl RtProcessor {
         }
         let overflow = samples.saturating_sub(self.input_ring.available());
         if overflow > 0 {
+            self.record_input_overflow(overflow);
             self.input_ring.discard(overflow);
             self.force_tier_demote();
         }
@@ -1074,9 +1144,6 @@ impl RtProcessor {
         }
 
         self.build_transient_mask_from_hints(min_output_len, ratio, kernel_start_frame);
-        for ch in 0..self.num_channels {
-            self.render_residual_lane(ch, min_output_len)?;
-        }
 
         let weights = self.effective_lane_weights();
         self.mix_into_pending(min_output_len, weights)?;
@@ -1151,30 +1218,11 @@ impl RtProcessor {
         }
     }
 
-    fn render_residual_lane(&mut self, ch: usize, out_len: usize) -> Result<(), StretchError> {
-        let output = &mut self.residual_output[ch];
-        if output.capacity() < out_len {
-            return Err(StretchError::BufferOverflow {
-                buffer: "rt_residual_lane",
-                requested: out_len,
-                available: output.capacity(),
-            });
-        }
-        output.clear();
-        for idx in 0..out_len {
-            let mut sample = self.transient_output[ch][idx] - self.tonal_output[ch][idx];
-            if (idx & 1) == 1 {
-                sample = -sample;
-            }
-            output.push(sample * 0.5);
-        }
-        Ok(())
-    }
-
-    fn mix_into_pending(&mut self, frames: usize, weights: [f32; 3]) -> Result<(), StretchError> {
+    fn mix_into_pending(&mut self, frames: usize, weights: [f32; 2]) -> Result<(), StretchError> {
         let needed = frames.saturating_mul(self.num_channels);
         let overflow = needed.saturating_sub(self.pending_output.available());
         if overflow > 0 {
+            self.record_output_overflow(overflow);
             self.pending_output.discard(overflow);
             self.force_tier_demote();
         }
@@ -1186,19 +1234,15 @@ impl RtProcessor {
                 .copied()
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0);
-            let transient_w = weights[0] * (0.30 + 0.70 * transient_gate);
+            let transient_w = weights[0] * (0.40 + 0.60 * transient_gate);
             let tonal_w = weights[1] * (1.0 - 0.55 * transient_gate);
-            let residual_w = weights[2] * (0.20 + 0.80 * transient_gate);
-            let norm = (transient_w + tonal_w + residual_w).max(1e-6);
+            let norm = (transient_w + tonal_w).max(1e-6);
             let tw = transient_w / norm;
             let tow = tonal_w / norm;
-            let rw = residual_w / norm;
 
             for ch in 0..self.num_channels {
-                let tonal = self.tonal_output[ch][frame];
-                let transient = self.transient_output[ch][frame];
-                let residual = self.residual_output[ch][frame];
-                let mixed = transient * tw + tonal * tow + residual * rw;
+                let mixed =
+                    self.transient_output[ch][frame] * tw + self.tonal_output[ch][frame] * tow;
                 if !self.pending_output.push(mixed) {
                     return Err(StretchError::InvalidState(
                         "rt pending output rejected push after capacity check",
@@ -1223,6 +1267,7 @@ impl RtProcessor {
         let needed = min_len.saturating_mul(self.num_channels);
         let overflow = needed.saturating_sub(self.pending_output.available());
         if overflow > 0 {
+            self.record_output_overflow(overflow);
             self.pending_output.discard(overflow);
         }
         for frame in 0..min_len {
@@ -1345,7 +1390,7 @@ impl RtProcessor {
         }
     }
 
-    fn effective_lane_weights(&self) -> [f32; 3] {
+    fn effective_lane_weights(&self) -> [f32; 2] {
         let hints = &self.hints;
         let bias = hints.normalized_lane_bias();
         let stem = hints.normalized_stem_lane_confidence();
@@ -1355,23 +1400,18 @@ impl RtProcessor {
             0.0
         };
         let stem_strength = self.config.stem_lane_hint_strength * stem_gate;
-        let noise_conf = hints.noise_confidence.clamp(0.0, 1.0);
         let transient = self.blend_weights[0]
             + 0.20 * hints.transient_confidence.clamp(0.0, 1.0)
             + 0.15 * bias[0]
-            + stem_strength * (0.28 * stem[0] + 0.04 * (1.0 - noise_conf));
+            + stem_strength * 0.28 * stem[0];
         let tonal = self.blend_weights[1]
             + 0.20 * hints.tonal_confidence.clamp(0.0, 1.0)
             + 0.10 * hints.beat_confidence.clamp(0.0, 1.0)
             + 0.10 * bias[1]
             + stem_strength * 0.30 * stem[1];
-        let residual = self.blend_weights[2]
-            + 0.20 * noise_conf
-            + 0.15 * bias[2]
-            + stem_strength * (0.24 * stem[2] + 0.12 * noise_conf);
 
-        let sum = (transient + tonal + residual).max(1e-6);
-        [transient / sum, tonal / sum, residual / sum]
+        let sum = (transient + tonal).max(1e-6);
+        [transient / sum, tonal / sum]
     }
 
     fn consume_kernel_input(&mut self) {
@@ -1392,7 +1432,7 @@ impl RtProcessor {
 
 #[cfg(test)]
 mod tests {
-    use super::{LatencyProfile, QualityTier, RtConfig, RtProcessor};
+    use super::{LatencyProfile, QualityTier, RtConfig, RtProcessor, RtRuntimeTelemetry};
     use crate::core::types::StretchParams;
     use crate::dual_plane::hints::RenderHints;
     use crate::dual_plane::warp_map::TimeWarpMap;
@@ -1539,8 +1579,8 @@ mod tests {
         assert!(rt.pending_output.is_empty());
     }
 
-    fn assert_weights_close(a: [f32; 3], b: [f32; 3], eps: f32) {
-        for idx in 0..3 {
+    fn assert_weights_close(a: [f32; 2], b: [f32; 2], eps: f32) {
+        for idx in 0..2 {
             assert!(
                 (a[idx] - b[idx]).abs() <= eps,
                 "lane weight mismatch at index {idx}: {} vs {} (eps={eps})",
@@ -1776,6 +1816,62 @@ mod tests {
             telemetry.callback_budget,
             LatencyProfile::Scratch.callback_budget()
         );
+    }
+
+    #[test]
+    fn runtime_telemetry_tracks_overflows() {
+        let params = StretchParams::new(1.10)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let cfg = RtConfig::new(params, 128);
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input_fill = rt.input_ring.capacity().saturating_sub(8);
+        let input_prefill = vec![0.0f32; input_fill];
+        assert_eq!(rt.input_ring.push_slice(&input_prefill), input_fill);
+        rt.push_input_with_overload_policy(&[0.0; 16]).unwrap();
+
+        let pending_fill = rt.pending_output.capacity().saturating_sub(1);
+        let pending_prefill = vec![0.0f32; pending_fill];
+        assert_eq!(rt.pending_output.push_slice(&pending_prefill), pending_fill);
+        rt.transient_output[0].clear();
+        rt.tonal_output[0].clear();
+        rt.transient_output[0].extend_from_slice(&[0.25, 0.25]);
+        rt.tonal_output[0].extend_from_slice(&[0.5, 0.5]);
+        rt.transient_mask[0] = 0.0;
+        rt.transient_mask[1] = 0.0;
+        rt.mix_into_pending(2, [0.5, 0.5]).unwrap();
+
+        assert_eq!(
+            rt.runtime_telemetry(),
+            RtRuntimeTelemetry {
+                input_overflow_events: 1,
+                input_dropped_samples: 8,
+                output_overflow_events: 1,
+                output_dropped_samples: 1,
+                quality_demotions_due_to_overload: 2,
+                process_error_count: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_telemetry_tracks_swallowed_process_errors() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let cfg = RtConfig::new(params, 128);
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let bad_inputs: [&[f32]; 0] = [];
+        let mut out = [0.0f32; 128];
+        let mut outputs = [&mut out[..]];
+        assert_eq!(rt.process(&bad_inputs, &mut outputs), (0, 0));
+        assert_eq!(rt.runtime_telemetry().process_error_count, 1);
     }
 
     #[test]

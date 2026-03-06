@@ -35,15 +35,15 @@ impl QualityTier {
         }
     }
 
-    /// Base lane blend weights `[transient, tonal, residual]`.
+    /// Base lane blend weights `[transient, tonal]`.
     #[inline]
-    pub fn lane_weights(self) -> [f32; 3] {
+    pub fn lane_weights(self) -> [f32; 2] {
         match self {
-            QualityTier::Q0 => [0.02, 0.98, 0.0],
-            QualityTier::Q1 => [0.08, 0.90, 0.02],
-            QualityTier::Q2 => [0.14, 0.82, 0.04],
-            QualityTier::Q3 => [0.20, 0.75, 0.05],
-            QualityTier::Q4 => [0.24, 0.70, 0.06],
+            QualityTier::Q0 => [0.02, 0.98],
+            QualityTier::Q1 => [0.10, 0.90],
+            QualityTier::Q2 => [0.16, 0.84],
+            QualityTier::Q3 => [0.22, 0.78],
+            QualityTier::Q4 => [0.28, 0.72],
         }
     }
 }

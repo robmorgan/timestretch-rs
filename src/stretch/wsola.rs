@@ -647,7 +647,7 @@ impl Wsola {
             if advance_output < self.segment_size {
                 (self.segment_size - advance_output).min(overlap_len)
             } else {
-                0
+                overlap_len
             }
         } else {
             overlap_len

@@ -4,7 +4,9 @@ use crate::analysis::transient::{detect_transients_with_options, TransientDetect
 use crate::core::ring_buffer::RingBuffer;
 use crate::core::types::{QualityMode, StretchParams};
 use crate::core::window::WindowType;
-use crate::dual_plane::{DualPlaneProcessor, LatencyProfile, RtConfig, RtProfileTelemetry};
+use crate::dual_plane::{
+    DualPlaneProcessor, LatencyProfile, RtConfig, RtProfileTelemetry, RtRuntimeTelemetry,
+};
 use crate::error::StretchError;
 use crate::stream::transient_scheduler::{TransientEventScheduler, TransientSchedulerStats};
 use crate::stretch::hybrid::HybridStretcher;
@@ -1950,6 +1952,13 @@ impl StreamProcessor {
             .map(|state| state.processor.profile_telemetry())
     }
 
+    /// Returns cumulative deterministic dual-plane runtime telemetry when active.
+    pub fn deterministic_runtime_telemetry(&self) -> Option<RtRuntimeTelemetry> {
+        self.dual_plane_deterministic
+            .as_ref()
+            .map(|state| state.processor.runtime_telemetry())
+    }
+
     /// Returns cumulative transient-reset telemetry for the current stream.
     pub fn transient_reset_stats(&self) -> TransientResetStats {
         let TransientSchedulerStats {
@@ -2859,6 +2868,18 @@ mod tests {
             .deterministic_profile_telemetry()
             .expect("dual-plane telemetry should be available by default");
         assert!(telemetry.auto_switching_enabled);
+    }
+
+    #[test]
+    fn test_stream_processor_dual_plane_runtime_telemetry_available() {
+        let params = StretchParams::new(1.02)
+            .with_sample_rate(44_100)
+            .with_channels(2);
+        let proc = StreamProcessor::new(params);
+        let telemetry = proc
+            .deterministic_runtime_telemetry()
+            .expect("dual-plane runtime telemetry should be available by default");
+        assert_eq!(telemetry, RtRuntimeTelemetry::default());
     }
 
     #[test]

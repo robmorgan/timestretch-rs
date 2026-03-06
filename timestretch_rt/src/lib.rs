@@ -8,5 +8,5 @@
 
 pub use timestretch::dual_plane::{
     DualPlaneProcessor, LatencyProfile, QualityTier, RenderHints, RtConfig, RtControlSender,
-    RtProcessor, TimeWarpMap, WarpAnchor,
+    RtProcessor, RtRuntimeTelemetry, TimeWarpMap, WarpAnchor,
 };
