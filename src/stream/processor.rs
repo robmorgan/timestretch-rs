@@ -504,6 +504,13 @@ impl std::fmt::Debug for StreamProcessor {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FixedProcessInterleavedBudget {
+    num_channels: usize,
+    block_frames: usize,
+    required_samples: usize,
+}
+
 impl StreamProcessor {
     /// Creates a new streaming processor.
     pub fn new(params: StretchParams) -> Self {
@@ -634,6 +641,26 @@ impl StreamProcessor {
         Ok(out)
     }
 
+    /// Returns a deterministic upper bound for fixed-buffer process output.
+    ///
+    /// The returned value is the maximum number of new interleaved samples the
+    /// deterministic fixed-buffer path may need to queue while consuming
+    /// `input_samples` of new input. If `output` in
+    /// [`StreamProcessor::process_interleaved_into`] is at least this large,
+    /// the call will not reject for `stream_process_interleaved_output`
+    /// capacity, regardless of current pending-output depth.
+    ///
+    /// This helper is available when the deterministic dual-plane backend is
+    /// active. The returned sample count is always aligned to whole frames.
+    pub fn max_process_interleaved_output_samples(
+        &mut self,
+        input_samples: usize,
+    ) -> Result<usize, StretchError> {
+        Ok(self
+            .fixed_process_interleaved_budget(input_samples)?
+            .required_samples)
+    }
+
     /// Processes a chunk of deterministic interleaved audio into a fixed buffer.
     ///
     /// Returns the number of interleaved samples written to `output`.
@@ -648,32 +675,11 @@ impl StreamProcessor {
         input: &[f32],
         output: &mut [f32],
     ) -> Result<usize, StretchError> {
-        if self.fixed_flush_pending {
-            return Err(StretchError::InvalidState(
-                "fixed-buffer flush output must be fully drained before new input",
-            ));
-        }
-        if self.use_hybrid {
-            return Err(StretchError::InvalidState(
-                "fixed-buffer processing is unavailable in legacy hybrid mode",
-            ));
-        }
-
-        self.ensure_default_dual_plane_backend();
-        let Some(state_meta) = self.dual_plane_deterministic.as_ref() else {
-            return Err(StretchError::InvalidState(
-                "dual-plane deterministic backend is unavailable",
-            ));
-        };
-        let num_channels = state_meta.num_channels.max(1);
-        let block_frames = state_meta.block_frames;
-        if !input.len().is_multiple_of(num_channels) {
-            return Err(StretchError::InvalidFormat(format!(
-                "input sample count {} is not a multiple of channel count {}",
-                input.len(),
-                num_channels
-            )));
-        }
+        let FixedProcessInterleavedBudget {
+            num_channels,
+            block_frames,
+            required_samples,
+        } = self.fixed_process_interleaved_budget(input.len())?;
         if input.iter().any(|s| !s.is_finite()) {
             return Err(StretchError::NonFiniteInput);
         }
@@ -682,20 +688,11 @@ impl StreamProcessor {
             .len()
             .saturating_div(num_channels)
             .saturating_mul(num_channels);
-        let input_frames = input.len() / num_channels;
-        let mut required_budget = 0usize;
-        let mut remaining_frames = input_frames;
-        while remaining_frames > 0 {
-            let frames = remaining_frames.min(block_frames);
-            required_budget = required_budget
-                .saturating_add(self.max_dual_plane_pending_samples_for_frames(frames)?);
-            remaining_frames -= frames;
-        }
         let available_budget = aligned_capacity.saturating_add(self.pending_output.available());
-        if required_budget > available_budget {
+        if required_samples > available_budget {
             return Err(StretchError::BufferOverflow {
                 buffer: "stream_process_interleaved_output",
-                requested: required_budget,
+                requested: required_samples,
                 available: available_budget,
             });
         }
@@ -1342,6 +1339,51 @@ impl StreamProcessor {
             .min(max_frames);
 
         Ok(bounded_frames.saturating_mul(num_channels))
+    }
+
+    fn fixed_process_interleaved_budget(
+        &mut self,
+        input_samples: usize,
+    ) -> Result<FixedProcessInterleavedBudget, StretchError> {
+        if self.fixed_flush_pending {
+            return Err(StretchError::InvalidState(
+                "fixed-buffer flush output must be fully drained before new input",
+            ));
+        }
+        if self.use_hybrid {
+            return Err(StretchError::InvalidState(
+                "fixed-buffer processing is unavailable in legacy hybrid mode",
+            ));
+        }
+
+        self.ensure_default_dual_plane_backend();
+        let Some(state_meta) = self.dual_plane_deterministic.as_ref() else {
+            return Err(StretchError::InvalidState(
+                "dual-plane deterministic backend is unavailable",
+            ));
+        };
+        let num_channels = state_meta.num_channels.max(1);
+        if !input_samples.is_multiple_of(num_channels) {
+            return Err(StretchError::InvalidFormat(format!(
+                "input sample count {} is not a multiple of channel count {}",
+                input_samples, num_channels
+            )));
+        }
+
+        let mut required_samples = 0usize;
+        let mut remaining_frames = input_samples / num_channels;
+        while remaining_frames > 0 {
+            let frames = remaining_frames.min(state_meta.block_frames);
+            required_samples = required_samples
+                .saturating_add(self.max_dual_plane_pending_samples_for_frames(frames)?);
+            remaining_frames -= frames;
+        }
+
+        Ok(FixedProcessInterleavedBudget {
+            num_channels,
+            block_frames: state_meta.block_frames,
+            required_samples,
+        })
     }
 
     fn process_dual_plane_chunk_to_pending(&mut self, input: &[f32]) -> Result<(), StretchError> {
@@ -3989,6 +4031,67 @@ mod tests {
             }
         ));
         assert_eq!(proc.capacities(), caps_before);
+    }
+
+    #[test]
+    fn test_max_process_interleaved_output_samples_matches_process_capacity_floor() {
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(44_100)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_dual_plane_deterministic(true).unwrap();
+
+        let input = vec![0.0f32; 256 * 2 * 16];
+        let budget = proc
+            .max_process_interleaved_output_samples(input.len())
+            .unwrap();
+        let (_, pending_len, _, pending_cap) = proc.capacities();
+        let min_output = budget.saturating_sub(pending_cap.saturating_sub(pending_len));
+
+        assert!(
+            min_output >= 2,
+            "expected host-visible output floor, got {min_output}"
+        );
+        assert_eq!(budget % 2, 0);
+
+        let caps_before = proc.capacities();
+        let mut too_small = vec![0.0f32; min_output - 2];
+        let err = proc
+            .process_interleaved_into(&input, &mut too_small)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StretchError::BufferOverflow {
+                buffer: "stream_process_interleaved_output",
+                ..
+            }
+        ));
+        assert_eq!(proc.capacities(), caps_before);
+
+        let mut just_enough = vec![0.0f32; min_output];
+        let written = proc
+            .process_interleaved_into(&input, &mut just_enough)
+            .unwrap();
+        assert!(written <= just_enough.len());
+    }
+
+    #[test]
+    fn test_max_process_interleaved_output_samples_rejects_hybrid_mode() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44_100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        let err = proc.max_process_interleaved_output_samples(16).unwrap_err();
+        assert_eq!(
+            err,
+            StretchError::InvalidState(
+                "fixed-buffer processing is unavailable in legacy hybrid mode"
+            )
+        );
     }
 
     #[test]
