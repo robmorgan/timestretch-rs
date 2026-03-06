@@ -119,6 +119,6 @@ Acceptance:
 
 ## Current Implementation Slice
 
-This change set continues Phase 1 by adding a fixed-buffer interleaved callback
-API to the RT core, so hosts no longer have to rely on `Vec` append semantics
-for the small-block dual-plane processing path.
+This change set continues Phase 1 by adding a fixed-buffer interleaved flush
+API to the RT core and dual-plane facade, so end-of-stream drain no longer
+depends on `Vec` append semantics in the deterministic path.

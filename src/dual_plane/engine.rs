@@ -181,6 +181,11 @@ impl DualPlaneProcessor {
         self.rt.flush(output)
     }
 
+    /// Flushes pending RT state into a fixed interleaved output buffer.
+    pub fn flush_into(&mut self, output: &mut [f32]) -> Result<usize, StretchError> {
+        self.rt.flush_into(output)
+    }
+
     pub fn rt(&self) -> &RtProcessor {
         &self.rt
     }

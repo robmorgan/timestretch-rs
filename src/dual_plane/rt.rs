@@ -3,7 +3,9 @@
 //! The callback-facing API is intentionally small:
 //! - [`RtProcessor::prepare`]
 //! - [`RtProcessor::process_block`]
+//! - [`RtProcessor::process_block_into`]
 //! - [`RtProcessor::flush`]
+//! - [`RtProcessor::flush_into`]
 
 use crate::core::crossover::LR4Crossover;
 use crate::core::ring_buffer::RingBuffer;
@@ -307,6 +309,7 @@ pub struct RtProcessor {
     blend_weights: [f32; 2],
     target_weights: [f32; 2],
     crossfade_blocks_left: usize,
+    flush_drain_pending: bool,
     input_timeline_frames: f64,
     active_ratio: f64,
 }
@@ -325,6 +328,7 @@ impl std::fmt::Debug for RtProcessor {
             .field("active_ratio", &self.active_ratio)
             .field("input_ring_len", &self.input_ring.len())
             .field("pending_output_len", &self.pending_output.len())
+            .field("flush_drain_pending", &self.flush_drain_pending)
             .finish()
     }
 }
@@ -478,6 +482,7 @@ impl RtProcessor {
             blend_weights: blend,
             target_weights: blend,
             crossfade_blocks_left: 0,
+            flush_drain_pending: false,
             input_timeline_frames: 0.0,
             active_ratio,
         }
@@ -622,6 +627,7 @@ impl RtProcessor {
             self.update_profile_policy();
             self.advance_profile_transition();
             self.advance_tier_crossfade();
+            self.assert_can_process_new_input()?;
 
             if input_slices.len() != self.num_channels || output_slices.len() != self.num_channels {
                 return Err(StretchError::InvalidFormat(format!(
@@ -721,6 +727,7 @@ impl RtProcessor {
             self.update_profile_policy();
             self.advance_profile_transition();
             self.advance_tier_crossfade();
+            self.assert_can_process_new_input()?;
 
             if input.len() != self.block_samples {
                 return Err(StretchError::InvalidFormat(format!(
@@ -787,6 +794,7 @@ impl RtProcessor {
             self.update_profile_policy();
             self.advance_profile_transition();
             self.advance_tier_crossfade();
+            self.assert_can_process_new_input()?;
 
             if input.len() != self.block_samples {
                 return Err(StretchError::InvalidFormat(format!(
@@ -845,33 +853,56 @@ impl RtProcessor {
             self.update_profile_policy();
             self.advance_profile_transition();
             self.advance_tier_crossfade();
-
-            let fft_samples = self
-                .config
-                .params
-                .fft_size
-                .saturating_mul(self.num_channels);
-            while self.input_ring.len() >= self.kernel_samples {
-                self.render_fixed_kernel()?;
-            }
-
-            if self.input_ring.len() >= fft_samples && self.input_ring.len() < self.kernel_samples {
-                let need = self.kernel_samples.saturating_sub(self.input_ring.len());
-                self.push_zeros(need)?;
-                self.render_fixed_kernel()?;
-            }
-
-            self.flush_tonal_tails_to_pending()?;
+            self.prepare_pending_flush_output()?;
             let _ = self.drain_pending_to_output(output, usize::MAX)?;
+            if self.pending_output.is_empty() {
+                self.finish_flush_drain();
+            }
+            Ok(())
+        })();
+        self.record_rt_result(result)
+    }
 
-            self.input_ring.clear();
-            self.pending_output.clear();
-            self.input_timeline_frames = 0.0;
-            for vocoder in &mut self.vocoders {
-                vocoder.reset_phase_state();
+    /// Flushes pending RT state into a fixed interleaved output buffer.
+    ///
+    /// Returns the number of interleaved samples written to `output`.
+    /// Only full frames are written; any trailing partial-frame capacity in
+    /// `output` is ignored.
+    ///
+    /// If more flushed output remains than fits in `output`, subsequent calls
+    /// continue draining the already-flushed tail until this method returns `0`.
+    /// No new input may be processed until the flush output has been fully
+    /// drained.
+    pub fn flush_into(&mut self, output: &mut [f32]) -> Result<usize, StretchError> {
+        let result = (|| -> Result<usize, StretchError> {
+            self.poll_control_updates();
+            self.update_profile_policy();
+            self.advance_profile_transition();
+            self.advance_tier_crossfade();
+            self.prepare_pending_flush_output()?;
+
+            if self.pending_output.is_empty() {
+                self.finish_flush_drain();
+                return Ok(0);
             }
 
-            Ok(())
+            let aligned_capacity = output
+                .len()
+                .saturating_div(self.num_channels.max(1))
+                .saturating_mul(self.num_channels.max(1));
+            if aligned_capacity == 0 {
+                return Err(StretchError::BufferOverflow {
+                    buffer: "rt_flush_output",
+                    requested: self.num_channels.max(1),
+                    available: aligned_capacity,
+                });
+            }
+
+            let written = self.drain_pending_to_buffer(output, usize::MAX)?;
+            if self.pending_output.is_empty() {
+                self.finish_flush_drain();
+            }
+            Ok(written)
         })();
         self.record_rt_result(result)
     }
@@ -943,9 +974,61 @@ impl RtProcessor {
             .saturating_mul(self.num_channels)
     }
 
+    #[inline]
+    fn assert_can_process_new_input(&self) -> Result<(), StretchError> {
+        if self.flush_drain_pending {
+            return Err(StretchError::InvalidState(
+                "rt flush output must be fully drained before new input",
+            ));
+        }
+        Ok(())
+    }
+
+    fn prepare_pending_flush_output(&mut self) -> Result<(), StretchError> {
+        if self.flush_drain_pending {
+            return Ok(());
+        }
+
+        let fft_samples = self
+            .config
+            .params
+            .fft_size
+            .saturating_mul(self.num_channels);
+        while self.input_ring.len() >= self.kernel_samples {
+            self.render_fixed_kernel()?;
+        }
+
+        if self.input_ring.len() >= fft_samples && self.input_ring.len() < self.kernel_samples {
+            let need = self.kernel_samples.saturating_sub(self.input_ring.len());
+            self.push_zeros(need)?;
+            self.render_fixed_kernel()?;
+        }
+
+        self.flush_tonal_tails_to_pending()?;
+        self.input_ring.clear();
+        for out in &mut self.tonal_output {
+            out.clear();
+        }
+        for out in &mut self.transient_output {
+            out.clear();
+        }
+        for vocoder in &mut self.vocoders {
+            vocoder.reset_phase_state();
+        }
+        self.flush_drain_pending = true;
+        Ok(())
+    }
+
+    fn finish_flush_drain(&mut self) {
+        self.pending_output.clear();
+        self.flush_drain_pending = false;
+        self.input_timeline_frames = 0.0;
+    }
+
     fn reset_state_for_unity_passthrough(&mut self) {
         self.input_ring.clear();
         self.pending_output.clear();
+        self.flush_drain_pending = false;
         for out in &mut self.tonal_output {
             out.clear();
         }
@@ -1768,6 +1851,105 @@ mod tests {
             rt.delay_telemetry().buffered_output_frames <= pending_before + max_output_frames,
             "draining into a fixed buffer should not amplify pending output"
         );
+    }
+
+    #[test]
+    fn flush_into_matches_vec_flush_when_drained_in_chunks() {
+        let params = StretchParams::new(1.35)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut cfg = RtConfig::new(params, 256);
+        cfg.latency_profile = LatencyProfile::Scratch;
+        let mut rt_vec = RtProcessor::prepare(cfg.clone()).unwrap();
+        let mut rt_fixed = RtProcessor::prepare(cfg).unwrap();
+
+        let mut no_output = [0.0f32; 0];
+        for i in 0..8 {
+            let input = stereo_sine_block(256, 48_000, 220.0, i as f32 * 0.17);
+            assert_eq!(
+                rt_vec.process_block_into(&input, &mut no_output).unwrap(),
+                0
+            );
+            assert_eq!(
+                rt_fixed.process_block_into(&input, &mut no_output).unwrap(),
+                0
+            );
+        }
+
+        let mut expected = Vec::with_capacity(16_384);
+        rt_vec.flush(&mut expected).unwrap();
+        assert!(
+            !expected.is_empty(),
+            "flush should emit deferred tail audio"
+        );
+
+        let mut actual = Vec::with_capacity(expected.len());
+        let mut chunk = vec![0.0f32; 192];
+        let mut iterations = 0usize;
+        loop {
+            let written = rt_fixed.flush_into(&mut chunk).unwrap();
+            if written == 0 {
+                break;
+            }
+            iterations += 1;
+            actual.extend_from_slice(&chunk[..written]);
+        }
+
+        assert!(
+            iterations > 1,
+            "fixed-buffer flush should support chunked draining"
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(rt_fixed.runtime_telemetry().process_error_count, 0);
+        assert_eq!(rt_fixed.delay_telemetry().buffered_input_frames, 0);
+        assert_eq!(rt_fixed.delay_telemetry().buffered_output_frames, 0);
+        assert!(rt_fixed.input_ring.is_empty());
+        assert!(rt_fixed.pending_output.is_empty());
+    }
+
+    #[test]
+    fn flush_into_requires_pending_output_to_drain_before_new_input() {
+        let params = StretchParams::new(1.35)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut cfg = RtConfig::new(params, 256);
+        cfg.latency_profile = LatencyProfile::Scratch;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let mut no_output = [0.0f32; 0];
+        for i in 0..8 {
+            let input = stereo_sine_block(256, 48_000, 220.0, i as f32 * 0.11);
+            assert_eq!(rt.process_block_into(&input, &mut no_output).unwrap(), 0);
+        }
+
+        let mut chunk = vec![0.0f32; 192];
+        let first_written = rt.flush_into(&mut chunk).unwrap();
+        assert!(first_written > 0);
+        assert!(
+            !rt.pending_output.is_empty(),
+            "small fixed buffer should leave flushed tail queued"
+        );
+
+        let input = stereo_sine_block(256, 48_000, 330.0, 0.37);
+        let err = rt.process_block_into(&input, &mut no_output).unwrap_err();
+        assert_eq!(
+            err,
+            StretchError::InvalidState("rt flush output must be fully drained before new input")
+        );
+        assert_eq!(rt.runtime_telemetry().process_error_count, 1);
+
+        loop {
+            if rt.flush_into(&mut chunk).unwrap() == 0 {
+                break;
+            }
+        }
+
+        assert!(rt.process_block_into(&input, &mut no_output).is_ok());
+        assert_eq!(rt.runtime_telemetry().process_error_count, 1);
     }
 
     #[test]
