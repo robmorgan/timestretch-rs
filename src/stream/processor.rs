@@ -2399,6 +2399,22 @@ impl StreamProcessor {
         })
     }
 
+    /// Returns the exact current host-visible delay in samples for deterministic mode.
+    ///
+    /// This includes algorithmic delay, buffered input/output, and current
+    /// profile/tier contributions. Returns `None` when deterministic
+    /// dual-plane telemetry is unavailable.
+    pub fn current_delay_samples(&self) -> Option<usize> {
+        self.deterministic_delay_telemetry()
+            .map(|telemetry| telemetry.total_frames)
+    }
+
+    /// Returns the exact current host-visible delay in seconds for deterministic mode.
+    pub fn current_delay_secs(&self) -> Option<f64> {
+        self.current_delay_samples()
+            .map(|frames| frames as f64 / self.params.sample_rate as f64)
+    }
+
     /// Returns cumulative transient-reset telemetry for the current stream.
     pub fn transient_reset_stats(&self) -> TransientResetStats {
         let TransientSchedulerStats {
@@ -2500,11 +2516,19 @@ impl StreamProcessor {
     }
 
     /// Returns the minimum latency in samples.
+    ///
+    /// For exact current deterministic delay, use
+    /// [`StreamProcessor::current_delay_samples`] or
+    /// [`StreamProcessor::deterministic_delay_telemetry`].
     pub fn latency_samples(&self) -> usize {
         min_latency_frames(self.params.fft_size)
     }
 
     /// Returns the minimum latency in seconds.
+    ///
+    /// For exact current deterministic delay, use
+    /// [`StreamProcessor::current_delay_secs`] or
+    /// [`StreamProcessor::deterministic_delay_telemetry`].
     pub fn latency_secs(&self) -> f64 {
         self.latency_samples() as f64 / self.params.sample_rate as f64
     }
@@ -3455,6 +3479,49 @@ mod tests {
             written
         );
         assert_eq!(before.total_frames - after.total_frames, written);
+    }
+
+    #[test]
+    fn test_stream_processor_current_delay_accessors_match_exact_telemetry() {
+        let params = StretchParams::new(1.03)
+            .with_sample_rate(44_100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+
+        let input: Vec<f32> = (0..(256 * 16))
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44_100.0).sin() * 0.5)
+            .collect();
+        let mut callback_output = [0.0f32; 0];
+        for chunk in input.chunks(256) {
+            proc.process_interleaved_into(chunk, &mut callback_output)
+                .unwrap();
+            if !proc.pending_output.is_empty() {
+                break;
+            }
+        }
+
+        let telemetry = proc
+            .deterministic_delay_telemetry()
+            .expect("dual-plane delay telemetry should be available");
+        assert_eq!(proc.current_delay_samples(), Some(telemetry.total_frames));
+        assert_eq!(
+            proc.current_delay_secs(),
+            Some(telemetry.total_frames as f64 / 44_100.0)
+        );
+    }
+
+    #[test]
+    fn test_stream_processor_current_delay_accessors_unavailable_in_hybrid_mode() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44_100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        assert_eq!(proc.current_delay_samples(), None);
+        assert_eq!(proc.current_delay_secs(), None);
     }
 
     #[test]
