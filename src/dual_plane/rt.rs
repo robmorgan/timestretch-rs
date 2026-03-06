@@ -662,6 +662,7 @@ impl RtProcessor {
                 .unwrap_or(0);
 
             if self.can_unity_passthrough(input_frames, output_frames_capacity) {
+                self.rearm_unity_passthrough();
                 for ch in 0..self.num_channels {
                     output_slices[ch][..input_frames]
                         .copy_from_slice(&input_slices[ch][..input_frames]);
@@ -739,6 +740,7 @@ impl RtProcessor {
                 .saturating_sub(output.len())
                 .saturating_div(self.num_channels.max(1));
             if self.can_unity_passthrough(self.config.block_frames, available_output_frames) {
+                self.rearm_unity_passthrough();
                 let available_samples = output.capacity().saturating_sub(output.len());
                 if input.len() > available_samples {
                     return Err(StretchError::BufferOverflow {
@@ -765,6 +767,73 @@ impl RtProcessor {
             let tier = self.governor.observe_block(start.elapsed());
             self.set_target_tier(tier);
             Ok(())
+        })();
+        self.record_rt_result(result)
+    }
+
+    /// Processes one callback block into a fixed interleaved output buffer.
+    ///
+    /// Returns the number of interleaved samples written to `output`.
+    /// Only full frames are written; any trailing partial-frame capacity in
+    /// `output` is ignored.
+    pub fn process_block_into(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<usize, StretchError> {
+        let result = (|| -> Result<usize, StretchError> {
+            let start = Instant::now();
+            self.poll_control_updates();
+            self.update_profile_policy();
+            self.advance_profile_transition();
+            self.advance_tier_crossfade();
+
+            if input.len() != self.block_samples {
+                return Err(StretchError::InvalidFormat(format!(
+                    "process_block_into requires exactly {} samples ({} frames x {} channels), got {}",
+                    self.block_samples,
+                    self.config.block_frames,
+                    self.num_channels,
+                    input.len()
+                )));
+            }
+            if input.iter().any(|s| !s.is_finite()) {
+                return Err(StretchError::NonFiniteInput);
+            }
+
+            let output_samples_capacity = output
+                .len()
+                .saturating_div(self.num_channels.max(1))
+                .saturating_mul(self.num_channels.max(1));
+            if self.unity_passthrough_eligible(self.config.block_frames) {
+                if output_samples_capacity < input.len() {
+                    return Err(StretchError::BufferOverflow {
+                        buffer: "rt_process_block_output",
+                        requested: input.len(),
+                        available: output_samples_capacity,
+                    });
+                }
+                self.rearm_unity_passthrough();
+                output[..input.len()].copy_from_slice(input);
+                self.input_timeline_frames += self.config.block_frames as f64;
+                self.active_ratio = 1.0;
+                let tier = self.governor.observe_block(start.elapsed());
+                self.set_target_tier(tier);
+                return Ok(input.len());
+            }
+
+            self.push_input_with_overload_policy(input)?;
+            if self.input_ring.len() >= self.kernel_samples {
+                self.render_fixed_kernel()?;
+            }
+            let max_emit = self
+                .max_output_samples_per_callback()
+                .min(output_samples_capacity);
+            let written = self.drain_pending_to_buffer(output, max_emit)?;
+
+            let tier = self.governor.observe_block(start.elapsed());
+            self.set_target_tier(tier);
+            Ok(written)
         })();
         self.record_rt_result(result)
     }
@@ -889,12 +958,8 @@ impl RtProcessor {
     }
 
     #[inline]
-    fn can_unity_passthrough(
-        &mut self,
-        input_frames: usize,
-        output_frames_capacity: usize,
-    ) -> bool {
-        if input_frames == 0 || output_frames_capacity < input_frames {
+    fn unity_passthrough_eligible(&self, input_frames: usize) -> bool {
+        if input_frames == 0 {
             return false;
         }
 
@@ -905,12 +970,21 @@ impl RtProcessor {
             return false;
         }
 
+        true
+    }
+
+    #[inline]
+    fn can_unity_passthrough(&self, input_frames: usize, output_frames_capacity: usize) -> bool {
+        output_frames_capacity >= input_frames && self.unity_passthrough_eligible(input_frames)
+    }
+
+    #[inline]
+    fn rearm_unity_passthrough(&mut self) {
         // Re-arm bit-exact passthrough after non-unity runs by dropping any
         // buffered overlap context when the host returns to unity ratio.
         if !self.input_ring.is_empty() || !self.pending_output.is_empty() {
             self.reset_state_for_unity_passthrough();
         }
-        true
     }
 
     fn set_latency_profile_internal(&mut self, profile: LatencyProfile) {
@@ -1359,6 +1433,32 @@ impl RtProcessor {
         Ok(emitted)
     }
 
+    fn drain_pending_to_buffer(
+        &mut self,
+        output: &mut [f32],
+        max_samples: usize,
+    ) -> Result<usize, StretchError> {
+        let aligned_capacity = output
+            .len()
+            .min(max_samples)
+            .saturating_div(self.num_channels.max(1))
+            .saturating_mul(self.num_channels.max(1));
+        let to_emit = self.pending_output.len().min(aligned_capacity);
+        if to_emit == 0 {
+            return Ok(0);
+        }
+
+        for sample in &mut output[..to_emit] {
+            let Some(value) = self.pending_output.pop() else {
+                return Err(StretchError::InvalidState(
+                    "rt pending drain to buffer made zero progress",
+                ));
+            };
+            *sample = value;
+        }
+        Ok(to_emit)
+    }
+
     fn drain_pending_to_slices(
         &mut self,
         output_slices: &mut [&mut [f32]],
@@ -1485,6 +1585,7 @@ mod tests {
     use crate::core::types::StretchParams;
     use crate::dual_plane::hints::RenderHints;
     use crate::dual_plane::warp_map::TimeWarpMap;
+    use crate::error::StretchError;
     use std::sync::Arc;
 
     fn stereo_sine_block(frames: usize, sample_rate: u32, hz: f32, phase: f32) -> Vec<f32> {
@@ -1580,6 +1681,93 @@ mod tests {
         assert_eq!(out, input);
         assert!(rt.input_ring.is_empty());
         assert!(rt.pending_output.is_empty());
+    }
+
+    #[test]
+    fn process_block_into_unity_ratio_is_bit_exact_passthrough() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut cfg = RtConfig::new(params, 256);
+        cfg.latency_profile = LatencyProfile::Scratch;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = stereo_sine_block(256, 48_000, 330.0, 0.37);
+        let mut out = vec![0.0f32; input.len()];
+        let written = rt.process_block_into(&input, &mut out).unwrap();
+
+        assert_eq!(written, input.len());
+        assert_eq!(out, input);
+        assert!(rt.input_ring.is_empty());
+        assert!(rt.pending_output.is_empty());
+    }
+
+    #[test]
+    fn process_block_into_unity_ratio_requires_full_block_capacity() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut cfg = RtConfig::new(params, 256);
+        cfg.latency_profile = LatencyProfile::Scratch;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = stereo_sine_block(256, 48_000, 330.0, 0.37);
+        let mut out = vec![0.0f32; input.len() - 2];
+        let err = rt.process_block_into(&input, &mut out).unwrap_err();
+
+        assert!(matches!(
+            err,
+            StretchError::BufferOverflow {
+                buffer: "rt_process_block_output",
+                requested,
+                available,
+            } if requested == input.len() && available == out.len()
+        ));
+        assert!(rt.input_ring.is_empty());
+        assert!(rt.pending_output.is_empty());
+    }
+
+    #[test]
+    fn process_block_into_allows_non_unity_processing_without_vec_output() {
+        let params = StretchParams::new(1.35)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut cfg = RtConfig::new(params, 256);
+        cfg.latency_profile = LatencyProfile::Scratch;
+        let max_output_frames = cfg.max_output_frames_per_kernel();
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let block = stereo_sine_block(256, 48_000, 220.0, 0.0);
+        let mut no_output = [0.0f32; 0];
+        for i in 0..8 {
+            let phase = i as f32 * 0.17;
+            let input = stereo_sine_block(256, 48_000, 220.0, phase);
+            assert_eq!(rt.process_block_into(&input, &mut no_output).unwrap(), 0);
+        }
+
+        assert_eq!(rt.runtime_telemetry().process_error_count, 0);
+        let pending_before = rt.delay_telemetry().buffered_output_frames;
+        assert!(
+            pending_before > 0,
+            "expected pending RT output after warmup"
+        );
+
+        let mut out = vec![0.0f32; block.len() * 4];
+        let written = rt.process_block_into(&block, &mut out).unwrap();
+
+        assert!(written > 0);
+        assert_eq!(written % rt.num_channels(), 0);
+        assert!(written <= out.len());
+        assert!(
+            rt.delay_telemetry().buffered_output_frames <= pending_before + max_output_frames,
+            "draining into a fixed buffer should not amplify pending output"
+        );
     }
 
     #[test]

@@ -70,6 +70,15 @@ impl DualPlaneProcessor {
         self.rt.process_block(input, output)
     }
 
+    /// RT-only processing call into a fixed interleaved output buffer.
+    pub fn process_block_into(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<usize, StretchError> {
+        self.rt.process_block_into(input, output)
+    }
+
     /// Convenience call: enqueue analysis for this block, then run RT processing.
     pub fn process_block_with_analysis(
         &mut self,
@@ -78,6 +87,16 @@ impl DualPlaneProcessor {
     ) -> Result<(), StretchError> {
         let _ = self.submit_analysis_block(input);
         self.process_block(input, output)
+    }
+
+    /// Convenience call: enqueue analysis for this block, then run RT processing into a slice.
+    pub fn process_block_with_analysis_into(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<usize, StretchError> {
+        let _ = self.submit_analysis_block(input);
+        self.process_block_into(input, output)
     }
 
     /// Queues a block for async analysis.

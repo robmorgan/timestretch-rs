@@ -119,6 +119,6 @@ Acceptance:
 
 ## Current Implementation Slice
 
-This change set continues Phase 1 by adding exact deterministic delay telemetry
-to the RT core, alongside the existing overload and callback-failure telemetry,
-and by surfacing that state through the deterministic `StreamProcessor` path.
+This change set continues Phase 1 by adding a fixed-buffer interleaved callback
+API to the RT core, so hosts no longer have to rely on `Vec` append semantics
+for the small-block dual-plane processing path.
