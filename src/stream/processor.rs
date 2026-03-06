@@ -2636,19 +2636,28 @@ impl StreamProcessor {
         })
     }
 
-    /// Returns the exact current host-visible delay in samples for deterministic mode.
+    /// Returns the exact current host-visible delay in audio frames for deterministic mode.
     ///
     /// This includes algorithmic delay, buffered input/output, and current
     /// profile/tier contributions. Returns `None` when deterministic
     /// dual-plane telemetry is unavailable.
-    pub fn current_delay_samples(&self) -> Option<usize> {
+    pub fn current_delay_frames(&self) -> Option<usize> {
         self.deterministic_delay_telemetry()
             .map(|telemetry| telemetry.total_frames)
     }
 
+    /// Returns the exact current host-visible delay in audio frames for deterministic mode.
+    ///
+    /// This historical alias returns the same frame count as
+    /// [`StreamProcessor::current_delay_frames`], not an interleaved scalar
+    /// sample count.
+    pub fn current_delay_samples(&self) -> Option<usize> {
+        self.current_delay_frames()
+    }
+
     /// Returns the exact current host-visible delay in seconds for deterministic mode.
     pub fn current_delay_secs(&self) -> Option<f64> {
-        self.current_delay_samples()
+        self.current_delay_frames()
             .map(|frames| frames as f64 / self.params.sample_rate as f64)
     }
 
@@ -2752,13 +2761,22 @@ impl StreamProcessor {
         self.source_bpm.map(|src| src / self.target_ratio)
     }
 
-    /// Returns the minimum latency in samples.
+    /// Returns the minimum latency in audio frames.
     ///
     /// For exact current deterministic delay, use
-    /// [`StreamProcessor::current_delay_samples`] or
+    /// [`StreamProcessor::current_delay_frames`] or
     /// [`StreamProcessor::deterministic_delay_telemetry`].
-    pub fn latency_samples(&self) -> usize {
+    pub fn latency_frames(&self) -> usize {
         min_latency_frames(self.params.fft_size)
+    }
+
+    /// Returns the minimum latency in audio frames.
+    ///
+    /// This historical alias returns the same frame count as
+    /// [`StreamProcessor::latency_frames`], not an interleaved scalar sample
+    /// count.
+    pub fn latency_samples(&self) -> usize {
+        self.latency_frames()
     }
 
     /// Returns the minimum latency in seconds.
@@ -2767,7 +2785,7 @@ impl StreamProcessor {
     /// [`StreamProcessor::current_delay_secs`] or
     /// [`StreamProcessor::deterministic_delay_telemetry`].
     pub fn latency_secs(&self) -> f64 {
-        self.latency_samples() as f64 / self.params.sample_rate as f64
+        self.latency_frames() as f64 / self.params.sample_rate as f64
     }
 
     /// Resets the processor state.
@@ -3105,10 +3123,12 @@ mod tests {
     fn test_stream_processor_latency() {
         let params = StretchParams::new(1.0)
             .with_sample_rate(44100)
+            .with_channels(2)
             .with_fft_size(4096);
 
         let proc = StreamProcessor::new(params);
         // 4096 * 3 / 2 = 6144 (1.5x FFT size for reduced latency)
+        assert_eq!(proc.latency_frames(), 6144);
         assert_eq!(proc.latency_samples(), 6144);
         assert!((proc.latency_secs() - 6144.0 / 44100.0).abs() < 1e-6);
     }
@@ -3724,16 +3744,22 @@ mod tests {
     fn test_stream_processor_current_delay_accessors_match_exact_telemetry() {
         let params = StretchParams::new(1.03)
             .with_sample_rate(44_100)
-            .with_channels(1)
+            .with_channels(2)
             .with_fft_size(1024)
             .with_hop_size(256);
         let mut proc = StreamProcessor::new(params);
 
         let input: Vec<f32> = (0..(256 * 16))
-            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44_100.0).sin() * 0.5)
+            .flat_map(|i| {
+                let t = i as f32 / 44_100.0;
+                [
+                    (2.0 * PI * 220.0 * t).sin() * 0.5,
+                    (2.0 * PI * 330.0 * t).sin() * 0.35,
+                ]
+            })
             .collect();
         let mut callback_output = [0.0f32; 0];
-        for chunk in input.chunks(256) {
+        for chunk in input.chunks(256 * 2) {
             proc.process_interleaved_into(chunk, &mut callback_output)
                 .unwrap();
             if !proc.pending_output.is_empty() {
@@ -3744,6 +3770,7 @@ mod tests {
         let telemetry = proc
             .deterministic_delay_telemetry()
             .expect("dual-plane delay telemetry should be available");
+        assert_eq!(proc.current_delay_frames(), Some(telemetry.total_frames));
         assert_eq!(proc.current_delay_samples(), Some(telemetry.total_frames));
         assert_eq!(
             proc.current_delay_secs(),
@@ -3759,6 +3786,7 @@ mod tests {
         let mut proc = StreamProcessor::new(params);
         proc.set_hybrid_mode(true);
 
+        assert_eq!(proc.current_delay_frames(), None);
         assert_eq!(proc.current_delay_samples(), None);
         assert_eq!(proc.current_delay_secs(), None);
     }
