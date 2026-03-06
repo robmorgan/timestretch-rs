@@ -29,18 +29,55 @@
 //!
 //! For real-time use, feed audio in chunks via [`StreamProcessor`]:
 //!
-//! ```
+//! ```no_run
 //! use timestretch::{EdmPreset, StreamProcessor, StreamingEngine, StretchParams};
 //!
 //! let params = StretchParams::new(1.0)
 //!     .with_preset(EdmPreset::DjBeatmatch)
-//!     .with_sample_rate(44100)
-//!     .with_channels(1);
+//!     .with_sample_rate(44_100)
+//!     .with_channels(2);
 //!
 //! let mut processor = StreamProcessor::new(params);
 //! processor.set_streaming_engine(StreamingEngine::Deterministic); // default
-//! // processor.process(&chunk) for each audio buffer
-//! // processor.set_stretch_ratio(1.05).unwrap() to change on the fly
+//!
+//! let input_chunk = vec![0.0f32; 256 * 2];
+//! let mut output_chunk = Vec::with_capacity(1_024);
+//! processor.process_into(&input_chunk, &mut output_chunk).unwrap();
+//! processor.set_stretch_ratio(1.05).unwrap();
+//! let mut remaining = Vec::with_capacity(1_024);
+//! processor.flush_into(&mut remaining).unwrap();
+//! ```
+//!
+//! For fixed host callback buffers, deterministic mode also exposes
+//! interleaved process/flush methods that never depend on `Vec` append
+//! semantics:
+//!
+//! ```no_run
+//! use timestretch::{EdmPreset, StreamProcessor, StreamingEngine, StretchParams};
+//!
+//! let params = StretchParams::new(1.02)
+//!     .with_preset(EdmPreset::DjBeatmatch)
+//!     .with_sample_rate(44_100)
+//!     .with_channels(2);
+//! let mut processor = StreamProcessor::new(params);
+//! processor.set_streaming_engine(StreamingEngine::Deterministic);
+//!
+//! let input_chunk = vec![0.0f32; 256 * 2];
+//! let mut callback_output = [0.0f32; 384];
+//! let written = processor
+//!     .process_interleaved_into(&input_chunk, &mut callback_output)
+//!     .unwrap();
+//! let _host_frames = &callback_output[..written];
+//!
+//! loop {
+//!     let written = processor
+//!         .flush_interleaved_into(&mut callback_output)
+//!         .unwrap();
+//!     if written == 0 {
+//!         break;
+//!     }
+//!     let _tail_chunk = &callback_output[..written];
+//! }
 //! ```
 
 use rustfft::{num_complex::Complex, FftPlanner};

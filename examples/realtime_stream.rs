@@ -2,11 +2,12 @@
 //!
 //! Demonstrates the StreamProcessor API for chunk-based real-time processing,
 //! simulating a DJ pitch fader that changes the tempo on the fly.
+//! The final section demonstrates fixed-buffer deterministic callbacks.
 //!
 //! Run with: cargo run --example realtime_stream
 
 use std::f32::consts::PI;
-use timestretch::{EdmPreset, StreamProcessor, StretchParams};
+use timestretch::{EdmPreset, StreamProcessor, StreamingEngine, StretchParams};
 
 fn main() {
     let sample_rate = 44100u32;
@@ -127,6 +128,57 @@ fn main() {
         total_output_samples,
         total_output_samples as f64 / sample_rate as f64
     );
+
+    // --- Part 4: Fixed-buffer deterministic callbacks ---
+    println!("\nPart 4: Fixed-Buffer Deterministic Callback Flow");
+
+    let params = StretchParams::new(1.02)
+        .with_preset(EdmPreset::DjBeatmatch)
+        .with_sample_rate(sample_rate)
+        .with_channels(2);
+    let mut processor = StreamProcessor::new(params);
+    processor.set_streaming_engine(StreamingEngine::Deterministic);
+
+    let stereo_input = mono_to_stereo_interleaved(&generate_house_pattern(sample_rate, 128.0, 2.0));
+    let input_chunk_samples = 256 * 2;
+    let mut callback_output = [0.0f32; 384];
+    let mut total_output_samples = 0usize;
+    let mut max_callback_samples = 0usize;
+
+    for chunk in stereo_input.chunks(input_chunk_samples) {
+        let written = processor
+            .process_interleaved_into(chunk, &mut callback_output)
+            .expect("fixed-buffer process failed");
+        total_output_samples += written;
+        max_callback_samples = max_callback_samples.max(written);
+    }
+
+    let mut flush_calls = 0usize;
+    loop {
+        let written = processor
+            .flush_interleaved_into(&mut callback_output)
+            .expect("fixed-buffer flush failed");
+        if written == 0 {
+            break;
+        }
+        flush_calls += 1;
+        total_output_samples += written;
+        max_callback_samples = max_callback_samples.max(written);
+    }
+
+    println!(
+        "  Input:  {} interleaved samples ({:.2}s stereo)",
+        stereo_input.len(),
+        stereo_input.len() as f64 / (sample_rate as f64 * 2.0)
+    );
+    println!(
+        "  Output: {} interleaved samples across fixed callbacks",
+        total_output_samples
+    );
+    println!(
+        "  Largest callback write: {} samples, flush callbacks: {}",
+        max_callback_samples, flush_calls
+    );
 }
 
 /// Generates a simple house-style pattern with kicks and a pad.
@@ -157,4 +209,13 @@ fn generate_house_pattern(sample_rate: u32, bpm: f64, duration_secs: f64) -> Vec
     }
 
     audio
+}
+
+fn mono_to_stereo_interleaved(mono: &[f32]) -> Vec<f32> {
+    let mut stereo = Vec::with_capacity(mono.len() * 2);
+    for &sample in mono {
+        stereo.push(sample);
+        stereo.push(sample);
+    }
+    stereo
 }
