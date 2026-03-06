@@ -483,6 +483,8 @@ pub struct StreamProcessor {
     dual_plane_preferred: bool,
     /// Optional active dual-plane deterministic backend state.
     dual_plane_deterministic: Option<DualPlaneDeterministicState>,
+    /// Deferred engine switch requested while a fixed-buffer flush drain is active.
+    pending_streaming_engine: Option<StreamingEngine>,
 }
 
 impl std::fmt::Debug for StreamProcessor {
@@ -500,6 +502,7 @@ impl std::fmt::Debug for StreamProcessor {
                 "dual_plane_deterministic",
                 &self.dual_plane_deterministic.is_some(),
             )
+            .field("pending_streaming_engine", &self.pending_streaming_engine)
             .field("dual_plane_preferred", &self.dual_plane_preferred)
             .field("source_bpm", &self.source_bpm)
             .field("input_ring_len", &self.input_ring.len())
@@ -593,6 +596,7 @@ impl StreamProcessor {
             fixed_flush_scratch: Vec::with_capacity(output_capacity_samples),
             dual_plane_preferred: true,
             dual_plane_deterministic: None,
+            pending_streaming_engine: None,
         };
         me.ensure_default_dual_plane_backend();
         me
@@ -2128,6 +2132,31 @@ impl StreamProcessor {
         self.fixed_flush_length_reconciled = false;
         self.expected_total_output_samples = 0.0;
         self.total_output_emitted_samples = 0;
+        if let Some(engine) = self.pending_streaming_engine.take() {
+            self.apply_streaming_engine_now(engine);
+        }
+    }
+
+    fn apply_streaming_engine_now(&mut self, engine: StreamingEngine) {
+        let enable_hybrid = matches!(engine, StreamingEngine::LegacyHybridRerender);
+        if enable_hybrid && self.dual_plane_deterministic.is_some() {
+            self.dual_plane_deterministic = None;
+        }
+        if enable_hybrid && !self.use_hybrid {
+            self.hybrid_state.reset(
+                &self.params,
+                self.current_ratio,
+                self.capacity_frames_per_channel,
+            );
+            self.hybrid_pending_rebase = false;
+        }
+        if self.use_hybrid != enable_hybrid {
+            self.reset_pitch_resamplers();
+        }
+        self.use_hybrid = enable_hybrid;
+        if !enable_hybrid {
+            self.ensure_default_dual_plane_backend();
+        }
     }
 
     fn append_hybrid_input(&mut self, num_channels: usize) -> Result<(), StretchError> {
@@ -2484,26 +2513,22 @@ impl StreamProcessor {
     ///
     /// This is equivalent to selecting
     /// [`StreamingEngine::LegacyHybridRerender`] when enabled and
-    /// [`StreamingEngine::Deterministic`] when disabled.
+    /// [`StreamingEngine::Deterministic`] when disabled. If a fixed-buffer
+    /// flush drain is active, the switch is deferred until the tail has been
+    /// fully drained.
     pub fn set_hybrid_mode(&mut self, enabled: bool) {
-        if enabled && self.dual_plane_deterministic.is_some() {
-            self.dual_plane_deterministic = None;
+        let engine = if enabled {
+            StreamingEngine::LegacyHybridRerender
+        } else {
+            StreamingEngine::Deterministic
+        };
+        if self.fixed_flush_pending {
+            self.pending_streaming_engine = Some(engine);
+            return;
         }
-        if enabled && !self.use_hybrid {
-            self.hybrid_state.reset(
-                &self.params,
-                self.current_ratio,
-                self.capacity_frames_per_channel,
-            );
-            self.hybrid_pending_rebase = false;
-        }
-        if self.use_hybrid != enabled {
-            self.reset_pitch_resamplers();
-        }
-        self.use_hybrid = enabled;
-        if !enabled {
-            self.ensure_default_dual_plane_backend();
-        }
+
+        self.pending_streaming_engine = None;
+        self.apply_streaming_engine_now(engine);
     }
 
     /// Returns whether hybrid processing mode is enabled.
@@ -2515,7 +2540,9 @@ impl StreamProcessor {
     ///
     /// [`StreamingEngine::Deterministic`] is the recommended real-time path.
     /// [`StreamingEngine::LegacyHybridRerender`] keeps the previous
-    /// rolling-window hybrid behavior as an explicit opt-in mode.
+    /// rolling-window hybrid behavior as an explicit opt-in mode. If a
+    /// fixed-buffer flush drain is active, the switch takes effect after the
+    /// tail has been fully drained.
     pub fn set_streaming_engine(&mut self, engine: StreamingEngine) {
         match engine {
             StreamingEngine::Deterministic => self.set_hybrid_mode(false),
@@ -2790,6 +2817,7 @@ impl StreamProcessor {
 
     /// Resets the processor state.
     pub fn reset(&mut self) {
+        let pending_streaming_engine = self.pending_streaming_engine.take();
         self.input_ring.clear();
         self.pending_output.clear();
         for buf in &mut self.channel_input_buffers {
@@ -2824,7 +2852,11 @@ impl StreamProcessor {
         self.fixed_flush_scratch.clear();
 
         self.dual_plane_deterministic = None;
-        self.ensure_default_dual_plane_backend();
+        if let Some(engine) = pending_streaming_engine {
+            self.apply_streaming_engine_now(engine);
+        } else {
+            self.ensure_default_dual_plane_backend();
+        }
     }
 
     fn update_vocoder_ratio(&mut self) {
@@ -4727,6 +4759,115 @@ mod tests {
 
         assert!(!proc.fixed_flush_pending);
         assert!(proc.process_into(&input[..256], &mut streamed).is_ok());
+    }
+
+    #[test]
+    fn test_streaming_engine_switch_waits_for_fixed_flush_tail_drain() {
+        let params = StretchParams::new(1.03)
+            .with_sample_rate(44_100)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut control = StreamProcessor::new(params.clone());
+        let mut switched = StreamProcessor::new(params);
+        control.set_dual_plane_deterministic(true).unwrap();
+        switched.set_dual_plane_deterministic(true).unwrap();
+        control.set_pitch_scale(1.05).unwrap();
+        switched.set_pitch_scale(1.05).unwrap();
+
+        let mut input = Vec::with_capacity(256 * 2 * 12);
+        for i in 0..(256 * 12) {
+            let t = i as f32 / 44_100.0;
+            input.push((2.0 * PI * 110.0 * t).sin() * 0.3);
+            input.push((2.0 * PI * 330.0 * t).sin() * 0.25);
+        }
+
+        let mut control_streamed = Vec::with_capacity(input.len() * 2);
+        let mut switched_streamed = Vec::with_capacity(input.len() * 2);
+        for chunk in input.chunks(256 * 2) {
+            control.process_into(chunk, &mut control_streamed).unwrap();
+            switched
+                .process_into(chunk, &mut switched_streamed)
+                .unwrap();
+        }
+        assert_eq!(control_streamed.len(), switched_streamed.len());
+        for (idx, (&lhs, &rhs)) in control_streamed
+            .iter()
+            .zip(switched_streamed.iter())
+            .enumerate()
+        {
+            assert!(
+                (lhs - rhs).abs() < 1e-6,
+                "Mismatch at streamed sample {idx}: {lhs} vs {rhs}"
+            );
+        }
+
+        let control_flush_budget = control.max_flush_interleaved_output_samples().unwrap();
+        let switched_flush_budget = switched.max_flush_interleaved_output_samples().unwrap();
+        assert!(control_flush_budget > 2);
+        assert_eq!(control_flush_budget, switched_flush_budget);
+
+        let mut control_tail = Vec::new();
+        let mut switched_tail = Vec::new();
+        let mut first_control = [0.0f32; 2];
+        let mut first_switched = [0.0f32; 2];
+        let control_written = control.flush_interleaved_into(&mut first_control).unwrap();
+        let switched_written = switched
+            .flush_interleaved_into(&mut first_switched)
+            .unwrap();
+        assert_eq!(control_written, switched_written);
+        assert!(switched_written > 0);
+        assert!(control.fixed_flush_pending);
+        assert!(switched.fixed_flush_pending);
+        control_tail.extend_from_slice(&first_control[..control_written]);
+        switched_tail.extend_from_slice(&first_switched[..switched_written]);
+
+        switched.set_streaming_engine(StreamingEngine::LegacyHybridRerender);
+        assert!(switched.fixed_flush_pending);
+        assert_eq!(
+            switched.pending_streaming_engine,
+            Some(StreamingEngine::LegacyHybridRerender)
+        );
+        assert!(!switched.is_hybrid_mode());
+        assert!(switched.is_dual_plane_deterministic());
+
+        let mut control_chunk = [0.0f32; 13];
+        let mut switched_chunk = [0.0f32; 13];
+        loop {
+            let control_written = control.flush_interleaved_into(&mut control_chunk).unwrap();
+            let switched_written = switched
+                .flush_interleaved_into(&mut switched_chunk)
+                .unwrap();
+            assert_eq!(control_written, switched_written);
+            control_tail.extend_from_slice(&control_chunk[..control_written]);
+            switched_tail.extend_from_slice(&switched_chunk[..switched_written]);
+            assert_eq!(control.fixed_flush_pending, switched.fixed_flush_pending);
+            if !switched.fixed_flush_pending {
+                break;
+            }
+        }
+
+        assert_eq!(control_tail.len(), switched_tail.len());
+        for (idx, (&lhs, &rhs)) in control_tail.iter().zip(switched_tail.iter()).enumerate() {
+            assert!(
+                (lhs - rhs).abs() < 1e-6,
+                "Mismatch at flushed sample {idx}: {lhs} vs {rhs}"
+            );
+        }
+
+        assert!(!switched.fixed_flush_pending);
+        assert_eq!(switched.pending_streaming_engine, None);
+        assert!(switched.is_hybrid_mode());
+        assert_eq!(
+            switched.streaming_engine(),
+            StreamingEngine::LegacyHybridRerender
+        );
+        assert!(!switched.is_dual_plane_deterministic());
+
+        let mut post_switch_output = Vec::with_capacity(1024);
+        switched
+            .process_into(&input[..256 * 2], &mut post_switch_output)
+            .unwrap();
     }
 
     #[test]
