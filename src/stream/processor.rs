@@ -475,6 +475,10 @@ pub struct StreamProcessor {
     fixed_flush_source_exhausted: bool,
     /// Whether pitch-resampler tail flush has already been applied.
     fixed_flush_pitch_tail_flushed: bool,
+    /// Whether fixed-buffer flush length reconciliation has already run.
+    fixed_flush_length_reconciled: bool,
+    /// Scratch used to reconcile fixed-buffer flush tails without reallocating.
+    fixed_flush_scratch: Vec<f32>,
     /// Whether deterministic mode prefers the dual-plane backend.
     dual_plane_preferred: bool,
     /// Optional active dual-plane deterministic backend state.
@@ -585,6 +589,8 @@ impl StreamProcessor {
             fixed_flush_pending: false,
             fixed_flush_source_exhausted: false,
             fixed_flush_pitch_tail_flushed: false,
+            fixed_flush_length_reconciled: false,
+            fixed_flush_scratch: Vec::with_capacity(output_capacity_samples),
             dual_plane_preferred: true,
             dual_plane_deterministic: None,
         };
@@ -1201,6 +1207,7 @@ impl StreamProcessor {
             self.fixed_flush_pending = true;
             self.fixed_flush_source_exhausted = false;
             self.fixed_flush_pitch_tail_flushed = false;
+            self.fixed_flush_length_reconciled = false;
         }
 
         let mut written_total = 0usize;
@@ -1225,6 +1232,14 @@ impl StreamProcessor {
                 self.flush_pitch_resampler_to_pending(num_channels)?;
                 self.reset_pitch_resamplers();
                 self.fixed_flush_pitch_tail_flushed = true;
+                if !self.pending_output.is_empty() {
+                    continue;
+                }
+            }
+
+            if !self.fixed_flush_length_reconciled {
+                self.reconcile_fixed_flush_pending_output(num_channels)?;
+                self.fixed_flush_length_reconciled = true;
                 if !self.pending_output.is_empty() {
                     continue;
                 }
@@ -1980,10 +1995,70 @@ impl StreamProcessor {
         Ok(written)
     }
 
+    fn reconcile_fixed_flush_pending_output(
+        &mut self,
+        num_channels: usize,
+    ) -> Result<(), StretchError> {
+        let expected_total = self.expected_total_output_samples.round() as isize;
+        let projected_total = self
+            .total_output_emitted_samples
+            .saturating_add(self.pending_output.len()) as isize;
+        let correction = expected_total - projected_total;
+        if correction == 0 {
+            return Ok(());
+        }
+
+        let pending = self.pending_output.len();
+        self.fixed_flush_scratch.resize(pending, 0.0);
+        let copied = self
+            .pending_output
+            .peek_slice(&mut self.fixed_flush_scratch[..pending]);
+        if copied != pending {
+            return Err(StretchError::InvalidState(
+                "fixed-buffer flush scratch copy did not capture full pending output",
+            ));
+        }
+
+        if correction > 0 {
+            let need = correction as usize;
+            if need > self.pending_output.available() {
+                return Err(StretchError::BufferOverflow {
+                    buffer: "stream_pending_output",
+                    requested: need,
+                    available: self.pending_output.available(),
+                });
+            }
+            extend_with_tonal_tail(&mut self.fixed_flush_scratch, need, 0);
+        } else {
+            let trim = ((-correction) as usize).min(self.fixed_flush_scratch.len());
+            self.fixed_flush_scratch
+                .truncate(self.fixed_flush_scratch.len().saturating_sub(trim));
+        }
+
+        if !self.fixed_flush_scratch.len().is_multiple_of(num_channels) {
+            return Err(StretchError::InvalidState(
+                "fixed-buffer flush correction broke interleaved frame alignment",
+            ));
+        }
+
+        self.pending_output.clear();
+        let pushed = self.pending_output.push_slice(&self.fixed_flush_scratch);
+        if pushed != self.fixed_flush_scratch.len() {
+            return Err(StretchError::BufferOverflow {
+                buffer: "stream_pending_output",
+                requested: self.fixed_flush_scratch.len(),
+                available: pushed,
+            });
+        }
+
+        Ok(())
+    }
+
     fn finish_fixed_flush_drain(&mut self) {
         self.fixed_flush_pending = false;
         self.fixed_flush_source_exhausted = false;
         self.fixed_flush_pitch_tail_flushed = false;
+        self.fixed_flush_length_reconciled = false;
         self.expected_total_output_samples = 0.0;
         self.total_output_emitted_samples = 0;
     }
@@ -2660,6 +2735,8 @@ impl StreamProcessor {
         self.fixed_flush_pending = false;
         self.fixed_flush_source_exhausted = false;
         self.fixed_flush_pitch_tail_flushed = false;
+        self.fixed_flush_length_reconciled = false;
+        self.fixed_flush_scratch.clear();
 
         self.dual_plane_deterministic = None;
         self.ensure_default_dual_plane_backend();
@@ -4328,6 +4405,48 @@ mod tests {
                 "Mismatch at sample {idx}: {lhs} vs {rhs}"
             );
         }
+    }
+
+    #[test]
+    fn test_reconcile_fixed_flush_pending_output_appends_final_frame_aligned_tail() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44_100)
+            .with_channels(2);
+        let mut proc = StreamProcessor::new(params);
+
+        assert_eq!(proc.pending_output.push_slice(&[0.0, 0.0, 0.0, 0.0]), 4);
+        proc.total_output_emitted_samples = 4;
+        proc.expected_total_output_samples = 10.0;
+
+        proc.reconcile_fixed_flush_pending_output(2).unwrap();
+
+        let mut pending = vec![1.0f32; proc.pending_output.len()];
+        let copied = proc.pending_output.peek_slice(&mut pending);
+        assert_eq!(copied, 6);
+        assert_eq!(pending, vec![0.0; 6]);
+    }
+
+    #[test]
+    fn test_reconcile_fixed_flush_pending_output_trims_remaining_tail() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44_100)
+            .with_channels(2);
+        let mut proc = StreamProcessor::new(params);
+
+        assert_eq!(
+            proc.pending_output
+                .push_slice(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),
+            6
+        );
+        proc.total_output_emitted_samples = 4;
+        proc.expected_total_output_samples = 8.0;
+
+        proc.reconcile_fixed_flush_pending_output(2).unwrap();
+
+        let mut pending = vec![0.0f32; proc.pending_output.len()];
+        let copied = proc.pending_output.peek_slice(&mut pending);
+        assert_eq!(copied, 4);
+        assert_eq!(pending, vec![0.1, 0.2, 0.3, 0.4]);
     }
 
     #[test]
