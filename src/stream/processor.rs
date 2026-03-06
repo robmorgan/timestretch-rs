@@ -679,6 +679,41 @@ impl StreamProcessor {
             .required_samples)
     }
 
+    /// Returns the exact number of interleaved samples already queued for fixed-buffer draining.
+    ///
+    /// This counts host-visible samples currently buffered above the
+    /// deterministic dual-plane backend. Hosts can add this value to
+    /// [`StreamProcessor::max_process_interleaved_output_samples`] to size an
+    /// output buffer large enough to drain the current queue and capture all
+    /// new output from the next [`StreamProcessor::process_interleaved_into`]
+    /// call.
+    ///
+    /// This helper is available when the deterministic dual-plane backend is
+    /// active. The returned sample count is always aligned to whole frames.
+    pub fn queued_interleaved_output_samples(&mut self) -> Result<usize, StretchError> {
+        if self.use_hybrid {
+            return Err(StretchError::InvalidState(
+                "fixed-buffer queued-output inspection is unavailable in legacy hybrid mode",
+            ));
+        }
+
+        self.ensure_default_dual_plane_backend();
+        let Some(state_meta) = self.dual_plane_deterministic.as_ref() else {
+            return Err(StretchError::InvalidState(
+                "dual-plane deterministic backend is unavailable",
+            ));
+        };
+
+        let num_channels = state_meta.num_channels.max(1);
+        if !self.pending_output.len().is_multiple_of(num_channels) {
+            return Err(StretchError::InvalidState(
+                "queued fixed-buffer output lost interleaved frame alignment",
+            ));
+        }
+
+        Ok(self.pending_output.len())
+    }
+
     /// Returns a deterministic upper bound for remaining fixed-buffer flush output.
     ///
     /// The returned value is a conservative upper bound for the number of
@@ -4220,6 +4255,75 @@ mod tests {
             err,
             StretchError::InvalidState(
                 "fixed-buffer processing is unavailable in legacy hybrid mode"
+            )
+        );
+    }
+
+    #[test]
+    fn test_queued_interleaved_output_samples_tracks_pending_drain() {
+        let params = StretchParams::new(1.03)
+            .with_sample_rate(44_100)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_dual_plane_deterministic(true).unwrap();
+        proc.set_pitch_scale(1.05).unwrap();
+
+        let mut input = Vec::with_capacity(256 * 2 * 12);
+        for i in 0..(256 * 12) {
+            let t = i as f32 / 44_100.0;
+            input.push((2.0 * PI * 110.0 * t).sin() * 0.3);
+            input.push((2.0 * PI * 330.0 * t).sin() * 0.25);
+        }
+
+        let mut callback_output = [0.0f32; 6];
+        for chunk in input.chunks(256 * 2) {
+            let _ = proc
+                .process_interleaved_into(chunk, &mut callback_output)
+                .unwrap();
+            if proc.queued_interleaved_output_samples().unwrap() >= 24 {
+                break;
+            }
+        }
+
+        let queued_before = proc.queued_interleaved_output_samples().unwrap();
+        assert!(
+            queued_before >= 24,
+            "expected queued output to validate fixed-buffer drain accounting"
+        );
+        assert_eq!(queued_before % 2, 0);
+
+        let mut partial_drain = [0.0f32; 8];
+        let written = proc
+            .process_interleaved_into(&[], &mut partial_drain)
+            .unwrap();
+        assert!(written > 0);
+        assert_eq!(
+            proc.queued_interleaved_output_samples().unwrap(),
+            queued_before - written
+        );
+
+        let remaining = proc.queued_interleaved_output_samples().unwrap();
+        let mut rest = vec![0.0f32; remaining];
+        let drained = proc.process_interleaved_into(&[], &mut rest).unwrap();
+        assert_eq!(drained, remaining);
+        assert_eq!(proc.queued_interleaved_output_samples().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_queued_interleaved_output_samples_rejects_hybrid_mode() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44_100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        let err = proc.queued_interleaved_output_samples().unwrap_err();
+        assert_eq!(
+            err,
+            StretchError::InvalidState(
+                "fixed-buffer queued-output inspection is unavailable in legacy hybrid mode"
             )
         );
     }
