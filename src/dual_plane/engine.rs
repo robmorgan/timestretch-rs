@@ -4,7 +4,8 @@ use crate::dual_plane::analysis_plane::{AnalysisPlane, AnalysisPlaneConfig};
 use crate::dual_plane::hints::RenderHints;
 use crate::dual_plane::quality::QualityTier;
 use crate::dual_plane::rt::{
-    RtConfig, RtControlSender, RtProcessor, RtProfileTelemetry, RtRuntimeTelemetry,
+    RtConfig, RtControlSender, RtDelayTelemetry, RtProcessor, RtProfileTelemetry,
+    RtRuntimeTelemetry,
 };
 use crate::dual_plane::warp_map::TimeWarpMap;
 use crate::error::StretchError;
@@ -147,6 +148,10 @@ impl DualPlaneProcessor {
 
     pub fn runtime_telemetry(&self) -> RtRuntimeTelemetry {
         self.rt.runtime_telemetry()
+    }
+
+    pub fn delay_telemetry(&self) -> RtDelayTelemetry {
+        self.rt.delay_telemetry()
     }
 
     pub fn active_ratio(&self) -> f64 {

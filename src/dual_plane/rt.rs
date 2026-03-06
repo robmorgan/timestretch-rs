@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 const RATIO_SNAP_EPS: f64 = 1e-6;
 const UNITY_BYPASS_RATIO_EPS: f64 = 1e-6;
+const ALGORITHMIC_DELAY_FFT_NUMERATOR: usize = 3;
+const ALGORITHMIC_DELAY_FFT_DENOMINATOR: usize = 2;
 
 /// Lock-free snapshot mailbox shared between control producers and RT callback.
 ///
@@ -230,6 +232,23 @@ pub struct RtRuntimeTelemetry {
     pub output_dropped_samples: u64,
     pub quality_demotions_due_to_overload: u64,
     pub process_error_count: u64,
+}
+
+/// Exact realtime delay telemetry exported for host compensation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RtDelayTelemetry {
+    /// Fixed algorithmic delay of the active stretcher core.
+    pub algorithmic_frames: usize,
+    /// Additional queued input not yet consumed by the RT core.
+    pub buffered_input_frames: usize,
+    /// Additional rendered output still queued for host delivery.
+    pub buffered_output_frames: usize,
+    /// Delay contribution from the current latency profile.
+    pub profile_frames: usize,
+    /// Delay contribution from the current quality tier.
+    pub tier_frames: usize,
+    /// Exact current total delay visible to the host.
+    pub total_frames: usize,
 }
 
 /// Sender handle for publishing control-plane snapshots without blocking RT.
@@ -539,6 +558,29 @@ impl RtProcessor {
     /// Returns cumulative realtime runtime telemetry.
     pub fn runtime_telemetry(&self) -> RtRuntimeTelemetry {
         self.runtime_telemetry
+    }
+
+    /// Returns exact current delay telemetry for host compensation.
+    pub fn delay_telemetry(&self) -> RtDelayTelemetry {
+        let algorithmic_frames = algorithmic_delay_frames(self.config.params.fft_size);
+        let buffered_input_frames = self.input_ring.len() / self.num_channels.max(1);
+        let buffered_output_frames = self.pending_output.len() / self.num_channels.max(1);
+        let profile_frames = 0;
+        let tier_frames = 0;
+        let total_frames = algorithmic_frames
+            .saturating_add(buffered_input_frames)
+            .saturating_add(buffered_output_frames)
+            .saturating_add(profile_frames)
+            .saturating_add(tier_frames);
+
+        RtDelayTelemetry {
+            algorithmic_frames,
+            buffered_input_frames,
+            buffered_output_frames,
+            profile_frames,
+            tier_frames,
+            total_frames,
+        }
     }
 
     /// Current warp ratio consumed by kernels.
@@ -1430,9 +1472,16 @@ impl RtProcessor {
     }
 }
 
+#[inline]
+const fn algorithmic_delay_frames(fft_size: usize) -> usize {
+    fft_size * ALGORITHMIC_DELAY_FFT_NUMERATOR / ALGORITHMIC_DELAY_FFT_DENOMINATOR
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LatencyProfile, QualityTier, RtConfig, RtProcessor, RtRuntimeTelemetry};
+    use super::{
+        LatencyProfile, QualityTier, RtConfig, RtDelayTelemetry, RtProcessor, RtRuntimeTelemetry,
+    };
     use crate::core::types::StretchParams;
     use crate::dual_plane::hints::RenderHints;
     use crate::dual_plane::warp_map::TimeWarpMap;
@@ -1872,6 +1921,49 @@ mod tests {
         let mut outputs = [&mut out[..]];
         assert_eq!(rt.process(&bad_inputs, &mut outputs), (0, 0));
         assert_eq!(rt.runtime_telemetry().process_error_count, 1);
+    }
+
+    #[test]
+    fn delay_telemetry_tracks_algorithmic_and_buffered_frames() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let cfg = RtConfig::new(params, 128);
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        assert_eq!(
+            rt.delay_telemetry(),
+            RtDelayTelemetry {
+                algorithmic_frames: 96,
+                buffered_input_frames: 0,
+                buffered_output_frames: 0,
+                profile_frames: 0,
+                tier_frames: 0,
+                total_frames: 96,
+            }
+        );
+
+        let input_fill = vec![0.0f32; 24];
+        let output_fill = vec![0.0f32; 40];
+        assert_eq!(rt.input_ring.push_slice(&input_fill), input_fill.len());
+        assert_eq!(
+            rt.pending_output.push_slice(&output_fill),
+            output_fill.len()
+        );
+
+        assert_eq!(
+            rt.delay_telemetry(),
+            RtDelayTelemetry {
+                algorithmic_frames: 96,
+                buffered_input_frames: 24,
+                buffered_output_frames: 40,
+                profile_frames: 0,
+                tier_frames: 0,
+                total_frames: 160,
+            }
+        );
     }
 
     #[test]

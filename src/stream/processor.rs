@@ -5,7 +5,8 @@ use crate::core::ring_buffer::RingBuffer;
 use crate::core::types::{QualityMode, StretchParams};
 use crate::core::window::WindowType;
 use crate::dual_plane::{
-    DualPlaneProcessor, LatencyProfile, RtConfig, RtProfileTelemetry, RtRuntimeTelemetry,
+    DualPlaneProcessor, LatencyProfile, RtConfig, RtDelayTelemetry, RtProfileTelemetry,
+    RtRuntimeTelemetry,
 };
 use crate::error::StretchError;
 use crate::stream::transient_scheduler::{TransientEventScheduler, TransientSchedulerStats};
@@ -1959,6 +1960,13 @@ impl StreamProcessor {
             .map(|state| state.processor.runtime_telemetry())
     }
 
+    /// Returns exact deterministic dual-plane delay telemetry when active.
+    pub fn deterministic_delay_telemetry(&self) -> Option<RtDelayTelemetry> {
+        self.dual_plane_deterministic
+            .as_ref()
+            .map(|state| state.processor.delay_telemetry())
+    }
+
     /// Returns cumulative transient-reset telemetry for the current stream.
     pub fn transient_reset_stats(&self) -> TransientResetStats {
         let TransientSchedulerStats {
@@ -2880,6 +2888,44 @@ mod tests {
             .deterministic_runtime_telemetry()
             .expect("dual-plane runtime telemetry should be available by default");
         assert_eq!(telemetry, RtRuntimeTelemetry::default());
+    }
+
+    #[test]
+    fn test_stream_processor_dual_plane_delay_telemetry_tracks_buffering() {
+        let params = StretchParams::new(1.02)
+            .with_sample_rate(44_100)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut proc = StreamProcessor::new(params);
+
+        let initial = proc
+            .deterministic_delay_telemetry()
+            .expect("dual-plane delay telemetry should be available by default");
+        assert_eq!(initial.algorithmic_frames, 96);
+        assert_eq!(initial.buffered_input_frames, 0);
+        assert_eq!(initial.buffered_output_frames, 0);
+        assert_eq!(initial.total_frames, 96);
+
+        let mut output = Vec::with_capacity(128);
+        proc.process_into(&[0.0; 32], &mut output).unwrap();
+        assert!(output.is_empty());
+
+        let buffered = proc
+            .deterministic_delay_telemetry()
+            .expect("dual-plane delay telemetry should remain available");
+        assert_eq!(buffered.algorithmic_frames, 96);
+        assert_eq!(buffered.buffered_input_frames, 32);
+        assert_eq!(buffered.buffered_output_frames, 0);
+        assert_eq!(buffered.total_frames, 128);
+
+        proc.flush_into(&mut output).unwrap();
+        let flushed = proc
+            .deterministic_delay_telemetry()
+            .expect("dual-plane delay telemetry should remain available");
+        assert_eq!(flushed.buffered_input_frames, 0);
+        assert_eq!(flushed.buffered_output_frames, 0);
+        assert_eq!(flushed.total_frames, 96);
     }
 
     #[test]

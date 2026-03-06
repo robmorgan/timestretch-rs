@@ -119,6 +119,6 @@ Acceptance:
 
 ## Current Implementation Slice
 
-This change set starts Phase 1 by adding explicit runtime telemetry for
-realtime overloads and callback failures, and by surfacing that telemetry
-through the deterministic `StreamProcessor` path.
+This change set continues Phase 1 by adding exact deterministic delay telemetry
+to the RT core, alongside the existing overload and callback-failure telemetry,
+and by surfacing that state through the deterministic `StreamProcessor` path.
