@@ -141,7 +141,10 @@ fn main() {
 
     let stereo_input = mono_to_stereo_interleaved(&generate_house_pattern(sample_rate, 128.0, 2.0));
     let input_chunk_samples = 256 * 2;
-    let mut callback_output = [0.0f32; 384];
+    let callback_capacity = processor
+        .max_process_interleaved_output_samples(input_chunk_samples)
+        .expect("process budget query failed");
+    let mut callback_output = vec![0.0f32; callback_capacity];
     let mut total_output_samples = 0usize;
     let mut max_callback_samples = 0usize;
 
@@ -155,12 +158,18 @@ fn main() {
 
     let mut flush_calls = 0usize;
     loop {
+        let flush_capacity = processor
+            .max_flush_interleaved_output_samples()
+            .expect("flush budget query failed");
+        if flush_capacity == 0 {
+            break;
+        }
+        if callback_output.len() < flush_capacity {
+            callback_output.resize(flush_capacity, 0.0);
+        }
         let written = processor
             .flush_interleaved_into(&mut callback_output)
             .expect("fixed-buffer flush failed");
-        if written == 0 {
-            break;
-        }
         flush_calls += 1;
         total_output_samples += written;
         max_callback_samples = max_callback_samples.max(written);
