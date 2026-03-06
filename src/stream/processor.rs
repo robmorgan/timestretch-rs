@@ -511,6 +511,18 @@ struct FixedProcessInterleavedBudget {
     required_samples: usize,
 }
 
+#[inline]
+fn align_interleaved_samples_up(samples: usize, num_channels: usize) -> usize {
+    if num_channels <= 1 {
+        return samples;
+    }
+
+    samples
+        .saturating_add(num_channels.saturating_sub(1))
+        .saturating_div(num_channels)
+        .saturating_mul(num_channels)
+}
+
 impl StreamProcessor {
     /// Creates a new streaming processor.
     pub fn new(params: StretchParams) -> Self {
@@ -659,6 +671,41 @@ impl StreamProcessor {
         Ok(self
             .fixed_process_interleaved_budget(input_samples)?
             .required_samples)
+    }
+
+    /// Returns a deterministic upper bound for remaining fixed-buffer flush output.
+    ///
+    /// The returned value is a conservative upper bound for the number of
+    /// interleaved samples still required to drain the current stream tail. If `output` in
+    /// [`StreamProcessor::flush_interleaved_into`] is at least this large, the
+    /// remaining tail drains in one call from the current stream state.
+    ///
+    /// This helper is available when the deterministic dual-plane backend is
+    /// active. The returned sample count is always aligned to whole frames.
+    pub fn max_flush_interleaved_output_samples(&mut self) -> Result<usize, StretchError> {
+        if self.use_hybrid {
+            return Err(StretchError::InvalidState(
+                "fixed-buffer flush is unavailable in legacy hybrid mode",
+            ));
+        }
+
+        self.ensure_default_dual_plane_backend();
+        let Some(state_meta) = self.dual_plane_deterministic.as_ref() else {
+            return Err(StretchError::InvalidState(
+                "dual-plane deterministic backend is unavailable",
+            ));
+        };
+
+        let num_channels = state_meta.num_channels.max(1);
+        let remaining = self.remaining_expected_flush_samples();
+        if remaining == 0 && self.pending_output.is_empty() {
+            return Ok(0);
+        }
+
+        Ok(align_interleaved_samples_up(
+            remaining.saturating_add(self.pending_output.capacity()),
+            num_channels,
+        ))
     }
 
     /// Processes a chunk of deterministic interleaved audio into a fixed buffer.
@@ -1384,6 +1431,12 @@ impl StreamProcessor {
             block_frames: state_meta.block_frames,
             required_samples,
         })
+    }
+
+    #[inline]
+    fn remaining_expected_flush_samples(&self) -> usize {
+        let expected_total = self.expected_total_output_samples.round().max(0.0) as usize;
+        expected_total.saturating_sub(self.total_output_emitted_samples)
     }
 
     fn process_dual_plane_chunk_to_pending(&mut self, input: &[f32]) -> Result<(), StretchError> {
@@ -4112,6 +4165,120 @@ mod tests {
             StretchError::InvalidState(
                 "fixed-buffer processing is unavailable in legacy hybrid mode"
             )
+        );
+    }
+
+    #[test]
+    fn test_max_flush_interleaved_output_samples_drains_remaining_tail_in_one_call() {
+        let params = StretchParams::new(1.03)
+            .with_sample_rate(44_100)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut vec_proc = StreamProcessor::new(params.clone());
+        let mut fixed_proc = StreamProcessor::new(params);
+        vec_proc.set_dual_plane_deterministic(true).unwrap();
+        fixed_proc.set_dual_plane_deterministic(true).unwrap();
+        vec_proc.set_pitch_scale(1.05).unwrap();
+        fixed_proc.set_pitch_scale(1.05).unwrap();
+
+        let mut input = Vec::with_capacity(256 * 2 * 12);
+        for i in 0..(256 * 12) {
+            let t = i as f32 / 44_100.0;
+            input.push((2.0 * PI * 110.0 * t).sin() * 0.3);
+            input.push((2.0 * PI * 330.0 * t).sin() * 0.25);
+        }
+
+        let mut expected = Vec::with_capacity(input.len() * 2);
+        let mut actual = Vec::with_capacity(input.len() * 2);
+        let mut callback_output = vec![0.0f32; 74];
+        for input_chunk in input.chunks(256 * 2) {
+            vec_proc.process_into(input_chunk, &mut expected).unwrap();
+            let written = fixed_proc
+                .process_interleaved_into(input_chunk, &mut callback_output)
+                .unwrap();
+            actual.extend_from_slice(&callback_output[..written]);
+        }
+
+        vec_proc.flush_into(&mut expected).unwrap();
+
+        let remaining = fixed_proc.max_flush_interleaved_output_samples().unwrap();
+        assert!(remaining > 0);
+
+        let mut flush_output = vec![0.0f32; remaining];
+        let written = fixed_proc
+            .flush_interleaved_into(&mut flush_output)
+            .unwrap();
+        assert!(written <= remaining);
+        actual.extend_from_slice(&flush_output[..written]);
+
+        assert_eq!(
+            fixed_proc.max_flush_interleaved_output_samples().unwrap(),
+            0
+        );
+        assert_eq!(
+            fixed_proc
+                .flush_interleaved_into(&mut flush_output)
+                .unwrap(),
+            0
+        );
+        assert_eq!(expected.len(), actual.len());
+        for (idx, (&lhs, &rhs)) in expected.iter().zip(actual.iter()).enumerate() {
+            assert!(
+                (lhs - rhs).abs() < 1e-6,
+                "Mismatch at sample {idx}: {lhs} vs {rhs}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_max_flush_interleaved_output_samples_tracks_partial_tail_drain() {
+        let params = StretchParams::new(1.04)
+            .with_sample_rate(44_100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_dual_plane_deterministic(true).unwrap();
+
+        let input: Vec<f32> = (0..(256 * 16))
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44_100.0).sin() * 0.7)
+            .collect();
+        let mut callback_output = [0.0f32; 64];
+        for chunk in input.chunks(256) {
+            let _ = proc
+                .process_interleaved_into(chunk, &mut callback_output)
+                .unwrap();
+        }
+
+        let mut first_chunk = [0.0f32; 8];
+        let first_written = proc.flush_interleaved_into(&mut first_chunk).unwrap();
+        assert!(first_written > 0);
+        assert!(proc.fixed_flush_pending);
+
+        let remaining = proc.max_flush_interleaved_output_samples().unwrap();
+        assert!(remaining > 0);
+
+        let mut rest = vec![0.0f32; remaining];
+        let written = proc.flush_interleaved_into(&mut rest).unwrap();
+        assert!(written <= remaining);
+        assert_eq!(proc.max_flush_interleaved_output_samples().unwrap(), 0);
+        assert_eq!(proc.flush_interleaved_into(&mut rest).unwrap(), 0);
+        assert!(!proc.fixed_flush_pending);
+    }
+
+    #[test]
+    fn test_max_flush_interleaved_output_samples_rejects_hybrid_mode() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44_100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        let err = proc.max_flush_interleaved_output_samples().unwrap_err();
+        assert_eq!(
+            err,
+            StretchError::InvalidState("fixed-buffer flush is unavailable in legacy hybrid mode")
         );
     }
 
