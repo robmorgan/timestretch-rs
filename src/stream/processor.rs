@@ -679,6 +679,38 @@ impl StreamProcessor {
             .required_samples)
     }
 
+    /// Returns a deterministic upper bound for the next fixed-buffer process callback output.
+    ///
+    /// The returned value includes both interleaved samples already queued for
+    /// draining and the maximum number of new interleaved samples the
+    /// deterministic fixed-buffer path may emit while consuming `input_samples`
+    /// of new input. If `output` in [`StreamProcessor::process_interleaved_into`]
+    /// is at least this large, the next call can drain the current queue and
+    /// accept `input_samples` of new input without leaving host-visible backlog
+    /// above the deterministic backend.
+    ///
+    /// This helper is equivalent to adding
+    /// [`StreamProcessor::queued_interleaved_output_samples`] and
+    /// [`StreamProcessor::max_process_interleaved_output_samples`], but keeps
+    /// next-callback sizing in one frame-aligned public call.
+    pub fn max_next_process_interleaved_output_samples(
+        &mut self,
+        input_samples: usize,
+    ) -> Result<usize, StretchError> {
+        let FixedProcessInterleavedBudget {
+            num_channels,
+            required_samples,
+            ..
+        } = self.fixed_process_interleaved_budget(input_samples)?;
+        if !self.pending_output.len().is_multiple_of(num_channels) {
+            return Err(StretchError::InvalidState(
+                "queued fixed-buffer output lost interleaved frame alignment",
+            ));
+        }
+
+        Ok(self.pending_output.len().saturating_add(required_samples))
+    }
+
     /// Returns the exact number of interleaved samples already queued for fixed-buffer draining.
     ///
     /// This counts host-visible samples currently buffered above the
@@ -4251,6 +4283,81 @@ mod tests {
         proc.set_hybrid_mode(true);
 
         let err = proc.max_process_interleaved_output_samples(16).unwrap_err();
+        assert_eq!(
+            err,
+            StretchError::InvalidState(
+                "fixed-buffer processing is unavailable in legacy hybrid mode"
+            )
+        );
+    }
+
+    #[test]
+    fn test_max_next_process_interleaved_output_samples_matches_combined_helpers() {
+        let params = StretchParams::new(1.03)
+            .with_sample_rate(44_100)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_dual_plane_deterministic(true).unwrap();
+        proc.set_pitch_scale(1.05).unwrap();
+
+        let mut input = Vec::with_capacity(256 * 2 * 12);
+        for i in 0..(256 * 12) {
+            let t = i as f32 / 44_100.0;
+            input.push((2.0 * PI * 110.0 * t).sin() * 0.3);
+            input.push((2.0 * PI * 330.0 * t).sin() * 0.25);
+        }
+
+        let input_chunk_len = 256 * 2;
+        let no_pending_budget = proc
+            .max_next_process_interleaved_output_samples(input_chunk_len)
+            .unwrap();
+        assert_eq!(
+            no_pending_budget,
+            proc.max_process_interleaved_output_samples(input_chunk_len)
+                .unwrap()
+        );
+        assert_eq!(no_pending_budget % 2, 0);
+
+        let mut callback_output = [0.0f32; 6];
+        for chunk in input.chunks(input_chunk_len) {
+            let _ = proc
+                .process_interleaved_into(chunk, &mut callback_output)
+                .unwrap();
+            if proc.queued_interleaved_output_samples().unwrap() >= 24 {
+                break;
+            }
+        }
+
+        let queued = proc.queued_interleaved_output_samples().unwrap();
+        assert!(
+            queued >= 24,
+            "expected queued output to validate combined budget"
+        );
+
+        let combined = proc
+            .max_next_process_interleaved_output_samples(input_chunk_len)
+            .unwrap();
+        let expected = queued.saturating_add(
+            proc.max_process_interleaved_output_samples(input_chunk_len)
+                .unwrap(),
+        );
+        assert_eq!(combined, expected);
+        assert_eq!(combined % 2, 0);
+    }
+
+    #[test]
+    fn test_max_next_process_interleaved_output_samples_rejects_hybrid_mode() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44_100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        let err = proc
+            .max_next_process_interleaved_output_samples(16)
+            .unwrap_err();
         assert_eq!(
             err,
             StretchError::InvalidState(

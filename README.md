@@ -121,7 +121,10 @@ let mut processor = StreamProcessor::new(params);
 processor.set_streaming_engine(StreamingEngine::Deterministic); // required
 
 let input_chunk = vec![0.0f32; 256 * 2];
-let mut callback_output = [0.0f32; 384]; // interleaved stereo scratch
+let callback_capacity = processor
+    .max_next_process_interleaved_output_samples(input_chunk.len())
+    .unwrap();
+let mut callback_output = vec![0.0f32; callback_capacity];
 
 let written = processor
     .process_interleaved_into(&input_chunk, &mut callback_output)

@@ -215,3 +215,78 @@ fn fixed_buffer_queued_output_helper_drains_midstream_pending_exactly() {
         );
     }
 }
+
+#[test]
+fn fixed_buffer_next_process_budget_drains_queued_and_new_output_in_one_callback() {
+    let params = StretchParams::new(1.03)
+        .with_preset(EdmPreset::DjBeatmatch)
+        .with_sample_rate(44_100)
+        .with_channels(2)
+        .with_fft_size(1024)
+        .with_hop_size(256);
+    let mut vec_proc = StreamProcessor::new(params.clone());
+    let mut fixed_proc = StreamProcessor::new(params);
+    vec_proc.set_streaming_engine(StreamingEngine::Deterministic);
+    fixed_proc.set_streaming_engine(StreamingEngine::Deterministic);
+    vec_proc.set_pitch_scale(1.05).unwrap();
+    fixed_proc.set_pitch_scale(1.05).unwrap();
+
+    let input = stereo_input(44_100, 256 * 14);
+    let mut expected = Vec::with_capacity(input.len() * 2);
+    let mut actual = Vec::with_capacity(input.len() * 2);
+    let mut callback_output = [0.0f32; 6];
+    let mut chunks = input.chunks(256 * 2);
+    let next_chunk = loop {
+        let chunk = chunks
+            .next()
+            .expect("expected queued output before the stream ended");
+
+        vec_proc.process_into(chunk, &mut expected).unwrap();
+        let written = fixed_proc
+            .process_interleaved_into(chunk, &mut callback_output)
+            .unwrap();
+        actual.extend_from_slice(&callback_output[..written]);
+
+        if fixed_proc.queued_interleaved_output_samples().unwrap() >= 24 {
+            break chunks
+                .next()
+                .expect("expected another callback chunk after queue buildup");
+        }
+    };
+
+    let queued = fixed_proc.queued_interleaved_output_samples().unwrap();
+    assert!(
+        queued >= 24,
+        "expected pending output to exercise combined budget"
+    );
+
+    let combined_budget = fixed_proc
+        .max_next_process_interleaved_output_samples(next_chunk.len())
+        .unwrap();
+    assert_eq!(
+        combined_budget,
+        queued.saturating_add(
+            fixed_proc
+                .max_process_interleaved_output_samples(next_chunk.len())
+                .unwrap()
+        )
+    );
+    assert_eq!(combined_budget % 2, 0, "budget must stay frame-aligned");
+
+    vec_proc.process_into(next_chunk, &mut expected).unwrap();
+
+    let mut catch_up_output = vec![0.0f32; combined_budget];
+    let written = fixed_proc
+        .process_interleaved_into(next_chunk, &mut catch_up_output)
+        .unwrap();
+    actual.extend_from_slice(&catch_up_output[..written]);
+
+    assert_eq!(fixed_proc.queued_interleaved_output_samples().unwrap(), 0);
+    assert_eq!(expected.len(), actual.len());
+    for (idx, (&lhs, &rhs)) in expected.iter().zip(actual.iter()).enumerate() {
+        assert!(
+            (lhs - rhs).abs() < 1e-6,
+            "Mismatch at sample {idx}: {lhs} vs {rhs}"
+        );
+    }
+}

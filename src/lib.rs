@@ -65,7 +65,7 @@
 //!
 //! let input_chunk = vec![0.0f32; 256 * 2];
 //! let callback_capacity = processor
-//!     .max_process_interleaved_output_samples(input_chunk.len())
+//!     .max_next_process_interleaved_output_samples(input_chunk.len())
 //!     .unwrap();
 //! let mut callback_output = vec![0.0f32; callback_capacity];
 //! let written = processor
