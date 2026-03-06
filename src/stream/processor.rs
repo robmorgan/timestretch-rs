@@ -469,6 +469,12 @@ pub struct StreamProcessor {
     pitch_resamplers: Vec<LinearResamplerState>,
     /// Reusable per-channel output buffers for pitch-resampled data.
     pitch_output_buffers: Vec<Vec<f32>>,
+    /// Whether a fixed-buffer flush drain is currently in progress.
+    fixed_flush_pending: bool,
+    /// Whether the deterministic backend has fully emitted its flush tail.
+    fixed_flush_source_exhausted: bool,
+    /// Whether pitch-resampler tail flush has already been applied.
+    fixed_flush_pitch_tail_flushed: bool,
     /// Whether deterministic mode prefers the dual-plane backend.
     dual_plane_preferred: bool,
     /// Optional active dual-plane deterministic backend state.
@@ -485,6 +491,7 @@ impl std::fmt::Debug for StreamProcessor {
             .field("pitch_scale", &self.pitch_scale)
             .field("hybrid_realtime_strict", &self.hybrid_realtime_strict)
             .field("initialized", &self.initialized)
+            .field("fixed_flush_pending", &self.fixed_flush_pending)
             .field(
                 "dual_plane_deterministic",
                 &self.dual_plane_deterministic.is_some(),
@@ -556,6 +563,9 @@ impl StreamProcessor {
             pitch_output_buffers: (0..num_channels)
                 .map(|_| Vec::with_capacity(pitch_output_capacity_frames))
                 .collect(),
+            fixed_flush_pending: false,
+            fixed_flush_source_exhausted: false,
+            fixed_flush_pitch_tail_flushed: false,
             dual_plane_preferred: true,
             dual_plane_deterministic: None,
         };
@@ -633,6 +643,11 @@ impl StreamProcessor {
         input: &[f32],
         output: &mut Vec<f32>,
     ) -> Result<(), StretchError> {
+        if self.fixed_flush_pending {
+            return Err(StretchError::InvalidState(
+                "fixed-buffer flush output must be fully drained before new input",
+            ));
+        }
         if input.iter().any(|s| !s.is_finite()) {
             return Err(StretchError::NonFiniteInput);
         }
@@ -716,6 +731,11 @@ impl StreamProcessor {
     ///
     /// Returns the number of samples written to `output`.
     pub fn flush_into(&mut self, output: &mut Vec<f32>) -> Result<usize, StretchError> {
+        if self.fixed_flush_pending {
+            return Err(StretchError::InvalidState(
+                "fixed-buffer flush output must be fully drained before Vec flush",
+            ));
+        }
         let before = output.len();
         if self.dual_plane_deterministic.is_some() && !self.use_hybrid {
             let written = self.flush_into_dual_plane(output)?;
@@ -848,6 +868,29 @@ impl StreamProcessor {
         let mut out = Vec::with_capacity(self.pending_output.capacity());
         self.flush_into(&mut out)?;
         Ok(out)
+    }
+
+    /// Flushes remaining deterministic interleaved samples into a fixed buffer.
+    ///
+    /// This host-facing fixed-buffer contract is available when the
+    /// deterministic dual-plane backend is active. If more output remains than
+    /// fits in `output`, call again until this method returns `0`. No new
+    /// input may be processed until the flush tail has been fully drained.
+    pub fn flush_interleaved_into(&mut self, output: &mut [f32]) -> Result<usize, StretchError> {
+        if self.use_hybrid {
+            return Err(StretchError::InvalidState(
+                "fixed-buffer flush is unavailable in legacy hybrid mode",
+            ));
+        }
+
+        self.ensure_default_dual_plane_backend();
+        if self.dual_plane_deterministic.is_none() {
+            return Err(StretchError::InvalidState(
+                "dual-plane deterministic backend is unavailable",
+            ));
+        }
+
+        self.flush_interleaved_into_dual_plane(output)
     }
 
     fn process_into_dual_plane(
@@ -1101,6 +1144,147 @@ impl StreamProcessor {
         self.reset_pitch_resamplers();
         let _ = self.drain_pending_to_output(output)?;
         Ok(output.len().saturating_sub(before))
+    }
+
+    fn flush_interleaved_into_dual_plane(
+        &mut self,
+        output: &mut [f32],
+    ) -> Result<usize, StretchError> {
+        let num_channels = self.params.channels.count().max(1);
+        let aligned_capacity = output
+            .len()
+            .saturating_div(num_channels)
+            .saturating_mul(num_channels);
+
+        if !self.fixed_flush_pending {
+            self.fixed_flush_pending = true;
+            self.fixed_flush_source_exhausted = false;
+            self.fixed_flush_pitch_tail_flushed = false;
+        }
+
+        let mut written_total = 0usize;
+        loop {
+            if written_total < aligned_capacity {
+                let written =
+                    self.drain_pending_to_buffer(&mut output[written_total..aligned_capacity])?;
+                written_total += written;
+                if written_total == aligned_capacity {
+                    return Ok(written_total);
+                }
+            }
+
+            if !self.fixed_flush_source_exhausted {
+                if self.flush_next_dual_plane_chunk_to_pending()? > 0 {
+                    continue;
+                }
+                self.fixed_flush_source_exhausted = true;
+            }
+
+            if !self.fixed_flush_pitch_tail_flushed {
+                self.flush_pitch_resampler_to_pending(num_channels)?;
+                self.reset_pitch_resamplers();
+                self.fixed_flush_pitch_tail_flushed = true;
+                if !self.pending_output.is_empty() {
+                    continue;
+                }
+            }
+
+            if self.pending_output.is_empty() {
+                self.finish_fixed_flush_drain();
+                return Ok(written_total);
+            }
+
+            if aligned_capacity == 0 {
+                return Err(StretchError::BufferOverflow {
+                    buffer: "stream_flush_interleaved_output",
+                    requested: num_channels,
+                    available: 0,
+                });
+            }
+
+            return Ok(written_total);
+        }
+    }
+
+    fn flush_next_dual_plane_chunk_to_pending(&mut self) -> Result<usize, StretchError> {
+        let Some(_state) = self.dual_plane_deterministic.as_ref() else {
+            return Err(StretchError::InvalidState(
+                "dual-plane deterministic state is unavailable",
+            ));
+        };
+
+        let num_channels = self.params.channels.count().max(1);
+        let max_chunk_frames = self
+            .channel_output_buffers
+            .iter()
+            .take(num_channels)
+            .map(|buf| buf.capacity())
+            .min()
+            .unwrap_or(0);
+        if max_chunk_frames == 0 {
+            return Err(StretchError::BufferOverflow {
+                buffer: "stream_channel_output",
+                requested: 1,
+                available: 0,
+            });
+        }
+
+        let written = {
+            let Some(state) = self.dual_plane_deterministic.as_mut() else {
+                return Err(StretchError::InvalidState(
+                    "dual-plane deterministic state became unavailable",
+                ));
+            };
+            let chunk_samples = max_chunk_frames.saturating_mul(num_channels);
+            if state.flush_interleaved.len() != chunk_samples {
+                state.flush_interleaved.resize(chunk_samples, 0.0);
+            }
+            state
+                .processor
+                .flush_into(&mut state.flush_interleaved[..])?
+        };
+        if written == 0 {
+            return Ok(0);
+        }
+        if !written.is_multiple_of(num_channels) {
+            return Err(StretchError::InvalidState(
+                "dual-plane flush emitted non-interleaved sample count",
+            ));
+        }
+
+        let chunk_frames = written / num_channels;
+        {
+            let (channel_output_buffers, dual_plane_state) = (
+                &mut self.channel_output_buffers,
+                &mut self.dual_plane_deterministic,
+            );
+            let Some(state) = dual_plane_state.as_mut() else {
+                return Err(StretchError::InvalidState(
+                    "dual-plane deterministic state became unavailable",
+                ));
+            };
+
+            for ch in 0..num_channels {
+                if channel_output_buffers[ch].capacity() < chunk_frames {
+                    return Err(StretchError::BufferOverflow {
+                        buffer: "stream_channel_output",
+                        requested: chunk_frames,
+                        available: channel_output_buffers[ch].capacity(),
+                    });
+                }
+                channel_output_buffers[ch].clear();
+            }
+
+            for frame in 0..chunk_frames {
+                let base = frame * num_channels;
+                for ch in 0..num_channels {
+                    channel_output_buffers[ch].push(state.flush_interleaved[base + ch]);
+                }
+            }
+        }
+
+        self.emit_channel_output_to_pending(chunk_frames, num_channels)?;
+        Ok(written)
     }
 
     fn push_input_samples(&mut self, input: &[f32]) -> Result<(), StretchError> {
@@ -1471,6 +1655,58 @@ impl StreamProcessor {
         self.total_output_emitted_samples += written;
 
         Ok(written)
+    }
+
+    fn drain_pending_to_buffer(&mut self, output: &mut [f32]) -> Result<usize, StretchError> {
+        let pending = self.pending_output.len();
+        if pending == 0 || output.is_empty() {
+            return Ok(0);
+        }
+
+        let num_channels = self.params.channels.count().max(1);
+        let target = pending
+            .min(output.len())
+            .saturating_div(num_channels)
+            .saturating_mul(num_channels);
+        if target == 0 {
+            return Ok(0);
+        }
+
+        let mut written = 0usize;
+        let mut chunk = [0.0f32; 512];
+        let mut iterations = 0usize;
+        let max_iterations = target
+            .saturating_add(chunk.len().saturating_sub(1))
+            .saturating_div(chunk.len())
+            .saturating_add(LOOP_GUARD_SLACK);
+        while written < target {
+            iterations = iterations.saturating_add(1);
+            if iterations > max_iterations {
+                return Err(StretchError::InvalidState(
+                    "pending-output buffer drain iteration bound exceeded",
+                ));
+            }
+            let take = (target - written).min(chunk.len());
+            let n = self.pending_output.pop_slice(&mut chunk[..take]);
+            if n == 0 {
+                return Err(StretchError::InvalidState(
+                    "pending-output buffer drain made zero progress",
+                ));
+            }
+            output[written..written + n].copy_from_slice(&chunk[..n]);
+            written += n;
+        }
+
+        self.total_output_emitted_samples += written;
+        Ok(written)
+    }
+
+    fn finish_fixed_flush_drain(&mut self) {
+        self.fixed_flush_pending = false;
+        self.fixed_flush_source_exhausted = false;
+        self.fixed_flush_pitch_tail_flushed = false;
+        self.expected_total_output_samples = 0.0;
+        self.total_output_emitted_samples = 0;
     }
 
     fn append_hybrid_input(&mut self, num_channels: usize) -> Result<(), StretchError> {
@@ -2106,6 +2342,9 @@ impl StreamProcessor {
         self.total_output_emitted_samples = 0;
         self.pitch_scale = 1.0;
         self.reset_pitch_resamplers();
+        self.fixed_flush_pending = false;
+        self.fixed_flush_source_exhausted = false;
+        self.fixed_flush_pitch_tail_flushed = false;
 
         self.dual_plane_deterministic = None;
         self.ensure_default_dual_plane_backend();
@@ -3315,6 +3554,111 @@ mod tests {
         let mut output = Vec::new();
         let n = proc.flush_into(&mut output).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_flush_interleaved_into_matches_vec_flush_when_drained_in_chunks() {
+        let params = StretchParams::new(1.03)
+            .with_sample_rate(44_100)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut vec_proc = StreamProcessor::new(params.clone());
+        let mut fixed_proc = StreamProcessor::new(params);
+        vec_proc.set_dual_plane_deterministic(true).unwrap();
+        fixed_proc.set_dual_plane_deterministic(true).unwrap();
+        vec_proc.set_pitch_scale(1.05).unwrap();
+        fixed_proc.set_pitch_scale(1.05).unwrap();
+
+        let mut input = Vec::with_capacity(256 * 2 * 12);
+        for i in 0..(256 * 12) {
+            let t = i as f32 / 44_100.0;
+            input.push((2.0 * PI * 110.0 * t).sin() * 0.3);
+            input.push((2.0 * PI * 330.0 * t).sin() * 0.25);
+        }
+
+        let mut expected = Vec::with_capacity(input.len() * 2);
+        let mut actual = Vec::with_capacity(input.len() * 2);
+        for chunk in input.chunks(256 * 2) {
+            vec_proc.process_into(chunk, &mut expected).unwrap();
+            fixed_proc.process_into(chunk, &mut actual).unwrap();
+        }
+
+        vec_proc.flush_into(&mut expected).unwrap();
+
+        let mut chunk = vec![0.0f32; 74];
+        loop {
+            let written = fixed_proc.flush_interleaved_into(&mut chunk).unwrap();
+            if written == 0 {
+                break;
+            }
+            actual.extend_from_slice(&chunk[..written]);
+        }
+
+        assert_eq!(expected.len(), actual.len());
+        for (idx, (&lhs, &rhs)) in expected.iter().zip(actual.iter()).enumerate() {
+            assert!(
+                (lhs - rhs).abs() < 1e-6,
+                "Mismatch at sample {idx}: {lhs} vs {rhs}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_flush_interleaved_into_requires_tail_to_drain_before_new_input() {
+        let params = StretchParams::new(1.04)
+            .with_sample_rate(44_100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_dual_plane_deterministic(true).unwrap();
+
+        let input: Vec<f32> = (0..(256 * 16))
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44_100.0).sin() * 0.7)
+            .collect();
+        let mut streamed = Vec::with_capacity(input.len() * 2);
+        for chunk in input.chunks(256) {
+            proc.process_into(chunk, &mut streamed).unwrap();
+        }
+
+        let mut chunk = [0.0f32; 8];
+        let first_written = proc.flush_interleaved_into(&mut chunk).unwrap();
+        assert!(first_written > 0);
+        assert!(proc.fixed_flush_pending);
+
+        let err = proc.process_into(&input[..256], &mut streamed).unwrap_err();
+        assert_eq!(
+            err,
+            StretchError::InvalidState(
+                "fixed-buffer flush output must be fully drained before new input"
+            )
+        );
+
+        loop {
+            if proc.flush_interleaved_into(&mut chunk).unwrap() == 0 {
+                break;
+            }
+        }
+
+        assert!(!proc.fixed_flush_pending);
+        assert!(proc.process_into(&input[..256], &mut streamed).is_ok());
+    }
+
+    #[test]
+    fn test_flush_interleaved_into_rejects_hybrid_mode() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44_100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        let mut output = [0.0f32; 32];
+        let err = proc.flush_interleaved_into(&mut output).unwrap_err();
+        assert_eq!(
+            err,
+            StretchError::InvalidState("fixed-buffer flush is unavailable in legacy hybrid mode")
+        );
     }
 
     #[test]

@@ -119,6 +119,7 @@ Acceptance:
 
 ## Current Implementation Slice
 
-This change set continues Phase 1 by adding a fixed-buffer interleaved flush
-API to the RT core and dual-plane facade, so end-of-stream drain no longer
-depends on `Vec` append semantics in the deterministic path.
+This change set continues Phase 1 by surfacing a fixed-buffer interleaved flush
+API through `StreamProcessor` for the deterministic dual-plane path, with
+resumable drain semantics so host-facing end-of-stream output no longer
+depends on `Vec` append semantics.
