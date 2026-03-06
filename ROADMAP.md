@@ -119,7 +119,8 @@ Acceptance:
 
 ## Current Implementation Slice
 
-This change set continues Phase 1 by surfacing a fixed-buffer interleaved flush
-API through `StreamProcessor` for the deterministic dual-plane path, with
-resumable drain semantics so host-facing end-of-stream output no longer
-depends on `Vec` append semantics.
+This change set continues Phase 1 by surfacing fixed-buffer interleaved process
+and flush APIs through `StreamProcessor` for the deterministic dual-plane path,
+with bounded output-budget checks and resumable drain semantics so host-facing
+steady-state and end-of-stream output no longer depend on `Vec` append
+semantics.

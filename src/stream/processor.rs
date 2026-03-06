@@ -634,6 +634,108 @@ impl StreamProcessor {
         Ok(out)
     }
 
+    /// Processes a chunk of deterministic interleaved audio into a fixed buffer.
+    ///
+    /// Returns the number of interleaved samples written to `output`.
+    /// Only full frames are written; any trailing partial-frame capacity in
+    /// `output` is ignored.
+    ///
+    /// This host-facing fixed-buffer contract is available when the
+    /// deterministic dual-plane backend is active. Produced samples that do
+    /// not fit in `output` remain queued for later calls.
+    pub fn process_interleaved_into(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<usize, StretchError> {
+        if self.fixed_flush_pending {
+            return Err(StretchError::InvalidState(
+                "fixed-buffer flush output must be fully drained before new input",
+            ));
+        }
+        if self.use_hybrid {
+            return Err(StretchError::InvalidState(
+                "fixed-buffer processing is unavailable in legacy hybrid mode",
+            ));
+        }
+
+        self.ensure_default_dual_plane_backend();
+        let Some(state_meta) = self.dual_plane_deterministic.as_ref() else {
+            return Err(StretchError::InvalidState(
+                "dual-plane deterministic backend is unavailable",
+            ));
+        };
+        let num_channels = state_meta.num_channels.max(1);
+        let block_frames = state_meta.block_frames;
+        if !input.len().is_multiple_of(num_channels) {
+            return Err(StretchError::InvalidFormat(format!(
+                "input sample count {} is not a multiple of channel count {}",
+                input.len(),
+                num_channels
+            )));
+        }
+        if input.iter().any(|s| !s.is_finite()) {
+            return Err(StretchError::NonFiniteInput);
+        }
+
+        let aligned_capacity = output
+            .len()
+            .saturating_div(num_channels)
+            .saturating_mul(num_channels);
+        let input_frames = input.len() / num_channels;
+        let mut required_budget = 0usize;
+        let mut remaining_frames = input_frames;
+        while remaining_frames > 0 {
+            let frames = remaining_frames.min(block_frames);
+            required_budget = required_budget
+                .saturating_add(self.max_dual_plane_pending_samples_for_frames(frames)?);
+            remaining_frames -= frames;
+        }
+        let available_budget = aligned_capacity.saturating_add(self.pending_output.available());
+        if required_budget > available_budget {
+            return Err(StretchError::BufferOverflow {
+                buffer: "stream_process_interleaved_output",
+                requested: required_budget,
+                available: available_budget,
+            });
+        }
+
+        self.initialized = true;
+
+        let mut written_total = 0usize;
+        if aligned_capacity > 0 {
+            written_total += self.drain_pending_to_buffer(&mut output[..aligned_capacity])?;
+        }
+
+        let mut offset = 0usize;
+        while offset < input.len() {
+            let remaining_frames = (input.len() - offset) / num_channels;
+            let frames = remaining_frames.min(block_frames);
+            if frames == 0 {
+                break;
+            }
+
+            let end = offset + frames * num_channels;
+            self.process_dual_plane_chunk_to_pending(&input[offset..end])?;
+            if written_total < aligned_capacity {
+                written_total +=
+                    self.drain_pending_to_buffer(&mut output[written_total..aligned_capacity])?;
+            }
+            offset = end;
+        }
+
+        if input.is_empty() {
+            self.interpolate_ratio_for_frames(COMMON_CALLBACK_FRAMES);
+            self.apply_current_dual_plane_ratio()?;
+        }
+
+        if written_total < aligned_capacity {
+            written_total +=
+                self.drain_pending_to_buffer(&mut output[written_total..aligned_capacity])?;
+        }
+        Ok(written_total)
+    }
+
     /// Processes a chunk of interleaved audio, appending output to `output`.
     ///
     /// This is the real-time API. It does not grow internal buffers in the
@@ -921,120 +1023,15 @@ impl StreamProcessor {
                 break;
             }
 
-            self.interpolate_ratio_for_frames(frames);
-            self.expected_total_output_samples +=
-                (frames * num_channels) as f64 * self.current_ratio;
-            let processing_ratio = self.processing_ratio();
-            let produced_frames = {
-                let (channel_output_buffers, dual_plane_state) = (
-                    &mut self.channel_output_buffers,
-                    &mut self.dual_plane_deterministic,
-                );
-                let Some(state) = dual_plane_state.as_mut() else {
-                    return Err(StretchError::InvalidState(
-                        "dual-plane deterministic state became unavailable",
-                    ));
-                };
-                if state.input_planar.len() != num_channels
-                    || state.output_planar.len() != num_channels
-                {
-                    return Err(StretchError::InvalidState(
-                        "dual-plane planar buffers do not match channel count",
-                    ));
-                }
-                if channel_output_buffers.len() < num_channels {
-                    return Err(StretchError::InvalidState(
-                        "channel output buffers do not match channel count",
-                    ));
-                }
-                if (processing_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
-                    apply_dual_plane_ratio(&mut state.processor, processing_ratio)?;
-                    state.last_ratio = processing_ratio;
-                }
-
-                for frame in 0..frames {
-                    let base = offset + frame * num_channels;
-                    for ch in 0..num_channels {
-                        state.input_planar[ch][frame] = input[base + ch];
-                    }
-                }
-
-                let produced_frames = if num_channels == 1 {
-                    let input_refs = [&state.input_planar[0][..frames]];
-                    let mut output_refs = [state.output_planar[0].as_mut_slice()];
-                    let (_consumed, produced) = state
-                        .processor
-                        .rt_mut()
-                        .process(&input_refs, &mut output_refs);
-                    produced
-                } else if num_channels == 2 {
-                    let input_refs = [
-                        &state.input_planar[0][..frames],
-                        &state.input_planar[1][..frames],
-                    ];
-                    let (left_out, right_out) = state.output_planar.split_at_mut(1);
-                    let mut output_refs = [left_out[0].as_mut_slice(), right_out[0].as_mut_slice()];
-                    let (_consumed, produced) = state
-                        .processor
-                        .rt_mut()
-                        .process(&input_refs, &mut output_refs);
-                    produced
-                } else {
-                    let input_refs: Vec<&[f32]> = state
-                        .input_planar
-                        .iter()
-                        .take(num_channels)
-                        .map(|channel| &channel[..frames])
-                        .collect();
-                    let mut output_refs: Vec<&mut [f32]> = state
-                        .output_planar
-                        .iter_mut()
-                        .take(num_channels)
-                        .map(|channel| channel.as_mut_slice())
-                        .collect();
-                    let (_consumed, produced) = state
-                        .processor
-                        .rt_mut()
-                        .process(&input_refs, &mut output_refs);
-                    produced
-                };
-
-                for ch in 0..num_channels {
-                    if channel_output_buffers[ch].capacity() < produced_frames {
-                        return Err(StretchError::BufferOverflow {
-                            buffer: "stream_channel_output",
-                            requested: produced_frames,
-                            available: channel_output_buffers[ch].capacity(),
-                        });
-                    }
-                    if state.output_planar[ch].len() < produced_frames {
-                        return Err(StretchError::InvalidState(
-                            "dual-plane output planar shorter than produced frame count",
-                        ));
-                    }
-                    channel_output_buffers[ch].clear();
-                    channel_output_buffers[ch]
-                        .extend_from_slice(&state.output_planar[ch][..produced_frames]);
-                }
-                produced_frames
-            };
-
-            if produced_frames > 0 {
-                self.emit_channel_output_to_pending(produced_frames, num_channels)?;
-                let _ = self.drain_pending_to_output(output)?;
-            }
-            offset += frames * num_channels;
+            let end = offset + frames * num_channels;
+            self.process_dual_plane_chunk_to_pending(&input[offset..end])?;
+            let _ = self.drain_pending_to_output(output)?;
+            offset = end;
         }
 
         if input.is_empty() {
             self.interpolate_ratio_for_frames(COMMON_CALLBACK_FRAMES);
-            let processing_ratio = self.processing_ratio();
-            if let Some(state) = self.dual_plane_deterministic.as_mut() {
-                if (processing_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
-                    apply_dual_plane_ratio(&mut state.processor, processing_ratio)?;
-                    state.last_ratio = processing_ratio;
-                }
-            }
+            self.apply_current_dual_plane_ratio()?;
         }
 
         let _ = self.drain_pending_to_output(output)?;
@@ -1285,6 +1282,193 @@ impl StreamProcessor {
 
         self.emit_channel_output_to_pending(chunk_frames, num_channels)?;
         Ok(written)
+    }
+
+    fn apply_current_dual_plane_ratio(&mut self) -> Result<(), StretchError> {
+        let processing_ratio = self.processing_ratio();
+        let Some(state) = self.dual_plane_deterministic.as_mut() else {
+            return Err(StretchError::InvalidState(
+                "dual-plane deterministic state is unavailable",
+            ));
+        };
+        if (processing_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
+            apply_dual_plane_ratio(&mut state.processor, processing_ratio)?;
+            state.last_ratio = processing_ratio;
+        }
+        Ok(())
+    }
+
+    fn max_dual_plane_pending_samples_for_frames(
+        &self,
+        input_frames: usize,
+    ) -> Result<usize, StretchError> {
+        let Some(state) = self.dual_plane_deterministic.as_ref() else {
+            return Err(StretchError::InvalidState(
+                "dual-plane deterministic state is unavailable",
+            ));
+        };
+
+        let num_channels = state.num_channels.max(1);
+        let dual_plane_frames = state
+            .output_planar
+            .iter()
+            .take(num_channels)
+            .map(Vec::len)
+            .min()
+            .unwrap_or(0);
+        let max_frames = if (self.pitch_scale - 1.0).abs() < RATIO_SNAP_THRESHOLD {
+            dual_plane_frames.min(
+                self.channel_output_buffers
+                    .iter()
+                    .take(num_channels)
+                    .map(|buf| buf.capacity())
+                    .min()
+                    .unwrap_or(0),
+            )
+        } else {
+            self.pitch_output_buffers
+                .iter()
+                .take(num_channels)
+                .map(|buf| buf.capacity())
+                .min()
+                .unwrap_or(0)
+        };
+
+        let ratio_hint = self.current_ratio.max(self.target_ratio).max(1.0);
+        let estimated_frames = ((input_frames as f64) * ratio_hint).ceil() as usize;
+        let bounded_frames = estimated_frames
+            .saturating_add(self.params.fft_size)
+            .saturating_add(4)
+            .min(max_frames);
+
+        Ok(bounded_frames.saturating_mul(num_channels))
+    }
+
+    fn process_dual_plane_chunk_to_pending(&mut self, input: &[f32]) -> Result<(), StretchError> {
+        if input.is_empty() {
+            return Ok(());
+        }
+
+        let Some(state_meta) = self.dual_plane_deterministic.as_ref() else {
+            return Err(StretchError::InvalidState(
+                "dual-plane deterministic state is unavailable",
+            ));
+        };
+        let num_channels = state_meta.num_channels.max(1);
+        let block_frames = state_meta.block_frames;
+        if !input.len().is_multiple_of(num_channels) {
+            return Err(StretchError::InvalidFormat(format!(
+                "input sample count {} is not a multiple of channel count {}",
+                input.len(),
+                num_channels
+            )));
+        }
+
+        let frames = input.len() / num_channels;
+        if frames > block_frames {
+            return Err(StretchError::InvalidFormat(format!(
+                "input frame count {} exceeds deterministic block size {}",
+                frames, block_frames
+            )));
+        }
+
+        self.interpolate_ratio_for_frames(frames);
+        self.expected_total_output_samples += input.len() as f64 * self.current_ratio;
+        self.apply_current_dual_plane_ratio()?;
+
+        let produced_frames = {
+            let (channel_output_buffers, dual_plane_state) = (
+                &mut self.channel_output_buffers,
+                &mut self.dual_plane_deterministic,
+            );
+            let Some(state) = dual_plane_state.as_mut() else {
+                return Err(StretchError::InvalidState(
+                    "dual-plane deterministic state became unavailable",
+                ));
+            };
+            if state.input_planar.len() != num_channels || state.output_planar.len() != num_channels
+            {
+                return Err(StretchError::InvalidState(
+                    "dual-plane planar buffers do not match channel count",
+                ));
+            }
+            if channel_output_buffers.len() < num_channels {
+                return Err(StretchError::InvalidState(
+                    "channel output buffers do not match channel count",
+                ));
+            }
+
+            for frame in 0..frames {
+                let base = frame * num_channels;
+                for ch in 0..num_channels {
+                    state.input_planar[ch][frame] = input[base + ch];
+                }
+            }
+
+            let produced_frames = if num_channels == 1 {
+                let input_refs = [&state.input_planar[0][..frames]];
+                let mut output_refs = [state.output_planar[0].as_mut_slice()];
+                let (_consumed, produced) = state
+                    .processor
+                    .rt_mut()
+                    .process(&input_refs, &mut output_refs);
+                produced
+            } else if num_channels == 2 {
+                let input_refs = [
+                    &state.input_planar[0][..frames],
+                    &state.input_planar[1][..frames],
+                ];
+                let (left_out, right_out) = state.output_planar.split_at_mut(1);
+                let mut output_refs = [left_out[0].as_mut_slice(), right_out[0].as_mut_slice()];
+                let (_consumed, produced) = state
+                    .processor
+                    .rt_mut()
+                    .process(&input_refs, &mut output_refs);
+                produced
+            } else {
+                let input_refs: Vec<&[f32]> = state
+                    .input_planar
+                    .iter()
+                    .take(num_channels)
+                    .map(|channel| &channel[..frames])
+                    .collect();
+                let mut output_refs: Vec<&mut [f32]> = state
+                    .output_planar
+                    .iter_mut()
+                    .take(num_channels)
+                    .map(|channel| channel.as_mut_slice())
+                    .collect();
+                let (_consumed, produced) = state
+                    .processor
+                    .rt_mut()
+                    .process(&input_refs, &mut output_refs);
+                produced
+            };
+
+            for ch in 0..num_channels {
+                if channel_output_buffers[ch].capacity() < produced_frames {
+                    return Err(StretchError::BufferOverflow {
+                        buffer: "stream_channel_output",
+                        requested: produced_frames,
+                        available: channel_output_buffers[ch].capacity(),
+                    });
+                }
+                if state.output_planar[ch].len() < produced_frames {
+                    return Err(StretchError::InvalidState(
+                        "dual-plane output planar shorter than produced frame count",
+                    ));
+                }
+                channel_output_buffers[ch].clear();
+                channel_output_buffers[ch]
+                    .extend_from_slice(&state.output_planar[ch][..produced_frames]);
+            }
+            produced_frames
+        };
+
+        if produced_frames > 0 {
+            self.emit_channel_output_to_pending(produced_frames, num_channels)?;
+        }
+        Ok(())
     }
 
     fn push_input_samples(&mut self, input: &[f32]) -> Result<(), StretchError> {
@@ -3554,6 +3738,105 @@ mod tests {
         let mut output = Vec::new();
         let n = proc.flush_into(&mut output).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_process_interleaved_into_matches_vec_process_and_flush_when_drained_in_chunks() {
+        let params = StretchParams::new(1.03)
+            .with_sample_rate(44_100)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut vec_proc = StreamProcessor::new(params.clone());
+        let mut fixed_proc = StreamProcessor::new(params);
+        vec_proc.set_dual_plane_deterministic(true).unwrap();
+        fixed_proc.set_dual_plane_deterministic(true).unwrap();
+        vec_proc.set_pitch_scale(1.05).unwrap();
+        fixed_proc.set_pitch_scale(1.05).unwrap();
+
+        let mut input = Vec::with_capacity(256 * 2 * 12);
+        for i in 0..(256 * 12) {
+            let t = i as f32 / 44_100.0;
+            input.push((2.0 * PI * 110.0 * t).sin() * 0.3);
+            input.push((2.0 * PI * 330.0 * t).sin() * 0.25);
+        }
+
+        let mut expected = Vec::with_capacity(input.len() * 2);
+        let mut actual = Vec::with_capacity(input.len() * 2);
+        let mut chunk = vec![0.0f32; 74];
+        for input_chunk in input.chunks(256 * 2) {
+            vec_proc.process_into(input_chunk, &mut expected).unwrap();
+            let written = fixed_proc
+                .process_interleaved_into(input_chunk, &mut chunk)
+                .unwrap();
+            actual.extend_from_slice(&chunk[..written]);
+        }
+
+        vec_proc.flush_into(&mut expected).unwrap();
+
+        loop {
+            let written = fixed_proc.flush_interleaved_into(&mut chunk).unwrap();
+            if written == 0 {
+                break;
+            }
+            actual.extend_from_slice(&chunk[..written]);
+        }
+
+        assert_eq!(expected.len(), actual.len());
+        for (idx, (&lhs, &rhs)) in expected.iter().zip(actual.iter()).enumerate() {
+            assert!(
+                (lhs - rhs).abs() < 1e-6,
+                "Mismatch at sample {idx}: {lhs} vs {rhs}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_process_interleaved_into_rejects_when_output_budget_is_too_small() {
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(44_100)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_dual_plane_deterministic(true).unwrap();
+
+        let input = vec![0.0f32; 256 * 2 * 16];
+        let caps_before = proc.capacities();
+        let mut output = [0.0f32; 0];
+        let err = proc
+            .process_interleaved_into(&input, &mut output)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StretchError::BufferOverflow {
+                buffer: "stream_process_interleaved_output",
+                ..
+            }
+        ));
+        assert_eq!(proc.capacities(), caps_before);
+    }
+
+    #[test]
+    fn test_process_interleaved_into_rejects_hybrid_mode() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44_100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        let input = [0.0f32; 16];
+        let mut output = [0.0f32; 32];
+        let err = proc
+            .process_interleaved_into(&input, &mut output)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            StretchError::InvalidState(
+                "fixed-buffer processing is unavailable in legacy hybrid mode"
+            )
+        );
     }
 
     #[test]
