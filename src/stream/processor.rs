@@ -2382,9 +2382,21 @@ impl StreamProcessor {
 
     /// Returns exact deterministic dual-plane delay telemetry when active.
     pub fn deterministic_delay_telemetry(&self) -> Option<RtDelayTelemetry> {
-        self.dual_plane_deterministic
-            .as_ref()
-            .map(|state| state.processor.delay_telemetry())
+        self.dual_plane_deterministic.as_ref().map(|state| {
+            let mut telemetry = state.processor.delay_telemetry();
+            // Account for host-visible samples already moved above the RT
+            // core into the stream-layer pending ring.
+            telemetry.buffered_output_frames = telemetry
+                .buffered_output_frames
+                .saturating_add(self.pending_output.len() / self.params.channels.count().max(1));
+            telemetry.total_frames = telemetry
+                .algorithmic_frames
+                .saturating_add(telemetry.buffered_input_frames)
+                .saturating_add(telemetry.buffered_output_frames)
+                .saturating_add(telemetry.profile_frames)
+                .saturating_add(telemetry.tier_frames);
+            telemetry
+        })
     }
 
     /// Returns cumulative transient-reset telemetry for the current stream.
@@ -3349,6 +3361,100 @@ mod tests {
         assert_eq!(flushed.buffered_input_frames, 0);
         assert_eq!(flushed.buffered_output_frames, 0);
         assert_eq!(flushed.total_frames, 96);
+    }
+
+    #[test]
+    fn test_stream_processor_dual_plane_delay_telemetry_includes_stream_pending_output() {
+        let params = StretchParams::new(1.03)
+            .with_sample_rate(44_100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+
+        let input: Vec<f32> = (0..(256 * 16))
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44_100.0).sin() * 0.5)
+            .collect();
+        let mut callback_output = [0.0f32; 0];
+        for chunk in input.chunks(256) {
+            proc.process_interleaved_into(chunk, &mut callback_output)
+                .unwrap();
+            if !proc.pending_output.is_empty() {
+                break;
+            }
+        }
+
+        assert!(
+            !proc.pending_output.is_empty(),
+            "expected bounded callback output to leave samples queued"
+        );
+
+        let rt = proc
+            .dual_plane_deterministic
+            .as_ref()
+            .expect("dual-plane telemetry should be available")
+            .processor
+            .delay_telemetry();
+        let stream_pending_frames = proc.pending_output.len();
+        let telemetry = proc
+            .deterministic_delay_telemetry()
+            .expect("dual-plane delay telemetry should be available");
+
+        assert_eq!(
+            telemetry.buffered_output_frames,
+            rt.buffered_output_frames + stream_pending_frames
+        );
+        assert_eq!(
+            telemetry.total_frames,
+            rt.total_frames + stream_pending_frames
+        );
+    }
+
+    #[test]
+    fn test_stream_processor_dual_plane_delay_telemetry_tracks_pending_drain() {
+        let params = StretchParams::new(1.03)
+            .with_sample_rate(44_100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+
+        let input: Vec<f32> = (0..(256 * 16))
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44_100.0).sin() * 0.5)
+            .collect();
+        let mut callback_output = [0.0f32; 0];
+        for chunk in input.chunks(256) {
+            proc.process_interleaved_into(chunk, &mut callback_output)
+                .unwrap();
+            if proc.pending_output.len() >= 32 {
+                break;
+            }
+        }
+
+        assert!(
+            proc.pending_output.len() >= 32,
+            "expected enough queued output to validate drain telemetry"
+        );
+
+        let before = proc
+            .deterministic_delay_telemetry()
+            .expect("dual-plane delay telemetry should be available");
+        let pending_before = proc.pending_output.len();
+
+        let mut drain = [0.0f32; 13];
+        let written = proc.process_interleaved_into(&[], &mut drain).unwrap();
+        assert!(written > 0);
+        assert!(proc.pending_output.len() < pending_before);
+
+        let after = proc
+            .deterministic_delay_telemetry()
+            .expect("dual-plane delay telemetry should be available");
+
+        assert_eq!(
+            before.buffered_output_frames - after.buffered_output_frames,
+            written
+        );
+        assert_eq!(before.total_frames - after.total_frames, written);
     }
 
     #[test]
