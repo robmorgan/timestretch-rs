@@ -23,6 +23,8 @@ const RATIO_SNAP_THRESHOLD: f64 = 0.0001;
 const RATIO_SMOOTHING_TIME_SECS: f64 = 0.050;
 /// Additional slew applied after kernel-window averaging for deterministic dual-plane updates.
 const DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS: f64 = 0.040;
+/// Short seam ramp used when deterministic rendering exits exact-unity bypass.
+const DUAL_PLANE_UNITY_EXIT_SEAM_FRAMES: usize = 64;
 /// Numerator for the FFT-size latency fraction (3/2 = 1.5x FFT size).
 const LATENCY_FFT_NUMERATOR: usize = 3;
 /// Denominator for the FFT-size latency fraction.
@@ -418,6 +420,9 @@ struct DualPlaneDeterministicState {
     ratio_window_blocks: usize,
     recent_chunk_ratios: Vec<f64>,
     last_ratio: f64,
+    last_output_samples: Vec<f32>,
+    unity_exit_seam_samples: Vec<f32>,
+    pending_unity_exit_seam: bool,
 }
 
 impl DualPlaneDeterministicState {
@@ -449,6 +454,9 @@ impl DualPlaneDeterministicState {
             ratio_window_blocks: kernel_frames.div_ceil(block_frames).max(1),
             recent_chunk_ratios: Vec::new(),
             last_ratio: ratio,
+            last_output_samples: vec![0.0; num_channels],
+            unity_exit_seam_samples: vec![0.0; num_channels],
+            pending_unity_exit_seam: false,
         })
     }
 
@@ -476,6 +484,61 @@ impl DualPlaneDeterministicState {
     fn reset_ratio_history(&mut self, ratio: f64) {
         self.recent_chunk_ratios.clear();
         self.last_ratio = ratio;
+        if (ratio - 1.0).abs() <= RATIO_SNAP_THRESHOLD {
+            self.pending_unity_exit_seam = false;
+        }
+    }
+
+    #[inline]
+    fn arm_unity_exit_seam(&mut self) {
+        if self.last_output_samples.len() != self.num_channels
+            || self.unity_exit_seam_samples.len() != self.num_channels
+        {
+            return;
+        }
+        self.unity_exit_seam_samples
+            .copy_from_slice(&self.last_output_samples);
+        self.pending_unity_exit_seam = true;
+    }
+
+    fn apply_pending_unity_exit_seam(
+        &mut self,
+        channel_output_buffers: &mut [Vec<f32>],
+        produced_frames: usize,
+        ramp_frames: usize,
+    ) {
+        if !self.pending_unity_exit_seam || produced_frames == 0 || ramp_frames == 0 {
+            return;
+        }
+
+        let ramp_len = produced_frames.min(ramp_frames);
+        let denom = ramp_len.saturating_add(1) as f32;
+        for ch in 0..self.num_channels.min(channel_output_buffers.len()) {
+            let anchor = self.unity_exit_seam_samples[ch];
+            for i in 0..ramp_len.min(channel_output_buffers[ch].len()) {
+                let t = (i + 1) as f32 / denom;
+                let target = channel_output_buffers[ch][i];
+                channel_output_buffers[ch][i] = anchor + (target - anchor) * t;
+            }
+        }
+
+        self.pending_unity_exit_seam = false;
+    }
+
+    fn capture_last_output_samples(
+        &mut self,
+        channel_output_buffers: &[Vec<f32>],
+        produced_frames: usize,
+    ) {
+        if produced_frames == 0 {
+            return;
+        }
+
+        for ch in 0..self.num_channels.min(channel_output_buffers.len()) {
+            if let Some(&sample) = channel_output_buffers[ch].get(produced_frames - 1) {
+                self.last_output_samples[ch] = sample;
+            }
+        }
     }
 }
 
@@ -1635,6 +1698,7 @@ impl StreamProcessor {
         self.expected_total_output_samples += input.len() as f64 * self.current_ratio;
         let processing_ratio = self.processing_ratio();
         let sample_rate = self.params.sample_rate;
+        let unity_exit_seam_frames = self.params.hop_size.min(DUAL_PLANE_UNITY_EXIT_SEAM_FRAMES);
 
         let produced_frames = {
             let (channel_output_buffers, dual_plane_state) = (
@@ -1664,6 +1728,7 @@ impl StreamProcessor {
                 }
                 state.reset_ratio_history(1.0);
             } else {
+                let exiting_exact_unity = (state.last_ratio - 1.0).abs() <= RATIO_SNAP_THRESHOLD;
                 let averaged_ratio = state.push_chunk_ratio(processing_ratio);
                 let applied_ratio = smooth_ratio_toward(
                     state.last_ratio,
@@ -1673,6 +1738,9 @@ impl StreamProcessor {
                     DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS,
                 );
                 if (applied_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
+                    if exiting_exact_unity {
+                        state.arm_unity_exit_seam();
+                    }
                     apply_dual_plane_ratio(&mut state.processor, applied_ratio)?;
                     state.last_ratio = applied_ratio;
                 }
@@ -1742,6 +1810,12 @@ impl StreamProcessor {
                 channel_output_buffers[ch]
                     .extend_from_slice(&state.output_planar[ch][..produced_frames]);
             }
+            state.apply_pending_unity_exit_seam(
+                channel_output_buffers,
+                produced_frames,
+                unity_exit_seam_frames,
+            );
+            state.capture_last_output_samples(channel_output_buffers, produced_frames);
             produced_frames
         };
 
@@ -3360,6 +3434,45 @@ mod tests {
             max_diff < 1.0,
             "Detected likely click artifact: max sample diff = {} (expected < 1.0)",
             max_diff
+        );
+    }
+
+    #[test]
+    fn test_stream_processor_dual_plane_unity_exit_seam_is_smoothed() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44_100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        assert!(proc.is_dual_plane_deterministic());
+
+        let chunk_size = 4096 * 2;
+        let signal: Vec<f32> = (0..chunk_size * 4)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44_100.0).sin())
+            .collect();
+
+        let mut output = Vec::with_capacity(signal.len() * 2);
+        proc.process_into(&signal[..chunk_size * 3], &mut output)
+            .unwrap();
+        let boundary = output.len();
+        assert!(
+            boundary > 0,
+            "unity pre-roll should emit deterministic output"
+        );
+
+        proc.set_stretch_ratio(1.05).unwrap();
+        proc.process_into(&signal[chunk_size * 3..], &mut output)
+            .unwrap();
+
+        assert!(
+            output.len() > boundary,
+            "non-unity follow-up chunk should emit output after the unity exit"
+        );
+
+        let seam_diff = (output[boundary] - output[boundary - 1]).abs();
+        assert!(
+            seam_diff < 0.5,
+            "exact-unity exit should not hard-jump at the first non-unity output sample (diff={})",
+            seam_diff
         );
     }
 
