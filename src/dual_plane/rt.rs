@@ -2501,4 +2501,74 @@ mod tests {
             "auto profile switching should resume after the ratio-motion freeze expires"
         );
     }
+
+    #[test]
+    fn ratio_motion_freeze_rearms_under_callback_rate_modulation() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Render;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+        let render_hints = Arc::new(RenderHints {
+            transient_confidence: 0.05,
+            tonal_confidence: 0.95,
+            noise_confidence: 0.05,
+            ..RenderHints::default()
+        });
+        let scratch_hints = Arc::new(RenderHints {
+            transient_confidence: 0.90,
+            tonal_confidence: 0.10,
+            noise_confidence: 0.20,
+            ..RenderHints::default()
+        });
+
+        for (step_idx, (ratio, hints)) in [
+            (1.70, Arc::clone(&scratch_hints)),
+            (1.00, Arc::clone(&render_hints)),
+            (1.68, Arc::clone(&scratch_hints)),
+            (1.02, Arc::clone(&render_hints)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            rt.set_constant_ratio(ratio);
+            rt.set_hint_snapshot(hints);
+
+            let mut output_refs = [&mut output[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+            let telemetry = rt.profile_telemetry();
+            assert_eq!(
+                telemetry.target_profile,
+                LatencyProfile::Render,
+                "callback-rate modulation should keep target profile frozen during step {step_idx}"
+            );
+            assert_eq!(
+                telemetry.current_profile,
+                LatencyProfile::Render,
+                "callback-rate modulation should not flap the active profile during step {step_idx}"
+            );
+        }
+
+        rt.set_constant_ratio(1.70);
+        rt.set_hint_snapshot(Arc::clone(&scratch_hints));
+        for _ in 0..3 {
+            let mut output_refs = [&mut output[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+        }
+        assert_eq!(
+            rt.profile_telemetry().target_profile,
+            LatencyProfile::Scratch,
+            "auto profile switching should resume once the repeated modulation stops"
+        );
+    }
 }

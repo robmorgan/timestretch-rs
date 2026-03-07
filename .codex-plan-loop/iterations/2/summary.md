@@ -1,9 +1,8 @@
-Files changed: [src/stream/processor.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/processor.rs#L24), [src/stream/processor.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/processor.rs#L399), and [src/stream/processor.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/processor.rs#L1571). This Stage 1 slice keeps a rolling chunk-ratio window sized to one dual-plane RT kernel and feeds the backend a lightly slewed average ratio instead of the latest callback ratio alone. I left the existing unrelated dirty files untouched, and Stage 1 remains `[~]`.
+Added one Stage 1 slice in [src/dual_plane/rt.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/dual_plane/rt.rs#L2504): a new regression test, `ratio_motion_freeze_rearms_under_callback_rate_modulation`, which verifies callback-rate ratio toggling re-arms the existing ratio-motion freeze and prevents auto-profile flapping until modulation stops. I left `ROADMAP.md` unchanged because Stage 1 was already `[~]`, and the stage exit criteria are still not satisfied. I did not edit `.codex-plan-loop`.
 
 Checks run:
-- `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`
-  Failed, but improved: baseline `p95=1.132`; modulated `p95=3.613` (down from `4.936`), `p98=5.433`, `mean=2.269`.
-- `cargo test --release --test quality_gates quality_gate_dual_plane_deterministic_long_run_drift -- --nocapture`
-  Passed.
+- `cargo test ratio_motion_freeze_ -- --nocapture`
+- `cargo test --features qa-harnesses --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`
+- `cargo fmt --all --check`
 
-Remaining risk: the dedicated Stage 1 fast-modulation gate still fails, and large outliers remain, so the next slice likely needs a deeper RT/kernel transition continuity fix rather than more adapter-only ratio shaping.
+Remaining risk: this iteration strengthens Stage 1 regression coverage only; it does not improve the fast-modulation path itself. The dedicated release gate still passes at the prior narrow margin (`modulated p95=2.695`, `mean=1.812`), so Stage 1 should remain `[~]`.
