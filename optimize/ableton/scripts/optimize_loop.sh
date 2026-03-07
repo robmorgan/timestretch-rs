@@ -132,7 +132,7 @@ for (( i=START_ITER; i<=MAX_ITERATIONS; i++ )); do
     # Plateau detection: track consecutive non-improving iterations
     ATTEMPTS_FILE="$LOG_DIR/attempts.log"
     TOTAL_ATTEMPTS=$(wc -l < "$ATTEMPTS_FILE" 2>/dev/null | tr -d ' ' || echo "0")
-    PLATEAU_LIMIT=$(python3 -c "print(max(3, 8 - int('$TOTAL_ATTEMPTS') // 20))" 2>/dev/null || echo "8")
+    PLATEAU_LIMIT=$(python3 -c "print(max(15, 20 - int('$TOTAL_ATTEMPTS') // 20))" 2>/dev/null || echo "20")
 
     if python3 -c "import sys; sys.exit(0 if float('$AVG_SCORE') > float('$BEST_SCORE') + 0.01 else 1)" 2>/dev/null; then
         BEST_SCORE="$AVG_SCORE"
