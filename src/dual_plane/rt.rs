@@ -630,9 +630,21 @@ impl RtProcessor {
             return;
         }
         if self.auto_profile_switching && self.current_profile == LatencyProfile::Scratch {
-            self.policy_profile = LatencyProfile::Scratch;
-            self.profile_candidate = LatencyProfile::Scratch;
+            let scratch = LatencyProfile::Scratch;
+            let current_weights = self.current_tier.lane_weights();
+            self.policy_profile = scratch;
+            self.profile_candidate = scratch;
             self.profile_candidate_streak = 0;
+            self.target_profile = scratch;
+            self.profile_transition_blocks_left = 0;
+            self.config.latency_profile = scratch;
+            scratch.apply_governor_defaults(&mut self.config.governor);
+            self.governor.set_config(self.config.governor);
+            self.governor.set_tier(self.current_tier);
+            self.target_tier = self.current_tier;
+            self.blend_weights = current_weights;
+            self.target_weights = current_weights;
+            self.crossfade_blocks_left = 0;
             return;
         }
         self.hold_profile_and_tier_transitions();
@@ -2656,5 +2668,100 @@ mod tests {
             LatencyProfile::Scratch,
             "auto profile switching should resume once the repeated modulation stops"
         );
+    }
+
+    #[test]
+    fn ratio_motion_freeze_rearm_from_scratch_cancels_pending_mix_transition() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Mix;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+
+        rt.set_constant_ratio(1.035);
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        let scratch_hold = rt.profile_telemetry();
+        assert_eq!(scratch_hold.current_profile, LatencyProfile::Scratch);
+        assert_eq!(scratch_hold.target_profile, LatencyProfile::Scratch);
+
+        rt.ratio_motion_freeze_blocks_left = 0;
+        rt.set_latency_profile_internal(LatencyProfile::Mix);
+        rt.advance_profile_transition();
+        rt.advance_tier_crossfade();
+
+        let mix_return = rt.profile_telemetry();
+        assert_eq!(
+            mix_return.current_profile,
+            LatencyProfile::Scratch,
+            "the scratch profile should still be active while the pending mix transition is in flight"
+        );
+        assert_eq!(
+            mix_return.target_profile,
+            LatencyProfile::Mix,
+            "test setup should queue a mix retarget while scratch remains active"
+        );
+        assert_eq!(
+            mix_return.target_tier,
+            QualityTier::Q2,
+            "test setup should also move the target tier back toward mix defaults"
+        );
+        assert!(
+            rt.profile_transition_blocks_left > 0,
+            "test setup should leave a profile transition in flight"
+        );
+        assert!(
+            rt.crossfade_blocks_left > 0,
+            "test setup should leave a tier crossfade in flight"
+        );
+
+        rt.active_ratio = 1.0;
+        rt.engage_ratio_motion_freeze_if_needed(1.035);
+
+        let rearmed = rt.profile_telemetry();
+        assert_eq!(
+            rearmed.current_profile,
+            LatencyProfile::Scratch,
+            "re-arming the modulation hold should keep scratch as the active profile"
+        );
+        assert_eq!(
+            rearmed.target_profile,
+            LatencyProfile::Scratch,
+            "re-arming from scratch should cancel the stale mix retarget"
+        );
+        assert_eq!(
+            rearmed.policy_profile,
+            LatencyProfile::Scratch,
+            "policy telemetry should reflect the renewed scratch hold"
+        );
+        assert_eq!(
+            rearmed.current_tier,
+            QualityTier::Q1,
+            "re-arming from scratch should keep the active tier on the scratch ladder"
+        );
+        assert_eq!(
+            rearmed.target_tier,
+            QualityTier::Q1,
+            "re-arming from scratch should cancel the stale mix tier retarget"
+        );
+        assert_eq!(
+            rt.profile_transition_blocks_left, 0,
+            "re-arming the modulation hold should clear the pending profile transition"
+        );
+        assert_eq!(
+            rt.crossfade_blocks_left, 0,
+            "re-arming the modulation hold should clear the pending tier crossfade"
+        );
+        assert_weights_close(rt.blend_weights, QualityTier::Q1.lane_weights(), 1e-6);
     }
 }
