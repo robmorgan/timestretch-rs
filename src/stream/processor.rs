@@ -449,6 +449,12 @@ impl DualPlaneDeterministicState {
         let sum: f64 = self.recent_chunk_ratios.iter().sum();
         sum / self.recent_chunk_ratios.len().max(1) as f64
     }
+
+    #[inline]
+    fn reset_ratio_history(&mut self, ratio: f64) {
+        self.recent_chunk_ratios.clear();
+        self.last_ratio = ratio;
+    }
 }
 
 pub struct StreamProcessor {
@@ -1464,6 +1470,13 @@ impl StreamProcessor {
                 "dual-plane deterministic state is unavailable",
             ));
         };
+        if processing_ratio == 1.0 {
+            if state.last_ratio != 1.0 {
+                apply_dual_plane_ratio(&mut state.processor, 1.0)?;
+            }
+            state.reset_ratio_history(1.0);
+            return Ok(());
+        }
         if (processing_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
             apply_dual_plane_ratio(&mut state.processor, processing_ratio)?;
             state.last_ratio = processing_ratio;
@@ -1623,17 +1636,24 @@ impl StreamProcessor {
                 ));
             }
 
-            let averaged_ratio = state.push_chunk_ratio(processing_ratio);
-            let applied_ratio = smooth_ratio_toward(
-                state.last_ratio,
-                averaged_ratio,
-                frames,
-                sample_rate,
-                DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS,
-            );
-            if (applied_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
-                apply_dual_plane_ratio(&mut state.processor, applied_ratio)?;
-                state.last_ratio = applied_ratio;
+            if processing_ratio == 1.0 {
+                if state.last_ratio != 1.0 {
+                    apply_dual_plane_ratio(&mut state.processor, 1.0)?;
+                }
+                state.reset_ratio_history(1.0);
+            } else {
+                let averaged_ratio = state.push_chunk_ratio(processing_ratio);
+                let applied_ratio = smooth_ratio_toward(
+                    state.last_ratio,
+                    averaged_ratio,
+                    frames,
+                    sample_rate,
+                    DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS,
+                );
+                if (applied_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
+                    apply_dual_plane_ratio(&mut state.processor, applied_ratio)?;
+                    state.last_ratio = applied_ratio;
+                }
             }
 
             for frame in 0..frames {
