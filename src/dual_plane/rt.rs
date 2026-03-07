@@ -1370,6 +1370,14 @@ impl RtProcessor {
             self.policy_profile = self.target_profile;
             return;
         }
+        if self.current_profile != self.target_profile {
+            // Keep the committed auto-profile target stable until the
+            // crossfade settles instead of reversing direction mid-transition.
+            self.policy_profile = self.target_profile;
+            self.profile_candidate = self.target_profile;
+            self.profile_candidate_streak = 0;
+            return;
+        }
 
         let suggested = self.suggest_profile();
         self.policy_profile = suggested;
@@ -2733,6 +2741,7 @@ mod tests {
         let mut cfg = RtConfig::new(params, 128);
         cfg.auto_profile_switching = true;
         cfg.profile_switch_hysteresis_blocks = 2;
+        cfg.ratio_motion_freeze_blocks = 0;
         let mut rt = RtProcessor::prepare(cfg).unwrap();
 
         let input = [0.0f32; 128];
@@ -2740,7 +2749,9 @@ mod tests {
         let input_refs = [&input[..]];
 
         // Render-favoring policy: near-unity ratio + strong tonal confidence.
-        rt.set_constant_ratio(1.0);
+        // Keep the ratio slightly non-unity so the test exercises committed
+        // kernels instead of the bit-exact unity passthrough path.
+        rt.set_constant_ratio(1.01);
         rt.set_hint_snapshot(Arc::new(RenderHints {
             transient_confidence: 0.05,
             tonal_confidence: 0.95,
@@ -2754,6 +2765,19 @@ mod tests {
         assert_eq!(
             rt.profile_telemetry().target_profile,
             LatencyProfile::Render
+        );
+        let render_transition = rt.profile_telemetry();
+        for _ in 0..=render_transition.transition_blocks_left {
+            if rt.profile_telemetry().current_profile == LatencyProfile::Render {
+                break;
+            }
+            let mut output_refs = [&mut output[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+        }
+        assert_eq!(
+            rt.profile_telemetry().current_profile,
+            LatencyProfile::Render,
+            "render-favoring policy should eventually settle the active profile onto render"
         );
 
         // Scratch-favoring policy: large ratio delta or strong transient confidence.
@@ -3094,6 +3118,94 @@ mod tests {
             "re-arming the modulation hold should clear the pending tier crossfade"
         );
         assert_weights_close(rt.blend_weights, QualityTier::Q1.lane_weights(), 1e-6);
+    }
+
+    #[test]
+    fn auto_profile_switching_holds_target_steady_until_transition_settles() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Render;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 0;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+        let render_hints = Arc::new(RenderHints {
+            transient_confidence: 0.05,
+            tonal_confidence: 0.95,
+            noise_confidence: 0.05,
+            ..RenderHints::default()
+        });
+        let scratch_hints = Arc::new(RenderHints {
+            transient_confidence: 0.90,
+            tonal_confidence: 0.10,
+            noise_confidence: 0.20,
+            ..RenderHints::default()
+        });
+
+        rt.set_constant_ratio(1.70);
+        rt.set_hint_snapshot(Arc::clone(&scratch_hints));
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+
+        let scratch_transition = rt.profile_telemetry();
+        assert_eq!(scratch_transition.current_profile, LatencyProfile::Render);
+        assert_eq!(scratch_transition.target_profile, LatencyProfile::Scratch);
+        assert_eq!(scratch_transition.policy_profile, LatencyProfile::Scratch);
+        assert!(
+            scratch_transition.transition_blocks_left > 0,
+            "test setup should leave a profile transition in flight"
+        );
+
+        rt.set_constant_ratio(1.01);
+        rt.set_hint_snapshot(Arc::clone(&render_hints));
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+
+        let held_transition = rt.profile_telemetry();
+        assert_eq!(
+            held_transition.current_profile,
+            LatencyProfile::Render,
+            "the active profile should stay on render until the scratch transition completes"
+        );
+        assert_eq!(
+            held_transition.target_profile,
+            LatencyProfile::Scratch,
+            "opposite suggestions must not immediately reverse an in-flight auto profile transition"
+        );
+        assert_eq!(
+            held_transition.policy_profile,
+            LatencyProfile::Scratch,
+            "policy telemetry should keep advertising the committed scratch target while it is still crossfading"
+        );
+
+        for _ in 0..=held_transition.transition_blocks_left {
+            if rt.profile_telemetry().current_profile == LatencyProfile::Scratch {
+                break;
+            }
+            let mut output_refs = [&mut output[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+        }
+
+        let settled_scratch = rt.profile_telemetry();
+        assert_eq!(settled_scratch.current_profile, LatencyProfile::Scratch);
+        assert_eq!(settled_scratch.target_profile, LatencyProfile::Scratch);
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        let render_retarget = rt.profile_telemetry();
+        assert_eq!(
+            render_retarget.target_profile,
+            LatencyProfile::Render,
+            "once the scratch transition settles, auto mode should be free to retarget back to render"
+        );
     }
 
     #[test]
