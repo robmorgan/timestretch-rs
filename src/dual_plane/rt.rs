@@ -660,6 +660,10 @@ impl RtProcessor {
 
     fn prepare_runtime_policy(&mut self) {
         self.poll_control_updates();
+    }
+
+    #[inline]
+    fn prepare_non_unity_runtime_policy(&mut self) {
         let preview_ratio = self.current_kernel_ratio(self.config.kernel_frames.max(1));
         if !self.ratio_motion_freeze_active() {
             self.engage_ratio_motion_freeze_if_needed(preview_ratio);
@@ -806,6 +810,7 @@ impl RtProcessor {
                 return Ok((input_frames, input_frames));
             }
 
+            self.prepare_non_unity_runtime_policy();
             self.prime_tonal_state_from_unity_history_if_needed(
                 self.current_kernel_ratio(self.config.kernel_frames),
             )?;
@@ -889,6 +894,7 @@ impl RtProcessor {
                 return Ok(());
             }
 
+            self.prepare_non_unity_runtime_policy();
             self.prime_tonal_state_from_unity_history_if_needed(
                 self.current_kernel_ratio(self.config.kernel_frames),
             )?;
@@ -954,6 +960,7 @@ impl RtProcessor {
                 return Ok(input.len());
             }
 
+            self.prepare_non_unity_runtime_policy();
             self.prime_tonal_state_from_unity_history_if_needed(
                 self.current_kernel_ratio(self.config.kernel_frames),
             )?;
@@ -3118,6 +3125,63 @@ mod tests {
             "re-arming the modulation hold should clear the pending tier crossfade"
         );
         assert_weights_close(rt.blend_weights, QualityTier::Q1.lane_weights(), 1e-6);
+    }
+
+    #[test]
+    fn unity_passthrough_does_not_arm_ratio_motion_freeze_or_bias_mix_profile() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Mix;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+        let initial = rt.profile_telemetry();
+        let initial_weights = rt.blend_weights;
+
+        rt.active_ratio = 1.04;
+        rt.set_constant_ratio(1.0);
+
+        let mut output_refs = [&mut output[..]];
+        let (consumed, produced) = rt.process(&input_refs, &mut output_refs);
+        assert_eq!((consumed, produced), (128, 128));
+        assert_eq!(
+            rt.ratio_motion_freeze_blocks_left, 0,
+            "exact-unity passthrough callbacks must not arm a stale ratio-motion freeze"
+        );
+        assert_eq!(rt.active_ratio, 1.0);
+
+        let telemetry = rt.profile_telemetry();
+        assert_eq!(
+            telemetry.current_profile, initial.current_profile,
+            "exact-unity passthrough must not bias the committed mix profile"
+        );
+        assert_eq!(
+            telemetry.target_profile, initial.target_profile,
+            "exact-unity passthrough must not retarget the profile hold state"
+        );
+        assert_eq!(
+            telemetry.policy_profile, initial.policy_profile,
+            "exact-unity passthrough must leave profile policy telemetry unchanged"
+        );
+        assert_eq!(
+            telemetry.current_tier, initial.current_tier,
+            "exact-unity passthrough must not retarget the active quality tier"
+        );
+        assert_eq!(
+            telemetry.target_tier, initial.target_tier,
+            "exact-unity passthrough must not queue a tier crossfade"
+        );
+        assert_weights_close(rt.blend_weights, initial_weights, 1e-6);
+        assert_weights_close(rt.target_weights, initial_weights, 1e-6);
     }
 
     #[test]
