@@ -38,10 +38,6 @@ const ADAPTIVE_SELECTIVE_RATIO_DISTANCE_MAX: f64 = 0.65;
 const ADAPTIVE_FORCE_ROI_RATIO_DISTANCE: f64 = 0.75;
 /// Number of synthesis frames to keep transient-focused locking active.
 const TRANSIENT_FOCUS_FRAMES: usize = 3;
-/// Small cross-unity modulation band where carried overlap normalization can
-/// safely re-anchor to unity instead of inheriting the previous expansion.
-const STREAMING_TAIL_UNITY_NEUTRAL_DISTANCE: f64 = 0.05;
-
 /// Phase vocoder state for time stretching.
 pub struct PhaseVocoder {
     fft_size: usize,
@@ -149,18 +145,7 @@ pub struct PhaseVocoder {
 
 #[inline]
 fn streaming_tail_normalize_ratio(carried_tail_ratio: f64, current_ratio: f64) -> f64 {
-    let carried_dist = (carried_tail_ratio - 1.0).abs();
-    let current_dist = (current_ratio - 1.0).abs();
-    let crosses_or_touches_unity = (carried_tail_ratio - 1.0) * (current_ratio - 1.0) <= 0.0;
-
-    if crosses_or_touches_unity
-        && carried_dist <= STREAMING_TAIL_UNITY_NEUTRAL_DISTANCE
-        && current_dist <= STREAMING_TAIL_UNITY_NEUTRAL_DISTANCE
-    {
-        1.0
-    } else {
-        carried_tail_ratio.max(current_ratio)
-    }
+    carried_tail_ratio.max(current_ratio)
 }
 
 impl PhaseVocoder {
@@ -2305,7 +2290,7 @@ mod tests {
     }
 
     #[test]
-    fn test_streaming_tail_ratio_recenters_small_cross_unity_modulation() {
+    fn test_streaming_tail_ratio_preserves_carried_overlap_for_small_cross_unity_modulation() {
         let fft_size = 1024;
         let hop = 256;
         let sample_rate = 44100u32;
@@ -2345,8 +2330,8 @@ mod tests {
             "second streaming chunk should continue carrying overlap tail"
         );
         assert!(
-            (pv.streaming_tail_ratio - 1.0).abs() < 1e-12,
-            "small cross-unity modulation should re-anchor carried overlap normalization to unity"
+            (pv.streaming_tail_ratio - 1.04).abs() < 1e-12,
+            "small cross-unity modulation should preserve the carried overlap ratio until flush"
         );
 
         let _ = pv.flush_streaming().unwrap();
