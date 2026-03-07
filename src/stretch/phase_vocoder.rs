@@ -681,8 +681,12 @@ impl PhaseVocoder {
         self.synthesis_emitted = self.synthesis_emitted.saturating_add(emit_len);
         self.streaming_tail_ratio = if self.streaming_tail.is_empty() {
             self.stretch_ratio
-        } else {
+        } else if emit_len < tail_len {
+            // Preserve the more conservative seam ratio only while unresolved
+            // overlap from the previous chunk is still present in the carried tail.
             normalize_ratio
+        } else {
+            self.stretch_ratio
         };
         Ok(())
     }
@@ -2278,8 +2282,8 @@ mod tests {
             "second streaming chunk should continue carrying overlap tail"
         );
         assert!(
-            (pv.streaming_tail_ratio - 1.18).abs() < 1e-12,
-            "carried tail should preserve the more expansion-prone ratio across the transition"
+            (pv.streaming_tail_ratio - 0.82).abs() < 1e-12,
+            "once the previous overlap has fully emitted, the carried tail should re-arm to the current ratio"
         );
 
         let _ = pv.flush_streaming().unwrap();
@@ -2330,14 +2334,61 @@ mod tests {
             "second streaming chunk should continue carrying overlap tail"
         );
         assert!(
-            (pv.streaming_tail_ratio - 1.04).abs() < 1e-12,
-            "small cross-unity modulation should preserve the carried overlap ratio until flush"
+            (pv.streaming_tail_ratio - 0.96).abs() < 1e-12,
+            "once the previous overlap has fully emitted, small cross-unity modulation should re-arm to the current ratio"
         );
 
         let _ = pv.flush_streaming().unwrap();
         assert!(
             (pv.streaming_tail_ratio - 0.96).abs() < 1e-12,
             "flush should clear carried overlap history and re-arm the current ratio"
+        );
+    }
+
+    #[test]
+    fn test_streaming_tail_ratio_only_preserves_prior_ratio_while_overlap_remains_unresolved() {
+        let fft_size = 1024;
+        let hop = 256;
+        let sample_rate = 44100u32;
+        let num_samples = fft_size * 5;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
+            })
+            .collect();
+
+        let mut pv = PhaseVocoder::new(fft_size, hop, 1.18, sample_rate, 120.0);
+        let first_chunk_len = fft_size * 2;
+        let first = pv.process_streaming(&input[..first_chunk_len]).unwrap();
+        assert!(!first.is_empty(), "first streaming chunk should emit audio");
+        assert!(
+            !pv.streaming_tail.is_empty(),
+            "first streaming chunk should retain overlap tail"
+        );
+        assert!(
+            (pv.streaming_tail_ratio - 1.18).abs() < 1e-12,
+            "tail ratio should match the ratio that generated the carried overlap"
+        );
+
+        let first_frames = (first_chunk_len - fft_size) / hop + 1;
+        let consumed = first_frames * hop;
+        let second_chunk_len = fft_size + hop;
+        pv.set_stretch_ratio(0.82);
+        let second = pv
+            .process_streaming(&input[consumed..consumed + second_chunk_len])
+            .unwrap();
+        assert!(
+            !second.is_empty(),
+            "short second streaming chunk should still emit audio"
+        );
+        assert!(
+            !pv.streaming_tail.is_empty(),
+            "short second streaming chunk should continue carrying overlap tail"
+        );
+        assert!(
+            (pv.streaming_tail_ratio - 1.18).abs() < 1e-12,
+            "the prior expansion ratio should persist only while unresolved overlap from that chunk remains in the carried tail"
         );
     }
 
