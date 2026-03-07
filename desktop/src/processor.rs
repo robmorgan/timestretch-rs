@@ -253,10 +253,9 @@ fn build_processor(state: &SharedStateHandle, sample_rate: u32) -> (DualPlanePro
             let params = StretchParams::new(base_ratio)
                 .with_sample_rate(sample_rate)
                 .with_channels(CHANNELS)
-                .with_quality_mode(QualityMode::LowLatency)
-                .with_window_type(timestretch::WindowType::Hann)
-                .with_fft_size(1024)
-                .with_hop_size(256);
+                .with_quality_mode(QualityMode::Balanced)
+                .with_fft_size(2048)
+                .with_hop_size(512);
 
             let mut cfg = RtConfig::new(params.clone(), CHUNK_FRAMES);
             cfg.latency_profile = latency_profile;
@@ -269,13 +268,13 @@ fn build_processor(state: &SharedStateHandle, sample_rate: u32) -> (DualPlanePro
             return (processor, preroll);
         }
 
-        // Fallback to a low-latency profile if BPM metadata is unavailable.
+        // Fallback if BPM metadata is unavailable.
         let params = StretchParams::new(ratio)
             .with_sample_rate(sample_rate)
             .with_channels(CHANNELS)
-            .with_quality_mode(QualityMode::LowLatency)
-            .with_fft_size(1024)
-            .with_hop_size(256);
+            .with_quality_mode(QualityMode::Balanced)
+            .with_fft_size(2048)
+            .with_hop_size(512);
         let mut cfg = RtConfig::new(params.clone(), CHUNK_FRAMES);
         cfg.latency_profile = latency_profile;
         let mut processor =
