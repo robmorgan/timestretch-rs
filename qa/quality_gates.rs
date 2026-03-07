@@ -1608,3 +1608,120 @@ fn quality_gate_dual_plane_unity_roundtrip_callback_toggle_regression() {
         baseline_stats.p99_ratio
     );
 }
+
+#[test]
+fn quality_gate_dual_plane_unity_roundtrip_short_interval_plateau_regression() {
+    let sample_rate = 44_100u32;
+    let bpm = 126.0;
+    let callback_frames = 256usize;
+    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
+    let input = mono_to_stereo_interleaved(&mono);
+
+    let (baseline_out, baseline_boundaries) = run_dual_plane_deterministic_with_ratio_steps(
+        &input,
+        sample_rate,
+        callback_frames,
+        &[1.0],
+        1,
+    );
+    let (modulated_out, modulated_boundaries) = run_dual_plane_deterministic_with_ratio_steps(
+        &input,
+        sample_rate,
+        callback_frames,
+        &[1.0, 1.035, 1.0, 0.965, 1.0, 1.025, 1.0, 0.975],
+        2,
+    );
+
+    assert!(
+        baseline_out.iter().all(|sample| sample.is_finite()),
+        "baseline unity-roundtrip short-interval gate produced non-finite samples"
+    );
+    assert!(
+        modulated_out.iter().all(|sample| sample.is_finite()),
+        "unity-roundtrip short-interval gate produced non-finite samples"
+    );
+    assert!(
+        !baseline_out.is_empty() && !modulated_out.is_empty(),
+        "unity-roundtrip short-interval gate produced empty output"
+    );
+
+    let baseline_left = extract_left_channel(&baseline_out);
+    let modulated_left = extract_left_channel(&modulated_out);
+    let trim = 16usize;
+    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
+        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
+    } else {
+        baseline_boundaries.clone()
+    }
+    .into_iter()
+    .filter(|&p| p > 1 && p + 1 < baseline_left.len())
+    .collect();
+    let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
+        modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
+    } else {
+        modulated_boundaries.clone()
+    }
+    .into_iter()
+    .filter(|&p| p > 1 && p + 1 < modulated_left.len())
+    .collect();
+
+    let window = (sample_rate as f64 * 0.008).round() as usize;
+    let guard = (sample_rate as f64 * 0.001).round() as usize;
+    let baseline_stats =
+        boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
+    let modulated_stats =
+        boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
+
+    println!(
+        "dual-plane-unity-roundtrip-short-interval gate: baseline(max={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p99={:.3},mean={:.3},n={})",
+        baseline_stats.max_ratio,
+        baseline_stats.p99_ratio,
+        baseline_stats.mean_ratio,
+        baseline_stats.evaluated_boundaries,
+        modulated_stats.max_ratio,
+        modulated_stats.p99_ratio,
+        modulated_stats.mean_ratio,
+        modulated_stats.evaluated_boundaries
+    );
+
+    write_quality_dashboard_csv(
+        "quality_gate_dual_plane_unity_roundtrip_short_interval_plateau_regression",
+        "baseline_max,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p99,modulated_mean,modulated_n",
+        &format!(
+            "{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{}",
+            baseline_stats.max_ratio,
+            baseline_stats.p99_ratio,
+            baseline_stats.mean_ratio,
+            baseline_stats.evaluated_boundaries,
+            modulated_stats.max_ratio,
+            modulated_stats.p99_ratio,
+            modulated_stats.mean_ratio,
+            modulated_stats.evaluated_boundaries
+        ),
+    );
+
+    assert!(
+        baseline_stats.evaluated_boundaries >= 32 && modulated_stats.evaluated_boundaries >= 32,
+        "unity-roundtrip short-interval regression gate evaluated too few boundaries (baseline={}, modulated={})",
+        baseline_stats.evaluated_boundaries,
+        modulated_stats.evaluated_boundaries
+    );
+    assert!(
+        modulated_stats.max_ratio <= baseline_stats.max_ratio * 1.30 + 0.20,
+        "unity-roundtrip short-interval regression failed (max): modulated {:.3} vs baseline {:.3}",
+        modulated_stats.max_ratio,
+        baseline_stats.max_ratio
+    );
+    assert!(
+        modulated_stats.p99_ratio <= baseline_stats.p99_ratio * 1.25 + 0.15,
+        "unity-roundtrip short-interval regression failed (p99): modulated {:.3} vs baseline {:.3}",
+        modulated_stats.p99_ratio,
+        baseline_stats.p99_ratio
+    );
+    assert!(
+        modulated_stats.mean_ratio <= baseline_stats.mean_ratio * 1.35 + 0.20,
+        "unity-roundtrip short-interval regression failed (mean): modulated {:.3} vs baseline {:.3}",
+        modulated_stats.mean_ratio,
+        baseline_stats.mean_ratio
+    );
+}
