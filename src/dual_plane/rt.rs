@@ -26,6 +26,7 @@ const UNITY_BYPASS_RATIO_EPS: f64 = 1e-6;
 const ALGORITHMIC_DELAY_FFT_NUMERATOR: usize = 3;
 const ALGORITHMIC_DELAY_FFT_DENOMINATOR: usize = 2;
 const RATIO_MOTION_FREEZE_TRIGGER: f64 = 7.5e-4;
+const RATIO_MOTION_HISTORY_BLOCKS: usize = 4;
 
 /// Lock-free snapshot mailbox shared between control producers and RT callback.
 ///
@@ -309,6 +310,9 @@ pub struct RtProcessor {
     profile_candidate_streak: usize,
     profile_transition_blocks_left: usize,
     ratio_motion_freeze_blocks_left: usize,
+    ratio_motion_history: [f64; RATIO_MOTION_HISTORY_BLOCKS],
+    ratio_motion_history_len: usize,
+    ratio_motion_history_cursor: usize,
     current_tier: QualityTier,
     target_tier: QualityTier,
     runtime_telemetry: RtRuntimeTelemetry,
@@ -488,6 +492,9 @@ impl RtProcessor {
             profile_candidate_streak: 0,
             profile_transition_blocks_left: 0,
             ratio_motion_freeze_blocks_left: 0,
+            ratio_motion_history: [1.0; RATIO_MOTION_HISTORY_BLOCKS],
+            ratio_motion_history_len: 0,
+            ratio_motion_history_cursor: 0,
             current_tier: initial_tier,
             target_tier: initial_tier,
             runtime_telemetry: RtRuntimeTelemetry::default(),
@@ -617,15 +624,54 @@ impl RtProcessor {
         true
     }
 
+    #[inline]
+    fn reset_ratio_motion_history(&mut self) {
+        self.ratio_motion_history_len = 0;
+        self.ratio_motion_history_cursor = 0;
+    }
+
+    #[inline]
+    fn push_ratio_motion_history(&mut self, ratio: f64) -> f64 {
+        let slot = self.ratio_motion_history_cursor;
+        self.ratio_motion_history[slot] = ratio;
+        self.ratio_motion_history_cursor =
+            (self.ratio_motion_history_cursor + 1) % self.ratio_motion_history.len();
+        self.ratio_motion_history_len =
+            (self.ratio_motion_history_len + 1).min(self.ratio_motion_history.len());
+
+        let mut min_ratio = ratio;
+        let mut max_ratio = ratio;
+        for &observed in self
+            .ratio_motion_history
+            .iter()
+            .take(self.ratio_motion_history_len)
+        {
+            min_ratio = min_ratio.min(observed);
+            max_ratio = max_ratio.max(observed);
+        }
+        max_ratio - min_ratio
+    }
+
     fn engage_ratio_motion_freeze_if_needed(&mut self, next_ratio: f64) {
         if self.config.ratio_motion_freeze_blocks == 0 || !next_ratio.is_finite() {
             return;
         }
         if (next_ratio - 1.0).abs() <= UNITY_BYPASS_RATIO_EPS {
+            self.reset_ratio_motion_history();
             return;
         }
-        if (next_ratio - self.active_ratio).abs() < RATIO_MOTION_FREEZE_TRIGGER {
-            return;
+        let step_delta = (next_ratio - self.active_ratio).abs();
+        if self.ratio_motion_freeze_active() {
+            self.reset_ratio_motion_history();
+            if step_delta < RATIO_MOTION_FREEZE_TRIGGER {
+                return;
+            }
+        } else {
+            let recent_span = self.push_ratio_motion_history(next_ratio);
+            if step_delta < RATIO_MOTION_FREEZE_TRIGGER && recent_span < RATIO_MOTION_FREEZE_TRIGGER
+            {
+                return;
+            }
         }
 
         self.ratio_motion_freeze_blocks_left = self.config.ratio_motion_freeze_blocks;
@@ -798,6 +844,7 @@ impl RtProcessor {
                         .copy_from_slice(&input_slices[ch][..input_frames]);
                 }
                 self.input_timeline_frames += input_frames as f64;
+                self.reset_ratio_motion_history();
                 self.active_ratio = 1.0;
                 self.advance_ratio_motion_freeze();
                 self.observe_governor_block(start.elapsed());
@@ -882,6 +929,7 @@ impl RtProcessor {
                 }
                 output.extend_from_slice(input);
                 self.input_timeline_frames += self.config.block_frames as f64;
+                self.reset_ratio_motion_history();
                 self.active_ratio = 1.0;
                 self.advance_ratio_motion_freeze();
                 self.observe_governor_block(start.elapsed());
@@ -948,6 +996,7 @@ impl RtProcessor {
                 self.record_unity_passthrough_samples(input);
                 output[..input.len()].copy_from_slice(input);
                 self.input_timeline_frames += self.config.block_frames as f64;
+                self.reset_ratio_motion_history();
                 self.active_ratio = 1.0;
                 self.advance_ratio_motion_freeze();
                 self.observe_governor_block(start.elapsed());
@@ -3118,6 +3167,69 @@ mod tests {
             rt.profile_telemetry().target_profile,
             LatencyProfile::Scratch,
             "auto profile switching should resume once the short-interval plateau modulation stops"
+        );
+    }
+
+    #[test]
+    fn ratio_motion_freeze_arms_for_cumulative_subthreshold_modulation() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Render;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 4;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+        let scratch_hints = Arc::new(RenderHints {
+            transient_confidence: 0.90,
+            tonal_confidence: 0.10,
+            noise_confidence: 0.20,
+            ..RenderHints::default()
+        });
+
+        for (step_idx, ratio) in [1.0003, 1.0006, 1.0009, 1.0012].into_iter().enumerate() {
+            rt.set_constant_ratio(ratio);
+            rt.set_hint_snapshot(Arc::clone(&scratch_hints));
+
+            let mut output_refs = [&mut output[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+            let telemetry = rt.profile_telemetry();
+            assert_eq!(
+                telemetry.current_profile,
+                LatencyProfile::Render,
+                "sub-threshold modulation should not flap the committed render profile during step {step_idx}"
+            );
+            assert_eq!(
+                telemetry.target_profile,
+                LatencyProfile::Render,
+                "cumulative sub-threshold modulation should keep the render target held during step {step_idx}"
+            );
+        }
+
+        assert_eq!(
+            rt.profile_candidate,
+            LatencyProfile::Scratch,
+            "scratch-biased hints should still accumulate the pending scratch candidate"
+        );
+        assert_eq!(
+            rt.profile_candidate_streak, 3,
+            "the modulation hold should pause the scratch hysteresis streak before the fourth sub-threshold step can commit"
+        );
+        assert_eq!(
+            rt.ratio_motion_freeze_blocks_left, 1,
+            "the fourth sub-threshold step should arm and then advance the configured ratio-motion hold"
+        );
+        assert_eq!(
+            rt.profile_telemetry().policy_profile,
+            LatencyProfile::Render,
+            "policy telemetry should stay on the held render profile once the cumulative motion hold arms"
         );
     }
 
