@@ -1,7 +1,10 @@
-Implemented one Stage 1 slice in [src/stream/transient_scheduler.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/transient_scheduler.rs#L249): a detected transient no longer burns one cooldown frame immediately on the same analysis frame that triggered the reset. I also added a focused regression at [src/stream/transient_scheduler.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/transient_scheduler.rs#L495) that tail-aligns a click to the final scanned frame and asserts the full configured cooldown is preserved for subsequent frames. `ROADMAP.md` was already at `[~]`, and it remains `[~]` because the stage exit gate is still failing.
+Implemented one Stage 1 slice in [src/dual_plane/rt.rs:594](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/dual_plane/rt.rs#L594) and [src/dual_plane/rt.rs:2568](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/dual_plane/rt.rs#L2568): when ratio-motion freeze biases auto-mode `Mix` into `Scratch`, the RT path now snaps `current_tier`, `target_tier`, and the raw lane weights to the scratch ladder immediately instead of leaving a stale tier crossfade active. I also tightened the existing regression to assert that immediate tier snap. `ROADMAP.md` was left unchanged because Stage 1 was already `[~]`, and I am not marking it `[x]`.
 
 Checks run:
-- `cargo test scheduler_ -- --nocapture` passed (`8 passed`).
-- `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture` failed unchanged: baseline `p95=1.132`, modulated `p95=3.613`, `p98=5.433`, `mean=2.269`.
+- `cargo fmt --all --check`
+- `cargo test ratio_motion_freeze_ -- --nocapture`
+- `cargo test --features qa-harnesses --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`
+- `cargo test --features qa-harnesses --release --test quality_gates quality_gate_dual_plane_callback_toggle_modulation_artifacts -- --nocapture`
+- `cargo test --features qa-harnesses --release --test quality_gates quality_gate_dual_plane_deterministic_long_run_drift -- --nocapture`
 
-Files changed this turn: [src/stream/transient_scheduler.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/transient_scheduler.rs). Remaining risk: this slice tightens transient reset scheduling, but the larger deterministic dual-plane fast-modulation artifact regression is still present, so Stage 1 is not ready to close.
+Remaining risk: the Stage 1 fast-modulation gate still shows the same rare outlier (`modulated max/p99 = 63.591`, `p95 = 1.837`, `p98 = 2.780`, `mean = 1.436`), so this slice improves tier-state coherence during the scratch hold but does not close the remaining fast-modulation artifact spike.

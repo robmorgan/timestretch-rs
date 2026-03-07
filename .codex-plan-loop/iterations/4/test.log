@@ -11,41 +11,32 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
      Running tests/realtime_allocations.rs (target/debug/deps/realtime_allocations-60155168e6216a7d)
 
 running 5 tests
-test dual_plane_rt_stem_aware_no_heap_growth_after_warmup ... ok
-test process_into_steady_state_no_heap_growth_after_warmup ... ok
 test process_into_hybrid_realtime_strict_no_heap_growth_after_warmup ... ok
-test process_into_hybrid_mode_allocation_telemetry_present ... ok
+test process_into_steady_state_no_heap_growth_after_warmup ... ok
+test dual_plane_rt_stem_aware_no_heap_growth_after_warmup ... ok
 test dual_plane_rt_process_block_no_heap_growth_after_warmup ... ok
+test process_into_hybrid_mode_allocation_telemetry_present ... ok
 
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.19s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.15s
 
      Running tests/realtime_dj_conditions.rs (target/debug/deps/realtime_dj_conditions-8acee62b1c2af69d)
 
 running 4 tests
 test realtime_midstream_ratio_changes_every_500ms ... ok
 test realtime_callback_1024_frames_no_overflow ... ok
-test realtime_callback_64_frames_10s ... ok
 test realtime_callback_128_frames_10s ... ok
+test realtime_callback_64_frames_10s ... ok
 
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.89s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.99s
 
-==> running: cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture
-    Finished `release` profile [optimized] target(s) in 0.02s
-     Running tests/quality_gates.rs (target/release/deps/quality_gates-84621307e5ae569f)
+==> running: cargo test --features qa-harnesses --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture
+   Compiling timestretch v0.3.0 (/Users/robbym/go/src/github.com/robmorgan/timestretch-rs)
+    Finished `release` profile [optimized] target(s) in 22.62s
+     Running qa/quality_gates.rs (target/release/deps/quality_gates-14139db635660048)
 
 running 1 test
-dual-plane-fast-mod gate: baseline(max=1.314,p95=1.132,p98=1.182,p99=1.231,mean=0.459,n=1348) modulated(max=59.994,p95=3.613,p98=5.433,p99=59.994,mean=2.269,n=1348)
+dual-plane-fast-mod gate: baseline(max=1.314,p95=1.132,p98=1.182,p99=1.231,mean=0.459,n=1348) modulated(max=63.591,p95=1.837,p98=2.780,p99=63.591,mean=1.436,n=1348)
+test quality_gate_dual_plane_fast_modulation_artifacts ... ok
 
-thread 'quality_gate_dual_plane_fast_modulation_artifacts' (175215924) panicked at tests/quality_gates.rs:960:5:
-dual-plane modulation artifact gate failed (p95): modulated 3.613 vs baseline 1.132
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-test quality_gate_dual_plane_fast_modulation_artifacts ... FAILED
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.33s
 
-failures:
-
-failures:
-    quality_gate_dual_plane_fast_modulation_artifacts
-
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.29s
-
-error: test failed, to rerun pass `--test quality_gates`

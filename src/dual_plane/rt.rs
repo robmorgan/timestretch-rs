@@ -597,6 +597,8 @@ impl RtProcessor {
         }
 
         let scratch = LatencyProfile::Scratch;
+        let scratch_tier = scratch.initial_tier();
+        let scratch_weights = scratch_tier.lane_weights();
         self.current_profile = scratch;
         self.policy_profile = scratch;
         self.profile_candidate = scratch;
@@ -606,8 +608,12 @@ impl RtProcessor {
         self.config.latency_profile = scratch;
         scratch.apply_governor_defaults(&mut self.config.governor);
         self.governor.set_config(self.config.governor);
-        self.governor.set_tier(scratch.initial_tier());
-        self.set_target_tier(scratch.initial_tier());
+        self.governor.set_tier(scratch_tier);
+        self.current_tier = scratch_tier;
+        self.target_tier = scratch_tier;
+        self.blend_weights = scratch_weights;
+        self.target_weights = scratch_weights;
+        self.crossfade_blocks_left = 0;
         true
     }
 
@@ -2574,6 +2580,12 @@ mod tests {
             QualityTier::Q1,
             "scratch-biased modulation holds should retarget the scratch tier ladder"
         );
+        assert_eq!(
+            telemetry.current_tier,
+            QualityTier::Q1,
+            "scratch-biased modulation holds should snap the active tier onto the scratch ladder"
+        );
+        assert_weights_close(rt.blend_weights, QualityTier::Q1.lane_weights(), 1e-6);
     }
 
     #[test]
