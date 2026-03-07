@@ -304,12 +304,14 @@ impl TransientEventScheduler {
         mask[2] = true;
         mask[3] = true;
 
-        // Kick-assist low-band reset: engage for either low-dominant hits or
-        // broadband percussive events with meaningful low contribution.
-        let low_dominant = low_flux > peak * 0.30 && low_flux > threshold * 0.12;
+        // Kick-assist low-band reset: engage only when the event carries
+        // enough actual low-end transient energy, not just an upper-band hit
+        // with a modest low shelf.
+        let low_energy_spike = sub_flux + low_flux > threshold * 0.75;
+        let low_dominant =
+            low_flux > peak * 0.30 && low_flux > threshold * 0.12 && low_energy_spike;
         let low_broadband_support =
             low_flux > peak * 0.22 && (mid_flux > peak * 0.25 || high_flux > peak * 0.25);
-        let low_energy_spike = sub_flux + low_flux > threshold * 0.75;
         let low_balance_guard = low_flux > (mid_flux + high_flux) * 0.18;
         if low_dominant || (low_broadband_support && low_energy_spike && low_balance_guard) {
             mask[1] = true;
@@ -455,6 +457,22 @@ mod tests {
         assert!(
             !mask[0],
             "sub band should remain conservative for moderate low-end events"
+        );
+    }
+
+    #[test]
+    fn scheduler_select_reset_mask_skips_low_for_bright_transient_with_weak_low_shelf() {
+        let mut scheduler = TransientEventScheduler::new(1024, 256, 44_100, 4096);
+        scheduler.warmup_frames = 0;
+        let mask = scheduler.select_reset_mask(0.02, 0.31, 0.75, 0.95, 0.60);
+        assert!(
+            !mask[1],
+            "low band should stay locked when upper-band transients only carry a weak low shelf"
+        );
+        assert!(mask[2], "mid band should still reset for bright transients");
+        assert!(
+            mask[3],
+            "high band should still reset for bright transients"
         );
     }
 
