@@ -25,7 +25,7 @@ const FLUX_HIGH_WEIGHT: f64 = 1.25;
 const FLUX_WARMUP_FRAMES: usize = 3;
 /// Maximum analysis frames scanned per scheduler pass.
 const FLUX_MAX_SCAN_FRAMES: usize = 8;
-/// Cooldown frames after an event to avoid duplicate resets.
+/// Minimum cooldown frames after an event to avoid duplicate resets.
 const FLUX_RESET_COOLDOWN_FRAMES: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -122,6 +122,19 @@ impl TransientEventScheduler {
         self.right_buffer.clear();
         self.last_processed_frame_start = None;
         self.stats = TransientSchedulerStats::default();
+    }
+
+    #[inline]
+    fn reset_cooldown_frames(&self) -> usize {
+        if self.hop_size == 0 {
+            return FLUX_RESET_COOLDOWN_FRAMES;
+        }
+
+        // Hold the scheduler through the full overlapping-window footprint of
+        // a detected event so the same click is not reclassified as a fresh
+        // transient on the next few callback snapshots.
+        let overlap_frames = self.fft_size.div_ceil(self.hop_size).saturating_sub(1);
+        FLUX_RESET_COOLDOWN_FRAMES.max(overlap_frames)
     }
 
     /// Detects a transient event from stereo interleaved input and returns a
@@ -259,7 +272,7 @@ impl TransientEventScheduler {
                 }
                 self.stats.events_detected_total =
                     self.stats.events_detected_total.saturating_add(1);
-                self.cooldown_frames = FLUX_RESET_COOLDOWN_FRAMES;
+                self.cooldown_frames = self.reset_cooldown_frames();
             }
 
             self.update_flux_stats(flux);
@@ -530,8 +543,38 @@ mod tests {
         assert!(mask.is_some(), "expected tail transient reset mask");
         assert_eq!(
             scheduler.cooldown_frames,
-            FLUX_RESET_COOLDOWN_FRAMES,
+            FLUX_RESET_COOLDOWN_FRAMES.max(fft.div_ceil(hop).saturating_sub(1)),
             "detected events should keep the full configured cooldown for subsequent analysis frames"
+        );
+    }
+
+    #[test]
+    fn scheduler_broad_tail_transient_does_not_retrigger_across_overlapping_callbacks() {
+        let sr = 44_100u32;
+        let fft = 1024usize;
+        let hop = 256usize;
+        let callback_frames = 4096usize;
+        let total_frames = callback_frames + hop * 4;
+        let mut stereo = vec![0.0f32; total_frames * 2];
+        for i in 0..total_frames {
+            let t = i as f32 / sr as f32;
+            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
+            let burst = if (3600..4000).contains(&i) { 2.0 } else { 0.0 };
+            stereo[i * 2] = base + burst;
+            stereo[i * 2 + 1] = base * 0.9 + burst;
+        }
+
+        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, callback_frames);
+        for origin in [0usize, hop, hop * 2, hop * 3] {
+            let start = origin * 2;
+            let end = start + callback_frames * 2;
+            let _ = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin);
+        }
+
+        let stats = scheduler.stats();
+        assert_eq!(
+            stats.events_detected_total, 1,
+            "one broad tail transient should not retrigger across overlapping callbacks"
         );
     }
 }
