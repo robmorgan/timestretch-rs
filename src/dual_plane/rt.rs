@@ -621,6 +621,9 @@ impl RtProcessor {
         if self.config.ratio_motion_freeze_blocks == 0 || !next_ratio.is_finite() {
             return;
         }
+        if (next_ratio - 1.0).abs() <= UNITY_BYPASS_RATIO_EPS {
+            return;
+        }
         if (next_ratio - self.active_ratio).abs() < RATIO_MOTION_FREEZE_TRIGGER {
             return;
         }
@@ -3471,6 +3474,63 @@ mod tests {
         assert_eq!(
             telemetry.target_tier, initial.target_tier,
             "exact-unity passthrough must not queue a tier crossfade"
+        );
+        assert_weights_close(rt.blend_weights, initial_weights, 1e-6);
+        assert_weights_close(rt.target_weights, initial_weights, 1e-6);
+    }
+
+    #[test]
+    fn buffered_unity_kernel_does_not_arm_ratio_motion_freeze_or_bias_mix_profile() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Mix;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let initial = rt.profile_telemetry();
+        let initial_weights = rt.blend_weights;
+        rt.active_ratio = 1.04;
+        rt.set_constant_ratio(1.0);
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 0];
+        let input_refs = [&input[..]];
+        let mut output_refs = [&mut output[..]];
+
+        let (consumed, produced) = rt.process(&input_refs, &mut output_refs);
+        assert_eq!((consumed, produced), (128, 0));
+        assert_eq!(
+            rt.ratio_motion_freeze_blocks_left, 0,
+            "buffered exact-unity kernels must not arm a stale ratio-motion freeze"
+        );
+        assert_eq!(rt.active_ratio, 1.0);
+
+        let telemetry = rt.profile_telemetry();
+        assert_eq!(
+            telemetry.current_profile, initial.current_profile,
+            "buffered exact-unity kernels must not bias the committed mix profile"
+        );
+        assert_eq!(
+            telemetry.target_profile, initial.target_profile,
+            "buffered exact-unity kernels must not retarget the held profile"
+        );
+        assert_eq!(
+            telemetry.policy_profile, initial.policy_profile,
+            "buffered exact-unity kernels must leave profile policy telemetry unchanged"
+        );
+        assert_eq!(
+            telemetry.current_tier, initial.current_tier,
+            "buffered exact-unity kernels must not retarget the active quality tier"
+        );
+        assert_eq!(
+            telemetry.target_tier, initial.target_tier,
+            "buffered exact-unity kernels must not queue a tier crossfade"
         );
         assert_weights_close(rt.blend_weights, initial_weights, 1e-6);
         assert_weights_close(rt.target_weights, initial_weights, 1e-6);
