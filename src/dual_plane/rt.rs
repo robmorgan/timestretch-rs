@@ -1319,6 +1319,34 @@ impl RtProcessor {
         if (base_ratio - 1.0).abs() > UNITY_BYPASS_RATIO_EPS {
             return false;
         }
+        if !self.local_base_ratio_stays_near_unity(start, end) {
+            return false;
+        }
+
+        true
+    }
+
+    fn local_base_ratio_stays_near_unity(&self, start: f64, end: f64) -> bool {
+        if let Some(ratio) = self.constant_ratio_override {
+            return (ratio - 1.0).abs() <= UNITY_BYPASS_RATIO_EPS;
+        }
+
+        // TimeWarpMap is piecewise-linear, so checking the segment slope at the
+        // interval start and every internal anchor covers the whole block.
+        if (self.warp_map.local_ratio_at_input(start) - 1.0).abs() > UNITY_BYPASS_RATIO_EPS {
+            return false;
+        }
+
+        for anchor in self.warp_map.anchors() {
+            if anchor.input_frame <= start || anchor.input_frame >= end {
+                continue;
+            }
+            if (self.warp_map.local_ratio_at_input(anchor.input_frame) - 1.0).abs()
+                > UNITY_BYPASS_RATIO_EPS
+            {
+                return false;
+            }
+        }
 
         true
     }
@@ -1956,7 +1984,7 @@ mod tests {
     };
     use crate::core::types::StretchParams;
     use crate::dual_plane::hints::RenderHints;
-    use crate::dual_plane::warp_map::TimeWarpMap;
+    use crate::dual_plane::warp_map::{TimeWarpMap, WarpAnchor};
     use crate::error::StretchError;
     use std::sync::Arc;
 
@@ -2073,6 +2101,44 @@ mod tests {
         assert_eq!(written, input.len());
         assert_eq!(out, input);
         assert!(rt.input_ring.is_empty());
+        assert!(rt.pending_output.is_empty());
+    }
+
+    #[test]
+    fn process_block_into_rejects_average_unity_piecewise_warp_for_passthrough() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut cfg = RtConfig::new(params, 256);
+        cfg.latency_profile = LatencyProfile::Scratch;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let warp_map = Arc::new(
+            TimeWarpMap::from_anchors(vec![
+                WarpAnchor::new(0.0, 0.0).unwrap(),
+                WarpAnchor::new(128.0, 123.52).unwrap(),
+                WarpAnchor::new(256.0, 256.0).unwrap(),
+            ])
+            .unwrap(),
+        );
+        rt.set_warp_map_snapshot(warp_map);
+
+        assert!(
+            !rt.unity_passthrough_eligible(256),
+            "piecewise warp blocks that only average to unity must stay on the non-unity path"
+        );
+
+        let input = stereo_sine_block(256, 48_000, 330.0, 0.37);
+        let mut out = vec![0.0f32; input.len()];
+        let written = rt.process_block_into(&input, &mut out).unwrap();
+
+        assert_eq!(
+            written, 0,
+            "average-unity piecewise warp should buffer for deterministic processing instead of bypassing"
+        );
+        assert_eq!(rt.input_ring.len(), input.len());
         assert!(rt.pending_output.is_empty());
     }
 
