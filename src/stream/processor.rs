@@ -485,6 +485,8 @@ pub struct StreamProcessor {
     dual_plane_deterministic: Option<DualPlaneDeterministicState>,
     /// Deferred engine switch requested while a fixed-buffer flush drain is active.
     pending_streaming_engine: Option<StreamingEngine>,
+    /// Deferred pitch-scale change requested while a fixed-buffer flush drain is active.
+    pending_pitch_scale: Option<f64>,
 }
 
 impl std::fmt::Debug for StreamProcessor {
@@ -503,6 +505,7 @@ impl std::fmt::Debug for StreamProcessor {
                 &self.dual_plane_deterministic.is_some(),
             )
             .field("pending_streaming_engine", &self.pending_streaming_engine)
+            .field("pending_pitch_scale", &self.pending_pitch_scale)
             .field("dual_plane_preferred", &self.dual_plane_preferred)
             .field("source_bpm", &self.source_bpm)
             .field("input_ring_len", &self.input_ring.len())
@@ -597,6 +600,7 @@ impl StreamProcessor {
             dual_plane_preferred: true,
             dual_plane_deterministic: None,
             pending_streaming_engine: None,
+            pending_pitch_scale: None,
         };
         me.ensure_default_dual_plane_backend();
         me
@@ -2135,6 +2139,9 @@ impl StreamProcessor {
         if let Some(engine) = self.pending_streaming_engine.take() {
             self.apply_streaming_engine_now(engine);
         }
+        if let Some(scale) = self.pending_pitch_scale.take() {
+            self.apply_pitch_scale_now(scale);
+        }
     }
 
     fn apply_streaming_engine_now(&mut self, engine: StreamingEngine) {
@@ -2734,17 +2741,18 @@ impl StreamProcessor {
     ///
     /// Stream mode applies pitch scale by rendering with an internal stretch
     /// ratio of `stretch_ratio * pitch_scale` and then resampling the rendered
-    /// stream per channel by `1.0 / pitch_scale` to preserve target tempo.
+    /// stream per channel by `1.0 / pitch_scale` to preserve target tempo. If
+    /// a fixed-buffer flush drain is active, the change takes effect after the
+    /// remaining tail has been fully drained.
     pub fn set_pitch_scale(&mut self, scale: f64) -> Result<(), StretchError> {
         let scale = validate_positive_finite_ratio(scale, "pitch scale")?;
-        if (scale - self.pitch_scale).abs() > RATIO_SNAP_THRESHOLD {
-            self.hybrid_pending_rebase = true;
-            self.reset_pitch_resamplers();
+        if self.fixed_flush_pending {
+            self.pending_pitch_scale = Some(scale);
+            return Ok(());
         }
-        self.pitch_scale = scale;
-        if dual_plane_supports_pitch_scale(scale) {
-            self.ensure_default_dual_plane_backend();
-        }
+
+        self.pending_pitch_scale = None;
+        self.apply_pitch_scale_now(scale);
         Ok(())
     }
 
@@ -2850,6 +2858,7 @@ impl StreamProcessor {
         self.fixed_flush_pitch_tail_flushed = false;
         self.fixed_flush_length_reconciled = false;
         self.fixed_flush_scratch.clear();
+        self.pending_pitch_scale = None;
 
         self.dual_plane_deterministic = None;
         if let Some(engine) = pending_streaming_engine {
@@ -2866,6 +2875,17 @@ impl StreamProcessor {
                 voc.set_stretch_ratio(processing_ratio);
             }
             self.vocoder_ratio = processing_ratio;
+        }
+    }
+
+    fn apply_pitch_scale_now(&mut self, scale: f64) {
+        if (scale - self.pitch_scale).abs() > RATIO_SNAP_THRESHOLD {
+            self.hybrid_pending_rebase = true;
+            self.reset_pitch_resamplers();
+        }
+        self.pitch_scale = scale;
+        if dual_plane_supports_pitch_scale(scale) {
+            self.ensure_default_dual_plane_backend();
         }
     }
 
@@ -4868,6 +4888,95 @@ mod tests {
         switched
             .process_into(&input[..256 * 2], &mut post_switch_output)
             .unwrap();
+    }
+
+    #[test]
+    fn test_pitch_scale_change_waits_for_fixed_flush_tail_drain() {
+        let params = StretchParams::new(1.03)
+            .with_sample_rate(44_100)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut control = StreamProcessor::new(params.clone());
+        let mut retuned = StreamProcessor::new(params);
+        control.set_dual_plane_deterministic(true).unwrap();
+        retuned.set_dual_plane_deterministic(true).unwrap();
+        control.set_pitch_scale(1.05).unwrap();
+        retuned.set_pitch_scale(1.05).unwrap();
+
+        let mut input = Vec::with_capacity(256 * 2 * 12);
+        for i in 0..(256 * 12) {
+            let t = i as f32 / 44_100.0;
+            input.push((2.0 * PI * 110.0 * t).sin() * 0.3);
+            input.push((2.0 * PI * 330.0 * t).sin() * 0.25);
+        }
+
+        let mut control_streamed = Vec::with_capacity(input.len() * 2);
+        let mut retuned_streamed = Vec::with_capacity(input.len() * 2);
+        for chunk in input.chunks(256 * 2) {
+            control.process_into(chunk, &mut control_streamed).unwrap();
+            retuned.process_into(chunk, &mut retuned_streamed).unwrap();
+        }
+        assert_eq!(control_streamed.len(), retuned_streamed.len());
+        for (idx, (&lhs, &rhs)) in control_streamed
+            .iter()
+            .zip(retuned_streamed.iter())
+            .enumerate()
+        {
+            assert!(
+                (lhs - rhs).abs() < 1e-6,
+                "Mismatch at streamed sample {idx}: {lhs} vs {rhs}"
+            );
+        }
+
+        let control_flush_budget = control.max_flush_interleaved_output_samples().unwrap();
+        let retuned_flush_budget = retuned.max_flush_interleaved_output_samples().unwrap();
+        assert!(control_flush_budget > 2);
+        assert_eq!(control_flush_budget, retuned_flush_budget);
+
+        let mut control_tail = Vec::new();
+        let mut retuned_tail = Vec::new();
+        let mut first_control = [0.0f32; 2];
+        let mut first_retuned = [0.0f32; 2];
+        let control_written = control.flush_interleaved_into(&mut first_control).unwrap();
+        let retuned_written = retuned.flush_interleaved_into(&mut first_retuned).unwrap();
+        assert_eq!(control_written, retuned_written);
+        assert!(retuned_written > 0);
+        assert!(control.fixed_flush_pending);
+        assert!(retuned.fixed_flush_pending);
+        control_tail.extend_from_slice(&first_control[..control_written]);
+        retuned_tail.extend_from_slice(&first_retuned[..retuned_written]);
+
+        retuned.set_pitch_scale(1.19).unwrap();
+        assert!(retuned.fixed_flush_pending);
+        assert_eq!(retuned.pending_pitch_scale, Some(1.19));
+        assert!((retuned.pitch_scale() - 1.05).abs() < 1e-9);
+
+        let mut control_chunk = [0.0f32; 13];
+        let mut retuned_chunk = [0.0f32; 13];
+        loop {
+            let control_written = control.flush_interleaved_into(&mut control_chunk).unwrap();
+            let retuned_written = retuned.flush_interleaved_into(&mut retuned_chunk).unwrap();
+            assert_eq!(control_written, retuned_written);
+            control_tail.extend_from_slice(&control_chunk[..control_written]);
+            retuned_tail.extend_from_slice(&retuned_chunk[..retuned_written]);
+            assert_eq!(control.fixed_flush_pending, retuned.fixed_flush_pending);
+            if !retuned.fixed_flush_pending {
+                break;
+            }
+        }
+
+        assert_eq!(control_tail.len(), retuned_tail.len());
+        for (idx, (&lhs, &rhs)) in control_tail.iter().zip(retuned_tail.iter()).enumerate() {
+            assert!(
+                (lhs - rhs).abs() < 1e-6,
+                "Mismatch at flushed sample {idx}: {lhs} vs {rhs}"
+            );
+        }
+
+        assert!(!retuned.fixed_flush_pending);
+        assert_eq!(retuned.pending_pitch_scale, None);
+        assert!((retuned.pitch_scale() - 1.19).abs() < 1e-9);
     }
 
     #[test]
