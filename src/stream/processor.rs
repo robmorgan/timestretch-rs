@@ -4026,6 +4026,55 @@ mod tests {
     }
 
     #[test]
+    fn test_short_interval_cross_unity_modulation_does_not_spuriously_trigger_transient_resets() {
+        let sample_rate = 48_000u32;
+        let chunk_frames = 256usize;
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(sample_rate)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_dual_plane_deterministic(false).unwrap();
+
+        let ratios = [1.04, 0.96, 1.04, 0.96, 1.04, 0.96, 1.04, 0.96, 1.04, 0.96];
+        let mut total_output = Vec::new();
+
+        for (chunk_idx, ratio) in ratios.into_iter().enumerate() {
+            proc.set_stretch_ratio(ratio).unwrap();
+
+            let mut chunk = Vec::with_capacity(chunk_frames * 2);
+            for frame in 0..chunk_frames {
+                let sample_idx = chunk_idx * chunk_frames + frame;
+                let t = sample_idx as f32 / sample_rate as f32;
+                chunk.push((2.0 * PI * 220.0 * t).sin() * 0.25);
+                chunk.push((2.0 * PI * 330.0 * t).sin() * 0.20);
+            }
+
+            total_output.extend_from_slice(&proc.process(&chunk).unwrap());
+        }
+
+        let stats = proc.transient_reset_stats();
+        assert_eq!(
+            stats.events_detected_total, 0,
+            "smooth stereo modulation should not schedule transient resets without actual onsets"
+        );
+        assert_eq!(
+            stats.reset_band_counts_total,
+            [0, 0, 0, 0],
+            "smooth stereo modulation should not increment per-band transient reset telemetry"
+        );
+        assert!(
+            stats.input_frames_consumed_total >= chunk_frames * 2,
+            "test should drive the stream far enough to exercise scheduler analysis"
+        );
+        assert!(
+            total_output.iter().all(|sample| sample.is_finite()),
+            "modulated stream output should remain finite"
+        );
+    }
+
+    #[test]
     fn test_stereo_channel_reset_masks_mid_full_side_mid_high() {
         let full = [true, true, true, true];
         let (mid, side) = stereo_channel_reset_masks(full);
