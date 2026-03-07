@@ -1,4 +1,4 @@
-You are working in the Git repository at /Users/robbym/go/src/github.com/robmorgan/timestretch-rs on branch research at commit fe4aa1b95eed91c9027b5f3b6edc064c6c33e800.
+You are working in the Git repository at /Users/robbym/go/src/github.com/robmorgan/timestretch-rs on branch research at commit f50c1063e5b32b9c50b124d51aea75a0422e1195.
 
 Execute exactly one small slice from the active roadmap stage only.
 
@@ -47,7 +47,7 @@ artifacts, improvements elsewhere will not matter.
 - `src/stream/processor.rs`
 - `src/stream/transient_scheduler.rs`
 - `src/stretch/phase_vocoder.rs`
-- `tests/quality_gates.rs`
+- `qa/quality_gates.rs`
 
 ### Work
 
@@ -61,30 +61,20 @@ artifacts, improvements elsewhere will not matter.
 
 ### Exit Criteria
 
-- `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`
+- `cargo test --features qa-harnesses --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`
   passes with margin, not barely.
 - Release-mode modulation no longer produces obvious clicks, roughness, or
   discontinuities on synthetic DJ-like material.
 - Fixes do not regress steady-state deterministic streaming quality.
 
 ## Previous Iteration Summary
-Files changed: [src/stream/processor.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/processor.rs#L24), [src/stream/processor.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/processor.rs#L399), and [src/stream/processor.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/processor.rs#L1571). This Stage 1 slice keeps a rolling chunk-ratio window sized to one dual-plane RT kernel and feeds the backend a lightly slewed average ratio instead of the latest callback ratio alone. I left the existing unrelated dirty files untouched, and Stage 1 remains `[~]`.
+Added one Stage 1 slice in [src/dual_plane/rt.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/dual_plane/rt.rs#L2504): a new regression test, `ratio_motion_freeze_rearms_under_callback_rate_modulation`, which verifies callback-rate ratio toggling re-arms the existing ratio-motion freeze and prevents auto-profile flapping until modulation stops. I left `ROADMAP.md` unchanged because Stage 1 was already `[~]`, and the stage exit criteria are still not satisfied. I did not edit `.codex-plan-loop`.
 
 Checks run:
-- `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`
-  Failed, but improved: baseline `p95=1.132`; modulated `p95=3.613` (down from `4.936`), `p98=5.433`, `mean=2.269`.
-- `cargo test --release --test quality_gates quality_gate_dual_plane_deterministic_long_run_drift -- --nocapture`
-  Passed.
+- `cargo test ratio_motion_freeze_ -- --nocapture`
+- `cargo test --features qa-harnesses --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`
+- `cargo fmt --all --check`
 
-Remaining risk: the dedicated Stage 1 fast-modulation gate still fails, and large outliers remain, so the next slice likely needs a deeper RT/kernel transition continuity fix rather than more adapter-only ratio shaping.
+Remaining risk: this iteration strengthens Stage 1 regression coverage only; it does not improve the fast-modulation path itself. The dedicated release gate still passes at the prior narrow margin (`modulated p95=2.695`, `mean=1.812`), so Stage 1 should remain `[~]`.
 ## Last Failure Context
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.37s
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.34s
-thread 'quality_gate_dual_plane_fast_modulation_artifacts' (175157413) panicked at tests/quality_gates.rs:960:5:
-dual-plane modulation artifact gate failed (p95): modulated 3.613 vs baseline 1.132
-test quality_gate_dual_plane_fast_modulation_artifacts ... FAILED
-failures:
-failures:
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.31s
-error: test failed, to rerun pass `--test quality_gates`
+No prior failure context is recorded.

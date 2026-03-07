@@ -591,6 +591,26 @@ impl RtProcessor {
         self.crossfade_blocks_left = 0;
     }
 
+    fn bias_ratio_motion_hold_to_scratch_if_needed(&mut self) -> bool {
+        if !self.auto_profile_switching || self.current_profile != LatencyProfile::Mix {
+            return false;
+        }
+
+        let scratch = LatencyProfile::Scratch;
+        self.current_profile = scratch;
+        self.policy_profile = scratch;
+        self.profile_candidate = scratch;
+        self.profile_candidate_streak = 0;
+        self.target_profile = scratch;
+        self.profile_transition_blocks_left = 0;
+        self.config.latency_profile = scratch;
+        scratch.apply_governor_defaults(&mut self.config.governor);
+        self.governor.set_config(self.config.governor);
+        self.governor.set_tier(scratch.initial_tier());
+        self.set_target_tier(scratch.initial_tier());
+        true
+    }
+
     fn engage_ratio_motion_freeze_if_needed(&mut self, next_ratio: f64) {
         if self.config.ratio_motion_freeze_blocks == 0 || !next_ratio.is_finite() {
             return;
@@ -600,6 +620,15 @@ impl RtProcessor {
         }
 
         self.ratio_motion_freeze_blocks_left = self.config.ratio_motion_freeze_blocks;
+        if self.bias_ratio_motion_hold_to_scratch_if_needed() {
+            return;
+        }
+        if self.auto_profile_switching && self.current_profile == LatencyProfile::Scratch {
+            self.policy_profile = LatencyProfile::Scratch;
+            self.profile_candidate = LatencyProfile::Scratch;
+            self.profile_candidate_streak = 0;
+            return;
+        }
         self.hold_profile_and_tier_transitions();
     }
 
@@ -2499,6 +2528,51 @@ mod tests {
             telemetry.target_profile,
             LatencyProfile::Scratch,
             "auto profile switching should resume after the ratio-motion freeze expires"
+        );
+    }
+
+    #[test]
+    fn ratio_motion_freeze_biases_mix_profile_to_scratch_under_fast_modulation() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Mix;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+
+        rt.set_constant_ratio(1.035);
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+
+        let telemetry = rt.profile_telemetry();
+        assert_eq!(
+            telemetry.current_profile,
+            LatencyProfile::Scratch,
+            "fast ratio motion should move auto-mode mix kernels onto the scratch profile"
+        );
+        assert_eq!(
+            telemetry.target_profile,
+            LatencyProfile::Scratch,
+            "fast ratio motion should hold the scratch target until modulation settles"
+        );
+        assert_eq!(
+            telemetry.policy_profile,
+            LatencyProfile::Scratch,
+            "policy telemetry should expose the modulation-biased scratch hold"
+        );
+        assert_eq!(
+            telemetry.target_tier,
+            QualityTier::Q1,
+            "scratch-biased modulation holds should retarget the scratch tier ladder"
         );
     }
 
