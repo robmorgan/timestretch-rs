@@ -21,6 +21,8 @@ const RATIO_SNAP_THRESHOLD: f64 = 0.0001;
 /// Smoothing is time-based (not callback-based), so behavior stays stable
 /// across 64/128/256/1024 frame callbacks.
 const RATIO_SMOOTHING_TIME_SECS: f64 = 0.050;
+/// Additional slew applied after kernel-window averaging for deterministic dual-plane updates.
+const DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS: f64 = 0.040;
 /// Numerator for the FFT-size latency fraction (3/2 = 1.5x FFT size).
 const LATENCY_FFT_NUMERATOR: usize = 3;
 /// Denominator for the FFT-size latency fraction.
@@ -111,6 +113,28 @@ fn apply_dual_plane_ratio(
     let ratio = validate_positive_finite_ratio(ratio, "dual-plane ratio")?;
     processor.rt_mut().set_constant_ratio(ratio);
     Ok(())
+}
+
+#[inline]
+fn smooth_ratio_toward(
+    current: f64,
+    target: f64,
+    frames: usize,
+    sample_rate: u32,
+    tau_secs: f64,
+) -> f64 {
+    if frames == 0 || (target - current).abs() <= RATIO_SNAP_THRESHOLD {
+        return target;
+    }
+
+    let tau_frames = (sample_rate as f64 * tau_secs).max(1.0);
+    let alpha = 1.0 - (-(frames as f64) / tau_frames).exp();
+    let next = current + alpha * (target - current);
+    if (next - target).abs() < RATIO_SNAP_THRESHOLD {
+        target
+    } else {
+        next
+    }
 }
 
 #[inline]
@@ -379,12 +403,15 @@ struct DualPlaneDeterministicState {
     input_planar: Vec<Vec<f32>>,
     output_planar: Vec<Vec<f32>>,
     flush_interleaved: Vec<f32>,
+    ratio_window_blocks: usize,
+    recent_chunk_ratios: Vec<f64>,
     last_ratio: f64,
 }
 
 impl DualPlaneDeterministicState {
     fn from_params(params: &StretchParams, ratio: f64) -> Result<Self, StretchError> {
         let block_frames = COMMON_CALLBACK_FRAMES;
+        let kernel_frames = (params.fft_size * 2).max(block_frames);
         let mut rt_cfg = RtConfig::new(params.clone(), block_frames);
         rt_cfg.latency_profile = latency_profile_for_quality(params.quality_mode);
         rt_cfg.auto_profile_switching = true;
@@ -407,8 +434,20 @@ impl DualPlaneDeterministicState {
                 .map(|_| vec![0.0; max_output_frames])
                 .collect(),
             flush_interleaved: Vec::with_capacity(max_output_frames.saturating_mul(num_channels)),
+            ratio_window_blocks: kernel_frames.div_ceil(block_frames).max(1),
+            recent_chunk_ratios: Vec::new(),
             last_ratio: ratio,
         })
+    }
+
+    #[inline]
+    fn push_chunk_ratio(&mut self, ratio: f64) -> f64 {
+        if self.recent_chunk_ratios.len() == self.ratio_window_blocks {
+            self.recent_chunk_ratios.remove(0);
+        }
+        self.recent_chunk_ratios.push(ratio);
+        let sum: f64 = self.recent_chunk_ratios.iter().sum();
+        sum / self.recent_chunk_ratios.len().max(1) as f64
     }
 }
 
@@ -1559,7 +1598,8 @@ impl StreamProcessor {
 
         self.interpolate_ratio_for_frames(frames);
         self.expected_total_output_samples += input.len() as f64 * self.current_ratio;
-        self.apply_current_dual_plane_ratio()?;
+        let processing_ratio = self.processing_ratio();
+        let sample_rate = self.params.sample_rate;
 
         let produced_frames = {
             let (channel_output_buffers, dual_plane_state) = (
@@ -1581,6 +1621,19 @@ impl StreamProcessor {
                 return Err(StretchError::InvalidState(
                     "channel output buffers do not match channel count",
                 ));
+            }
+
+            let averaged_ratio = state.push_chunk_ratio(processing_ratio);
+            let applied_ratio = smooth_ratio_toward(
+                state.last_ratio,
+                averaged_ratio,
+                frames,
+                sample_rate,
+                DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS,
+            );
+            if (applied_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
+                apply_dual_plane_ratio(&mut state.processor, applied_ratio)?;
+                state.last_ratio = applied_ratio;
             }
 
             for frame in 0..frames {

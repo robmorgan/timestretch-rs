@@ -1,0 +1,7 @@
+Stage 1 remains `[~]`; `ROADMAP.md` was already active and I did not mark it `[x]` because the exit gate still fails.
+
+Files changed: [src/stretch/phase_vocoder.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stretch/phase_vocoder.rs#L41) now re-anchors carried overlap normalization to `1.0` for small cross-unity ratio modulation, while still preserving the larger expansion-prone ratio for bigger transitions. I also added focused regressions at [src/stretch/phase_vocoder.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stretch/phase_vocoder.rs#L2255) covering both large ratio changes and small near-unity modulation.
+
+Checks run: `cargo test test_streaming_tail_ratio_ -- --nocapture` passed. `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture` failed unchanged: baseline `p95=1.132`, modulated `p95=3.613`, `p98=5.433`, `mean=2.269`.
+
+Remaining risk: this slice tightened one `PhaseVocoder` overlap-normalization corner case, but it did not move the main deterministic dual-plane fast-modulation artifact regression. The next blocker is still in the broader ratio-transition continuity path, not this carried-tail normalization behavior alone.

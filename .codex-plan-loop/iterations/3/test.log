@@ -1,0 +1,52 @@
+==> running: cargo test --test dual_plane_rt --test realtime_allocations --test realtime_dj_conditions
+   Compiling timestretch v0.3.0 (/Users/robbym/go/src/github.com/robmorgan/timestretch-rs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.79s
+     Running tests/dual_plane_rt.rs (target/debug/deps/dual_plane_rt-54de173989efffc1)
+
+running 2 tests
+test rt_processor_handles_fixed_blocks ... ok
+test dual_plane_accepts_warp_and_analysis_updates ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/realtime_allocations.rs (target/debug/deps/realtime_allocations-60155168e6216a7d)
+
+running 5 tests
+test dual_plane_rt_process_block_no_heap_growth_after_warmup ... ok
+test dual_plane_rt_stem_aware_no_heap_growth_after_warmup ... ok
+test process_into_hybrid_mode_allocation_telemetry_present ... ok
+test process_into_hybrid_realtime_strict_no_heap_growth_after_warmup ... ok
+test process_into_steady_state_no_heap_growth_after_warmup ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.23s
+
+     Running tests/realtime_dj_conditions.rs (target/debug/deps/realtime_dj_conditions-8acee62b1c2af69d)
+
+running 4 tests
+test realtime_midstream_ratio_changes_every_500ms ... ok
+test realtime_callback_1024_frames_no_overflow ... ok
+test realtime_callback_128_frames_10s ... ok
+test realtime_callback_64_frames_10s ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.90s
+
+==> running: cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture
+    Finished `release` profile [optimized] target(s) in 0.02s
+     Running tests/quality_gates.rs (target/release/deps/quality_gates-84621307e5ae569f)
+
+running 1 test
+dual-plane-fast-mod gate: baseline(max=1.314,p95=1.132,p98=1.182,p99=1.231,mean=0.459,n=1348) modulated(max=59.994,p95=3.613,p98=5.433,p99=59.994,mean=2.269,n=1348)
+
+thread 'quality_gate_dual_plane_fast_modulation_artifacts' (175193544) panicked at tests/quality_gates.rs:960:5:
+dual-plane modulation artifact gate failed (p95): modulated 3.613 vs baseline 1.132
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test quality_gate_dual_plane_fast_modulation_artifacts ... FAILED
+
+failures:
+
+failures:
+    quality_gate_dual_plane_fast_modulation_artifacts
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.30s
+
+error: test failed, to rerun pass `--test quality_gates`

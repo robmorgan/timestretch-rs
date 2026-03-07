@@ -1,0 +1,7 @@
+Implemented one Stage 1 slice in [src/stream/transient_scheduler.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/transient_scheduler.rs#L249): a detected transient no longer burns one cooldown frame immediately on the same analysis frame that triggered the reset. I also added a focused regression at [src/stream/transient_scheduler.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/transient_scheduler.rs#L495) that tail-aligns a click to the final scanned frame and asserts the full configured cooldown is preserved for subsequent frames. `ROADMAP.md` was already at `[~]`, and it remains `[~]` because the stage exit gate is still failing.
+
+Checks run:
+- `cargo test scheduler_ -- --nocapture` passed (`8 passed`).
+- `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture` failed unchanged: baseline `p95=1.132`, modulated `p95=3.613`, `p98=5.433`, `mean=2.269`.
+
+Files changed this turn: [src/stream/transient_scheduler.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/transient_scheduler.rs). Remaining risk: this slice tightens transient reset scheduling, but the larger deterministic dual-plane fast-modulation artifact regression is still present, so Stage 1 is not ready to close.

@@ -30,7 +30,7 @@ fast-modulation artifact regression is fixed.
 - Preserve the EDM-first focus unless there is a deliberate decision to expand
   into a broader general-purpose stretcher.
 
-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
+## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
 
 Automation: auto
 

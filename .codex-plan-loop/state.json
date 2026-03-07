@@ -1,0 +1,15 @@
+{
+  "active_stage_number": 1,
+  "active_stage_status": "[~]",
+  "active_stage_title": "Stabilize Fast Modulation and Transition Quality",
+  "branch": "research",
+  "consecutive_stalls": 5,
+  "failure_count": 5,
+  "last_failure_path": "/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/.codex-plan-loop/iterations/5/failure_summary.txt",
+  "last_result": "test_failed",
+  "managed_untracked_path": "/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/.codex-plan-loop/managed_untracked.txt",
+  "next_iteration": 6,
+  "session_id": "roadmap-loop-20260307T073849Z-53520",
+  "start_sha": "fe4aa1b95eed91c9027b5f3b6edc064c6c33e800",
+  "success_count": 0
+}

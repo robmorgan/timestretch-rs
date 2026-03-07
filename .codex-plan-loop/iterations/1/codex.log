@@ -1,0 +1,3314 @@
+OpenAI Codex v0.106.0 (research preview)
+--------
+workdir: /Users/robbym/go/src/github.com/robmorgan/timestretch-rs
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019cc73c-19aa-74e2-ae6a-a6ec9e513d82
+--------
+user
+You are working in the Git repository at /Users/robbym/go/src/github.com/robmorgan/timestretch-rs on branch research at commit fe4aa1b95eed91c9027b5f3b6edc064c6c33e800.
+
+Execute exactly one small slice from the active roadmap stage only.
+
+Requirements:
+- Implement exactly one small slice inside the active stage.
+- Do not jump to later stages.
+- Run the most relevant local checks for the files you touch.
+- Update the active stage status from [ ] to [~] when work begins.
+- Update [~] to [x] only if the stage exit criteria are satisfied and the dedicated stage verification passes.
+- Do not edit /Users/robbym/go/src/github.com/robmorgan/timestretch-rs/.codex-plan-loop.
+- Leave the repository in a state where the outer loop can run its smoke and stage-specific tests.
+- End with a concise summary of files changed, checks run, and remaining risk.
+
+This is loop iteration 1.
+This is the active roadmap stage: Stage 1 - Stabilize Fast Modulation and Transition Quality
+
+## Goal
+
+Make `timestretch-rs` competitive with production-grade realtime stretchers by
+closing the remaining gaps in audible quality, modulation stability, realtime
+contract quality, external quality evidence, and API strictness.
+
+## Principles
+
+- Fix audible regressions before adding features.
+- Make the RT-safe path the default, obvious path.
+- Reject malformed input instead of silently truncating or falling back.
+- Prefer reference-driven quality gates over self-comparison alone.
+- Preserve the EDM-first focus unless there is a deliberate decision to expand
+  into a broader general-purpose stretcher.
+
+## Active Stage
+## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
+
+Automation: auto
+
+### Why
+
+This is the clearest current signal that the library is not yet
+production-stable. If dynamic ratio changes still produce obvious boundary
+artifacts, improvements elsewhere will not matter.
+
+### Primary Files
+
+- `src/dual_plane/rt.rs`
+- `src/stream/processor.rs`
+- `src/stream/transient_scheduler.rs`
+- `src/stretch/phase_vocoder.rs`
+- `tests/quality_gates.rs`
+
+### Work
+
+- Fix ratio-transition continuity in the dual-plane deterministic path.
+- Reduce profile-switch churn and improve hysteresis for automation-heavy use.
+- Tighten transient reset scheduling so fast modulation does not over-trigger
+  phase resets.
+- Review how phase state is preserved or reseeded during rapid ratio changes.
+- Add additional focused tests around repeated short-interval modulation, not
+  just the existing one gate.
+
+### Exit Criteria
+
+- `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`
+  passes with margin, not barely.
+- Release-mode modulation no longer produces obvious clicks, roughness, or
+  discontinuities on synthetic DJ-like material.
+- Fixes do not regress steady-state deterministic streaming quality.
+
+## Previous Iteration Summary
+No prior iteration summary is available.
+
+## Last Failure Context
+No prior failure context is recorded.
+
+mcp startup: no servers
+
+thinking
+**Inspecting active roadmap**
+
+I need to focus on complying with one specific task within the active stage. First, I'll check the roadmap document, possibly the README or ROADMAP files. I'll update the stage status according to our criteria – changing it from [ ] to [] when work begins, and to [x] only if we meet the exit criteria. Since it seems likely that this slice won’t fully satisfy those criteria, we’ll keep it at []. I’ll ensure to run relevant local checks and provide a concise summary afterward. Let’s get started!
+codex
+I’m locating the roadmap file and the Stage 1 code paths first so I can take one bounded change inside that stage, update the stage marker, and then run the narrowest relevant checks on what I touch.
+exec
+/bin/zsh -lc "pwd && rg -n \"Stage 1: Stabilize Fast Modulation and Transition Quality|## \\[ \\] Stage 1|## \\[~\\] Stage 1|## \\[x\\] Stage 1\" -S ." in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc 'rg --files .' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rs succeeded in 52ms:
+/Users/robbym/go/src/github.com/robmorgan/timestretch-rs
+./ROADMAP.md:33:## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
+ succeeded in 52ms:
+./src/cli.rs
+./src/dual_plane/engine.rs
+./src/dual_plane/warp_map.rs
+./src/dual_plane/analysis_plane.rs
+./src/dual_plane/quality.rs
+./src/dual_plane/hints.rs
+./src/dual_plane/mod.rs
+./src/dual_plane/rt.rs
+./src/io/wav.rs
+./src/io/mod.rs
+./src/stream/mod.rs
+./src/stream/transient_scheduler.rs
+./src/stream/processor.rs
+./src/lib.rs
+./src/error.rs
+./src/stretch/phase_locking.rs
+./src/stretch/multi_resolution.rs
+./src/stretch/stereo.rs
+./src/stretch/wsola.rs
+./src/stretch/envelope.rs
+
+thinking
+**Inspecting ROADMAP stage**
+
+I need to take a closer look at the ROADMAP stage and relevant code. I should identify a small slice to focus on, perhaps adding targeted tests around short-interval modulation in tests/quality_gates.rs and adjusting the code. I’m also considering tightening transient reset scheduling to prevent fast modulation from over-triggering phase resets. Implementing additional tests might satisfy the requirement, but the user likely expects both code changes and tests. I should update the ROADMAP status and inspect relevant files like ROADMAP, quality_gates, transient_scheduler, and processor.
+codex
+I found the roadmap entry in `ROADMAP.md`. Next I’m reading the Stage 1 quality gate and the modulation/transient scheduling code to pick one tight slice that fits the stage without spilling into later work.
+exec
+/bin/zsh -lc "sed -n '1,140p' ROADMAP.md" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc "sed -n '1,260p' tests/quality_gates.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc "sed -n '1,260p' src/stream/transient_scheduler.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc "sed -n '1,340p' src/stream/processor.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rs succeeded in 51ms:
+# Roadmap
+
+## Goal
+
+Make `timestretch-rs` competitive with production-grade realtime stretchers by
+closing the remaining gaps in audible quality, modulation stability, realtime
+contract quality, external quality evidence, and API strictness.
+
+## Current Status
+
+The repository is already beyond a toy implementation:
+
+- The core hybrid design is real: phase vocoder, WSOLA, HPSS, multi-resolution,
+  stereo handling, streaming, and a deterministic RT path all exist.
+- CI, quality gates, regression tests, and allocation tests are already in
+  place.
+- The main gap is not "missing DSP ideas". The main gap is the last 20%:
+  stronger continuity under modulation, tighter routing/decomposition, stricter
+  invariants, and reference-driven tuning.
+
+ succeeded in 51ms:
+use std::f32::consts::PI;
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::Instant;
+use timestretch::{analysis::comparison, EdmPreset, StreamProcessor, StretchParams};
+
+const STRICT_CALLBACK_BUDGET_ENV: &str = "TIMESTRETCH_STRICT_CALLBACK_BUDGET";
+const CALLBACK_BUDGET_MULTIPLIER_ENV: &str = "TIMESTRETCH_CALLBACK_BUDGET_MULTIPLIER";
+const QUALITY_DASHBOARD_DIR_ENV: &str = "TIMESTRETCH_QUALITY_DASHBOARD_DIR";
+
+fn generate_gate_signal(sample_rate: u32, bpm: f64, duration_secs: f64) -> Vec<f32> {
+    let total_samples = (sample_rate as f64 * duration_secs) as usize;
+    let beat_interval = (60.0 * sample_rate as f64 / bpm) as usize;
+    let mut out = vec![0.0f32; total_samples];
+
+    for (i, sample) in out.iter_mut().enumerate().take(total_samples) {
+        let t = i as f32 / sample_rate as f32;
+        *sample += 0.22 * (2.0 * PI * 55.0 * t).sin();
+        *sample += 0.15 * (2.0 * PI * 220.0 * t).sin();
+ succeeded in 51ms:
+//! Persistent transient-event scheduling for deterministic stream processing.
+
+use crate::core::fft::COMPLEX_ZERO;
+use crate::core::window::{generate_window, WindowType};
+use rustfft::{num_complex::Complex, FftPlanner};
+use std::sync::Arc;
+
+/// Sub-bass/low-band split (Hz) used for reset-mask routing.
+const BAND_SUB_END_HZ: f64 = 100.0;
+/// Low/mid split (Hz) used for reset-mask routing.
+const BAND_LOW_END_HZ: f64 = 500.0;
+/// Mid/high split (Hz) used for reset-mask routing.
+const BAND_MID_END_HZ: f64 = 4000.0;
+/// EMA coefficient for adaptive spectral-flux statistics.
+const FLUX_EMA_ALPHA: f64 = 0.2;
+/// Sigma multiplier for adaptive spectral-flux threshold.
+const FLUX_THRESHOLD_SIGMA: f64 = 2.5;
+/// Required jump versus previous frame flux to classify a transient.
+const FLUX_SPIKE_RATIO: f64 = 1.6;
+/// Absolute guard to suppress near-silence false triggers.
+ succeeded in 51ms:
+//! Real-time streaming time-stretch processor.
+
+use crate::analysis::transient::{detect_transients_with_options, TransientDetectionOptions};
+use crate::core::ring_buffer::RingBuffer;
+use crate::core::types::{QualityMode, StretchParams};
+use crate::core::window::WindowType;
+use crate::dual_plane::{
+    DualPlaneProcessor, LatencyProfile, RtConfig, RtDelayTelemetry, RtProfileTelemetry,
+    RtRuntimeTelemetry,
+};
+use crate::error::StretchError;
+use crate::stream::transient_scheduler::{TransientEventScheduler, TransientSchedulerStats};
+use crate::stretch::hybrid::HybridStretcher;
+use crate::stretch::phase_vocoder::PhaseVocoder;
+use crate::stretch::stereo::StereoMode;
+
+/// Threshold below which ratio differences are considered negligible.
+const RATIO_SNAP_THRESHOLD: f64 = 0.0001;
+/// Ratio smoothing time constant in seconds.
+///
+exec
+/bin/zsh -lc "sed -n '340,760p' src/stream/processor.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc 'rg -n "TransientEventScheduler|detect_stereo_reset_mask|reset_mask|transient" src/stream/processor.rs src/dual_plane/rt.rs src/stretch/phase_vocoder.rs tests/quality_gates.rs' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc "sed -n '1,320p' src/dual_plane/rt.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rs succeeded in 51ms:
+//! Hard-RT audio plane.
+//!
+//! The callback-facing API is intentionally small:
+//! - [`RtProcessor::prepare`]
+//! - [`RtProcessor::process_block`]
+//! - [`RtProcessor::process_block_into`]
+//! - [`RtProcessor::flush`]
+//! - [`RtProcessor::flush_into`]
+
+use crate::core::crossover::LR4Crossover;
+use crate::core::ring_buffer::RingBuffer;
+use crate::core::types::StretchParams;
+use crate::dual_plane::hints::RenderHints;
+use crate::dual_plane::quality::{LatencyProfile, QualityGovernor, QualityTier, RtGovernorConfig};
+use crate::dual_plane::warp_map::TimeWarpMap;
+use crate::error::StretchError;
+use crate::stretch::phase_vocoder::PhaseVocoder;
+use crate::stretch::wsola::Wsola;
+use arc_swap::ArcSwap;
+use std::sync::atomic::{AtomicU64, Ordering};
+ succeeded in 52ms:
+tests/quality_gates.rs:279:    let transient =
+tests/quality_gates.rs:280:        comparison::transient_match_score(reference_aligned, candidate_aligned, sample_rate, 12.0);
+tests/quality_gates.rs:282:        "quality-gates: len_diff_pct={:.4}% transient={:.3} xcorr_peak={:.3} offset={}",
+tests/quality_gates.rs:283:        len_diff_pct, transient.match_rate, xcorr.peak_value, xcorr.peak_offset
+tests/quality_gates.rs:285:    let transient_or_structure_ok = transient.match_rate >= 0.60 || xcorr.peak_value >= 0.75;
+tests/quality_gates.rs:287:        transient_or_structure_ok,
+tests/quality_gates.rs:288:        "transient/structure gate failed: match rate {:.3} < 0.60 and xcorr {:.3} < 0.75",
+tests/quality_gates.rs:289:        transient.match_rate, xcorr.peak_value
+tests/quality_gates.rs:295:    // transient, and loudness gates verify perceptual accuracy; xcorr is a
+tests/quality_gates.rs:381:        "len_diff_pct,transient_match_rate,cross_correlation_peak,loudness_diff_db,sub_bass_similarity,low_similarity,mid_similarity,high_similarity,boundary_max_ratio_ref,boundary_mean_ratio_ref,boundary_max_ratio_cand,boundary_mean_ratio_cand,boundary_count_ref,boundary_count_cand",
+tests/quality_gates.rs:385:            transient.match_rate,
+src/stretch/phase_vocoder.rs:39:/// Number of synthesis frames to keep transient-focused locking active.
+src/stretch/phase_vocoder.rs:60:    /// Used by selective band resets so transient-triggered partial resets do
+src/stretch/phase_vocoder.rs:94:    /// Short-lived state that tightens phase behavior right after a transient reset.
+src/stretch/phase_vocoder.rs:95:    transient_focus_frames: usize,
+src/stretch/phase_vocoder.rs:287:            transient_focus_frames: 0,
+src/stretch/phase_vocoder.rs:349:    /// Call this at transient boundaries so that stale phase state from a
+src/stretch/phase_vocoder.rs:357:        self.transient_focus_frames = 0;
+src/stretch/phase_vocoder.rs:387:    /// indicated by `reset_mask`: `[sub_bass, low, mid, high]`.
+src/stretch/phase_vocoder.rs:390:    /// This avoids disrupting phase tracking in bands where no transient occurred
+ succeeded in 52ms:
+}
+
+/// Streaming chunk-based processor for real-time time stretching.
+///
+/// Uses fixed-capacity ring buffers in the steady state:
+/// - no `Vec::drain`
+/// - no front-removal shifts
+/// - deterministic memory bounds
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingEngine {
+    /// Default deterministic stream engine with bounded per-callback work.
+    ///
+    /// This engine uses persistent phase-vocoder state and avoids full rolling
+    /// re-renders of historical context in callback paths.
+    Deterministic,
+    /// Legacy rolling-window hybrid re-render engine.
+    ///
+    /// This mode can provide stronger transient handling for selected content,
+    /// but has higher callback-cost variability and is intended as opt-in.
+    LegacyHybridRerender,
+
+thinking
+**Inspecting scheduler usage**
+
+I need to gather more information regarding the scheduler usage and possibly relevant tests. It seems like inspecting the transient_scheduler's rest and tests will be a good step. This will help me understand how it's being utilized and ensure everything is functioning correctly. I’ll keep this focused on gathering relevant data to ensure I'm thorough. Let’s see what I can find regarding how the scheduler operates!
+codex
+I’ve narrowed the likely slice to Stage 1’s transient-reset scheduling rather than broader ratio continuity. I’m checking how resets are triggered and what tests already exist so I can make one contained change plus a focused regression test.
+exec
+/bin/zsh -lc "sed -n '2880,2985p' src/stream/processor.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc "sed -n '5250,5365p' src/stream/processor.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc "sed -n '260,420p' src/stream/transient_scheduler.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc 'rg -n "fast_modulation|modulation|ratio change|set_stretch_ratio|set_ratio|tempo" tests src/stream src/dual_plane src/stretch/phase_vocoder.rs tests/quality_gates.rs' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rs succeeded in 51ms:
+                    self.stats.events_detected_total.saturating_add(1);
+                self.cooldown_frames = FLUX_RESET_COOLDOWN_FRAMES;
+            }
+
+            self.update_flux_stats(flux);
+            self.prev_flux = flux;
+            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
+            self.last_processed_frame_start = Some(absolute_frame_start);
+        }
+
+        if reset_mask.iter().any(|&v| v) {
+            Some(reset_mask)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn update_flux_stats(&mut self, flux: f64) {
+        let delta = flux - self.mean_flux;
+ succeeded in 51ms:
+    #[test]
+    fn test_stream_processor_with_bpm() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_bpm(128.0);
+
+        let proc = StreamProcessor::new(params);
+        assert_eq!(proc.bpm(), Some(128.0));
+        assert_eq!(proc.params().bpm, Some(128.0));
+    }
+
+    #[test]
+    fn test_stream_processor_bpm_default_none() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+
+        let proc = StreamProcessor::new(params);
+        assert_eq!(proc.bpm(), None);
+ succeeded in 51ms:
+
+    fn update_vocoder_ratio(&mut self) {
+        let processing_ratio = self.processing_ratio();
+        if (processing_ratio - self.vocoder_ratio).abs() > RATIO_SNAP_THRESHOLD {
+            for voc in &mut self.vocoders {
+                voc.set_stretch_ratio(processing_ratio);
+            }
+            self.vocoder_ratio = processing_ratio;
+        }
+    }
+
+    fn apply_pitch_scale_now(&mut self, scale: f64) {
+        if (scale - self.pitch_scale).abs() > RATIO_SNAP_THRESHOLD {
+            self.hybrid_pending_rebase = true;
+            self.reset_pitch_resamplers();
+        }
+        self.pitch_scale = scale;
+        if dual_plane_supports_pitch_scale(scale) {
+            self.ensure_default_dual_plane_backend();
+        }
+ succeeded in 51ms:
+tests/quality_gates.rs:561:fn quality_gate_streaming_callback_budget_tempo_and_pitch_modulation() {
+tests/quality_gates.rs:568:            "Skipping tempo+pitch callback budget gate: set {}=1 (strict) or {}=<value> to enable",
+tests/quality_gates.rs:572:            "quality_gate_streaming_callback_budget_tempo_and_pitch_modulation",
+tests/quality_gates.rs:580:        StreamProcessor::try_from_tempo_low_latency(source_bpm, source_bpm, sample_rate, 2)
+tests/quality_gates.rs:581:            .expect("valid low-latency tempo constructor");
+tests/quality_gates.rs:589:        assert!(processor.set_tempo(target_bpm));
+tests/quality_gates.rs:612:        assert!(processor.set_tempo(target_bpm));
+tests/quality_gates.rs:615:            .expect("valid modulation pitch scale");
+tests/quality_gates.rs:642:        .expect("flush_into failed for tempo+pitch callback budget gate");
+tests/quality_gates.rs:646:        "tempo+pitch callback budget gate measured no callbacks"
+tests/quality_gates.rs:650:        "tempo+pitch callback budget gate produced empty output"
+tests/quality_gates.rs:657:        "callback-budget-tempo-pitch: callbacks={} max_ratio={:.3} p99={:.3} p999={:.3} avg_ratio={:.3} max_ms={:.3} budget_ms={:.3} strict_mode={}",
+tests/quality_gates.rs:668:        "quality_gate_streaming_callback_budget_tempo_and_pitch_modulation",
+tests/quality_gates.rs:686:        "tempo+pitch callback budget p99 gate failed: p99 ratio {:.3} > {:.3}",
+tests/quality_gates.rs:693:        "tempo+pitch callback budget p999 gate failed: p999 ratio {:.3} > {:.3}",
+tests/quality_gates.rs:700:        "tempo+pitch callback budget gate failed: max callback ratio {:.3} > {:.3} outlier limit (max callback {:.3}ms, budget {:.3}ms). Set {}=0 for relaxed mode or {} to tune.",
+tests/quality_gates.rs:717:fn run_dual_plane_deterministic_with_ratio_modulation(
+tests/quality_gates.rs:746:                .set_stretch_ratio(ratio)
+tests/quality_gates.rs:747:                .expect("ratio modulation must stay in valid range");
+tests/quality_gates.rs:817:fn quality_gate_dual_plane_fast_modulation_artifacts() {
+exec
+/bin/zsh -lc "sed -n '420,560p' src/stream/transient_scheduler.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc "sed -n '717,950p' tests/quality_gates.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc 'git status --short' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rs succeeded in 51ms:
+            stereo[i * 2] = base + click;
+            stereo[i * 2 + 1] = base * 0.9 + click;
+        }
+
+        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
+        let first = scheduler.detect_stereo_reset_mask(&stereo, 0);
+        let second = scheduler.detect_stereo_reset_mask(&stereo, 0);
+        assert!(first.is_some(), "first pass should observe transient");
+        assert!(
+            second.is_none(),
+            "second pass with same origin should not reprocess duplicate frames"
+        );
+    }
+
+    #[test]
+    fn scheduler_select_reset_mask_always_sets_mid_and_high() {
+        let mut scheduler = TransientEventScheduler::new(1024, 256, 44_100, 4096);
+        scheduler.warmup_frames = 0;
+        let mask = scheduler.select_reset_mask(0.0, 0.2, 0.1, 0.3, 1.0);
+        assert!(mask[3], "high band should always reset on detected events");
+ succeeded in 50ms:
+fn run_dual_plane_deterministic_with_ratio_modulation(
+    input: &[f32],
+    sample_rate: u32,
+    callback_frames: usize,
+    modulate: bool,
+) -> (Vec<f32>, Vec<usize>) {
+    let params = StretchParams::new(1.0)
+        .with_sample_rate(sample_rate)
+        .with_channels(2)
+        .with_fft_size(1024)
+        .with_hop_size(256)
+        .with_preset(EdmPreset::DjBeatmatch);
+    let mut processor = StreamProcessor::new(params);
+    assert!(
+        processor.is_dual_plane_deterministic(),
+        "deterministic stream should default to dual-plane backend"
+    );
+
+    let chunk_samples = callback_frames * 2;
+    let chunks: Vec<&[f32]> = input.chunks(chunk_samples).collect();
+ succeeded in 52ms:
+?? .codex-plan-loop/
+
+thinking
+**Deciding on testing approach**
+
+I need to focus on a small slice for my testing. It might be simplest to add a specific test around repeated short-interval modulation while making the scheduler less trigger-happy on small modulation changes. I should understand if the current quality gate is failing due to too many resets. Maybe I'll inspect the scheduler's threshold under modulation. I could also create a new unit test to demonstrate any over-trigger issues. I'll need some data to proceed with my choice.
+exec
+/bin/zsh -lc "sed -n '320,430p' src/stretch/phase_vocoder.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc "sed -n '2128,2175p' src/stretch/phase_vocoder.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc "sed -n '2489,2555p' src/stream/processor.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rs succeeded in 52ms:
+
+    // --- set_stretch_ratio ---
+
+    #[test]
+    fn test_set_stretch_ratio_updates_hop_synthesis() {
+        let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
+        assert_eq!(pv.hop_synthesis(), 1024); // 1024 * 1.0 = 1024
+
+        pv.set_stretch_ratio(2.0);
+        assert_eq!(pv.hop_synthesis(), 2048); // 1024 * 2.0 = 2048
+
+        pv.set_stretch_ratio(0.5);
+        assert_eq!(pv.hop_synthesis(), 512); // 1024 * 0.5 = 512
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_preserves_phase_state() {
+        // Process some audio, then change ratio and process more.
+        // Phase should be continuous (no reset).
+        let fft_size = 4096;
+ succeeded in 52ms:
+    pub fn hop_analysis(&self) -> usize {
+        self.hop_analysis
+    }
+
+    /// Returns the synthesis hop size.
+    #[inline]
+    pub fn hop_synthesis(&self) -> usize {
+        self.hop_synthesis
+    }
+
+    /// Returns the sub-bass bin cutoff index.
+    #[inline]
+    pub fn sub_bass_bin(&self) -> usize {
+        self.sub_bass_bin
+    }
+
+    /// Updates the stretch ratio without resetting phase state.
+    ///
+    /// This recalculates the synthesis hop size from the new ratio while
+    /// preserving all accumulated phase information. Use this for smooth
+ succeeded in 52ms:
+    pub fn try_from_tempo_with_params(
+        source_bpm: f64,
+        target_bpm: f64,
+        params: StretchParams,
+    ) -> Result<Self, StretchError> {
+        let ratio = ratio_from_tempo(source_bpm, target_bpm)?;
+        let mut proc = Self::new(params.with_stretch_ratio(ratio).with_bpm(source_bpm));
+        proc.source_bpm = Some(source_bpm);
+        Ok(proc)
+    }
+
+    /// Changes the stretch ratio for subsequent processing.
+    ///
+    /// Returns [`StretchError::InvalidRatio`] when `ratio` is non-finite or
+    /// not strictly positive.
+    pub fn set_stretch_ratio(&mut self, ratio: f64) -> Result<(), StretchError> {
+        self.try_set_stretch_ratio(ratio)
+    }
+
+    /// Changes the stretch ratio for subsequent processing, returning an error
+
+
+
+
+thinking
+**Evaluating process paths**
+
+I'm considering whether the deterministic dual-plane path utilizes a transient scheduler. It looks like the StreamProcessor's dual-plane deterministic relies on the DualPlaneProcessor. I need to inspect the process path and search for specifics like `is_dual_plane_deterministic` and `process_into`. The modulation artifacts gate might impact the dual-plane backend. If I opt for a scheduler, it may not be relevant to the dual-plane gate, but I suspect a small slice could operate independently within the main gate.
+thinking
+**Considering testing strategies**
+
+I'm weighing whether to leave the repository ready for running smoke and stage-specific tests. Adding a test seems safe, but maybe the user is more interested in actual progress than tests? They mentioned implementing a small slice of the roadmap, and focused tests could fit within that. I’m thinking of making a meaningful test for short-interval modulation in a dual-plane path. Perhaps I could also create a second quality gate to measure changes effectively.
+thinking
+**Updating testing approach**
+
+I'm focusing on only modifying tests and the ROADMAP, which feels low risk and manageable. I need to remember to update the stage status from [ ] to [] when the work starts, but we won’t set it to [x] since the exit criteria aren't met yet. I'll run checks on relevant local files I modify. For the quality gates, I might consider running a command like `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture` to include a new test.
+thinking
+**Reviewing helper functions**
+
+I want to dive deeper into the tests and quality gates in the `quality_gates.rs` file, focusing on the helper functions. Understanding these functions better will help me assess their effectiveness and ensure they meet our quality standards. It’s essential to evaluate how they interact with the rest of the codebase and if they can be improved or optimized in any way. Let’s get started on that now!
+codex
+I’m taking the smallest clearly valid slice from Stage 1: strengthen the Stage 1 evidence with a dedicated short-interval modulation regression test in `tests/quality_gates.rs`, and leave the roadmap stage in `in progress` since that alone won’t satisfy the exit criteria.
+exec
+/bin/zsh -lc "sed -n '260,420p' tests/quality_gates.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc "sed -n '420,720p' tests/quality_gates.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rs succeeded in 52ms:
+        "duration gate failed: length diff {:.5}% exceeds 0.6% (ref={}, cand={})",
+        len_diff_pct,
+        reference.len(),
+        candidate.len()
+    );
+
+    let min_len = reference.len().min(candidate.len());
+    let reference = &reference[..min_len];
+    let candidate = &candidate[..min_len];
+
+    let xcorr = comparison::cross_correlation(reference, candidate);
+    let (reference_aligned, candidate_aligned, ref_start) =
+        align_by_offset(reference, candidate, xcorr.peak_offset);
+    assert!(
+        !reference_aligned.is_empty() && !candidate_aligned.is_empty(),
+        "alignment produced empty comparison windows (offset={})",
+        xcorr.peak_offset
+    );
+
+    let transient =
+ succeeded in 51ms:
+}
+
+#[test]
+fn quality_gate_streaming_worst_case_callback_budget() {
+    let sample_rate = 44_100u32;
+    let bpm = 126.0;
+    let ratio = 1.02;
+    let callback_frames = 256usize;
+    let input = generate_gate_signal(sample_rate, bpm, 10.0);
+    let Some(multiplier) = callback_budget_multiplier() else {
+        println!(
+            "Skipping callback budget gate: set {}=1 (strict) or {}=<value> to enable",
+            STRICT_CALLBACK_BUDGET_ENV, CALLBACK_BUDGET_MULTIPLIER_ENV
+        );
+        write_quality_dashboard_csv(
+            "quality_gate_streaming_worst_case_callback_budget",
+            "status,max_ratio,p99_ratio,p999_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
+            "skipped,NaN,NaN,NaN,NaN,NaN,NaN,0,NaN,false",
+        );
+        return;
+Plan update
+Taking one Stage 1 slice only: add a focused release quality gate for repeated short-interval dual-plane modulation and mark Stage 1 in progress in the roadmap.
+  ✓ Inspect Stage 1 roadmap entry and existing fast-modulation quality gates to define one bounded slice
+  → Edit ROADMAP.md and tests/quality_gates.rs for the short-interval modulation regression slice
+  • Run the release quality-gate tests most relevant to the touched file and summarize remaining risk
+
+
+
+
+thinking
+**Calibrating test thresholds**
+
+I think I need to recalibrate the new test thresholds. I could consider adding a test that runs using an alternating ratio with a higher frequency than the current sine modulation. For example, I could toggle the ratio between 0.965 and 1.035 every callback or every second callback. The boundaries would be half the output length of each callback. I might compare this with a baseline ratio of 1.0 or a smoother modulation. I want to ensure focused tests on short-interval modulation.
+thinking
+**Exploring modulation function design**
+
+I’m thinking about defining a function like `run_dual_plane_deterministic_with_ratio_schedule`, which takes a closure for the ratio chunk. The existing function calls could schedule this with options for modulation. I’m considering simplifying things by adding a new helper function, `run_dual_plane_deterministic_with_ratio_sequence`, that takes a slice of ratios instead and cycles through them. 
+
+I want to look at existing tests for inspiration, but I might decide on specific ratios repeated every callback or abrupt toggling every couple of callbacks to identify boundary issues.
+thinking
+**Evaluating calibration and testing**
+
+I need to consider calibrating using empirical methods for a baseline. I'll plan to run a new test that incorporates finite outputs with well-defined boundaries. Writing a dashboard as a CSV can help maintain consistency, and I might explore a DJ-like synthetic input. The test runtimes are crucial since 8 seconds with 256 callbacks gives approximately 137 chunks, which is enough. I'll also modify the ROADMAP stage marker accordingly while keeping the exit criteria in mind. Let's implement the updated ROADMAP and the new test!
+thinking
+**Considering work updates**
+
+It’s not necessarily clear-cut, but the requirement states that I need to update when work begins. I'll handle this update in the same patch to keep everything organized. Making sure to include commentary before any file edits is essential, as it helps clarify the changes being made and maintains a good workflow. I want to ensure that everything is documented properly for anyone who might review the changes later. Let's keep it on track!
+codex
+I’ve chosen the slice and I’m editing now: `ROADMAP.md` will move Stage 1 to `[~]`, and `tests/quality_gates.rs` will get one new release regression gate for abrupt short-interval ratio steps on the dual-plane deterministic path.
+
+thinking
+**Considering helper functions**
+
+I’m thinking about using a constant baseline with the new helper and a ratio of [1.0] to hold 1. It seems good, but should we consider adding a generic closure-based helper instead of just sticking to a sequence-specific one? I guess sequence-specific is okay too. Now, I should patch the ROADMAP and also the tests to reflect these changes. It feels like there's a lot to consider here!
+file update
+M /Users/robbym/go/src/github.com/robmorgan/timestretch-rs/ROADMAP.md
+@@ -32,3 +32,3 @@
+ 
+-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
++## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+ 
+M /Users/robbym/go/src/github.com/robmorgan/timestretch-rs/tests/quality_gates.rs
+@@ -761,2 +761,45 @@
+ 
++fn run_dual_plane_deterministic_with_ratio_steps(
++    input: &[f32],
++    sample_rate: u32,
++    callback_frames: usize,
++    ratios: &[f64],
++    hold_callbacks: usize,
++) -> (Vec<f32>, Vec<usize>) {
++    let params = StretchParams::new(1.0)
++        .with_sample_rate(sample_rate)
++        .with_channels(2)
++        .with_fft_size(1024)
++        .with_hop_size(256)
++        .with_preset(EdmPreset::DjBeatmatch);
++    let mut processor = StreamProcessor::new(params);
++    assert!(
++        processor.is_dual_plane_deterministic(),
++        "deterministic stream should default to dual-plane backend"
++    );
++    assert!(!ratios.is_empty(), "ratio step schedule must not be empty");
++
++    let chunk_samples = callback_frames * 2;
++    let mut output = Vec::with_capacity((input.len() as f64 * 1.20) as usize + 32_768);
++    let mut boundaries = Vec::with_capacity(input.len() / chunk_samples + 1);
++
++    for (idx, chunk) in input.chunks(chunk_samples).enumerate() {
++        let schedule_idx = idx / hold_callbacks.max(1);
++        let ratio = ratios[schedule_idx % ratios.len()];
++        processor
++            .set_stretch_ratio(ratio)
++            .expect("ratio step modulation must stay in valid range");
++        processor
++            .process_into(chunk, &mut output)
++            .expect("dual-plane stream process_into failed");
++        boundaries.push(output.len() / 2);
++    }
++    processor
++        .flush_into(&mut output)
++        .expect("dual-plane stream flush_into failed");
++    boundaries.push(output.len() / 2);
++
++    (output, boundaries)
++}
++
+ #[test]
+@@ -935 +978,123 @@
+ }
++
++#[test]
++fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
++    let sample_rate = 44_100u32;
++    let bpm = 126.0;
++    let callback_frames = 256usize;
++    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
++    let input = mono_to_stereo_interleaved(&mono);
++
++    let (baseline_out, baseline_boundaries) = run_dual_plane_deterministic_with_ratio_modulation(
++        &input,
++        sample_rate,
++        callback_frames,
++        false,
++    );
++    let (modulated_out, modulated_boundaries) = run_dual_plane_deterministic_with_ratio_steps(
++        &input,
++        sample_rate,
++        callback_frames,
++        &[0.965, 1.035, 0.975, 1.025],
++        2,
++    );
++
++    assert!(
++        baseline_out.iter().all(|s| s.is_finite()),
++        "baseline short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        modulated_out.iter().all(|s| s.is_finite()),
++        "short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        !baseline_out.is_empty() && !modulated_out.is_empty(),
++        "short-interval modulation gate produced empty output"
++    );
++
++    let baseline_left = extract_left_channel(&baseline_out);
++    let modulated_left = extract_left_channel(&modulated_out);
++    let trim = 16usize;
++    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
++        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
++    } else {
++        baseline_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < baseline_left.len())
++    .collect();
++    let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
++        modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
++    } else {
++        modulated_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < modulated_left.len())
++    .collect();
++    let window = (sample_rate as f64 * 0.008).round() as usize; // +/-8ms
++    let guard = (sample_rate as f64 * 0.001).round() as usize; // +/-1ms
++    let baseline_stats =
++        boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
++    let modulated_stats =
++        boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
++    println!(
++        "dual-plane-short-step-mod gate: baseline(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={})",
++        baseline_stats.max_ratio,
++        baseline_stats.p95_ratio,
++        baseline_stats.p98_ratio,
++        baseline_stats.p99_ratio,
++        baseline_stats.mean_ratio,
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.max_ratio,
++        modulated_stats.p95_ratio,
++        modulated_stats.p98_ratio,
++        modulated_stats.p99_ratio,
++        modulated_stats.mean_ratio,
++        modulated_stats.evaluated_boundaries
++    );
++
++    write_quality_dashboard_csv(
++        "quality_gate_dual_plane_short_interval_step_modulation_artifacts",
++        "baseline_max,baseline_p95,baseline_p98,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_p99,modulated_mean,modulated_n",
++        &format!(
++            "{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
++            baseline_stats.max_ratio,
++            baseline_stats.p95_ratio,
++            baseline_stats.p98_ratio,
++            baseline_stats.p99_ratio,
++            baseline_stats.mean_ratio,
++            baseline_stats.evaluated_boundaries,
++            modulated_stats.max_ratio,
++            modulated_stats.p95_ratio,
++            modulated_stats.p98_ratio,
++            modulated_stats.p99_ratio,
++            modulated_stats.mean_ratio,
++            modulated_stats.evaluated_boundaries
++        ),
++    );
++
++    assert!(
++        baseline_stats.evaluated_boundaries >= 32 && modulated_stats.evaluated_boundaries >= 32,
++        "short-interval modulation artifact gate evaluated too few boundaries (baseline={}, modulated={})",
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.evaluated_boundaries
++    );
++    assert!(
++        modulated_stats.p95_ratio <= baseline_stats.p95_ratio * 2.6 + 1.0,
++        "short-interval modulation artifact gate failed (p95): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p95_ratio,
++        baseline_stats.p95_ratio
++    );
++    assert!(
++        modulated_stats.p98_ratio <= baseline_stats.p98_ratio * 3.0 + 1.4,
++        "short-interval modulation artifact gate failed (p98): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p98_ratio,
++        baseline_stats.p98_ratio
++    );
++    assert!(
++        modulated_stats.mean_ratio <= baseline_stats.mean_ratio * 2.3 + 1.0,
++        "short-interval modulation artifact gate failed (mean): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.mean_ratio,
++        baseline_stats.mean_ratio
++    );
++}
+apply_patch(auto_approved=true) exited 0 in 29ms:
+Success. Updated the following files:
+M /Users/robbym/go/src/github.com/robmorgan/timestretch-rs/ROADMAP.md
+M /Users/robbym/go/src/github.com/robmorgan/timestretch-rs/tests/quality_gates.rs
+file update:
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8ae35f7b90f219dd49715028e5eb3931f021b376..a8da8c16081e9bdb608b5315bcb2f6f6432ab8a8
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -30,7 +30,7 @@
+ - Preserve the EDM-first focus unless there is a deliberate decision to expand
+   into a broader general-purpose stretcher.
+ 
+-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
++## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+ 
+ Automation: auto
+ 
+diff --git a/tests/quality_gates.rs b/tests/quality_gates.rs
+index 052ba76bc2c85719d165ebcd795c8465a04b0bdd..c0d1553d13266474e1a79be81fe29a04003e7130
+--- a/tests/quality_gates.rs
++++ b/tests/quality_gates.rs
+@@ -759,6 +759,49 @@
+     (output, boundaries)
+ }
+ 
++fn run_dual_plane_deterministic_with_ratio_steps(
++    input: &[f32],
++    sample_rate: u32,
++    callback_frames: usize,
++    ratios: &[f64],
++    hold_callbacks: usize,
++) -> (Vec<f32>, Vec<usize>) {
++    let params = StretchParams::new(1.0)
++        .with_sample_rate(sample_rate)
++        .with_channels(2)
++        .with_fft_size(1024)
++        .with_hop_size(256)
++        .with_preset(EdmPreset::DjBeatmatch);
++    let mut processor = StreamProcessor::new(params);
++    assert!(
++        processor.is_dual_plane_deterministic(),
++        "deterministic stream should default to dual-plane backend"
++    );
++    assert!(!ratios.is_empty(), "ratio step schedule must not be empty");
++
++    let chunk_samples = callback_frames * 2;
++    let mut output = Vec::with_capacity((input.len() as f64 * 1.20) as usize + 32_768);
++    let mut boundaries = Vec::with_capacity(input.len() / chunk_samples + 1);
++
++    for (idx, chunk) in input.chunks(chunk_samples).enumerate() {
++        let schedule_idx = idx / hold_callbacks.max(1);
++        let ratio = ratios[schedule_idx % ratios.len()];
++        processor
++            .set_stretch_ratio(ratio)
++            .expect("ratio step modulation must stay in valid range");
++        processor
++            .process_into(chunk, &mut output)
++            .expect("dual-plane stream process_into failed");
++        boundaries.push(output.len() / 2);
++    }
++    processor
++        .flush_into(&mut output)
++        .expect("dual-plane stream flush_into failed");
++    boundaries.push(output.len() / 2);
++
++    (output, boundaries)
++}
++
+ #[test]
+ fn quality_gate_dual_plane_deterministic_long_run_drift() {
+     let sample_rate = 44_100u32;
+@@ -933,3 +976,125 @@
+         baseline_stats.mean_ratio
+     );
+ }
++
++#[test]
++fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
++    let sample_rate = 44_100u32;
++    let bpm = 126.0;
++    let callback_frames = 256usize;
++    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
++    let input = mono_to_stereo_interleaved(&mono);
++
++    let (baseline_out, baseline_boundaries) = run_dual_plane_deterministic_with_ratio_modulation(
++        &input,
++        sample_rate,
++        callback_frames,
++        false,
++    );
++    let (modulated_out, modulated_boundaries) = run_dual_plane_deterministic_with_ratio_steps(
++        &input,
++        sample_rate,
++        callback_frames,
++        &[0.965, 1.035, 0.975, 1.025],
++        2,
++    );
++
++    assert!(
++        baseline_out.iter().all(|s| s.is_finite()),
++        "baseline short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        modulated_out.iter().all(|s| s.is_finite()),
++        "short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        !baseline_out.is_empty() && !modulated_out.is_empty(),
++        "short-interval modulation gate produced empty output"
++    );
++
++    let baseline_left = extract_left_channel(&baseline_out);
++    let modulated_left = extract_left_channel(&modulated_out);
++    let trim = 16usize;
++    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
++        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
++    } else {
++        baseline_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < baseline_left.len())
++    .collect();
++    let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
++        modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
++    } else {
++        modulated_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < modulated_left.len())
++    .collect();
++    let window = (sample_rate as f64 * 0.008).round() as usize; // +/-8ms
++    let guard = (sample_rate as f64 * 0.001).round() as usize; // +/-1ms
++    let baseline_stats =
++        boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
++    let modulated_stats =
++        boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
++    println!(
++        "dual-plane-short-step-mod gate: baseline(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={})",
++        baseline_stats.max_ratio,
++        baseline_stats.p95_ratio,
++        baseline_stats.p98_ratio,
++        baseline_stats.p99_ratio,
++        baseline_stats.mean_ratio,
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.max_ratio,
++        modulated_stats.p95_ratio,
++        modulated_stats.p98_ratio,
++        modulated_stats.p99_ratio,
++        modulated_stats.mean_ratio,
++        modulated_stats.evaluated_boundaries
++    );
++
++    write_quality_dashboard_csv(
++        "quality_gate_dual_plane_short_interval_step_modulation_artifacts",
++        "baseline_max,baseline_p95,baseline_p98,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_p99,modulated_mean,modulated_n",
++        &format!(
++            "{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
++            baseline_stats.max_ratio,
++            baseline_stats.p95_ratio,
++            baseline_stats.p98_ratio,
++            baseline_stats.p99_ratio,
++            baseline_stats.mean_ratio,
++            baseline_stats.evaluated_boundaries,
++            modulated_stats.max_ratio,
++            modulated_stats.p95_ratio,
++            modulated_stats.p98_ratio,
++            modulated_stats.p99_ratio,
++            modulated_stats.mean_ratio,
++            modulated_stats.evaluated_boundaries
++        ),
++    );
++
++    assert!(
++        baseline_stats.evaluated_boundaries >= 32 && modulated_stats.evaluated_boundaries >= 32,
++        "short-interval modulation artifact gate evaluated too few boundaries (baseline={}, modulated={})",
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.evaluated_boundaries
++    );
++    assert!(
++        modulated_stats.p95_ratio <= baseline_stats.p95_ratio * 2.6 + 1.0,
++        "short-interval modulation artifact gate failed (p95): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p95_ratio,
++        baseline_stats.p95_ratio
++    );
++    assert!(
++        modulated_stats.p98_ratio <= baseline_stats.p98_ratio * 3.0 + 1.4,
++        "short-interval modulation artifact gate failed (p98): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p98_ratio,
++        baseline_stats.p98_ratio
++    );
++    assert!(
++        modulated_stats.mean_ratio <= baseline_stats.mean_ratio * 2.3 + 1.0,
++        "short-interval modulation artifact gate failed (mean): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.mean_ratio,
++        baseline_stats.mean_ratio
++    );
++}
+
+file update:
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8ae35f7b90f219dd49715028e5eb3931f021b376..a8da8c16081e9bdb608b5315bcb2f6f6432ab8a8
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -30,7 +30,7 @@
+ - Preserve the EDM-first focus unless there is a deliberate decision to expand
+   into a broader general-purpose stretcher.
+ 
+-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
++## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+ 
+ Automation: auto
+ 
+diff --git a/tests/quality_gates.rs b/tests/quality_gates.rs
+index 052ba76bc2c85719d165ebcd795c8465a04b0bdd..c0d1553d13266474e1a79be81fe29a04003e7130
+--- a/tests/quality_gates.rs
++++ b/tests/quality_gates.rs
+@@ -759,6 +759,49 @@
+     (output, boundaries)
+ }
+ 
++fn run_dual_plane_deterministic_with_ratio_steps(
++    input: &[f32],
++    sample_rate: u32,
++    callback_frames: usize,
++    ratios: &[f64],
++    hold_callbacks: usize,
++) -> (Vec<f32>, Vec<usize>) {
++    let params = StretchParams::new(1.0)
++        .with_sample_rate(sample_rate)
++        .with_channels(2)
++        .with_fft_size(1024)
++        .with_hop_size(256)
++        .with_preset(EdmPreset::DjBeatmatch);
++    let mut processor = StreamProcessor::new(params);
++    assert!(
++        processor.is_dual_plane_deterministic(),
++        "deterministic stream should default to dual-plane backend"
++    );
++    assert!(!ratios.is_empty(), "ratio step schedule must not be empty");
++
++    let chunk_samples = callback_frames * 2;
++    let mut output = Vec::with_capacity((input.len() as f64 * 1.20) as usize + 32_768);
++    let mut boundaries = Vec::with_capacity(input.len() / chunk_samples + 1);
++
++    for (idx, chunk) in input.chunks(chunk_samples).enumerate() {
++        let schedule_idx = idx / hold_callbacks.max(1);
++        let ratio = ratios[schedule_idx % ratios.len()];
++        processor
++            .set_stretch_ratio(ratio)
++            .expect("ratio step modulation must stay in valid range");
++        processor
++            .process_into(chunk, &mut output)
++            .expect("dual-plane stream process_into failed");
++        boundaries.push(output.len() / 2);
++    }
++    processor
++        .flush_into(&mut output)
++        .expect("dual-plane stream flush_into failed");
++    boundaries.push(output.len() / 2);
++
++    (output, boundaries)
++}
++
+ #[test]
+ fn quality_gate_dual_plane_deterministic_long_run_drift() {
+     let sample_rate = 44_100u32;
+@@ -933,3 +976,125 @@
+         baseline_stats.mean_ratio
+     );
+ }
++
++#[test]
++fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
++    let sample_rate = 44_100u32;
++    let bpm = 126.0;
++    let callback_frames = 256usize;
++    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
++    let input = mono_to_stereo_interleaved(&mono);
++
++    let (baseline_out, baseline_boundaries) = run_dual_plane_deterministic_with_ratio_modulation(
++        &input,
++        sample_rate,
++        callback_frames,
++        false,
++    );
++    let (modulated_out, modulated_boundaries) = run_dual_plane_deterministic_with_ratio_steps(
++        &input,
++        sample_rate,
++        callback_frames,
++        &[0.965, 1.035, 0.975, 1.025],
++        2,
++    );
++
++    assert!(
++        baseline_out.iter().all(|s| s.is_finite()),
++        "baseline short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        modulated_out.iter().all(|s| s.is_finite()),
++        "short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        !baseline_out.is_empty() && !modulated_out.is_empty(),
++        "short-interval modulation gate produced empty output"
++    );
++
++    let baseline_left = extract_left_channel(&baseline_out);
++    let modulated_left = extract_left_channel(&modulated_out);
++    let trim = 16usize;
++    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
++        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
++    } else {
++        baseline_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < baseline_left.len())
++    .collect();
++    let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
++        modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
++    } else {
++        modulated_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < modulated_left.len())
++    .collect();
++    let window = (sample_rate as f64 * 0.008).round() as usize; // +/-8ms
++    let guard = (sample_rate as f64 * 0.001).round() as usize; // +/-1ms
++    let baseline_stats =
++        boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
++    let modulated_stats =
++        boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
++    println!(
++        "dual-plane-short-step-mod gate: baseline(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={})",
++        baseline_stats.max_ratio,
++        baseline_stats.p95_ratio,
++        baseline_stats.p98_ratio,
++        baseline_stats.p99_ratio,
++        baseline_stats.mean_ratio,
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.max_ratio,
++        modulated_stats.p95_ratio,
++        modulated_stats.p98_ratio,
++        modulated_stats.p99_ratio,
++        modulated_stats.mean_ratio,
++        modulated_stats.evaluated_boundaries
++    );
++
++    write_quality_dashboard_csv(
++        "quality_gate_dual_plane_short_interval_step_modulation_artifacts",
++        "baseline_max,baseline_p95,baseline_p98,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_p99,modulated_mean,modulated_n",
++        &format!(
++            "{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
++            baseline_stats.max_ratio,
++            baseline_stats.p95_ratio,
++            baseline_stats.p98_ratio,
++            baseline_stats.p99_ratio,
++            baseline_stats.mean_ratio,
++            baseline_stats.evaluated_boundaries,
++            modulated_stats.max_ratio,
++            modulated_stats.p95_ratio,
++            modulated_stats.p98_ratio,
++            modulated_stats.p99_ratio,
++            modulated_stats.mean_ratio,
++            modulated_stats.evaluated_boundaries
++        ),
++    );
++
++    assert!(
++        baseline_stats.evaluated_boundaries >= 32 && modulated_stats.evaluated_boundaries >= 32,
++        "short-interval modulation artifact gate evaluated too few boundaries (baseline={}, modulated={})",
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.evaluated_boundaries
++    );
++    assert!(
++        modulated_stats.p95_ratio <= baseline_stats.p95_ratio * 2.6 + 1.0,
++        "short-interval modulation artifact gate failed (p95): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p95_ratio,
++        baseline_stats.p95_ratio
++    );
++    assert!(
++        modulated_stats.p98_ratio <= baseline_stats.p98_ratio * 3.0 + 1.4,
++        "short-interval modulation artifact gate failed (p98): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p98_ratio,
++        baseline_stats.p98_ratio
++    );
++    assert!(
++        modulated_stats.mean_ratio <= baseline_stats.mean_ratio * 2.3 + 1.0,
++        "short-interval modulation artifact gate failed (mean): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.mean_ratio,
++        baseline_stats.mean_ratio
++    );
++}
+
+codex
+The new slice is in place. I’m checking the diff now, then I’ll run the narrow release quality-gate tests for the existing fast-modulation gate plus the new short-interval step gate.
+exec
+/bin/zsh -lc 'git diff -- ROADMAP.md tests/quality_gates.rs' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rs succeeded in 51ms:
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8ae35f7..a8da8c1 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -30,7 +30,7 @@ fast-modulation artifact regression is fixed.
+ - Preserve the EDM-first focus unless there is a deliberate decision to expand
+   into a broader general-purpose stretcher.
+ 
+-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
++## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+ 
+ Automation: auto
+ 
+diff --git a/tests/quality_gates.rs b/tests/quality_gates.rs
+index 052ba76..c0d1553 100644
+--- a/tests/quality_gates.rs
++++ b/tests/quality_gates.rs
+@@ -759,6 +759,49 @@ fn run_dual_plane_deterministic_with_ratio_modulation(
+     (output, boundaries)
+ }
+exec
+/bin/zsh -lc 'cargo test --release --test quality_gates quality_gate_dual_plane_short_interval_step_modulation_artifacts -- --nocapture' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsfile update:
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8ae35f7b90f219dd49715028e5eb3931f021b376..a8da8c16081e9bdb608b5315bcb2f6f6432ab8a8
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -30,7 +30,7 @@
+ - Preserve the EDM-first focus unless there is a deliberate decision to expand
+   into a broader general-purpose stretcher.
+ 
+-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
++## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+ 
+ Automation: auto
+ 
+diff --git a/tests/quality_gates.rs b/tests/quality_gates.rs
+index 052ba76bc2c85719d165ebcd795c8465a04b0bdd..c0d1553d13266474e1a79be81fe29a04003e7130
+--- a/tests/quality_gates.rs
++++ b/tests/quality_gates.rs
+@@ -759,6 +759,49 @@
+     (output, boundaries)
+ }
+ 
++fn run_dual_plane_deterministic_with_ratio_steps(
++    input: &[f32],
++    sample_rate: u32,
++    callback_frames: usize,
++    ratios: &[f64],
++    hold_callbacks: usize,
++) -> (Vec<f32>, Vec<usize>) {
++    let params = StretchParams::new(1.0)
++        .with_sample_rate(sample_rate)
++        .with_channels(2)
++        .with_fft_size(1024)
++        .with_hop_size(256)
++        .with_preset(EdmPreset::DjBeatmatch);
++    let mut processor = StreamProcessor::new(params);
++    assert!(
++        processor.is_dual_plane_deterministic(),
++        "deterministic stream should default to dual-plane backend"
++    );
++    assert!(!ratios.is_empty(), "ratio step schedule must not be empty");
++
++    let chunk_samples = callback_frames * 2;
++    let mut output = Vec::with_capacity((input.len() as f64 * 1.20) as usize + 32_768);
++    let mut boundaries = Vec::with_capacity(input.len() / chunk_samples + 1);
++
++    for (idx, chunk) in input.chunks(chunk_samples).enumerate() {
++        let schedule_idx = idx / hold_callbacks.max(1);
++        let ratio = ratios[schedule_idx % ratios.len()];
++        processor
++            .set_stretch_ratio(ratio)
++            .expect("ratio step modulation must stay in valid range");
++        processor
++            .process_into(chunk, &mut output)
++            .expect("dual-plane stream process_into failed");
++        boundaries.push(output.len() / 2);
++    }
++    processor
++        .flush_into(&mut output)
++        .expect("dual-plane stream flush_into failed");
++    boundaries.push(output.len() / 2);
++
++    (output, boundaries)
++}
++
+ #[test]
+ fn quality_gate_dual_plane_deterministic_long_run_drift() {
+     let sample_rate = 44_100u32;
+@@ -933,3 +976,125 @@
+         baseline_stats.mean_ratio
+     );
+ }
++
++#[test]
++fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
++    let sample_rate = 44_100u32;
++    let bpm = 126.0;
++    let callback_frames = 256usize;
++    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
++    let input = mono_to_stereo_interleaved(&mono);
++
++    let (baseline_out, baseline_boundaries) = run_dual_plane_deterministic_with_ratio_modulation(
++        &input,
++        sample_rate,
++        callback_frames,
++        false,
++    );
++    let (modulated_out, modulated_boundaries) = run_dual_plane_deterministic_with_ratio_steps(
++        &input,
++        sample_rate,
++        callback_frames,
++        &[0.965, 1.035, 0.975, 1.025],
++        2,
++    );
++
++    assert!(
++        baseline_out.iter().all(|s| s.is_finite()),
++        "baseline short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        modulated_out.iter().all(|s| s.is_finite()),
++        "short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        !baseline_out.is_empty() && !modulated_out.is_empty(),
++        "short-interval modulation gate produced empty output"
++    );
++
++    let baseline_left = extract_left_channel(&baseline_out);
++    let modulated_left = extract_left_channel(&modulated_out);
++    let trim = 16usize;
++    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
++        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
++    } else {
++        baseline_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < baseline_left.len())
++    .collect();
++    let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
++        modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
++    } else {
++        modulated_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < modulated_left.len())
++    .collect();
++    let window = (sample_rate as f64 * 0.008).round() as usize; // +/-8ms
++    let guard = (sample_rate as f64 * 0.001).round() as usize; // +/-1ms
++    let baseline_stats =
++        boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
++    let modulated_stats =
++        boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
++    println!(
++        "dual-plane-short-step-mod gate: baseline(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={})",
++        baseline_stats.max_ratio,
++        baseline_stats.p95_ratio,
++        baseline_stats.p98_ratio,
++        baseline_stats.p99_ratio,
++        baseline_stats.mean_ratio,
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.max_ratio,
++        modulated_stats.p95_ratio,
++        modulated_stats.p98_ratio,
++        modulated_stats.p99_ratio,
++        modulated_stats.mean_ratio,
++        modulated_stats.evaluated_boundaries
++    );
++
++    write_quality_dashboard_csv(
++        "quality_gate_dual_plane_short_interval_step_modulation_artifacts",
++        "baseline_max,baseline_p95,baseline_p98,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_p99,modulated_mean,modulated_n",
++        &format!(
++            "{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
++            baseline_stats.max_ratio,
++            baseline_stats.p95_ratio,
++            baseline_stats.p98_ratio,
++            baseline_stats.p99_ratio,
++            baseline_stats.mean_ratio,
++            baseline_stats.evaluated_boundaries,
++            modulated_stats.max_ratio,
++            modulated_stats.p95_ratio,
++            modulated_stats.p98_ratio,
++            modulated_stats.p99_ratio,
++            modulated_stats.mean_ratio,
++            modulated_stats.evaluated_boundaries
++        ),
++    );
++
++    assert!(
++        baseline_stats.evaluated_boundaries >= 32 && modulated_stats.evaluated_boundaries >= 32,
++        "short-interval modulation artifact gate evaluated too few boundaries (baseline={}, modulated={})",
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.evaluated_boundaries
++    );
++    assert!(
++        modulated_stats.p95_ratio <= baseline_stats.p95_ratio * 2.6 + 1.0,
++        "short-interval modulation artifact gate failed (p95): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p95_ratio,
++        baseline_stats.p95_ratio
++    );
++    assert!(
++        modulated_stats.p98_ratio <= baseline_stats.p98_ratio * 3.0 + 1.4,
++        "short-interval modulation artifact gate failed (p98): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p98_ratio,
++        baseline_stats.p98_ratio
++    );
++    assert!(
++        modulated_stats.mean_ratio <= baseline_stats.mean_ratio * 2.3 + 1.0,
++        "short-interval modulation artifact gate failed (mean): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.mean_ratio,
++        baseline_stats.mean_ratio
++    );
++}
+
+codex
+The release test is building now. Once I have the metrics from the new gate, I’ll confirm whether the threshold needs tightening or loosening before I run the existing fast-modulation gate alongside it.
+file update:
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8ae35f7b90f219dd49715028e5eb3931f021b376..a8da8c16081e9bdb608b5315bcb2f6f6432ab8a8
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -30,7 +30,7 @@
+ - Preserve the EDM-first focus unless there is a deliberate decision to expand
+   into a broader general-purpose stretcher.
+ 
+-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
++## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+ 
+ Automation: auto
+ 
+diff --git a/tests/quality_gates.rs b/tests/quality_gates.rs
+index 052ba76bc2c85719d165ebcd795c8465a04b0bdd..c0d1553d13266474e1a79be81fe29a04003e7130
+--- a/tests/quality_gates.rs
++++ b/tests/quality_gates.rs
+@@ -759,6 +759,49 @@
+     (output, boundaries)
+ }
+ 
++fn run_dual_plane_deterministic_with_ratio_steps(
++    input: &[f32],
++    sample_rate: u32,
++    callback_frames: usize,
++    ratios: &[f64],
++    hold_callbacks: usize,
++) -> (Vec<f32>, Vec<usize>) {
++    let params = StretchParams::new(1.0)
++        .with_sample_rate(sample_rate)
++        .with_channels(2)
++        .with_fft_size(1024)
++        .with_hop_size(256)
++        .with_preset(EdmPreset::DjBeatmatch);
++    let mut processor = StreamProcessor::new(params);
++    assert!(
++        processor.is_dual_plane_deterministic(),
++        "deterministic stream should default to dual-plane backend"
++    );
++    assert!(!ratios.is_empty(), "ratio step schedule must not be empty");
++
++    let chunk_samples = callback_frames * 2;
++    let mut output = Vec::with_capacity((input.len() as f64 * 1.20) as usize + 32_768);
++    let mut boundaries = Vec::with_capacity(input.len() / chunk_samples + 1);
++
++    for (idx, chunk) in input.chunks(chunk_samples).enumerate() {
++        let schedule_idx = idx / hold_callbacks.max(1);
++        let ratio = ratios[schedule_idx % ratios.len()];
++        processor
++            .set_stretch_ratio(ratio)
++            .expect("ratio step modulation must stay in valid range");
++        processor
++            .process_into(chunk, &mut output)
++            .expect("dual-plane stream process_into failed");
++        boundaries.push(output.len() / 2);
++    }
++    processor
++        .flush_into(&mut output)
++        .expect("dual-plane stream flush_into failed");
++    boundaries.push(output.len() / 2);
++
++    (output, boundaries)
++}
++
+ #[test]
+ fn quality_gate_dual_plane_deterministic_long_run_drift() {
+     let sample_rate = 44_100u32;
+@@ -933,3 +976,125 @@
+         baseline_stats.mean_ratio
+     );
+ }
++
++#[test]
++fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
++    let sample_rate = 44_100u32;
++    let bpm = 126.0;
++    let callback_frames = 256usize;
++    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
++    let input = mono_to_stereo_interleaved(&mono);
++
++    let (baseline_out, baseline_boundaries) = run_dual_plane_deterministic_with_ratio_modulation(
++        &input,
++        sample_rate,
++        callback_frames,
++        false,
++    );
++    let (modulated_out, modulated_boundaries) = run_dual_plane_deterministic_with_ratio_steps(
++        &input,
++        sample_rate,
++        callback_frames,
++        &[0.965, 1.035, 0.975, 1.025],
++        2,
++    );
++
++    assert!(
++        baseline_out.iter().all(|s| s.is_finite()),
++        "baseline short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        modulated_out.iter().all(|s| s.is_finite()),
++        "short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        !baseline_out.is_empty() && !modulated_out.is_empty(),
++        "short-interval modulation gate produced empty output"
++    );
++
++    let baseline_left = extract_left_channel(&baseline_out);
++    let modulated_left = extract_left_channel(&modulated_out);
++    let trim = 16usize;
++    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
++        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
++    } else {
++        baseline_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < baseline_left.len())
++    .collect();
++    let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
++        modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
++    } else {
++        modulated_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < modulated_left.len())
++    .collect();
++    let window = (sample_rate as f64 * 0.008).round() as usize; // +/-8ms
++    let guard = (sample_rate as f64 * 0.001).round() as usize; // +/-1ms
++    let baseline_stats =
++        boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
++    let modulated_stats =
++        boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
++    println!(
++        "dual-plane-short-step-mod gate: baseline(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={})",
++        baseline_stats.max_ratio,
++        baseline_stats.p95_ratio,
++        baseline_stats.p98_ratio,
++        baseline_stats.p99_ratio,
++        baseline_stats.mean_ratio,
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.max_ratio,
++        modulated_stats.p95_ratio,
++        modulated_stats.p98_ratio,
++        modulated_stats.p99_ratio,
++        modulated_stats.mean_ratio,
++        modulated_stats.evaluated_boundaries
++    );
++
++    write_quality_dashboard_csv(
++        "quality_gate_dual_plane_short_interval_step_modulation_artifacts",
++        "baseline_max,baseline_p95,baseline_p98,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_p99,modulated_mean,modulated_n",
++        &format!(
++            "{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
++            baseline_stats.max_ratio,
++            baseline_stats.p95_ratio,
++            baseline_stats.p98_ratio,
++            baseline_stats.p99_ratio,
++            baseline_stats.mean_ratio,
++            baseline_stats.evaluated_boundaries,
++            modulated_stats.max_ratio,
++            modulated_stats.p95_ratio,
++            modulated_stats.p98_ratio,
++            modulated_stats.p99_ratio,
++            modulated_stats.mean_ratio,
++            modulated_stats.evaluated_boundaries
++        ),
++    );
++
++    assert!(
++        baseline_stats.evaluated_boundaries >= 32 && modulated_stats.evaluated_boundaries >= 32,
++        "short-interval modulation artifact gate evaluated too few boundaries (baseline={}, modulated={})",
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.evaluated_boundaries
++    );
++    assert!(
++        modulated_stats.p95_ratio <= baseline_stats.p95_ratio * 2.6 + 1.0,
++        "short-interval modulation artifact gate failed (p95): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p95_ratio,
++        baseline_stats.p95_ratio
++    );
++    assert!(
++        modulated_stats.p98_ratio <= baseline_stats.p98_ratio * 3.0 + 1.4,
++        "short-interval modulation artifact gate failed (p98): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p98_ratio,
++        baseline_stats.p98_ratio
++    );
++    assert!(
++        modulated_stats.mean_ratio <= baseline_stats.mean_ratio * 2.3 + 1.0,
++        "short-interval modulation artifact gate failed (mean): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.mean_ratio,
++        baseline_stats.mean_ratio
++    );
++}
+
+file update:
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8ae35f7b90f219dd49715028e5eb3931f021b376..a8da8c16081e9bdb608b5315bcb2f6f6432ab8a8
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -30,7 +30,7 @@
+ - Preserve the EDM-first focus unless there is a deliberate decision to expand
+   into a broader general-purpose stretcher.
+ 
+-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
++## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+ 
+ Automation: auto
+ 
+diff --git a/tests/quality_gates.rs b/tests/quality_gates.rs
+index 052ba76bc2c85719d165ebcd795c8465a04b0bdd..c0d1553d13266474e1a79be81fe29a04003e7130
+--- a/tests/quality_gates.rs
++++ b/tests/quality_gates.rs
+@@ -759,6 +759,49 @@
+     (output, boundaries)
+ }
+ 
++fn run_dual_plane_deterministic_with_ratio_steps(
++    input: &[f32],
++    sample_rate: u32,
++    callback_frames: usize,
++    ratios: &[f64],
++    hold_callbacks: usize,
++) -> (Vec<f32>, Vec<usize>) {
++    let params = StretchParams::new(1.0)
++        .with_sample_rate(sample_rate)
++        .with_channels(2)
++        .with_fft_size(1024)
++        .with_hop_size(256)
++        .with_preset(EdmPreset::DjBeatmatch);
++    let mut processor = StreamProcessor::new(params);
++    assert!(
++        processor.is_dual_plane_deterministic(),
++        "deterministic stream should default to dual-plane backend"
++    );
++    assert!(!ratios.is_empty(), "ratio step schedule must not be empty");
++
++    let chunk_samples = callback_frames * 2;
++    let mut output = Vec::with_capacity((input.len() as f64 * 1.20) as usize + 32_768);
++    let mut boundaries = Vec::with_capacity(input.len() / chunk_samples + 1);
++
++    for (idx, chunk) in input.chunks(chunk_samples).enumerate() {
++        let schedule_idx = idx / hold_callbacks.max(1);
++        let ratio = ratios[schedule_idx % ratios.len()];
++        processor
++            .set_stretch_ratio(ratio)
++            .expect("ratio step modulation must stay in valid range");
++        processor
++            .process_into(chunk, &mut output)
++            .expect("dual-plane stream process_into failed");
++        boundaries.push(output.len() / 2);
++    }
++    processor
++        .flush_into(&mut output)
++        .expect("dual-plane stream flush_into failed");
++    boundaries.push(output.len() / 2);
++
++    (output, boundaries)
++}
++
+ #[test]
+ fn quality_gate_dual_plane_deterministic_long_run_drift() {
+     let sample_rate = 44_100u32;
+@@ -933,3 +976,125 @@
+         baseline_stats.mean_ratio
+     );
+ }
++
++#[test]
++fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
++    let sample_rate = 44_100u32;
++    let bpm = 126.0;
++    let callback_frames = 256usize;
++    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
++    let input = mono_to_stereo_interleaved(&mono);
++
++    let (baseline_out, baseline_boundaries) = run_dual_plane_deterministic_with_ratio_modulation(
++        &input,
++        sample_rate,
++        callback_frames,
++        false,
++    );
++    let (modulated_out, modulated_boundaries) = run_dual_plane_deterministic_with_ratio_steps(
++        &input,
++        sample_rate,
++        callback_frames,
++        &[0.965, 1.035, 0.975, 1.025],
++        2,
++    );
++
++    assert!(
++        baseline_out.iter().all(|s| s.is_finite()),
++        "baseline short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        modulated_out.iter().all(|s| s.is_finite()),
++        "short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        !baseline_out.is_empty() && !modulated_out.is_empty(),
++        "short-interval modulation gate produced empty output"
++    );
++
++    let baseline_left = extract_left_channel(&baseline_out);
++    let modulated_left = extract_left_channel(&modulated_out);
++    let trim = 16usize;
++    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
++        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
++    } else {
++        baseline_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < baseline_left.len())
++    .collect();
++    let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
++        modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
++    } else {
++        modulated_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < modulated_left.len())
++    .collect();
++    let window = (sample_rate as f64 * 0.008).round() as usize; // +/-8ms
++    let guard = (sample_rate as f64 * 0.001).round() as usize; // +/-1ms
++    let baseline_stats =
++        boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
++    let modulated_stats =
++        boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
++    println!(
++        "dual-plane-short-step-mod gate: baseline(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={})",
++        baseline_stats.max_ratio,
++        baseline_stats.p95_ratio,
++        baseline_stats.p98_ratio,
++        baseline_stats.p99_ratio,
++        baseline_stats.mean_ratio,
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.max_ratio,
++        modulated_stats.p95_ratio,
++        modulated_stats.p98_ratio,
++        modulated_stats.p99_ratio,
++        modulated_stats.mean_ratio,
++        modulated_stats.evaluated_boundaries
++    );
++
++    write_quality_dashboard_csv(
++        "quality_gate_dual_plane_short_interval_step_modulation_artifacts",
++        "baseline_max,baseline_p95,baseline_p98,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_p99,modulated_mean,modulated_n",
++        &format!(
++            "{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
++            baseline_stats.max_ratio,
++            baseline_stats.p95_ratio,
++            baseline_stats.p98_ratio,
++            baseline_stats.p99_ratio,
++            baseline_stats.mean_ratio,
++            baseline_stats.evaluated_boundaries,
++            modulated_stats.max_ratio,
++            modulated_stats.p95_ratio,
++            modulated_stats.p98_ratio,
++            modulated_stats.p99_ratio,
++            modulated_stats.mean_ratio,
++            modulated_stats.evaluated_boundaries
++        ),
++    );
++
++    assert!(
++        baseline_stats.evaluated_boundaries >= 32 && modulated_stats.evaluated_boundaries >= 32,
++        "short-interval modulation artifact gate evaluated too few boundaries (baseline={}, modulated={})",
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.evaluated_boundaries
++    );
++    assert!(
++        modulated_stats.p95_ratio <= baseline_stats.p95_ratio * 2.6 + 1.0,
++        "short-interval modulation artifact gate failed (p95): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p95_ratio,
++        baseline_stats.p95_ratio
++    );
++    assert!(
++        modulated_stats.p98_ratio <= baseline_stats.p98_ratio * 3.0 + 1.4,
++        "short-interval modulation artifact gate failed (p98): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p98_ratio,
++        baseline_stats.p98_ratio
++    );
++    assert!(
++        modulated_stats.mean_ratio <= baseline_stats.mean_ratio * 2.3 + 1.0,
++        "short-interval modulation artifact gate failed (mean): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.mean_ratio,
++        baseline_stats.mean_ratio
++    );
++}
+
+file update:
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8ae35f7b90f219dd49715028e5eb3931f021b376..a8da8c16081e9bdb608b5315bcb2f6f6432ab8a8
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -30,7 +30,7 @@
+ - Preserve the EDM-first focus unless there is a deliberate decision to expand
+   into a broader general-purpose stretcher.
+ 
+-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
++## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+ 
+ Automation: auto
+ 
+diff --git a/tests/quality_gates.rs b/tests/quality_gates.rs
+index 052ba76bc2c85719d165ebcd795c8465a04b0bdd..c0d1553d13266474e1a79be81fe29a04003e7130
+--- a/tests/quality_gates.rs
++++ b/tests/quality_gates.rs
+@@ -759,6 +759,49 @@
+     (output, boundaries)
+ }
+ 
++fn run_dual_plane_deterministic_with_ratio_steps(
++    input: &[f32],
++    sample_rate: u32,
++    callback_frames: usize,
++    ratios: &[f64],
++    hold_callbacks: usize,
++) -> (Vec<f32>, Vec<usize>) {
++    let params = StretchParams::new(1.0)
++        .with_sample_rate(sample_rate)
++        .with_channels(2)
++        .with_fft_size(1024)
++        .with_hop_size(256)
++        .with_preset(EdmPreset::DjBeatmatch);
++    let mut processor = StreamProcessor::new(params);
++    assert!(
++        processor.is_dual_plane_deterministic(),
++        "deterministic stream should default to dual-plane backend"
++    );
++    assert!(!ratios.is_empty(), "ratio step schedule must not be empty");
++
++    let chunk_samples = callback_frames * 2;
++    let mut output = Vec::with_capacity((input.len() as f64 * 1.20) as usize + 32_768);
++    let mut boundaries = Vec::with_capacity(input.len() / chunk_samples + 1);
++
++    for (idx, chunk) in input.chunks(chunk_samples).enumerate() {
++        let schedule_idx = idx / hold_callbacks.max(1);
++        let ratio = ratios[schedule_idx % ratios.len()];
++        processor
++            .set_stretch_ratio(ratio)
++            .expect("ratio step modulation must stay in valid range");
++        processor
++            .process_into(chunk, &mut output)
++            .expect("dual-plane stream process_into failed");
++        boundaries.push(output.len() / 2);
++    }
++    processor
++        .flush_into(&mut output)
++        .expect("dual-plane stream flush_into failed");
++    boundaries.push(output.len() / 2);
++
++    (output, boundaries)
++}
++
+ #[test]
+ fn quality_gate_dual_plane_deterministic_long_run_drift() {
+     let sample_rate = 44_100u32;
+@@ -933,3 +976,125 @@
+         baseline_stats.mean_ratio
+     );
+ }
++
++#[test]
++fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
++    let sample_rate = 44_100u32;
++    let bpm = 126.0;
++    let callback_frames = 256usize;
++    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
++    let input = mono_to_stereo_interleaved(&mono);
++
++    let (baseline_out, baseline_boundaries) = run_dual_plane_deterministic_with_ratio_modulation(
++        &input,
++        sample_rate,
++        callback_frames,
++        false,
++    );
++    let (modulated_out, modulated_boundaries) = run_dual_plane_deterministic_with_ratio_steps(
++        &input,
++        sample_rate,
++        callback_frames,
++        &[0.965, 1.035, 0.975, 1.025],
++        2,
++    );
++
++    assert!(
++        baseline_out.iter().all(|s| s.is_finite()),
++        "baseline short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        modulated_out.iter().all(|s| s.is_finite()),
++        "short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        !baseline_out.is_empty() && !modulated_out.is_empty(),
++        "short-interval modulation gate produced empty output"
++    );
++
++    let baseline_left = extract_left_channel(&baseline_out);
++    let modulated_left = extract_left_channel(&modulated_out);
++    let trim = 16usize;
++    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
++        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
++    } else {
++        baseline_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < baseline_left.len())
++    .collect();
++    let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
++        modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
++    } else {
++        modulated_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < modulated_left.len())
++    .collect();
++    let window = (sample_rate as f64 * 0.008).round() as usize; // +/-8ms
++    let guard = (sample_rate as f64 * 0.001).round() as usize; // +/-1ms
++    let baseline_stats =
++        boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
++    let modulated_stats =
++        boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
++    println!(
++        "dual-plane-short-step-mod gate: baseline(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={})",
++        baseline_stats.max_ratio,
++        baseline_stats.p95_ratio,
++        baseline_stats.p98_ratio,
++        baseline_stats.p99_ratio,
++        baseline_stats.mean_ratio,
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.max_ratio,
++        modulated_stats.p95_ratio,
++        modulated_stats.p98_ratio,
++        modulated_stats.p99_ratio,
++        modulated_stats.mean_ratio,
++        modulated_stats.evaluated_boundaries
++    );
++
++    write_quality_dashboard_csv(
++        "quality_gate_dual_plane_short_interval_step_modulation_artifacts",
++        "baseline_max,baseline_p95,baseline_p98,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_p99,modulated_mean,modulated_n",
++        &format!(
++            "{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
++            baseline_stats.max_ratio,
++            baseline_stats.p95_ratio,
++            baseline_stats.p98_ratio,
++            baseline_stats.p99_ratio,
++            baseline_stats.mean_ratio,
++            baseline_stats.evaluated_boundaries,
++            modulated_stats.max_ratio,
++            modulated_stats.p95_ratio,
++            modulated_stats.p98_ratio,
++            modulated_stats.p99_ratio,
++            modulated_stats.mean_ratio,
++            modulated_stats.evaluated_boundaries
++        ),
++    );
++
++    assert!(
++        baseline_stats.evaluated_boundaries >= 32 && modulated_stats.evaluated_boundaries >= 32,
++        "short-interval modulation artifact gate evaluated too few boundaries (baseline={}, modulated={})",
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.evaluated_boundaries
++    );
++    assert!(
++        modulated_stats.p95_ratio <= baseline_stats.p95_ratio * 2.6 + 1.0,
++        "short-interval modulation artifact gate failed (p95): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p95_ratio,
++        baseline_stats.p95_ratio
++    );
++    assert!(
++        modulated_stats.p98_ratio <= baseline_stats.p98_ratio * 3.0 + 1.4,
++        "short-interval modulation artifact gate failed (p98): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p98_ratio,
++        baseline_stats.p98_ratio
++    );
++    assert!(
++        modulated_stats.mean_ratio <= baseline_stats.mean_ratio * 2.3 + 1.0,
++        "short-interval modulation artifact gate failed (mean): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.mean_ratio,
++        baseline_stats.mean_ratio
++    );
++}
+
+ succeeded in 23.84s:
+   Compiling timestretch v0.2.0 (/Users/robbym/go/src/github.com/robmorgan/timestretch-rs)
+    Finished `release` profile [optimized] target(s) in 22.87s
+     Running tests/quality_gates.rs (target/release/deps/quality_gates-5a55ec99e6779e36)
+
+running 1 test
+dual-plane-short-step-mod gate: baseline(max=1.314,p95=1.132,p98=1.182,p99=1.231,mean=0.459,n=1348) modulated(max=4.299,p95=2.600,p98=3.196,p99=4.299,mean=0.926,n=1333)
+test quality_gate_dual_plane_short_interval_step_modulation_artifacts ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.33s
+
+collab spawn_agent(call_t8IsOZvwmKYVl6kbcKJGGusF, prompt="Run the remaining relevant release check for the touched quality gate file in /Users/robbym/go/src/github.com/robmorgan/…")
+mcp startup: no servers
+spawn_agent(call_t8IsOZvwmKYVl6kbcKJGGusF, prompt="Run the remaining relevant release check for the touched quality gate file in /Users/robbym/go/src/github.com/robmorgan/…") pending init:
+  agent: 019cc73f-2ab4-7dd2-83f8-a9766247e8e2
+file update:
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8ae35f7b90f219dd49715028e5eb3931f021b376..a8da8c16081e9bdb608b5315bcb2f6f6432ab8a8
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -30,7 +30,7 @@
+ - Preserve the EDM-first focus unless there is a deliberate decision to expand
+   into a broader general-purpose stretcher.
+ 
+-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
++## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+ 
+ Automation: auto
+ 
+diff --git a/tests/quality_gates.rs b/tests/quality_gates.rs
+index 052ba76bc2c85719d165ebcd795c8465a04b0bdd..c0d1553d13266474e1a79be81fe29a04003e7130
+--- a/tests/quality_gates.rs
++++ b/tests/quality_gates.rs
+@@ -759,6 +759,49 @@
+     (output, boundaries)
+ }
+ 
++fn run_dual_plane_deterministic_with_ratio_steps(
++    input: &[f32],
++    sample_rate: u32,
++    callback_frames: usize,
++    ratios: &[f64],
++    hold_callbacks: usize,
++) -> (Vec<f32>, Vec<usize>) {
++    let params = StretchParams::new(1.0)
++        .with_sample_rate(sample_rate)
++        .with_channels(2)
++        .with_fft_size(1024)
++        .with_hop_size(256)
++        .with_preset(EdmPreset::DjBeatmatch);
++    let mut processor = StreamProcessor::new(params);
++    assert!(
++        processor.is_dual_plane_deterministic(),
++        "deterministic stream should default to dual-plane backend"
++    );
++    assert!(!ratios.is_empty(), "ratio step schedule must not be empty");
++
++    let chunk_samples = callback_frames * 2;
++    let mut output = Vec::with_capacity((input.len() as f64 * 1.20) as usize + 32_768);
++    let mut boundaries = Vec::with_capacity(input.len() / chunk_samples + 1);
++
++    for (idx, chunk) in input.chunks(chunk_samples).enumerate() {
++        let schedule_idx = idx / hold_callbacks.max(1);
++        let ratio = ratios[schedule_idx % ratios.len()];
++        processor
++            .set_stretch_ratio(ratio)
++            .expect("ratio step modulation must stay in valid range");
++        processor
++            .process_into(chunk, &mut output)
++            .expect("dual-plane stream process_into failed");
++        boundaries.push(output.len() / 2);
++    }
++    processor
++        .flush_into(&mut output)
++        .expect("dual-plane stream flush_into failed");
++    boundaries.push(output.len() / 2);
++
++    (output, boundaries)
++}
++
+ #[test]
+ fn quality_gate_dual_plane_deterministic_long_run_drift() {
+     let sample_rate = 44_100u32;
+@@ -933,3 +976,125 @@
+         baseline_stats.mean_ratio
+     );
+ }
++
++#[test]
++fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
++    let sample_rate = 44_100u32;
++    let bpm = 126.0;
++    let callback_frames = 256usize;
++    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
++    let input = mono_to_stereo_interleaved(&mono);
++
++    let (baseline_out, baseline_boundaries) = run_dual_plane_deterministic_with_ratio_modulation(
++        &input,
++        sample_rate,
++        callback_frames,
++        false,
++    );
++    let (modulated_out, modulated_boundaries) = run_dual_plane_deterministic_with_ratio_steps(
++        &input,
++        sample_rate,
++        callback_frames,
++        &[0.965, 1.035, 0.975, 1.025],
++        2,
++    );
++
++    assert!(
++        baseline_out.iter().all(|s| s.is_finite()),
++        "baseline short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        modulated_out.iter().all(|s| s.is_finite()),
++        "short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        !baseline_out.is_empty() && !modulated_out.is_empty(),
++        "short-interval modulation gate produced empty output"
++    );
++
++    let baseline_left = extract_left_channel(&baseline_out);
++    let modulated_left = extract_left_channel(&modulated_out);
++    let trim = 16usize;
++    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
++        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
++    } else {
++        baseline_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < baseline_left.len())
++    .collect();
++    let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
++        modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
++    } else {
++        modulated_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < modulated_left.len())
++    .collect();
++    let window = (sample_rate as f64 * 0.008).round() as usize; // +/-8ms
++    let guard = (sample_rate as f64 * 0.001).round() as usize; // +/-1ms
++    let baseline_stats =
++        boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
++    let modulated_stats =
++        boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
++    println!(
++        "dual-plane-short-step-mod gate: baseline(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={})",
++        baseline_stats.max_ratio,
++        baseline_stats.p95_ratio,
++        baseline_stats.p98_ratio,
++        baseline_stats.p99_ratio,
++        baseline_stats.mean_ratio,
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.max_ratio,
++        modulated_stats.p95_ratio,
++        modulated_stats.p98_ratio,
++        modulated_stats.p99_ratio,
++        modulated_stats.mean_ratio,
++        modulated_stats.evaluated_boundaries
++    );
++
++    write_quality_dashboard_csv(
++        "quality_gate_dual_plane_short_interval_step_modulation_artifacts",
++        "baseline_max,baseline_p95,baseline_p98,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_p99,modulated_mean,modulated_n",
++        &format!(
++            "{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
++            baseline_stats.max_ratio,
++            baseline_stats.p95_ratio,
++            baseline_stats.p98_ratio,
++            baseline_stats.p99_ratio,
++            baseline_stats.mean_ratio,
++            baseline_stats.evaluated_boundaries,
++            modulated_stats.max_ratio,
++            modulated_stats.p95_ratio,
++            modulated_stats.p98_ratio,
++            modulated_stats.p99_ratio,
++            modulated_stats.mean_ratio,
++            modulated_stats.evaluated_boundaries
++        ),
++    );
++
++    assert!(
++        baseline_stats.evaluated_boundaries >= 32 && modulated_stats.evaluated_boundaries >= 32,
++        "short-interval modulation artifact gate evaluated too few boundaries (baseline={}, modulated={})",
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.evaluated_boundaries
++    );
++    assert!(
++        modulated_stats.p95_ratio <= baseline_stats.p95_ratio * 2.6 + 1.0,
++        "short-interval modulation artifact gate failed (p95): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p95_ratio,
++        baseline_stats.p95_ratio
++    );
++    assert!(
++        modulated_stats.p98_ratio <= baseline_stats.p98_ratio * 3.0 + 1.4,
++        "short-interval modulation artifact gate failed (p98): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p98_ratio,
++        baseline_stats.p98_ratio
++    );
++    assert!(
++        modulated_stats.mean_ratio <= baseline_stats.mean_ratio * 2.3 + 1.0,
++        "short-interval modulation artifact gate failed (mean): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.mean_ratio,
++        baseline_stats.mean_ratio
++    );
++}
+
+
+thinking
+I need to consider that I might have to wait for a large timeout. It's interesting how sometimes things take longer than expected, and I wonder how that affects what I'm trying to do. I'm curious if there are ways to manage waiting, perhaps by keeping myself busy while I wait. It’s a good reminder that patience is important, but I’ll also stay on my toes just in case something happens sooner than I think!
+codex
+I have the new gate’s metrics and it passes. I’m running the existing Stage 1 fast-modulation release gate as the companion check so the touched test file is validated against both the old and new modulation cases.
+collab wait(call_gsPddDRLdeeuaeuIbjqgH8kQ)
+  receivers: 019cc73f-2ab4-7dd2-83f8-a9766247e8e2
+codex
+Running the requested release test exactly as specified and waiting for it to finish.
+exec
+/bin/zsh -lc 'cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rs exited 101 in 300ms:
+dual-plane-fast-mod gate: baseline(max=1.314,p95=1.132,p98=1.182,p99=1.231,mean=0.459,n=1348) modulated(max=59.994,p95=4.936,p98=5.468,p99=59.994,mean=2.430,n=1348)
+
+thread 'quality_gate_dual_plane_fast_modulation_artifacts' (175083855) panicked at tests/quality_gates.rs:960:5:
+dual-plane modulation artifact gate failed (p95): modulated 4.936 vs baseline 1.132
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test quality_gate_dual_plane_fast_modulation_artifacts ... FAILED
+
+failures:
+
+failures:
+    quality_gate_dual_plane_fast_modulation_artifacts
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.29s
+
+error: test failed, to rerun pass `--test quality_gates`
+codex
+```text
+    Finished `release` profile [optimized] target(s) in 0.02s
+     Running tests/quality_gates.rs (target/release/deps/quality_gates-5a55ec99e6779e36)
+
+running 1 test
+dual-plane-fast-mod gate: baseline(max=1.314,p95=1.132,p98=1.182,p99=1.231,mean=0.459,n=1348) modulated(max=59.994,p95=4.936,p98=5.468,p99=59.994,mean=2.430,n=1348)
+
+thread 'quality_gate_dual_plane_fast_modulation_artifacts' (175083855) panicked at tests/quality_gates.rs:960:5:
+dual-plane modulation artifact gate failed (p95): modulated 4.936 vs baseline 1.132
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test quality_gate_dual_plane_fast_modulation_artifacts ... FAILED
+
+failures:
+
+failures:
+    quality_gate_dual_plane_fast_modulation_artifacts
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.29s
+
+error: test failed, to rerun pass `--test quality_gates`
+```
+
+Exit status: `101`
+wait(call_gsPddDRLdeeuaeuIbjqgH8kQ) 1 agents complete:
+  019cc73f-2ab4-7dd2-83f8-a9766247e8e2 completed: "```text
+    Finished `release` profile [optimized] target(s) in 0.02s
+     Running tests/quality_gates.rs (target/releas…"
+file update:
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8ae35f7b90f219dd49715028e5eb3931f021b376..a8da8c16081e9bdb608b5315bcb2f6f6432ab8a8
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -30,7 +30,7 @@
+ - Preserve the EDM-first focus unless there is a deliberate decision to expand
+   into a broader general-purpose stretcher.
+ 
+-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
++## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+ 
+ Automation: auto
+ 
+diff --git a/tests/quality_gates.rs b/tests/quality_gates.rs
+index 052ba76bc2c85719d165ebcd795c8465a04b0bdd..c0d1553d13266474e1a79be81fe29a04003e7130
+--- a/tests/quality_gates.rs
++++ b/tests/quality_gates.rs
+@@ -759,6 +759,49 @@
+     (output, boundaries)
+ }
+ 
++fn run_dual_plane_deterministic_with_ratio_steps(
++    input: &[f32],
++    sample_rate: u32,
++    callback_frames: usize,
++    ratios: &[f64],
++    hold_callbacks: usize,
++) -> (Vec<f32>, Vec<usize>) {
++    let params = StretchParams::new(1.0)
++        .with_sample_rate(sample_rate)
++        .with_channels(2)
++        .with_fft_size(1024)
++        .with_hop_size(256)
++        .with_preset(EdmPreset::DjBeatmatch);
++    let mut processor = StreamProcessor::new(params);
++    assert!(
++        processor.is_dual_plane_deterministic(),
++        "deterministic stream should default to dual-plane backend"
++    );
++    assert!(!ratios.is_empty(), "ratio step schedule must not be empty");
++
++    let chunk_samples = callback_frames * 2;
++    let mut output = Vec::with_capacity((input.len() as f64 * 1.20) as usize + 32_768);
++    let mut boundaries = Vec::with_capacity(input.len() / chunk_samples + 1);
++
++    for (idx, chunk) in input.chunks(chunk_samples).enumerate() {
++        let schedule_idx = idx / hold_callbacks.max(1);
++        let ratio = ratios[schedule_idx % ratios.len()];
++        processor
++            .set_stretch_ratio(ratio)
++            .expect("ratio step modulation must stay in valid range");
++        processor
++            .process_into(chunk, &mut output)
++            .expect("dual-plane stream process_into failed");
++        boundaries.push(output.len() / 2);
++    }
++    processor
++        .flush_into(&mut output)
++        .expect("dual-plane stream flush_into failed");
++    boundaries.push(output.len() / 2);
++
++    (output, boundaries)
++}
++
+ #[test]
+ fn quality_gate_dual_plane_deterministic_long_run_drift() {
+     let sample_rate = 44_100u32;
+@@ -933,3 +976,125 @@
+         baseline_stats.mean_ratio
+     );
+ }
++
++#[test]
++fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
++    let sample_rate = 44_100u32;
++    let bpm = 126.0;
++    let callback_frames = 256usize;
++    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
++    let input = mono_to_stereo_interleaved(&mono);
++
++    let (baseline_out, baseline_boundaries) = run_dual_plane_deterministic_with_ratio_modulation(
++        &input,
++        sample_rate,
++        callback_frames,
++        false,
++    );
++    let (modulated_out, modulated_boundaries) = run_dual_plane_deterministic_with_ratio_steps(
++        &input,
++        sample_rate,
++        callback_frames,
++        &[0.965, 1.035, 0.975, 1.025],
++        2,
++    );
++
++    assert!(
++        baseline_out.iter().all(|s| s.is_finite()),
++        "baseline short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        modulated_out.iter().all(|s| s.is_finite()),
++        "short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        !baseline_out.is_empty() && !modulated_out.is_empty(),
++        "short-interval modulation gate produced empty output"
++    );
++
++    let baseline_left = extract_left_channel(&baseline_out);
++    let modulated_left = extract_left_channel(&modulated_out);
++    let trim = 16usize;
++    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
++        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
++    } else {
++        baseline_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < baseline_left.len())
++    .collect();
++    let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
++        modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
++    } else {
++        modulated_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < modulated_left.len())
++    .collect();
++    let window = (sample_rate as f64 * 0.008).round() as usize; // +/-8ms
++    let guard = (sample_rate as f64 * 0.001).round() as usize; // +/-1ms
++    let baseline_stats =
++        boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
++    let modulated_stats =
++        boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
++    println!(
++        "dual-plane-short-step-mod gate: baseline(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={})",
++        baseline_stats.max_ratio,
++        baseline_stats.p95_ratio,
++        baseline_stats.p98_ratio,
++        baseline_stats.p99_ratio,
++        baseline_stats.mean_ratio,
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.max_ratio,
++        modulated_stats.p95_ratio,
++        modulated_stats.p98_ratio,
++        modulated_stats.p99_ratio,
++        modulated_stats.mean_ratio,
++        modulated_stats.evaluated_boundaries
++    );
++
++    write_quality_dashboard_csv(
++        "quality_gate_dual_plane_short_interval_step_modulation_artifacts",
++        "baseline_max,baseline_p95,baseline_p98,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_p99,modulated_mean,modulated_n",
++        &format!(
++            "{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
++            baseline_stats.max_ratio,
++            baseline_stats.p95_ratio,
++            baseline_stats.p98_ratio,
++            baseline_stats.p99_ratio,
++            baseline_stats.mean_ratio,
++            baseline_stats.evaluated_boundaries,
++            modulated_stats.max_ratio,
++            modulated_stats.p95_ratio,
++            modulated_stats.p98_ratio,
++            modulated_stats.p99_ratio,
++            modulated_stats.mean_ratio,
++            modulated_stats.evaluated_boundaries
++        ),
++    );
++
++    assert!(
++        baseline_stats.evaluated_boundaries >= 32 && modulated_stats.evaluated_boundaries >= 32,
++        "short-interval modulation artifact gate evaluated too few boundaries (baseline={}, modulated={})",
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.evaluated_boundaries
++    );
++    assert!(
++        modulated_stats.p95_ratio <= baseline_stats.p95_ratio * 2.6 + 1.0,
++        "short-interval modulation artifact gate failed (p95): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p95_ratio,
++        baseline_stats.p95_ratio
++    );
++    assert!(
++        modulated_stats.p98_ratio <= baseline_stats.p98_ratio * 3.0 + 1.4,
++        "short-interval modulation artifact gate failed (p98): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p98_ratio,
++        baseline_stats.p98_ratio
++    );
++    assert!(
++        modulated_stats.mean_ratio <= baseline_stats.mean_ratio * 2.3 + 1.0,
++        "short-interval modulation artifact gate failed (mean): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.mean_ratio,
++        baseline_stats.mean_ratio
++    );
++}
+
+collab close_agent(call_pZ9mmYfoxyWLyIQZ5h3Nd3gX)
+  receiver: 019cc73f-2ab4-7dd2-83f8-a9766247e8e2
+close_agent(call_pZ9mmYfoxyWLyIQZ5h3Nd3gX) completed: "```text
+    Finished `release` profile [optimized] target(s) in 0.02s
+     Running tests/quality_gates.rs (target/releas…":
+  receiver: 019cc73f-2ab4-7dd2-83f8-a9766247e8e2
+file update:
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8ae35f7b90f219dd49715028e5eb3931f021b376..a8da8c16081e9bdb608b5315bcb2f6f6432ab8a8
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -30,7 +30,7 @@
+ - Preserve the EDM-first focus unless there is a deliberate decision to expand
+   into a broader general-purpose stretcher.
+ 
+-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
++## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+ 
+ Automation: auto
+ 
+diff --git a/tests/quality_gates.rs b/tests/quality_gates.rs
+index 052ba76bc2c85719d165ebcd795c8465a04b0bdd..c0d1553d13266474e1a79be81fe29a04003e7130
+--- a/tests/quality_gates.rs
++++ b/tests/quality_gates.rs
+@@ -759,6 +759,49 @@
+     (output, boundaries)
+ }
+ 
++fn run_dual_plane_deterministic_with_ratio_steps(
++    input: &[f32],
++    sample_rate: u32,
++    callback_frames: usize,
++    ratios: &[f64],
++    hold_callbacks: usize,
++) -> (Vec<f32>, Vec<usize>) {
++    let params = StretchParams::new(1.0)
++        .with_sample_rate(sample_rate)
++        .with_channels(2)
++        .with_fft_size(1024)
++        .with_hop_size(256)
++        .with_preset(EdmPreset::DjBeatmatch);
++    let mut processor = StreamProcessor::new(params);
++    assert!(
++        processor.is_dual_plane_deterministic(),
++        "deterministic stream should default to dual-plane backend"
++    );
++    assert!(!ratios.is_empty(), "ratio step schedule must not be empty");
++
++    let chunk_samples = callback_frames * 2;
++    let mut output = Vec::with_capacity((input.len() as f64 * 1.20) as usize + 32_768);
++    let mut boundaries = Vec::with_capacity(input.len() / chunk_samples + 1);
++
++    for (idx, chunk) in input.chunks(chunk_samples).enumerate() {
++        let schedule_idx = idx / hold_callbacks.max(1);
++        let ratio = ratios[schedule_idx % ratios.len()];
++        processor
++            .set_stretch_ratio(ratio)
++            .expect("ratio step modulation must stay in valid range");
++        processor
++            .process_into(chunk, &mut output)
++            .expect("dual-plane stream process_into failed");
++        boundaries.push(output.len() / 2);
++    }
++    processor
++        .flush_into(&mut output)
++        .expect("dual-plane stream flush_into failed");
++    boundaries.push(output.len() / 2);
++
++    (output, boundaries)
++}
++
+ #[test]
+ fn quality_gate_dual_plane_deterministic_long_run_drift() {
+     let sample_rate = 44_100u32;
+@@ -933,3 +976,125 @@
+         baseline_stats.mean_ratio
+     );
+ }
++
++#[test]
++fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
++    let sample_rate = 44_100u32;
++    let bpm = 126.0;
++    let callback_frames = 256usize;
++    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
++    let input = mono_to_stereo_interleaved(&mono);
++
++    let (baseline_out, baseline_boundaries) = run_dual_plane_deterministic_with_ratio_modulation(
++        &input,
++        sample_rate,
++        callback_frames,
++        false,
++    );
++    let (modulated_out, modulated_boundaries) = run_dual_plane_deterministic_with_ratio_steps(
++        &input,
++        sample_rate,
++        callback_frames,
++        &[0.965, 1.035, 0.975, 1.025],
++        2,
++    );
++
++    assert!(
++        baseline_out.iter().all(|s| s.is_finite()),
++        "baseline short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        modulated_out.iter().all(|s| s.is_finite()),
++        "short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        !baseline_out.is_empty() && !modulated_out.is_empty(),
++        "short-interval modulation gate produced empty output"
++    );
++
++    let baseline_left = extract_left_channel(&baseline_out);
++    let modulated_left = extract_left_channel(&modulated_out);
++    let trim = 16usize;
++    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
++        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
++    } else {
++        baseline_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < baseline_left.len())
++    .collect();
++    let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
++        modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
++    } else {
++        modulated_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < modulated_left.len())
++    .collect();
++    let window = (sample_rate as f64 * 0.008).round() as usize; // +/-8ms
++    let guard = (sample_rate as f64 * 0.001).round() as usize; // +/-1ms
++    let baseline_stats =
++        boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
++    let modulated_stats =
++        boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
++    println!(
++        "dual-plane-short-step-mod gate: baseline(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={})",
++        baseline_stats.max_ratio,
++        baseline_stats.p95_ratio,
++        baseline_stats.p98_ratio,
++        baseline_stats.p99_ratio,
++        baseline_stats.mean_ratio,
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.max_ratio,
++        modulated_stats.p95_ratio,
++        modulated_stats.p98_ratio,
++        modulated_stats.p99_ratio,
++        modulated_stats.mean_ratio,
++        modulated_stats.evaluated_boundaries
++    );
++
++    write_quality_dashboard_csv(
++        "quality_gate_dual_plane_short_interval_step_modulation_artifacts",
++        "baseline_max,baseline_p95,baseline_p98,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_p99,modulated_mean,modulated_n",
++        &format!(
++            "{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
++            baseline_stats.max_ratio,
++            baseline_stats.p95_ratio,
++            baseline_stats.p98_ratio,
++            baseline_stats.p99_ratio,
++            baseline_stats.mean_ratio,
++            baseline_stats.evaluated_boundaries,
++            modulated_stats.max_ratio,
++            modulated_stats.p95_ratio,
++            modulated_stats.p98_ratio,
++            modulated_stats.p99_ratio,
++            modulated_stats.mean_ratio,
++            modulated_stats.evaluated_boundaries
++        ),
++    );
++
++    assert!(
++        baseline_stats.evaluated_boundaries >= 32 && modulated_stats.evaluated_boundaries >= 32,
++        "short-interval modulation artifact gate evaluated too few boundaries (baseline={}, modulated={})",
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.evaluated_boundaries
++    );
++    assert!(
++        modulated_stats.p95_ratio <= baseline_stats.p95_ratio * 2.6 + 1.0,
++        "short-interval modulation artifact gate failed (p95): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p95_ratio,
++        baseline_stats.p95_ratio
++    );
++    assert!(
++        modulated_stats.p98_ratio <= baseline_stats.p98_ratio * 3.0 + 1.4,
++        "short-interval modulation artifact gate failed (p98): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p98_ratio,
++        baseline_stats.p98_ratio
++    );
++    assert!(
++        modulated_stats.mean_ratio <= baseline_stats.mean_ratio * 2.3 + 1.0,
++        "short-interval modulation artifact gate failed (mean): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.mean_ratio,
++        baseline_stats.mean_ratio
++    );
++}
+
+
+thinking
+**Checking update progress**
+
+I think I need to update my plan and make sure to check if the previous steps have run successfully. Step 2 seems to be completed, but I’m unsure about Step 3 since there might have been a failure. However, if the checks indicate it's done, I can mark it as completed. I should use the update_plan function to reflect these changes.
+Plan update
+The Stage 1 slice is implemented and the relevant release quality gates were run. The new short-interval step gate passes; the pre-existing fast-modulation gate still fails, so Stage 1 remains in progress.
+  ✓ Inspect Stage 1 roadmap entry and existing fast-modulation quality gates to define one bounded slice
+  ✓ Edit ROADMAP.md and tests/quality_gates.rs for the short-interval modulation regression slice
+  ✓ Run the release quality-gate tests most relevant to the touched file and summarize remaining risk
+file update:
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8ae35f7b90f219dd49715028e5eb3931f021b376..a8da8c16081e9bdb608b5315bcb2f6f6432ab8a8
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -30,7 +30,7 @@
+ - Preserve the EDM-first focus unless there is a deliberate decision to expand
+   into a broader general-purpose stretcher.
+ 
+-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
++## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+ 
+ Automation: auto
+ 
+diff --git a/tests/quality_gates.rs b/tests/quality_gates.rs
+index 052ba76bc2c85719d165ebcd795c8465a04b0bdd..c0d1553d13266474e1a79be81fe29a04003e7130
+--- a/tests/quality_gates.rs
++++ b/tests/quality_gates.rs
+@@ -759,6 +759,49 @@
+     (output, boundaries)
+ }
+ 
++fn run_dual_plane_deterministic_with_ratio_steps(
++    input: &[f32],
++    sample_rate: u32,
++    callback_frames: usize,
++    ratios: &[f64],
++    hold_callbacks: usize,
++) -> (Vec<f32>, Vec<usize>) {
++    let params = StretchParams::new(1.0)
++        .with_sample_rate(sample_rate)
++        .with_channels(2)
++        .with_fft_size(1024)
++        .with_hop_size(256)
++        .with_preset(EdmPreset::DjBeatmatch);
++    let mut processor = StreamProcessor::new(params);
++    assert!(
++        processor.is_dual_plane_deterministic(),
++        "deterministic stream should default to dual-plane backend"
++    );
++    assert!(!ratios.is_empty(), "ratio step schedule must not be empty");
++
++    let chunk_samples = callback_frames * 2;
++    let mut output = Vec::with_capacity((input.len() as f64 * 1.20) as usize + 32_768);
++    let mut boundaries = Vec::with_capacity(input.len() / chunk_samples + 1);
++
++    for (idx, chunk) in input.chunks(chunk_samples).enumerate() {
++        let schedule_idx = idx / hold_callbacks.max(1);
++        let ratio = ratios[schedule_idx % ratios.len()];
++        processor
++            .set_stretch_ratio(ratio)
++            .expect("ratio step modulation must stay in valid range");
++        processor
++            .process_into(chunk, &mut output)
++            .expect("dual-plane stream process_into failed");
++        boundaries.push(output.len() / 2);
++    }
++    processor
++        .flush_into(&mut output)
++        .expect("dual-plane stream flush_into failed");
++    boundaries.push(output.len() / 2);
++
++    (output, boundaries)
++}
++
+ #[test]
+ fn quality_gate_dual_plane_deterministic_long_run_drift() {
+     let sample_rate = 44_100u32;
+@@ -933,3 +976,125 @@
+         baseline_stats.mean_ratio
+     );
+ }
++
++#[test]
++fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
++    let sample_rate = 44_100u32;
++    let bpm = 126.0;
++    let callback_frames = 256usize;
++    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
++    let input = mono_to_stereo_interleaved(&mono);
++
++    let (baseline_out, baseline_boundaries) = run_dual_plane_deterministic_with_ratio_modulation(
++        &input,
++        sample_rate,
++        callback_frames,
++        false,
++    );
++    let (modulated_out, modulated_boundaries) = run_dual_plane_deterministic_with_ratio_steps(
++        &input,
++        sample_rate,
++        callback_frames,
++        &[0.965, 1.035, 0.975, 1.025],
++        2,
++    );
++
++    assert!(
++        baseline_out.iter().all(|s| s.is_finite()),
++        "baseline short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        modulated_out.iter().all(|s| s.is_finite()),
++        "short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        !baseline_out.is_empty() && !modulated_out.is_empty(),
++        "short-interval modulation gate produced empty output"
++    );
++
++    let baseline_left = extract_left_channel(&baseline_out);
++    let modulated_left = extract_left_channel(&modulated_out);
++    let trim = 16usize;
++    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
++        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
++    } else {
++        baseline_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < baseline_left.len())
++    .collect();
++    let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
++        modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
++    } else {
++        modulated_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < modulated_left.len())
++    .collect();
++    let window = (sample_rate as f64 * 0.008).round() as usize; // +/-8ms
++    let guard = (sample_rate as f64 * 0.001).round() as usize; // +/-1ms
++    let baseline_stats =
++        boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
++    let modulated_stats =
++        boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
++    println!(
++        "dual-plane-short-step-mod gate: baseline(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={})",
++        baseline_stats.max_ratio,
++        baseline_stats.p95_ratio,
++        baseline_stats.p98_ratio,
++        baseline_stats.p99_ratio,
++        baseline_stats.mean_ratio,
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.max_ratio,
++        modulated_stats.p95_ratio,
++        modulated_stats.p98_ratio,
++        modulated_stats.p99_ratio,
++        modulated_stats.mean_ratio,
++        modulated_stats.evaluated_boundaries
++    );
++
++    write_quality_dashboard_csv(
++        "quality_gate_dual_plane_short_interval_step_modulation_artifacts",
++        "baseline_max,baseline_p95,baseline_p98,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_p99,modulated_mean,modulated_n",
++        &format!(
++            "{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
++            baseline_stats.max_ratio,
++            baseline_stats.p95_ratio,
++            baseline_stats.p98_ratio,
++            baseline_stats.p99_ratio,
++            baseline_stats.mean_ratio,
++            baseline_stats.evaluated_boundaries,
++            modulated_stats.max_ratio,
++            modulated_stats.p95_ratio,
++            modulated_stats.p98_ratio,
++            modulated_stats.p99_ratio,
++            modulated_stats.mean_ratio,
++            modulated_stats.evaluated_boundaries
++        ),
++    );
++
++    assert!(
++        baseline_stats.evaluated_boundaries >= 32 && modulated_stats.evaluated_boundaries >= 32,
++        "short-interval modulation artifact gate evaluated too few boundaries (baseline={}, modulated={})",
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.evaluated_boundaries
++    );
++    assert!(
++        modulated_stats.p95_ratio <= baseline_stats.p95_ratio * 2.6 + 1.0,
++        "short-interval modulation artifact gate failed (p95): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p95_ratio,
++        baseline_stats.p95_ratio
++    );
++    assert!(
++        modulated_stats.p98_ratio <= baseline_stats.p98_ratio * 3.0 + 1.4,
++        "short-interval modulation artifact gate failed (p98): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p98_ratio,
++        baseline_stats.p98_ratio
++    );
++    assert!(
++        modulated_stats.mean_ratio <= baseline_stats.mean_ratio * 2.3 + 1.0,
++        "short-interval modulation artifact gate failed (mean): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.mean_ratio,
++        baseline_stats.mean_ratio
++    );
++}
+
+
+thinking
+**Running tests and inspecting files**
+
+I’m considering running `cargo test` to cover recent changes and check for existing issues. It might also be good to ensure formatting, but that's not strictly necessary. I can run the tests individually, like with `cargo test --release --test quality_gates quality_gate_dual_plane_short_interval_step_modulation_artifacts -- --nocapture`. I’ll also check for any line references with `git diff --stat` and perhaps run `git status --short` to see if everything looks good.
+codex
+The bounded slice is finished. I’m doing one last status check so the final handoff can clearly separate what changed from the still-open Stage 1 risk that the existing fast-modulation gate exposed.
+exec
+/bin/zsh -lc 'git status --short ROADMAP.md tests/quality_gates.rs' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc "nl -ba ROADMAP.md | sed -n '28,40p'" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc "nl -ba tests/quality_gates.rs | sed -n '750,1105p'" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc 'git diff --stat -- ROADMAP.md tests/quality_gates.rs' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rs succeeded in 52ms:
+ M ROADMAP.md
+ M tests/quality_gates.rs
+ succeeded in 52ms:
+    28	- Reject malformed input instead of silently truncating or falling back.
+    29	- Prefer reference-driven quality gates over self-comparison alone.
+    30	- Preserve the EDM-first focus unless there is a deliberate decision to expand
+    31	  into a broader general-purpose stretcher.
+    32	
+    33	## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+    34	
+    35	Automation: auto
+    36	
+    37	### Why
+    38	
+    39	This is the clearest current signal that the library is not yet
+    40	production-stable. If dynamic ratio changes still produce obvious boundary
+ succeeded in 52ms:
+   750	            .process_into(chunk, &mut output)
+   751	            .expect("dual-plane stream process_into failed");
+   752	        boundaries.push(output.len() / 2);
+   753	    }
+   754	    processor
+   755	        .flush_into(&mut output)
+   756	        .expect("dual-plane stream flush_into failed");
+   757	    boundaries.push(output.len() / 2);
+   758	
+   759	    (output, boundaries)
+   760	}
+   761	
+   762	fn run_dual_plane_deterministic_with_ratio_steps(
+   763	    input: &[f32],
+   764	    sample_rate: u32,
+   765	    callback_frames: usize,
+   766	    ratios: &[f64],
+   767	    hold_callbacks: usize,
+   768	) -> (Vec<f32>, Vec<usize>) {
+   769	    let params = StretchParams::new(1.0)
+ succeeded in 51ms:
+ ROADMAP.md             |   2 +-
+ tests/quality_gates.rs | 165 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 166 insertions(+), 1 deletion(-)
+file update:
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8ae35f7b90f219dd49715028e5eb3931f021b376..a8da8c16081e9bdb608b5315bcb2f6f6432ab8a8
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -30,7 +30,7 @@
+ - Preserve the EDM-first focus unless there is a deliberate decision to expand
+   into a broader general-purpose stretcher.
+ 
+-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
++## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+ 
+ Automation: auto
+ 
+diff --git a/tests/quality_gates.rs b/tests/quality_gates.rs
+index 052ba76bc2c85719d165ebcd795c8465a04b0bdd..c0d1553d13266474e1a79be81fe29a04003e7130
+--- a/tests/quality_gates.rs
++++ b/tests/quality_gates.rs
+@@ -759,6 +759,49 @@
+     (output, boundaries)
+ }
+ 
++fn run_dual_plane_deterministic_with_ratio_steps(
++    input: &[f32],
++    sample_rate: u32,
++    callback_frames: usize,
++    ratios: &[f64],
++    hold_callbacks: usize,
++) -> (Vec<f32>, Vec<usize>) {
++    let params = StretchParams::new(1.0)
++        .with_sample_rate(sample_rate)
++        .with_channels(2)
++        .with_fft_size(1024)
++        .with_hop_size(256)
++        .with_preset(EdmPreset::DjBeatmatch);
++    let mut processor = StreamProcessor::new(params);
++    assert!(
++        processor.is_dual_plane_deterministic(),
++        "deterministic stream should default to dual-plane backend"
++    );
++    assert!(!ratios.is_empty(), "ratio step schedule must not be empty");
++
++    let chunk_samples = callback_frames * 2;
++    let mut output = Vec::with_capacity((input.len() as f64 * 1.20) as usize + 32_768);
++    let mut boundaries = Vec::with_capacity(input.len() / chunk_samples + 1);
++
++    for (idx, chunk) in input.chunks(chunk_samples).enumerate() {
++        let schedule_idx = idx / hold_callbacks.max(1);
++        let ratio = ratios[schedule_idx % ratios.len()];
++        processor
++            .set_stretch_ratio(ratio)
++            .expect("ratio step modulation must stay in valid range");
++        processor
++            .process_into(chunk, &mut output)
++            .expect("dual-plane stream process_into failed");
++        boundaries.push(output.len() / 2);
++    }
++    processor
++        .flush_into(&mut output)
++        .expect("dual-plane stream flush_into failed");
++    boundaries.push(output.len() / 2);
++
++    (output, boundaries)
++}
++
+ #[test]
+ fn quality_gate_dual_plane_deterministic_long_run_drift() {
+     let sample_rate = 44_100u32;
+@@ -933,3 +976,125 @@
+         baseline_stats.mean_ratio
+     );
+ }
++
++#[test]
++fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
++    let sample_rate = 44_100u32;
++    let bpm = 126.0;
++    let callback_frames = 256usize;
++    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
++    let input = mono_to_stereo_interleaved(&mono);
++
++    let (baseline_out, baseline_boundaries) = run_dual_plane_deterministic_with_ratio_modulation(
++        &input,
++        sample_rate,
++        callback_frames,
++        false,
++    );
++    let (modulated_out, modulated_boundaries) = run_dual_plane_deterministic_with_ratio_steps(
++        &input,
++        sample_rate,
++        callback_frames,
++        &[0.965, 1.035, 0.975, 1.025],
++        2,
++    );
++
++    assert!(
++        baseline_out.iter().all(|s| s.is_finite()),
++        "baseline short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        modulated_out.iter().all(|s| s.is_finite()),
++        "short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        !baseline_out.is_empty() && !modulated_out.is_empty(),
++        "short-interval modulation gate produced empty output"
++    );
++
++    let baseline_left = extract_left_channel(&baseline_out);
++    let modulated_left = extract_left_channel(&modulated_out);
++    let trim = 16usize;
++    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
++        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
++    } else {
++        baseline_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < baseline_left.len())
++    .collect();
++    let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
++        modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
++    } else {
++        modulated_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < modulated_left.len())
++    .collect();
++    let window = (sample_rate as f64 * 0.008).round() as usize; // +/-8ms
++    let guard = (sample_rate as f64 * 0.001).round() as usize; // +/-1ms
++    let baseline_stats =
++        boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
++    let modulated_stats =
++        boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
++    println!(
++        "dual-plane-short-step-mod gate: baseline(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={})",
++        baseline_stats.max_ratio,
++        baseline_stats.p95_ratio,
++        baseline_stats.p98_ratio,
++        baseline_stats.p99_ratio,
++        baseline_stats.mean_ratio,
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.max_ratio,
++        modulated_stats.p95_ratio,
++        modulated_stats.p98_ratio,
++        modulated_stats.p99_ratio,
++        modulated_stats.mean_ratio,
++        modulated_stats.evaluated_boundaries
++    );
++
++    write_quality_dashboard_csv(
++        "quality_gate_dual_plane_short_interval_step_modulation_artifacts",
++        "baseline_max,baseline_p95,baseline_p98,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_p99,modulated_mean,modulated_n",
++        &format!(
++            "{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
++            baseline_stats.max_ratio,
++            baseline_stats.p95_ratio,
++            baseline_stats.p98_ratio,
++            baseline_stats.p99_ratio,
++            baseline_stats.mean_ratio,
++            baseline_stats.evaluated_boundaries,
++            modulated_stats.max_ratio,
++            modulated_stats.p95_ratio,
++            modulated_stats.p98_ratio,
++            modulated_stats.p99_ratio,
++            modulated_stats.mean_ratio,
++            modulated_stats.evaluated_boundaries
++        ),
++    );
++
++    assert!(
++        baseline_stats.evaluated_boundaries >= 32 && modulated_stats.evaluated_boundaries >= 32,
++        "short-interval modulation artifact gate evaluated too few boundaries (baseline={}, modulated={})",
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.evaluated_boundaries
++    );
++    assert!(
++        modulated_stats.p95_ratio <= baseline_stats.p95_ratio * 2.6 + 1.0,
++        "short-interval modulation artifact gate failed (p95): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p95_ratio,
++        baseline_stats.p95_ratio
++    );
++    assert!(
++        modulated_stats.p98_ratio <= baseline_stats.p98_ratio * 3.0 + 1.4,
++        "short-interval modulation artifact gate failed (p98): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p98_ratio,
++        baseline_stats.p98_ratio
++    );
++    assert!(
++        modulated_stats.mean_ratio <= baseline_stats.mean_ratio * 2.3 + 1.0,
++        "short-interval modulation artifact gate failed (mean): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.mean_ratio,
++        baseline_stats.mean_ratio
++    );
++}
+
+
+thinking
+**Considering testing metrics**
+
+I need to include some specific file references, such as ROADMAP line 33 and tests/quality_gates.rs lines 762 and 981. It's important to mention the helper and the new test too. The stage status change should be noted at ROADMAP line 33. 
+
+The checks are as follows: 
+- The first test passed with baseline metrics.
+- The second test failed, revealing a risk in Stage 1 related to fast modulation.
+
+I think I should also mention the update in ROADMAP.md status. Let’s try to finalize this concisely.
+codex
+Files changed: [ROADMAP.md](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/ROADMAP.md#L33) and [tests/quality_gates.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/tests/quality_gates.rs#L762). Stage 1 is now marked `[~]`, and I added one Stage 1 slice only: a reusable short-step ratio runner plus a new release regression gate for repeated short-interval dual-plane modulation at [tests/quality_gates.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/tests/quality_gates.rs#L980).
+
+Checks run:
+- `cargo test --release --test quality_gates quality_gate_dual_plane_short_interval_step_modulation_artifacts -- --nocapture`  
+  Passed. Metrics: baseline `p95=1.132`, modulated `p95=2.600`, baseline `mean=0.459`, modulated `mean=0.926`.
+- `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`  
+  Failed. Metrics: baseline `p95=1.132`, modulated `p95=4.936`; baseline `p98=1.182`, modulated `p98=5.468`.
+
+Remaining risk: Stage 1 exit criteria are still not met because the existing dedicated fast-modulation gate is failing in release mode. The repo now has better coverage for short-interval modulation, but the underlying dual-plane modulation continuity issue remains unresolved.
+file update:
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8ae35f7b90f219dd49715028e5eb3931f021b376..a8da8c16081e9bdb608b5315bcb2f6f6432ab8a8
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -30,7 +30,7 @@
+ - Preserve the EDM-first focus unless there is a deliberate decision to expand
+   into a broader general-purpose stretcher.
+ 
+-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
++## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+ 
+ Automation: auto
+ 
+diff --git a/tests/quality_gates.rs b/tests/quality_gates.rs
+index 052ba76bc2c85719d165ebcd795c8465a04b0bdd..c0d1553d13266474e1a79be81fe29a04003e7130
+--- a/tests/quality_gates.rs
++++ b/tests/quality_gates.rs
+@@ -759,6 +759,49 @@
+     (output, boundaries)
+ }
+ 
++fn run_dual_plane_deterministic_with_ratio_steps(
++    input: &[f32],
++    sample_rate: u32,
++    callback_frames: usize,
++    ratios: &[f64],
++    hold_callbacks: usize,
++) -> (Vec<f32>, Vec<usize>) {
++    let params = StretchParams::new(1.0)
++        .with_sample_rate(sample_rate)
++        .with_channels(2)
++        .with_fft_size(1024)
++        .with_hop_size(256)
++        .with_preset(EdmPreset::DjBeatmatch);
++    let mut processor = StreamProcessor::new(params);
++    assert!(
++        processor.is_dual_plane_deterministic(),
++        "deterministic stream should default to dual-plane backend"
++    );
++    assert!(!ratios.is_empty(), "ratio step schedule must not be empty");
++
++    let chunk_samples = callback_frames * 2;
++    let mut output = Vec::with_capacity((input.len() as f64 * 1.20) as usize + 32_768);
++    let mut boundaries = Vec::with_capacity(input.len() / chunk_samples + 1);
++
++    for (idx, chunk) in input.chunks(chunk_samples).enumerate() {
++        let schedule_idx = idx / hold_callbacks.max(1);
++        let ratio = ratios[schedule_idx % ratios.len()];
++        processor
++            .set_stretch_ratio(ratio)
++            .expect("ratio step modulation must stay in valid range");
++        processor
++            .process_into(chunk, &mut output)
++            .expect("dual-plane stream process_into failed");
++        boundaries.push(output.len() / 2);
++    }
++    processor
++        .flush_into(&mut output)
++        .expect("dual-plane stream flush_into failed");
++    boundaries.push(output.len() / 2);
++
++    (output, boundaries)
++}
++
+ #[test]
+ fn quality_gate_dual_plane_deterministic_long_run_drift() {
+     let sample_rate = 44_100u32;
+@@ -933,3 +976,125 @@
+         baseline_stats.mean_ratio
+     );
+ }
++
++#[test]
++fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
++    let sample_rate = 44_100u32;
++    let bpm = 126.0;
++    let callback_frames = 256usize;
++    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
++    let input = mono_to_stereo_interleaved(&mono);
++
++    let (baseline_out, baseline_boundaries) = run_dual_plane_deterministic_with_ratio_modulation(
++        &input,
++        sample_rate,
++        callback_frames,
++        false,
++    );
++    let (modulated_out, modulated_boundaries) = run_dual_plane_deterministic_with_ratio_steps(
++        &input,
++        sample_rate,
++        callback_frames,
++        &[0.965, 1.035, 0.975, 1.025],
++        2,
++    );
++
++    assert!(
++        baseline_out.iter().all(|s| s.is_finite()),
++        "baseline short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        modulated_out.iter().all(|s| s.is_finite()),
++        "short-interval modulation gate produced non-finite samples"
++    );
++    assert!(
++        !baseline_out.is_empty() && !modulated_out.is_empty(),
++        "short-interval modulation gate produced empty output"
++    );
++
++    let baseline_left = extract_left_channel(&baseline_out);
++    let modulated_left = extract_left_channel(&modulated_out);
++    let trim = 16usize;
++    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
++        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
++    } else {
++        baseline_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < baseline_left.len())
++    .collect();
++    let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
++        modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
++    } else {
++        modulated_boundaries.clone()
++    }
++    .into_iter()
++    .filter(|&p| p > 1 && p + 1 < modulated_left.len())
++    .collect();
++    let window = (sample_rate as f64 * 0.008).round() as usize; // +/-8ms
++    let guard = (sample_rate as f64 * 0.001).round() as usize; // +/-1ms
++    let baseline_stats =
++        boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
++    let modulated_stats =
++        boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
++    println!(
++        "dual-plane-short-step-mod gate: baseline(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={})",
++        baseline_stats.max_ratio,
++        baseline_stats.p95_ratio,
++        baseline_stats.p98_ratio,
++        baseline_stats.p99_ratio,
++        baseline_stats.mean_ratio,
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.max_ratio,
++        modulated_stats.p95_ratio,
++        modulated_stats.p98_ratio,
++        modulated_stats.p99_ratio,
++        modulated_stats.mean_ratio,
++        modulated_stats.evaluated_boundaries
++    );
++
++    write_quality_dashboard_csv(
++        "quality_gate_dual_plane_short_interval_step_modulation_artifacts",
++        "baseline_max,baseline_p95,baseline_p98,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_p99,modulated_mean,modulated_n",
++        &format!(
++            "{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
++            baseline_stats.max_ratio,
++            baseline_stats.p95_ratio,
++            baseline_stats.p98_ratio,
++            baseline_stats.p99_ratio,
++            baseline_stats.mean_ratio,
++            baseline_stats.evaluated_boundaries,
++            modulated_stats.max_ratio,
++            modulated_stats.p95_ratio,
++            modulated_stats.p98_ratio,
++            modulated_stats.p99_ratio,
++            modulated_stats.mean_ratio,
++            modulated_stats.evaluated_boundaries
++        ),
++    );
++
++    assert!(
++        baseline_stats.evaluated_boundaries >= 32 && modulated_stats.evaluated_boundaries >= 32,
++        "short-interval modulation artifact gate evaluated too few boundaries (baseline={}, modulated={})",
++        baseline_stats.evaluated_boundaries,
++        modulated_stats.evaluated_boundaries
++    );
++    assert!(
++        modulated_stats.p95_ratio <= baseline_stats.p95_ratio * 2.6 + 1.0,
++        "short-interval modulation artifact gate failed (p95): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p95_ratio,
++        baseline_stats.p95_ratio
++    );
++    assert!(
++        modulated_stats.p98_ratio <= baseline_stats.p98_ratio * 3.0 + 1.4,
++        "short-interval modulation artifact gate failed (p98): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.p98_ratio,
++        baseline_stats.p98_ratio
++    );
++    assert!(
++        modulated_stats.mean_ratio <= baseline_stats.mean_ratio * 2.3 + 1.0,
++        "short-interval modulation artifact gate failed (mean): modulated {:.3} vs baseline {:.3}",
++        modulated_stats.mean_ratio,
++        baseline_stats.mean_ratio
++    );
++}
+
+tokens used
+125,812
+Files changed: [ROADMAP.md](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/ROADMAP.md#L33) and [tests/quality_gates.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/tests/quality_gates.rs#L762). Stage 1 is now marked `[~]`, and I added one Stage 1 slice only: a reusable short-step ratio runner plus a new release regression gate for repeated short-interval dual-plane modulation at [tests/quality_gates.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/tests/quality_gates.rs#L980).
+
+Checks run:
+- `cargo test --release --test quality_gates quality_gate_dual_plane_short_interval_step_modulation_artifacts -- --nocapture`  
+  Passed. Metrics: baseline `p95=1.132`, modulated `p95=2.600`, baseline `mean=0.459`, modulated `mean=0.926`.
+- `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`  
+  Failed. Metrics: baseline `p95=1.132`, modulated `p95=4.936`; baseline `p98=1.182`, modulated `p98=5.468`.
+
+Remaining risk: Stage 1 exit criteria are still not met because the existing dedicated fast-modulation gate is failing in release mode. The repo now has better coverage for short-interval modulation, but the underlying dual-plane modulation continuity issue remains unresolved.

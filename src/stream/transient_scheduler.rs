@@ -246,7 +246,8 @@ impl TransientEventScheduler {
                 && flux > self.prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
                 && flux > FLUX_ABS_MIN;
 
-            if is_transient && self.cooldown_frames == 0 {
+            let triggered_event = is_transient && self.cooldown_frames == 0;
+            if triggered_event {
                 let event_mask =
                     self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
                 for i in 0..4 {
@@ -263,7 +264,9 @@ impl TransientEventScheduler {
 
             self.update_flux_stats(flux);
             self.prev_flux = flux;
-            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
+            if !triggered_event {
+                self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
+            }
             self.last_processed_frame_start = Some(absolute_frame_start);
         }
 
@@ -333,7 +336,7 @@ impl TransientEventScheduler {
 
 #[cfg(test)]
 mod tests {
-    use super::TransientEventScheduler;
+    use super::{TransientEventScheduler, FLUX_RESET_COOLDOWN_FRAMES};
     use std::f32::consts::PI;
 
     #[test]
@@ -486,5 +489,31 @@ mod tests {
         let reset_stats = scheduler.stats();
         assert_eq!(reset_stats.events_detected_total, 0);
         assert_eq!(reset_stats.reset_band_counts_total, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn scheduler_tail_transient_preserves_full_cooldown_window() {
+        let sr = 44_100u32;
+        let fft = 1024usize;
+        let hop = 256usize;
+        let frames = 4096usize;
+        let mut stereo = vec![0.0f32; frames * 2];
+        for i in 0..frames {
+            let t = i as f32 / sr as f32;
+            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
+            // Align the click so only the final scanned analysis frame sees it.
+            let click = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
+            stereo[i * 2] = base + click;
+            stereo[i * 2 + 1] = base * 0.9 + click;
+        }
+
+        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
+        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
+        assert!(mask.is_some(), "expected tail transient reset mask");
+        assert_eq!(
+            scheduler.cooldown_frames,
+            FLUX_RESET_COOLDOWN_FRAMES,
+            "detected events should keep the full configured cooldown for subsequent analysis frames"
+        );
     }
 }

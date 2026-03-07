@@ -1,0 +1,1538 @@
+OpenAI Codex v0.106.0 (research preview)
+--------
+workdir: /Users/robbym/go/src/github.com/robmorgan/timestretch-rs
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019cc75e-2b4f-7543-a81a-7e7446d00f41
+--------
+user
+You are working in the Git repository at /Users/robbym/go/src/github.com/robmorgan/timestretch-rs on branch research at commit fe4aa1b95eed91c9027b5f3b6edc064c6c33e800.
+
+Execute exactly one small slice from the active roadmap stage only.
+
+Requirements:
+- Implement exactly one small slice inside the active stage.
+- Do not jump to later stages.
+- Run the most relevant local checks for the files you touch.
+- Update the active stage status from [ ] to [~] when work begins.
+- Update [~] to [x] only if the stage exit criteria are satisfied and the dedicated stage verification passes.
+- Do not edit /Users/robbym/go/src/github.com/robmorgan/timestretch-rs/.codex-plan-loop.
+- Leave the repository in a state where the outer loop can run its smoke and stage-specific tests.
+- End with a concise summary of files changed, checks run, and remaining risk.
+
+This is loop iteration 4.
+This is the active roadmap stage: Stage 1 - Stabilize Fast Modulation and Transition Quality
+
+## Goal
+
+Make `timestretch-rs` competitive with production-grade realtime stretchers by
+closing the remaining gaps in audible quality, modulation stability, realtime
+contract quality, external quality evidence, and API strictness.
+
+## Principles
+
+- Fix audible regressions before adding features.
+- Make the RT-safe path the default, obvious path.
+- Reject malformed input instead of silently truncating or falling back.
+- Prefer reference-driven quality gates over self-comparison alone.
+- Preserve the EDM-first focus unless there is a deliberate decision to expand
+  into a broader general-purpose stretcher.
+
+## Active Stage
+## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+
+Automation: auto
+
+### Why
+
+This is the clearest current signal that the library is not yet
+production-stable. If dynamic ratio changes still produce obvious boundary
+artifacts, improvements elsewhere will not matter.
+
+### Primary Files
+
+- `src/dual_plane/rt.rs`
+- `src/stream/processor.rs`
+- `src/stream/transient_scheduler.rs`
+- `src/stretch/phase_vocoder.rs`
+- `tests/quality_gates.rs`
+
+### Work
+
+- Fix ratio-transition continuity in the dual-plane deterministic path.
+- Reduce profile-switch churn and improve hysteresis for automation-heavy use.
+- Tighten transient reset scheduling so fast modulation does not over-trigger
+  phase resets.
+- Review how phase state is preserved or reseeded during rapid ratio changes.
+- Add additional focused tests around repeated short-interval modulation, not
+  just the existing one gate.
+
+### Exit Criteria
+
+- `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`
+  passes with margin, not barely.
+- Release-mode modulation no longer produces obvious clicks, roughness, or
+  discontinuities on synthetic DJ-like material.
+- Fixes do not regress steady-state deterministic streaming quality.
+
+## Previous Iteration Summary
+Implemented one Stage 1 slice in [src/stretch/phase_vocoder.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stretch/phase_vocoder.rs#L135): the streaming PV now tracks a carried `streaming_tail_ratio` so overlap tails that span a ratio change are normalized with the more expansion-prone ratio instead of snapping to the newest ratio at the chunk boundary. I also added a focused regression test at [src/stretch/phase_vocoder.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stretch/phase_vocoder.rs#L2237). I left the existing unrelated dirty files untouched, and Stage 1 remains `[~]` because the exit criteria are not met.
+
+Checks run:
+- `cargo test --release stretch::phase_vocoder::tests::test_streaming_tail_ratio_preserves_overlap_history_across_ratio_change -- --nocapture` passed.
+- `cargo test --release stretch::phase_vocoder::tests::test_process_streaming_and_flush_produce_finite_output -- --nocapture` passed.
+- `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture` failed unchanged: baseline `p95=1.132`; modulated `p95=3.613`, `p98=5.433`, `mean=2.269`, `max/p99=59.994`.
+- `cargo test --release --test quality_gates quality_gate_dual_plane_deterministic_long_run_drift -- --nocapture` passed.
+
+Remaining risk: the dedicated Stage 1 fast-modulation gate is still failing, so the next slice likely needs a deeper deterministic dual-plane transition fix beyond PV tail normalization alone.
+## Last Failure Context
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.23s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.90s
+thread 'quality_gate_dual_plane_fast_modulation_artifacts' (175193544) panicked at tests/quality_gates.rs:960:5:
+dual-plane modulation artifact gate failed (p95): modulated 3.613 vs baseline 1.132
+test quality_gate_dual_plane_fast_modulation_artifacts ... FAILED
+failures:
+failures:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.30s
+error: test failed, to rerun pass `--test quality_gates`
+
+mcp startup: no servers
+
+
+thinking
+**Planning coding tasks**
+
+I need to act in the role of a coding agent, focusing on a specific section of the repository. When work begins, I should update the active stage status accordingly. It seems the status is already marked as active, but if there’s a roadmap file, I need to find that without modifying the .codex-plan-loop. I should select one small slice, likely by adding focused tests related to modulation or path fixes. I also need to run relevant checks on the affected files.
+thinking
+**Inspecting stage criteria**
+
+I need to confirm if the stage exit criteria are met and if the dedicated verification passes. Right now, it looks like the stage remains marked as active. I should find the active roadmap file and update it when my work begins, but since it’s already active, maybe no edit is necessary. I’ll also check for any markdown files related to the roadmap and inspect the git status. Lastly, I’ll announce a commentary update before starting on the changes.
+codex
+I’m locating the active roadmap entry and the Stage 1 code/tests it points to, then I’ll take one contained slice in that stage and verify it with the narrowest relevant checks.
+exec
+/bin/zsh -lc 'git status --short' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc 'rg -n "Stage 1: Stabilize Fast Modulation and Transition Quality|Stage 1 - Stabilize Fast Modulation and Transition Quality" -S .' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc 'rg --files src tests . | rg "(src/dual_plane/rt.rs|src/stream/processor.rs|src/stream/transient_scheduler.rs|src/stretch/phase_vocoder.rs|tests/quality_gates.rs|roadmap|ROADMAP|plan)"' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rs succeeded in 53ms:
+ M Cargo.lock
+ M Cargo.toml
+ M ROADMAP.md
+ M desktop/Cargo.toml
+ M src/stream/processor.rs
+ M src/stretch/phase_vocoder.rs
+ M tests/quality_gates.rs
+ M web/Cargo.toml
+?? .codex-plan-loop/
+ succeeded in 52ms:
+./ROADMAP.md:33:## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+ succeeded in 52ms:
+src/dual_plane/engine.rs
+src/dual_plane/warp_map.rs
+src/dual_plane/analysis_plane.rs
+src/dual_plane/quality.rs
+src/dual_plane/hints.rs
+src/dual_plane/mod.rs
+src/dual_plane/rt.rs
+./src/dual_plane/engine.rs
+./src/dual_plane/warp_map.rs
+./src/dual_plane/analysis_plane.rs
+./src/dual_plane/quality.rs
+./src/dual_plane/hints.rs
+./src/dual_plane/mod.rs
+./src/dual_plane/rt.rs
+tests/dual_plane_parity.rs
+./src/stream/transient_scheduler.rs
+./src/stream/processor.rs
+./src/stretch/phase_vocoder.rs
+tests/quality_gates.rs
+tests/dual_plane_rt.rs
+
+
+
+thinking
+**Inspecting roadmap file**
+
+I need to inspect the roadmap file, particularly focusing on one small slice. There's a chance of a dirty worktree due to user changes, so I'll check the status and possible diffs carefully. I want to avoid any unintentional reverts while also keeping track of current modifications. Since the user asked for a small slice, I could add tests in tests/quality_gates.rs, but I need to be cautious about existing changes and conflicting modifications. I will ensure to run relevant local checks as well.
+thinking
+**Considering new test addition**
+
+I can add a focused test to `tests/quality_gates.rs` regarding repeated short-interval modulation. However, if that file is already dirty from user changes, I’ll need to inspect the diffs and content first. Alternatively, I might check `src/dual_plane/rt.rs` for existing clean code. I should use the explorer to check specific areas of the codebase, as the guidelines suggest using it for well-scoped questions too. But it’s not mandatory—it’s just helpful!
+thinking
+**Inspecting the plan and context**
+
+I need to update my plan after gathering enough context. I could use the update_plan tool to display it, especially since the work might be substantial, but it might not be necessary if things are simple. It’s important to have commentary before diving into substantial work. I’ll ensure frequent updates every 30 seconds. First, I should inspect the roadmap context and the relevant test file around the failing test, as well as check for any user changes in the files. Understanding the dirty state is crucial!
+codex
+I found the roadmap in `ROADMAP.md`; Stage 1 is already marked `[~]`, so I’ll keep it there unless the stage gate actually clears. Next I’m reading the fast-modulation gate and nearby helpers to pick a single contained Stage 1 slice that won’t cut across later work.
+exec
+/bin/zsh -lc "sed -n '880,1040p' tests/quality_gates.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc "sed -n '1,120p' ROADMAP.md" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc 'git diff -- tests/quality_gates.rs src/stretch/phase_vocoder.rs src/stream/processor.rs ROADMAP.md' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rs succeeded in 53ms:
+# Roadmap
+
+## Goal
+
+Make `timestretch-rs` competitive with production-grade realtime stretchers by
+closing the remaining gaps in audible quality, modulation stability, realtime
+contract quality, external quality evidence, and API strictness.
+
+## Current Status
+
+The repository is already beyond a toy implementation:
+
+- The core hybrid design is real: phase vocoder, WSOLA, HPSS, multi-resolution,
+  stereo handling, streaming, and a deterministic RT path all exist.
+- CI, quality gates, regression tests, and allocation tests are already in
+  place.
+- The main gap is not "missing DSP ideas". The main gap is the last 20%:
+  stronger continuity under modulation, tighter routing/decomposition, stricter
+  invariants, and reference-driven tuning.
+
+ succeeded in 53ms:
+    assert!(
+        baseline_out.iter().all(|s| s.is_finite()),
+        "baseline dual-plane modulation gate produced non-finite samples"
+    );
+    assert!(
+        modulated_out.iter().all(|s| s.is_finite()),
+        "modulated dual-plane modulation gate produced non-finite samples"
+    );
+    assert!(
+        !baseline_out.is_empty() && !modulated_out.is_empty(),
+        "dual-plane modulation gate produced empty output"
+    );
+
+    let baseline_left = extract_left_channel(&baseline_out);
+    let modulated_left = extract_left_channel(&modulated_out);
+    let trim = 16usize;
+    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
+        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
+    } else {
+        baseline_boundaries.clone()
+ succeeded in 52ms:
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8ae35f7..a8da8c1 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -30,7 +30,7 @@ fast-modulation artifact regression is fixed.
+ - Preserve the EDM-first focus unless there is a deliberate decision to expand
+   into a broader general-purpose stretcher.
+ 
+-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
++## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+ 
+ Automation: auto
+ 
+diff --git a/src/stream/processor.rs b/src/stream/processor.rs
+index 20dc0c5..321261e 100644
+--- a/src/stream/processor.rs
++++ b/src/stream/processor.rs
+@@ -21,6 +21,8 @@ const RATIO_SNAP_THRESHOLD: f64 = 0.0001;
+ /// Smoothing is time-based (not callback-based), so behavior stays stable
+ /// across 64/128/256/1024 frame callbacks.
+
+
+
+
+
+thinking
+**Evaluating unit tests for scheduler**
+
+I’m considering adding a unit test to the transient_scheduler or processor to expose potential over-trigger resets. I need to inspect current file versions, especially focusing on any changes not yet committed. It seems I should operate on a dirty worktree and use git diff to see prior modifications without reverting anything.
+
+Maybe I could add a hysteresis unit test in `src/stream/transient_scheduler.rs`, but I also think a targeted test for repeated short-interval modulation in `tests/quality_gates.rs` might already be sufficient. I'll need to check that file further for any existing tests.
+thinking
+**Identifying the next slice from the roadmap**
+
+The user has asked me to "execute exactly one small slice from the active roadmap stage," suggesting that each loop focuses on smaller tasks. I need to determine the current active slice, but there aren't any explicitly smaller items listed. I could pick "add additional focused tests around repeated short-interval modulation," which may be partly done but likely hasn’t been committed because the repo is dirty. Alternatively, I might choose to "reduce profile-switch churn and improve hysteresis" in `src/stream/processor.rs`, but that area might also already be dirty.
+thinking
+**Evaluating changes in code**
+
+I’m looking at whether the previous changes have already passed. The user mentioned iteration 4, but the summary only described changes in the phase_vocoder slice. However, the git diff shows changes in processor.rs and tests/quality_gates.rs, suggesting there are uncommitted changes involved that I need to investigate. I want to ensure I don’t overwrite anything, so I should focus on understanding if those files were modified by the user or from earlier iterations. It might be safest to avoid editing those files. I should inspect the code for a small contained fix or test.
+thinking
+**Considering unit tests and quality gates**
+
+I'm thinking it might be smart to add a unit test around transient reset scheduling to prevent over-triggering. Implementing this fix could mean making some code edits. Since the active gate is failing, a small slice might be more manageable, like adding a regression test for repeated short-interval modulation. However, that test seems to exist already, so I could create a different focused test in `tests/quality_gates.rs` for alternating callbacks. But that touches a dirty file, which might still be acceptable if I carefully append.  I'll ensure to follow the user's guidance by running only relevant local checks afterward. It's crucial to proceed cautiously given the existing changes.
+thinking
+**Assessing the need for code fixes and tests**
+
+It seems I might not need a deeper code fix, but I’m wondering if it’s valuable to pursue this. The outer loop requires smoke and stage-specific tests, so adding a test shouldn’t disrupt smoke tests as long as it passes. However, if the new targeted test fails, it wouldn’t be acceptable—only passing tests can be added. Perhaps I should set thresholds based on the baseline and focus on writing a unit test for helper or scheduler behavior in `src/stream/transient_scheduler.rs`. I need to carefully analyze the current code and tests first.
+codex
+The tree is already dirty in several Stage 1 files, including new processor and quality-gate work that I did not create in this turn, so I’m avoiding broad edits there. I’m checking for a contained untouched Stage 1 surface where I can land one narrow regression slice without interfering with those existing changes.
+exec
+/bin/zsh -lc "sed -n '1,280p' src/dual_plane/rt.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc "sed -n '1,260p' src/stream/transient_scheduler.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc 'rg -n "#[[:space:]]*test|mod tests|transient|reset|hyster|ratio" src/stream/transient_scheduler.rs src/dual_plane/rt.rs src/stream/processor.rs' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rs succeeded in 53ms:
+//! Hard-RT audio plane.
+//!
+//! The callback-facing API is intentionally small:
+//! - [`RtProcessor::prepare`]
+//! - [`RtProcessor::process_block`]
+//! - [`RtProcessor::process_block_into`]
+//! - [`RtProcessor::flush`]
+//! - [`RtProcessor::flush_into`]
+
+use crate::core::crossover::LR4Crossover;
+use crate::core::ring_buffer::RingBuffer;
+use crate::core::types::StretchParams;
+use crate::dual_plane::hints::RenderHints;
+use crate::dual_plane::quality::{LatencyProfile, QualityGovernor, QualityTier, RtGovernorConfig};
+use crate::dual_plane::warp_map::TimeWarpMap;
+use crate::error::StretchError;
+use crate::stretch::phase_vocoder::PhaseVocoder;
+use crate::stretch::wsola::Wsola;
+use arc_swap::ArcSwap;
+use std::sync::atomic::{AtomicU64, Ordering};
+ succeeded in 53ms:
+//! Persistent transient-event scheduling for deterministic stream processing.
+
+use crate::core::fft::COMPLEX_ZERO;
+use crate::core::window::{generate_window, WindowType};
+use rustfft::{num_complex::Complex, FftPlanner};
+use std::sync::Arc;
+
+/// Sub-bass/low-band split (Hz) used for reset-mask routing.
+const BAND_SUB_END_HZ: f64 = 100.0;
+/// Low/mid split (Hz) used for reset-mask routing.
+const BAND_LOW_END_HZ: f64 = 500.0;
+/// Mid/high split (Hz) used for reset-mask routing.
+const BAND_MID_END_HZ: f64 = 4000.0;
+/// EMA coefficient for adaptive spectral-flux statistics.
+const FLUX_EMA_ALPHA: f64 = 0.2;
+/// Sigma multiplier for adaptive spectral-flux threshold.
+const FLUX_THRESHOLD_SIGMA: f64 = 2.5;
+/// Required jump versus previous frame flux to classify a transient.
+const FLUX_SPIKE_RATIO: f64 = 1.6;
+/// Absolute guard to suppress near-silence false triggers.
+ succeeded in 53ms:
+Total output lines: 565
+
+src/stream/transient_scheduler.rs:1://! Persistent transient-event scheduling for deterministic stream processing.
+src/stream/transient_scheduler.rs:8:/// Sub-bass/low-band split (Hz) used for reset-mask routing.
+src/stream/transient_scheduler.rs:10:/// Low/mid split (Hz) used for reset-mask routing.
+src/stream/transient_scheduler.rs:12:/// Mid/high split (Hz) used for reset-mask routing.
+src/stream/transient_scheduler.rs:18:/// Required jump versus previous frame flux to classify a transient.
+src/stream/transient_scheduler.rs:28:/// Cooldown frames after an event to avoid duplicate resets.
+src/stream/transient_scheduler.rs:34:    pub(crate) reset_band_counts_total: [u64; 4],
+src/stream/transient_scheduler.rs:37:/// Stateful spectral-flux transient scheduler.
+src/stream/transient_scheduler.rs:40:/// computes a stereo-coherent transient score from per-channel magnitudes, and
+src/stream/transient_scheduler.rs:41:/// emits a per-band phase-reset
+src/stream/transient_scheduler.rs:42:/// mask (`[sub_bass, low, mid, high]`) when a transient event is detected.
+src/stream/transient_scheduler.rs:114:    pub(crate) fn reset(&mut self) {
+src/stream/transient_scheduler.rs:127:    /// Detects a transient event from stereo interleaved input and returns a
+src/stream/transient_scheduler.rs:128:    /// per-band reset mask when detected.
+src/stream/transient_scheduler.rs:132:    pub(crate) fn detect_stereo_reset_mask(
+src/stream/transient_scheduler.rs:171:        // We only need recent analysis frames to schedule phase resets in the
+src/stream/transient_scheduler.rs:174:        let mut reset_mask = [false; 4];
+src/stream/transient_scheduler.rs:219:                // cancellation for anti-phase/wide stereo transients.
+
+thinking
+**Inspecting tests for transient_scheduler**
+
+I think I need to look into the transient_scheduler tests. It might be a good opportunity to add a new test for cooldown under repeated close transients. This would align with tightening transient reset scheduling to avoid over-triggering phase resets. A small regression test could help ensure the cooldown properly suppresses duplicate triggers during short-interval hits within a few frames. I'll check the tests section to see what coverage is already there and if a fix is needed.
+codex
+I found an isolated Stage 1 surface in `src/stream/transient_scheduler.rs`: it already has unit tests, but nothing targeted at repeated short-interval transient bursts. I’m reading that test block now to see whether one regression case can cover the over-trigger angle without touching the broader dirty files.
+exec
+/bin/zsh -lc "sed -n '335,520p' src/stream/transient_scheduler.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc "sed -n '2948,3005p' src/stream/processor.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rs succeeded in 57ms:
+mod tests {
+    use super::TransientEventScheduler;
+    use std::f32::consts::PI;
+
+    #[test]
+    fn scheduler_detects_click_transient() {
+        let sr = 44_100u32;
+        let fft = 1024usize;
+        let hop = 256usize;
+        let frames = 4096usize;
+        let mut stereo = vec![0.0f32; frames * 2];
+        for i in 0..frames {
+            let t = i as f32 / sr as f32;
+            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
+            // Place the click near the tail so the scheduler's recent-frame
+            // scan window observes it.
+            let click = if (3400..3420).contains(&i) { 2.0 } else { 0.0 };
+            stereo[i * 2] = base + click;
+            stereo[i * 2 + 1] = base * 0.9 + click;
+        }
+ succeeded in 57ms:
+        }
+        self.pitch_scale = scale;
+        if dual_plane_supports_pitch_scale(scale) {
+            self.ensure_default_dual_plane_backend();
+        }
+    }
+
+    fn apply_transient_scheduled_phase_reset(&mut self, total_frames: usize) {
+        if total_frames < self.params.fft_size {
+            return;
+        }
+
+        let total_samples = total_frames.saturating_mul(2);
+        if total_samples == 0 || total_samples > self.interleaved_scratch.len() {
+            return;
+        }
+
+        let stereo = &self.interleaved_scratch[..total_samples];
+        let Some(reset_mask) = self
+            .transient_scheduler
+exec
+/bin/zsh -lc "sed -n '240,334p' src/stream/transient_scheduler.rs" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rs succeeded in 52ms:
+                continue;
+            }
+
+            let sigma = self.var_flux.max(0.0).sqrt();
+            let threshold = self.mean_flux + FLUX_THRESHOLD_SIGMA * sigma;
+            let is_transient = flux > threshold
+                && flux > self.prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
+                && flux > FLUX_ABS_MIN;
+
+            if is_transient && self.cooldown_frames == 0 {
+                let event_mask =
+                    self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
+                for i in 0..4 {
+                    reset_mask[i] |= event_mask[i];
+                    if event_mask[i] {
+                        self.stats.reset_band_counts_total[i] =
+                            self.stats.reset_band_counts_total[i].saturating_add(1);
+                    }
+                }
+                self.stats.events_detected_total =
+
+
+
+
+
+
+
+thinking
+**Evaluating cooldown logic**
+
+I’m examining the cooldown settings and considering if it’s effective enough. If the cooldown frames are set to two and they're being decremented in the same frame, I wonder if there's a bug since it might only suppress for one frame. Maybe I should add a unit test to ensure this suppression works correctly, and I could also implement a small fix to adjust the cooldown logic while adding a targeted test. This could be a meaningful slice for improvement!
+thinking
+**Inspecting cooldown usage**
+
+I need to examine the existing uses or expectations around cooldown count. I might not find direct implementations, but I think I could modify it to only decrement in non-trigger cases. It would be better to change the logic to only decrement when an event isn't triggered. If I set it up this way, I can preserve the analysis frames that are suppressed correctly. It seems like a solid idea, and I'll probably add a unit test for close transient events too!
+thinking
+**Understanding detection masking**
+
+I need to grasp how `detect_stereo_reset_mask` processes recent frames in one go. I might create an input with two clicks in nearby hops and expect the `stats.events_detected_total` to equal one because of the cooldown. It seems I could manage that in a single call. Alternatively, I could try three clicks spaced apart by one hop, calling the detection on the entire audio and again expecting one event. However, the consistency of detection could be influenced by threshold and adaptation.
+thinking
+**Evaluating detection logic**
+
+I'm thinking about the detection logic for clicks at specific positions and how it could relate to events detected in the analysis frames. I might detect a first transient, but the second could be suppressed. I should find concrete samples where this occurs, perhaps placing two clicks near the tail of the signal. I also want to consider using a structured signal with bursts aligned to frame boundaries. An alternative might be to add a focused unit test to check the cooldown counter behavior without audio.
+thinking
+**Evaluating cooldown testing**
+
+I’m thinking about setting `cooldown_frames = FLUX_RESET_COOLDOWN_FRAMES` to simulate the end-of-loop behavior. But then I realize that's just testing implementation details, not the scheduler's function. Maybe a helper could be useful, but that would increase the code complexity. A more elegant solution might be to derive the expected behavior based on actual detection. I could also create a unit test around `last_processed_frame_start` to see how it interacts with cooldown, using sliding origins where transients overlap.
+thinking
+**Evaluating testing strategy**
+
+I’m considering writing a test with three calls, each advancing by one hop, while a transient spans a few frames. I expect only the first call to detect it, though the third call might do so too. I need to inspect the scheduler in the stream processor since it's called per process chunk. Over-triggering could occur across fast modulation if new transients happen within a couple of frames. I might need to run a quality gate after any fixes to see if there's an impact.
+thinking
+**Planning for tests**
+
+I think it's a good idea to run the transient_scheduler test module along with the failing quality gate as the most relevant local checks. Since the user wants the outer loop, I can run smoke and stage-specific tests, and it's appropriate to include the stage-specific quality gate even if it takes time. I also need to check for existing tests in the processor related to transient reset stats or modulation, but for now, focusing on the scheduler tests and quality gate should suffice. I could create a short plan with three steps, which sounds good!
+Plan update
+I found a narrow Stage 1 slice in the transient reset scheduler: enforce the configured cooldown across subsequent analysis frames, then cover it with one focused regression test and rerun the relevant scheduler + fast-modulation checks.
+  → Adjust transient scheduler cooldown handling for repeated short-interval triggers
+  • Add one focused regression test for adjacent transient bursts
+  • Run targeted scheduler tests and the Stage 1 fast-modulation gate
+
+
+
+
+
+
+
+
+thinking
+**Inspecting cooldown usage**
+
+I need to check if the current code is using cooldowns correctly to see if we can fix it. I’m considering testing stats, maybe creating a regression test that uses synthetic clicks separated by a hop or two. First, I could run the existing scheduler tests as a baseline. Then, I might create a quick experiment using cargo test, particularly focusing on `cargo test src::stream::transient_scheduler`. I’ll look at existing test behavior, perhaps adding a `println!` for clarity.
+thinking
+**Designing an audio detection test**
+
+I could create a temporary command using `cargo test` after some modifications. I’m thinking about the audio pattern we want, which involves two strong spectral flux peaks in consecutive analysis frames. The `detect_stereo_reset_mask` function computes the flux based on the differences between current and previous frames. We’ll add click pulses, and the overlapping nature of the windows means each click will influence multiple frames. However, we also want to ensure the clicks are close enough to detect two separate events without misclassification during adaptation or warmup.
+thinking
+**Considering cooldown testing methods**
+
+I’m brainstorming another idea: creating bursts of different frequency content to produce flux spikes across frames. However, it might be simpler to manipulate the scheduler state and call `select_reset_mask`. Still, we need to focus on testing cooldown behavior rather than just the mask. I could add a tiny helper method like `advance_cooldown(triggered: bool)` for testing purposes, but that might just be an implementation detail. I wonder if a clearer option is to create a method like `consume_cooldown(triggered: bool)` or `after_frame(triggered: bool)`.
+thinking
+**Revising test design logic**
+
+I'm thinking through test design and considering whether to write the tests first or fix the current code. I want to reason about the helper method for cooldown management. I see a possible patch that simplifies logic by eliminating redundancy. Instead of having separate conditions, I can use a single expression to determine if `triggered` is true. This allows for a more concise, efficient setting of cooldown frames while ensuring stats and masks get set correctly.
+thinking
+**Considering testing cooldown logic**
+
+I don't think I need a helper for testing. To test the cooldown accurately, I might be able to directly access `cooldown_frames` after calling the new helper. This approach could provide clarity on how `cooldown_frames` is updated. Adding a unit test that manually simulates the logic by setting fields could be a beneficial strategy. I want to ensure that the tests effectively verify the cooldown functionality without introducing unnecessary complexity.
+thinking
+**Considering cooldown logic**
+
+I’m focusing on setting `cooldown_frames` to 0 and creating a block with a transient. When I call detect and check if `scheduler.cooldown_frames` matches `FLUX_RESET_COOLDOWN_FRAMES`, I realize the cooldown might decrement after the event due to subsequent frames in the loop. It's crucial to ensure that cooldown only decrements on the same event, but later frames still affect the final value. I think it’s smarter to test with an event happening at the last analyzed frame to avoid brittleness.
+thinking
+**Analyzing cooldown behavior**
+
+I’m realizing that the current bug will yield a cooldown of `FLUX_RESET_COOLDOWN_FRAMES - 1` due to decrementing in the same frame. After the fix, it should correctly match `FLUX_RESET_COOLDOWN_FRAMES`. Our existing click tests are set up to capture events near the tail, so it’s likely the event will occur in the last frames. 
+
+I could assert that `scheduler.cooldown_frames` equals 2 after detection on a tail click. Writing a precise regression test like `scheduler_event_keeps_full_cooldown_after_tail_transient` sounds effective!
+thinking
+**Verifying frame calculations**
+
+I’m checking if this aligns with the stage focused on tightening transient reset scheduling to avoid over-triggering. Yes, it does! I need to confirm that the event is indeed at the last analyzed frame. Am I right in thinking that `last_processed_frame_start` should correspond to 3072? 
+
+Let’s compute `num_frames`: if I take (4096-1024)/256 + 1, that equals 13. Then, `start_frame` should be 13 - 8, which gives me 5. The frames begin at 1280 and go to 3072.
+codex
+I’ve narrowed the slice to one concrete bug in Stage 1’s transient reset path: the scheduler decrements its cooldown on the same frame that triggers a reset, so the configured hold effectively shrinks by one frame. I’m patching that in `src/stream/transient_scheduler.rs` and adding one regression test that pins the intended cooldown behavior on a tail-aligned transient.
+file update
+M /Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/transient_scheduler.rs
+@@ -248,3 +248,4 @@
+ 
+-            if is_transient && self.cooldown_frames == 0 {
++            let triggered_event = is_transient && self.cooldown_frames == 0;
++            if triggered_event {
+                 let event_mask =
+@@ -265,3 +266,5 @@
+             self.prev_flux = flux;
+-            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            if !triggered_event {
++                self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            }
+             self.last_processed_frame_start = Some(absolute_frame_start);
+@@ -489,2 +492,28 @@
+     }
++
++    #[test]
++    fn scheduler_tail_transient_preserves_full_cooldown_window() {
++        let sr = 44_100u32;
++        let fft = 1024usize;
++        let hop = 256usize;
++        let frames = 4096usize;
++        let mut stereo = vec![0.0f32; frames * 2];
++        for i in 0..frames {
++            let t = i as f32 / sr as f32;
++            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
++            // Align the click so only the final scanned analysis frame sees it.
++            let click = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
++            stereo[i * 2] = base + click;
++            stereo[i * 2 + 1] = base * 0.9 + click;
++        }
++
++        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
++        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
++        assert!(mask.is_some(), "expected tail transient reset mask");
++        assert_eq!(
++            scheduler.cooldown_frames,
++            FLUX_RESET_COOLDOWN_FRAMES,
++            "detected events should keep the full configured cooldown for subsequent analysis frames"
++        );
++    }
+ }
+apply_patch(auto_approved=true) exited 0 in 28ms:
+Success. Updated the following files:
+M /Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/transient_scheduler.rs
+file update:
+diff --git a/src/stream/transient_scheduler.rs b/src/stream/transient_scheduler.rs
+index bfb45b7973e277fe22ae2e7e4c936ef6b4145728..b5173b378f3a838dbcbf0cb2d31fc7c00608c9ea
+--- a/src/stream/transient_scheduler.rs
++++ b/src/stream/transient_scheduler.rs
+@@ -246,7 +246,8 @@
+                 && flux > self.prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
+                 && flux > FLUX_ABS_MIN;
+ 
+-            if is_transient && self.cooldown_frames == 0 {
++            let triggered_event = is_transient && self.cooldown_frames == 0;
++            if triggered_event {
+                 let event_mask =
+                     self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
+                 for i in 0..4 {
+@@ -263,7 +264,9 @@
+ 
+             self.update_flux_stats(flux);
+             self.prev_flux = flux;
+-            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            if !triggered_event {
++                self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            }
+             self.last_processed_frame_start = Some(absolute_frame_start);
+         }
+ 
+@@ -487,4 +490,30 @@
+         assert_eq!(reset_stats.events_detected_total, 0);
+         assert_eq!(reset_stats.reset_band_counts_total, [0, 0, 0, 0]);
+     }
++
++    #[test]
++    fn scheduler_tail_transient_preserves_full_cooldown_window() {
++        let sr = 44_100u32;
++        let fft = 1024usize;
++        let hop = 256usize;
++        let frames = 4096usize;
++        let mut stereo = vec![0.0f32; frames * 2];
++        for i in 0..frames {
++            let t = i as f32 / sr as f32;
++            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
++            // Align the click so only the final scanned analysis frame sees it.
++            let click = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
++            stereo[i * 2] = base + click;
++            stereo[i * 2 + 1] = base * 0.9 + click;
++        }
++
++        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
++        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
++        assert!(mask.is_some(), "expected tail transient reset mask");
++        assert_eq!(
++            scheduler.cooldown_frames,
++            FLUX_RESET_COOLDOWN_FRAMES,
++            "detected events should keep the full configured cooldown for subsequent analysis frames"
++        );
++    }
+ }
+
+file update:
+diff --git a/src/stream/transient_scheduler.rs b/src/stream/transient_scheduler.rs
+index bfb45b7973e277fe22ae2e7e4c936ef6b4145728..b5173b378f3a838dbcbf0cb2d31fc7c00608c9ea
+--- a/src/stream/transient_scheduler.rs
++++ b/src/stream/transient_scheduler.rs
+@@ -246,7 +246,8 @@
+                 && flux > self.prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
+                 && flux > FLUX_ABS_MIN;
+ 
+-            if is_transient && self.cooldown_frames == 0 {
++            let triggered_event = is_transient && self.cooldown_frames == 0;
++            if triggered_event {
+                 let event_mask =
+                     self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
+                 for i in 0..4 {
+@@ -263,7 +264,9 @@
+ 
+             self.update_flux_stats(flux);
+             self.prev_flux = flux;
+-            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            if !triggered_event {
++                self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            }
+             self.last_processed_frame_start = Some(absolute_frame_start);
+         }
+ 
+@@ -487,4 +490,30 @@
+         assert_eq!(reset_stats.events_detected_total, 0);
+         assert_eq!(reset_stats.reset_band_counts_total, [0, 0, 0, 0]);
+     }
++
++    #[test]
++    fn scheduler_tail_transient_preserves_full_cooldown_window() {
++        let sr = 44_100u32;
++        let fft = 1024usize;
++        let hop = 256usize;
++        let frames = 4096usize;
++        let mut stereo = vec![0.0f32; frames * 2];
++        for i in 0..frames {
++            let t = i as f32 / sr as f32;
++            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
++            // Align the click so only the final scanned analysis frame sees it.
++            let click = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
++            stereo[i * 2] = base + click;
++            stereo[i * 2 + 1] = base * 0.9 + click;
++        }
++
++        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
++        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
++        assert!(mask.is_some(), "expected tail transient reset mask");
++        assert_eq!(
++            scheduler.cooldown_frames,
++            FLUX_RESET_COOLDOWN_FRAMES,
++            "detected events should keep the full configured cooldown for subsequent analysis frames"
++        );
++    }
+ }
+
+
+
+thinking
+**Evaluating command execution**
+
+I'm considering whether to run both processes in parallel since one is for debugging and the other for release. However, since they share the same target directory, they might collide over locks, which suggests a sequential approach could be better. I should definitely use an awaiter for any long-running command. The developer's instruction to use awaiter every time a command could take a while is solid advice. So, I need to ensure I implement this correctly for testing and running commands.
+thinking
+**Deciding on the testing method**
+
+I'm contemplating whether to spawn an agent with instructions to run tests or just use exec_command directly. The guidelines say to use an awaiter for any command that might take a long time, which certainly includes testing. It makes sense to spawn an awaiter to run the tests sequentially and wait for results. I also need to check the diff to ensure only one file is modified at this stage. This will help keep things organized moving forward.
+codex
+The code change is in place and limited to one Stage 1 surface. I’m running the scheduler regression plus the dedicated Stage 1 fast-modulation gate now, since that gate is the only exit signal that matters for this stage.
+collab spawn_agent(call_NQRbVfmrQ1YS822aMbHHnFZX, prompt="In /Users/robbym/go/src/github.com/robmorgan/timestretch-rs, run these checks sequentially and report concise results wi…")
+spawn_agent(call_NQRbVfmrQ1YS822aMbHHnFZX, prompt="In /Users/robbym/go/src/github.com/robmorgan/timestretch-rs, run these checks sequentially and report concise results wi…") pending init:
+  agent: 019cc760-d8a1-7601-ad45-e1ae79276f17
+mcp startup: no servers
+file update:
+diff --git a/src/stream/transient_scheduler.rs b/src/stream/transient_scheduler.rs
+index bfb45b7973e277fe22ae2e7e4c936ef6b4145728..b5173b378f3a838dbcbf0cb2d31fc7c00608c9ea
+--- a/src/stream/transient_scheduler.rs
++++ b/src/stream/transient_scheduler.rs
+@@ -246,7 +246,8 @@
+                 && flux > self.prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
+                 && flux > FLUX_ABS_MIN;
+ 
+-            if is_transient && self.cooldown_frames == 0 {
++            let triggered_event = is_transient && self.cooldown_frames == 0;
++            if triggered_event {
+                 let event_mask =
+                     self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
+                 for i in 0..4 {
+@@ -263,7 +264,9 @@
+ 
+             self.update_flux_stats(flux);
+             self.prev_flux = flux;
+-            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            if !triggered_event {
++                self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            }
+             self.last_processed_frame_start = Some(absolute_frame_start);
+         }
+ 
+@@ -487,4 +490,30 @@
+         assert_eq!(reset_stats.events_detected_total, 0);
+         assert_eq!(reset_stats.reset_band_counts_total, [0, 0, 0, 0]);
+     }
++
++    #[test]
++    fn scheduler_tail_transient_preserves_full_cooldown_window() {
++        let sr = 44_100u32;
++        let fft = 1024usize;
++        let hop = 256usize;
++        let frames = 4096usize;
++        let mut stereo = vec![0.0f32; frames * 2];
++        for i in 0..frames {
++            let t = i as f32 / sr as f32;
++            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
++            // Align the click so only the final scanned analysis frame sees it.
++            let click = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
++            stereo[i * 2] = base + click;
++            stereo[i * 2 + 1] = base * 0.9 + click;
++        }
++
++        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
++        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
++        assert!(mask.is_some(), "expected tail transient reset mask");
++        assert_eq!(
++            scheduler.cooldown_frames,
++            FLUX_RESET_COOLDOWN_FRAMES,
++            "detected events should keep the full configured cooldown for subsequent analysis frames"
++        );
++    }
+ }
+
+collab wait(call_ufcezcDg2fb7FZ6XeKrOu5Bq)
+  receivers: 019cc760-d8a1-7601-ad45-e1ae79276f17
+codex
+Running the two requested cargo checks in sequence from `/Users/robbym/go/src/github.com/robmorgan/timestretch-rs`. I’ll wait for each to finish and then report pass/fail with the relevant output.
+exec
+/bin/zsh -lc 'cargo test scheduler_ -- --nocapture' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rscodex
+The first check hit a compile error in `src/stream/transient_scheduler.rs`; I’m confirming the command has fully exited before moving to the second requested check.
+ exited 101 in 4.01s:
+error[E0425]: cannot find value `FLUX_RESET_COOLDOWN_FRAMES` in this scope
+   --> src/stream/transient_scheduler.rs:515:13
+    |
+515 |             FLUX_RESET_COOLDOWN_FRAMES,
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+    |
+help: consider importing this constant
+    |
+339 +     use crate::stream::transient_scheduler::FLUX_RESET_COOLDOWN_FRAMES;
+    |
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `timestretch` (lib test) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+codex
+The first command has failed with exit code `101`. Starting the second check now and waiting for completion.
+exec
+/bin/zsh -lc 'cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rscodex
+The release test is still compiling. I’m continuing to await it to a terminal result.
+codex
+The second command is still running with no final output yet. Continuing to poll.
+codex
+The release test is still in progress. I’m waiting on completion before reporting the final status.
+ exited 101 in 23.85s:
+    Finished `release` profile [optimized] target(s) in 22.91s
+     Running tests/quality_gates.rs (target/release/deps/quality_gates-84621307e5ae569f)
+
+running 1 test
+
+thread 'quality_gate_dual_plane_fast_modulation_artifacts' (175204490) panicked at tests/quality_gates.rs:960:5:
+dual-plane modulation artifact gate failed (p95): modulated 3.613 vs baseline 1.132
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+dual-plane-fast-mod gate: baseline(max=1.314,p95=1.132,p98=1.182,p99=1.231,mean=0.459,n=1348) modulated(max=59.994,p95=3.613,p98=5.433,p99=59.994,mean=2.269,n=1348)
+test quality_gate_dual_plane_fast_modulation_artifacts ... FAILED
+
+failures:
+
+failures:
+    quality_gate_dual_plane_fast_modulation_artifacts
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.33s
+
+error: test failed, to rerun pass `--test quality_gates`
+codex
+1. `cargo test scheduler_ -- --nocapture`
+FAIL
+Key output:
+```text
+error[E0425]: cannot find value `FLUX_RESET_COOLDOWN_FRAMES` in this scope
+   --> src/stream/transient_scheduler.rs:515:13
+help: consider importing this constant
+error: could not compile `timestretch` (lib test) due to 1 previous error
+```
+
+2. `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`
+FAIL
+Key output:
+```text
+thread 'quality_gate_dual_plane_fast_modulation_artifacts' panicked at tests/quality_gates.rs:960:5:
+dual-plane modulation artifact gate failed (p95): modulated 3.613 vs baseline 1.132
+
+dual-plane-fast-mod gate:
+baseline(max=1.314,p95=1.132,p98=1.182,p99=1.231,mean=0.459,n=1348)
+modulated(max=59.994,p95=3.613,p98=5.433,p99=59.994,mean=2.269,n=1348)
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out
+```
+wait(call_ufcezcDg2fb7FZ6XeKrOu5Bq) 1 agents complete:
+  019cc760-d8a1-7601-ad45-e1ae79276f17 completed: "1. `cargo test scheduler_ -- --nocapture`
+FAIL
+Key output:
+```text
+error[E0425]: cannot find value `FLUX_RESET_COOLDOWN_…"
+file update:
+diff --git a/src/stream/transient_scheduler.rs b/src/stream/transient_scheduler.rs
+index bfb45b7973e277fe22ae2e7e4c936ef6b4145728..b5173b378f3a838dbcbf0cb2d31fc7c00608c9ea
+--- a/src/stream/transient_scheduler.rs
++++ b/src/stream/transient_scheduler.rs
+@@ -246,7 +246,8 @@
+                 && flux > self.prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
+                 && flux > FLUX_ABS_MIN;
+ 
+-            if is_transient && self.cooldown_frames == 0 {
++            let triggered_event = is_transient && self.cooldown_frames == 0;
++            if triggered_event {
+                 let event_mask =
+                     self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
+                 for i in 0..4 {
+@@ -263,7 +264,9 @@
+ 
+             self.update_flux_stats(flux);
+             self.prev_flux = flux;
+-            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            if !triggered_event {
++                self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            }
+             self.last_processed_frame_start = Some(absolute_frame_start);
+         }
+ 
+@@ -487,4 +490,30 @@
+         assert_eq!(reset_stats.events_detected_total, 0);
+         assert_eq!(reset_stats.reset_band_counts_total, [0, 0, 0, 0]);
+     }
++
++    #[test]
++    fn scheduler_tail_transient_preserves_full_cooldown_window() {
++        let sr = 44_100u32;
++        let fft = 1024usize;
++        let hop = 256usize;
++        let frames = 4096usize;
++        let mut stereo = vec![0.0f32; frames * 2];
++        for i in 0..frames {
++            let t = i as f32 / sr as f32;
++            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
++            // Align the click so only the final scanned analysis frame sees it.
++            let click = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
++            stereo[i * 2] = base + click;
++            stereo[i * 2 + 1] = base * 0.9 + click;
++        }
++
++        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
++        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
++        assert!(mask.is_some(), "expected tail transient reset mask");
++        assert_eq!(
++            scheduler.cooldown_frames,
++            FLUX_RESET_COOLDOWN_FRAMES,
++            "detected events should keep the full configured cooldown for subsequent analysis frames"
++        );
++    }
+ }
+
+
+thinking
+**Resolving compile errors**
+
+I need to fix a compile error in the test because a constant isn't in scope. It seems that the tests module is only using `super::TransientEventScheduler`. I might need to either import the constant directly or refer to `super::FLUX_RESET_COOLDOWN_FRAMES`. I’ll patch it and rerun the checks afterward. I also have to update the commentary before making any edits. Let's make sure everything is in order before proceeding!
+codex
+The scheduler change itself compiled conceptually, but the new unit test missed the cooldown constant import inside the test module. I’m fixing that small test-scope error and rerunning the same narrow checks.
+file update
+M /Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/transient_scheduler.rs
+@@ -338,3 +338,3 @@
+ mod tests {
+-    use super::TransientEventScheduler;
++    use super::{TransientEventScheduler, FLUX_RESET_COOLDOWN_FRAMES};
+     use std::f32::consts::PI;
+apply_patch(auto_approved=true) exited 0 in 40ms:
+Success. Updated the following files:
+M /Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/transient_scheduler.rs
+file update:
+diff --git a/src/stream/transient_scheduler.rs b/src/stream/transient_scheduler.rs
+index bfb45b7973e277fe22ae2e7e4c936ef6b4145728..a28bbb500b44d6ddf8869c5a41d8b496f7ec052f
+--- a/src/stream/transient_scheduler.rs
++++ b/src/stream/transient_scheduler.rs
+@@ -246,7 +246,8 @@
+                 && flux > self.prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
+                 && flux > FLUX_ABS_MIN;
+ 
+-            if is_transient && self.cooldown_frames == 0 {
++            let triggered_event = is_transient && self.cooldown_frames == 0;
++            if triggered_event {
+                 let event_mask =
+                     self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
+                 for i in 0..4 {
+@@ -263,7 +264,9 @@
+ 
+             self.update_flux_stats(flux);
+             self.prev_flux = flux;
+-            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            if !triggered_event {
++                self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            }
+             self.last_processed_frame_start = Some(absolute_frame_start);
+         }
+ 
+@@ -333,7 +336,7 @@
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::TransientEventScheduler;
++    use super::{TransientEventScheduler, FLUX_RESET_COOLDOWN_FRAMES};
+     use std::f32::consts::PI;
+ 
+     #[test]
+@@ -487,4 +490,30 @@
+         assert_eq!(reset_stats.events_detected_total, 0);
+         assert_eq!(reset_stats.reset_band_counts_total, [0, 0, 0, 0]);
+     }
++
++    #[test]
++    fn scheduler_tail_transient_preserves_full_cooldown_window() {
++        let sr = 44_100u32;
++        let fft = 1024usize;
++        let hop = 256usize;
++        let frames = 4096usize;
++        let mut stereo = vec![0.0f32; frames * 2];
++        for i in 0..frames {
++            let t = i as f32 / sr as f32;
++            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
++            // Align the click so only the final scanned analysis frame sees it.
++            let click = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
++            stereo[i * 2] = base + click;
++            stereo[i * 2 + 1] = base * 0.9 + click;
++        }
++
++        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
++        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
++        assert!(mask.is_some(), "expected tail transient reset mask");
++        assert_eq!(
++            scheduler.cooldown_frames,
++            FLUX_RESET_COOLDOWN_FRAMES,
++            "detected events should keep the full configured cooldown for subsequent analysis frames"
++        );
++    }
+ }
+
+file update:
+diff --git a/src/stream/transient_scheduler.rs b/src/stream/transient_scheduler.rs
+index bfb45b7973e277fe22ae2e7e4c936ef6b4145728..a28bbb500b44d6ddf8869c5a41d8b496f7ec052f
+--- a/src/stream/transient_scheduler.rs
++++ b/src/stream/transient_scheduler.rs
+@@ -246,7 +246,8 @@
+                 && flux > self.prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
+                 && flux > FLUX_ABS_MIN;
+ 
+-            if is_transient && self.cooldown_frames == 0 {
++            let triggered_event = is_transient && self.cooldown_frames == 0;
++            if triggered_event {
+                 let event_mask =
+                     self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
+                 for i in 0..4 {
+@@ -263,7 +264,9 @@
+ 
+             self.update_flux_stats(flux);
+             self.prev_flux = flux;
+-            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            if !triggered_event {
++                self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            }
+             self.last_processed_frame_start = Some(absolute_frame_start);
+         }
+ 
+@@ -333,7 +336,7 @@
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::TransientEventScheduler;
++    use super::{TransientEventScheduler, FLUX_RESET_COOLDOWN_FRAMES};
+     use std::f32::consts::PI;
+ 
+     #[test]
+@@ -487,4 +490,30 @@
+         assert_eq!(reset_stats.events_detected_total, 0);
+         assert_eq!(reset_stats.reset_band_counts_total, [0, 0, 0, 0]);
+     }
++
++    #[test]
++    fn scheduler_tail_transient_preserves_full_cooldown_window() {
++        let sr = 44_100u32;
++        let fft = 1024usize;
++        let hop = 256usize;
++        let frames = 4096usize;
++        let mut stereo = vec![0.0f32; frames * 2];
++        for i in 0..frames {
++            let t = i as f32 / sr as f32;
++            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
++            // Align the click so only the final scanned analysis frame sees it.
++            let click = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
++            stereo[i * 2] = base + click;
++            stereo[i * 2 + 1] = base * 0.9 + click;
++        }
++
++        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
++        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
++        assert!(mask.is_some(), "expected tail transient reset mask");
++        assert_eq!(
++            scheduler.cooldown_frames,
++            FLUX_RESET_COOLDOWN_FRAMES,
++            "detected events should keep the full configured cooldown for subsequent analysis frames"
++        );
++    }
+ }
+
+collab spawn_agent(call_LZdQI5Md6LtZRFuVjEGkEdz5, prompt="In /Users/robbym/go/src/github.com/robmorgan/timestretch-rs, rerun these checks sequentially and report concise pass/fai…")
+mcp startup: no servers
+spawn_agent(call_LZdQI5Md6LtZRFuVjEGkEdz5, prompt="In /Users/robbym/go/src/github.com/robmorgan/timestretch-rs, rerun these checks sequentially and report concise pass/fai…") pending init:
+  agent: 019cc761-a895-7632-919f-24c7e738fdeb
+file update:
+diff --git a/src/stream/transient_scheduler.rs b/src/stream/transient_scheduler.rs
+index bfb45b7973e277fe22ae2e7e4c936ef6b4145728..a28bbb500b44d6ddf8869c5a41d8b496f7ec052f
+--- a/src/stream/transient_scheduler.rs
++++ b/src/stream/transient_scheduler.rs
+@@ -246,7 +246,8 @@
+                 && flux > self.prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
+                 && flux > FLUX_ABS_MIN;
+ 
+-            if is_transient && self.cooldown_frames == 0 {
++            let triggered_event = is_transient && self.cooldown_frames == 0;
++            if triggered_event {
+                 let event_mask =
+                     self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
+                 for i in 0..4 {
+@@ -263,7 +264,9 @@
+ 
+             self.update_flux_stats(flux);
+             self.prev_flux = flux;
+-            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            if !triggered_event {
++                self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            }
+             self.last_processed_frame_start = Some(absolute_frame_start);
+         }
+ 
+@@ -333,7 +336,7 @@
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::TransientEventScheduler;
++    use super::{TransientEventScheduler, FLUX_RESET_COOLDOWN_FRAMES};
+     use std::f32::consts::PI;
+ 
+     #[test]
+@@ -487,4 +490,30 @@
+         assert_eq!(reset_stats.events_detected_total, 0);
+         assert_eq!(reset_stats.reset_band_counts_total, [0, 0, 0, 0]);
+     }
++
++    #[test]
++    fn scheduler_tail_transient_preserves_full_cooldown_window() {
++        let sr = 44_100u32;
++        let fft = 1024usize;
++        let hop = 256usize;
++        let frames = 4096usize;
++        let mut stereo = vec![0.0f32; frames * 2];
++        for i in 0..frames {
++            let t = i as f32 / sr as f32;
++            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
++            // Align the click so only the final scanned analysis frame sees it.
++            let click = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
++            stereo[i * 2] = base + click;
++            stereo[i * 2 + 1] = base * 0.9 + click;
++        }
++
++        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
++        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
++        assert!(mask.is_some(), "expected tail transient reset mask");
++        assert_eq!(
++            scheduler.cooldown_frames,
++            FLUX_RESET_COOLDOWN_FRAMES,
++            "detected events should keep the full configured cooldown for subsequent analysis frames"
++        );
++    }
+ }
+
+collab wait(call_lHbOYXXQVsudfuteDITa70hr)
+  receivers: 019cc761-a895-7632-919f-24c7e738fdeb
+codex
+Running the two requested test commands in order from `/Users/robbym/go/src/github.com/robmorgan/timestretch-rs`, then I’ll report pass/fail and the quality-gate metrics that were printed.
+exec
+/bin/zsh -lc 'cargo test scheduler_ -- --nocapture' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rscodex
+The scheduler test command is still running; I’m waiting for it to finish before starting the quality-gate test.
+codex
+No terminal output yet from the first command. Continuing to await completion.
+codex
+The first command has finished the matching unit tests and is still walking the remaining test binaries with zero selected cases. I’m waiting for the full cargo run to terminate cleanly before starting step 2.
+codex
+Still awaiting the first cargo invocation; it is continuing through additional test targets with no selected `scheduler_` cases.
+codex
+The first command is still draining remaining test binaries. I’m keeping the sequence strict and will start the release quality gate only after this exits.
+codex
+The scheduler-filtered run is almost done; it has reached `tests/quality_gates.rs` and is still processing the remaining targets.
+codex
+Still waiting on the tail of the first cargo run. It is continuing through the last integration targets with zero selected tests.
+ succeeded in 1m 10s:
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.26s
+     Running unittests src/lib.rs (target/debug/deps/timestretch-50faad168a690d3c)
+
+running 8 tests
+test stream::transient_scheduler::tests::scheduler_select_reset_mask_enables_low_for_broadband_percussion ... ok
+test stream::transient_scheduler::tests::scheduler_select_reset_mask_always_sets_mid_and_high ... ok
+test stream::transient_scheduler::tests::scheduler_detects_antiphase_click_transient ... ok
+test stream::transient_scheduler::tests::scheduler_stats_accumulate_and_reset ... ok
+test stream::transient_scheduler::tests::scheduler_skips_duplicate_frames_for_same_origin ... ok
+test stream::transient_scheduler::tests::scheduler_detects_click_transient ... ok
+test stream::transient_scheduler::tests::scheduler_tail_transient_preserves_full_cooldown_window ... ok
+test stream::transient_scheduler::tests::scheduler_reset_clears_state ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 691 filtered out; finished in 0.02s
+
+     Running tests/algorithm_edge_cases.rs (target/debug/deps/algorithm_edge_cases-43f7ced4a59c6a5b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 49 filtered out; finished in 0.00s
+codex
+The first command completed successfully. Starting the release quality-gate test now and I’ll capture the printed metrics from that run.
+exec
+/bin/zsh -lc 'cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rscodex
+The release quality-gate build is in progress. I’m waiting for the test to complete and will extract the printed gate metrics from its output.
+codex
+No output from the release run yet beyond compilation start. Continuing to await completion.
+codex
+Still compiling or linking the release test binary. I’m keeping the await loop running until it reaches a terminal state.
+ exited 101 in 23.51s:
+    Finished `release` profile [optimized] target(s) in 22.91s
+     Running tests/quality_gates.rs (target/release/deps/quality_gates-84621307e5ae569f)
+
+running 1 test
+
+thread 'quality_gate_dual_plane_fast_modulation_artifacts' (175213415) panicked at tests/quality_gates.rs:960:5:
+dual-plane modulation artifact gate failed (p95): modulated 3.613 vs baseline 1.132
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+dual-plane-fast-mod gate: baseline(max=1.314,p95=1.132,p98=1.182,p99=1.231,mean=0.459,n=1348) modulated(max=59.994,p95=3.613,p98=5.433,p99=59.994,mean=2.269,n=1348)
+test quality_gate_dual_plane_fast_modulation_artifacts ... FAILED
+
+failures:
+
+failures:
+    quality_gate_dual_plane_fast_modulation_artifacts
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.33s
+
+error: test failed, to rerun pass `--test quality_gates`
+codex
+`1. cargo test scheduler_ -- --nocapture`: PASS
+
+Key result: `8 passed; 0 failed` in the matching scheduler unit tests, with the overall cargo invocation exiting cleanly after scanning other test binaries with zero selected cases.
+
+`2. cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`: FAIL
+
+Quality gate printed:
+- `baseline(max=1.314,p95=1.132,p98=1.182,p99=1.231,mean=0.459,n=1348)`
+- `modulated(max=59.994,p95=3.613,p98=5.433,p99=59.994,mean=2.269,n=1348)`
+
+Failure message:
+- `dual-plane modulation artifact gate failed (p95): modulated 3.613 vs baseline 1.132`
+
+No files were modified.
+wait(call_lHbOYXXQVsudfuteDITa70hr) 1 agents complete:
+  019cc761-a895-7632-919f-24c7e738fdeb completed: "`1. cargo test scheduler_ -- --nocapture`: PASS
+
+Key result: `8 passed; 0 failed` in the matching scheduler unit tests, …"
+file update:
+diff --git a/src/stream/transient_scheduler.rs b/src/stream/transient_scheduler.rs
+index bfb45b7973e277fe22ae2e7e4c936ef6b4145728..a28bbb500b44d6ddf8869c5a41d8b496f7ec052f
+--- a/src/stream/transient_scheduler.rs
++++ b/src/stream/transient_scheduler.rs
+@@ -246,7 +246,8 @@
+                 && flux > self.prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
+                 && flux > FLUX_ABS_MIN;
+ 
+-            if is_transient && self.cooldown_frames == 0 {
++            let triggered_event = is_transient && self.cooldown_frames == 0;
++            if triggered_event {
+                 let event_mask =
+                     self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
+                 for i in 0..4 {
+@@ -263,7 +264,9 @@
+ 
+             self.update_flux_stats(flux);
+             self.prev_flux = flux;
+-            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            if !triggered_event {
++                self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            }
+             self.last_processed_frame_start = Some(absolute_frame_start);
+         }
+ 
+@@ -333,7 +336,7 @@
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::TransientEventScheduler;
++    use super::{TransientEventScheduler, FLUX_RESET_COOLDOWN_FRAMES};
+     use std::f32::consts::PI;
+ 
+     #[test]
+@@ -487,4 +490,30 @@
+         assert_eq!(reset_stats.events_detected_total, 0);
+         assert_eq!(reset_stats.reset_band_counts_total, [0, 0, 0, 0]);
+     }
++
++    #[test]
++    fn scheduler_tail_transient_preserves_full_cooldown_window() {
++        let sr = 44_100u32;
++        let fft = 1024usize;
++        let hop = 256usize;
++        let frames = 4096usize;
++        let mut stereo = vec![0.0f32; frames * 2];
++        for i in 0..frames {
++            let t = i as f32 / sr as f32;
++            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
++            // Align the click so only the final scanned analysis frame sees it.
++            let click = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
++            stereo[i * 2] = base + click;
++            stereo[i * 2 + 1] = base * 0.9 + click;
++        }
++
++        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
++        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
++        assert!(mask.is_some(), "expected tail transient reset mask");
++        assert_eq!(
++            scheduler.cooldown_frames,
++            FLUX_RESET_COOLDOWN_FRAMES,
++            "detected events should keep the full configured cooldown for subsequent analysis frames"
++        );
++    }
+ }
+
+codex
+The regression test passed and the Stage 1 gate is still failing with the same fast-modulation numbers, so this slice stays scoped to transient reset cooldown only. I’m pulling the exact diff/line references now and then I’ll close with a concise handoff that leaves Stage 1 at `[~]`.
+exec
+/bin/zsh -lc "nl -ba src/stream/transient_scheduler.rs | sed -n '240,275p'" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc 'git diff -- src/stream/transient_scheduler.rs' in /Users/robbym/go/src/github.com/robmorgan/timestretch-rsexec
+/bin/zsh -lc "nl -ba src/stream/transient_scheduler.rs | sed -n '455,525p'" in /Users/robbym/go/src/github.com/robmorgan/timestretch-rs succeeded in 52ms:
+   240	                continue;
+   241	            }
+   242	
+   243	            let sigma = self.var_flux.max(0.0).sqrt();
+   244	            let threshold = self.mean_flux + FLUX_THRESHOLD_SIGMA * sigma;
+   245	            let is_transient = flux > threshold
+   246	                && flux > self.prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
+   247	                && flux > FLUX_ABS_MIN;
+   248	
+   249	            let triggered_event = is_transient && self.cooldown_frames == 0;
+   250	            if triggered_event {
+   251	                let event_mask =
+   252	                    self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
+   253	                for i in 0..4 {
+   254	                    reset_mask[i] |= event_mask[i];
+   255	                    if event_mask[i] {
+   256	                        self.stats.reset_band_counts_total[i] =
+   257	                            self.stats.reset_band_counts_total[i].saturating_add(1);
+   258	                    }
+   259	                }
+ succeeded in 51ms:
+diff --git a/src/stream/transient_scheduler.rs b/src/stream/transient_scheduler.rs
+index bfb45b7..a28bbb5 100644
+--- a/src/stream/transient_scheduler.rs
++++ b/src/stream/transient_scheduler.rs
+@@ -246,7 +246,8 @@ impl TransientEventScheduler {
+                 && flux > self.prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
+                 && flux > FLUX_ABS_MIN;
+ 
+-            if is_transient && self.cooldown_frames == 0 {
++            let triggered_event = is_transient && self.cooldown_frames == 0;
++            if triggered_event {
+                 let event_mask =
+                     self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
+                 for i in 0..4 {
+@@ -263,7 +264,9 @@ impl TransientEventScheduler {
+ 
+             self.update_flux_stats(flux);
+             self.prev_flux = flux;
+-            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            if !triggered_event {
+ succeeded in 52ms:
+   455	        assert!(
+   456	            !mask[0],
+   457	            "sub band should remain conservative for moderate low-end events"
+   458	        );
+   459	    }
+   460	
+   461	    #[test]
+   462	    fn scheduler_stats_accumulate_and_reset() {
+   463	        let sr = 44_100u32;
+   464	        let fft = 1024usize;
+   465	        let hop = 256usize;
+   466	        let frames = 4096usize;
+   467	        let mut stereo = vec![0.0f32; frames * 2];
+   468	        for i in 0..frames {
+   469	            let t = i as f32 / sr as f32;
+   470	            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
+   471	            let click = if (3400..3420).contains(&i) { 2.0 } else { 0.0 };
+   472	            stereo[i * 2] = base + click;
+   473	            stereo[i * 2 + 1] = base * 0.9 + click;
+   474	        }
+file update:
+diff --git a/src/stream/transient_scheduler.rs b/src/stream/transient_scheduler.rs
+index bfb45b7973e277fe22ae2e7e4c936ef6b4145728..a28bbb500b44d6ddf8869c5a41d8b496f7ec052f
+--- a/src/stream/transient_scheduler.rs
++++ b/src/stream/transient_scheduler.rs
+@@ -246,7 +246,8 @@
+                 && flux > self.prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
+                 && flux > FLUX_ABS_MIN;
+ 
+-            if is_transient && self.cooldown_frames == 0 {
++            let triggered_event = is_transient && self.cooldown_frames == 0;
++            if triggered_event {
+                 let event_mask =
+                     self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
+                 for i in 0..4 {
+@@ -263,7 +264,9 @@
+ 
+             self.update_flux_stats(flux);
+             self.prev_flux = flux;
+-            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            if !triggered_event {
++                self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            }
+             self.last_processed_frame_start = Some(absolute_frame_start);
+         }
+ 
+@@ -333,7 +336,7 @@
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::TransientEventScheduler;
++    use super::{TransientEventScheduler, FLUX_RESET_COOLDOWN_FRAMES};
+     use std::f32::consts::PI;
+ 
+     #[test]
+@@ -487,4 +490,30 @@
+         assert_eq!(reset_stats.events_detected_total, 0);
+         assert_eq!(reset_stats.reset_band_counts_total, [0, 0, 0, 0]);
+     }
++
++    #[test]
++    fn scheduler_tail_transient_preserves_full_cooldown_window() {
++        let sr = 44_100u32;
++        let fft = 1024usize;
++        let hop = 256usize;
++        let frames = 4096usize;
++        let mut stereo = vec![0.0f32; frames * 2];
++        for i in 0..frames {
++            let t = i as f32 / sr as f32;
++            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
++            // Align the click so only the final scanned analysis frame sees it.
++            let click = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
++            stereo[i * 2] = base + click;
++            stereo[i * 2 + 1] = base * 0.9 + click;
++        }
++
++        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
++        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
++        assert!(mask.is_some(), "expected tail transient reset mask");
++        assert_eq!(
++            scheduler.cooldown_frames,
++            FLUX_RESET_COOLDOWN_FRAMES,
++            "detected events should keep the full configured cooldown for subsequent analysis frames"
++        );
++    }
+ }
+
+
+thinking
+**Updating the plan**
+
+I think it's time to update my plan since I've completed step 3 — but I should note that the gate is still failing. I’ll make sure to reflect that in the plan itself. So, while it seems all steps are completed, I’ll keep that notation about the gate failing, and I can indicate that the stage remains at its current status. This way, I’ll have a clear view of what's left to address!
+Plan update
+Completed the targeted Stage 1 slice in the transient scheduler. The focused regression passed; the dedicated fast-modulation quality gate still fails unchanged, so Stage 1 remains in progress.
+  ✓ Adjust transient scheduler cooldown handling for repeated short-interval triggers
+  ✓ Add one focused regression test for adjacent transient bursts
+  ✓ Run targeted scheduler tests and the Stage 1 fast-modulation gate
+file update:
+diff --git a/src/stream/transient_scheduler.rs b/src/stream/transient_scheduler.rs
+index bfb45b7973e277fe22ae2e7e4c936ef6b4145728..a28bbb500b44d6ddf8869c5a41d8b496f7ec052f
+--- a/src/stream/transient_scheduler.rs
++++ b/src/stream/transient_scheduler.rs
+@@ -246,7 +246,8 @@
+                 && flux > self.prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
+                 && flux > FLUX_ABS_MIN;
+ 
+-            if is_transient && self.cooldown_frames == 0 {
++            let triggered_event = is_transient && self.cooldown_frames == 0;
++            if triggered_event {
+                 let event_mask =
+                     self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
+                 for i in 0..4 {
+@@ -263,7 +264,9 @@
+ 
+             self.update_flux_stats(flux);
+             self.prev_flux = flux;
+-            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            if !triggered_event {
++                self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            }
+             self.last_processed_frame_start = Some(absolute_frame_start);
+         }
+ 
+@@ -333,7 +336,7 @@
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::TransientEventScheduler;
++    use super::{TransientEventScheduler, FLUX_RESET_COOLDOWN_FRAMES};
+     use std::f32::consts::PI;
+ 
+     #[test]
+@@ -487,4 +490,30 @@
+         assert_eq!(reset_stats.events_detected_total, 0);
+         assert_eq!(reset_stats.reset_band_counts_total, [0, 0, 0, 0]);
+     }
++
++    #[test]
++    fn scheduler_tail_transient_preserves_full_cooldown_window() {
++        let sr = 44_100u32;
++        let fft = 1024usize;
++        let hop = 256usize;
++        let frames = 4096usize;
++        let mut stereo = vec![0.0f32; frames * 2];
++        for i in 0..frames {
++            let t = i as f32 / sr as f32;
++            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
++            // Align the click so only the final scanned analysis frame sees it.
++            let click = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
++            stereo[i * 2] = base + click;
++            stereo[i * 2 + 1] = base * 0.9 + click;
++        }
++
++        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
++        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
++        assert!(mask.is_some(), "expected tail transient reset mask");
++        assert_eq!(
++            scheduler.cooldown_frames,
++            FLUX_RESET_COOLDOWN_FRAMES,
++            "detected events should keep the full configured cooldown for subsequent analysis frames"
++        );
++    }
+ }
+
+codex
+Implemented one Stage 1 slice in [src/stream/transient_scheduler.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/transient_scheduler.rs#L249): a detected transient no longer burns one cooldown frame immediately on the same analysis frame that triggered the reset. I also added a focused regression at [src/stream/transient_scheduler.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/transient_scheduler.rs#L495) that tail-aligns a click to the final scanned frame and asserts the full configured cooldown is preserved for subsequent frames. `ROADMAP.md` was already at `[~]`, and it remains `[~]` because the stage exit gate is still failing.
+
+Checks run:
+- `cargo test scheduler_ -- --nocapture` passed (`8 passed`).
+- `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture` failed unchanged: baseline `p95=1.132`, modulated `p95=3.613`, `p98=5.433`, `mean=2.269`.
+
+Files changed this turn: [src/stream/transient_scheduler.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/transient_scheduler.rs). Remaining risk: this slice tightens transient reset scheduling, but the larger deterministic dual-plane fast-modulation artifact regression is still present, so Stage 1 is not ready to close.
+file update:
+diff --git a/src/stream/transient_scheduler.rs b/src/stream/transient_scheduler.rs
+index bfb45b7973e277fe22ae2e7e4c936ef6b4145728..a28bbb500b44d6ddf8869c5a41d8b496f7ec052f
+--- a/src/stream/transient_scheduler.rs
++++ b/src/stream/transient_scheduler.rs
+@@ -246,7 +246,8 @@
+                 && flux > self.prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
+                 && flux > FLUX_ABS_MIN;
+ 
+-            if is_transient && self.cooldown_frames == 0 {
++            let triggered_event = is_transient && self.cooldown_frames == 0;
++            if triggered_event {
+                 let event_mask =
+                     self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
+                 for i in 0..4 {
+@@ -263,7 +264,9 @@
+ 
+             self.update_flux_stats(flux);
+             self.prev_flux = flux;
+-            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            if !triggered_event {
++                self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
++            }
+             self.last_processed_frame_start = Some(absolute_frame_start);
+         }
+ 
+@@ -333,7 +336,7 @@
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::TransientEventScheduler;
++    use super::{TransientEventScheduler, FLUX_RESET_COOLDOWN_FRAMES};
+     use std::f32::consts::PI;
+ 
+     #[test]
+@@ -487,4 +490,30 @@
+         assert_eq!(reset_stats.events_detected_total, 0);
+         assert_eq!(reset_stats.reset_band_counts_total, [0, 0, 0, 0]);
+     }
++
++    #[test]
++    fn scheduler_tail_transient_preserves_full_cooldown_window() {
++        let sr = 44_100u32;
++        let fft = 1024usize;
++        let hop = 256usize;
++        let frames = 4096usize;
++        let mut stereo = vec![0.0f32; frames * 2];
++        for i in 0..frames {
++            let t = i as f32 / sr as f32;
++            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
++            // Align the click so only the final scanned analysis frame sees it.
++            let click = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
++            stereo[i * 2] = base + click;
++            stereo[i * 2 + 1] = base * 0.9 + click;
++        }
++
++        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
++        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
++        assert!(mask.is_some(), "expected tail transient reset mask");
++        assert_eq!(
++            scheduler.cooldown_frames,
++            FLUX_RESET_COOLDOWN_FRAMES,
++            "detected events should keep the full configured cooldown for subsequent analysis frames"
++        );
++    }
+ }
+
+tokens used
+43,245
+Implemented one Stage 1 slice in [src/stream/transient_scheduler.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/transient_scheduler.rs#L249): a detected transient no longer burns one cooldown frame immediately on the same analysis frame that triggered the reset. I also added a focused regression at [src/stream/transient_scheduler.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/transient_scheduler.rs#L495) that tail-aligns a click to the final scanned frame and asserts the full configured cooldown is preserved for subsequent frames. `ROADMAP.md` was already at `[~]`, and it remains `[~]` because the stage exit gate is still failing.
+
+Checks run:
+- `cargo test scheduler_ -- --nocapture` passed (`8 passed`).
+- `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture` failed unchanged: baseline `p95=1.132`, modulated `p95=3.613`, `p98=5.433`, `mean=2.269`.
+
+Files changed this turn: [src/stream/transient_scheduler.rs](/Users/robbym/go/src/github.com/robmorgan/timestretch-rs/src/stream/transient_scheduler.rs). Remaining risk: this slice tightens transient reset scheduling, but the larger deterministic dual-plane fast-modulation artifact regression is still present, so Stage 1 is not ready to close.
