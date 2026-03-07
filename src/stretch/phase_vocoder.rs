@@ -2393,6 +2393,83 @@ mod tests {
     }
 
     #[test]
+    fn test_streaming_tail_ratio_holds_prior_seam_across_repeated_short_interval_modulation() {
+        let fft_size = 1024;
+        let hop = 256;
+        let sample_rate = 44100u32;
+        let num_samples = fft_size * 8;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
+            })
+            .collect();
+
+        let mut pv = PhaseVocoder::new(fft_size, hop, 1.04, sample_rate, 120.0);
+        let first_chunk_len = fft_size * 2;
+        let first = pv.process_streaming(&input[..first_chunk_len]).unwrap();
+        assert!(!first.is_empty(), "first streaming chunk should emit audio");
+        assert!(
+            !pv.streaming_tail.is_empty(),
+            "first streaming chunk should retain overlap tail"
+        );
+        assert!(
+            (pv.streaming_tail_ratio - 1.04).abs() < 1e-12,
+            "tail ratio should match the ratio that generated the carried overlap"
+        );
+
+        let mut consumed = ((first_chunk_len - fft_size) / hop + 1) * hop;
+        let short_chunk_len = fft_size + hop;
+
+        pv.set_stretch_ratio(0.96);
+        let second = pv
+            .process_streaming(&input[consumed..consumed + short_chunk_len])
+            .unwrap();
+        assert!(
+            !second.is_empty(),
+            "second short streaming chunk should still emit audio"
+        );
+        assert!(
+            (pv.streaming_tail_ratio - 1.04).abs() < 1e-12,
+            "the unresolved prior seam should keep its expansion ratio through the first cross-unity modulation step"
+        );
+
+        consumed += ((short_chunk_len - fft_size) / hop + 1) * hop;
+        pv.set_stretch_ratio(1.02);
+        let third = pv
+            .process_streaming(&input[consumed..consumed + short_chunk_len])
+            .unwrap();
+        assert!(
+            !third.is_empty(),
+            "third short streaming chunk should still emit audio"
+        );
+        assert!(
+            (pv.streaming_tail_ratio - 1.04).abs() < 1e-12,
+            "repeated short-interval modulation should keep the unresolved prior seam ratio instead of re-arming on each toggle"
+        );
+
+        consumed += ((short_chunk_len - fft_size) / hop + 1) * hop;
+        pv.set_stretch_ratio(0.98);
+        let fourth = pv
+            .process_streaming(&input[consumed..consumed + first_chunk_len])
+            .unwrap();
+        assert!(
+            !fourth.is_empty(),
+            "a longer follow-up chunk should still emit audio"
+        );
+        assert!(
+            (pv.streaming_tail_ratio - 0.98).abs() < 1e-12,
+            "once the older overlap has drained, the carried tail should re-arm to the current modulation ratio"
+        );
+
+        let _ = pv.flush_streaming().unwrap();
+        assert!(
+            (pv.streaming_tail_ratio - 0.98).abs() < 1e-12,
+            "flush should preserve the re-armed current ratio after repeated short-interval modulation"
+        );
+    }
+
+    #[test]
     fn test_flush_streaming_is_idempotent() {
         let fft_size = 1024;
         let hop = 256;
