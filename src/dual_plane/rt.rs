@@ -579,8 +579,6 @@ impl RtProcessor {
 
     fn hold_profile_and_tier_transitions(&mut self) {
         self.policy_profile = self.current_profile;
-        self.profile_candidate = self.current_profile;
-        self.profile_candidate_streak = 0;
         self.target_profile = self.current_profile;
         self.profile_transition_blocks_left = 0;
         self.config.latency_profile = self.current_profile;
@@ -1400,8 +1398,6 @@ impl RtProcessor {
     fn update_profile_policy(&mut self) {
         if self.ratio_motion_freeze_active() {
             self.policy_profile = self.current_profile;
-            self.profile_candidate = self.current_profile;
-            self.profile_candidate_streak = 0;
             return;
         }
         if !self.auto_profile_switching {
@@ -3177,6 +3173,94 @@ mod tests {
             rt.profile_telemetry().target_profile,
             LatencyProfile::Render,
             "non-kernel preview callbacks should stay on the held render profile"
+        );
+    }
+
+    #[test]
+    fn ratio_motion_freeze_pauses_inflight_hysteresis_instead_of_restarting_it() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Render;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 4;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+        let scratch_hints = Arc::new(RenderHints {
+            transient_confidence: 0.90,
+            tonal_confidence: 0.10,
+            noise_confidence: 0.20,
+            ..RenderHints::default()
+        });
+
+        rt.set_constant_ratio(1.0005);
+        rt.set_hint_snapshot(Arc::clone(&scratch_hints));
+        for build_idx in 0..2 {
+            let mut output_refs = [&mut output[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+            assert_eq!(
+                rt.profile_candidate,
+                LatencyProfile::Scratch,
+                "scratch-biased hints should accumulate a scratch candidate before the freeze at step {build_idx}"
+            );
+        }
+        assert_eq!(
+            rt.profile_candidate_streak, 2,
+            "pre-freeze scratch evidence should accumulate toward the configured hysteresis threshold"
+        );
+        assert_eq!(
+            rt.profile_telemetry().target_profile,
+            LatencyProfile::Render,
+            "partial hysteresis progress should not retarget the profile before the threshold is met"
+        );
+
+        rt.set_constant_ratio(1.0015);
+        for freeze_idx in 0..2 {
+            let mut output_refs = [&mut output[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+            assert_eq!(
+                rt.profile_candidate,
+                LatencyProfile::Scratch,
+                "ratio-motion freeze should preserve the in-flight scratch candidate during held step {freeze_idx}"
+            );
+            assert_eq!(
+                rt.profile_candidate_streak, 2,
+                "ratio-motion freeze should pause, not reset, the accumulated hysteresis streak during held step {freeze_idx}"
+            );
+            assert_eq!(
+                rt.profile_telemetry().target_profile,
+                LatencyProfile::Render,
+                "the held render profile should stay committed until the freeze fully expires"
+            );
+        }
+
+        for resume_idx in 0..2 {
+            let mut output_refs = [&mut output[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+            if resume_idx == 0 {
+                assert_eq!(
+                    rt.profile_telemetry().target_profile,
+                    LatencyProfile::Render,
+                    "the first post-freeze callback should continue the preserved hysteresis streak without committing early"
+                );
+                assert_eq!(
+                    rt.profile_candidate_streak, 3,
+                    "the first post-freeze callback should resume the preserved scratch streak"
+                );
+            }
+        }
+
+        assert_eq!(
+            rt.profile_telemetry().target_profile,
+            LatencyProfile::Scratch,
+            "preserved hysteresis progress should let scratch retarget after only the remaining post-freeze callbacks"
         );
     }
 
