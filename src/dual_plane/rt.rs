@@ -283,6 +283,7 @@ pub struct RtProcessor {
     kernel_samples: usize,
     input_ring: RingBuffer<f32>,
     pending_output: RingBuffer<f32>,
+    unity_history: RingBuffer<f32>,
     interleaved_scratch: Vec<f32>,
     channel_input: Vec<Vec<f32>>,
     pv_channel_input: Vec<Vec<f32>>,
@@ -451,6 +452,7 @@ impl RtProcessor {
             kernel_samples,
             input_ring: RingBuffer::with_capacity(input_capacity_samples),
             pending_output: RingBuffer::with_capacity(output_capacity_samples),
+            unity_history: RingBuffer::with_capacity(kernel_samples),
             interleaved_scratch: vec![0.0; kernel_samples],
             channel_input: (0..num_channels)
                 .map(|_| Vec::with_capacity(kernel_samples / num_channels))
@@ -785,6 +787,15 @@ impl RtProcessor {
 
             if self.can_unity_passthrough(input_frames, output_frames_capacity) {
                 self.rearm_unity_passthrough();
+                let needed_samples = input_frames.saturating_mul(self.num_channels);
+                debug_assert!(needed_samples <= self.interleaved_scratch.len());
+                for frame in 0..input_frames {
+                    for ch in 0..self.num_channels {
+                        self.interleaved_scratch[frame * self.num_channels + ch] =
+                            input_slices[ch][frame];
+                    }
+                }
+                self.record_unity_passthrough_from_scratch(needed_samples);
                 for ch in 0..self.num_channels {
                     output_slices[ch][..input_frames]
                         .copy_from_slice(&input_slices[ch][..input_frames]);
@@ -795,6 +806,9 @@ impl RtProcessor {
                 return Ok((input_frames, input_frames));
             }
 
+            self.prime_tonal_state_from_unity_history_if_needed(
+                self.current_kernel_ratio(self.config.kernel_frames),
+            )?;
             if input_frames > 0 {
                 let needed_samples = input_frames.saturating_mul(self.num_channels);
                 if needed_samples > self.interleaved_scratch.len() {
@@ -859,6 +873,7 @@ impl RtProcessor {
                 .saturating_div(self.num_channels.max(1));
             if self.can_unity_passthrough(self.config.block_frames, available_output_frames) {
                 self.rearm_unity_passthrough();
+                self.record_unity_passthrough_samples(input);
                 let available_samples = output.capacity().saturating_sub(output.len());
                 if input.len() > available_samples {
                     return Err(StretchError::BufferOverflow {
@@ -874,6 +889,9 @@ impl RtProcessor {
                 return Ok(());
             }
 
+            self.prime_tonal_state_from_unity_history_if_needed(
+                self.current_kernel_ratio(self.config.kernel_frames),
+            )?;
             self.push_input_with_overload_policy(input)?;
             if self.input_ring.len() >= self.kernel_samples {
                 self.render_fixed_kernel()?;
@@ -928,6 +946,7 @@ impl RtProcessor {
                     });
                 }
                 self.rearm_unity_passthrough();
+                self.record_unity_passthrough_samples(input);
                 output[..input.len()].copy_from_slice(input);
                 self.input_timeline_frames += self.config.block_frames as f64;
                 self.active_ratio = 1.0;
@@ -935,6 +954,9 @@ impl RtProcessor {
                 return Ok(input.len());
             }
 
+            self.prime_tonal_state_from_unity_history_if_needed(
+                self.current_kernel_ratio(self.config.kernel_frames),
+            )?;
             self.push_input_with_overload_policy(input)?;
             if self.input_ring.len() >= self.kernel_samples {
                 self.render_fixed_kernel()?;
@@ -1123,9 +1145,139 @@ impl RtProcessor {
         self.input_timeline_frames = 0.0;
     }
 
+    fn record_unity_passthrough_samples(&mut self, input: &[f32]) {
+        let capacity = self.unity_history.capacity();
+        if capacity == 0 || input.is_empty() {
+            return;
+        }
+
+        let to_store = if input.len() > capacity {
+            &input[input.len() - capacity..]
+        } else {
+            input
+        };
+        let overflow = to_store
+            .len()
+            .saturating_sub(self.unity_history.available());
+        if overflow > 0 {
+            self.unity_history
+                .discard(overflow.min(self.unity_history.len()));
+        }
+        let pushed = self.unity_history.push_slice(to_store);
+        debug_assert_eq!(pushed, to_store.len());
+    }
+
+    fn record_unity_passthrough_from_scratch(&mut self, samples: usize) {
+        let capacity = self.unity_history.capacity();
+        if capacity == 0 || samples == 0 {
+            return;
+        }
+
+        let available = samples.min(self.interleaved_scratch.len());
+        let keep = available.min(capacity);
+        let start = available.saturating_sub(keep);
+        let overflow = keep.saturating_sub(self.unity_history.available());
+        if overflow > 0 {
+            self.unity_history
+                .discard(overflow.min(self.unity_history.len()));
+        }
+
+        let pushed = self
+            .unity_history
+            .push_slice(&self.interleaved_scratch[start..start + keep]);
+        debug_assert_eq!(pushed, keep);
+    }
+
+    fn prime_tonal_state_from_unity_history_if_needed(
+        &mut self,
+        ratio: f64,
+    ) -> Result<(), StretchError> {
+        if (ratio - 1.0).abs() <= UNITY_BYPASS_RATIO_EPS
+            || (self.active_ratio - 1.0).abs() > UNITY_BYPASS_RATIO_EPS
+            || !self.input_ring.is_empty()
+            || !self.pending_output.is_empty()
+        {
+            return Ok(());
+        }
+
+        let history_samples = self.unity_history.len();
+        let min_history_samples = self
+            .config
+            .params
+            .fft_size
+            .saturating_mul(self.num_channels);
+        if history_samples < min_history_samples {
+            return Ok(());
+        }
+        if history_samples > self.interleaved_scratch.len() {
+            return Err(StretchError::BufferOverflow {
+                buffer: "rt_unity_history_scratch",
+                requested: history_samples,
+                available: self.interleaved_scratch.len(),
+            });
+        }
+
+        let copied = self
+            .unity_history
+            .peek_slice(&mut self.interleaved_scratch[..history_samples]);
+        if copied != history_samples {
+            return Err(StretchError::InvalidState(
+                "failed to snapshot unity passthrough history",
+            ));
+        }
+
+        let history_frames = history_samples / self.num_channels.max(1);
+        for ch in 0..self.num_channels {
+            if self.channel_input[ch].capacity() < history_frames {
+                return Err(StretchError::BufferOverflow {
+                    buffer: "rt_channel_input",
+                    requested: history_frames,
+                    available: self.channel_input[ch].capacity(),
+                });
+            }
+            if self.pv_channel_input[ch].capacity() < history_frames {
+                return Err(StretchError::BufferOverflow {
+                    buffer: "rt_pv_channel_input",
+                    requested: history_frames,
+                    available: self.pv_channel_input[ch].capacity(),
+                });
+            }
+            self.channel_input[ch].clear();
+            self.pv_channel_input[ch].clear();
+        }
+
+        for frame in 0..history_frames {
+            let base = frame * self.num_channels;
+            for ch in 0..self.num_channels {
+                self.channel_input[ch].push(self.interleaved_scratch[base + ch]);
+            }
+        }
+
+        for vocoder in &mut self.vocoders {
+            vocoder.set_stretch_ratio(ratio);
+        }
+
+        for ch in 0..self.num_channels {
+            for frame in 0..history_frames {
+                let (_low, high) =
+                    self.sub_bass_crossovers[ch].process_sample(self.channel_input[ch][frame]);
+                self.pv_channel_input[ch].push(high);
+            }
+
+            self.tonal_output[ch].clear();
+            self.vocoders[ch]
+                .process_streaming_into(&self.pv_channel_input[ch], &mut self.tonal_output[ch])?;
+            self.tonal_output[ch].clear();
+        }
+
+        self.unity_history.clear();
+        Ok(())
+    }
+
     fn reset_state_for_unity_passthrough(&mut self) {
         self.input_ring.clear();
         self.pending_output.clear();
+        self.unity_history.clear();
         self.flush_drain_pending = false;
         for out in &mut self.tonal_output {
             out.clear();
@@ -2108,6 +2260,55 @@ mod tests {
         assert_eq!(out_right, right);
         assert!(rt.input_ring.is_empty());
         assert!(rt.pending_output.is_empty());
+    }
+
+    #[test]
+    fn non_unity_entry_primes_tonal_history_after_unity_passthrough() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 32);
+        cfg.latency_profile = LatencyProfile::Scratch;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let mut unity_output = [0.0f32; 32];
+        for block_idx in 0..4 {
+            let input: Vec<f32> = (0..32)
+                .map(|i| {
+                    let phase = (block_idx * 32 + i) as f32 * 0.031;
+                    phase.sin() * 0.4
+                })
+                .collect();
+            let written = rt.process_block_into(&input, &mut unity_output).unwrap();
+            assert_eq!(written, input.len());
+            assert_eq!(&unity_output[..written], &input[..]);
+        }
+
+        assert_eq!(rt.unity_history.len(), rt.kernel_samples);
+
+        rt.set_constant_ratio(1.04);
+        let input: Vec<f32> = (0..32)
+            .map(|i| ((128 + i) as f32 * 0.031).sin() * 0.4)
+            .collect();
+        let written = rt.process_block_into(&input, &mut []).unwrap();
+        assert_eq!(
+            written, 0,
+            "single warm-start block should not render a full kernel"
+        );
+        assert_eq!(rt.input_ring.len(), input.len());
+        assert!(rt.unity_history.is_empty());
+
+        let tonal_tail = rt.vocoders[0].flush_streaming().unwrap();
+        assert!(
+            !tonal_tail.is_empty(),
+            "unity-exit warm start should leave tonal overlap state primed"
+        );
+        assert!(
+            tonal_tail.iter().all(|sample| sample.is_finite()),
+            "primed tonal tail must remain finite"
+        );
     }
 
     fn assert_weights_close(a: [f32; 2], b: [f32; 2], eps: f32) {
