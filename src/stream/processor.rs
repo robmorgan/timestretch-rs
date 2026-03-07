@@ -2602,6 +2602,11 @@ impl StreamProcessor {
         &mut self,
         profile: LatencyProfile,
     ) -> Result<(), StretchError> {
+        if self.fixed_flush_pending {
+            return Err(StretchError::InvalidState(
+                "deterministic latency profile cannot change until fixed-buffer flush output is fully drained",
+            ));
+        }
         if self.use_hybrid {
             return Err(StretchError::InvalidState(
                 "deterministic latency profile is unavailable in legacy hybrid mode",
@@ -2622,6 +2627,11 @@ impl StreamProcessor {
         &mut self,
         enabled: bool,
     ) -> Result<(), StretchError> {
+        if self.fixed_flush_pending {
+            return Err(StretchError::InvalidState(
+                "deterministic auto profile switching cannot change until fixed-buffer flush output is fully drained",
+            ));
+        }
         if self.use_hybrid {
             return Err(StretchError::InvalidState(
                 "deterministic auto profile switching is unavailable in legacy hybrid mode",
@@ -4977,6 +4987,87 @@ mod tests {
         assert!(!retuned.fixed_flush_pending);
         assert_eq!(retuned.pending_pitch_scale, None);
         assert!((retuned.pitch_scale() - 1.19).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_deterministic_profile_configuration_rejected_during_fixed_flush_tail_drain() {
+        let params = StretchParams::new(1.04)
+            .with_sample_rate(44_100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_dual_plane_deterministic(true).unwrap();
+
+        let input: Vec<f32> = (0..(256 * 16))
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44_100.0).sin() * 0.7)
+            .collect();
+        let mut callback_output = [0.0f32; 64];
+        for chunk in input.chunks(256) {
+            let _ = proc
+                .process_interleaved_into(chunk, &mut callback_output)
+                .unwrap();
+        }
+
+        let mut first_chunk = [0.0f32; 8];
+        let first_written = proc.flush_interleaved_into(&mut first_chunk).unwrap();
+        assert!(first_written > 0);
+        assert!(proc.fixed_flush_pending);
+
+        let telemetry_before = proc
+            .deterministic_profile_telemetry()
+            .expect("dual-plane telemetry should be available");
+
+        let profile_err = proc
+            .set_deterministic_latency_profile(LatencyProfile::Scratch)
+            .unwrap_err();
+        assert_eq!(
+            profile_err,
+            StretchError::InvalidState(
+                "deterministic latency profile cannot change until fixed-buffer flush output is fully drained"
+            )
+        );
+
+        let auto_err = proc
+            .set_deterministic_auto_profile_switching(false)
+            .unwrap_err();
+        assert_eq!(
+            auto_err,
+            StretchError::InvalidState(
+                "deterministic auto profile switching cannot change until fixed-buffer flush output is fully drained"
+            )
+        );
+
+        let telemetry_during = proc
+            .deterministic_profile_telemetry()
+            .expect("dual-plane telemetry should stay available during drain");
+        assert_eq!(telemetry_before, telemetry_during);
+
+        let mut rest = [0.0f32; 64];
+        loop {
+            if proc.flush_interleaved_into(&mut rest).unwrap() == 0 {
+                break;
+            }
+        }
+        assert!(!proc.fixed_flush_pending);
+
+        proc.set_deterministic_auto_profile_switching(false)
+            .unwrap();
+        let telemetry_after_auto = proc
+            .deterministic_profile_telemetry()
+            .expect("dual-plane telemetry should stay available after drain");
+        assert!(!telemetry_after_auto.auto_switching_enabled);
+
+        proc.set_deterministic_latency_profile(LatencyProfile::Scratch)
+            .unwrap();
+        let telemetry_after_profile = proc
+            .deterministic_profile_telemetry()
+            .expect("dual-plane telemetry should stay available after profile change");
+        assert_eq!(
+            telemetry_after_profile.target_profile,
+            LatencyProfile::Scratch
+        );
+        assert!(!telemetry_after_profile.auto_switching_enabled);
     }
 
     #[test]
