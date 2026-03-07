@@ -806,6 +806,7 @@ impl RtProcessor {
                 }
                 self.input_timeline_frames += input_frames as f64;
                 self.active_ratio = 1.0;
+                self.advance_ratio_motion_freeze();
                 self.observe_governor_block(start.elapsed());
                 return Ok((input_frames, input_frames));
             }
@@ -890,6 +891,7 @@ impl RtProcessor {
                 output.extend_from_slice(input);
                 self.input_timeline_frames += self.config.block_frames as f64;
                 self.active_ratio = 1.0;
+                self.advance_ratio_motion_freeze();
                 self.observe_governor_block(start.elapsed());
                 return Ok(());
             }
@@ -956,6 +958,7 @@ impl RtProcessor {
                 output[..input.len()].copy_from_slice(input);
                 self.input_timeline_frames += self.config.block_frames as f64;
                 self.active_ratio = 1.0;
+                self.advance_ratio_motion_freeze();
                 self.observe_governor_block(start.elapsed());
                 return Ok(input.len());
             }
@@ -3182,6 +3185,72 @@ mod tests {
         );
         assert_weights_close(rt.blend_weights, initial_weights, 1e-6);
         assert_weights_close(rt.target_weights, initial_weights, 1e-6);
+    }
+
+    #[test]
+    fn unity_passthrough_advances_existing_ratio_motion_freeze_hold() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Mix;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+        let render_hints = Arc::new(RenderHints {
+            transient_confidence: 0.05,
+            tonal_confidence: 0.95,
+            noise_confidence: 0.05,
+            ..RenderHints::default()
+        });
+
+        rt.set_constant_ratio(1.035);
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        let scratch_hold = rt.profile_telemetry();
+        assert_eq!(scratch_hold.current_profile, LatencyProfile::Scratch);
+        assert_eq!(scratch_hold.target_profile, LatencyProfile::Scratch);
+        assert_eq!(rt.ratio_motion_freeze_blocks_left, 1);
+
+        rt.set_constant_ratio(1.0);
+        let mut output_refs = [&mut output[..]];
+        let (consumed, produced) = rt.process(&input_refs, &mut output_refs);
+        assert_eq!((consumed, produced), (128, 128));
+        assert_eq!(
+            rt.ratio_motion_freeze_blocks_left, 0,
+            "exact-unity passthrough should consume an existing ratio-motion freeze hold"
+        );
+        let post_unity = rt.profile_telemetry();
+        assert_eq!(post_unity.current_profile, LatencyProfile::Scratch);
+        assert_eq!(post_unity.target_profile, LatencyProfile::Scratch);
+
+        rt.set_constant_ratio(1.0005);
+        rt.set_hint_snapshot(render_hints);
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+
+        let resumed = rt.profile_telemetry();
+        assert_eq!(
+            resumed.current_profile,
+            LatencyProfile::Scratch,
+            "the committed scratch profile should stay active until the queued render transition settles"
+        );
+        assert_eq!(
+            resumed.target_profile,
+            LatencyProfile::Render,
+            "once the unity callback consumes the hold, the next stable near-unity kernel should be able to retarget away from scratch"
+        );
+        assert!(
+            resumed.transition_blocks_left > 0,
+            "retargeting away from scratch should queue a transition instead of snapping instantly"
+        );
     }
 
     #[test]
