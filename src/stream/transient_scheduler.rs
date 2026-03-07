@@ -281,6 +281,13 @@ impl TransientEventScheduler {
                 self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
             }
             self.last_processed_frame_start = Some(absolute_frame_start);
+            if triggered_event {
+                // The caller can apply only one reset mask per scheduler pass.
+                // Stop after the first accepted event so later onsets remain
+                // individually schedulable on the next overlapping callback
+                // instead of being merged into one broader reset.
+                break;
+            }
         }
 
         if reset_mask.iter().any(|&v| v) {
@@ -575,6 +582,34 @@ mod tests {
         assert_eq!(
             stats.events_detected_total, 1,
             "one broad tail transient should not retrigger across overlapping callbacks"
+        );
+    }
+
+    #[test]
+    fn scheduler_pass_emits_only_first_schedulable_event() {
+        let sr = 44_100u32;
+        let fft = 1024usize;
+        let hop = 256usize;
+        let frames = 4096usize;
+        let mut stereo = vec![0.0f32; frames * 2];
+        for i in 0..frames {
+            let t = i as f32 / sr as f32;
+            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
+            let click_a = if (2816..2836).contains(&i) { 2.0 } else { 0.0 };
+            let click_b = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
+            let sample = base + click_a + click_b;
+            stereo[i * 2] = sample;
+            stereo[i * 2 + 1] = sample * 0.9;
+        }
+
+        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
+        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
+        assert!(mask.is_some(), "expected first-event reset mask");
+
+        let stats = scheduler.stats();
+        assert_eq!(
+            stats.events_detected_total, 1,
+            "one scheduler pass should emit only the earliest schedulable transient event"
         );
     }
 }
