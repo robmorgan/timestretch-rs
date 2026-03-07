@@ -113,6 +113,13 @@ impl ProfileTransitionStats {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct CallbackCadenceStats {
+    callbacks_after_first_output: usize,
+    callbacks_with_output_after_first_output: usize,
+    max_idle_gap_callbacks: usize,
+}
+
 fn percentile(mut values: Vec<f64>, quantile: f64) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -802,6 +809,77 @@ fn push_boundary_if_advanced(boundaries: &mut Vec<usize>, output_frames: usize) 
     }
 }
 
+fn callback_cadence_stats(written_frames: &[usize]) -> CallbackCadenceStats {
+    let Some(first_output_idx) = written_frames.iter().position(|&written| written > 0) else {
+        return CallbackCadenceStats::default();
+    };
+
+    let mut callbacks_with_output = 0usize;
+    let mut max_idle_gap = 0usize;
+    let mut current_idle_gap = 0usize;
+    for &written in &written_frames[first_output_idx..] {
+        if written > 0 {
+            callbacks_with_output += 1;
+            max_idle_gap = max_idle_gap.max(current_idle_gap);
+            current_idle_gap = 0;
+        } else {
+            current_idle_gap += 1;
+        }
+    }
+    max_idle_gap = max_idle_gap.max(current_idle_gap);
+
+    CallbackCadenceStats {
+        callbacks_after_first_output: written_frames.len().saturating_sub(first_output_idx),
+        callbacks_with_output_after_first_output: callbacks_with_output,
+        max_idle_gap_callbacks: max_idle_gap,
+    }
+}
+
+fn run_dual_plane_deterministic_fixed_buffer_ratio_steps_callback_writes(
+    input: &[f32],
+    sample_rate: u32,
+    callback_frames: usize,
+    ratios: &[f64],
+    hold_callbacks: usize,
+) -> Vec<usize> {
+    let params = StretchParams::new(1.0)
+        .with_sample_rate(sample_rate)
+        .with_channels(2)
+        .with_fft_size(1024)
+        .with_hop_size(256)
+        .with_preset(EdmPreset::DjBeatmatch);
+    let mut processor = StreamProcessor::new(params);
+    assert!(
+        processor.is_dual_plane_deterministic(),
+        "deterministic stream should default to dual-plane backend"
+    );
+    assert!(!ratios.is_empty(), "ratio step schedule must not be empty");
+
+    let chunk_samples = callback_frames * 2;
+    let mut callback_output = vec![0.0f32; chunk_samples];
+    let mut callback_writes = Vec::with_capacity(input.len() / chunk_samples + 1);
+
+    for (idx, chunk) in input.chunks(chunk_samples).enumerate() {
+        let schedule_idx = idx / hold_callbacks.max(1);
+        let ratio = ratios[schedule_idx % ratios.len()];
+        processor
+            .set_stretch_ratio(ratio)
+            .expect("ratio step modulation must stay in valid range");
+        let written = processor
+            .process_interleaved_into(chunk, &mut callback_output)
+            .expect("dual-plane fixed-buffer process_interleaved_into failed");
+        assert!(
+            written <= callback_output.len(),
+            "fixed-buffer callback write exceeded host buffer (written={}, capacity={})",
+            written,
+            callback_output.len()
+        );
+        callback_writes.push(written / 2);
+    }
+
+    callback_writes
+}
+
 fn run_dual_plane_deterministic_with_ratio_modulation_mode(
     input: &[f32],
     sample_rate: u32,
@@ -1419,6 +1497,49 @@ fn quality_gate_dual_plane_callback_toggle_modulation_artifacts() {
         "callback-toggle modulation artifact gate failed (mean): modulated {:.3} vs baseline {:.3}",
         modulated_stats.mean_ratio,
         baseline_stats.mean_ratio
+    );
+}
+
+#[test]
+fn quality_gate_dual_plane_fixed_buffer_callback_toggle_write_cadence_regression() {
+    let sample_rate = 44_100u32;
+    let bpm = 126.0;
+    let callback_frames = 256usize;
+    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
+    let input = mono_to_stereo_interleaved(&mono);
+
+    let callback_writes = run_dual_plane_deterministic_fixed_buffer_ratio_steps_callback_writes(
+        &input,
+        sample_rate,
+        callback_frames,
+        &[0.965, 1.035, 0.975, 1.025],
+        1,
+    );
+    let stats = callback_cadence_stats(&callback_writes);
+
+    println!(
+        "dual-plane-fixed-buffer-callback-toggle-cadence: callbacks_after_first_output={} callbacks_with_output_after_first_output={} max_idle_gap_callbacks={}",
+        stats.callbacks_after_first_output,
+        stats.callbacks_with_output_after_first_output,
+        stats.max_idle_gap_callbacks
+    );
+
+    assert!(
+        stats.callbacks_after_first_output >= 64,
+        "fixed-buffer callback-toggle cadence gate observed too little steady-state output (callbacks_after_first_output={})",
+        stats.callbacks_after_first_output
+    );
+    assert!(
+        stats.callbacks_with_output_after_first_output * 2
+            >= stats.callbacks_after_first_output,
+        "fixed-buffer callback-toggle cadence gate regressed: only {} of {} callbacks emitted output after the first write",
+        stats.callbacks_with_output_after_first_output,
+        stats.callbacks_after_first_output
+    );
+    assert!(
+        stats.max_idle_gap_callbacks <= 4,
+        "fixed-buffer callback-toggle cadence gate regressed: max idle gap {} callbacks",
+        stats.max_idle_gap_callbacks
     );
 }
 
