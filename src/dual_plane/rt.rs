@@ -659,7 +659,9 @@ impl RtProcessor {
     fn prepare_runtime_policy(&mut self) {
         self.poll_control_updates();
         let preview_ratio = self.current_kernel_ratio(self.config.kernel_frames.max(1));
-        self.engage_ratio_motion_freeze_if_needed(preview_ratio);
+        if !self.ratio_motion_freeze_active() {
+            self.engage_ratio_motion_freeze_if_needed(preview_ratio);
+        }
         self.update_profile_policy();
         self.advance_profile_transition();
         self.advance_tier_crossfade();
@@ -2667,6 +2669,55 @@ mod tests {
             rt.profile_telemetry().target_profile,
             LatencyProfile::Scratch,
             "auto profile switching should resume once the repeated modulation stops"
+        );
+    }
+
+    #[test]
+    fn ratio_motion_freeze_preview_does_not_rearm_before_next_kernel() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 32);
+        cfg.latency_profile = LatencyProfile::Render;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 32];
+        let mut output = [0.0f32; 64];
+        let input_refs = [&input[..]];
+        let scratch_hints = Arc::new(RenderHints {
+            transient_confidence: 0.90,
+            tonal_confidence: 0.10,
+            noise_confidence: 0.20,
+            ..RenderHints::default()
+        });
+
+        rt.set_constant_ratio(1.70);
+        rt.set_hint_snapshot(scratch_hints);
+
+        for _ in 0..4 {
+            let mut output_refs = [&mut output[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+        }
+        assert_eq!(
+            rt.ratio_motion_freeze_blocks_left, 1,
+            "first committed kernel should advance the configured freeze hold by exactly one block"
+        );
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        assert_eq!(
+            rt.ratio_motion_freeze_blocks_left, 1,
+            "callback previews without another committed kernel must not rearm the freeze hold"
+        );
+        assert_eq!(
+            rt.profile_telemetry().target_profile,
+            LatencyProfile::Render,
+            "non-kernel preview callbacks should stay on the held render profile"
         );
     }
 
