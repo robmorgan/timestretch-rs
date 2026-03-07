@@ -662,6 +662,10 @@ impl RtProcessor {
         if !self.ratio_motion_freeze_active() {
             self.engage_ratio_motion_freeze_if_needed(preview_ratio);
         }
+    }
+
+    #[inline]
+    fn advance_runtime_policy_for_committed_kernel(&mut self) {
         self.update_profile_policy();
         self.advance_profile_transition();
         self.advance_tier_crossfade();
@@ -1414,6 +1418,7 @@ impl RtProcessor {
             }
             self.active_ratio = ratio;
         }
+        self.advance_runtime_policy_for_committed_kernel();
 
         // Build PV input: highpass to remove sub-bass, then mask transients.
         // Sub-bass occupies 1-2 FFT bins at typical sizes; PV smears them.
@@ -2814,5 +2819,60 @@ mod tests {
             "re-arming the modulation hold should clear the pending tier crossfade"
         );
         assert_weights_close(rt.blend_weights, QualityTier::Q1.lane_weights(), 1e-6);
+    }
+
+    #[test]
+    fn preview_callbacks_do_not_advance_profile_or_tier_transitions_before_kernel_commit() {
+        let params = StretchParams::new(1.05)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 32);
+        cfg.latency_profile = LatencyProfile::Render;
+        cfg.auto_profile_switching = false;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        rt.set_latency_profile(LatencyProfile::Mix);
+        let initial_transition = rt.profile_transition_blocks_left;
+        let initial_crossfade = rt.crossfade_blocks_left;
+        assert!(
+            initial_transition > 0,
+            "test setup should stage a profile transition"
+        );
+        assert!(
+            initial_crossfade > 0,
+            "test setup should stage a tier crossfade"
+        );
+
+        let input = [0.0f32; 32];
+        let mut output = [0.0f32; 64];
+        let input_refs = [&input[..]];
+
+        for preview_idx in 0..3 {
+            let mut output_refs = [&mut output[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+            assert_eq!(
+                rt.profile_transition_blocks_left, initial_transition,
+                "preview-only callback {preview_idx} must not advance the pending profile transition"
+            );
+            assert_eq!(
+                rt.crossfade_blocks_left, initial_crossfade,
+                "preview-only callback {preview_idx} must not advance the pending tier crossfade"
+            );
+        }
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        assert_eq!(
+            rt.profile_transition_blocks_left,
+            initial_transition - 1,
+            "the first committed kernel should advance the profile transition by exactly one block"
+        );
+        assert_eq!(
+            rt.crossfade_blocks_left,
+            initial_crossfade - 1,
+            "the first committed kernel should advance the tier crossfade by exactly one block"
+        );
     }
 }
