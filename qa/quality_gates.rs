@@ -796,6 +796,12 @@ fn configure_deterministic_profile_mode(
     }
 }
 
+fn push_boundary_if_advanced(boundaries: &mut Vec<usize>, output_frames: usize) {
+    if boundaries.last().copied() != Some(output_frames) {
+        boundaries.push(output_frames);
+    }
+}
+
 fn run_dual_plane_deterministic_with_ratio_modulation_mode(
     input: &[f32],
     sample_rate: u32,
@@ -839,12 +845,12 @@ fn run_dual_plane_deterministic_with_ratio_modulation_mode(
                 .deterministic_profile_telemetry()
                 .expect("dual-plane deterministic telemetry should stay available"),
         );
-        boundaries.push(output.len() / 2);
+        push_boundary_if_advanced(&mut boundaries, output.len() / 2);
     }
     processor
         .flush_into(&mut output)
         .expect("dual-plane stream flush_into failed");
-    boundaries.push(output.len() / 2);
+    push_boundary_if_advanced(&mut boundaries, output.len() / 2);
 
     (output, boundaries, profile_stats)
 }
@@ -898,12 +904,12 @@ fn run_dual_plane_deterministic_with_ratio_steps(
         processor
             .process_into(chunk, &mut output)
             .expect("dual-plane stream process_into failed");
-        boundaries.push(output.len() / 2);
+        push_boundary_if_advanced(&mut boundaries, output.len() / 2);
     }
     processor
         .flush_into(&mut output)
         .expect("dual-plane stream flush_into failed");
-    boundaries.push(output.len() / 2);
+    push_boundary_if_advanced(&mut boundaries, output.len() / 2);
 
     (output, boundaries)
 }
