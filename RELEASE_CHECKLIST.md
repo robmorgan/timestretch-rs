@@ -8,7 +8,7 @@ opt-in deterministic toggle workflow.
 
 - [ ] Verify CI quality gates are green for the default deterministic route:
   - `cargo test --test realtime_allocations -- --nocapture`
-  - `TIMESTRETCH_STRICT_CALLBACK_BUDGET=1 cargo test --release --test quality_gates -- --nocapture`
+  - `TIMESTRETCH_STRICT_CALLBACK_BUDGET=1 cargo test --features qa-harnesses --release --test quality_gates -- --nocapture`
   - `cargo test --test dual_plane_parity -- --nocapture`
 - [ ] Confirm default routing behavior in tests:
   - New `StreamProcessor` starts on deterministic dual-plane backend.

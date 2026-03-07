@@ -98,7 +98,7 @@ Acceptance:
 
 ## Benchmark Snapshot (2026-02-28)
 Run command:
-- `cargo test --test quality_benchmark -- --ignored --nocapture`
+- `cargo test --features qa-harnesses --test quality_benchmark -- --ignored --nocapture`
 
 Generated artifacts:
 - `target/quality_benchmark/quality_report.csv`

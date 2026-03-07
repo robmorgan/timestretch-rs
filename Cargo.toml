@@ -28,6 +28,7 @@ path = "test_audio/generate.rs"
 
 [features]
 cli = []
+qa-harnesses = []
 
 [dev-dependencies]
 toml = "0.8"
@@ -41,3 +42,28 @@ lto = true
 [workspace]
 members = ["timestretch_rt"]
 exclude = ["desktop", "web"]
+
+[[test]]
+name = "benchmarks"
+path = "qa/benchmarks.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
+name = "quality_benchmark"
+path = "qa/quality_benchmark.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
+name = "quality_gates"
+path = "qa/quality_gates.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
+name = "reference_quality"
+path = "qa/reference_quality.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
+name = "rubberband_comparison"
+path = "qa/rubberband_comparison.rs"
+required-features = ["qa-harnesses"]

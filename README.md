@@ -371,35 +371,37 @@ sub-bass cutoff, ~20ms WSOLA segments, ~10ms search range.
 Performance depends heavily on preset, ratio, and mode (PV-only streaming vs
 hybrid streaming vs offline batch).
 
-Run built-in benchmark tests:
+Run opt-in QA harnesses:
 
 ```sh
+# These harnesses are excluded from default `cargo test`.
+
 # Throughput-oriented benchmark suite (use release for realistic timing)
-cargo test --release --test benchmarks -- --nocapture
+cargo test --features qa-harnesses --release --test benchmarks -- --nocapture
 
 # M0 baseline command (strict corpus validation + archive)
 ./benchmarks/run_m0_baseline.sh
 
 # Quality-gate benchmark subset (CI-enforced)
-cargo test --test quality_gates -- --nocapture
+cargo test --features qa-harnesses --test quality_gates -- --nocapture
 
 # Strict callback-budget gate (same mode used in CI quality-gates job)
-TIMESTRETCH_STRICT_CALLBACK_BUDGET=1 cargo test --release --test quality_gates -- --nocapture
+TIMESTRETCH_STRICT_CALLBACK_BUDGET=1 cargo test --features qa-harnesses --release --test quality_gates -- --nocapture
 
 # Emit quality dashboard CSV artifacts (one file per quality gate)
-TIMESTRETCH_QUALITY_DASHBOARD_DIR=target/quality_dashboard cargo test --test quality_gates -- --nocapture
+TIMESTRETCH_QUALITY_DASHBOARD_DIR=target/quality_dashboard cargo test --features qa-harnesses --test quality_gates -- --nocapture
 
 # Reference-quality comparison (strict corpus required)
-TIMESTRETCH_STRICT_REFERENCE_BENCHMARK=1 TIMESTRETCH_REFERENCE_MAX_SECONDS=30 cargo test --test reference_quality -- --nocapture
+TIMESTRETCH_STRICT_REFERENCE_BENCHMARK=1 TIMESTRETCH_REFERENCE_MAX_SECONDS=30 cargo test --features qa-harnesses --test reference_quality -- --nocapture
 
 # Ad-hoc reference-quality run (non-strict, short window)
-TIMESTRETCH_REFERENCE_MAX_SECONDS=5 cargo test --test reference_quality -- --nocapture
+TIMESTRETCH_REFERENCE_MAX_SECONDS=5 cargo test --features qa-harnesses --test reference_quality -- --nocapture
 
 # Single-scenario comparison against an external Rubber Band render
 TIMESTRETCH_RUBBERBAND_ORIGINAL_WAV=benchmarks/audio/originals/loop.wav \
 TIMESTRETCH_RUBBERBAND_REFERENCE_WAV=benchmarks/audio/references/loop_rubberband.wav \
 TIMESTRETCH_RUBBERBAND_RATIO=1.113043478 \
-cargo test --test rubberband_comparison -- --nocapture
+cargo test --features qa-harnesses --test rubberband_comparison -- --nocapture
 ```
 
 See `benchmarks/README.md` for corpus setup and manifest/checksum requirements.

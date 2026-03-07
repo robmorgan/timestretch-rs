@@ -46,7 +46,7 @@ artifacts, improvements elsewhere will not matter.
 - `src/stream/processor.rs`
 - `src/stream/transient_scheduler.rs`
 - `src/stretch/phase_vocoder.rs`
-- `tests/quality_gates.rs`
+- `qa/quality_gates.rs`
 
 ### Work
 
@@ -60,7 +60,7 @@ artifacts, improvements elsewhere will not matter.
 
 ### Exit Criteria
 
-- `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`
+- `cargo test --features qa-harnesses --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`
   passes with margin, not barely.
 - Release-mode modulation no longer produces obvious clicks, roughness, or
   discontinuities on synthetic DJ-like material.
@@ -284,9 +284,9 @@ needs authoritative, repeatable evidence.
 
 ### Primary Files
 
-- `tests/reference_quality.rs`
-- `tests/rubberband_comparison.rs`
-- `tests/quality_benchmark.rs`
+- `qa/reference_quality.rs`
+- `qa/rubberband_comparison.rs`
+- `qa/quality_benchmark.rs`
 - `benchmarks/manifest.toml`
 - `benchmarks/README.md`
 - `.github/workflows/ci.yml`

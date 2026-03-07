@@ -60,7 +60,7 @@ This command:
 For ad-hoc runs without strict enforcement:
 
 ```bash
-cargo test --test reference_quality -- --nocapture
+cargo test --features qa-harnesses --test reference_quality -- --nocapture
 ```
 
 You can optionally set `TIMESTRETCH_REFERENCE_MAX_SECONDS=<seconds>` for deterministic
@@ -75,7 +75,7 @@ provide paths through environment variables:
 TIMESTRETCH_RUBBERBAND_ORIGINAL_WAV=benchmarks/audio/originals/my-loop.wav \
 TIMESTRETCH_RUBBERBAND_REFERENCE_WAV=benchmarks/audio/references/my-loop_rubberband.wav \
 TIMESTRETCH_RUBBERBAND_RATIO=1.024 \
-cargo test --test rubberband_comparison -- --nocapture
+cargo test --features qa-harnesses --test rubberband_comparison -- --nocapture
 ```
 
 Optional variables:
@@ -93,19 +93,19 @@ Outputs are written to `target/rubberband_benchmark/`:
 CI enforces a corpus-independent benchmark subset via:
 
 ```bash
-cargo test --test quality_gates -- --nocapture
+cargo test --features qa-harnesses --test quality_gates -- --nocapture
 ```
 
 CI also enforces a strict worst-case callback-time budget gate in release mode:
 
 ```bash
-TIMESTRETCH_STRICT_CALLBACK_BUDGET=1 cargo test --release --test quality_gates -- --nocapture
+TIMESTRETCH_STRICT_CALLBACK_BUDGET=1 cargo test --features qa-harnesses --release --test quality_gates -- --nocapture
 ```
 
 To emit machine-readable dashboard artifacts locally:
 
 ```bash
-TIMESTRETCH_QUALITY_DASHBOARD_DIR=target/quality_dashboard cargo test --test quality_gates -- --nocapture
+TIMESTRETCH_QUALITY_DASHBOARD_DIR=target/quality_dashboard cargo test --features qa-harnesses --test quality_gates -- --nocapture
 ```
 
 This writes per-gate CSV files under `target/quality_dashboard/`.
@@ -123,7 +123,7 @@ This test uses synthetic DJ-like material and fails on regressions for:
 Run the full synthetic benchmark harness (ignored by default because it is slower):
 
 ```bash
-cargo test --test quality_benchmark -- --ignored --nocapture
+cargo test --features qa-harnesses --test quality_benchmark -- --ignored --nocapture
 ```
 
 Outputs are written to `target/quality_benchmark/`:

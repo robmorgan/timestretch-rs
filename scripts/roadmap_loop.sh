@@ -642,12 +642,12 @@ stage_test_commands_auto() {
     case "$stage_number" in
         1)
             cat <<'EOF'
-cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture
+cargo test --features qa-harnesses --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture
 EOF
             ;;
         2)
             cat <<'EOF'
-cargo test --test quality_gates quality_gate_batch_vs_stream_hybrid_subset -- --nocapture
+cargo test --features qa-harnesses --test quality_gates quality_gate_batch_vs_stream_hybrid_subset -- --nocapture
 cargo test --test hybrid_streaming --test streaming_batch_parity --test stretch_quality_regressions
 EOF
             ;;
@@ -668,7 +668,7 @@ EOF
             ;;
         6)
             cat <<'EOF'
-cargo test --release --test quality_gates quality_gate_streaming_callback_budget_tempo_and_pitch_modulation -- --nocapture
+cargo test --features qa-harnesses --release --test quality_gates quality_gate_streaming_callback_budget_tempo_and_pitch_modulation -- --nocapture
 cargo test --test fixed_buffer_streaming --test pitch_shift --test stretch_quality_regressions
 EOF
             ;;
@@ -679,9 +679,9 @@ EOF
             ;;
         8)
             cat <<'EOF'
-cargo test --test quality_benchmark -- --ignored --nocapture
-cargo test --test reference_quality -- --nocapture
-cargo test --test rubberband_comparison -- --nocapture
+cargo test --features qa-harnesses --test quality_benchmark -- --ignored --nocapture
+cargo test --features qa-harnesses --test reference_quality -- --nocapture
+cargo test --features qa-harnesses --test rubberband_comparison -- --nocapture
 EOF
             ;;
     esac

@@ -15,7 +15,7 @@ import subprocess
 import sys
 
 timeout = float(sys.argv[1])
-cmd = ["cargo", "test", "--release", "--test", "reference_quality", "--", "--nocapture"]
+cmd = ["cargo", "test", "--features", "qa-harnesses", "--release", "--test", "reference_quality", "--", "--nocapture"]
 try:
     completed = subprocess.run(cmd, check=False, timeout=timeout)
 except subprocess.TimeoutExpired:
@@ -24,7 +24,7 @@ except subprocess.TimeoutExpired:
 sys.exit(completed.returncode)
 PY
 else
-  cargo test --release --test reference_quality -- --nocapture
+  cargo test --features qa-harnesses --release --test reference_quality -- --nocapture
 fi
 
 REPORT_PATH="$ROOT_DIR/benchmarks/audio/output/report.json"

@@ -1,6 +1,6 @@
 //! Performance benchmarks for the timestretch library.
 //!
-//! Run with: cargo test --release --test benchmarks -- --nocapture
+//! Run with: cargo test --features qa-harnesses --release --test benchmarks -- --nocapture
 
 use std::f32::consts::PI;
 use std::time::Instant;
