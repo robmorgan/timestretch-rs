@@ -1263,7 +1263,14 @@ impl RtProcessor {
                     self.sub_bass_crossovers[ch].process_sample(self.channel_input[ch][frame]);
                 self.pv_channel_input[ch].push(high);
             }
+        }
 
+        // Keep unity-exit warm-starts aligned with the committed-kernel path:
+        // transient-heavy regions should be attenuated before they seed the PV.
+        let history_start_frame = (self.input_timeline_frames - history_frames as f64).max(0.0);
+        self.apply_input_domain_transient_mask(history_frames, history_start_frame);
+
+        for ch in 0..self.num_channels {
             self.tonal_output[ch].clear();
             self.vocoders[ch]
                 .process_streaming_into(&self.pv_channel_input[ch], &mut self.tonal_output[ch])?;
@@ -2308,6 +2315,73 @@ mod tests {
         assert!(
             tonal_tail.iter().all(|sample| sample.is_finite()),
             "primed tonal tail must remain finite"
+        );
+    }
+
+    #[test]
+    fn non_unity_entry_applies_transient_mask_when_priming_unity_history() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 32);
+        cfg.latency_profile = LatencyProfile::Scratch;
+
+        let mut baseline = RtProcessor::prepare(cfg.clone()).unwrap();
+        let mut masked = RtProcessor::prepare(cfg).unwrap();
+        let mut unity_output = [0.0f32; 32];
+
+        for block_idx in 0..4 {
+            let input: Vec<f32> = (0..32)
+                .map(|i| {
+                    let phase = (block_idx * 32 + i) as f32 * 0.031;
+                    phase.sin() * 0.4
+                })
+                .collect();
+            let baseline_written = baseline
+                .process_block_into(&input, &mut unity_output)
+                .unwrap();
+            let masked_written = masked
+                .process_block_into(&input, &mut unity_output)
+                .unwrap();
+            assert_eq!(baseline_written, input.len());
+            assert_eq!(masked_written, input.len());
+        }
+
+        masked.set_hint_snapshot(Arc::new(RenderHints {
+            at_input_frame: 0,
+            transient_mask: vec![1.0; masked.config.kernel_frames],
+            ..RenderHints::default()
+        }));
+
+        let input: Vec<f32> = (0..32)
+            .map(|i| ((128 + i) as f32 * 0.031).sin() * 0.4)
+            .collect();
+        baseline.set_constant_ratio(1.04);
+        masked.set_constant_ratio(1.04);
+        assert_eq!(baseline.process_block_into(&input, &mut []).unwrap(), 0);
+        assert_eq!(masked.process_block_into(&input, &mut []).unwrap(), 0);
+
+        let baseline_tail = baseline.vocoders[0].flush_streaming().unwrap();
+        let masked_tail = masked.vocoders[0].flush_streaming().unwrap();
+        assert!(
+            !baseline_tail.is_empty() && !masked_tail.is_empty(),
+            "unity-exit warm start should leave a tonal tail to compare"
+        );
+        assert!(
+            baseline_tail.iter().all(|sample| sample.is_finite())
+                && masked_tail.iter().all(|sample| sample.is_finite()),
+            "warm-start tonal tails must remain finite"
+        );
+
+        let baseline_mean_abs = baseline_tail.iter().map(|sample| sample.abs()).sum::<f32>()
+            / baseline_tail.len() as f32;
+        let masked_mean_abs =
+            masked_tail.iter().map(|sample| sample.abs()).sum::<f32>() / masked_tail.len() as f32;
+        assert!(
+            masked_mean_abs <= baseline_mean_abs * 0.05 + 1e-6,
+            "transient-masked unity-history priming should strongly suppress masked tonal carryover (baseline_mean_abs={baseline_mean_abs:.6}, masked_mean_abs={masked_mean_abs:.6})"
         );
     }
 
