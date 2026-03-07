@@ -3,7 +3,10 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
-use timestretch::{analysis::comparison, EdmPreset, StreamProcessor, StretchParams};
+use timestretch::{
+    analysis::comparison, EdmPreset, LatencyProfile, RtProfileTelemetry, StreamProcessor,
+    StretchParams,
+};
 
 const STRICT_CALLBACK_BUDGET_ENV: &str = "TIMESTRETCH_STRICT_CALLBACK_BUDGET";
 const CALLBACK_BUDGET_MULTIPLIER_ENV: &str = "TIMESTRETCH_CALLBACK_BUDGET_MULTIPLIER";
@@ -48,6 +51,66 @@ struct BoundaryArtifactStats {
     p98_ratio: f64,
     p99_ratio: f64,
     evaluated_boundaries: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DeterministicProfileMode {
+    Auto,
+    Fixed(LatencyProfile),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProfileTransitionStats {
+    current_profile_changes: usize,
+    target_profile_changes: usize,
+    policy_profile_changes: usize,
+    current_tier_changes: usize,
+    target_tier_changes: usize,
+    observed_callbacks: usize,
+    last: Option<RtProfileTelemetry>,
+}
+
+impl ProfileTransitionStats {
+    fn observe(&mut self, telemetry: RtProfileTelemetry) {
+        if let Some(last) = self.last {
+            self.current_profile_changes +=
+                usize::from(last.current_profile != telemetry.current_profile);
+            self.target_profile_changes +=
+                usize::from(last.target_profile != telemetry.target_profile);
+            self.policy_profile_changes +=
+                usize::from(last.policy_profile != telemetry.policy_profile);
+            self.current_tier_changes += usize::from(last.current_tier != telemetry.current_tier);
+            self.target_tier_changes += usize::from(last.target_tier != telemetry.target_tier);
+        }
+        self.observed_callbacks += 1;
+        self.last = Some(telemetry);
+    }
+
+    fn summary(self) -> String {
+        let final_profile = self
+            .last
+            .map(|telemetry| {
+                format!(
+                    "final(current={:?},target={:?},policy={:?},tier={:?}->{:?})",
+                    telemetry.current_profile,
+                    telemetry.target_profile,
+                    telemetry.policy_profile,
+                    telemetry.current_tier,
+                    telemetry.target_tier
+                )
+            })
+            .unwrap_or_else(|| "final(unavailable)".to_string());
+        format!(
+            "callbacks={}, current_profile_changes={}, target_profile_changes={}, policy_profile_changes={}, current_tier_changes={}, target_tier_changes={}, {}",
+            self.observed_callbacks,
+            self.current_profile_changes,
+            self.target_profile_changes,
+            self.policy_profile_changes,
+            self.current_tier_changes,
+            self.target_tier_changes,
+            final_profile
+        )
+    }
 }
 
 fn percentile(mut values: Vec<f64>, quantile: f64) -> f64 {
@@ -714,12 +777,32 @@ fn extract_left_channel(stereo_interleaved: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-fn run_dual_plane_deterministic_with_ratio_modulation(
+fn configure_deterministic_profile_mode(
+    processor: &mut StreamProcessor,
+    mode: DeterministicProfileMode,
+) {
+    match mode {
+        DeterministicProfileMode::Auto => processor
+            .set_deterministic_auto_profile_switching(true)
+            .expect("dual-plane deterministic auto profile switching should be configurable"),
+        DeterministicProfileMode::Fixed(profile) => {
+            processor
+                .set_deterministic_auto_profile_switching(false)
+                .expect("dual-plane deterministic auto profile switching should be configurable");
+            processor
+                .set_deterministic_latency_profile(profile)
+                .expect("dual-plane deterministic latency profile should be configurable");
+        }
+    }
+}
+
+fn run_dual_plane_deterministic_with_ratio_modulation_mode(
     input: &[f32],
     sample_rate: u32,
     callback_frames: usize,
     modulate: bool,
-) -> (Vec<f32>, Vec<usize>) {
+    mode: DeterministicProfileMode,
+) -> (Vec<f32>, Vec<usize>, ProfileTransitionStats) {
     let params = StretchParams::new(1.0)
         .with_sample_rate(sample_rate)
         .with_channels(2)
@@ -731,12 +814,14 @@ fn run_dual_plane_deterministic_with_ratio_modulation(
         processor.is_dual_plane_deterministic(),
         "deterministic stream should default to dual-plane backend"
     );
+    configure_deterministic_profile_mode(&mut processor, mode);
 
     let chunk_samples = callback_frames * 2;
     let chunks: Vec<&[f32]> = input.chunks(chunk_samples).collect();
     let total_chunks = chunks.len().max(1);
     let mut output = Vec::with_capacity((input.len() as f64 * 1.20) as usize + 32_768);
     let mut boundaries = Vec::with_capacity(total_chunks + 1);
+    let mut profile_stats = ProfileTransitionStats::default();
 
     for (idx, chunk) in chunks.iter().enumerate() {
         if modulate {
@@ -749,6 +834,11 @@ fn run_dual_plane_deterministic_with_ratio_modulation(
         processor
             .process_into(chunk, &mut output)
             .expect("dual-plane stream process_into failed");
+        profile_stats.observe(
+            processor
+                .deterministic_profile_telemetry()
+                .expect("dual-plane deterministic telemetry should stay available"),
+        );
         boundaries.push(output.len() / 2);
     }
     processor
@@ -756,6 +846,22 @@ fn run_dual_plane_deterministic_with_ratio_modulation(
         .expect("dual-plane stream flush_into failed");
     boundaries.push(output.len() / 2);
 
+    (output, boundaries, profile_stats)
+}
+
+fn run_dual_plane_deterministic_with_ratio_modulation(
+    input: &[f32],
+    sample_rate: u32,
+    callback_frames: usize,
+    modulate: bool,
+) -> (Vec<f32>, Vec<usize>) {
+    let (output, boundaries, _) = run_dual_plane_deterministic_with_ratio_modulation_mode(
+        input,
+        sample_rate,
+        callback_frames,
+        modulate,
+        DeterministicProfileMode::Auto,
+    );
     (output, boundaries)
 }
 
@@ -975,6 +1081,94 @@ fn quality_gate_dual_plane_fast_modulation_artifacts() {
         modulated_stats.mean_ratio,
         baseline_stats.mean_ratio
     );
+}
+
+#[test]
+#[ignore = "diagnostic harness for comparing deterministic profile modes under fast modulation"]
+fn quality_gate_dual_plane_fast_modulation_profile_mode_diagnostics() {
+    let sample_rate = 44_100u32;
+    let bpm = 126.0;
+    let callback_frames = 256usize;
+    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
+    let input = mono_to_stereo_interleaved(&mono);
+    let modes = [
+        ("auto", DeterministicProfileMode::Auto),
+        (
+            "fixed-mix",
+            DeterministicProfileMode::Fixed(LatencyProfile::Mix),
+        ),
+        (
+            "fixed-scratch",
+            DeterministicProfileMode::Fixed(LatencyProfile::Scratch),
+        ),
+    ];
+
+    for (label, mode) in modes {
+        let (baseline_out, baseline_boundaries, baseline_profile) =
+            run_dual_plane_deterministic_with_ratio_modulation_mode(
+                &input,
+                sample_rate,
+                callback_frames,
+                false,
+                mode,
+            );
+        let (modulated_out, modulated_boundaries, modulated_profile) =
+            run_dual_plane_deterministic_with_ratio_modulation_mode(
+                &input,
+                sample_rate,
+                callback_frames,
+                true,
+                mode,
+            );
+
+        let baseline_left = extract_left_channel(&baseline_out);
+        let modulated_left = extract_left_channel(&modulated_out);
+        let trim = 16usize;
+        let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
+            baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
+        } else {
+            baseline_boundaries.clone()
+        }
+        .into_iter()
+        .filter(|&p| p > 1 && p + 1 < baseline_left.len())
+        .collect();
+        let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
+            modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
+        } else {
+            modulated_boundaries.clone()
+        }
+        .into_iter()
+        .filter(|&p| p > 1 && p + 1 < modulated_left.len())
+        .collect();
+        let window = (sample_rate as f64 * 0.008).round() as usize;
+        let guard = (sample_rate as f64 * 0.001).round() as usize;
+        let baseline_stats =
+            boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
+        let modulated_stats =
+            boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
+
+        println!(
+            "fast-mod profile diagnostics [{label}] baseline(p95={:.3},p98={:.3},mean={:.3}) modulated(p95={:.3},p98={:.3},mean={:.3}) baseline_profile={} modulated_profile={}",
+            baseline_stats.p95_ratio,
+            baseline_stats.p98_ratio,
+            baseline_stats.mean_ratio,
+            modulated_stats.p95_ratio,
+            modulated_stats.p98_ratio,
+            modulated_stats.mean_ratio,
+            baseline_profile.summary(),
+            modulated_profile.summary()
+        );
+
+        assert!(
+            baseline_out.iter().all(|sample| sample.is_finite())
+                && modulated_out.iter().all(|sample| sample.is_finite()),
+            "profile mode diagnostics produced non-finite output for {label}"
+        );
+        assert!(
+            !baseline_out.is_empty() && !modulated_out.is_empty(),
+            "profile mode diagnostics produced empty output for {label}"
+        );
+    }
 }
 
 #[test]

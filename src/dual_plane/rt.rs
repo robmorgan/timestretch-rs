@@ -25,6 +25,7 @@ const RATIO_SNAP_EPS: f64 = 1e-6;
 const UNITY_BYPASS_RATIO_EPS: f64 = 1e-6;
 const ALGORITHMIC_DELAY_FFT_NUMERATOR: usize = 3;
 const ALGORITHMIC_DELAY_FFT_DENOMINATOR: usize = 2;
+const RATIO_MOTION_FREEZE_TRIGGER: f64 = 7.5e-4;
 
 /// Lock-free snapshot mailbox shared between control producers and RT callback.
 ///
@@ -100,6 +101,8 @@ pub struct RtConfig {
     pub auto_profile_switching: bool,
     /// Required consecutive blocks before applying an auto profile change.
     pub profile_switch_hysteresis_blocks: usize,
+    /// Hold profile and tier transitions for this many kernels after a ratio step.
+    pub ratio_motion_freeze_blocks: usize,
     /// Optional stem-aware lane weighting in RT mixer.
     ///
     /// Off by default for conservative rollout.
@@ -125,6 +128,7 @@ impl RtConfig {
             max_ratio: 4.0,
             auto_profile_switching: false,
             profile_switch_hysteresis_blocks: 8,
+            ratio_motion_freeze_blocks: 3,
             stem_aware_lanes: false,
             stem_lane_hint_strength: 0.65,
             governor: RtGovernorConfig::default(),
@@ -303,6 +307,7 @@ pub struct RtProcessor {
     profile_candidate: LatencyProfile,
     profile_candidate_streak: usize,
     profile_transition_blocks_left: usize,
+    ratio_motion_freeze_blocks_left: usize,
     current_tier: QualityTier,
     target_tier: QualityTier,
     runtime_telemetry: RtRuntimeTelemetry,
@@ -323,6 +328,10 @@ impl std::fmt::Debug for RtProcessor {
             .field("auto_profile_switching", &self.auto_profile_switching)
             .field("current_profile", &self.current_profile)
             .field("target_profile", &self.target_profile)
+            .field(
+                "ratio_motion_freeze_blocks_left",
+                &self.ratio_motion_freeze_blocks_left,
+            )
             .field("current_tier", &self.current_tier)
             .field("target_tier", &self.target_tier)
             .field("active_ratio", &self.active_ratio)
@@ -476,6 +485,7 @@ impl RtProcessor {
             profile_candidate: initial_profile,
             profile_candidate_streak: 0,
             profile_transition_blocks_left: 0,
+            ratio_motion_freeze_blocks_left: 0,
             current_tier: initial_tier,
             target_tier: initial_tier,
             runtime_telemetry: RtRuntimeTelemetry::default(),
@@ -560,6 +570,62 @@ impl RtProcessor {
         }
     }
 
+    #[inline]
+    fn ratio_motion_freeze_active(&self) -> bool {
+        self.ratio_motion_freeze_blocks_left > 0
+    }
+
+    fn hold_profile_and_tier_transitions(&mut self) {
+        self.policy_profile = self.current_profile;
+        self.profile_candidate = self.current_profile;
+        self.profile_candidate_streak = 0;
+        self.target_profile = self.current_profile;
+        self.profile_transition_blocks_left = 0;
+        self.config.latency_profile = self.current_profile;
+        self.current_profile
+            .apply_governor_defaults(&mut self.config.governor);
+        self.governor.set_config(self.config.governor);
+        self.governor.set_tier(self.current_tier);
+        self.target_tier = self.current_tier;
+        self.target_weights = self.blend_weights;
+        self.crossfade_blocks_left = 0;
+    }
+
+    fn engage_ratio_motion_freeze_if_needed(&mut self, next_ratio: f64) {
+        if self.config.ratio_motion_freeze_blocks == 0 || !next_ratio.is_finite() {
+            return;
+        }
+        if (next_ratio - self.active_ratio).abs() < RATIO_MOTION_FREEZE_TRIGGER {
+            return;
+        }
+
+        self.ratio_motion_freeze_blocks_left = self.config.ratio_motion_freeze_blocks;
+        self.hold_profile_and_tier_transitions();
+    }
+
+    #[inline]
+    fn advance_ratio_motion_freeze(&mut self) {
+        self.ratio_motion_freeze_blocks_left =
+            self.ratio_motion_freeze_blocks_left.saturating_sub(1);
+    }
+
+    fn prepare_runtime_policy(&mut self) {
+        self.poll_control_updates();
+        let preview_ratio = self.current_kernel_ratio(self.config.kernel_frames.max(1));
+        self.engage_ratio_motion_freeze_if_needed(preview_ratio);
+        self.update_profile_policy();
+        self.advance_profile_transition();
+        self.advance_tier_crossfade();
+    }
+
+    #[inline]
+    fn observe_governor_block(&mut self, elapsed: Duration) {
+        let tier = self.governor.observe_block(elapsed);
+        if !self.ratio_motion_freeze_active() {
+            self.set_target_tier(tier);
+        }
+    }
+
     /// Returns cumulative realtime runtime telemetry.
     pub fn runtime_telemetry(&self) -> RtRuntimeTelemetry {
         self.runtime_telemetry
@@ -623,10 +689,7 @@ impl RtProcessor {
     ) -> Result<(usize, usize), StretchError> {
         let result = (|| -> Result<(usize, usize), StretchError> {
             let start = Instant::now();
-            self.poll_control_updates();
-            self.update_profile_policy();
-            self.advance_profile_transition();
-            self.advance_tier_crossfade();
+            self.prepare_runtime_policy();
             self.assert_can_process_new_input()?;
 
             if input_slices.len() != self.num_channels || output_slices.len() != self.num_channels {
@@ -675,8 +738,7 @@ impl RtProcessor {
                 }
                 self.input_timeline_frames += input_frames as f64;
                 self.active_ratio = 1.0;
-                let tier = self.governor.observe_block(start.elapsed());
-                self.set_target_tier(tier);
+                self.observe_governor_block(start.elapsed());
                 return Ok((input_frames, input_frames));
             }
 
@@ -708,8 +770,7 @@ impl RtProcessor {
             let produced_frames =
                 self.drain_pending_to_slices(output_slices, output_frames_capacity)?;
 
-            let tier = self.governor.observe_block(start.elapsed());
-            self.set_target_tier(tier);
+            self.observe_governor_block(start.elapsed());
             Ok((input_frames, produced_frames))
         })();
         self.record_rt_result(result)
@@ -723,10 +784,7 @@ impl RtProcessor {
     ) -> Result<(), StretchError> {
         let result = (|| -> Result<(), StretchError> {
             let start = Instant::now();
-            self.poll_control_updates();
-            self.update_profile_policy();
-            self.advance_profile_transition();
-            self.advance_tier_crossfade();
+            self.prepare_runtime_policy();
             self.assert_can_process_new_input()?;
 
             if input.len() != self.block_samples {
@@ -759,8 +817,7 @@ impl RtProcessor {
                 output.extend_from_slice(input);
                 self.input_timeline_frames += self.config.block_frames as f64;
                 self.active_ratio = 1.0;
-                let tier = self.governor.observe_block(start.elapsed());
-                self.set_target_tier(tier);
+                self.observe_governor_block(start.elapsed());
                 return Ok(());
             }
 
@@ -771,8 +828,7 @@ impl RtProcessor {
             let max_emit = self.max_output_samples_per_callback();
             let _ = self.drain_pending_to_output(output, max_emit)?;
 
-            let tier = self.governor.observe_block(start.elapsed());
-            self.set_target_tier(tier);
+            self.observe_governor_block(start.elapsed());
             Ok(())
         })();
         self.record_rt_result(result)
@@ -790,10 +846,7 @@ impl RtProcessor {
     ) -> Result<usize, StretchError> {
         let result = (|| -> Result<usize, StretchError> {
             let start = Instant::now();
-            self.poll_control_updates();
-            self.update_profile_policy();
-            self.advance_profile_transition();
-            self.advance_tier_crossfade();
+            self.prepare_runtime_policy();
             self.assert_can_process_new_input()?;
 
             if input.len() != self.block_samples {
@@ -825,8 +878,7 @@ impl RtProcessor {
                 output[..input.len()].copy_from_slice(input);
                 self.input_timeline_frames += self.config.block_frames as f64;
                 self.active_ratio = 1.0;
-                let tier = self.governor.observe_block(start.elapsed());
-                self.set_target_tier(tier);
+                self.observe_governor_block(start.elapsed());
                 return Ok(input.len());
             }
 
@@ -839,8 +891,7 @@ impl RtProcessor {
                 .min(output_samples_capacity);
             let written = self.drain_pending_to_buffer(output, max_emit)?;
 
-            let tier = self.governor.observe_block(start.elapsed());
-            self.set_target_tier(tier);
+            self.observe_governor_block(start.elapsed());
             Ok(written)
         })();
         self.record_rt_result(result)
@@ -849,10 +900,7 @@ impl RtProcessor {
     /// Flushes all pending RT state.
     pub fn flush(&mut self, output: &mut Vec<f32>) -> Result<(), StretchError> {
         let result = (|| -> Result<(), StretchError> {
-            self.poll_control_updates();
-            self.update_profile_policy();
-            self.advance_profile_transition();
-            self.advance_tier_crossfade();
+            self.prepare_runtime_policy();
             self.prepare_pending_flush_output()?;
             let _ = self.drain_pending_to_output(output, usize::MAX)?;
             if self.pending_output.is_empty() {
@@ -875,10 +923,7 @@ impl RtProcessor {
     /// drained.
     pub fn flush_into(&mut self, output: &mut [f32]) -> Result<usize, StretchError> {
         let result = (|| -> Result<usize, StretchError> {
-            self.poll_control_updates();
-            self.update_profile_policy();
-            self.advance_profile_transition();
-            self.advance_tier_crossfade();
+            self.prepare_runtime_policy();
             self.prepare_pending_flush_output()?;
 
             if self.pending_output.is_empty() {
@@ -1103,6 +1148,12 @@ impl RtProcessor {
     }
 
     fn update_profile_policy(&mut self) {
+        if self.ratio_motion_freeze_active() {
+            self.policy_profile = self.current_profile;
+            self.profile_candidate = self.current_profile;
+            self.profile_candidate_streak = 0;
+            return;
+        }
         if !self.auto_profile_switching {
             self.policy_profile = self.target_profile;
             return;
@@ -1130,6 +1181,10 @@ impl RtProcessor {
     }
 
     fn advance_profile_transition(&mut self) {
+        if self.ratio_motion_freeze_active() {
+            self.profile_transition_blocks_left = 0;
+            return;
+        }
         if self.current_profile == self.target_profile {
             self.profile_transition_blocks_left = 0;
             return;
@@ -1300,6 +1355,7 @@ impl RtProcessor {
         }
 
         let ratio = self.current_kernel_ratio(frames);
+        self.engage_ratio_motion_freeze_if_needed(ratio);
         if (ratio - self.active_ratio).abs() > RATIO_SNAP_EPS {
             for vocoder in &mut self.vocoders {
                 vocoder.set_stretch_ratio(ratio);
@@ -1339,6 +1395,7 @@ impl RtProcessor {
         }
         if min_output_len == usize::MAX || min_output_len == 0 {
             self.consume_kernel_input();
+            self.advance_ratio_motion_freeze();
             return Ok(());
         }
 
@@ -1347,6 +1404,7 @@ impl RtProcessor {
         let weights = self.effective_lane_weights();
         self.mix_into_pending(min_output_len, weights)?;
         self.consume_kernel_input();
+        self.advance_ratio_motion_freeze();
         Ok(())
     }
 
@@ -2384,6 +2442,63 @@ mod tests {
         assert_eq!(
             rt.profile_telemetry().target_profile,
             LatencyProfile::Scratch
+        );
+    }
+
+    #[test]
+    fn ratio_motion_freeze_holds_auto_profile_churn_for_configured_kernels() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Render;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+
+        rt.set_constant_ratio(1.70);
+        rt.set_hint_snapshot(Arc::new(RenderHints {
+            transient_confidence: 0.90,
+            tonal_confidence: 0.10,
+            noise_confidence: 0.20,
+            ..RenderHints::default()
+        }));
+
+        for hold_idx in 0..2 {
+            let mut output_refs = [&mut output[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+            let telemetry = rt.profile_telemetry();
+            assert_eq!(
+                telemetry.target_profile,
+                LatencyProfile::Render,
+                "ratio-motion freeze should hold the current profile during kernel {hold_idx}"
+            );
+            assert_eq!(
+                telemetry.current_profile,
+                LatencyProfile::Render,
+                "current profile should stay fixed while ratio-motion freeze is active"
+            );
+            assert_eq!(
+                telemetry.target_tier,
+                QualityTier::Q4,
+                "ratio-motion freeze should also hold tier retargeting"
+            );
+        }
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        let telemetry = rt.profile_telemetry();
+        assert_eq!(
+            telemetry.target_profile,
+            LatencyProfile::Scratch,
+            "auto profile switching should resume after the ratio-motion freeze expires"
         );
     }
 }
