@@ -1,4 +1,4 @@
-You are working in the Git repository at /Users/robbym/go/src/github.com/robmorgan/timestretch-rs on branch research at commit fe4aa1b95eed91c9027b5f3b6edc064c6c33e800.
+You are working in the Git repository at /Users/robbym/go/src/github.com/robmorgan/timestretch-rs on branch research at commit 104bf2f644316a34b3ea24498965bb8a2980ecc7.
 
 Execute exactly one small slice from the active roadmap stage only.
 
@@ -31,7 +31,7 @@ contract quality, external quality evidence, and API strictness.
   into a broader general-purpose stretcher.
 
 ## Active Stage
-## [ ] Stage 1: Stabilize Fast Modulation and Transition Quality
+## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
 
 Automation: auto
 
@@ -47,7 +47,7 @@ artifacts, improvements elsewhere will not matter.
 - `src/stream/processor.rs`
 - `src/stream/transient_scheduler.rs`
 - `src/stretch/phase_vocoder.rs`
-- `tests/quality_gates.rs`
+- `qa/quality_gates.rs`
 
 ### Work
 
@@ -61,7 +61,7 @@ artifacts, improvements elsewhere will not matter.
 
 ### Exit Criteria
 
-- `cargo test --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`
+- `cargo test --features qa-harnesses --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`
   passes with margin, not barely.
 - Release-mode modulation no longer produces obvious clicks, roughness, or
   discontinuities on synthetic DJ-like material.
