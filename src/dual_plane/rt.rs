@@ -661,14 +661,6 @@ impl RtProcessor {
     }
 
     #[inline]
-    fn prepare_non_unity_runtime_policy(&mut self) {
-        let preview_ratio = self.current_kernel_ratio(self.config.kernel_frames.max(1));
-        if !self.ratio_motion_freeze_active() {
-            self.engage_ratio_motion_freeze_if_needed(preview_ratio);
-        }
-    }
-
-    #[inline]
     fn advance_runtime_policy_for_committed_kernel(&mut self) {
         self.update_profile_policy();
         self.advance_profile_transition();
@@ -809,7 +801,6 @@ impl RtProcessor {
                 return Ok((input_frames, input_frames));
             }
 
-            self.prepare_non_unity_runtime_policy();
             self.prime_tonal_state_from_unity_history_if_needed(
                 self.current_kernel_ratio(self.config.kernel_frames),
             )?;
@@ -894,7 +885,6 @@ impl RtProcessor {
                 return Ok(());
             }
 
-            self.prepare_non_unity_runtime_policy();
             self.prime_tonal_state_from_unity_history_if_needed(
                 self.current_kernel_ratio(self.config.kernel_frames),
             )?;
@@ -961,7 +951,6 @@ impl RtProcessor {
                 return Ok(input.len());
             }
 
-            self.prepare_non_unity_runtime_policy();
             self.prime_tonal_state_from_unity_history_if_needed(
                 self.current_kernel_ratio(self.config.kernel_frames),
             )?;
@@ -1609,6 +1598,8 @@ impl RtProcessor {
         }
 
         let ratio = self.current_kernel_ratio(frames);
+        // Commit ratio-motion holds only when a kernel actually renders so
+        // preview-only callbacks cannot mutate live profile state.
         self.engage_ratio_motion_freeze_if_needed(ratio);
         if (ratio - self.active_ratio).abs() > RATIO_SNAP_EPS {
             for vocoder in &mut self.vocoders {
@@ -3124,6 +3115,75 @@ mod tests {
             rt.profile_telemetry().target_profile,
             LatencyProfile::Scratch,
             "auto profile switching should resume once the short-interval plateau modulation stops"
+        );
+    }
+
+    #[test]
+    fn ratio_motion_freeze_preview_callbacks_do_not_mutate_mix_profile_before_first_kernel() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 32);
+        cfg.latency_profile = LatencyProfile::Mix;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 32];
+        let mut output = [0.0f32; 64];
+        let input_refs = [&input[..]];
+
+        rt.set_constant_ratio(1.035);
+
+        for preview_idx in 0..3 {
+            let mut output_refs = [&mut output[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+            let telemetry = rt.profile_telemetry();
+            assert_eq!(
+                telemetry.current_profile,
+                LatencyProfile::Mix,
+                "preview-only callback {preview_idx} must not snap the committed mix profile to scratch before any kernel renders"
+            );
+            assert_eq!(
+                telemetry.target_profile,
+                LatencyProfile::Mix,
+                "preview-only callback {preview_idx} must not retarget the mix profile hold before any kernel renders"
+            );
+            assert_eq!(
+                telemetry.policy_profile,
+                LatencyProfile::Mix,
+                "preview-only callback {preview_idx} must leave policy telemetry on mix before any kernel renders"
+            );
+            assert_eq!(
+                rt.ratio_motion_freeze_blocks_left, 0,
+                "preview-only callback {preview_idx} must not arm the ratio-motion freeze before the first committed kernel"
+            );
+        }
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        let committed = rt.profile_telemetry();
+        assert_eq!(
+            committed.current_profile,
+            LatencyProfile::Scratch,
+            "the first committed fast-modulation kernel should still bias mix mode onto scratch"
+        );
+        assert_eq!(
+            committed.target_profile,
+            LatencyProfile::Scratch,
+            "the first committed fast-modulation kernel should still hold scratch as the target"
+        );
+        assert_eq!(
+            committed.policy_profile,
+            LatencyProfile::Scratch,
+            "policy telemetry should reflect the scratch-biased hold once a kernel commits"
+        );
+        assert_eq!(
+            rt.ratio_motion_freeze_blocks_left, 1,
+            "the first committed kernel should arm and then advance the configured freeze hold"
         );
     }
 
