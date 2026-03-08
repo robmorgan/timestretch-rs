@@ -3320,6 +3320,64 @@ mod tests {
     }
 
     #[test]
+    fn test_dual_plane_deterministic_ratio_history_resets_across_repeated_unity_plateaus() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        assert!((state.push_chunk_ratio(1.035, 1.035) - 1.035).abs() < 1e-9);
+        assert!((state.push_chunk_ratio(1.025, 1.025) - 1.03).abs() < 1e-9);
+        assert_eq!(state.recent_chunk_ratios.len(), 2);
+
+        let first_unity_hold_average = state.push_chunk_ratio(1.012, 1.0);
+        assert!(
+            (first_unity_hold_average - 1.012).abs() < 1e-9,
+            "the first exact-unity hold callback should clear the prior off-unity averaging window"
+        );
+        let second_unity_hold_average = state.push_chunk_ratio(1.004, 1.0);
+        assert!(
+            (second_unity_hold_average - 1.004).abs() < 1e-9,
+            "each repeated exact-unity hold callback should keep its own fresh averaging window"
+        );
+
+        let first_below_unity_average = state.push_chunk_ratio(0.988, 0.965);
+        assert!(
+            (first_below_unity_average - 0.988).abs() < 1e-9,
+            "leaving a repeated exact-unity plateau should drop stale above-unity history before the first short below-unity burst"
+        );
+        let second_below_unity_average = state.push_chunk_ratio(0.976, 0.965);
+        assert!(
+            (second_below_unity_average - 0.982).abs() < 1e-9,
+            "the second callback of a short below-unity burst should average only against the current burst"
+        );
+
+        let third_unity_hold_average = state.push_chunk_ratio(0.994, 1.0);
+        assert!(
+            (third_unity_hold_average - 0.994).abs() < 1e-9,
+            "returning to exact unity should clear the short below-unity burst immediately"
+        );
+        let fourth_unity_hold_average = state.push_chunk_ratio(0.999, 1.0);
+        assert!(
+            (fourth_unity_hold_average - 0.999).abs() < 1e-9,
+            "repeated exact-unity callbacks should continue isolating their own averaging windows"
+        );
+
+        let resumed_above_unity_average = state.push_chunk_ratio(1.018, 1.025);
+        assert!(
+            (resumed_above_unity_average - 1.018).abs() < 1e-9,
+            "the first post-plateau callback of the next short above-unity burst should start a fresh same-side window"
+        );
+        assert_eq!(
+            state.recent_chunk_ratios,
+            vec![1.018],
+            "repeated exact-unity plateaus should prevent stale opposite-side history from leaking into the next short burst"
+        );
+    }
+
+    #[test]
     fn test_dual_plane_deterministic_ratio_history_resets_on_requested_bounce_before_crossing_unity(
     ) {
         let params = StretchParams::new(1.0)
