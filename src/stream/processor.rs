@@ -2485,10 +2485,12 @@ impl StreamProcessor {
         }
 
         let stereo = &self.interleaved_scratch[..total_samples];
-        let Some(reset_mask) = self
-            .transient_scheduler
-            .detect_stereo_reset_mask(stereo, self.input_frames_consumed_total)
-        else {
+        let suppress_low_bands = self.transient_reset_should_hold_low_bands();
+        let Some(reset_mask) = self.transient_scheduler.detect_stereo_reset_mask(
+            stereo,
+            self.input_frames_consumed_total,
+            suppress_low_bands,
+        ) else {
             return;
         };
 
@@ -2504,6 +2506,18 @@ impl StreamProcessor {
         for vocoder in &mut self.vocoders {
             vocoder.reset_phase_state_bands(reset_mask, self.params.sample_rate);
         }
+    }
+
+    #[inline]
+    fn transient_reset_should_hold_low_bands(&self) -> bool {
+        let ratio_delta = (self.target_ratio - self.current_ratio).abs();
+        if ratio_delta <= 0.015 {
+            return false;
+        }
+
+        let current_side = ratio_modulation_side(self.current_ratio);
+        let target_side = ratio_modulation_side(self.target_ratio);
+        current_side != 0 && target_side != 0 && current_side != target_side
     }
 
     /// Returns the BPM stored in the params, if any.
@@ -3791,6 +3805,67 @@ mod tests {
         assert!(
             total_output.iter().all(|sample| sample.is_finite()),
             "modulated stream output should remain finite while the transient overlap drains"
+        );
+    }
+
+    #[test]
+    fn test_short_interval_cross_unity_modulation_holds_low_band_resets() {
+        let sample_rate = 48_000u32;
+        let chunk_frames = 512usize;
+        let click_range = 1600usize..1620usize;
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(sample_rate)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_dual_plane_deterministic(false).unwrap();
+
+        let ratios = [1.04, 0.96, 1.04, 0.96, 1.04, 0.96];
+
+        for (chunk_idx, ratio) in ratios.into_iter().enumerate() {
+            proc.set_stretch_ratio(ratio).unwrap();
+
+            let mut chunk = Vec::with_capacity(chunk_frames * 2);
+            for frame in 0..chunk_frames {
+                let sample_idx = chunk_idx * chunk_frames + frame;
+                let t = sample_idx as f32 / sample_rate as f32;
+                let click = if click_range.contains(&sample_idx) {
+                    2.0
+                } else {
+                    0.0
+                };
+                chunk.push((2.0 * PI * 60.0 * t).sin() * 0.35 + click);
+                chunk.push((2.0 * PI * 90.0 * t).sin() * 0.30 + click);
+            }
+
+            let output = proc.process(&chunk).unwrap();
+            assert!(
+                output.iter().all(|sample| sample.is_finite()),
+                "modulated stream output should remain finite while low-band reset holds are active"
+            );
+        }
+
+        let stats = proc.transient_reset_stats();
+        assert_eq!(
+            stats.events_detected_total, 1,
+            "one real transient should still schedule exactly one reset event during cross-unity modulation"
+        );
+        assert_eq!(
+            stats.reset_band_counts_total[0], 0,
+            "cross-unity modulation should keep sub-band phase resets locked for a single transient"
+        );
+        assert_eq!(
+            stats.reset_band_counts_total[1], 0,
+            "cross-unity modulation should keep low-band phase resets locked for a single transient"
+        );
+        assert_eq!(
+            stats.reset_band_counts_total[2], 1,
+            "cross-unity modulation should still allow one mid-band reset for the real transient"
+        );
+        assert_eq!(
+            stats.reset_band_counts_total[3], 1,
+            "cross-unity modulation should still allow one high-band reset for the real transient"
         );
     }
 

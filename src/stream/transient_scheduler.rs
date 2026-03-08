@@ -146,6 +146,7 @@ impl TransientEventScheduler {
         &mut self,
         interleaved_stereo: &[f32],
         frame_origin: usize,
+        suppress_low_bands: bool,
     ) -> Option<[bool; 4]> {
         if self.hop_size == 0 || interleaved_stereo.len() < self.fft_size.saturating_mul(2) {
             return None;
@@ -265,8 +266,12 @@ impl TransientEventScheduler {
 
             let triggered_event = is_transient && self.cooldown_frames == 0;
             if triggered_event {
-                let event_mask =
+                let mut event_mask =
                     self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
+                if suppress_low_bands {
+                    event_mask[0] = false;
+                    event_mask[1] = false;
+                }
                 for i in 0..4 {
                     reset_mask[i] |= event_mask[i];
                     if event_mask[i] {
@@ -383,7 +388,7 @@ mod tests {
         }
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
-        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
+        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
         assert!(mask.is_some(), "expected transient reset mask");
         let mask = mask.unwrap();
         assert!(
@@ -410,7 +415,7 @@ mod tests {
         }
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
-        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
+        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
         assert!(
             mask.is_some(),
             "expected reset mask for anti-phase transient content"
@@ -426,9 +431,9 @@ mod tests {
         let stereo = vec![0.0f32; frames * 2];
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
-        let _ = scheduler.detect_stereo_reset_mask(&stereo, 0);
+        let _ = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
         scheduler.reset();
-        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
+        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
         assert!(
             mask.is_none(),
             "silent input should not produce reset mask after reset"
@@ -451,8 +456,8 @@ mod tests {
         }
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
-        let first = scheduler.detect_stereo_reset_mask(&stereo, 0);
-        let second = scheduler.detect_stereo_reset_mask(&stereo, 0);
+        let first = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
+        let second = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
         assert!(first.is_some(), "first pass should observe transient");
         assert!(
             second.is_none(),
@@ -516,7 +521,7 @@ mod tests {
         }
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
-        let _ = scheduler.detect_stereo_reset_mask(&stereo, 0);
+        let _ = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
         let stats = scheduler.stats();
         assert!(
             stats.events_detected_total > 0,
@@ -550,7 +555,7 @@ mod tests {
         }
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
-        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
+        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
         assert!(mask.is_some(), "expected tail transient reset mask");
         assert_eq!(
             scheduler.cooldown_frames,
@@ -579,7 +584,7 @@ mod tests {
         }
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, callback_frames);
-        let first = scheduler.detect_stereo_reset_mask(&stereo[..callback_frames * 2], 0);
+        let first = scheduler.detect_stereo_reset_mask(&stereo[..callback_frames * 2], 0, false);
         assert!(
             first.is_some(),
             "expected initial tail transient reset mask"
@@ -597,8 +602,11 @@ mod tests {
 
         let shifted_start = half_hop * 2;
         let shifted_end = shifted_start + callback_frames * 2;
-        let second =
-            scheduler.detect_stereo_reset_mask(&stereo[shifted_start..shifted_end], half_hop);
+        let second = scheduler.detect_stereo_reset_mask(
+            &stereo[shifted_start..shifted_end],
+            half_hop,
+            false,
+        );
         assert!(
             second.is_none(),
             "sub-hop-overlapped callback should not schedule a duplicate transient reset"
@@ -643,7 +651,7 @@ mod tests {
         for origin in (0..=8).map(|step| step * half_hop) {
             let start = origin * 2;
             let end = start + callback_frames * 2;
-            let mask = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin);
+            let mask = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin, false);
             if mask.is_some() {
                 triggered_origins.push(origin);
             }
@@ -697,7 +705,7 @@ mod tests {
         ] {
             let start = origin * 2;
             let end = start + callback_frames * 2;
-            let mask = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin);
+            let mask = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin, false);
             if mask.is_some() {
                 triggered_origins.push(origin);
             }
@@ -777,7 +785,7 @@ mod tests {
         ] {
             let start = origin * 2;
             let end = start + callback_frames * 2;
-            let mask = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin);
+            let mask = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin, false);
             if mask.is_some() {
                 triggered_origins.push(origin);
             }
@@ -815,7 +823,7 @@ mod tests {
         for origin in [0usize, hop, hop * 2, hop * 3] {
             let start = origin * 2;
             let end = start + callback_frames * 2;
-            let _ = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin);
+            let _ = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin, false);
         }
 
         let stats = scheduler.stats();
@@ -843,7 +851,7 @@ mod tests {
         }
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
-        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0);
+        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
         assert!(mask.is_some(), "expected first-event reset mask");
 
         let stats = scheduler.stats();
