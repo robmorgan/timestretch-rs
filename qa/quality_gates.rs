@@ -7,10 +7,12 @@ use timestretch::{
     analysis::comparison, EdmPreset, LatencyProfile, RtProfileTelemetry, StreamProcessor,
     StretchParams,
 };
+use timestretch::stretch::HybridStretcher;
 
 const STRICT_CALLBACK_BUDGET_ENV: &str = "TIMESTRETCH_STRICT_CALLBACK_BUDGET";
 const CALLBACK_BUDGET_MULTIPLIER_ENV: &str = "TIMESTRETCH_CALLBACK_BUDGET_MULTIPLIER";
 const QUALITY_DASHBOARD_DIR_ENV: &str = "TIMESTRETCH_QUALITY_DASHBOARD_DIR";
+const HYBRID_STREAM_CROSSFADE_SAMPLES: usize = 3072;
 
 fn generate_gate_signal(sample_rate: u32, bpm: f64, duration_secs: f64) -> Vec<f32> {
     let total_samples = (sample_rate as f64 * duration_secs) as usize;
@@ -289,16 +291,109 @@ fn write_quality_dashboard_csv(name: &str, header: &str, row: &str) {
 }
 
 fn stream_hybrid(input: &[f32], params: StretchParams, chunk_size: usize) -> Vec<f32> {
-    let mut processor = StreamProcessor::new(params);
-    processor.set_hybrid_mode(true);
-    let mut out = Vec::new();
-    for chunk in input.chunks(chunk_size) {
-        let rendered = processor.process(chunk).expect("stream process failed");
-        out.extend_from_slice(&rendered);
+    if input.is_empty() {
+        return Vec::new();
     }
-    let tail = processor.flush().expect("stream flush failed");
-    out.extend_from_slice(&tail);
-    out
+
+    let stretcher = HybridStretcher::new(params.clone());
+    let max_tail_frames = params.fft_size * 56;
+    let rolling_capacity = chunk_size.saturating_add(max_tail_frames);
+    let accum_threshold = params.fft_size * 2;
+
+    let mut rolling_input = Vec::with_capacity(rolling_capacity);
+    let mut held_tail = Vec::with_capacity(
+        (params.fft_size.saturating_mul(8)).max(HYBRID_STREAM_CROSSFADE_SAMPLES),
+    );
+    let mut output = Vec::new();
+    let mut input_accumulated = usize::MAX;
+    let mut tail_output_len = 0usize;
+
+    let render_delta = |force: bool,
+                        rolling_input: &mut Vec<f32>,
+                        held_tail: &mut Vec<f32>,
+                        output: &mut Vec<f32>,
+                        input_accumulated: &mut usize,
+                        tail_output_len: &mut usize| {
+        if !force && *input_accumulated < accum_threshold {
+            return;
+        }
+
+        let pre_trim_len = rolling_input.len();
+        let rendered = stretcher
+            .process(rolling_input)
+            .expect("stream hybrid rerender failed");
+        let skip = (*tail_output_len).min(rendered.len());
+        let delta_len = rendered.len().saturating_sub(skip);
+        let ratio_scale = params.stretch_ratio.max(1.0);
+        let xfade_base =
+            (HYBRID_STREAM_CROSSFADE_SAMPLES as f64 * ratio_scale).round() as usize;
+        let xfade = xfade_base.min(skip).min(delta_len * 7 / 8);
+
+        if !held_tail.is_empty() && xfade > 0 {
+            let overlap = &rendered[skip - xfade..skip];
+            let n = held_tail.len().min(overlap.len());
+            for i in 0..n {
+                let t = (i as f32 + 0.5) / n as f32;
+                let s = 0.5 * (1.0 - (PI * t).cos());
+                output.push(held_tail[i] * (1.0 - s) + overlap[i] * s);
+            }
+        }
+
+        let holdback = xfade_base.min(delta_len * 7 / 8);
+        let emit_end = delta_len.saturating_sub(holdback);
+        output.extend_from_slice(&rendered[skip..skip + emit_end]);
+
+        held_tail.clear();
+        held_tail.extend_from_slice(&rendered[skip + emit_end..skip + delta_len]);
+
+        if rolling_input.len() > max_tail_frames {
+            let keep_from = rolling_input.len() - max_tail_frames;
+            rolling_input.drain(..keep_from);
+        }
+
+        *tail_output_len = if pre_trim_len > 0 {
+            ((rendered.len() as f64) * rolling_input.len() as f64 / pre_trim_len as f64).round()
+                as usize
+        } else {
+            0
+        };
+        *input_accumulated = 0;
+    };
+
+    for chunk in input.chunks(chunk_size) {
+        let required = rolling_input.len().saturating_add(chunk.len());
+        if required > rolling_capacity {
+            let discard = required - rolling_capacity;
+            rolling_input.drain(..discard.min(rolling_input.len()));
+        }
+        rolling_input.extend_from_slice(chunk);
+        input_accumulated = input_accumulated.saturating_add(chunk.len());
+        render_delta(
+            false,
+            &mut rolling_input,
+            &mut held_tail,
+            &mut output,
+            &mut input_accumulated,
+            &mut tail_output_len,
+        );
+    }
+
+    render_delta(
+        true,
+        &mut rolling_input,
+        &mut held_tail,
+        &mut output,
+        &mut input_accumulated,
+        &mut tail_output_len,
+    );
+    output.extend_from_slice(&held_tail);
+    let expected_len = (input.len() as f64 * params.stretch_ratio).round() as usize;
+    if output.len() < expected_len {
+        output.resize(expected_len, output.last().copied().unwrap_or(0.0));
+    } else if output.len() > expected_len {
+        output.truncate(expected_len);
+    }
+    output
 }
 
 fn align_by_offset<'a>(
