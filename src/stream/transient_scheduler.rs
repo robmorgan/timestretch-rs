@@ -662,6 +662,76 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_tail_transient_does_not_retrigger_across_mixed_sub_hop_callbacks() {
+        let sr = 44_100u32;
+        let fft = 1024usize;
+        let hop = 256usize;
+        let callback_frames = 4096usize;
+        let quarter_hop = hop / 4;
+        let total_frames = callback_frames + hop * 4;
+        let mut stereo = vec![0.0f32; total_frames * 2];
+        for i in 0..total_frames {
+            let t = i as f32 / sr as f32;
+            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
+            // Keep one late transient inside the overlapping callback windows
+            // while the callback origin advances by mixed sub-hop strides.
+            let click = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
+            stereo[i * 2] = base + click;
+            stereo[i * 2 + 1] = base * 0.9 + click;
+        }
+
+        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, callback_frames);
+        let expected_last_start = Some(3072usize);
+        let expected_cooldown = scheduler.reset_cooldown_frames();
+        let mut triggered_origins = Vec::new();
+
+        for origin in [
+            0usize,
+            quarter_hop,
+            hop / 2,
+            hop - quarter_hop,
+            hop,
+            hop + quarter_hop,
+            hop + hop / 2,
+            hop * 2,
+        ] {
+            let start = origin * 2;
+            let end = start + callback_frames * 2;
+            let mask = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin);
+            if mask.is_some() {
+                triggered_origins.push(origin);
+            }
+
+            if origin > 0 && origin < hop {
+                assert!(
+                    mask.is_none(),
+                    "mixed sub-hop callback at origin {origin} should not reschedule the same tail transient"
+                );
+                assert_eq!(
+                    scheduler.last_processed_frame_start,
+                    expected_last_start,
+                    "mixed sub-hop callback at origin {origin} should not advance the processed-frame cursor"
+                );
+                assert_eq!(
+                    scheduler.cooldown_frames, expected_cooldown,
+                    "mixed sub-hop callback at origin {origin} should not burn the transient cooldown"
+                );
+            }
+        }
+
+        assert_eq!(
+            triggered_origins,
+            vec![0],
+            "mixed sub-hop callbacks should not retrigger one tail transient after the initial pass"
+        );
+        assert_eq!(
+            scheduler.stats().events_detected_total,
+            1,
+            "one tail transient should count as a single reset event across mixed sub-hop callbacks"
+        );
+    }
+
+    #[test]
     fn scheduler_broad_tail_transient_does_not_retrigger_across_overlapping_callbacks() {
         let sr = 44_100u32;
         let fft = 1024usize;
