@@ -272,6 +272,7 @@ struct DualPlaneDeterministicState {
     recent_chunk_ratios: Vec<f64>,
     last_ratio: f64,
     last_output_samples: Vec<f32>,
+    has_last_output_samples: bool,
     unity_exit_seam_samples: Vec<f32>,
     pending_unity_exit_seam: bool,
 }
@@ -306,6 +307,7 @@ impl DualPlaneDeterministicState {
             recent_chunk_ratios: Vec::new(),
             last_ratio: ratio,
             last_output_samples: vec![0.0; num_channels],
+            has_last_output_samples: false,
             unity_exit_seam_samples: vec![0.0; num_channels],
             pending_unity_exit_seam: false,
         })
@@ -348,7 +350,8 @@ impl DualPlaneDeterministicState {
 
     #[inline]
     fn arm_unity_exit_seam(&mut self) {
-        if self.last_output_samples.len() != self.num_channels
+        if !self.has_last_output_samples
+            || self.last_output_samples.len() != self.num_channels
             || self.unity_exit_seam_samples.len() != self.num_channels
         {
             return;
@@ -396,6 +399,7 @@ impl DualPlaneDeterministicState {
                 self.last_output_samples[ch] = sample;
             }
         }
+        self.has_last_output_samples = true;
     }
 }
 
@@ -3238,6 +3242,39 @@ mod tests {
             state.recent_chunk_ratios,
             vec![1.012],
             "requested cross-unity modulation should start a fresh averaging window from the first transition callback"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_unity_exit_seam_requires_real_prior_output() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        state.arm_unity_exit_seam();
+        assert!(
+            !state.pending_unity_exit_seam,
+            "unity-exit seam smoothing should stay idle until deterministic output has produced a real anchor sample"
+        );
+
+        let channel_output_buffers = [vec![0.125, -0.25, 0.375]];
+        state.capture_last_output_samples(&channel_output_buffers, 3);
+        assert!(
+            state.has_last_output_samples,
+            "capturing deterministic output should arm a real seam anchor for later unity exits"
+        );
+
+        state.arm_unity_exit_seam();
+        assert!(
+            state.pending_unity_exit_seam,
+            "once deterministic output has emitted audio, the next exact-unity exit should carry the captured seam anchor"
+        );
+        assert!(
+            (state.unity_exit_seam_samples[0] - 0.375).abs() < 1e-12,
+            "unity-exit seam smoothing should anchor from the last emitted sample instead of an initial placeholder"
         );
     }
 
