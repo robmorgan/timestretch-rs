@@ -634,6 +634,17 @@ impl RtProcessor {
     }
 
     #[inline]
+    fn clear_pending_auto_profile_candidate_for_unity_plateau(&mut self) {
+        if self.auto_profile_switching && self.current_profile == self.target_profile {
+            self.post_ratio_motion_profile_hold_blocks_left =
+                self.post_ratio_motion_profile_hold_blocks_left.max(1);
+            self.policy_profile = self.current_profile;
+            self.profile_candidate = self.current_profile;
+            self.profile_candidate_streak = 0;
+        }
+    }
+
+    #[inline]
     fn reset_ratio_motion_history(&mut self) {
         self.ratio_motion_history_len = 0;
         self.ratio_motion_history_cursor = 0;
@@ -675,6 +686,9 @@ impl RtProcessor {
         }
         if (next_ratio - 1.0).abs() <= UNITY_BYPASS_RATIO_EPS {
             self.reset_ratio_motion_history();
+            // Exact-unity plateaus should not inherit a stale pending
+            // candidate from the preceding modulation burst.
+            self.clear_pending_auto_profile_candidate_for_unity_plateau();
             return;
         }
         let step_delta = (next_ratio - self.active_ratio).abs();
@@ -876,6 +890,7 @@ impl RtProcessor {
                 }
                 self.input_timeline_frames += input_frames as f64;
                 self.reset_ratio_motion_history();
+                self.clear_pending_auto_profile_candidate_for_unity_plateau();
                 self.active_ratio = 1.0;
                 self.advance_ratio_motion_freeze();
                 self.observe_governor_block(start.elapsed());
@@ -961,6 +976,7 @@ impl RtProcessor {
                 output.extend_from_slice(input);
                 self.input_timeline_frames += self.config.block_frames as f64;
                 self.reset_ratio_motion_history();
+                self.clear_pending_auto_profile_candidate_for_unity_plateau();
                 self.active_ratio = 1.0;
                 self.advance_ratio_motion_freeze();
                 self.observe_governor_block(start.elapsed());
@@ -1028,6 +1044,7 @@ impl RtProcessor {
                 output[..input.len()].copy_from_slice(input);
                 self.input_timeline_frames += self.config.block_frames as f64;
                 self.reset_ratio_motion_history();
+                self.clear_pending_auto_profile_candidate_for_unity_plateau();
                 self.active_ratio = 1.0;
                 self.advance_ratio_motion_freeze();
                 self.observe_governor_block(start.elapsed());
@@ -3939,6 +3956,62 @@ mod tests {
         );
         assert_weights_close(rt.blend_weights, initial_weights, 1e-6);
         assert_weights_close(rt.target_weights, initial_weights, 1e-6);
+    }
+
+    #[test]
+    fn exact_unity_plateau_clears_pending_auto_profile_candidate() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Render;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 4;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+        let scratch_hints = Arc::new(RenderHints {
+            transient_confidence: 0.90,
+            tonal_confidence: 0.10,
+            noise_confidence: 0.20,
+            ..RenderHints::default()
+        });
+
+        rt.set_constant_ratio(1.0005);
+        rt.set_hint_snapshot(Arc::clone(&scratch_hints));
+        for _ in 0..2 {
+            let mut output_refs = [&mut output[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+        }
+        assert_eq!(rt.profile_candidate, LatencyProfile::Scratch);
+        assert_eq!(
+            rt.profile_candidate_streak, 2,
+            "pre-plateau modulation should accumulate a pending scratch candidate"
+        );
+
+        rt.set_constant_ratio(1.0);
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+
+        assert_eq!(
+            rt.profile_candidate,
+            LatencyProfile::Render,
+            "exact-unity plateau should clear the stale scratch candidate"
+        );
+        assert_eq!(
+            rt.profile_candidate_streak, 0,
+            "exact-unity plateau should restart hysteresis from the committed profile"
+        );
+        assert_eq!(
+            rt.profile_telemetry().policy_profile,
+            LatencyProfile::Render,
+            "exact-unity plateau should keep policy telemetry parked on the committed profile"
+        );
     }
 
     #[test]
