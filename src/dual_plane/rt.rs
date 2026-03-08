@@ -742,9 +742,14 @@ impl RtProcessor {
     }
 
     #[inline]
+    fn profile_transition_active(&self) -> bool {
+        self.current_profile != self.target_profile
+    }
+
+    #[inline]
     fn observe_governor_block(&mut self, elapsed: Duration) {
         let tier = self.governor.observe_block(elapsed);
-        if !self.ratio_motion_freeze_active() {
+        if !self.ratio_motion_freeze_active() && !self.profile_transition_active() {
             self.set_target_tier(tier);
         }
     }
@@ -2058,6 +2063,7 @@ mod tests {
     use crate::dual_plane::warp_map::{TimeWarpMap, WarpAnchor};
     use crate::error::StretchError;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn stereo_sine_block(frames: usize, sample_rate: u32, hz: f32, phase: f32) -> Vec<f32> {
         let mut out = Vec::with_capacity(frames * 2);
@@ -4152,6 +4158,67 @@ mod tests {
             render_retarget.target_profile,
             LatencyProfile::Render,
             "once the scratch transition settles, auto mode should be free to retarget back to render"
+        );
+    }
+
+    #[test]
+    fn governor_tier_updates_wait_until_profile_transition_settles() {
+        let params = StretchParams::new(1.05)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Render;
+        cfg.auto_profile_switching = false;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        rt.set_latency_profile_internal(LatencyProfile::Scratch);
+        rt.config.governor.promote_after_blocks = 1;
+        rt.config.governor.max_tier = QualityTier::Q2;
+        rt.governor.set_config(rt.config.governor);
+        rt.governor.set_tier(QualityTier::Q1);
+        let transition = rt.profile_telemetry();
+        assert_eq!(transition.current_profile, LatencyProfile::Render);
+        assert_eq!(transition.target_profile, LatencyProfile::Scratch);
+        assert_eq!(
+            transition.target_tier,
+            QualityTier::Q1,
+            "switching to scratch should initially target the scratch tier ladder"
+        );
+        let initial_crossfade = rt.crossfade_blocks_left;
+        assert!(
+            transition.transition_blocks_left > 0,
+            "test setup should leave a profile transition in flight"
+        );
+        assert!(
+            initial_crossfade > 0,
+            "test setup should leave a tier crossfade in flight"
+        );
+
+        rt.observe_governor_block(Duration::ZERO);
+        let held = rt.profile_telemetry();
+        assert_eq!(
+            held.target_tier,
+            QualityTier::Q1,
+            "governor tier observations must not retarget the tier while the profile transition is still in flight"
+        );
+        assert_eq!(
+            rt.crossfade_blocks_left, initial_crossfade,
+            "blocking tier retargets during the profile transition should keep the queued crossfade stable"
+        );
+
+        while rt.profile_telemetry().current_profile != LatencyProfile::Scratch {
+            rt.advance_profile_transition();
+        }
+
+        rt.observe_governor_block(Duration::ZERO);
+        let settled = rt.profile_telemetry();
+        assert_eq!(settled.current_profile, LatencyProfile::Scratch);
+        assert_eq!(
+            settled.target_tier,
+            QualityTier::Q2,
+            "once the profile transition settles, governor tier promotions should be allowed to retarget the scratch tier"
         );
     }
 
