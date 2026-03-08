@@ -21,6 +21,12 @@ const RATIO_SNAP_THRESHOLD: f64 = 0.0001;
 const RATIO_SMOOTHING_TIME_SECS: f64 = 0.050;
 /// Additional slew applied after kernel-window averaging for deterministic dual-plane updates.
 const DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS: f64 = 0.040;
+/// Near-unity request band that resets deterministic ratio averaging history.
+///
+/// Fast modulation often crosses unity without landing on an exact 1.0 callback.
+/// Treat a small plateau around unity as a fresh boundary so the next burst does
+/// not average against stale opposite-side history.
+const DUAL_PLANE_RATIO_HISTORY_UNITY_RESET_EPS: f64 = 0.005;
 /// Short seam ramp used when deterministic rendering exits exact-unity bypass.
 const DUAL_PLANE_UNITY_EXIT_SEAM_FRAMES: usize = 64;
 /// Numerator for the FFT-size latency fraction (3/2 = 1.5x FFT size).
@@ -270,7 +276,7 @@ struct DualPlaneDeterministicState {
     flush_interleaved: Vec<f32>,
     ratio_window_blocks: usize,
     recent_chunk_ratios: Vec<f64>,
-    last_requested_exact_unity: bool,
+    last_requested_unity_reset_zone: bool,
     last_ratio_history_side: i8,
     last_ratio: f64,
     last_output_samples: Vec<f32>,
@@ -307,7 +313,7 @@ impl DualPlaneDeterministicState {
             flush_interleaved: Vec::with_capacity(max_output_frames.saturating_mul(num_channels)),
             ratio_window_blocks: kernel_frames.div_ceil(block_frames).max(1),
             recent_chunk_ratios: Vec::new(),
-            last_requested_exact_unity: false,
+            last_requested_unity_reset_zone: false,
             last_ratio_history_side: 0,
             last_ratio: ratio,
             last_output_samples: vec![0.0; num_channels],
@@ -319,8 +325,9 @@ impl DualPlaneDeterministicState {
 
     #[inline]
     fn push_chunk_ratio(&mut self, ratio: f64, requested_ratio: f64) -> f64 {
-        let requested_exact_unity = (requested_ratio - 1.0).abs() <= RATIO_SNAP_THRESHOLD;
-        if requested_exact_unity || self.last_requested_exact_unity {
+        let requested_unity_reset_zone =
+            (requested_ratio - 1.0).abs() <= DUAL_PLANE_RATIO_HISTORY_UNITY_RESET_EPS;
+        if requested_unity_reset_zone || self.last_requested_unity_reset_zone {
             self.recent_chunk_ratios.clear();
             self.last_ratio_history_side = 0;
         }
@@ -344,7 +351,7 @@ impl DualPlaneDeterministicState {
             self.recent_chunk_ratios.remove(0);
         }
         self.recent_chunk_ratios.push(ratio);
-        self.last_requested_exact_unity = requested_exact_unity;
+        self.last_requested_unity_reset_zone = requested_unity_reset_zone;
         self.last_ratio_history_side = effective_side;
         let sum: f64 = self.recent_chunk_ratios.iter().sum();
         sum / self.recent_chunk_ratios.len().max(1) as f64
@@ -353,7 +360,7 @@ impl DualPlaneDeterministicState {
     #[inline]
     fn reset_ratio_history(&mut self, ratio: f64) {
         self.recent_chunk_ratios.clear();
-        self.last_requested_exact_unity = false;
+        self.last_requested_unity_reset_zone = false;
         self.last_ratio_history_side = 0;
         self.last_ratio = ratio;
         if (ratio - 1.0).abs() <= RATIO_SNAP_THRESHOLD {
@@ -3330,6 +3337,48 @@ mod tests {
             state.recent_chunk_ratios,
             vec![1.028],
             "the first post-plateau modulation callback should start a fresh same-side averaging window"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_deterministic_ratio_history_resets_on_requested_near_unity_plateau() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        assert!((state.push_chunk_ratio(1.035, 1.035) - 1.035).abs() < 1e-9);
+        assert!((state.push_chunk_ratio(1.025, 1.025) - 1.03).abs() < 1e-9);
+        assert_eq!(state.recent_chunk_ratios.len(), 2);
+
+        let requested_near_unity_average = state.push_chunk_ratio(1.012, 1.004);
+        assert!(
+            (requested_near_unity_average - 1.012).abs() < 1e-9,
+            "a near-unity request should clear the prior off-unity averaging window before smoothing finishes settling"
+        );
+        assert_eq!(
+            state.recent_chunk_ratios,
+            vec![1.012],
+            "the first near-unity hold callback should start a fresh averaging window"
+        );
+
+        let plateau_tail_average = state.push_chunk_ratio(1.006, 1.003);
+        assert!(
+            (plateau_tail_average - 1.006).abs() < 1e-9,
+            "each near-unity hold callback should keep its own fresh averaging window"
+        );
+
+        let resumed_below_unity_average = state.push_chunk_ratio(0.988, 0.965);
+        assert!(
+            (resumed_below_unity_average - 0.988).abs() < 1e-9,
+            "leaving a near-unity plateau should drop stale pre-plateau history before the next short burst"
+        );
+        assert_eq!(
+            state.recent_chunk_ratios,
+            vec![0.988],
+            "the first post-plateau callback should start a fresh opposite-side averaging window"
         );
     }
 
