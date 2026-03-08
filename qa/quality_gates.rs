@@ -1386,6 +1386,37 @@ fn quality_gate_dual_plane_fast_modulation_auto_profile_hysteresis_regression() 
         fixed_mix_stats.evaluated_boundaries,
         fixed_scratch_stats.evaluated_boundaries
     );
+    let fixed_mix_final = fixed_mix_profile
+        .last
+        .expect("fixed-mix fast-modulation regression should observe profile telemetry");
+    let fixed_scratch_final = fixed_scratch_profile
+        .last
+        .expect("fixed-scratch fast-modulation regression should observe profile telemetry");
+    assert_eq!(
+        fixed_mix_final.current_profile,
+        LatencyProfile::Mix,
+        "fixed mix mode should stay on mix under fast modulation"
+    );
+    assert_eq!(
+        fixed_mix_final.target_profile,
+        LatencyProfile::Mix,
+        "fixed mix mode should not retarget away from mix under fast modulation"
+    );
+    assert_eq!(
+        fixed_scratch_final.current_profile,
+        LatencyProfile::Scratch,
+        "fixed scratch mode should settle onto scratch under fast modulation"
+    );
+    assert_eq!(
+        fixed_scratch_final.target_profile,
+        LatencyProfile::Scratch,
+        "fixed scratch mode should not be canceled back to mix under fast modulation"
+    );
+    assert_eq!(
+        fixed_scratch_final.policy_profile,
+        LatencyProfile::Scratch,
+        "fixed scratch mode policy telemetry should stay aligned with the manual target"
+    );
     assert!(
         auto_profile.current_profile_changes <= 2,
         "auto fast-modulation profile hysteresis regressed: current profile changed {} times",

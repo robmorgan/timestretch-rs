@@ -683,6 +683,9 @@ impl RtProcessor {
 
         self.ratio_motion_freeze_blocks_left = self.config.ratio_motion_freeze_blocks;
         self.post_ratio_motion_profile_hold_blocks_left = 0;
+        if !self.auto_profile_switching {
+            return;
+        }
         if self.bias_ratio_motion_hold_to_scratch_if_needed() {
             return;
         }
@@ -1449,12 +1452,12 @@ impl RtProcessor {
     }
 
     fn update_profile_policy(&mut self) {
-        if self.ratio_motion_freeze_active() {
-            self.policy_profile = self.current_profile;
-            return;
-        }
         if !self.auto_profile_switching {
             self.policy_profile = self.target_profile;
+            return;
+        }
+        if self.ratio_motion_freeze_active() {
+            self.policy_profile = self.current_profile;
             return;
         }
         if self.post_ratio_motion_profile_hold_blocks_left > 0 {
@@ -1495,7 +1498,7 @@ impl RtProcessor {
     }
 
     fn advance_profile_transition(&mut self) {
-        if self.ratio_motion_freeze_active() {
+        if self.ratio_motion_freeze_active() && self.auto_profile_switching {
             self.profile_transition_blocks_left = 0;
             return;
         }
