@@ -270,6 +270,7 @@ struct DualPlaneDeterministicState {
     flush_interleaved: Vec<f32>,
     ratio_window_blocks: usize,
     recent_chunk_ratios: Vec<f64>,
+    last_requested_exact_unity: bool,
     last_ratio: f64,
     last_output_samples: Vec<f32>,
     has_last_output_samples: bool,
@@ -305,6 +306,7 @@ impl DualPlaneDeterministicState {
             flush_interleaved: Vec::with_capacity(max_output_frames.saturating_mul(num_channels)),
             ratio_window_blocks: kernel_frames.div_ceil(block_frames).max(1),
             recent_chunk_ratios: Vec::new(),
+            last_requested_exact_unity: false,
             last_ratio: ratio,
             last_output_samples: vec![0.0; num_channels],
             has_last_output_samples: false,
@@ -315,7 +317,8 @@ impl DualPlaneDeterministicState {
 
     #[inline]
     fn push_chunk_ratio(&mut self, ratio: f64, requested_ratio: f64) -> f64 {
-        if (requested_ratio - 1.0).abs() <= RATIO_SNAP_THRESHOLD {
+        let requested_exact_unity = (requested_ratio - 1.0).abs() <= RATIO_SNAP_THRESHOLD;
+        if requested_exact_unity || self.last_requested_exact_unity {
             self.recent_chunk_ratios.clear();
         }
         if let Some(&last_chunk_ratio) = self.recent_chunk_ratios.last() {
@@ -338,6 +341,7 @@ impl DualPlaneDeterministicState {
             self.recent_chunk_ratios.remove(0);
         }
         self.recent_chunk_ratios.push(ratio);
+        self.last_requested_exact_unity = requested_exact_unity;
         let sum: f64 = self.recent_chunk_ratios.iter().sum();
         sum / self.recent_chunk_ratios.len().max(1) as f64
     }
@@ -345,6 +349,7 @@ impl DualPlaneDeterministicState {
     #[inline]
     fn reset_ratio_history(&mut self, ratio: f64) {
         self.recent_chunk_ratios.clear();
+        self.last_requested_exact_unity = false;
         self.last_ratio = ratio;
         if (ratio - 1.0).abs() <= RATIO_SNAP_THRESHOLD {
             self.pending_unity_exit_seam = false;
@@ -3272,6 +3277,40 @@ mod tests {
             state.recent_chunk_ratios,
             vec![1.012],
             "a requested exact-unity plateau should start a fresh averaging window for the next modulation step"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_deterministic_ratio_history_resets_when_leaving_requested_exact_unity_plateau(
+    ) {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        assert!((state.push_chunk_ratio(1.035, 1.035) - 1.035).abs() < 1e-9);
+        assert!((state.push_chunk_ratio(1.025, 1.025) - 1.03).abs() < 1e-9);
+        assert_eq!(state.recent_chunk_ratios.len(), 2);
+
+        let requested_unity_average = state.push_chunk_ratio(1.012, 1.0);
+        assert!((requested_unity_average - 1.012).abs() < 1e-9);
+        let plateau_tail_average = state.push_chunk_ratio(1.004, 1.0);
+        assert!(
+            (plateau_tail_average - 1.004).abs() < 1e-9,
+            "each exact-unity hold callback should keep its own fresh averaging window"
+        );
+
+        let resumed_modulation_average = state.push_chunk_ratio(1.028, 1.028);
+        assert!(
+            (resumed_modulation_average - 1.028).abs() < 1e-9,
+            "leaving a requested exact-unity plateau should drop stale near-unity history before averaging resumes"
+        );
+        assert_eq!(
+            state.recent_chunk_ratios,
+            vec![1.028],
+            "the first post-plateau modulation callback should start a fresh same-side averaging window"
         );
     }
 
