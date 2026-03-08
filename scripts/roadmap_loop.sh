@@ -319,10 +319,139 @@ read_state_int_field() {
 
 ensure_summary_file() {
     local summary_file=$1
-    if [[ ! -f "$summary_file" ]]; then
+    if [[ ! -s "$summary_file" ]]; then
         cat > "$summary_file" <<'EOF'
 Codex did not write a final summary message for this iteration.
 EOF
+    fi
+}
+
+extract_commit_subject_from_summary() {
+    local summary_file=$1
+    python3 - "$summary_file" <<'PY'
+import pathlib
+import re
+import sys
+import textwrap
+
+summary_path = pathlib.Path(sys.argv[1])
+text = summary_path.read_text(encoding="utf-8", errors="replace")
+lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+candidate = ""
+for line in lines:
+    match = re.match(r"^(?:commit message|commit|subject)\s*:\s*(.+)$", line, flags=re.IGNORECASE)
+    if match:
+        candidate = match.group(1).strip()
+        break
+
+if not candidate:
+    for line in lines:
+        lowered = line.lower()
+        if lowered in {"files changed:", "checks run:", "remaining risk:"}:
+            continue
+        if lowered.startswith(("files changed:", "checks run:", "remaining risk:")):
+            continue
+        candidate = line
+        break
+
+if candidate:
+    first_sentence = re.split(r"(?<=[.!?])\s+", candidate, maxsplit=1)[0].strip()
+    if first_sentence:
+        candidate = first_sentence
+
+    prefix, separator, suffix = candidate.partition(": ")
+    if separator and any(
+        token in prefix.lower()
+        for token in (
+            "implemented",
+            "added",
+            "updated",
+            "fixed",
+            "refactored",
+            "improved",
+            "stage",
+            "slice",
+        )
+    ):
+        candidate = suffix.strip() or candidate
+
+candidate = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", candidate)
+candidate = candidate.replace("`", "")
+candidate = re.sub(r"^\s*[-*]\s*", "", candidate)
+candidate = re.sub(r"\s+", " ", candidate).strip().strip(".")
+candidate = re.sub(r"^(?:plan-loop|loop)\s*:\s*", "", candidate, flags=re.IGNORECASE)
+
+if not candidate or candidate == "Codex did not write a final summary message for this iteration":
+    print("")
+    raise SystemExit
+
+lowered = candidate.lower()
+if re.fullmatch(r"stage \d+ iteration \d+", lowered):
+    print("")
+    raise SystemExit
+if re.fullmatch(r"roadmap iteration \d+", lowered):
+    print("")
+    raise SystemExit
+
+if len(candidate) > 120:
+    candidate = textwrap.shorten(candidate, width=120, placeholder="...")
+
+print(candidate)
+PY
+}
+
+build_fallback_commit_subject() {
+    local stage_number=$1
+    local stage_title=$2
+    python3 - "$stage_number" "$stage_title" <<'PY'
+import re
+import subprocess
+import sys
+import textwrap
+
+stage_number, stage_title = sys.argv[1:3]
+paths = subprocess.check_output(
+    ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMRD", "--"],
+    text=True,
+).splitlines()
+paths = [path.strip() for path in paths if path.strip()]
+
+if paths:
+    if len(paths) == 1:
+        subject = f"update {paths[0]}"
+    elif len(paths) == 2:
+        subject = f"update {paths[0]} and {paths[1]}"
+    else:
+        subject = f"update {paths[0]}, {paths[1]}, and {len(paths) - 2} more files"
+elif stage_number and stage_title:
+    clean_title = re.sub(r"\s+", " ", stage_title.strip())
+    subject = f"advance stage {stage_number}: {clean_title}" if clean_title else f"advance stage {stage_number}"
+else:
+    subject = "update roadmap loop changes"
+
+if len(subject) > 120:
+    subject = textwrap.shorten(subject, width=120, placeholder="...")
+
+print(subject)
+PY
+}
+
+build_iteration_commit_message() {
+    local summary_file=$1
+    local stage_number=$2
+    local stage_title=$3
+    local subject
+
+    subject="$(extract_commit_subject_from_summary "$summary_file")"
+    if [[ -z "$subject" ]]; then
+        subject="$(build_fallback_commit_subject "$stage_number" "$stage_title")"
+    fi
+
+    if [[ "$subject" =~ ^(plan-loop|loop): ]]; then
+        printf '%s\n' "$subject"
+    else
+        printf 'plan-loop: %s\n' "$subject"
     fi
 }
 
@@ -571,7 +700,8 @@ Requirements:
 - Update [~] to [x] only if the stage exit criteria are satisfied and the dedicated stage verification passes.
 - Do not edit $STATE_DIR.
 - Leave the repository in a state where the outer loop can run its smoke and stage-specific tests.
-- End with a concise summary of files changed, checks run, and remaining risk.
+- End with a `Commit message:` line containing a single git subject that states what actually changed.
+- Then include a concise summary of files changed, checks run, and remaining risk.
 
 This is loop iteration $iteration.
 This is the active roadmap stage: Stage $active_stage_number - $active_stage_title
@@ -613,7 +743,8 @@ Requirements:
 - Update ROADMAP.md only if it materially needs a status or progress adjustment based on the work you complete.
 - Do not edit $STATE_DIR.
 - Leave the repository in a state where the outer loop can run its fast test suite.
-- End with a concise summary of files changed, checks run, and remaining risk.
+- End with a `Commit message:` line containing a single git subject that states what actually changed.
+- Then include a concise summary of files changed, checks run, and remaining risk.
 
 This is loop iteration $iteration.
 
@@ -789,7 +920,7 @@ run_iteration() {
     local pre_snapshot post_snapshot head_sha last_failure_path agent_status tests_status
     local before_untracked after_untracked roadmap_info pre_stage_number pre_stage_title pre_stage_status
     local pre_stage_automation post_stage_number post_stage_title post_stage_status
-    local current_stalls success_count failure_count stage_advanced new_stalls
+    local current_stalls success_count failure_count stage_advanced new_stalls commit_message
 
     current_stalls="$(read_state_int_field consecutive_stalls)"
     success_count="$(read_state_int_field success_count)"
@@ -1012,17 +1143,14 @@ run_iteration() {
         post_stage_status=""
     fi
 
-    if (( STATUS_HEADINGS )) && [[ -n "$pre_stage_number" ]]; then
-        git commit -m "plan-loop: stage ${pre_stage_number} iteration ${iteration}" >/dev/null
-    else
-        git commit -m "loop: roadmap iteration $iteration" >/dev/null
-    fi
+    commit_message="$(build_iteration_commit_message "$summary_file" "$pre_stage_number" "$pre_stage_title")"
+    git commit -m "$commit_message" >/dev/null
 
     success_count=$((success_count + 1))
     write_state "$session_id" "$branch" "$start_sha" "$((iteration + 1))" "success" "" \
         "$post_stage_number" "$post_stage_title" "$post_stage_status" "0" \
         "$success_count" "$failure_count"
-    echo "Committed iteration $iteration"
+    echo "Committed iteration $iteration: $commit_message"
     rm -f "$roadmap_info"
     return 0
 }
