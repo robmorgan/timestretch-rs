@@ -620,6 +620,48 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_tail_transient_does_not_retrigger_across_repeated_half_hop_callbacks() {
+        let sr = 44_100u32;
+        let fft = 1024usize;
+        let hop = 256usize;
+        let callback_frames = 4096usize;
+        let half_hop = hop / 2;
+        let total_frames = callback_frames + hop * 4;
+        let mut stereo = vec![0.0f32; total_frames * 2];
+        for i in 0..total_frames {
+            let t = i as f32 / sr as f32;
+            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
+            // Keep a single late transient inside the overlapping callback
+            // windows long enough to exercise repeated half-hop re-entry.
+            let click = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
+            stereo[i * 2] = base + click;
+            stereo[i * 2 + 1] = base * 0.9 + click;
+        }
+
+        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, callback_frames);
+        let mut triggered_origins = Vec::new();
+        for origin in (0..=8).map(|step| step * half_hop) {
+            let start = origin * 2;
+            let end = start + callback_frames * 2;
+            let mask = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin);
+            if mask.is_some() {
+                triggered_origins.push(origin);
+            }
+        }
+
+        assert_eq!(
+            triggered_origins,
+            vec![0],
+            "repeated half-hop callbacks should not retrigger one tail transient after the initial pass"
+        );
+        assert_eq!(
+            scheduler.stats().events_detected_total,
+            1,
+            "one tail transient should count as a single reset event across repeated half-hop callbacks"
+        );
+    }
+
+    #[test]
     fn scheduler_broad_tail_transient_does_not_retrigger_across_overlapping_callbacks() {
         let sr = 44_100u32;
         let fft = 1024usize;
