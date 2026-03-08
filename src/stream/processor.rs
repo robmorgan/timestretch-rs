@@ -315,6 +315,9 @@ impl DualPlaneDeterministicState {
 
     #[inline]
     fn push_chunk_ratio(&mut self, ratio: f64, requested_ratio: f64) -> f64 {
+        if (requested_ratio - 1.0).abs() <= RATIO_SNAP_THRESHOLD {
+            self.recent_chunk_ratios.clear();
+        }
         if let Some(&last_chunk_ratio) = self.recent_chunk_ratios.last() {
             let next_side = ratio_modulation_side(ratio);
             let requested_side = ratio_modulation_side(requested_ratio);
@@ -3242,6 +3245,33 @@ mod tests {
             state.recent_chunk_ratios,
             vec![1.012],
             "requested cross-unity modulation should start a fresh averaging window from the first transition callback"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_deterministic_ratio_history_resets_on_requested_exact_unity() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        let first_average = state.push_chunk_ratio(1.035, 1.035);
+        assert!((first_average - 1.035).abs() < 1e-9);
+        let plateau_average = state.push_chunk_ratio(1.025, 1.025);
+        assert!((plateau_average - 1.03).abs() < 1e-9);
+        assert_eq!(state.recent_chunk_ratios.len(), 2);
+
+        let requested_unity_average = state.push_chunk_ratio(1.012, 1.0);
+        assert!(
+            (requested_unity_average - 1.012).abs() < 1e-9,
+            "an exact-unity request should clear stale same-side history before smoothing finishes returning to unity"
+        );
+        assert_eq!(
+            state.recent_chunk_ratios,
+            vec![1.012],
+            "a requested exact-unity plateau should start a fresh averaging window for the next modulation step"
         );
     }
 
