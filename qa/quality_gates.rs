@@ -956,6 +956,25 @@ fn run_dual_plane_deterministic_with_ratio_steps(
     ratios: &[f64],
     hold_callbacks: usize,
 ) -> (Vec<f32>, Vec<usize>) {
+    let (output, boundaries, _) = run_dual_plane_deterministic_with_ratio_steps_mode(
+        input,
+        sample_rate,
+        callback_frames,
+        ratios,
+        hold_callbacks,
+        DeterministicProfileMode::Auto,
+    );
+    (output, boundaries)
+}
+
+fn run_dual_plane_deterministic_with_ratio_steps_mode(
+    input: &[f32],
+    sample_rate: u32,
+    callback_frames: usize,
+    ratios: &[f64],
+    hold_callbacks: usize,
+    mode: DeterministicProfileMode,
+) -> (Vec<f32>, Vec<usize>, ProfileTransitionStats) {
     let params = StretchParams::new(1.0)
         .with_sample_rate(sample_rate)
         .with_channels(2)
@@ -967,11 +986,13 @@ fn run_dual_plane_deterministic_with_ratio_steps(
         processor.is_dual_plane_deterministic(),
         "deterministic stream should default to dual-plane backend"
     );
+    configure_deterministic_profile_mode(&mut processor, mode);
     assert!(!ratios.is_empty(), "ratio step schedule must not be empty");
 
     let chunk_samples = callback_frames * 2;
     let mut output = Vec::with_capacity((input.len() as f64 * 1.20) as usize + 32_768);
     let mut boundaries = Vec::with_capacity(input.len() / chunk_samples + 1);
+    let mut profile_stats = ProfileTransitionStats::default();
 
     for (idx, chunk) in input.chunks(chunk_samples).enumerate() {
         let schedule_idx = idx / hold_callbacks.max(1);
@@ -982,6 +1003,11 @@ fn run_dual_plane_deterministic_with_ratio_steps(
         processor
             .process_into(chunk, &mut output)
             .expect("dual-plane stream process_into failed");
+        profile_stats.observe(
+            processor
+                .deterministic_profile_telemetry()
+                .expect("dual-plane deterministic telemetry should stay available"),
+        );
         push_boundary_if_advanced(&mut boundaries, output.len() / 2);
     }
     processor
@@ -989,7 +1015,7 @@ fn run_dual_plane_deterministic_with_ratio_steps(
         .expect("dual-plane stream flush_into failed");
     push_boundary_if_advanced(&mut boundaries, output.len() / 2);
 
-    (output, boundaries)
+    (output, boundaries, profile_stats)
 }
 
 #[test]
@@ -1466,13 +1492,15 @@ fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
         callback_frames,
         false,
     );
-    let (modulated_out, modulated_boundaries) = run_dual_plane_deterministic_with_ratio_steps(
-        &input,
-        sample_rate,
-        callback_frames,
-        &[0.965, 1.035, 0.975, 1.025],
-        2,
-    );
+    let (modulated_out, modulated_boundaries, modulated_profile) =
+        run_dual_plane_deterministic_with_ratio_steps_mode(
+            &input,
+            sample_rate,
+            callback_frames,
+            &[0.965, 1.035, 0.975, 1.025],
+            2,
+            DeterministicProfileMode::Auto,
+        );
 
     assert!(
         baseline_out.iter().all(|s| s.is_finite()),
@@ -1513,7 +1541,7 @@ fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
     let modulated_stats =
         boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
     println!(
-        "dual-plane-short-step-mod gate: baseline(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={})",
+        "dual-plane-short-step-mod gate: baseline(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},p99={:.3},mean={:.3},n={},profiles={})",
         baseline_stats.max_ratio,
         baseline_stats.p95_ratio,
         baseline_stats.p98_ratio,
@@ -1525,14 +1553,15 @@ fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
         modulated_stats.p98_ratio,
         modulated_stats.p99_ratio,
         modulated_stats.mean_ratio,
-        modulated_stats.evaluated_boundaries
+        modulated_stats.evaluated_boundaries,
+        modulated_profile.summary()
     );
 
     write_quality_dashboard_csv(
         "quality_gate_dual_plane_short_interval_step_modulation_artifacts",
-        "baseline_max,baseline_p95,baseline_p98,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_p99,modulated_mean,modulated_n",
+        "baseline_max,baseline_p95,baseline_p98,baseline_p99,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_p99,modulated_mean,modulated_n,modulated_current_profile_changes,modulated_target_profile_changes,modulated_policy_profile_changes",
         &format!(
-            "{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
+            "{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{},{},{},{}",
             baseline_stats.max_ratio,
             baseline_stats.p95_ratio,
             baseline_stats.p98_ratio,
@@ -1544,7 +1573,10 @@ fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
             modulated_stats.p98_ratio,
             modulated_stats.p99_ratio,
             modulated_stats.mean_ratio,
-            modulated_stats.evaluated_boundaries
+            modulated_stats.evaluated_boundaries,
+            modulated_profile.current_profile_changes,
+            modulated_profile.target_profile_changes,
+            modulated_profile.policy_profile_changes
         ),
     );
 
@@ -1571,6 +1603,36 @@ fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
         "short-interval modulation artifact gate failed (mean): modulated {:.3} vs baseline {:.3}",
         modulated_stats.mean_ratio,
         baseline_stats.mean_ratio
+    );
+    let modulated_final = modulated_profile
+        .last
+        .expect("short-interval modulation gate should observe profile telemetry");
+    assert_eq!(
+        modulated_final.current_profile,
+        LatencyProfile::Mix,
+        "short-interval modulation should keep the active profile on mix"
+    );
+    assert_eq!(
+        modulated_final.target_profile,
+        LatencyProfile::Mix,
+        "short-interval modulation should keep the target profile on mix"
+    );
+    assert_eq!(
+        modulated_final.policy_profile,
+        LatencyProfile::Mix,
+        "short-interval modulation should keep the policy profile on mix"
+    );
+    assert_eq!(
+        modulated_profile.current_profile_changes, 0,
+        "short-interval modulation should not churn the current profile"
+    );
+    assert_eq!(
+        modulated_profile.target_profile_changes, 0,
+        "short-interval modulation should not churn the target profile"
+    );
+    assert_eq!(
+        modulated_profile.policy_profile_changes, 0,
+        "short-interval modulation should not churn the policy profile"
     );
 }
 
