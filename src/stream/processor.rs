@@ -3659,6 +3659,82 @@ mod tests {
     }
 
     #[test]
+    fn test_dual_plane_short_interval_cross_unity_modulation_can_still_retarget_to_scratch() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut proc = StreamProcessor::new(params);
+        assert!(
+            proc.is_dual_plane_deterministic(),
+            "deterministic stream should default to the dual-plane backend"
+        );
+
+        let chunk = [0.0f32; 256];
+        for (step_idx, ratio) in [1.035, 0.975, 1.025, 0.965, 1.035, 0.975]
+            .into_iter()
+            .enumerate()
+        {
+            proc.set_stretch_ratio(ratio).unwrap();
+            let output = proc.process(&chunk).unwrap();
+            assert!(
+                output.iter().all(|sample| sample.is_finite()),
+                "deterministic modulation should keep output finite during step {step_idx}"
+            );
+        }
+
+        let after_modulation = proc
+            .deterministic_profile_telemetry()
+            .expect("dual-plane telemetry should remain available after modulation");
+        assert_eq!(
+            after_modulation.current_profile,
+            LatencyProfile::Mix,
+            "short-interval modulation should leave the committed profile parked on mix before the stable plateau begins"
+        );
+        assert_eq!(
+            after_modulation.target_profile,
+            LatencyProfile::Mix,
+            "short-interval modulation should not leave a stale scratch retarget queued once the modulation burst ends"
+        );
+
+        proc.set_stretch_ratio(1.70).unwrap();
+        let mut saw_scratch_target = false;
+        let mut saw_scratch_current = false;
+        for settle_idx in 0..16 {
+            let output = proc.process(&chunk).unwrap();
+            assert!(
+                output.iter().all(|sample| sample.is_finite()),
+                "stable post-modulation scratch plateau should keep output finite during settle step {settle_idx}"
+            );
+            let telemetry = proc
+                .deterministic_profile_telemetry()
+                .expect("dual-plane telemetry should remain available while the plateau settles");
+            saw_scratch_target |= telemetry.target_profile == LatencyProfile::Scratch;
+            saw_scratch_current |= telemetry.current_profile == LatencyProfile::Scratch;
+            if saw_scratch_target && saw_scratch_current {
+                break;
+            }
+        }
+
+        assert!(
+            saw_scratch_target,
+            "once the rapid modulation stops, a stable scratch-biased plateau should still be able to retarget away from mix"
+        );
+        assert!(
+            saw_scratch_current,
+            "once hysteresis and the profile transition settle, the stable scratch-biased plateau should still be able to commit scratch"
+        );
+        assert!(
+            proc.flush()
+                .unwrap()
+                .iter()
+                .all(|sample| sample.is_finite()),
+            "stable post-modulation plateau flush should remain finite"
+        );
+    }
+
+    #[test]
     fn test_stereo_channel_reset_masks_mid_full_side_mid_high() {
         let full = [true, true, true, true];
         let (mid, side) = stereo_channel_reset_masks(full);
