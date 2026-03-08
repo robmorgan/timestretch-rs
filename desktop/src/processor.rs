@@ -3,9 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use timestretch::{
-    DualPlaneProcessor, QualityMode, RtConfig, StretchParams, TimeWarpMap,
-};
+use timestretch::{DualPlaneProcessor, EdmPreset, RtConfig, StretchParams, TimeWarpMap};
 
 use crate::audio_engine::RingProducer;
 use crate::state::{AtomicPosition, PresetChoice, SharedStateHandle, StopFlag, Transport};
@@ -152,7 +150,8 @@ pub fn start_processing_thread(
             }
 
             // Update warp-map ratio snapshot.
-            if let Err(err) = maybe_update_ratio_warp(&mut processor, &mut last_ratio, stretch_ratio)
+            if let Err(err) =
+                maybe_update_ratio_warp(&mut processor, &mut last_ratio, stretch_ratio)
             {
                 log::error!("Invalid stretch ratio {stretch_ratio}: {err}");
                 thread::sleep(Duration::from_millis(5));
@@ -253,14 +252,12 @@ fn build_processor(state: &SharedStateHandle, sample_rate: u32) -> (DualPlanePro
             let params = StretchParams::new(base_ratio)
                 .with_sample_rate(sample_rate)
                 .with_channels(CHANNELS)
-                .with_quality_mode(QualityMode::Balanced)
-                .with_fft_size(2048)
-                .with_hop_size(512);
+                .with_preset(EdmPreset::DjBeatmatch);
 
             let mut cfg = RtConfig::new(params.clone(), CHUNK_FRAMES);
             cfg.latency_profile = latency_profile;
-            let mut processor =
-                DualPlaneProcessor::prepare(cfg).expect("valid dual-plane RT config for desktop DJ");
+            let mut processor = DualPlaneProcessor::prepare(cfg)
+                .expect("valid dual-plane RT config for desktop DJ");
             if let Err(err) = force_ratio_warp(&mut processor, ratio) {
                 log::warn!("failed to apply ratio {ratio} to low-latency DJ processor: {err}");
             }
@@ -272,9 +269,7 @@ fn build_processor(state: &SharedStateHandle, sample_rate: u32) -> (DualPlanePro
         let params = StretchParams::new(ratio)
             .with_sample_rate(sample_rate)
             .with_channels(CHANNELS)
-            .with_quality_mode(QualityMode::Balanced)
-            .with_fft_size(2048)
-            .with_hop_size(512);
+            .with_preset(EdmPreset::DjBeatmatch);
         let mut cfg = RtConfig::new(params.clone(), CHUNK_FRAMES);
         cfg.latency_profile = latency_profile;
         let mut processor =

@@ -420,10 +420,7 @@ impl TimeStretchApp {
             }
 
             if ui
-                .add_enabled(
-                    transport != Transport::Stopped,
-                    egui::Button::new("Stop"),
-                )
+                .add_enabled(transport != Transport::Stopped, egui::Button::new("Stop"))
                 .clicked()
             {
                 self.stop_playback();
@@ -487,14 +484,11 @@ impl TimeStretchApp {
                             egui::TextEdit::singleline(&mut self.target_bpm_text)
                                 .desired_width(60.0),
                         );
-                        if response.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                        {
+                        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             if let Ok(target) = self.target_bpm_text.parse::<f64>() {
                                 if target > 0.0 && detected_bpm > 0.0 {
                                     self.stretch_ratio = detected_bpm / target;
-                                    self.stretch_ratio =
-                                        self.stretch_ratio.clamp(0.5, 2.0);
+                                    self.stretch_ratio = self.stretch_ratio.clamp(0.5, 2.0);
                                     let mut st = self.state.lock().unwrap();
                                     st.stretch_ratio = self.stretch_ratio;
                                     st.target_bpm = target;
@@ -594,10 +588,7 @@ impl TimeStretchApp {
                 let pitch_processing = self.state.lock().unwrap().pitch_processing;
                 if pitch_processing {
                     ui.label("");
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        "Processing pitch shift...",
-                    );
+                    ui.colored_label(egui::Color32::YELLOW, "Processing pitch shift...");
                     ui.end_row();
                     ctx_request_repaint(ui);
                 }

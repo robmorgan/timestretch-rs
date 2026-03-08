@@ -28,7 +28,12 @@ pub fn decode_file(path: &Path) -> Result<DecodedAudio, String> {
     }
 
     let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .map_err(|e| format!("Failed to probe format: {e}"))?;
 
     let mut format = probed.format;
@@ -40,10 +45,7 @@ pub fn decode_file(path: &Path) -> Result<DecodedAudio, String> {
     let track_id = track.id;
     let codec_params = track.codec_params.clone();
     let sample_rate = codec_params.sample_rate.ok_or("Unknown sample rate")?;
-    let src_channels = codec_params
-        .channels
-        .map(|c| c.count() as u32)
-        .unwrap_or(2);
+    let src_channels = codec_params.channels.map(|c| c.count() as u32).unwrap_or(2);
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&codec_params, &DecoderOptions::default())
@@ -77,10 +79,7 @@ pub fn decode_file(path: &Path) -> Result<DecodedAudio, String> {
 
     // If mono, convert to interleaved stereo
     let (samples, out_channels) = if src_channels == 1 {
-        let stereo: Vec<f32> = all_samples
-            .iter()
-            .flat_map(|&s| [s, s])
-            .collect();
+        let stereo: Vec<f32> = all_samples.iter().flat_map(|&s| [s, s]).collect();
         (stereo, 2)
     } else {
         (all_samples, src_channels.min(2))
