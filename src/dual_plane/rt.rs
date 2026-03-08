@@ -310,6 +310,7 @@ pub struct RtProcessor {
     profile_candidate_streak: usize,
     profile_transition_blocks_left: usize,
     ratio_motion_freeze_blocks_left: usize,
+    post_ratio_motion_profile_hold_blocks_left: usize,
     ratio_motion_history: [f64; RATIO_MOTION_HISTORY_BLOCKS],
     ratio_motion_history_len: usize,
     ratio_motion_history_cursor: usize,
@@ -492,6 +493,7 @@ impl RtProcessor {
             profile_candidate_streak: 0,
             profile_transition_blocks_left: 0,
             ratio_motion_freeze_blocks_left: 0,
+            post_ratio_motion_profile_hold_blocks_left: 0,
             ratio_motion_history: [1.0; RATIO_MOTION_HISTORY_BLOCKS],
             ratio_motion_history_len: 0,
             ratio_motion_history_cursor: 0,
@@ -552,6 +554,7 @@ impl RtProcessor {
         self.policy_profile = profile;
         self.profile_candidate = profile;
         self.profile_candidate_streak = 0;
+        self.post_ratio_motion_profile_hold_blocks_left = 0;
         self.set_latency_profile_internal(profile);
     }
 
@@ -562,6 +565,7 @@ impl RtProcessor {
             self.policy_profile = self.target_profile;
             self.profile_candidate = self.target_profile;
             self.profile_candidate_streak = 0;
+            self.post_ratio_motion_profile_hold_blocks_left = 0;
         }
     }
 
@@ -675,6 +679,7 @@ impl RtProcessor {
         }
 
         self.ratio_motion_freeze_blocks_left = self.config.ratio_motion_freeze_blocks;
+        self.post_ratio_motion_profile_hold_blocks_left = 0;
         if self.bias_ratio_motion_hold_to_scratch_if_needed() {
             return;
         }
@@ -701,8 +706,12 @@ impl RtProcessor {
 
     #[inline]
     fn advance_ratio_motion_freeze(&mut self) {
+        let was_active = self.ratio_motion_freeze_blocks_left > 0;
         self.ratio_motion_freeze_blocks_left =
             self.ratio_motion_freeze_blocks_left.saturating_sub(1);
+        if was_active && self.ratio_motion_freeze_blocks_left == 0 && self.auto_profile_switching {
+            self.post_ratio_motion_profile_hold_blocks_left = 1;
+        }
     }
 
     fn prepare_runtime_policy(&mut self) {
@@ -1443,6 +1452,13 @@ impl RtProcessor {
         }
         if !self.auto_profile_switching {
             self.policy_profile = self.target_profile;
+            return;
+        }
+        if self.post_ratio_motion_profile_hold_blocks_left > 0 {
+            self.policy_profile = self.current_profile;
+            self.post_ratio_motion_profile_hold_blocks_left = self
+                .post_ratio_motion_profile_hold_blocks_left
+                .saturating_sub(1);
             return;
         }
         if self.current_profile != self.target_profile {
@@ -2965,8 +2981,17 @@ mod tests {
         let telemetry = rt.profile_telemetry();
         assert_eq!(
             telemetry.target_profile,
+            LatencyProfile::Render,
+            "the first committed kernel after the ratio-motion freeze should still hold the current render profile"
+        );
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        let telemetry = rt.profile_telemetry();
+        assert_eq!(
+            telemetry.target_profile,
             LatencyProfile::Scratch,
-            "auto profile switching should resume after the ratio-motion freeze expires"
+            "auto profile switching should resume on the second committed kernel after the ratio-motion freeze expires"
         );
     }
 
@@ -3080,7 +3105,7 @@ mod tests {
 
         rt.set_constant_ratio(1.70);
         rt.set_hint_snapshot(Arc::clone(&scratch_hints));
-        for _ in 0..3 {
+        for _ in 0..4 {
             let mut output_refs = [&mut output[..]];
             let _ = rt.process(&input_refs, &mut output_refs);
         }
@@ -3159,7 +3184,7 @@ mod tests {
 
         rt.set_constant_ratio(1.035);
         rt.set_hint_snapshot(Arc::clone(&scratch_hints));
-        for _ in 0..3 {
+        for _ in 0..4 {
             let mut output_refs = [&mut output[..]];
             let _ = rt.process(&input_refs, &mut output_refs);
         }
@@ -3416,18 +3441,28 @@ mod tests {
             );
         }
 
-        for resume_idx in 0..2 {
+        for resume_idx in 0..3 {
             let mut output_refs = [&mut output[..]];
             let _ = rt.process(&input_refs, &mut output_refs);
             if resume_idx == 0 {
                 assert_eq!(
                     rt.profile_telemetry().target_profile,
                     LatencyProfile::Render,
-                    "the first post-freeze callback should continue the preserved hysteresis streak without committing early"
+                    "the first post-freeze callback should keep the render hold in place without restarting or advancing hysteresis"
+                );
+                assert_eq!(
+                    rt.profile_candidate_streak, 2,
+                    "the first post-freeze callback should preserve the pre-freeze scratch streak without advancing it"
+                );
+            } else if resume_idx == 1 {
+                assert_eq!(
+                    rt.profile_telemetry().target_profile,
+                    LatencyProfile::Render,
+                    "the second post-freeze callback should resume the preserved hysteresis streak without committing early"
                 );
                 assert_eq!(
                     rt.profile_candidate_streak, 3,
-                    "the first post-freeze callback should resume the preserved scratch streak"
+                    "the second post-freeze callback should resume the preserved scratch streak"
                 );
             }
         }
@@ -3435,7 +3470,82 @@ mod tests {
         assert_eq!(
             rt.profile_telemetry().target_profile,
             LatencyProfile::Scratch,
-            "preserved hysteresis progress should let scratch retarget after only the remaining post-freeze callbacks"
+            "preserved hysteresis progress should let scratch retarget after only the remaining callbacks once the post-freeze hold clears"
+        );
+    }
+
+    #[test]
+    fn post_freeze_profile_hold_blocks_first_calm_kernel_from_retargeting_away_from_scratch() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Mix;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+        let render_hints = Arc::new(RenderHints {
+            transient_confidence: 0.05,
+            tonal_confidence: 0.95,
+            noise_confidence: 0.05,
+            ..RenderHints::default()
+        });
+
+        rt.set_constant_ratio(1.035);
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        assert_eq!(
+            rt.profile_telemetry().current_profile,
+            LatencyProfile::Scratch,
+            "fast motion should still bias the auto mix path onto scratch"
+        );
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        assert_eq!(
+            rt.ratio_motion_freeze_blocks_left, 0,
+            "the second kernel should consume the configured ratio-motion freeze hold"
+        );
+
+        rt.set_hint_snapshot(Arc::clone(&render_hints));
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        let first_calm = rt.profile_telemetry();
+        assert_eq!(
+            first_calm.current_profile,
+            LatencyProfile::Scratch,
+            "the first calm kernel after a fast-modulation burst should keep scratch active"
+        );
+        assert_eq!(
+            first_calm.target_profile,
+            LatencyProfile::Scratch,
+            "the first calm kernel after a fast-modulation burst should not immediately retarget away from scratch"
+        );
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        let second_calm = rt.profile_telemetry();
+        assert_eq!(
+            second_calm.current_profile,
+            LatencyProfile::Scratch,
+            "retargeting away from scratch should still occur via a transition"
+        );
+        assert_eq!(
+            second_calm.target_profile,
+            LatencyProfile::Render,
+            "the second calm kernel should be the first one allowed to retarget away from scratch"
+        );
+        assert!(
+            second_calm.transition_blocks_left > 0,
+            "retargeting away from scratch should queue a transition instead of snapping instantly"
         );
     }
 
@@ -3701,12 +3811,26 @@ mod tests {
         assert_eq!(
             resumed.current_profile,
             LatencyProfile::Scratch,
+            "the first stable near-unity kernel after a unity callback should keep the scratch profile active"
+        );
+        assert_eq!(
+            resumed.target_profile,
+            LatencyProfile::Scratch,
+            "the first stable near-unity kernel after a unity callback should not immediately retarget away from scratch"
+        );
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        let resumed = rt.profile_telemetry();
+        assert_eq!(
+            resumed.current_profile,
+            LatencyProfile::Scratch,
             "the committed scratch profile should stay active until the queued render transition settles"
         );
         assert_eq!(
             resumed.target_profile,
             LatencyProfile::Render,
-            "once the unity callback consumes the hold, the next stable near-unity kernel should be able to retarget away from scratch"
+            "once the unity callback consumes the hold, the second stable near-unity kernel should be able to retarget away from scratch"
         );
         assert!(
             resumed.transition_blocks_left > 0,
