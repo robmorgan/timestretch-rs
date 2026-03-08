@@ -27,6 +27,12 @@ const DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS: f64 = 0.040;
 /// Treat a small plateau around unity as a fresh boundary so the next burst does
 /// not average against stale opposite-side history.
 const DUAL_PLANE_RATIO_HISTORY_UNITY_RESET_EPS: f64 = 0.005;
+/// Requested-ratio delta required before same-side trend reversals reset averaging.
+///
+/// Short automation bursts can pivot before crossing unity. Resetting the
+/// deterministic averaging window on a material turnaround keeps the next burst
+/// from being smeared by stale pre-turnaround ratios.
+const DUAL_PLANE_RATIO_HISTORY_DIRECTION_RESET_EPS: f64 = 0.003;
 /// Short seam ramp used when deterministic rendering exits exact-unity bypass.
 const DUAL_PLANE_UNITY_EXIT_SEAM_FRAMES: usize = 64;
 /// Numerator for the FFT-size latency fraction (3/2 = 1.5x FFT size).
@@ -277,6 +283,8 @@ struct DualPlaneDeterministicState {
     ratio_window_blocks: usize,
     recent_chunk_ratios: Vec<f64>,
     last_requested_unity_reset_zone: bool,
+    last_requested_ratio: f64,
+    last_requested_direction: i8,
     last_ratio_history_side: i8,
     last_ratio: f64,
     last_output_samples: Vec<f32>,
@@ -314,6 +322,8 @@ impl DualPlaneDeterministicState {
             ratio_window_blocks: kernel_frames.div_ceil(block_frames).max(1),
             recent_chunk_ratios: Vec::new(),
             last_requested_unity_reset_zone: false,
+            last_requested_ratio: ratio,
+            last_requested_direction: 0,
             last_ratio_history_side: 0,
             last_ratio: ratio,
             last_output_samples: vec![0.0; num_channels],
@@ -333,6 +343,24 @@ impl DualPlaneDeterministicState {
         }
         let next_side = ratio_modulation_side(ratio);
         let requested_side = ratio_modulation_side(requested_ratio);
+        let requested_delta = requested_ratio - self.last_requested_ratio;
+        let requested_direction =
+            if requested_delta.abs() <= DUAL_PLANE_RATIO_HISTORY_DIRECTION_RESET_EPS {
+                0
+            } else if requested_delta > 0.0 {
+                1
+            } else {
+                -1
+            };
+        if requested_side != 0
+            && requested_side == ratio_modulation_side(self.last_requested_ratio)
+            && self.recent_chunk_ratios.len() >= 2
+            && requested_direction != 0
+            && self.last_requested_direction != 0
+            && requested_direction != self.last_requested_direction
+        {
+            self.recent_chunk_ratios.clear();
+        }
         let effective_side = if requested_side != 0 {
             requested_side
         } else {
@@ -352,6 +380,8 @@ impl DualPlaneDeterministicState {
         }
         self.recent_chunk_ratios.push(ratio);
         self.last_requested_unity_reset_zone = requested_unity_reset_zone;
+        self.last_requested_ratio = requested_ratio;
+        self.last_requested_direction = requested_direction;
         self.last_ratio_history_side = effective_side;
         let sum: f64 = self.recent_chunk_ratios.iter().sum();
         sum / self.recent_chunk_ratios.len().max(1) as f64
@@ -361,6 +391,8 @@ impl DualPlaneDeterministicState {
     fn reset_ratio_history(&mut self, ratio: f64) {
         self.recent_chunk_ratios.clear();
         self.last_requested_unity_reset_zone = false;
+        self.last_requested_ratio = ratio;
+        self.last_requested_direction = 0;
         self.last_ratio_history_side = 0;
         self.last_ratio = ratio;
         if (ratio - 1.0).abs() <= RATIO_SNAP_THRESHOLD {
@@ -3470,6 +3502,31 @@ mod tests {
             state.recent_chunk_ratios,
             vec![1.021],
             "rapid requested direction flips should segment ratio history by requested modulation side, not by the still-lagging applied ratio"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_deterministic_ratio_history_resets_on_same_side_requested_turnaround() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        assert!((state.push_chunk_ratio(1.035, 1.035) - 1.035).abs() < 1e-9);
+        assert!((state.push_chunk_ratio(1.028, 1.028) - 1.0315).abs() < 1e-9);
+        assert!((state.push_chunk_ratio(1.020, 1.020) - 1.0276666666666667).abs() < 1e-9);
+
+        let turned_back_up = state.push_chunk_ratio(1.024, 1.024);
+        assert!(
+            (turned_back_up - 1.024).abs() < 1e-9,
+            "same-side requested turnaround should reset stale descending history instead of averaging through the pivot"
+        );
+        assert_eq!(
+            state.recent_chunk_ratios,
+            vec![1.024],
+            "same-side turnaround should start a fresh averaging window at the pivot callback"
         );
     }
 
