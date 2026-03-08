@@ -1256,6 +1256,172 @@ fn quality_gate_dual_plane_fast_modulation_profile_mode_diagnostics() {
 }
 
 #[test]
+fn quality_gate_dual_plane_fast_modulation_auto_profile_hysteresis_regression() {
+    let sample_rate = 44_100u32;
+    let bpm = 126.0;
+    let callback_frames = 256usize;
+    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
+    let input = mono_to_stereo_interleaved(&mono);
+
+    let (auto_out, auto_boundaries, auto_profile) =
+        run_dual_plane_deterministic_with_ratio_modulation_mode(
+            &input,
+            sample_rate,
+            callback_frames,
+            true,
+            DeterministicProfileMode::Auto,
+        );
+    let (fixed_mix_out, fixed_mix_boundaries, fixed_mix_profile) =
+        run_dual_plane_deterministic_with_ratio_modulation_mode(
+            &input,
+            sample_rate,
+            callback_frames,
+            true,
+            DeterministicProfileMode::Fixed(LatencyProfile::Mix),
+        );
+    let (fixed_scratch_out, fixed_scratch_boundaries, fixed_scratch_profile) =
+        run_dual_plane_deterministic_with_ratio_modulation_mode(
+            &input,
+            sample_rate,
+            callback_frames,
+            true,
+            DeterministicProfileMode::Fixed(LatencyProfile::Scratch),
+        );
+
+    for (label, output) in [
+        ("auto", &auto_out),
+        ("fixed-mix", &fixed_mix_out),
+        ("fixed-scratch", &fixed_scratch_out),
+    ] {
+        assert!(
+            output.iter().all(|sample| sample.is_finite()),
+            "fast-modulation profile hysteresis regression produced non-finite output for {label}"
+        );
+        assert!(
+            !output.is_empty(),
+            "fast-modulation profile hysteresis regression produced empty output for {label}"
+        );
+    }
+
+    let trim = 16usize;
+    let positions = |boundaries: &[usize], signal_len: usize| -> Vec<usize> {
+        let relevant = if boundaries.len() > trim * 2 {
+            &boundaries[trim..boundaries.len() - trim]
+        } else {
+            boundaries
+        };
+        relevant
+            .iter()
+            .copied()
+            .filter(|&pos| pos > 1 && pos + 1 < signal_len)
+            .collect()
+    };
+    let window = (sample_rate as f64 * 0.008).round() as usize;
+    let guard = (sample_rate as f64 * 0.001).round() as usize;
+
+    let auto_left = extract_left_channel(&auto_out);
+    let fixed_mix_left = extract_left_channel(&fixed_mix_out);
+    let fixed_scratch_left = extract_left_channel(&fixed_scratch_out);
+    let auto_stats = boundary_artifact_stats(
+        &auto_left,
+        &positions(&auto_boundaries, auto_left.len()),
+        window,
+        guard,
+    );
+    let fixed_mix_stats = boundary_artifact_stats(
+        &fixed_mix_left,
+        &positions(&fixed_mix_boundaries, fixed_mix_left.len()),
+        window,
+        guard,
+    );
+    let fixed_scratch_stats = boundary_artifact_stats(
+        &fixed_scratch_left,
+        &positions(&fixed_scratch_boundaries, fixed_scratch_left.len()),
+        window,
+        guard,
+    );
+
+    println!(
+        "fast-mod auto-profile hysteresis: auto(p95={:.3},p98={:.3},mean={:.3},profiles={}) fixed-mix(p95={:.3},p98={:.3},mean={:.3},profiles={}) fixed-scratch(p95={:.3},p98={:.3},mean={:.3},profiles={})",
+        auto_stats.p95_ratio,
+        auto_stats.p98_ratio,
+        auto_stats.mean_ratio,
+        auto_profile.summary(),
+        fixed_mix_stats.p95_ratio,
+        fixed_mix_stats.p98_ratio,
+        fixed_mix_stats.mean_ratio,
+        fixed_mix_profile.summary(),
+        fixed_scratch_stats.p95_ratio,
+        fixed_scratch_stats.p98_ratio,
+        fixed_scratch_stats.mean_ratio,
+        fixed_scratch_profile.summary()
+    );
+
+    write_quality_dashboard_csv(
+        "quality_gate_dual_plane_fast_modulation_auto_profile_hysteresis_regression",
+        "auto_p95,auto_p98,auto_mean,auto_current_profile_changes,auto_target_profile_changes,auto_policy_profile_changes,fixed_mix_p95,fixed_mix_p98,fixed_mix_mean,fixed_scratch_p95,fixed_scratch_p98,fixed_scratch_mean",
+        &format!(
+            "{:.6},{:.6},{:.6},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
+            auto_stats.p95_ratio,
+            auto_stats.p98_ratio,
+            auto_stats.mean_ratio,
+            auto_profile.current_profile_changes,
+            auto_profile.target_profile_changes,
+            auto_profile.policy_profile_changes,
+            fixed_mix_stats.p95_ratio,
+            fixed_mix_stats.p98_ratio,
+            fixed_mix_stats.mean_ratio,
+            fixed_scratch_stats.p95_ratio,
+            fixed_scratch_stats.p98_ratio,
+            fixed_scratch_stats.mean_ratio
+        ),
+    );
+
+    assert!(
+        auto_stats.evaluated_boundaries >= 32
+            && fixed_mix_stats.evaluated_boundaries >= 32
+            && fixed_scratch_stats.evaluated_boundaries >= 32,
+        "fast-modulation profile hysteresis regression evaluated too few boundaries (auto={}, fixed_mix={}, fixed_scratch={})",
+        auto_stats.evaluated_boundaries,
+        fixed_mix_stats.evaluated_boundaries,
+        fixed_scratch_stats.evaluated_boundaries
+    );
+    assert!(
+        auto_profile.current_profile_changes <= 2,
+        "auto fast-modulation profile hysteresis regressed: current profile changed {} times",
+        auto_profile.current_profile_changes
+    );
+    assert!(
+        auto_profile.target_profile_changes <= 2,
+        "auto fast-modulation profile hysteresis regressed: target profile changed {} times",
+        auto_profile.target_profile_changes
+    );
+    assert!(
+        auto_profile.policy_profile_changes <= 2,
+        "auto fast-modulation profile hysteresis regressed: policy profile changed {} times",
+        auto_profile.policy_profile_changes
+    );
+    assert!(
+        auto_stats.p95_ratio <= fixed_mix_stats.p95_ratio * 0.80 + 0.05,
+        "auto fast-modulation profile hysteresis regressed (p95): auto {:.3} vs fixed mix {:.3}",
+        auto_stats.p95_ratio,
+        fixed_mix_stats.p95_ratio
+    );
+    assert!(
+        auto_stats.p98_ratio <= fixed_mix_stats.p98_ratio * 0.80 + 0.05,
+        "auto fast-modulation profile hysteresis regressed (p98): auto {:.3} vs fixed mix {:.3}",
+        auto_stats.p98_ratio,
+        fixed_mix_stats.p98_ratio
+    );
+    assert!(
+        auto_stats.mean_ratio <= fixed_mix_stats.mean_ratio * 0.85 + 0.05,
+        "auto fast-modulation profile hysteresis regressed (mean): auto {:.3} vs fixed mix {:.3}",
+        auto_stats.mean_ratio,
+        fixed_mix_stats.mean_ratio
+    );
+}
+
+#[test]
 fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
     let sample_rate = 44_100u32;
     let bpm = 126.0;
