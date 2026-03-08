@@ -662,6 +662,14 @@ impl RtProcessor {
     }
 
     fn engage_ratio_motion_freeze_if_needed(&mut self, next_ratio: f64) {
+        if !self.auto_profile_switching {
+            // Fixed-profile mode should not accumulate latent modulation holds
+            // that can leak back in when auto switching is re-enabled.
+            self.ratio_motion_freeze_blocks_left = 0;
+            self.post_ratio_motion_profile_hold_blocks_left = 0;
+            self.reset_ratio_motion_history();
+            return;
+        }
         if self.config.ratio_motion_freeze_blocks == 0 || !next_ratio.is_finite() {
             return;
         }
@@ -2903,6 +2911,84 @@ mod tests {
             disabled.policy_profile,
             LatencyProfile::Scratch,
             "policy telemetry should stay aligned with the preserved manual target"
+        );
+    }
+
+    #[test]
+    fn fixed_profile_mode_does_not_rearm_ratio_motion_freeze_on_new_modulation() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Render;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+        let scratch_hints = Arc::new(RenderHints {
+            transient_confidence: 0.90,
+            tonal_confidence: 0.10,
+            noise_confidence: 0.20,
+            ..RenderHints::default()
+        });
+
+        rt.set_auto_profile_switching(false);
+        rt.set_constant_ratio(1.035);
+        rt.set_hint_snapshot(Arc::clone(&scratch_hints));
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+
+        let fixed_mode = rt.profile_telemetry();
+        assert!(!fixed_mode.auto_switching_enabled);
+        assert_eq!(
+            fixed_mode.current_profile,
+            LatencyProfile::Render,
+            "fixed profile mode should keep the committed render profile under new modulation"
+        );
+        assert_eq!(
+            fixed_mode.target_profile,
+            LatencyProfile::Render,
+            "fixed profile mode should not retarget while auto switching is disabled"
+        );
+        assert_eq!(
+            rt.ratio_motion_freeze_blocks_left, 0,
+            "new modulation should not re-arm the ratio-motion freeze while auto switching is disabled"
+        );
+        assert_eq!(
+            rt.post_ratio_motion_profile_hold_blocks_left, 0,
+            "fixed profile mode should not queue a post-freeze profile hold"
+        );
+        assert_eq!(
+            rt.ratio_motion_history_len, 0,
+            "fixed profile mode should not accumulate ratio-motion history for later auto-mode reuse"
+        );
+
+        rt.set_auto_profile_switching(true);
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+
+        let resumed = rt.profile_telemetry();
+        assert!(resumed.auto_switching_enabled);
+        assert_eq!(
+            rt.ratio_motion_freeze_blocks_left, 0,
+            "re-enabling auto mode should start from a clean modulation-hold state"
+        );
+        assert_eq!(
+            resumed.target_profile,
+            LatencyProfile::Scratch,
+            "once auto mode resumes, the same scratch-biased modulation should be evaluated immediately instead of inheriting a stale fixed-mode hold"
+        );
+        assert!(
+            resumed.transition_blocks_left > 0,
+            "resuming auto mode should still retarget through a transition instead of snapping profiles"
         );
     }
 
