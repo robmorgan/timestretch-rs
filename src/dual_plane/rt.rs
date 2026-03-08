@@ -554,6 +554,9 @@ impl RtProcessor {
         self.policy_profile = profile;
         self.profile_candidate = profile;
         self.profile_candidate_streak = 0;
+        // Manual overrides should not inherit an auto-mode modulation hold.
+        self.ratio_motion_freeze_blocks_left = 0;
+        self.reset_ratio_motion_history();
         self.post_ratio_motion_profile_hold_blocks_left = 0;
         self.set_latency_profile_internal(profile);
     }
@@ -2760,6 +2763,78 @@ mod tests {
         assert_eq!(
             telemetry.callback_budget,
             LatencyProfile::Scratch.callback_budget()
+        );
+    }
+
+    #[test]
+    fn manual_latency_profile_switch_clears_active_ratio_motion_freeze() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Mix;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+
+        rt.set_constant_ratio(1.035);
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        let scratch_hold = rt.profile_telemetry();
+        assert_eq!(scratch_hold.current_profile, LatencyProfile::Scratch);
+        assert_eq!(scratch_hold.target_profile, LatencyProfile::Scratch);
+        assert_eq!(
+            rt.ratio_motion_freeze_blocks_left, 1,
+            "test setup should leave one modulation-hold block armed"
+        );
+
+        rt.set_latency_profile(LatencyProfile::Render);
+        assert_eq!(
+            rt.ratio_motion_freeze_blocks_left, 0,
+            "manual overrides should clear the active ratio-motion freeze so the queued profile transition can advance"
+        );
+        let queued_transition = rt.profile_transition_blocks_left;
+        let queued_crossfade = rt.crossfade_blocks_left;
+        let manual = rt.profile_telemetry();
+        assert!(!manual.auto_switching_enabled);
+        assert_eq!(manual.current_profile, LatencyProfile::Scratch);
+        assert_eq!(manual.target_profile, LatencyProfile::Render);
+        assert_eq!(manual.current_tier, QualityTier::Q1);
+        assert_eq!(manual.target_tier, QualityTier::Q4);
+        assert!(
+            queued_transition > 0,
+            "manual override should queue a profile transition back toward render"
+        );
+        assert!(
+            queued_crossfade > 0,
+            "manual override should queue a tier crossfade back toward render defaults"
+        );
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+
+        let post_override = rt.profile_telemetry();
+        assert_eq!(
+            post_override.current_profile,
+            LatencyProfile::Scratch,
+            "the first post-override kernel should keep the previous profile active while the manual transition is still in flight"
+        );
+        assert_eq!(post_override.target_profile, LatencyProfile::Render);
+        assert_eq!(
+            post_override.transition_blocks_left,
+            queued_transition.saturating_sub(1),
+            "manual override should advance the queued profile transition instead of zeroing it during a stale freeze hold"
+        );
+        assert!(
+            rt.crossfade_blocks_left < queued_crossfade,
+            "manual override should also advance the queued tier crossfade on the next committed kernel"
         );
     }
 
