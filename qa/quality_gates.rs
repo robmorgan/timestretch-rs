@@ -1840,6 +1840,197 @@ fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
 }
 
 #[test]
+fn quality_gate_dual_plane_short_interval_auto_profile_regression() {
+    let sample_rate = 44_100u32;
+    let bpm = 126.0;
+    let callback_frames = 256usize;
+    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
+    let input = mono_to_stereo_interleaved(&mono);
+    let ratios = [0.965, 1.035, 0.975, 1.025];
+
+    let (auto_out, auto_boundaries, auto_profile) =
+        run_dual_plane_deterministic_with_ratio_steps_mode(
+            &input,
+            sample_rate,
+            callback_frames,
+            &ratios,
+            1,
+            DeterministicProfileMode::Auto,
+        );
+    let (fixed_mix_out, fixed_mix_boundaries, fixed_mix_profile) =
+        run_dual_plane_deterministic_with_ratio_steps_mode(
+            &input,
+            sample_rate,
+            callback_frames,
+            &ratios,
+            1,
+            DeterministicProfileMode::Fixed(LatencyProfile::Mix),
+        );
+    let (fixed_scratch_out, fixed_scratch_boundaries, fixed_scratch_profile) =
+        run_dual_plane_deterministic_with_ratio_steps_mode(
+            &input,
+            sample_rate,
+            callback_frames,
+            &ratios,
+            1,
+            DeterministicProfileMode::Fixed(LatencyProfile::Scratch),
+        );
+
+    for (label, output) in [
+        ("auto", &auto_out),
+        ("fixed-mix", &fixed_mix_out),
+        ("fixed-scratch", &fixed_scratch_out),
+    ] {
+        assert!(
+            output.iter().all(|sample| sample.is_finite()),
+            "short-interval auto-profile regression produced non-finite output for {label}"
+        );
+        assert!(
+            !output.is_empty(),
+            "short-interval auto-profile regression produced empty output for {label}"
+        );
+    }
+
+    let trim = 16usize;
+    let positions = |boundaries: &[usize], signal_len: usize| -> Vec<usize> {
+        let relevant = if boundaries.len() > trim * 2 {
+            &boundaries[trim..boundaries.len() - trim]
+        } else {
+            boundaries
+        };
+        relevant
+            .iter()
+            .copied()
+            .filter(|&pos| pos > 1 && pos + 1 < signal_len)
+            .collect()
+    };
+    let window = (sample_rate as f64 * 0.008).round() as usize;
+    let guard = (sample_rate as f64 * 0.001).round() as usize;
+
+    let auto_left = extract_left_channel(&auto_out);
+    let fixed_mix_left = extract_left_channel(&fixed_mix_out);
+    let fixed_scratch_left = extract_left_channel(&fixed_scratch_out);
+    let auto_stats = boundary_artifact_stats(
+        &auto_left,
+        &positions(&auto_boundaries, auto_left.len()),
+        window,
+        guard,
+    );
+    let fixed_mix_stats = boundary_artifact_stats(
+        &fixed_mix_left,
+        &positions(&fixed_mix_boundaries, fixed_mix_left.len()),
+        window,
+        guard,
+    );
+    let fixed_scratch_stats = boundary_artifact_stats(
+        &fixed_scratch_left,
+        &positions(&fixed_scratch_boundaries, fixed_scratch_left.len()),
+        window,
+        guard,
+    );
+
+    println!(
+        "short-interval auto-profile regression: auto(p95={:.3},p98={:.3},mean={:.3},profiles={}) fixed-mix(p95={:.3},p98={:.3},mean={:.3},profiles={}) fixed-scratch(p95={:.3},p98={:.3},mean={:.3},profiles={})",
+        auto_stats.p95_ratio,
+        auto_stats.p98_ratio,
+        auto_stats.mean_ratio,
+        auto_profile.summary(),
+        fixed_mix_stats.p95_ratio,
+        fixed_mix_stats.p98_ratio,
+        fixed_mix_stats.mean_ratio,
+        fixed_mix_profile.summary(),
+        fixed_scratch_stats.p95_ratio,
+        fixed_scratch_stats.p98_ratio,
+        fixed_scratch_stats.mean_ratio,
+        fixed_scratch_profile.summary()
+    );
+
+    write_quality_dashboard_csv(
+        "quality_gate_dual_plane_short_interval_auto_profile_regression",
+        "auto_p95,auto_p98,auto_mean,auto_current_profile_changes,auto_target_profile_changes,auto_policy_profile_changes,fixed_mix_p95,fixed_mix_p98,fixed_mix_mean,fixed_scratch_p95,fixed_scratch_p98,fixed_scratch_mean",
+        &format!(
+            "{:.6},{:.6},{:.6},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
+            auto_stats.p95_ratio,
+            auto_stats.p98_ratio,
+            auto_stats.mean_ratio,
+            auto_profile.current_profile_changes,
+            auto_profile.target_profile_changes,
+            auto_profile.policy_profile_changes,
+            fixed_mix_stats.p95_ratio,
+            fixed_mix_stats.p98_ratio,
+            fixed_mix_stats.mean_ratio,
+            fixed_scratch_stats.p95_ratio,
+            fixed_scratch_stats.p98_ratio,
+            fixed_scratch_stats.mean_ratio
+        ),
+    );
+
+    assert!(
+        auto_stats.evaluated_boundaries >= 32
+            && fixed_mix_stats.evaluated_boundaries >= 32
+            && fixed_scratch_stats.evaluated_boundaries >= 32,
+        "short-interval auto-profile regression evaluated too few boundaries (auto={}, fixed_mix={}, fixed_scratch={})",
+        auto_stats.evaluated_boundaries,
+        fixed_mix_stats.evaluated_boundaries,
+        fixed_scratch_stats.evaluated_boundaries
+    );
+    let auto_final = auto_profile
+        .last
+        .expect("short-interval auto-profile regression should observe profile telemetry");
+    assert_eq!(
+        auto_final.current_profile,
+        LatencyProfile::Mix,
+        "short-interval auto-profile regression should keep the active profile on mix"
+    );
+    assert_eq!(
+        auto_final.target_profile,
+        LatencyProfile::Mix,
+        "short-interval auto-profile regression should keep the target profile on mix"
+    );
+    assert_eq!(
+        auto_final.policy_profile,
+        LatencyProfile::Mix,
+        "short-interval auto-profile regression should keep the policy profile on mix"
+    );
+    assert_eq!(
+        auto_profile.current_profile_changes, 0,
+        "short-interval auto-profile regression should not churn the current profile"
+    );
+    assert_eq!(
+        auto_profile.target_profile_changes, 0,
+        "short-interval auto-profile regression should not churn the target profile"
+    );
+    assert_eq!(
+        auto_profile.policy_profile_changes, 0,
+        "short-interval auto-profile regression should not churn the policy profile"
+    );
+    assert!(
+        auto_stats.p95_ratio <= fixed_mix_stats.p95_ratio + 0.02,
+        "short-interval auto-profile regression diverged from fixed mix (p95): auto {:.3} vs fixed mix {:.3}",
+        auto_stats.p95_ratio,
+        fixed_mix_stats.p95_ratio
+    );
+    assert!(
+        auto_stats.p98_ratio <= fixed_mix_stats.p98_ratio + 0.03,
+        "short-interval auto-profile regression diverged from fixed mix (p98): auto {:.3} vs fixed mix {:.3}",
+        auto_stats.p98_ratio,
+        fixed_mix_stats.p98_ratio
+    );
+    assert!(
+        auto_stats.mean_ratio <= fixed_mix_stats.mean_ratio + 0.02,
+        "short-interval auto-profile regression diverged from fixed mix (mean): auto {:.3} vs fixed mix {:.3}",
+        auto_stats.mean_ratio,
+        fixed_mix_stats.mean_ratio
+    );
+    assert!(
+        auto_stats.p95_ratio <= fixed_scratch_stats.p95_ratio * 0.90 + 0.05,
+        "short-interval auto-profile regression failed to stay below scratch-biased artifacts (p95): auto {:.3} vs fixed scratch {:.3}",
+        auto_stats.p95_ratio,
+        fixed_scratch_stats.p95_ratio
+    );
+}
+
+#[test]
 fn quality_gate_dual_plane_profile_transition_commit_artifacts() {
     let sample_rate = 44_100u32;
     let callback_frames = 256usize;
