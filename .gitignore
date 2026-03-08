@@ -8,3 +8,4 @@ web/target/
 desktop/target/
 benchmarks/audio/
 .codex-loop/
+.codex-plan-loop/

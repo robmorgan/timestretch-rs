@@ -64,7 +64,7 @@
 ## Migration Plan
 1. Introduce dual-plane modules in parallel with `StreamProcessor` (done).
 2. Add parity tests between `StreamProcessor` deterministic mode and RT plane (done).
-3. Route `StreamingEngine::Deterministic` to dual-plane RT core behind opt-in flag (done).
+3. Route deterministic streaming to dual-plane RT core by default (done).
 4. Move remaining adaptive logic from `src/stretch/hybrid.rs` into analysis snapshots (done).
 5. Add CI gates for callback p99/p999, RT heap activity, long-run drift, and fast-modulation artifacts (done).
 

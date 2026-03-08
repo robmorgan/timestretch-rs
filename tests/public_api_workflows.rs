@@ -85,7 +85,6 @@ fn from_tempo_streaming_workflow_handles_midstream_changes() {
     for (chunk_idx, chunk) in input.data.chunks(2048).enumerate() {
         if chunk_idx == 6 {
             assert!(processor.set_tempo(130.0));
-            processor.set_hybrid_mode(true);
         }
         output.extend_from_slice(&processor.process(chunk).unwrap());
     }
@@ -94,7 +93,6 @@ fn from_tempo_streaming_workflow_handles_midstream_changes() {
     let ratio = output.len() as f64 / input.data.len().max(1) as f64;
     assert_eq!(processor.source_bpm(), Some(128.0));
     assert_eq!(processor.target_bpm(), Some(130.0));
-    assert!(processor.is_hybrid_mode());
     assert!(!output.is_empty());
     assert!(output.iter().all(|s| s.is_finite()));
     assert!(

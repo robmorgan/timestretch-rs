@@ -1,5 +1,5 @@
 use std::f32::consts::PI;
-use timestretch::{EdmPreset, StreamProcessor, StreamingEngine, StretchParams};
+use timestretch::{EdmPreset, StreamProcessor, StretchParams};
 
 fn stereo_input(sample_rate: u32, frames: usize) -> Vec<f32> {
     let mut input = Vec::with_capacity(frames * 2);
@@ -34,8 +34,6 @@ fn fixed_buffer_budget_helpers_cover_public_callback_flow() {
         .with_hop_size(256);
     let mut vec_proc = StreamProcessor::new(params.clone());
     let mut fixed_proc = StreamProcessor::new(params);
-    vec_proc.set_streaming_engine(StreamingEngine::Deterministic);
-    fixed_proc.set_streaming_engine(StreamingEngine::Deterministic);
     vec_proc.set_pitch_scale(1.05).unwrap();
     fixed_proc.set_pitch_scale(1.05).unwrap();
 
@@ -108,8 +106,6 @@ fn fixed_buffer_callbacks_match_vec_flush_on_irregular_stream_lengths() {
         .with_hop_size(256);
     let mut vec_proc = StreamProcessor::new(params.clone());
     let mut fixed_proc = StreamProcessor::new(params);
-    vec_proc.set_streaming_engine(StreamingEngine::Deterministic);
-    fixed_proc.set_streaming_engine(StreamingEngine::Deterministic);
     vec_proc.set_pitch_scale(1.07).unwrap();
     fixed_proc.set_pitch_scale(1.07).unwrap();
 
@@ -172,8 +168,6 @@ fn fixed_buffer_queued_output_helper_drains_midstream_pending_exactly() {
         .with_hop_size(256);
     let mut vec_proc = StreamProcessor::new(params.clone());
     let mut fixed_proc = StreamProcessor::new(params);
-    vec_proc.set_streaming_engine(StreamingEngine::Deterministic);
-    fixed_proc.set_streaming_engine(StreamingEngine::Deterministic);
     vec_proc.set_pitch_scale(1.05).unwrap();
     fixed_proc.set_pitch_scale(1.05).unwrap();
 
@@ -226,8 +220,6 @@ fn fixed_buffer_next_process_budget_drains_queued_and_new_output_in_one_callback
         .with_hop_size(256);
     let mut vec_proc = StreamProcessor::new(params.clone());
     let mut fixed_proc = StreamProcessor::new(params);
-    vec_proc.set_streaming_engine(StreamingEngine::Deterministic);
-    fixed_proc.set_streaming_engine(StreamingEngine::Deterministic);
     vec_proc.set_pitch_scale(1.05).unwrap();
     fixed_proc.set_pitch_scale(1.05).unwrap();
 

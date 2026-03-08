@@ -133,8 +133,8 @@ Notes:
 ## Phase D - Dual-Plane Migration Completion (Open)
 
 ### D1. Make Dual-Plane Deterministic the Default Runtime
-- [x] Route `StreamingEngine::Deterministic` through `DualPlaneProcessor` by default (remove opt-in toggle requirement).
-- [x] Preserve legacy path only behind explicit `StreamingEngine::LegacyHybridRerender`.
+- [x] Route deterministic streaming through `DualPlaneProcessor` by default (remove opt-in toggle requirement).
+- [x] Remove legacy hybrid rerender path.
 - [x] Keep behavior-compatible fallback for unsupported deterministic features until parity is complete.
 
 Acceptance:

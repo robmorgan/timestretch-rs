@@ -1,5 +1,5 @@
 use timestretch::analysis::comparison;
-use timestretch::{RtConfig, RtProcessor, StreamProcessor, StreamingEngine, StretchParams};
+use timestretch::{RtConfig, RtProcessor, StreamProcessor, StretchParams};
 
 fn synth_stereo_signal(frames: usize, sample_rate: u32) -> Vec<f32> {
     let mut out = Vec::with_capacity(frames * 2);
@@ -33,7 +33,6 @@ fn run_stream_deterministic(
 ) -> Vec<f32> {
     let channels = params.channels.count().max(1);
     let mut processor = StreamProcessor::new(params);
-    processor.set_streaming_engine(StreamingEngine::Deterministic);
     let mut out = Vec::with_capacity(input_interleaved.len() * 2);
     for chunk in input_interleaved.chunks(chunk_frames * channels) {
         processor.process_into(chunk, &mut out).unwrap();
@@ -50,7 +49,6 @@ fn run_stream_deterministic_modulated(
 ) -> Vec<f32> {
     let channels = params.channels.count().max(1);
     let mut processor = StreamProcessor::new(params);
-    processor.set_streaming_engine(StreamingEngine::Deterministic);
     processor
         .set_dual_plane_deterministic(dual_plane)
         .expect("fresh-stream dual-plane toggle should succeed");

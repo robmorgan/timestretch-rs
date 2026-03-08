@@ -75,7 +75,7 @@ let output = timestretch::stretch(&input, &params).unwrap();
 ### Real-Time Streaming
 
 ```rust
-use timestretch::{EdmPreset, QualityMode, StreamProcessor, StreamingEngine, StretchParams};
+use timestretch::{EdmPreset, QualityMode, StreamProcessor, StretchParams};
 
 let params = StretchParams::new(1.02)
     .with_preset(EdmPreset::DjBeatmatch)
@@ -84,8 +84,6 @@ let params = StretchParams::new(1.02)
     .with_quality_mode(QualityMode::Balanced);
 
 let mut processor = StreamProcessor::new(params);
-processor.set_streaming_engine(StreamingEngine::Deterministic); // default realtime path
-// processor.set_streaming_engine(StreamingEngine::LegacyHybridRerender); // optional legacy hybrid path
 let mut output_chunk = Vec::with_capacity(8192); // pre-allocate once
 
 // Feed chunks as they arrive from your audio driver
@@ -110,7 +108,7 @@ Use these deterministic APIs when the host owns the callback buffer and you
 need bounded output budgets instead of `Vec` append semantics.
 
 ```rust
-use timestretch::{EdmPreset, StreamProcessor, StreamingEngine, StretchParams};
+use timestretch::{EdmPreset, StreamProcessor, StretchParams};
 
 let params = StretchParams::new(1.02)
     .with_preset(EdmPreset::DjBeatmatch)
@@ -118,7 +116,6 @@ let params = StretchParams::new(1.02)
     .with_channels(2);
 
 let mut processor = StreamProcessor::new(params);
-processor.set_streaming_engine(StreamingEngine::Deterministic); // required
 
 let input_chunk = vec![0.0f32; 256 * 2];
 let callback_capacity = processor
@@ -170,11 +167,9 @@ rt.flush(&mut out).unwrap();
 ### Tempo-Aware Streaming (DJ)
 
 ```rust
-use timestretch::{StreamProcessor, StreamingEngine};
+use timestretch::StreamProcessor;
 
 let mut processor = StreamProcessor::from_tempo(126.0, 128.0, 44100, 2);
-processor.set_streaming_engine(StreamingEngine::Deterministic); // default
-// processor.set_streaming_engine(StreamingEngine::LegacyHybridRerender); // optional legacy path
 
 // Move the target deck tempo during playback
 processor.set_tempo(130.0);
@@ -418,9 +413,8 @@ See `benchmarks/README.md` for corpus setup and manifest/checksum requirements.
 - **`EdmPreset`** — enum of tuned parameter sets for EDM workflows
 - **`EnvelopePreset`** — formant/envelope profile (`Off`, `Balanced`, `Vocal`)
 - **`QualityMode`** — explicit streaming profile: `LowLatency` (lean path, HPSS off), `Balanced`, `MaxQuality` (HPSS + adaptive crossfade/phase-lock enabled)
-- **`StreamingEngine`** — streaming execution model: `Deterministic` (default) or `LegacyHybridRerender` (opt-in)
 - **`StreamProcessor`** — chunked real-time processor with on-the-fly ratio/tempo
-  changes, `from_tempo()`/`set_tempo()`, `set_streaming_engine()`, plus both
+  changes, `from_tempo()`/`set_tempo()`, plus both
   `Vec`-append (`process_into()`/`flush_into()`) and fixed-buffer interleaved
   (`process_interleaved_into()`/`flush_interleaved_into()`) deterministic APIs
 - **`PreAnalysisArtifact`** — serializable offline beat/onset analysis artifact

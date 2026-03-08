@@ -112,7 +112,7 @@ fn test_streaming_chunk_sweep_zero_crossings_and_safety() {
 
     for &bs in &[64usize, 128, 256, 512, 1024, 2048] {
         let output =
-            run_streaming_mono(&input, parity_params(ratio), bs, false).expect("streaming failed");
+            run_streaming_mono(&input, parity_params(ratio), bs).expect("streaming failed");
         assert!(
             !output.is_empty(),
             "streaming produced no output for chunk_size={}",
@@ -164,7 +164,7 @@ fn test_streaming_chunk_sweep_amplitude_mapping() {
 
     for &bs in &[64usize, 128, 256, 512, 1024, 2048] {
         let output =
-            run_streaming_mono(&input, parity_params(ratio), bs, false).expect("streaming failed");
+            run_streaming_mono(&input, parity_params(ratio), bs).expect("streaming failed");
         let mut prev = 0.0f64;
         let mut abs_error_sum = 0.0f64;
 

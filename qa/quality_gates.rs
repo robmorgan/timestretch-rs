@@ -34,6 +34,22 @@ fn generate_gate_signal(sample_rate: u32, bpm: f64, duration_secs: f64) -> Vec<f
     out
 }
 
+fn generate_harmonic_bed(sample_rate: u32, duration_secs: f64) -> Vec<f32> {
+    let total_samples = (sample_rate as f64 * duration_secs) as usize;
+    let mut out = vec![0.0f32; total_samples];
+
+    for (i, sample) in out.iter_mut().enumerate().take(total_samples) {
+        let t = i as f32 / sample_rate as f32;
+        let slow_env = 0.88 + 0.12 * (2.0 * PI * 0.27 * t).sin();
+        *sample += slow_env * 0.28 * (2.0 * PI * 110.0 * t).sin();
+        *sample += slow_env * 0.18 * (2.0 * PI * 220.0 * t).sin();
+        *sample += slow_env * 0.10 * (2.0 * PI * 330.0 * t).sin();
+        *sample += slow_env * 0.06 * (2.0 * PI * 660.0 * t).sin();
+    }
+
+    out
+}
+
 fn mono_to_stereo_interleaved(mono: &[f32]) -> Vec<f32> {
     let mut stereo = Vec::with_capacity(mono.len() * 2);
     for &s in mono {
@@ -68,6 +84,13 @@ struct ProfileTransitionStats {
     target_tier_changes: usize,
     observed_callbacks: usize,
     last: Option<RtProfileTelemetry>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProfileChangeTrace {
+    callback_output_frames: Vec<usize>,
+    current_profile_change_callbacks: Vec<usize>,
+    current_profile_change_profiles: Vec<LatencyProfile>,
 }
 
 impl ProfileTransitionStats {
@@ -1018,6 +1041,92 @@ fn run_dual_plane_deterministic_with_ratio_steps_mode(
     (output, boundaries, profile_stats)
 }
 
+fn run_dual_plane_deterministic_with_ratio_steps_mode_trace(
+    input: &[f32],
+    sample_rate: u32,
+    callback_frames: usize,
+    ratios: &[f64],
+    hold_callbacks: usize,
+    mode: DeterministicProfileMode,
+) -> (
+    Vec<f32>,
+    Vec<usize>,
+    ProfileTransitionStats,
+    ProfileChangeTrace,
+) {
+    let params = StretchParams::new(1.0)
+        .with_sample_rate(sample_rate)
+        .with_channels(2)
+        .with_fft_size(1024)
+        .with_hop_size(256)
+        .with_preset(EdmPreset::DjBeatmatch);
+    let mut processor = StreamProcessor::new(params);
+    assert!(
+        processor.is_dual_plane_deterministic(),
+        "deterministic stream should default to dual-plane backend"
+    );
+    configure_deterministic_profile_mode(&mut processor, mode);
+    assert!(!ratios.is_empty(), "ratio step schedule must not be empty");
+
+    let chunk_samples = callback_frames * 2;
+    let mut output = Vec::with_capacity((input.len() as f64 * 1.75) as usize + 32_768);
+    let mut boundaries = Vec::with_capacity(input.len() / chunk_samples + 1);
+    let mut profile_stats = ProfileTransitionStats::default();
+    let mut trace = ProfileChangeTrace::default();
+
+    for (idx, chunk) in input.chunks(chunk_samples).enumerate() {
+        let schedule_idx = idx / hold_callbacks.max(1);
+        let ratio = ratios[schedule_idx % ratios.len()];
+        processor
+            .set_stretch_ratio(ratio)
+            .expect("ratio step modulation must stay in valid range");
+        processor
+            .process_into(chunk, &mut output)
+            .expect("dual-plane stream process_into failed");
+        let telemetry = processor
+            .deterministic_profile_telemetry()
+            .expect("dual-plane deterministic telemetry should stay available");
+        if let Some(last) = profile_stats.last {
+            if last.current_profile != telemetry.current_profile {
+                trace.current_profile_change_callbacks.push(idx);
+                trace
+                    .current_profile_change_profiles
+                    .push(telemetry.current_profile);
+            }
+        }
+        profile_stats.observe(telemetry);
+        let output_frames = output.len() / 2;
+        trace.callback_output_frames.push(output_frames);
+        push_boundary_if_advanced(&mut boundaries, output_frames);
+    }
+    processor
+        .flush_into(&mut output)
+        .expect("dual-plane stream flush_into failed");
+    push_boundary_if_advanced(&mut boundaries, output.len() / 2);
+
+    (output, boundaries, profile_stats, trace)
+}
+
+fn positions_from_callback_trace(
+    callback_output_frames: &[usize],
+    callbacks: &[usize],
+    signal_len: usize,
+) -> Vec<usize> {
+    let mut positions = Vec::with_capacity(callbacks.len());
+    for &callback_idx in callbacks {
+        let Some(&position) = callback_output_frames.get(callback_idx) else {
+            continue;
+        };
+        if position <= 1 || position + 1 >= signal_len {
+            continue;
+        }
+        if positions.last().copied() != Some(position) {
+            positions.push(position);
+        }
+    }
+    positions
+}
+
 #[test]
 fn quality_gate_dual_plane_deterministic_long_run_drift() {
     let sample_rate = 44_100u32;
@@ -1633,6 +1742,172 @@ fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
     assert_eq!(
         modulated_profile.policy_profile_changes, 0,
         "short-interval modulation should not churn the policy profile"
+    );
+}
+
+#[test]
+fn quality_gate_dual_plane_profile_transition_commit_artifacts() {
+    let sample_rate = 44_100u32;
+    let callback_frames = 256usize;
+    let hold_callbacks = 24usize;
+    let mono = generate_harmonic_bed(sample_rate, 8.0);
+    let input = mono_to_stereo_interleaved(&mono);
+    let ratios = [1.18, 1.70, 1.18];
+
+    let (auto_out, _auto_boundaries, auto_profile, auto_trace) =
+        run_dual_plane_deterministic_with_ratio_steps_mode_trace(
+            &input,
+            sample_rate,
+            callback_frames,
+            &ratios,
+            hold_callbacks,
+            DeterministicProfileMode::Auto,
+        );
+    let (fixed_mix_out, _fixed_mix_boundaries, fixed_mix_profile, fixed_mix_trace) =
+        run_dual_plane_deterministic_with_ratio_steps_mode_trace(
+            &input,
+            sample_rate,
+            callback_frames,
+            &ratios,
+            hold_callbacks,
+            DeterministicProfileMode::Fixed(LatencyProfile::Mix),
+        );
+    let (fixed_scratch_out, _fixed_scratch_boundaries, fixed_scratch_profile, fixed_scratch_trace) =
+        run_dual_plane_deterministic_with_ratio_steps_mode_trace(
+            &input,
+            sample_rate,
+            callback_frames,
+            &ratios,
+            hold_callbacks,
+            DeterministicProfileMode::Fixed(LatencyProfile::Scratch),
+        );
+
+    for (label, output) in [
+        ("auto", &auto_out),
+        ("fixed-mix", &fixed_mix_out),
+        ("fixed-scratch", &fixed_scratch_out),
+    ] {
+        assert!(
+            output.iter().all(|sample| sample.is_finite()),
+            "profile-transition commit gate produced non-finite output for {label}"
+        );
+        assert!(
+            !output.is_empty(),
+            "profile-transition commit gate produced empty output for {label}"
+        );
+    }
+
+    let auto_scratch_changes = auto_trace
+        .current_profile_change_profiles
+        .iter()
+        .filter(|&&profile| profile == LatencyProfile::Scratch)
+        .count();
+    assert!(
+        auto_scratch_changes > 0,
+        "profile-transition commit gate should observe at least one scratch commit, saw scratch={} ({})",
+        auto_scratch_changes,
+        auto_profile.summary()
+    );
+
+    let window = (sample_rate as f64 * 0.008).round() as usize;
+    let guard = (sample_rate as f64 * 0.001).round() as usize;
+    let auto_left = extract_left_channel(&auto_out);
+    let fixed_mix_left = extract_left_channel(&fixed_mix_out);
+    let fixed_scratch_left = extract_left_channel(&fixed_scratch_out);
+    let auto_positions = positions_from_callback_trace(
+        &auto_trace.callback_output_frames,
+        &auto_trace.current_profile_change_callbacks,
+        auto_left.len(),
+    );
+    let fixed_mix_positions = positions_from_callback_trace(
+        &fixed_mix_trace.callback_output_frames,
+        &auto_trace.current_profile_change_callbacks,
+        fixed_mix_left.len(),
+    );
+    let fixed_scratch_positions = positions_from_callback_trace(
+        &fixed_scratch_trace.callback_output_frames,
+        &auto_trace.current_profile_change_callbacks,
+        fixed_scratch_left.len(),
+    );
+
+    let auto_stats = boundary_artifact_stats(&auto_left, &auto_positions, window, guard);
+    let fixed_mix_stats =
+        boundary_artifact_stats(&fixed_mix_left, &fixed_mix_positions, window, guard);
+    let fixed_scratch_stats =
+        boundary_artifact_stats(&fixed_scratch_left, &fixed_scratch_positions, window, guard);
+
+    println!(
+        "profile-transition commit gate: auto(p95={:.3},p98={:.3},mean={:.3},n={},profiles={}) fixed-mix(p95={:.3},p98={:.3},mean={:.3},n={},profiles={}) fixed-scratch(p95={:.3},p98={:.3},mean={:.3},n={},profiles={})",
+        auto_stats.p95_ratio,
+        auto_stats.p98_ratio,
+        auto_stats.mean_ratio,
+        auto_stats.evaluated_boundaries,
+        auto_profile.summary(),
+        fixed_mix_stats.p95_ratio,
+        fixed_mix_stats.p98_ratio,
+        fixed_mix_stats.mean_ratio,
+        fixed_mix_stats.evaluated_boundaries,
+        fixed_mix_profile.summary(),
+        fixed_scratch_stats.p95_ratio,
+        fixed_scratch_stats.p98_ratio,
+        fixed_scratch_stats.mean_ratio,
+        fixed_scratch_stats.evaluated_boundaries,
+        fixed_scratch_profile.summary()
+    );
+
+    write_quality_dashboard_csv(
+        "quality_gate_dual_plane_profile_transition_commit_artifacts",
+        "auto_p95,auto_p98,auto_mean,auto_n,auto_scratch_changes,fixed_mix_p95,fixed_mix_p98,fixed_mix_mean,fixed_mix_n,fixed_scratch_p95,fixed_scratch_p98,fixed_scratch_mean,fixed_scratch_n",
+        &format!(
+            "{:.6},{:.6},{:.6},{},{},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{}",
+            auto_stats.p95_ratio,
+            auto_stats.p98_ratio,
+            auto_stats.mean_ratio,
+            auto_stats.evaluated_boundaries,
+            auto_scratch_changes,
+            fixed_mix_stats.p95_ratio,
+            fixed_mix_stats.p98_ratio,
+            fixed_mix_stats.mean_ratio,
+            fixed_mix_stats.evaluated_boundaries,
+            fixed_scratch_stats.p95_ratio,
+            fixed_scratch_stats.p98_ratio,
+            fixed_scratch_stats.mean_ratio,
+            fixed_scratch_stats.evaluated_boundaries
+        ),
+    );
+
+    assert!(
+        auto_stats.evaluated_boundaries >= 1
+            && fixed_mix_stats.evaluated_boundaries >= 1
+            && fixed_scratch_stats.evaluated_boundaries >= 1,
+        "profile-transition commit gate evaluated too few commit boundaries (auto={}, fixed_mix={}, fixed_scratch={})",
+        auto_stats.evaluated_boundaries,
+        fixed_mix_stats.evaluated_boundaries,
+        fixed_scratch_stats.evaluated_boundaries
+    );
+
+    let endpoint_p95 = fixed_mix_stats.p95_ratio.max(fixed_scratch_stats.p95_ratio);
+    let endpoint_p98 = fixed_mix_stats.p98_ratio.max(fixed_scratch_stats.p98_ratio);
+    let endpoint_mean = fixed_mix_stats
+        .mean_ratio
+        .max(fixed_scratch_stats.mean_ratio);
+    assert!(
+        auto_stats.p95_ratio <= endpoint_p95 * 1.20 + 0.10,
+        "profile-transition commit gate regressed (p95): auto {:.3} vs fixed endpoint {:.3}",
+        auto_stats.p95_ratio,
+        endpoint_p95
+    );
+    assert!(
+        auto_stats.p98_ratio <= endpoint_p98 * 1.25 + 0.15,
+        "profile-transition commit gate regressed (p98): auto {:.3} vs fixed endpoint {:.3}",
+        auto_stats.p98_ratio,
+        endpoint_p98
+    );
+    assert!(
+        auto_stats.mean_ratio <= endpoint_mean * 1.20 + 0.10,
+        "profile-transition commit gate regressed (mean): auto {:.3} vs fixed endpoint {:.3}",
+        auto_stats.mean_ratio,
+        endpoint_mean
     );
 }
 

@@ -7,7 +7,7 @@
 //! Run with: cargo run --example realtime_stream
 
 use std::f32::consts::PI;
-use timestretch::{EdmPreset, StreamProcessor, StreamingEngine, StretchParams};
+use timestretch::{EdmPreset, StreamProcessor, StretchParams};
 
 fn main() {
     let sample_rate = 44100u32;
@@ -137,7 +137,6 @@ fn main() {
         .with_sample_rate(sample_rate)
         .with_channels(2);
     let mut processor = StreamProcessor::new(params);
-    processor.set_streaming_engine(StreamingEngine::Deterministic);
 
     let stereo_input = mono_to_stereo_interleaved(&generate_house_pattern(sample_rate, 128.0, 2.0));
     let input_chunk_samples = 256 * 2;

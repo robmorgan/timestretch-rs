@@ -30,7 +30,7 @@
 //! For real-time use, feed audio in chunks via [`StreamProcessor`]:
 //!
 //! ```no_run
-//! use timestretch::{EdmPreset, StreamProcessor, StreamingEngine, StretchParams};
+//! use timestretch::{EdmPreset, StreamProcessor, StretchParams};
 //!
 //! let params = StretchParams::new(1.0)
 //!     .with_preset(EdmPreset::DjBeatmatch)
@@ -38,7 +38,6 @@
 //!     .with_channels(2);
 //!
 //! let mut processor = StreamProcessor::new(params);
-//! processor.set_streaming_engine(StreamingEngine::Deterministic); // default
 //!
 //! let input_chunk = vec![0.0f32; 256 * 2];
 //! let mut output_chunk = Vec::with_capacity(1_024);
@@ -54,14 +53,13 @@
 //! contract instead of relying on hardcoded guesses:
 //!
 //! ```no_run
-//! use timestretch::{EdmPreset, StreamProcessor, StreamingEngine, StretchParams};
+//! use timestretch::{EdmPreset, StreamProcessor, StretchParams};
 //!
 //! let params = StretchParams::new(1.02)
 //!     .with_preset(EdmPreset::DjBeatmatch)
 //!     .with_sample_rate(44_100)
 //!     .with_channels(2);
 //! let mut processor = StreamProcessor::new(params);
-//! processor.set_streaming_engine(StreamingEngine::Deterministic);
 //!
 //! let input_chunk = vec![0.0f32; 256 * 2];
 //! let callback_capacity = processor
@@ -109,7 +107,7 @@ pub use dual_plane::{
     RtDelayTelemetry, RtProcessor, RtProfileTelemetry, RtRuntimeTelemetry, TimeWarpMap, WarpAnchor,
 };
 pub use error::StretchError;
-pub use stream::{StreamProcessor, StreamingEngine, TransientResetStats};
+pub use stream::{StreamProcessor, TransientResetStats};
 pub use stretch::phase_locking::PhaseLockingMode;
 pub use stretch::stereo::StereoMode;
 
