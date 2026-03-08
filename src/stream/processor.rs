@@ -271,6 +271,7 @@ struct DualPlaneDeterministicState {
     ratio_window_blocks: usize,
     recent_chunk_ratios: Vec<f64>,
     last_requested_exact_unity: bool,
+    last_ratio_history_side: i8,
     last_ratio: f64,
     last_output_samples: Vec<f32>,
     has_last_output_samples: bool,
@@ -307,6 +308,7 @@ impl DualPlaneDeterministicState {
             ratio_window_blocks: kernel_frames.div_ceil(block_frames).max(1),
             recent_chunk_ratios: Vec::new(),
             last_requested_exact_unity: false,
+            last_ratio_history_side: 0,
             last_ratio: ratio,
             last_output_samples: vec![0.0; num_channels],
             has_last_output_samples: false,
@@ -320,28 +322,30 @@ impl DualPlaneDeterministicState {
         let requested_exact_unity = (requested_ratio - 1.0).abs() <= RATIO_SNAP_THRESHOLD;
         if requested_exact_unity || self.last_requested_exact_unity {
             self.recent_chunk_ratios.clear();
+            self.last_ratio_history_side = 0;
         }
-        if let Some(&last_chunk_ratio) = self.recent_chunk_ratios.last() {
-            let next_side = ratio_modulation_side(ratio);
-            let requested_side = ratio_modulation_side(requested_ratio);
-            let last_side = ratio_modulation_side(last_chunk_ratio);
-            let effective_side = if requested_side != 0 {
-                requested_side
-            } else {
-                next_side
-            };
-            if effective_side != 0 && last_side != 0 && effective_side != last_side {
-                // Drop stale opposite-side history as soon as the requested
-                // modulation flips across unity, even if smoothing has not
-                // yet carried the applied ratio onto the new side.
-                self.recent_chunk_ratios.clear();
-            }
+        let next_side = ratio_modulation_side(ratio);
+        let requested_side = ratio_modulation_side(requested_ratio);
+        let effective_side = if requested_side != 0 {
+            requested_side
+        } else {
+            next_side
+        };
+        if effective_side != 0
+            && self.last_ratio_history_side != 0
+            && effective_side != self.last_ratio_history_side
+        {
+            // Drop stale opposite-side history as soon as the requested
+            // modulation flips across unity, even if smoothing has not yet
+            // carried the applied ratio onto the new side.
+            self.recent_chunk_ratios.clear();
         }
         if self.recent_chunk_ratios.len() == self.ratio_window_blocks {
             self.recent_chunk_ratios.remove(0);
         }
         self.recent_chunk_ratios.push(ratio);
         self.last_requested_exact_unity = requested_exact_unity;
+        self.last_ratio_history_side = effective_side;
         let sum: f64 = self.recent_chunk_ratios.iter().sum();
         sum / self.recent_chunk_ratios.len().max(1) as f64
     }
@@ -350,6 +354,7 @@ impl DualPlaneDeterministicState {
     fn reset_ratio_history(&mut self, ratio: f64) {
         self.recent_chunk_ratios.clear();
         self.last_requested_exact_unity = false;
+        self.last_ratio_history_side = 0;
         self.last_ratio = ratio;
         if (ratio - 1.0).abs() <= RATIO_SNAP_THRESHOLD {
             self.pending_unity_exit_seam = false;
@@ -3311,6 +3316,39 @@ mod tests {
             state.recent_chunk_ratios,
             vec![1.028],
             "the first post-plateau modulation callback should start a fresh same-side averaging window"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_deterministic_ratio_history_resets_on_requested_bounce_before_crossing_unity(
+    ) {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        assert!((state.push_chunk_ratio(1.035, 1.035) - 1.035).abs() < 1e-9);
+        assert!((state.push_chunk_ratio(1.025, 1.025) - 1.03).abs() < 1e-9);
+        assert_eq!(state.recent_chunk_ratios.len(), 2);
+
+        let toward_below_unity = state.push_chunk_ratio(1.012, 0.965);
+        assert!(
+            (toward_below_unity - 1.012).abs() < 1e-9,
+            "a requested cross-unity move should start a fresh window immediately even before the applied ratio crosses unity"
+        );
+        assert_eq!(state.recent_chunk_ratios, vec![1.012]);
+
+        let bounced_back_above_unity = state.push_chunk_ratio(1.021, 1.03);
+        assert!(
+            (bounced_back_above_unity - 1.021).abs() < 1e-9,
+            "a one-callback bounce back above unity should not average against the stale pre-bounce transition history"
+        );
+        assert_eq!(
+            state.recent_chunk_ratios,
+            vec![1.021],
+            "rapid requested direction flips should segment ratio history by requested modulation side, not by the still-lagging applied ratio"
         );
     }
 
