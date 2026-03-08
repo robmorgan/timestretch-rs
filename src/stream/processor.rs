@@ -312,14 +312,20 @@ impl DualPlaneDeterministicState {
     }
 
     #[inline]
-    fn push_chunk_ratio(&mut self, ratio: f64) -> f64 {
+    fn push_chunk_ratio(&mut self, ratio: f64, requested_ratio: f64) -> f64 {
         if let Some(&last_chunk_ratio) = self.recent_chunk_ratios.last() {
             let next_side = ratio_modulation_side(ratio);
+            let requested_side = ratio_modulation_side(requested_ratio);
             let last_side = ratio_modulation_side(last_chunk_ratio);
-            if next_side != 0 && last_side != 0 && next_side != last_side {
-                // Drop stale opposite-side history so short-interval
-                // cross-unity modulation does not average into a false
-                // near-unity backend step at the transition.
+            let effective_side = if requested_side != 0 {
+                requested_side
+            } else {
+                next_side
+            };
+            if effective_side != 0 && last_side != 0 && effective_side != last_side {
+                // Drop stale opposite-side history as soon as the requested
+                // modulation flips across unity, even if smoothing has not
+                // yet carried the applied ratio onto the new side.
                 self.recent_chunk_ratios.clear();
             }
         }
@@ -1469,6 +1475,7 @@ impl StreamProcessor {
         self.interpolate_ratio_for_frames(frames);
         self.expected_total_output_samples += input.len() as f64 * self.current_ratio;
         let processing_ratio = self.processing_ratio();
+        let target_processing_ratio = self.target_ratio * self.pitch_scale;
         let sample_rate = self.params.sample_rate;
         let unity_exit_seam_frames = self.params.hop_size.min(DUAL_PLANE_UNITY_EXIT_SEAM_FRAMES);
 
@@ -1501,7 +1508,8 @@ impl StreamProcessor {
                 state.reset_ratio_history(1.0);
             } else {
                 let exiting_exact_unity = (state.last_ratio - 1.0).abs() <= RATIO_SNAP_THRESHOLD;
-                let averaged_ratio = state.push_chunk_ratio(processing_ratio);
+                let averaged_ratio =
+                    state.push_chunk_ratio(processing_ratio, target_processing_ratio);
                 let applied_ratio = smooth_ratio_toward(
                     state.last_ratio,
                     averaged_ratio,
@@ -3192,18 +3200,45 @@ mod tests {
             .with_hop_size(256);
         let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
 
-        let first_average = state.push_chunk_ratio(1.035);
+        let first_average = state.push_chunk_ratio(1.035, 1.035);
         assert!((first_average - 1.035).abs() < 1e-9);
-        let plateau_average = state.push_chunk_ratio(1.025);
+        let plateau_average = state.push_chunk_ratio(1.025, 1.025);
         assert!((plateau_average - 1.03).abs() < 1e-9);
         assert_eq!(state.recent_chunk_ratios.len(), 2);
 
-        let cross_unity_average = state.push_chunk_ratio(0.965);
+        let cross_unity_average = state.push_chunk_ratio(0.965, 0.965);
         assert!(
             (cross_unity_average - 0.965).abs() < 1e-9,
             "cross-unity modulation should clear stale opposite-side history before averaging"
         );
         assert_eq!(state.recent_chunk_ratios, vec![0.965]);
+    }
+
+    #[test]
+    fn test_dual_plane_deterministic_ratio_history_resets_on_requested_cross_unity() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        let first_average = state.push_chunk_ratio(1.035, 1.035);
+        assert!((first_average - 1.035).abs() < 1e-9);
+        let plateau_average = state.push_chunk_ratio(1.025, 1.025);
+        assert!((plateau_average - 1.03).abs() < 1e-9);
+        assert_eq!(state.recent_chunk_ratios.len(), 2);
+
+        let requested_cross_unity_average = state.push_chunk_ratio(1.012, 0.965);
+        assert!(
+            (requested_cross_unity_average - 1.012).abs() < 1e-9,
+            "an opposite-side modulation request should clear stale same-side history before the smoothed ratio fully crosses unity"
+        );
+        assert_eq!(
+            state.recent_chunk_ratios,
+            vec![1.012],
+            "requested cross-unity modulation should start a fresh averaging window from the first transition callback"
+        );
     }
 
     #[test]
