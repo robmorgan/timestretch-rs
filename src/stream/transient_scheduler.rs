@@ -190,7 +190,11 @@ impl TransientEventScheduler {
             let start = frame_idx * self.hop_size;
             let absolute_frame_start = absolute_frame_origin.saturating_add(start);
             if let Some(last_start) = self.last_processed_frame_start {
-                if absolute_frame_start <= last_start {
+                // Require one full-hop of absolute forward progress before a
+                // new scheduler pass can rescan the same transient region.
+                // This prevents sub-hop-overlapped callbacks from burning the
+                // cooldown on nearly identical FFT windows.
+                if absolute_frame_start < last_start.saturating_add(self.hop_size) {
                     continue;
                 }
             }
@@ -552,6 +556,66 @@ mod tests {
             scheduler.cooldown_frames,
             FLUX_RESET_COOLDOWN_FRAMES.max(fft.div_ceil(hop).saturating_sub(1)),
             "detected events should keep the full configured cooldown for subsequent analysis frames"
+        );
+    }
+
+    #[test]
+    fn scheduler_sub_hop_overlap_does_not_advance_cursor_or_burn_cooldown() {
+        let sr = 44_100u32;
+        let fft = 1024usize;
+        let hop = 256usize;
+        let callback_frames = 4096usize;
+        let half_hop = hop / 2;
+        let total_frames = callback_frames + half_hop;
+        let mut stereo = vec![0.0f32; total_frames * 2];
+        for i in 0..total_frames {
+            let t = i as f32 / sr as f32;
+            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
+            // Align the click so only the final scanned analysis frame in the
+            // first callback sees it.
+            let click = if (3840..3860).contains(&i) { 2.0 } else { 0.0 };
+            stereo[i * 2] = base + click;
+            stereo[i * 2 + 1] = base * 0.9 + click;
+        }
+
+        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, callback_frames);
+        let first = scheduler.detect_stereo_reset_mask(&stereo[..callback_frames * 2], 0);
+        assert!(
+            first.is_some(),
+            "expected initial tail transient reset mask"
+        );
+        assert_eq!(
+            scheduler.last_processed_frame_start,
+            Some(3072),
+            "tail click should advance the processed-frame cursor to the final schedulable frame"
+        );
+        let expected_cooldown = scheduler.reset_cooldown_frames();
+        assert_eq!(
+            scheduler.cooldown_frames, expected_cooldown,
+            "detected event should arm the full cooldown"
+        );
+
+        let shifted_start = half_hop * 2;
+        let shifted_end = shifted_start + callback_frames * 2;
+        let second =
+            scheduler.detect_stereo_reset_mask(&stereo[shifted_start..shifted_end], half_hop);
+        assert!(
+            second.is_none(),
+            "sub-hop-overlapped callback should not schedule a duplicate transient reset"
+        );
+        assert_eq!(
+            scheduler.last_processed_frame_start,
+            Some(3072),
+            "sub-hop-overlapped callback should not advance the processed-frame cursor"
+        );
+        assert_eq!(
+            scheduler.cooldown_frames, expected_cooldown,
+            "sub-hop-overlapped callback should not consume cooldown on nearly identical windows"
+        );
+        assert_eq!(
+            scheduler.stats().events_detected_total,
+            1,
+            "sub-hop-overlapped callback should not count as a fresh transient event"
         );
     }
 
