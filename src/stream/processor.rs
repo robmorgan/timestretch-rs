@@ -4188,6 +4188,72 @@ mod tests {
     }
 
     #[test]
+    fn test_dual_plane_short_interval_cross_unity_modulation_avoids_profile_churn() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut proc = StreamProcessor::new(params);
+        assert!(
+            proc.is_dual_plane_deterministic(),
+            "deterministic stream should default to the dual-plane backend"
+        );
+
+        let initial = proc
+            .deterministic_profile_telemetry()
+            .expect("dual-plane telemetry should be available");
+        assert_eq!(initial.current_profile, LatencyProfile::Mix);
+        assert_eq!(initial.target_profile, LatencyProfile::Mix);
+        assert_eq!(initial.policy_profile, LatencyProfile::Mix);
+        assert!(
+            initial.auto_switching_enabled,
+            "dual-plane deterministic profile switching should default to auto mode"
+        );
+
+        let chunk = [0.0f32; 256];
+        for (step_idx, ratio) in [1.035, 0.975, 1.025, 0.965, 1.035, 0.975]
+            .into_iter()
+            .enumerate()
+        {
+            proc.set_stretch_ratio(ratio).unwrap();
+            let output = proc.process(&chunk).unwrap();
+            assert!(
+                output.iter().all(|sample| sample.is_finite()),
+                "deterministic modulation should keep output finite during step {step_idx}"
+            );
+            let telemetry = proc
+                .deterministic_profile_telemetry()
+                .expect("dual-plane telemetry should remain available during modulation");
+            assert_eq!(
+                telemetry.current_profile,
+                LatencyProfile::Mix,
+                "short-interval deterministic modulation should keep the active profile on mix during step {step_idx}"
+            );
+            assert_eq!(
+                telemetry.target_profile,
+                LatencyProfile::Mix,
+                "short-interval deterministic modulation should keep the target profile on mix during step {step_idx}"
+            );
+            assert!(
+                telemetry.policy_profile == LatencyProfile::Mix,
+                "short-interval deterministic modulation should keep the policy profile on mix during step {step_idx}"
+            );
+            assert!(
+                telemetry.auto_switching_enabled,
+                "auto profile switching should remain enabled during deterministic modulation"
+            );
+        }
+        assert!(
+            proc.flush()
+                .unwrap()
+                .iter()
+                .all(|sample| sample.is_finite()),
+            "deterministic modulation flush should remain finite"
+        );
+    }
+
+    #[test]
     fn test_stereo_channel_reset_masks_mid_full_side_mid_high() {
         let full = [true, true, true, true];
         let (mid, side) = stereo_channel_reset_masks(full);
