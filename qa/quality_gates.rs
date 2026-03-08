@@ -1840,6 +1840,165 @@ fn quality_gate_dual_plane_short_interval_step_modulation_artifacts() {
 }
 
 #[test]
+fn quality_gate_dual_plane_repeated_unity_plateau_modulation_artifacts() {
+    let sample_rate = 44_100u32;
+    let bpm = 126.0;
+    let callback_frames = 256usize;
+    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
+    let input = mono_to_stereo_interleaved(&mono);
+    let ratios = [1.035, 1.025, 1.0, 1.0, 0.965, 0.975, 1.0, 1.0, 1.025, 1.035];
+
+    let (baseline_out, baseline_boundaries) = run_dual_plane_deterministic_with_ratio_modulation(
+        &input,
+        sample_rate,
+        callback_frames,
+        false,
+    );
+    let (modulated_out, modulated_boundaries, modulated_profile) =
+        run_dual_plane_deterministic_with_ratio_steps_mode(
+            &input,
+            sample_rate,
+            callback_frames,
+            &ratios,
+            1,
+            DeterministicProfileMode::Auto,
+        );
+
+    assert!(
+        baseline_out.iter().all(|s| s.is_finite()),
+        "baseline repeated-unity-plateau modulation gate produced non-finite samples"
+    );
+    assert!(
+        modulated_out.iter().all(|s| s.is_finite()),
+        "repeated-unity-plateau modulation gate produced non-finite samples"
+    );
+    assert!(
+        !baseline_out.is_empty() && !modulated_out.is_empty(),
+        "repeated-unity-plateau modulation gate produced empty output"
+    );
+
+    let baseline_left = extract_left_channel(&baseline_out);
+    let modulated_left = extract_left_channel(&modulated_out);
+    let trim = 16usize;
+    let baseline_positions: Vec<usize> = if baseline_boundaries.len() > trim * 2 {
+        baseline_boundaries[trim..baseline_boundaries.len() - trim].to_vec()
+    } else {
+        baseline_boundaries.clone()
+    }
+    .into_iter()
+    .filter(|&p| p > 1 && p + 1 < baseline_left.len())
+    .collect();
+    let modulated_positions: Vec<usize> = if modulated_boundaries.len() > trim * 2 {
+        modulated_boundaries[trim..modulated_boundaries.len() - trim].to_vec()
+    } else {
+        modulated_boundaries.clone()
+    }
+    .into_iter()
+    .filter(|&p| p > 1 && p + 1 < modulated_left.len())
+    .collect();
+    let window = (sample_rate as f64 * 0.008).round() as usize;
+    let guard = (sample_rate as f64 * 0.001).round() as usize;
+    let baseline_stats =
+        boundary_artifact_stats(&baseline_left, &baseline_positions, window, guard);
+    let modulated_stats =
+        boundary_artifact_stats(&modulated_left, &modulated_positions, window, guard);
+
+    println!(
+        "dual-plane-repeated-unity-plateau gate: baseline(max={:.3},p95={:.3},p98={:.3},mean={:.3},n={}) modulated(max={:.3},p95={:.3},p98={:.3},mean={:.3},n={},profiles={})",
+        baseline_stats.max_ratio,
+        baseline_stats.p95_ratio,
+        baseline_stats.p98_ratio,
+        baseline_stats.mean_ratio,
+        baseline_stats.evaluated_boundaries,
+        modulated_stats.max_ratio,
+        modulated_stats.p95_ratio,
+        modulated_stats.p98_ratio,
+        modulated_stats.mean_ratio,
+        modulated_stats.evaluated_boundaries,
+        modulated_profile.summary()
+    );
+
+    write_quality_dashboard_csv(
+        "quality_gate_dual_plane_repeated_unity_plateau_modulation_artifacts",
+        "baseline_max,baseline_p95,baseline_p98,baseline_mean,baseline_n,modulated_max,modulated_p95,modulated_p98,modulated_mean,modulated_n,modulated_current_profile_changes,modulated_target_profile_changes,modulated_policy_profile_changes",
+        &format!(
+            "{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{},{},{},{}",
+            baseline_stats.max_ratio,
+            baseline_stats.p95_ratio,
+            baseline_stats.p98_ratio,
+            baseline_stats.mean_ratio,
+            baseline_stats.evaluated_boundaries,
+            modulated_stats.max_ratio,
+            modulated_stats.p95_ratio,
+            modulated_stats.p98_ratio,
+            modulated_stats.mean_ratio,
+            modulated_stats.evaluated_boundaries,
+            modulated_profile.current_profile_changes,
+            modulated_profile.target_profile_changes,
+            modulated_profile.policy_profile_changes
+        ),
+    );
+
+    assert!(
+        baseline_stats.evaluated_boundaries >= 32 && modulated_stats.evaluated_boundaries >= 32,
+        "repeated-unity-plateau modulation gate evaluated too few boundaries (baseline={}, modulated={})",
+        baseline_stats.evaluated_boundaries,
+        modulated_stats.evaluated_boundaries
+    );
+    assert!(
+        modulated_stats.p95_ratio <= baseline_stats.p95_ratio * 2.4 + 0.9,
+        "repeated-unity-plateau modulation gate failed (p95): modulated {:.3} vs baseline {:.3}",
+        modulated_stats.p95_ratio,
+        baseline_stats.p95_ratio
+    );
+    assert!(
+        modulated_stats.p98_ratio <= baseline_stats.p98_ratio * 2.8 + 1.2,
+        "repeated-unity-plateau modulation gate failed (p98): modulated {:.3} vs baseline {:.3}",
+        modulated_stats.p98_ratio,
+        baseline_stats.p98_ratio
+    );
+    assert!(
+        modulated_stats.mean_ratio <= baseline_stats.mean_ratio * 2.1 + 0.9,
+        "repeated-unity-plateau modulation gate failed (mean): modulated {:.3} vs baseline {:.3}",
+        modulated_stats.mean_ratio,
+        baseline_stats.mean_ratio
+    );
+    let modulated_final = modulated_profile
+        .last
+        .expect("repeated-unity-plateau modulation gate should observe profile telemetry");
+    assert_eq!(
+        modulated_final.current_profile,
+        LatencyProfile::Mix,
+        "repeated-unity-plateau modulation should keep the active profile on mix"
+    );
+    assert_eq!(
+        modulated_final.target_profile,
+        LatencyProfile::Mix,
+        "repeated-unity-plateau modulation should keep the target profile on mix"
+    );
+    assert_eq!(
+        modulated_final.policy_profile,
+        LatencyProfile::Mix,
+        "repeated-unity-plateau modulation should keep the policy profile on mix"
+    );
+    assert!(
+        modulated_profile.current_profile_changes <= 2,
+        "repeated-unity-plateau modulation regressed: current profile changed {} times",
+        modulated_profile.current_profile_changes
+    );
+    assert!(
+        modulated_profile.target_profile_changes <= 2,
+        "repeated-unity-plateau modulation regressed: target profile changed {} times",
+        modulated_profile.target_profile_changes
+    );
+    assert!(
+        modulated_profile.policy_profile_changes <= 2,
+        "repeated-unity-plateau modulation regressed: policy profile changed {} times",
+        modulated_profile.policy_profile_changes
+    );
+}
+
+#[test]
 fn quality_gate_dual_plane_short_interval_auto_profile_regression() {
     let sample_rate = 44_100u32;
     let bpm = 126.0;
