@@ -748,10 +748,11 @@ impl RtProcessor {
 
     #[inline]
     fn observe_governor_block(&mut self, elapsed: Duration) {
-        let tier = self.governor.observe_block(elapsed);
-        if !self.ratio_motion_freeze_active() && !self.profile_transition_active() {
-            self.set_target_tier(tier);
+        if self.ratio_motion_freeze_active() || self.profile_transition_active() {
+            return;
         }
+        let tier = self.governor.observe_block(elapsed);
+        self.set_target_tier(tier);
     }
 
     /// Returns cumulative realtime runtime telemetry.
@@ -1446,7 +1447,9 @@ impl RtProcessor {
         self.config.latency_profile = profile;
         profile.apply_governor_defaults(&mut self.config.governor);
         self.governor.set_config(self.config.governor);
-        self.governor.set_tier(profile.initial_tier());
+        // Keep the governor pinned to the committed tier until the profile
+        // retarget crossfade actually commits.
+        self.governor.set_tier(self.current_tier);
         self.set_target_tier(profile.initial_tier());
     }
 
@@ -1544,6 +1547,7 @@ impl RtProcessor {
         if self.crossfade_blocks_left == 0 {
             self.blend_weights = self.target_weights;
             self.current_tier = self.target_tier;
+            self.governor.set_tier(self.current_tier);
             return;
         }
         let denom = self.crossfade_blocks_left as f32;
@@ -1554,6 +1558,7 @@ impl RtProcessor {
         if self.crossfade_blocks_left == 0 {
             self.blend_weights = self.target_weights;
             self.current_tier = self.target_tier;
+            self.governor.set_tier(self.current_tier);
         }
     }
 
@@ -4204,6 +4209,11 @@ mod tests {
             "governor tier observations must not retarget the tier while the profile transition is still in flight"
         );
         assert_eq!(
+            rt.governor.tier(),
+            QualityTier::Q1,
+            "governor observations must keep the seeded scratch-tier state pinned while the profile transition is still in flight"
+        );
+        assert_eq!(
             rt.crossfade_blocks_left, initial_crossfade,
             "blocking tier retargets during the profile transition should keep the queued crossfade stable"
         );
@@ -4219,6 +4229,11 @@ mod tests {
             settled.target_tier,
             QualityTier::Q2,
             "once the profile transition settles, governor tier promotions should be allowed to retarget the scratch tier"
+        );
+        assert_eq!(
+            rt.governor.tier(),
+            QualityTier::Q2,
+            "once the profile transition settles, the governor should advance from the committed tier instead of a stale in-flight target"
         );
     }
 
