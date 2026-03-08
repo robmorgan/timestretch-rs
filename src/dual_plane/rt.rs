@@ -568,6 +568,8 @@ impl RtProcessor {
             self.policy_profile = self.target_profile;
             self.profile_candidate = self.target_profile;
             self.profile_candidate_streak = 0;
+            self.ratio_motion_freeze_blocks_left = 0;
+            self.reset_ratio_motion_history();
             self.post_ratio_motion_profile_hold_blocks_left = 0;
         }
     }
@@ -2838,6 +2840,69 @@ mod tests {
         assert!(
             rt.crossfade_blocks_left < queued_crossfade,
             "manual override should also advance the queued tier crossfade on the next committed kernel"
+        );
+    }
+
+    #[test]
+    fn disabling_auto_profile_switching_clears_active_ratio_motion_freeze() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Mix;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+
+        rt.set_constant_ratio(1.035);
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+
+        let held = rt.profile_telemetry();
+        assert_eq!(held.current_profile, LatencyProfile::Scratch);
+        assert_eq!(held.target_profile, LatencyProfile::Scratch);
+        assert_eq!(
+            rt.ratio_motion_freeze_blocks_left, 1,
+            "test setup should leave one modulation-hold block armed"
+        );
+
+        rt.set_auto_profile_switching(false);
+
+        let disabled = rt.profile_telemetry();
+        assert!(!disabled.auto_switching_enabled);
+        assert_eq!(
+            rt.ratio_motion_freeze_blocks_left, 0,
+            "disabling auto switching should clear the inherited ratio-motion freeze"
+        );
+        assert_eq!(
+            rt.ratio_motion_history_len, 0,
+            "disabling auto switching should clear stale ratio-motion history"
+        );
+        assert_eq!(
+            rt.post_ratio_motion_profile_hold_blocks_left, 0,
+            "disabling auto switching should cancel any queued post-freeze profile hold"
+        );
+        assert_eq!(
+            disabled.current_profile,
+            LatencyProfile::Scratch,
+            "disabling auto should preserve the currently committed profile"
+        );
+        assert_eq!(
+            disabled.target_profile,
+            LatencyProfile::Scratch,
+            "disabling auto should preserve the already selected target profile"
+        );
+        assert_eq!(
+            disabled.policy_profile,
+            LatencyProfile::Scratch,
+            "policy telemetry should stay aligned with the preserved manual target"
         );
     }
 

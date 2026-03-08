@@ -3,11 +3,11 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
+use timestretch::stretch::HybridStretcher;
 use timestretch::{
     analysis::comparison, EdmPreset, LatencyProfile, RtProfileTelemetry, StreamProcessor,
     StretchParams,
 };
-use timestretch::stretch::HybridStretcher;
 
 const STRICT_CALLBACK_BUDGET_ENV: &str = "TIMESTRETCH_STRICT_CALLBACK_BUDGET";
 const CALLBACK_BUDGET_MULTIPLIER_ENV: &str = "TIMESTRETCH_CALLBACK_BUDGET_MULTIPLIER";
@@ -325,8 +325,7 @@ fn stream_hybrid(input: &[f32], params: StretchParams, chunk_size: usize) -> Vec
         let skip = (*tail_output_len).min(rendered.len());
         let delta_len = rendered.len().saturating_sub(skip);
         let ratio_scale = params.stretch_ratio.max(1.0);
-        let xfade_base =
-            (HYBRID_STREAM_CROSSFADE_SAMPLES as f64 * ratio_scale).round() as usize;
+        let xfade_base = (HYBRID_STREAM_CROSSFADE_SAMPLES as f64 * ratio_scale).round() as usize;
         let xfade = xfade_base.min(skip).min(delta_len * 7 / 8);
 
         if !held_tail.is_empty() && xfade > 0 {
