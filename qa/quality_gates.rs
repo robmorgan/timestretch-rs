@@ -1544,6 +1544,49 @@ fn quality_gate_dual_plane_fixed_buffer_callback_toggle_write_cadence_regression
 }
 
 #[test]
+fn quality_gate_dual_plane_fixed_buffer_short_interval_plateau_write_cadence_regression() {
+    let sample_rate = 44_100u32;
+    let bpm = 126.0;
+    let callback_frames = 256usize;
+    let mono = generate_gate_signal(sample_rate, bpm, 8.0);
+    let input = mono_to_stereo_interleaved(&mono);
+
+    let callback_writes = run_dual_plane_deterministic_fixed_buffer_ratio_steps_callback_writes(
+        &input,
+        sample_rate,
+        callback_frames,
+        &[0.965, 1.035, 0.975, 1.025],
+        2,
+    );
+    let stats = callback_cadence_stats(&callback_writes);
+
+    println!(
+        "dual-plane-fixed-buffer-short-plateau-cadence: callbacks_after_first_output={} callbacks_with_output_after_first_output={} max_idle_gap_callbacks={}",
+        stats.callbacks_after_first_output,
+        stats.callbacks_with_output_after_first_output,
+        stats.max_idle_gap_callbacks
+    );
+
+    assert!(
+        stats.callbacks_after_first_output >= 64,
+        "fixed-buffer short-interval plateau cadence gate observed too little steady-state output (callbacks_after_first_output={})",
+        stats.callbacks_after_first_output
+    );
+    assert!(
+        stats.callbacks_with_output_after_first_output * 2
+            >= stats.callbacks_after_first_output,
+        "fixed-buffer short-interval plateau cadence gate regressed: only {} of {} callbacks emitted output after the first write",
+        stats.callbacks_with_output_after_first_output,
+        stats.callbacks_after_first_output
+    );
+    assert!(
+        stats.max_idle_gap_callbacks <= 4,
+        "fixed-buffer short-interval plateau cadence gate regressed: max idle gap {} callbacks",
+        stats.max_idle_gap_callbacks
+    );
+}
+
+#[test]
 fn quality_gate_dual_plane_callback_toggle_modulation_outlier_regression() {
     let sample_rate = 44_100u32;
     let bpm = 126.0;
