@@ -732,6 +732,70 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_mixed_sub_hop_callbacks_schedule_next_distinct_transient_once() {
+        let sr = 44_100u32;
+        let fft = 1024usize;
+        let hop = 256usize;
+        let callback_frames = 4096usize;
+        let quarter_hop = hop / 4;
+        let total_frames = callback_frames + hop * 5;
+        let mut stereo = vec![0.0f32; total_frames * 2];
+        for i in 0..total_frames {
+            let t = i as f32 / sr as f32;
+            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
+            // The first click is late enough to trigger near the end of the
+            // initial callback without being visible in the prior analysis
+            // frame. The second begins just after the last pre-cooldown
+            // window so it should fire on the first post-cooldown mixed
+            // callback that clears the full-hop gate.
+            let click_a = if (3328..3348).contains(&i) { 2.0 } else { 0.0 };
+            let click_b = if (4416..4496).contains(&i) { 4.0 } else { 0.0 };
+            let sample = base + click_a + click_b;
+            stereo[i * 2] = sample;
+            stereo[i * 2 + 1] = sample * 0.9;
+        }
+
+        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, callback_frames);
+        let mut triggered_origins = Vec::new();
+        for origin in [
+            0usize,
+            quarter_hop,
+            hop / 2,
+            hop - quarter_hop,
+            hop,
+            hop + quarter_hop,
+            hop + hop / 2,
+            hop + hop - quarter_hop,
+            hop * 2,
+            hop * 2 + quarter_hop,
+            hop * 2 + hop / 2,
+            hop * 2 + hop - quarter_hop,
+            hop * 3,
+            hop * 3 + quarter_hop,
+            hop * 3 + hop / 2,
+            hop * 3 + hop - quarter_hop,
+        ] {
+            let start = origin * 2;
+            let end = start + callback_frames * 2;
+            let mask = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin);
+            if mask.is_some() {
+                triggered_origins.push(origin);
+            }
+        }
+
+        assert_eq!(
+            triggered_origins,
+            vec![0, hop * 2 + quarter_hop],
+            "mixed sub-hop overlap should keep suppressing the first transient while still scheduling the next distinct transient exactly once"
+        );
+        assert_eq!(
+            scheduler.stats().events_detected_total,
+            2,
+            "two distinct transients should produce exactly two reset events across mixed sub-hop callbacks"
+        );
+    }
+
+    #[test]
     fn scheduler_broad_tail_transient_does_not_retrigger_across_overlapping_callbacks() {
         let sr = 44_100u32;
         let fft = 1024usize;
