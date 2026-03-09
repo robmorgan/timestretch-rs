@@ -160,6 +160,11 @@ fn ratio_modulation_side(ratio: f64) -> i8 {
     }
 }
 
+#[inline]
+fn dual_plane_ratio_in_unity_reset_zone(ratio: f64) -> bool {
+    (ratio - 1.0).abs() <= DUAL_PLANE_RATIO_HISTORY_UNITY_RESET_EPS
+}
+
 /// Stateful linear resampler used for realtime pitch control in stream mode.
 ///
 /// Maintains one-sample look-behind and a fractional source cursor so
@@ -395,7 +400,7 @@ impl DualPlaneDeterministicState {
         self.last_requested_direction = 0;
         self.last_ratio_history_side = 0;
         self.last_ratio = ratio;
-        if (ratio - 1.0).abs() <= RATIO_SNAP_THRESHOLD {
+        if dual_plane_ratio_in_unity_reset_zone(ratio) {
             self.pending_unity_exit_seam = false;
         }
     }
@@ -1563,7 +1568,8 @@ impl StreamProcessor {
                 }
                 state.reset_ratio_history(1.0);
             } else {
-                let exiting_exact_unity = (state.last_ratio - 1.0).abs() <= RATIO_SNAP_THRESHOLD;
+                let exiting_unity_reset_zone =
+                    dual_plane_ratio_in_unity_reset_zone(state.last_ratio);
                 let averaged_ratio =
                     state.push_chunk_ratio(processing_ratio, target_processing_ratio);
                 let applied_ratio = smooth_ratio_toward(
@@ -1574,7 +1580,9 @@ impl StreamProcessor {
                     DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS,
                 );
                 if (applied_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
-                    if exiting_exact_unity {
+                    if exiting_unity_reset_zone
+                        && !dual_plane_ratio_in_unity_reset_zone(applied_ratio)
+                    {
                         state.arm_unity_exit_seam();
                     }
                     apply_dual_plane_ratio(&mut state.processor, applied_ratio)?;
@@ -2943,6 +2951,45 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_processor_dual_plane_near_unity_exit_seam_is_smoothed() {
+        let params = StretchParams::new(1.003)
+            .with_sample_rate(44_100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        assert!(proc.is_dual_plane_deterministic());
+
+        let chunk_size = 4096 * 2;
+        let signal: Vec<f32> = (0..chunk_size * 4)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44_100.0).sin())
+            .collect();
+
+        let mut output = Vec::with_capacity(signal.len() * 2);
+        proc.process_into(&signal[..chunk_size * 3], &mut output)
+            .unwrap();
+        let boundary = output.len();
+        assert!(
+            boundary > 0,
+            "near-unity pre-roll should emit deterministic output"
+        );
+
+        proc.set_stretch_ratio(1.03).unwrap();
+        proc.process_into(&signal[chunk_size * 3..], &mut output)
+            .unwrap();
+
+        assert!(
+            output.len() > boundary,
+            "off-unity follow-up chunk should emit output after the near-unity exit"
+        );
+
+        let seam_diff = (output[boundary] - output[boundary - 1]).abs();
+        assert!(
+            seam_diff < 0.5,
+            "near-unity exit should not hard-jump at the first post-plateau output sample (diff={})",
+            seam_diff
+        );
+    }
+
+    #[test]
     fn test_stream_processor_rejects_nan() {
         let params = StretchParams::new(1.0)
             .with_sample_rate(44100)
@@ -3567,6 +3614,30 @@ mod tests {
         assert!(
             (state.unity_exit_seam_samples[0] - 0.375).abs() < 1e-12,
             "unity-exit seam smoothing should anchor from the last emitted sample instead of an initial placeholder"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_ratio_history_reset_clears_pending_near_unity_exit_seam() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        let channel_output_buffers = [vec![0.125, -0.25, 0.375]];
+        state.capture_last_output_samples(&channel_output_buffers, 3);
+        state.arm_unity_exit_seam();
+        assert!(
+            state.pending_unity_exit_seam,
+            "test setup should arm the carried seam anchor before entering a near-unity plateau"
+        );
+
+        state.reset_ratio_history(1.003);
+        assert!(
+            !state.pending_unity_exit_seam,
+            "entering the near-unity reset zone should clear any stale carried seam before the next modulation burst"
         );
     }
 
