@@ -98,6 +98,12 @@ pub struct PhaseVocoder {
     adaptive_phase_locking: bool,
     /// Short-lived state that tightens phase behavior right after a transient reset.
     transient_focus_frames: usize,
+    /// Previous effective ratio used to slew phase advance through a seam.
+    ratio_change_phase_from: f64,
+    /// Remaining frames in the phase-ratio continuity slew.
+    ratio_change_phase_frames: usize,
+    /// Total frames scheduled for the current phase-ratio continuity slew.
+    ratio_change_phase_total_frames: usize,
     /// Whether spectral envelope preservation is enabled.
     envelope_preservation: bool,
     /// Envelope correction strength (0 = off, 1 = full, >1 stronger).
@@ -319,6 +325,9 @@ impl PhaseVocoder {
             phase_locking_mode,
             adaptive_phase_locking: false,
             transient_focus_frames: 0,
+            ratio_change_phase_from: stretch_ratio,
+            ratio_change_phase_frames: 0,
+            ratio_change_phase_total_frames: 0,
             envelope_preservation,
             envelope_strength: 1.0,
             adaptive_envelope_order: true,
@@ -376,7 +385,9 @@ impl PhaseVocoder {
     /// post-change frames prefer tighter phase coherence at the seam.
     #[inline]
     pub fn set_stretch_ratio(&mut self, stretch_ratio: f64) {
-        let ratio_delta = (stretch_ratio - self.stretch_ratio).abs();
+        let prior_ratio = self.stretch_ratio;
+        let ratio_delta = (stretch_ratio - prior_ratio).abs();
+        let continuity_phase_from = self.continuity_focus_phase_ratio(prior_ratio);
         self.stretch_ratio = stretch_ratio;
         self.hop_synthesis = (self.hop_analysis as f64 * stretch_ratio).round() as usize;
         if ratio_delta >= RATIO_CHANGE_FOCUS_TRIGGER {
@@ -388,6 +399,9 @@ impl PhaseVocoder {
                 self.streaming_tail.len(),
                 self.hop_analysis,
             );
+            self.ratio_change_phase_from = continuity_phase_from;
+            self.ratio_change_phase_frames = continuity_focus_frames;
+            self.ratio_change_phase_total_frames = continuity_focus_frames;
             self.transient_focus_frames = self.transient_focus_frames.max(continuity_focus_frames);
         }
     }
@@ -403,6 +417,9 @@ impl PhaseVocoder {
         self.prev_phase.fill(0.0);
         self.phase_seed_pending.fill(true);
         self.transient_focus_frames = 0;
+        self.ratio_change_phase_frames = 0;
+        self.ratio_change_phase_total_frames = 0;
+        self.ratio_change_phase_from = self.stretch_ratio;
     }
 
     /// Enables or disables confidence-driven adaptive phase-lock switching.
@@ -823,6 +840,9 @@ impl PhaseVocoder {
             self.prev_phase.fill(0.0);
             self.phase_seed_pending.fill(true);
             self.transient_focus_frames = 0;
+            self.ratio_change_phase_frames = 0;
+            self.ratio_change_phase_total_frames = 0;
+            self.ratio_change_phase_from = self.stretch_ratio;
             self.synthesis_pos = 0.0;
             self.synthesis_emitted = 0;
         }
@@ -1052,6 +1072,7 @@ impl PhaseVocoder {
     fn advance_phases(&mut self, num_bins: usize, hop_ratio: f64) {
         let hop_a = self.hop_analysis as f64;
         let fft = self.fft_size as f64;
+        let phase_hop_ratio = self.continuity_focus_phase_ratio(hop_ratio);
 
         // --- Pass 1: Extract magnitudes and analysis phases ---
         for bin in 0..num_bins {
@@ -1107,7 +1128,7 @@ impl PhaseVocoder {
                 let expected_diff = self.expected_phase_advance[bin];
                 let phase_diff = phase - self.prev_phase[bin];
                 let deviation = wrap_phase_f64(phase_diff - expected_diff);
-                self.phase_accum[bin] += (expected_diff + deviation) * hop_ratio;
+                self.phase_accum[bin] += (expected_diff + deviation) * phase_hop_ratio;
             } else {
                 // Standard IF estimation:
                 //   phase_diff = current_phase - prev_phase
@@ -1154,12 +1175,12 @@ impl PhaseVocoder {
                         // Refined expected phase advance based on interpolated bin position
                         let refined_expected = TWO_PI_F64 * (bin as f64 + p) * hop_a / fft;
                         let refined_deviation = wrap_phase_f64(phase_diff - refined_expected);
-                        (refined_expected + refined_deviation) * hop_ratio
+                        (refined_expected + refined_deviation) * phase_hop_ratio
                     } else {
-                        (expected_diff + deviation) * hop_ratio
+                        (expected_diff + deviation) * phase_hop_ratio
                     }
                 } else {
-                    (expected_diff + deviation) * hop_ratio
+                    (expected_diff + deviation) * phase_hop_ratio
                 };
 
                 self.phase_accum[bin] += phase_advance;
@@ -1347,8 +1368,24 @@ impl PhaseVocoder {
     }
 
     #[inline]
+    fn continuity_focus_phase_ratio(&self, hop_ratio: f64) -> f64 {
+        if self.ratio_change_phase_frames == 0 || self.ratio_change_phase_total_frames == 0 {
+            return hop_ratio;
+        }
+
+        let remaining = self
+            .ratio_change_phase_frames
+            .min(self.ratio_change_phase_total_frames);
+        let completed = self.ratio_change_phase_total_frames - remaining;
+        let progress =
+            (completed as f64 + 1.0) / (self.ratio_change_phase_total_frames as f64 + 1.0);
+        self.ratio_change_phase_from + (hop_ratio - self.ratio_change_phase_from) * progress
+    }
+
+    #[inline]
     fn decay_transient_focus(&mut self) {
         self.transient_focus_frames = self.transient_focus_frames.saturating_sub(1);
+        self.ratio_change_phase_frames = self.ratio_change_phase_frames.saturating_sub(1);
     }
 }
 
@@ -2381,6 +2418,33 @@ mod tests {
         assert_eq!(
             pv.transient_focus_frames, RATIO_CHANGE_FOCUS_FRAMES,
             "follow-up ratio steps should refresh continuity focus so repeated short-interval modulation keeps seam locking tight"
+        );
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_restarts_phase_ratio_slew_from_current_effective_ratio() {
+        let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
+
+        pv.set_stretch_ratio(1.12);
+        assert!(
+            (pv.continuity_focus_phase_ratio(pv.stretch_ratio) - 1.03).abs() < 1e-12,
+            "the first continuity-focus frame should only move partway toward the new ratio"
+        );
+
+        pv.decay_transient_focus();
+        assert!(
+            (pv.continuity_focus_phase_ratio(pv.stretch_ratio) - 1.06).abs() < 1e-12,
+            "the effective phase ratio should keep gliding toward the target while the seam window drains"
+        );
+
+        pv.set_stretch_ratio(0.92);
+        assert!(
+            (pv.ratio_change_phase_from - 1.06).abs() < 1e-12,
+            "a repeated short-interval modulation step should restart from the in-flight effective phase ratio, not the stale previous target"
+        );
+        assert!(
+            (pv.continuity_focus_phase_ratio(pv.stretch_ratio) - 1.025).abs() < 1e-12,
+            "the restarted seam slew should glide from the current effective ratio into the new target instead of snapping in one callback"
         );
     }
 
