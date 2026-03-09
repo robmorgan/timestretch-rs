@@ -26,6 +26,12 @@ const FLUX_HIGH_WEIGHT: f64 = 1.25;
 const FLUX_MODULATION_THRESHOLD_SCALE_STEP: f64 = 0.08;
 /// Extra spike-ratio requirement per overlap window during modulation holds.
 const FLUX_MODULATION_SPIKE_RATIO_STEP: f64 = 0.05;
+/// Minimum upper-band share required before low-band-suppressed modulation
+/// converts a detected event into a mid/high phase reset.
+const FLUX_MODULATION_MIN_UPPER_SHARE: f64 = 0.55;
+/// Minimum upper-band energy relative to the adaptive threshold before
+/// modulation-hold events may reset only the upper bands.
+const FLUX_MODULATION_MIN_UPPER_THRESHOLD_SHARE: f64 = 0.35;
 /// Number of flux frames to observe before trigger checks.
 const FLUX_WARMUP_FRAMES: usize = 3;
 /// Maximum analysis frames scanned per scheduler pass.
@@ -174,6 +180,27 @@ impl TransientEventScheduler {
         (threshold_scale, spike_ratio)
     }
 
+    #[inline]
+    fn should_accept_upper_band_reset_during_modulation_hold(
+        &self,
+        sub_flux: f64,
+        low_flux: f64,
+        mid_flux: f64,
+        high_flux: f64,
+        threshold: f64,
+    ) -> bool {
+        let upper_flux = mid_flux + high_flux;
+        let total_flux = sub_flux + low_flux + upper_flux;
+        if total_flux <= 0.0 {
+            return false;
+        }
+
+        let upper_share = upper_flux / total_flux;
+        let upper_strength = upper_flux / threshold.max(1e-12);
+        upper_share >= FLUX_MODULATION_MIN_UPPER_SHARE
+            && upper_strength >= FLUX_MODULATION_MIN_UPPER_THRESHOLD_SHARE
+    }
+
     /// Detects a transient event from stereo interleaved input and returns a
     /// per-band reset mask when detected.
     ///
@@ -309,6 +336,14 @@ impl TransientEventScheduler {
                 let mut event_mask =
                     self.select_reset_mask(sub_flux, low_flux, mid_flux, high_flux, threshold);
                 if suppress_low_bands {
+                    if !self.should_accept_upper_band_reset_during_modulation_hold(
+                        sub_flux, low_flux, mid_flux, high_flux, threshold,
+                    ) {
+                        self.update_flux_stats(flux);
+                        self.prev_flux = flux;
+                        self.last_processed_frame_start = Some(absolute_frame_start);
+                        continue;
+                    }
                     event_mask[0] = false;
                     event_mask[1] = false;
                 }
@@ -408,7 +443,8 @@ impl TransientEventScheduler {
 #[cfg(test)]
 mod tests {
     use super::{
-        TransientEventScheduler, FLUX_MODULATION_SPIKE_RATIO_STEP,
+        TransientEventScheduler, FLUX_MODULATION_MIN_UPPER_SHARE,
+        FLUX_MODULATION_MIN_UPPER_THRESHOLD_SHARE, FLUX_MODULATION_SPIKE_RATIO_STEP,
         FLUX_MODULATION_THRESHOLD_SCALE_STEP, FLUX_RESET_COOLDOWN_FRAMES, FLUX_SPIKE_RATIO,
         MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS,
     };
@@ -625,6 +661,37 @@ mod tests {
                     + FLUX_MODULATION_SPIKE_RATIO_STEP
                         * MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS as f64),
             "low-band-suppressed modulation should require a proportionally larger frame-to-frame spike"
+        );
+    }
+
+    #[test]
+    fn scheduler_modulation_hold_rejects_low_dominant_event_without_clear_upper_attack() {
+        let scheduler = TransientEventScheduler::new(1024, 256, 44_100, 4096);
+        let threshold = 1.0;
+        let upper_flux = 0.34;
+        let total_flux = upper_flux / (FLUX_MODULATION_MIN_UPPER_SHARE - 0.01);
+        let low_flux = total_flux - upper_flux;
+
+        assert!(
+            !scheduler.should_accept_upper_band_reset_during_modulation_hold(
+                0.0, low_flux, upper_flux * 0.35, upper_flux * 0.65, threshold
+            ),
+            "modulation-hold mode should reject events whose energy stays mostly in the held low bands"
+        );
+    }
+
+    #[test]
+    fn scheduler_modulation_hold_accepts_clear_upper_band_attack() {
+        let scheduler = TransientEventScheduler::new(1024, 256, 44_100, 4096);
+        let threshold = 1.0;
+        let upper_flux = FLUX_MODULATION_MIN_UPPER_THRESHOLD_SHARE + 0.08;
+        let low_flux = upper_flux * (1.0 / FLUX_MODULATION_MIN_UPPER_SHARE - 1.0) * 0.6;
+
+        assert!(
+            scheduler.should_accept_upper_band_reset_during_modulation_hold(
+                0.0, low_flux, upper_flux * 0.45, upper_flux * 0.55, threshold
+            ),
+            "modulation-hold mode should still allow distinct upper-band attacks to reseed the vocoder"
         );
     }
 
