@@ -42,6 +42,9 @@ const TRANSIENT_FOCUS_FRAMES: usize = 3;
 const RATIO_CHANGE_FOCUS_FRAMES: usize = 3;
 /// Keep continuity focus active slightly longer when automation reverses direction mid-seam.
 const RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES: usize = 1;
+/// Keep continuity focus active slightly longer when a new step must re-anchor
+/// to an older carried seam that is still farther from unity than the in-flight ratio.
+const RATIO_CHANGE_CARRIED_SEAM_FOCUS_EXTRA_FRAMES: usize = 1;
 /// Ignore tiny ratio deltas that are below the modulation-seam risk zone.
 const RATIO_CHANGE_FOCUS_TRIGGER: f64 = 1e-3;
 /// Cap extra continuity-focus extension so long tails do not pin identity locking.
@@ -416,7 +419,9 @@ impl PhaseVocoder {
     pub fn set_stretch_ratio(&mut self, stretch_ratio: f64) {
         let prior_ratio = self.stretch_ratio;
         let ratio_delta = (stretch_ratio - prior_ratio).abs();
-        let mut continuity_phase_from = self.continuity_focus_phase_ratio(prior_ratio);
+        let in_flight_phase_ratio = self.continuity_focus_phase_ratio(prior_ratio);
+        let mut continuity_phase_from = in_flight_phase_ratio;
+        let mut reanchored_to_carried_seam = false;
         if !self.streaming_tail.is_empty() {
             let carried_phase_ratio = self.streaming_tail_phase_ratio;
             if ratio_is_meaningfully_above_unity(carried_phase_ratio)
@@ -430,6 +435,7 @@ impl PhaseVocoder {
                 // seam. Otherwise tiny automation steps can stop refreshing the
                 // seam hold while the older expansion tail is still audible.
                 continuity_phase_from = carried_phase_ratio;
+                reanchored_to_carried_seam = true;
             } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
                 && !ratio_is_meaningfully_below_unity(continuity_phase_from)
                 && !ratio_is_meaningfully_above_unity(stretch_ratio)
@@ -439,6 +445,7 @@ impl PhaseVocoder {
                 // that remain audibly below unity after the continuity window
                 // has drifted back toward neutral.
                 continuity_phase_from = carried_phase_ratio;
+                reanchored_to_carried_seam = true;
             } else if ratio_is_meaningfully_above_unity(carried_phase_ratio)
                 && ratio_is_meaningfully_below_unity(continuity_phase_from)
                 && !ratio_is_meaningfully_below_unity(stretch_ratio)
@@ -450,6 +457,7 @@ impl PhaseVocoder {
                 // an already-compressed phase ratio while the older expanded
                 // tail is still audible.
                 continuity_phase_from = carried_phase_ratio;
+                reanchored_to_carried_seam = true;
             } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
                 && ratio_is_meaningfully_above_unity(continuity_phase_from)
                 && !ratio_is_meaningfully_above_unity(stretch_ratio)
@@ -459,6 +467,7 @@ impl PhaseVocoder {
                 // expanded in-flight ratio while the older compressed overlap
                 // is still draining.
                 continuity_phase_from = carried_phase_ratio;
+                reanchored_to_carried_seam = true;
             } else if ratio_is_meaningfully_above_unity(carried_phase_ratio)
                 && ratio_is_meaningfully_below_unity(continuity_phase_from)
                 && stretch_ratio < continuity_phase_from - RATIO_CHANGE_FOCUS_TRIGGER
@@ -470,6 +479,7 @@ impl PhaseVocoder {
                 // ratio and leaves the unresolved expansion overlap to snap on
                 // the next callback.
                 continuity_phase_from = carried_phase_ratio;
+                reanchored_to_carried_seam = true;
             } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
                 && ratio_is_meaningfully_above_unity(continuity_phase_from)
                 && stretch_ratio > continuity_phase_from + RATIO_CHANGE_FOCUS_TRIGGER
@@ -478,6 +488,7 @@ impl PhaseVocoder {
                 // when automation rebounds across unity and immediately pushes
                 // farther into expansion before the older overlap drains.
                 continuity_phase_from = carried_phase_ratio;
+                reanchored_to_carried_seam = true;
             } else if ratio_is_meaningfully_above_unity(carried_phase_ratio)
                 && ratio_is_meaningfully_above_unity(continuity_phase_from)
                 && stretch_ratio + RATIO_CHANGE_FOCUS_TRIGGER < continuity_phase_from
@@ -488,6 +499,7 @@ impl PhaseVocoder {
                 // the restart anchored to that older seam so fast automation
                 // does not relax the overlap twice before it has fully drained.
                 continuity_phase_from = carried_phase_ratio;
+                reanchored_to_carried_seam = true;
             } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
                 && ratio_is_meaningfully_below_unity(continuity_phase_from)
                 && stretch_ratio - RATIO_CHANGE_FOCUS_TRIGGER > continuity_phase_from
@@ -496,6 +508,7 @@ impl PhaseVocoder {
                 // Mirror the same protection for unresolved compression seams
                 // when the target rebounds back toward unity without crossing it.
                 continuity_phase_from = carried_phase_ratio;
+                reanchored_to_carried_seam = true;
             } else if ratio_is_meaningfully_above_unity(carried_phase_ratio)
                 && ratio_is_meaningfully_above_unity(continuity_phase_from)
                 && stretch_ratio > continuity_phase_from + RATIO_CHANGE_FOCUS_TRIGGER
@@ -507,6 +520,7 @@ impl PhaseVocoder {
                 // from the weaker in-flight ratio would loosen the overlap
                 // once, then tighten it again on the next callback.
                 continuity_phase_from = carried_phase_ratio;
+                reanchored_to_carried_seam = true;
             } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
                 && ratio_is_meaningfully_below_unity(continuity_phase_from)
                 && stretch_ratio + RATIO_CHANGE_FOCUS_TRIGGER < continuity_phase_from
@@ -516,6 +530,7 @@ impl PhaseVocoder {
                 // when modulation briefly relaxes toward unity and then pushes
                 // deeper into compression before the older overlap has drained.
                 continuity_phase_from = carried_phase_ratio;
+                reanchored_to_carried_seam = true;
             }
         }
         let reversed_direction = ratio_change_reverses_inflight_direction(
@@ -523,6 +538,8 @@ impl PhaseVocoder {
             prior_ratio,
             stretch_ratio,
         );
+        let reanchored_far_from_inflight = reanchored_to_carried_seam
+            && (continuity_phase_from - in_flight_phase_ratio).abs() >= RATIO_CHANGE_FOCUS_TRIGGER;
         let continuity_delta = (stretch_ratio - continuity_phase_from).abs();
         self.stretch_ratio = stretch_ratio;
         self.hop_synthesis = (self.hop_analysis as f64 * stretch_ratio).round() as usize;
@@ -537,9 +554,11 @@ impl PhaseVocoder {
                 self.streaming_tail.len(),
                 self.hop_analysis,
             );
-            if reversed_direction {
-                continuity_focus_frames = continuity_focus_frames
-                    .saturating_add(RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES);
+            if reversed_direction || reanchored_far_from_inflight {
+                continuity_focus_frames = continuity_focus_frames.saturating_add(
+                    RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES
+                        .max(RATIO_CHANGE_CARRIED_SEAM_FOCUS_EXTRA_FRAMES),
+                );
             }
             self.ratio_change_phase_from = continuity_phase_from;
             self.ratio_change_phase_frames = continuity_focus_frames;
@@ -3231,6 +3250,15 @@ mod tests {
         assert!(
             (pv.ratio_change_phase_from - 1.12).abs() < 1e-12,
             "same-side rebound toward unity should restart from the carried expansion seam while that overlap tail is still unresolved"
+        );
+        assert_eq!(
+            pv.ratio_change_phase_total_frames,
+            continuity_focus_frames_for_ratio_change(
+                RATIO_CHANGE_FOCUS_FRAMES,
+                pv.streaming_tail.len(),
+                hop,
+            ) + RATIO_CHANGE_CARRIED_SEAM_FOCUS_EXTRA_FRAMES,
+            "re-anchoring to an older carried expansion seam should hold continuity focus one extra frame so the overlap does not relax before that seam drains"
         );
     }
 
