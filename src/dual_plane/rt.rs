@@ -29,6 +29,7 @@ const RATIO_MOTION_FREEZE_TRIGGER: f64 = 7.5e-4;
 const RATIO_MOTION_HISTORY_BLOCKS: usize = 4;
 const AUTO_PROFILE_NEAR_UNITY_PLATEAU_EPS: f64 = 0.005;
 const POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS: usize = 2;
+const SCRATCH_EXIT_HYSTERESIS_EXTRA_BLOCKS: usize = 1;
 const UNITY_PLATEAU_EXTRA_PROFILE_HOLD_RATIO: f64 = 0.02;
 
 /// Lock-free snapshot mailbox shared between control producers and RT callback.
@@ -1531,6 +1532,21 @@ impl RtProcessor {
         }
     }
 
+    #[inline]
+    fn profile_switch_hysteresis_requirement(&self, suggested: LatencyProfile) -> usize {
+        let mut required = self.profile_switch_hysteresis_blocks;
+        if self.current_profile == LatencyProfile::Scratch
+            && self.target_profile == LatencyProfile::Scratch
+            && suggested != LatencyProfile::Scratch
+        {
+            // Require one extra calm kernel before auto mode exits scratch so
+            // fast-modulation recovery does not immediately reverse on the
+            // first quieter callback after the hold drains.
+            required = required.saturating_add(SCRATCH_EXIT_HYSTERESIS_EXTRA_BLOCKS);
+        }
+        required
+    }
+
     fn update_profile_policy(&mut self) {
         if !self.auto_profile_switching {
             self.policy_profile = self.target_profile;
@@ -1581,7 +1597,7 @@ impl RtProcessor {
             self.profile_candidate_streak = 1;
         }
 
-        if self.profile_candidate_streak >= self.profile_switch_hysteresis_blocks {
+        if self.profile_candidate_streak >= self.profile_switch_hysteresis_requirement(suggested) {
             self.profile_candidate_streak = 0;
             self.set_latency_profile_internal(suggested);
         }
@@ -3920,15 +3936,33 @@ mod tests {
         assert_eq!(
             third_calm.current_profile,
             LatencyProfile::Scratch,
-            "retargeting away from scratch should still occur via a transition after the extended hold drains"
+            "the first calm kernel after the extended hold drains should keep scratch active until the exit suggestion repeats"
         );
         assert_eq!(
             third_calm.target_profile,
+            LatencyProfile::Scratch,
+            "the first calm kernel after the extended hold drains should not immediately retarget away from scratch"
+        );
+        assert_eq!(
+            third_calm.transition_blocks_left, 0,
+            "the extra scratch-exit confirmation should not queue a render transition on the first post-hold calm kernel"
+        );
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        let fourth_calm = rt.profile_telemetry();
+        assert_eq!(
+            fourth_calm.current_profile,
+            LatencyProfile::Scratch,
+            "retargeting away from scratch should still occur via a transition instead of snapping instantly once the calm suggestion repeats"
+        );
+        assert_eq!(
+            fourth_calm.target_profile,
             LatencyProfile::Render,
-            "the third calm kernel should be the first one allowed to retarget away from scratch"
+            "the second post-hold calm kernel should be the first one allowed to retarget away from scratch"
         );
         assert!(
-            third_calm.transition_blocks_left > 0,
+            fourth_calm.transition_blocks_left > 0,
             "retargeting away from scratch should queue a transition instead of snapping instantly"
         );
     }
@@ -4578,11 +4612,25 @@ mod tests {
 
         let mut output_refs = [&mut output[..]];
         let _ = rt.process(&input_refs, &mut output_refs);
+        let render_hold = rt.profile_telemetry();
+        assert_eq!(
+            render_hold.target_profile,
+            LatencyProfile::Scratch,
+            "the first calm callback after scratch settles should keep scratch pinned until the exit suggestion repeats"
+        );
+        assert_eq!(
+            render_hold.transition_blocks_left,
+            0,
+            "the extra scratch-exit confirmation should not queue a render transition on the first calm callback"
+        );
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
         let render_retarget = rt.profile_telemetry();
         assert_eq!(
             render_retarget.target_profile,
             LatencyProfile::Render,
-            "once the scratch transition settles, auto mode should be free to retarget back to render"
+            "once the scratch transition settles, the repeated calm suggestion should be free to retarget back to render"
         );
     }
 
