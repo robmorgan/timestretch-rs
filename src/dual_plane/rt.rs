@@ -32,6 +32,7 @@ const POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS: usize = 2;
 const SCRATCH_EXIT_HYSTERESIS_EXTRA_BLOCKS: usize = 1;
 const DIRECT_SCRATCH_TO_RENDER_EXIT_EXTRA_BLOCKS: usize = 1;
 const UNITY_PLATEAU_EXTRA_PROFILE_HOLD_RATIO: f64 = 0.02;
+const RATIO_CONTINUITY_SLEW_MAX_STEP: f64 = 0.012;
 
 /// Lock-free snapshot mailbox shared between control producers and RT callback.
 ///
@@ -945,7 +946,9 @@ impl RtProcessor {
             }
 
             self.prime_tonal_state_from_unity_history_if_needed(
-                self.current_kernel_ratio(self.config.kernel_frames),
+                self.smooth_kernel_ratio_for_continuity(
+                    self.current_kernel_ratio(self.config.kernel_frames),
+                ),
             )?;
             if input_frames > 0 {
                 let needed_samples = input_frames.saturating_mul(self.num_channels);
@@ -1031,7 +1034,9 @@ impl RtProcessor {
             }
 
             self.prime_tonal_state_from_unity_history_if_needed(
-                self.current_kernel_ratio(self.config.kernel_frames),
+                self.smooth_kernel_ratio_for_continuity(
+                    self.current_kernel_ratio(self.config.kernel_frames),
+                ),
             )?;
             self.push_input_with_overload_policy(input)?;
             if self.input_ring.len() >= self.kernel_samples {
@@ -1099,7 +1104,9 @@ impl RtProcessor {
             }
 
             self.prime_tonal_state_from_unity_history_if_needed(
-                self.current_kernel_ratio(self.config.kernel_frames),
+                self.smooth_kernel_ratio_for_continuity(
+                    self.current_kernel_ratio(self.config.kernel_frames),
+                ),
             )?;
             self.push_input_with_overload_policy(input)?;
             if self.input_ring.len() >= self.kernel_samples {
@@ -1801,10 +1808,11 @@ impl RtProcessor {
             }
         }
 
-        let ratio = self.current_kernel_ratio(frames);
+        let raw_ratio = self.current_kernel_ratio(frames);
         // Commit ratio-motion holds only when a kernel actually renders so
         // preview-only callbacks cannot mutate live profile state.
-        self.engage_ratio_motion_freeze_if_needed(ratio);
+        self.engage_ratio_motion_freeze_if_needed(raw_ratio);
+        let ratio = self.smooth_kernel_ratio_for_continuity(raw_ratio);
         if (ratio - self.active_ratio).abs() > RATIO_SNAP_EPS {
             for vocoder in &mut self.vocoders {
                 vocoder.set_stretch_ratio(ratio);
@@ -2115,6 +2123,21 @@ impl RtProcessor {
     }
 
     #[inline]
+    fn smooth_kernel_ratio_for_continuity(&self, ratio: f64) -> f64 {
+        if !self.auto_profile_switching || !ratio.is_finite() {
+            return ratio;
+        }
+
+        let step = ratio - self.active_ratio;
+        if step.abs() <= RATIO_CONTINUITY_SLEW_MAX_STEP {
+            return ratio;
+        }
+
+        (self.active_ratio + step.signum() * RATIO_CONTINUITY_SLEW_MAX_STEP)
+            .clamp(self.config.min_ratio, self.config.max_ratio)
+    }
+
+    #[inline]
     fn base_ratio_over_range(&self, start: f64, end: f64) -> f64 {
         if let Some(ratio) = self.constant_ratio_override {
             ratio
@@ -2172,7 +2195,7 @@ const fn algorithmic_delay_frames(fft_size: usize) -> usize {
 mod tests {
     use super::{
         LatencyProfile, QualityTier, RtConfig, RtDelayTelemetry, RtProcessor, RtRuntimeTelemetry,
-        POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS,
+        POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS, RATIO_CONTINUITY_SLEW_MAX_STEP,
     };
     use crate::core::types::StretchParams;
     use crate::dual_plane::hints::RenderHints;
@@ -4678,6 +4701,36 @@ mod tests {
             render_from_mix.target_profile,
             LatencyProfile::Render,
             "after the scratch exit lands on mix, calm suggestions should be free to continue retargeting back to render"
+        );
+    }
+
+    #[test]
+    fn auto_profile_fast_modulation_slews_committed_kernel_ratio_steps() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut cfg = RtConfig::new(params, 2048);
+        cfg.latency_profile = LatencyProfile::Mix;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 2;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let block = stereo_sine_block(2048, 48_000, 220.0, 0.0);
+        rt.set_constant_ratio(1.04);
+
+        assert_eq!(rt.process_block_into(&block, &mut []).unwrap(), 0);
+        assert!(
+            (rt.active_ratio() - (1.0 + RATIO_CONTINUITY_SLEW_MAX_STEP)).abs() < 1e-9,
+            "first committed kernel should cap the fast-mod ratio step instead of jumping straight to the requested ratio"
+        );
+
+        assert_eq!(rt.process_block_into(&block, &mut []).unwrap(), 0);
+        assert!(
+            (rt.active_ratio() - (1.0 + 2.0 * RATIO_CONTINUITY_SLEW_MAX_STEP)).abs() < 1e-9,
+            "repeated fast-mod kernels should keep walking the ratio toward the requested target in bounded continuity steps"
         );
     }
 
