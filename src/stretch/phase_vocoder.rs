@@ -521,6 +521,28 @@ impl PhaseVocoder {
                 // once, then tighten it again on the next callback.
                 continuity_phase_from = carried_phase_ratio;
                 reanchored_to_carried_seam = true;
+            } else if ratio_is_meaningfully_above_unity(carried_phase_ratio)
+                && ratio_is_meaningfully_below_unity(continuity_phase_from)
+                && stretch_ratio < continuity_phase_from
+                && stretch_ratio + RATIO_CHANGE_FOCUS_TRIGGER >= continuity_phase_from
+            {
+                // A tiny follow-up push deeper into compression can arrive
+                // while an older expansion seam is still unresolved. Keep the
+                // continuity slew anchored to that carried seam so the overlap
+                // does not restart from the fresher compression ratio just
+                // because the latest nudge itself is sub-threshold.
+                continuity_phase_from = carried_phase_ratio;
+                reanchored_to_carried_seam = true;
+            } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
+                && ratio_is_meaningfully_above_unity(continuity_phase_from)
+                && stretch_ratio > continuity_phase_from
+                && stretch_ratio - RATIO_CHANGE_FOCUS_TRIGGER <= continuity_phase_from
+            {
+                // Mirror the same protection for a carried compression seam
+                // when a tiny follow-up push deeper into expansion lands
+                // before the older opposite-side overlap has drained.
+                continuity_phase_from = carried_phase_ratio;
+                reanchored_to_carried_seam = true;
             } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
                 && ratio_is_meaningfully_below_unity(continuity_phase_from)
                 && stretch_ratio + RATIO_CHANGE_FOCUS_TRIGGER < continuity_phase_from
@@ -3426,6 +3448,37 @@ mod tests {
                 pv.hop_analysis,
             ) + RATIO_CHANGE_CARRIED_SEAM_FOCUS_EXTRA_FRAMES,
             "re-anchoring a tiny same-side nudge to an older carried seam should refresh continuity focus so the overlap does not relax mid-tail"
+        );
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_reanchors_to_opposite_side_carried_seam_for_subthreshold_deeper_step()
+    {
+        let mut pv = PhaseVocoder::new(1024, 256, 0.92, 44_100, 120.0);
+        pv.streaming_tail = vec![0.0; 64];
+        pv.streaming_tail_phase_ratio = 1.12;
+        pv.ratio_change_phase_from = 1.12;
+        pv.ratio_change_phase_total_frames = 4;
+        pv.ratio_change_phase_frames = 1;
+        pv.transient_focus_frames = 1;
+        assert!(
+            ratio_is_meaningfully_below_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
+            "test setup should leave the in-flight seam on the compression side before the tiny deeper step"
+        );
+
+        pv.set_stretch_ratio(0.9195);
+        assert!(
+            (pv.ratio_change_phase_from - 1.12).abs() < 1e-12,
+            "a sub-threshold deeper compression nudge should restart from the older carried expansion seam while that overlap tail is still unresolved"
+        );
+        assert_eq!(
+            pv.ratio_change_phase_total_frames,
+            continuity_focus_frames_for_ratio_change(
+                RATIO_CHANGE_FOCUS_FRAMES,
+                pv.streaming_tail.len(),
+                pv.hop_analysis,
+            ) + RATIO_CHANGE_CARRIED_SEAM_FOCUS_EXTRA_FRAMES,
+            "re-anchoring a tiny opposite-side follow-up step should refresh continuity focus so the older seam does not snap mid-tail"
         );
     }
 
