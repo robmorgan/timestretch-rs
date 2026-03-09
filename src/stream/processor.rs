@@ -23,6 +23,13 @@ const RATIO_SMOOTHING_TIME_SECS: f64 = 0.050;
 const DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS: f64 = 0.040;
 /// Shorter apply slew for the first three callbacks of a freshly-reset modulation window.
 const DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_TIME_SECS: f64 = 0.015;
+/// Requested/applied ratio lag that keeps deterministic burst smoothing active.
+///
+/// Fast modulation can keep the applied ratio one or two callbacks behind the
+/// requested burst even after the history window is no longer "fresh". Keep the
+/// shorter apply slew alive while that lag is still material so transitions do
+/// not relax back into the slower steady-state ramp mid-burst.
+const DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_LAG_EPS: f64 = 0.006;
 /// Near-unity request band that resets deterministic ratio averaging history.
 ///
 /// Fast modulation often crosses unity without landing on an exact 1.0 callback.
@@ -513,7 +520,10 @@ impl DualPlaneDeterministicState {
 
     #[inline]
     fn ratio_apply_smoothing_time_secs(&self) -> f64 {
-        if self.recent_chunk_ratios.len() <= 3 {
+        if self.recent_chunk_ratios.len() <= 3
+            || (self.last_requested_ratio - self.last_ratio).abs()
+                >= DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_LAG_EPS
+        {
             DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_TIME_SECS
         } else {
             DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS
@@ -3883,6 +3893,31 @@ mod tests {
             state.ratio_apply_smoothing_time_secs(),
             DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS,
             "once the fresh modulation window has more than three callbacks, deterministic apply smoothing should fall back to the steady-state slew"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_established_ratio_window_keeps_burst_apply_smoothing_while_lagging_target() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        state.push_chunk_ratio(1.028, 1.028);
+        state.last_ratio = 1.020;
+        state.push_chunk_ratio(1.024, 1.024);
+        state.last_ratio = 1.022;
+        state.push_chunk_ratio(1.021, 1.021);
+        state.last_ratio = 1.012;
+        state.push_chunk_ratio(1.0205, 1.0205);
+
+        assert_eq!(state.recent_chunk_ratios.len(), 4);
+        assert_eq!(
+            state.ratio_apply_smoothing_time_secs(),
+            DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_TIME_SECS,
+            "an established modulation window should keep the shorter apply slew while the applied ratio still materially trails the requested burst"
         );
     }
 
