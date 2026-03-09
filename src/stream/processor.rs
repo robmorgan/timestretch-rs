@@ -47,6 +47,8 @@ const TRANSIENT_RESET_MODULATION_BASE_OVERLAP_WINDOWS: usize = 2;
 const TRANSIENT_RESET_MODULATION_MAX_EXTRA_OVERLAP_WINDOWS: usize = 2;
 /// Ratio-jump range that scales transient-reset duplicate protection under modulation.
 const TRANSIENT_RESET_MODULATION_OVERLAP_RATIO_RANGE: f64 = 0.09;
+/// Deterministic auto-profile hysteresis blocks used to avoid one-kernel churn after short bursts.
+const DETERMINISTIC_AUTO_PROFILE_SWITCH_HYSTERESIS_BLOCKS: usize = 2;
 /// Numerator for the FFT-size latency fraction (3/2 = 1.5x FFT size).
 const LATENCY_FFT_NUMERATOR: usize = 3;
 /// Denominator for the FFT-size latency fraction.
@@ -364,7 +366,8 @@ impl DualPlaneDeterministicState {
         let mut rt_cfg = RtConfig::new(params.clone(), block_frames);
         rt_cfg.latency_profile = latency_profile_for_quality(params.quality_mode);
         rt_cfg.auto_profile_switching = true;
-        rt_cfg.profile_switch_hysteresis_blocks = 1;
+        rt_cfg.profile_switch_hysteresis_blocks =
+            DETERMINISTIC_AUTO_PROFILE_SWITCH_HYSTERESIS_BLOCKS;
         // The deterministic stream path should keep auto-profile switching,
         // but its chunked offline-style processing is not the callback-safety
         // case that justifies RT scratch-bias freezes during every short
@@ -4851,6 +4854,25 @@ mod tests {
         );
 
         proc.set_stretch_ratio(1.70).unwrap();
+        let first_plateau = proc.process(&chunk).unwrap();
+        assert!(
+            first_plateau.iter().all(|sample| sample.is_finite()),
+            "the first stable post-modulation scratch plateau callback should keep output finite"
+        );
+        let first_plateau_telemetry = proc
+            .deterministic_profile_telemetry()
+            .expect("dual-plane telemetry should remain available on the first stable plateau");
+        assert_eq!(
+            first_plateau_telemetry.current_profile,
+            LatencyProfile::Mix,
+            "one stable scratch-biased callback should not immediately commit scratch after a short modulation burst"
+        );
+        assert_eq!(
+            first_plateau_telemetry.target_profile,
+            LatencyProfile::Mix,
+            "one stable scratch-biased callback should not immediately retarget away from mix after a short modulation burst"
+        );
+
         let mut saw_scratch_target = false;
         let mut saw_scratch_current = false;
         for settle_idx in 0..16 {
