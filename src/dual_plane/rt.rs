@@ -331,6 +331,7 @@ pub struct RtProcessor {
     flush_drain_pending: bool,
     input_timeline_frames: f64,
     active_ratio: f64,
+    policy_ratio: f64,
 }
 
 impl std::fmt::Debug for RtProcessor {
@@ -349,6 +350,7 @@ impl std::fmt::Debug for RtProcessor {
             .field("current_tier", &self.current_tier)
             .field("target_tier", &self.target_tier)
             .field("active_ratio", &self.active_ratio)
+            .field("policy_ratio", &self.policy_ratio)
             .field("input_ring_len", &self.input_ring.len())
             .field("pending_output_len", &self.pending_output.len())
             .field("flush_drain_pending", &self.flush_drain_pending)
@@ -514,6 +516,7 @@ impl RtProcessor {
             flush_drain_pending: false,
             input_timeline_frames: 0.0,
             active_ratio,
+            policy_ratio: active_ratio,
         }
     }
 
@@ -942,6 +945,7 @@ impl RtProcessor {
                 self.reset_ratio_motion_history();
                 self.clear_pending_auto_profile_candidate_for_unity_plateau();
                 self.active_ratio = 1.0;
+                self.policy_ratio = 1.0;
                 self.advance_ratio_motion_freeze();
                 self.observe_governor_block(start.elapsed());
                 return Ok((input_frames, input_frames));
@@ -1030,6 +1034,7 @@ impl RtProcessor {
                 self.reset_ratio_motion_history();
                 self.clear_pending_auto_profile_candidate_for_unity_plateau();
                 self.active_ratio = 1.0;
+                self.policy_ratio = 1.0;
                 self.advance_ratio_motion_freeze();
                 self.observe_governor_block(start.elapsed());
                 return Ok(());
@@ -1100,6 +1105,7 @@ impl RtProcessor {
                 self.reset_ratio_motion_history();
                 self.clear_pending_auto_profile_candidate_for_unity_plateau();
                 self.active_ratio = 1.0;
+                self.policy_ratio = 1.0;
                 self.advance_ratio_motion_freeze();
                 self.observe_governor_block(start.elapsed());
                 return Ok(input.len());
@@ -1528,7 +1534,7 @@ impl RtProcessor {
 
     #[inline]
     fn suggest_profile(&self) -> LatencyProfile {
-        let ratio_delta = (self.active_ratio - 1.0).abs();
+        let ratio_delta = (self.policy_ratio - 1.0).abs();
         let transient = self.hints.transient_confidence.clamp(0.0, 1.0);
         let tonal = self.hints.tonal_confidence.clamp(0.0, 1.0);
         let noise = self.hints.noise_confidence.clamp(0.0, 1.0);
@@ -1583,7 +1589,7 @@ impl RtProcessor {
             self.policy_profile = self.target_profile;
             return;
         }
-        if (self.active_ratio - 1.0).abs() <= AUTO_PROFILE_NEAR_UNITY_PLATEAU_EPS {
+        if (self.policy_ratio - 1.0).abs() <= AUTO_PROFILE_NEAR_UNITY_PLATEAU_EPS {
             self.cancel_inflight_auto_profile_transition();
             self.post_ratio_motion_profile_hold_blocks_left = self
                 .post_ratio_motion_profile_hold_blocks_left
@@ -1814,6 +1820,7 @@ impl RtProcessor {
         // Commit ratio-motion holds only when a kernel actually renders so
         // preview-only callbacks cannot mutate live profile state.
         self.engage_ratio_motion_freeze_if_needed(raw_ratio);
+        self.policy_ratio = raw_ratio;
         let ratio = self.smooth_kernel_ratio_for_continuity(raw_ratio);
         if (ratio - self.active_ratio).abs() > RATIO_SNAP_EPS {
             for vocoder in &mut self.vocoders {

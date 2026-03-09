@@ -364,7 +364,13 @@ impl DualPlaneDeterministicState {
         let mut rt_cfg = RtConfig::new(params.clone(), block_frames);
         rt_cfg.latency_profile = latency_profile_for_quality(params.quality_mode);
         rt_cfg.auto_profile_switching = true;
-        rt_cfg.profile_switch_hysteresis_blocks = 6;
+        rt_cfg.profile_switch_hysteresis_blocks = 1;
+        // The deterministic stream path should keep auto-profile switching,
+        // but its chunked offline-style processing is not the callback-safety
+        // case that justifies RT scratch-bias freezes during every short
+        // modulation step. Let the deterministic path ride out brief DJ-style
+        // bursts on Mix and only retarget once the plateau is actually stable.
+        rt_cfg.ratio_motion_freeze_blocks = 0;
         rt_cfg.min_ratio = 0.05;
         rt_cfg.max_ratio = 8.0;
         let max_output_frames = ((rt_cfg.kernel_frames as f64 * rt_cfg.max_ratio).ceil() as usize)
