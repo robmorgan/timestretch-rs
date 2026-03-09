@@ -21,6 +21,11 @@ const FLUX_SPIKE_RATIO: f64 = 1.6;
 const FLUX_ABS_MIN: f64 = 1e-4;
 /// Extra emphasis on high-band flux.
 const FLUX_HIGH_WEIGHT: f64 = 1.25;
+/// Extra trigger threshold per overlap window when modulation already holds
+/// low bands phase-locked.
+const FLUX_MODULATION_THRESHOLD_SCALE_STEP: f64 = 0.08;
+/// Extra spike-ratio requirement per overlap window during modulation holds.
+const FLUX_MODULATION_SPIKE_RATIO_STEP: f64 = 0.05;
 /// Number of flux frames to observe before trigger checks.
 const FLUX_WARMUP_FRAMES: usize = 3;
 /// Maximum analysis frames scanned per scheduler pass.
@@ -151,6 +156,24 @@ impl TransientEventScheduler {
         cooldown_frames
     }
 
+    #[inline]
+    fn trigger_requirements(
+        &self,
+        suppress_low_bands: bool,
+        modulation_overlap_windows: usize,
+    ) -> (f64, f64) {
+        if !suppress_low_bands || modulation_overlap_windows == 0 {
+            return (1.0, FLUX_SPIKE_RATIO);
+        }
+
+        let overlap_windows = modulation_overlap_windows as f64;
+        let threshold_scale = 1.0 + FLUX_MODULATION_THRESHOLD_SCALE_STEP * overlap_windows;
+        let spike_ratio =
+            FLUX_SPIKE_RATIO * (1.0 + FLUX_MODULATION_SPIKE_RATIO_STEP * overlap_windows);
+
+        (threshold_scale, spike_ratio)
+    }
+
     /// Detects a transient event from stereo interleaved input and returns a
     /// per-band reset mask when detected.
     ///
@@ -274,9 +297,11 @@ impl TransientEventScheduler {
             }
 
             let sigma = self.var_flux.max(0.0).sqrt();
-            let threshold = self.mean_flux + FLUX_THRESHOLD_SIGMA * sigma;
+            let (threshold_scale, spike_ratio) =
+                self.trigger_requirements(suppress_low_bands, modulation_overlap_windows);
+            let threshold = (self.mean_flux + FLUX_THRESHOLD_SIGMA * sigma) * threshold_scale;
             let is_transient = flux > threshold
-                && flux > self.prev_flux.max(FLUX_ABS_MIN) * FLUX_SPIKE_RATIO
+                && flux > self.prev_flux.max(FLUX_ABS_MIN) * spike_ratio
                 && flux > FLUX_ABS_MIN;
 
             let triggered_event = is_transient && self.cooldown_frames == 0;
@@ -383,7 +408,8 @@ impl TransientEventScheduler {
 #[cfg(test)]
 mod tests {
     use super::{
-        TransientEventScheduler, FLUX_RESET_COOLDOWN_FRAMES,
+        TransientEventScheduler, FLUX_MODULATION_SPIKE_RATIO_STEP,
+        FLUX_MODULATION_THRESHOLD_SCALE_STEP, FLUX_RESET_COOLDOWN_FRAMES, FLUX_SPIKE_RATIO,
         MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS,
     };
     use std::f32::consts::PI;
@@ -561,6 +587,44 @@ mod tests {
             strong_modulation,
             base + overlap_frames * (MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS + 2),
             "larger modulation bursts should hold accepted resets through extra overlap windows"
+        );
+    }
+
+    #[test]
+    fn scheduler_trigger_requirements_stay_neutral_without_modulation_hold() {
+        let scheduler = TransientEventScheduler::new(1024, 256, 44_100, 4096);
+
+        assert_eq!(
+            scheduler.trigger_requirements(false, 0),
+            (1.0, FLUX_SPIKE_RATIO)
+        );
+        assert_eq!(
+            scheduler.trigger_requirements(true, 0),
+            (1.0, FLUX_SPIKE_RATIO)
+        );
+    }
+
+    #[test]
+    fn scheduler_trigger_requirements_tighten_with_modulation_overlap_windows() {
+        let scheduler = TransientEventScheduler::new(1024, 256, 44_100, 4096);
+
+        let (threshold_scale, spike_ratio) =
+            scheduler.trigger_requirements(true, MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS);
+
+        assert_eq!(
+            threshold_scale,
+            1.0
+                + FLUX_MODULATION_THRESHOLD_SCALE_STEP
+                    * MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS as f64,
+            "low-band-suppressed modulation should require a proportionally stronger flux threshold"
+        );
+        assert_eq!(
+            spike_ratio,
+            FLUX_SPIKE_RATIO
+                * (1.0
+                    + FLUX_MODULATION_SPIKE_RATIO_STEP
+                        * MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS as f64),
+            "low-band-suppressed modulation should require a proportionally larger frame-to-frame spike"
         );
     }
 
