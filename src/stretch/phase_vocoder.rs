@@ -420,6 +420,26 @@ impl PhaseVocoder {
         if !self.streaming_tail.is_empty() {
             let carried_phase_ratio = self.streaming_tail_phase_ratio;
             if ratio_is_meaningfully_above_unity(carried_phase_ratio)
+                && !ratio_is_meaningfully_above_unity(continuity_phase_from)
+                && !ratio_is_meaningfully_below_unity(stretch_ratio)
+                && carried_phase_ratio > continuity_phase_from + RATIO_CHANGE_FOCUS_TRIGGER
+            {
+                // If the explicit continuity window has already drained back
+                // near unity but an older expanded overlap is still unresolved,
+                // keep near-unity follow-up nudges anchored to that carried
+                // seam. Otherwise tiny automation steps can stop refreshing the
+                // seam hold while the older expansion tail is still audible.
+                continuity_phase_from = carried_phase_ratio;
+            } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
+                && !ratio_is_meaningfully_below_unity(continuity_phase_from)
+                && !ratio_is_meaningfully_above_unity(stretch_ratio)
+                && carried_phase_ratio + RATIO_CHANGE_FOCUS_TRIGGER < continuity_phase_from
+            {
+                // Mirror the same protection for unresolved compression tails
+                // that remain audibly below unity after the continuity window
+                // has drifted back toward neutral.
+                continuity_phase_from = carried_phase_ratio;
+            } else if ratio_is_meaningfully_above_unity(carried_phase_ratio)
                 && ratio_is_meaningfully_below_unity(continuity_phase_from)
                 && !ratio_is_meaningfully_below_unity(stretch_ratio)
             {
@@ -503,9 +523,11 @@ impl PhaseVocoder {
             prior_ratio,
             stretch_ratio,
         );
+        let continuity_delta = (stretch_ratio - continuity_phase_from).abs();
         self.stretch_ratio = stretch_ratio;
         self.hop_synthesis = (self.hop_analysis as f64 * stretch_ratio).round() as usize;
-        if ratio_delta >= RATIO_CHANGE_FOCUS_TRIGGER {
+        if ratio_delta >= RATIO_CHANGE_FOCUS_TRIGGER || continuity_delta >= RATIO_CHANGE_FOCUS_TRIGGER
+        {
             // Fast automation can land another meaningful ratio step before the
             // previous continuity-focus window drains. Refresh the window so
             // late seam frames do not relax back into looser locking mid-burst.
@@ -2616,6 +2638,28 @@ mod tests {
         assert_eq!(
             pv.transient_focus_frames, RATIO_CHANGE_FOCUS_FRAMES,
             "a new ratio step should re-engage continuity focus once the prior seam window has drained"
+        );
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_reengages_focus_for_small_nudge_when_carried_seam_is_still_far() {
+        let mut pv = PhaseVocoder::new(1024, 256, 1.0002, 44_100, 120.0);
+        pv.streaming_tail = vec![0.0; 64];
+        pv.streaming_tail_phase_ratio = 1.04;
+        pv.ratio_change_phase_from = 1.04;
+        pv.ratio_change_phase_total_frames = RATIO_CHANGE_FOCUS_FRAMES;
+        pv.ratio_change_phase_frames = 0;
+        pv.transient_focus_frames = 0;
+
+        pv.set_stretch_ratio(1.0006);
+
+        assert_eq!(
+            pv.transient_focus_frames, RATIO_CHANGE_FOCUS_FRAMES,
+            "a near-unity nudge should still re-engage continuity focus when the unresolved carried seam remains meaningfully expanded"
+        );
+        assert!(
+            (pv.ratio_change_phase_from - 1.04).abs() < 1e-12,
+            "the refreshed continuity slew should restart from the unresolved carried seam instead of the tiny prior target delta"
         );
     }
 
