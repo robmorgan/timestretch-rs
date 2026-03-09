@@ -42,6 +42,8 @@ const TRANSIENT_FOCUS_FRAMES: usize = 3;
 const RATIO_CHANGE_FOCUS_FRAMES: usize = 3;
 /// Ignore tiny ratio deltas that are below the modulation-seam risk zone.
 const RATIO_CHANGE_FOCUS_TRIGGER: f64 = 1e-3;
+/// Cap extra continuity-focus extension so long tails do not pin identity locking.
+const RATIO_CHANGE_TAIL_FOCUS_MAX_FRAMES: usize = 6;
 /// Phase vocoder state for time stretching.
 pub struct PhaseVocoder {
     fft_size: usize,
@@ -150,6 +152,24 @@ pub struct PhaseVocoder {
 #[inline]
 fn streaming_tail_normalize_ratio(carried_tail_ratio: f64, current_ratio: f64) -> f64 {
     carried_tail_ratio.max(current_ratio)
+}
+
+#[inline]
+fn continuity_focus_frames_for_ratio_change(
+    base_frames: usize,
+    tail_samples: usize,
+    hop: usize,
+) -> usize {
+    if tail_samples == 0 || hop == 0 {
+        return base_frames;
+    }
+
+    base_frames.max(
+        tail_samples
+            .div_ceil(hop)
+            .saturating_add(1)
+            .min(RATIO_CHANGE_TAIL_FOCUS_MAX_FRAMES),
+    )
 }
 
 impl PhaseVocoder {
@@ -363,8 +383,12 @@ impl PhaseVocoder {
             // Fast automation can land another meaningful ratio step before the
             // previous continuity-focus window drains. Refresh the window so
             // late seam frames do not relax back into looser locking mid-burst.
-            self.transient_focus_frames =
-                self.transient_focus_frames.max(RATIO_CHANGE_FOCUS_FRAMES);
+            let continuity_focus_frames = continuity_focus_frames_for_ratio_change(
+                RATIO_CHANGE_FOCUS_FRAMES,
+                self.streaming_tail.len(),
+                self.hop_analysis,
+            );
+            self.transient_focus_frames = self.transient_focus_frames.max(continuity_focus_frames);
         }
     }
 
@@ -2326,6 +2350,46 @@ mod tests {
         assert_eq!(
             pv.transient_focus_frames, RATIO_CHANGE_FOCUS_FRAMES,
             "a new ratio step should re-engage continuity focus once the prior seam window has drained"
+        );
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_extends_continuity_focus_while_streaming_tail_is_unresolved() {
+        let fft_size = 1024;
+        let hop = 256;
+        let sample_rate = 44_100u32;
+        let input: Vec<f32> = (0..fft_size * 5)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
+            })
+            .collect();
+
+        let mut pv = PhaseVocoder::new(fft_size, hop, 1.04, sample_rate, 120.0);
+        let first_chunk_len = fft_size * 2;
+        let first = pv.process_streaming(&input[..first_chunk_len]).unwrap();
+        assert!(!first.is_empty(), "first streaming chunk should emit audio");
+        assert!(
+            !pv.streaming_tail.is_empty(),
+            "first streaming chunk should retain unresolved overlap tail"
+        );
+
+        pv.transient_focus_frames = 0;
+        let expected = continuity_focus_frames_for_ratio_change(
+            RATIO_CHANGE_FOCUS_FRAMES,
+            pv.streaming_tail.len(),
+            hop,
+        );
+
+        pv.set_stretch_ratio(0.96);
+
+        assert_eq!(
+            pv.transient_focus_frames, expected,
+            "ratio changes with unresolved streaming overlap should keep continuity focus active until the seam has more time to drain"
+        );
+        assert!(
+            pv.transient_focus_frames > RATIO_CHANGE_FOCUS_FRAMES,
+            "streaming seam carry should extend continuity focus beyond the fixed minimum window"
         );
     }
 
