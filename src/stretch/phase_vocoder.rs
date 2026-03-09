@@ -39,7 +39,7 @@ const ADAPTIVE_FORCE_ROI_RATIO_DISTANCE: f64 = 0.75;
 /// Number of synthesis frames to keep transient-focused locking active.
 const TRANSIENT_FOCUS_FRAMES: usize = 3;
 /// Briefly tighten phase locking after a meaningful runtime ratio step.
-const RATIO_CHANGE_FOCUS_FRAMES: usize = 2;
+const RATIO_CHANGE_FOCUS_FRAMES: usize = 3;
 /// Ignore tiny ratio deltas that are below the modulation-seam risk zone.
 const RATIO_CHANGE_FOCUS_TRIGGER: f64 = 1e-3;
 /// Phase vocoder state for time stretching.
@@ -359,7 +359,10 @@ impl PhaseVocoder {
         let ratio_delta = (stretch_ratio - self.stretch_ratio).abs();
         self.stretch_ratio = stretch_ratio;
         self.hop_synthesis = (self.hop_analysis as f64 * stretch_ratio).round() as usize;
-        if ratio_delta >= RATIO_CHANGE_FOCUS_TRIGGER && !self.transient_focus_active() {
+        if ratio_delta >= RATIO_CHANGE_FOCUS_TRIGGER {
+            // Fast automation can land another meaningful ratio step before the
+            // previous continuity-focus window drains. Refresh the window so
+            // late seam frames do not relax back into looser locking mid-burst.
             self.transient_focus_frames =
                 self.transient_focus_frames.max(RATIO_CHANGE_FOCUS_FRAMES);
         }
@@ -2299,7 +2302,8 @@ mod tests {
     }
 
     #[test]
-    fn test_set_stretch_ratio_does_not_rearm_continuity_focus_while_active() {
+    fn test_set_stretch_ratio_refreshes_continuity_focus_during_repeated_short_interval_modulation()
+    {
         let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
         pv.set_stretch_ratio(1.002);
         assert_eq!(pv.transient_focus_frames, RATIO_CHANGE_FOCUS_FRAMES);
@@ -2307,8 +2311,8 @@ mod tests {
         pv.transient_focus_frames = 1;
         pv.set_stretch_ratio(1.004);
         assert_eq!(
-            pv.transient_focus_frames, 1,
-            "follow-up ratio steps should not keep re-arming continuity focus before the current seam settles"
+            pv.transient_focus_frames, RATIO_CHANGE_FOCUS_FRAMES,
+            "follow-up ratio steps should refresh continuity focus so repeated short-interval modulation keeps seam locking tight"
         );
     }
 
