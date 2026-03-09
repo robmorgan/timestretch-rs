@@ -439,6 +439,24 @@ impl PhaseVocoder {
                 // expanded in-flight ratio while the older compressed overlap
                 // is still draining.
                 continuity_phase_from = carried_phase_ratio;
+            } else if ratio_is_meaningfully_above_unity(carried_phase_ratio)
+                && ratio_is_meaningfully_above_unity(continuity_phase_from)
+                && stretch_ratio + RATIO_CHANGE_FOCUS_TRIGGER < continuity_phase_from
+                && carried_phase_ratio > continuity_phase_from
+            {
+                // The unresolved seam can still be more expanded than the
+                // in-flight phase slew after a short same-side rebound. Keep
+                // the restart anchored to that older seam so fast automation
+                // does not relax the overlap twice before it has fully drained.
+                continuity_phase_from = carried_phase_ratio;
+            } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
+                && ratio_is_meaningfully_below_unity(continuity_phase_from)
+                && stretch_ratio - RATIO_CHANGE_FOCUS_TRIGGER > continuity_phase_from
+                && carried_phase_ratio < continuity_phase_from
+            {
+                // Mirror the same protection for unresolved compression seams
+                // when the target rebounds back toward unity without crossing it.
+                continuity_phase_from = carried_phase_ratio;
             }
         }
         let reversed_direction = ratio_change_reverses_inflight_direction(
@@ -3002,6 +3020,132 @@ mod tests {
         assert!(
             !third.is_empty(),
             "the rebound chunk should still emit audio after re-anchoring the compression seam"
+        );
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_keeps_same_side_carried_expansion_seam_when_rebounding_toward_unity()
+    {
+        let fft_size = 1024;
+        let hop = 256;
+        let sample_rate = 44100u32;
+        let num_samples = fft_size * 8;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
+            })
+            .collect();
+
+        let mut pv = PhaseVocoder::new(fft_size, hop, 1.12, sample_rate, 120.0);
+        let first_chunk_len = fft_size * 2;
+        let first = pv.process_streaming(&input[..first_chunk_len]).unwrap();
+        assert!(!first.is_empty(), "first streaming chunk should emit audio");
+        assert!(
+            !pv.streaming_tail.is_empty(),
+            "first streaming chunk should retain overlap tail"
+        );
+
+        let mut consumed = ((first_chunk_len - fft_size) / hop + 1) * hop;
+        let short_chunk_len = fft_size;
+
+        pv.set_stretch_ratio(1.04);
+        let second = pv
+            .process_streaming(&input[consumed..consumed + short_chunk_len])
+            .unwrap();
+        assert!(
+            !second.is_empty(),
+            "short follow-up chunk should still emit audio"
+        );
+        assert!(
+            (pv.streaming_tail_phase_ratio - 1.12).abs() < 1e-12,
+            "the prior expansion seam should still be carried after the short same-side step"
+        );
+
+        consumed += ((short_chunk_len - fft_size) / hop + 1) * hop;
+        let hold = pv
+            .process_streaming(&input[consumed..consumed + short_chunk_len])
+            .unwrap();
+        assert!(
+            !hold.is_empty(),
+            "a second short chunk at the reduced expansion ratio should still emit audio"
+        );
+        assert!(
+            (pv.streaming_tail_phase_ratio - 1.12).abs() < 1e-12,
+            "the carried expansion seam should persist until the older overlap fully drains"
+        );
+        assert!(
+            ratio_is_meaningfully_above_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
+            "test setup should leave the in-flight expansion seam above unity before the rebound"
+        );
+
+        pv.set_stretch_ratio(1.02);
+        assert!(
+            (pv.ratio_change_phase_from - 1.12).abs() < 1e-12,
+            "same-side rebound toward unity should restart from the carried expansion seam while that overlap tail is still unresolved"
+        );
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_keeps_same_side_carried_compression_seam_when_rebounding_toward_unity(
+    ) {
+        let fft_size = 1024;
+        let hop = 256;
+        let sample_rate = 44100u32;
+        let num_samples = fft_size * 8;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
+            })
+            .collect();
+
+        let mut pv = PhaseVocoder::new(fft_size, hop, 0.88, sample_rate, 120.0);
+        let first_chunk_len = fft_size * 2;
+        let first = pv.process_streaming(&input[..first_chunk_len]).unwrap();
+        assert!(!first.is_empty(), "first streaming chunk should emit audio");
+        assert!(
+            !pv.streaming_tail.is_empty(),
+            "first streaming chunk should retain overlap tail"
+        );
+
+        let mut consumed = ((first_chunk_len - fft_size) / hop + 1) * hop;
+        let short_chunk_len = fft_size;
+
+        pv.set_stretch_ratio(0.96);
+        let second = pv
+            .process_streaming(&input[consumed..consumed + short_chunk_len])
+            .unwrap();
+        assert!(
+            !second.is_empty(),
+            "short follow-up chunk should still emit audio"
+        );
+        assert!(
+            (pv.streaming_tail_phase_ratio - 0.88).abs() < 1e-12,
+            "the prior compression seam should still be carried after the short same-side step"
+        );
+
+        consumed += ((short_chunk_len - fft_size) / hop + 1) * hop;
+        let hold = pv
+            .process_streaming(&input[consumed..consumed + short_chunk_len])
+            .unwrap();
+        assert!(
+            !hold.is_empty(),
+            "a second short chunk at the relaxed compression ratio should still emit audio"
+        );
+        assert!(
+            (pv.streaming_tail_phase_ratio - 0.88).abs() < 1e-12,
+            "the carried compression seam should persist until the older overlap fully drains"
+        );
+        assert!(
+            ratio_is_meaningfully_below_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
+            "test setup should leave the in-flight compression seam below unity before the rebound"
+        );
+
+        pv.set_stretch_ratio(0.98);
+        assert!(
+            (pv.ratio_change_phase_from - 0.88).abs() < 1e-12,
+            "same-side rebound toward unity should restart from the carried compression seam while that overlap tail is still unresolved"
         );
     }
 
