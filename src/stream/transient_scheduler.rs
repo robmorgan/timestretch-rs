@@ -32,6 +32,9 @@ const FLUX_MODULATION_MIN_UPPER_SHARE: f64 = 0.55;
 /// Minimum upper-band energy relative to the adaptive threshold before
 /// modulation-hold events may reset only the upper bands.
 const FLUX_MODULATION_MIN_UPPER_THRESHOLD_SHARE: f64 = 0.35;
+/// Required upper-band dominance over held low bands before modulation-hold
+/// mode turns a seam-side event into a fresh upper-band reset.
+const FLUX_MODULATION_MIN_UPPER_DOMINANCE: f64 = 1.25;
 /// Number of flux frames to observe before trigger checks.
 const FLUX_WARMUP_FRAMES: usize = 3;
 /// Maximum analysis frames scanned per scheduler pass.
@@ -217,8 +220,11 @@ impl TransientEventScheduler {
 
         let upper_share = upper_flux / total_flux;
         let upper_strength = upper_flux / threshold.max(1e-12);
+        let held_low_flux = sub_flux + low_flux;
+        let upper_dominance = upper_flux / held_low_flux.max(1e-12);
         upper_share >= FLUX_MODULATION_MIN_UPPER_SHARE
             && upper_strength >= FLUX_MODULATION_MIN_UPPER_THRESHOLD_SHARE
+            && upper_dominance >= FLUX_MODULATION_MIN_UPPER_DOMINANCE
     }
 
     /// Detects a transient event from stereo interleaved input and returns a
@@ -465,9 +471,10 @@ impl TransientEventScheduler {
 #[cfg(test)]
 mod tests {
     use super::{
-        TransientEventScheduler, FLUX_MODULATION_MIN_UPPER_SHARE,
-        FLUX_MODULATION_MIN_UPPER_THRESHOLD_SHARE, FLUX_MODULATION_SPIKE_RATIO_STEP,
-        FLUX_MODULATION_THRESHOLD_SCALE_STEP, FLUX_RESET_COOLDOWN_FRAMES, FLUX_SPIKE_RATIO,
+        TransientEventScheduler, FLUX_MODULATION_MIN_UPPER_DOMINANCE,
+        FLUX_MODULATION_MIN_UPPER_SHARE, FLUX_MODULATION_MIN_UPPER_THRESHOLD_SHARE,
+        FLUX_MODULATION_SPIKE_RATIO_STEP, FLUX_MODULATION_THRESHOLD_SCALE_STEP,
+        FLUX_RESET_COOLDOWN_FRAMES, FLUX_SPIKE_RATIO,
         MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS,
     };
     use std::f32::consts::PI;
@@ -739,6 +746,34 @@ mod tests {
                 0.0, low_flux, upper_flux * 0.45, upper_flux * 0.55, threshold
             ),
             "modulation-hold mode should still allow distinct upper-band attacks to reseed the vocoder"
+        );
+    }
+
+    #[test]
+    fn scheduler_modulation_hold_rejects_borderline_upper_share_when_low_bands_still_compete() {
+        let scheduler = TransientEventScheduler::new(1024, 256, 44_100, 4096);
+        let threshold = 1.0;
+        let held_low_flux = 0.32;
+        let upper_flux = held_low_flux * (FLUX_MODULATION_MIN_UPPER_DOMINANCE - 0.02);
+        let total_flux = held_low_flux + upper_flux;
+
+        assert!(
+            upper_flux / total_flux > FLUX_MODULATION_MIN_UPPER_SHARE,
+            "test fixture should still clear the existing upper-share gate"
+        );
+        assert!(
+            upper_flux / threshold > FLUX_MODULATION_MIN_UPPER_THRESHOLD_SHARE,
+            "test fixture should still clear the existing upper-strength gate"
+        );
+        assert!(
+            !scheduler.should_accept_upper_band_reset_during_modulation_hold(
+                0.0,
+                held_low_flux,
+                upper_flux * 0.45,
+                upper_flux * 0.55,
+                threshold,
+            ),
+            "modulation-hold mode should keep rejecting seam-side events until upper bands clearly dominate the held low bands"
         );
     }
 
