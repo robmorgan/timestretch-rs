@@ -212,6 +212,15 @@ fn unity_exit_seam_ratio_delta(
     }
 }
 
+#[inline]
+fn should_snap_dual_plane_first_post_unity_ratio(
+    previous_ratio: f64,
+    requested_ratio: f64,
+) -> bool {
+    dual_plane_ratio_in_unity_reset_zone(previous_ratio)
+        && !dual_plane_ratio_in_unity_reset_zone(requested_ratio)
+}
+
 /// Stateful linear resampler used for realtime pitch control in stream mode.
 ///
 /// Maintains one-sample look-behind and a fractional source cursor so
@@ -1660,15 +1669,23 @@ impl StreamProcessor {
             } else {
                 let exiting_unity_reset_zone =
                     dual_plane_ratio_in_unity_reset_zone(state.last_ratio);
+                let snap_first_post_unity_ratio = should_snap_dual_plane_first_post_unity_ratio(
+                    state.last_ratio,
+                    target_processing_ratio,
+                );
                 let averaged_ratio =
                     state.push_chunk_ratio(processing_ratio, target_processing_ratio);
-                let applied_ratio = smooth_ratio_toward(
-                    state.last_ratio,
-                    averaged_ratio,
-                    frames,
-                    sample_rate,
-                    state.ratio_apply_smoothing_time_secs(),
-                );
+                let applied_ratio = if snap_first_post_unity_ratio {
+                    target_processing_ratio
+                } else {
+                    smooth_ratio_toward(
+                        state.last_ratio,
+                        averaged_ratio,
+                        frames,
+                        sample_rate,
+                        state.ratio_apply_smoothing_time_secs(),
+                    )
+                };
                 if (applied_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
                     if exiting_unity_reset_zone
                         && !dual_plane_ratio_in_unity_reset_zone(applied_ratio)
@@ -4016,6 +4033,26 @@ mod tests {
         assert!(
             requested_delta_frames > applied_delta_frames,
             "requested post-plateau jumps should extend the deterministic seam beyond the first smoothed ratio step"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_first_post_unity_callback_snaps_to_requested_ratio() {
+        assert!(
+            should_snap_dual_plane_first_post_unity_ratio(1.0, 1.035),
+            "the first callback after an exact-unity plateau should apply the requested above-unity ratio directly"
+        );
+        assert!(
+            should_snap_dual_plane_first_post_unity_ratio(0.997, 0.965),
+            "the first callback after a near-unity plateau should apply the requested below-unity ratio directly"
+        );
+        assert!(
+            !should_snap_dual_plane_first_post_unity_ratio(1.0, 1.003),
+            "near-unity hold callbacks should keep snapping parked at exact unity instead of rearming a post-plateau jump"
+        );
+        assert!(
+            !should_snap_dual_plane_first_post_unity_ratio(1.02, 1.035),
+            "once deterministic rendering has already left the unity reset zone, later callbacks should return to the normal apply smoothing path"
         );
     }
 
