@@ -665,8 +665,9 @@ impl RtProcessor {
         }
 
         self.cancel_inflight_auto_profile_transition();
-        self.post_ratio_motion_profile_hold_blocks_left =
-            self.post_ratio_motion_profile_hold_blocks_left.max(1);
+        self.post_ratio_motion_profile_hold_blocks_left = self
+            .post_ratio_motion_profile_hold_blocks_left
+            .max(POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS);
         self.policy_profile = self.current_profile;
         self.profile_candidate = self.current_profile;
         self.profile_candidate_streak = 0;
@@ -1528,8 +1529,9 @@ impl RtProcessor {
         }
         if (self.active_ratio - 1.0).abs() <= AUTO_PROFILE_NEAR_UNITY_PLATEAU_EPS {
             self.cancel_inflight_auto_profile_transition();
-            self.post_ratio_motion_profile_hold_blocks_left =
-                self.post_ratio_motion_profile_hold_blocks_left.max(1);
+            self.post_ratio_motion_profile_hold_blocks_left = self
+                .post_ratio_motion_profile_hold_blocks_left
+                .max(POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS);
             self.policy_profile = self.current_profile;
             self.profile_candidate = self.current_profile;
             self.profile_candidate_streak = 0;
@@ -2123,6 +2125,7 @@ const fn algorithmic_delay_frames(fft_size: usize) -> usize {
 mod tests {
     use super::{
         LatencyProfile, QualityTier, RtConfig, RtDelayTelemetry, RtProcessor, RtRuntimeTelemetry,
+        POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS,
     };
     use crate::core::types::StretchParams;
     use crate::dual_plane::hints::RenderHints;
@@ -4144,6 +4147,96 @@ mod tests {
         );
         assert_weights_close(rt.blend_weights, QualityTier::Q4.lane_weights(), 1e-6);
         assert_weights_close(rt.target_weights, QualityTier::Q4.lane_weights(), 1e-6);
+    }
+
+    #[test]
+    fn near_unity_plateau_holds_render_profile_through_short_post_plateau_burst() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Render;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 0;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let input_refs = [&input[..]];
+        let scratch_hints = Arc::new(RenderHints {
+            transient_confidence: 0.90,
+            tonal_confidence: 0.10,
+            noise_confidence: 0.20,
+            ..RenderHints::default()
+        });
+        let render_hints = Arc::new(RenderHints {
+            transient_confidence: 0.05,
+            tonal_confidence: 0.95,
+            noise_confidence: 0.05,
+            ..RenderHints::default()
+        });
+
+        rt.set_constant_ratio(1.004);
+        rt.set_hint_snapshot(render_hints);
+        let mut plateau_output = [0.0f32; 256];
+        let mut plateau_refs = [&mut plateau_output[..]];
+        let _ = rt.process(&input_refs, &mut plateau_refs);
+
+        assert_eq!(
+            rt.post_ratio_motion_profile_hold_blocks_left,
+            POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS,
+            "near-unity plateau should arm the same short profile hold used after ratio-motion freeze"
+        );
+
+        for burst_idx in 0..POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS {
+            rt.set_constant_ratio(1.70);
+            rt.set_hint_snapshot(scratch_hints.clone());
+            let mut burst_output = [0.0f32; 256];
+            let mut burst_refs = [&mut burst_output[..]];
+            let _ = rt.process(&input_refs, &mut burst_refs);
+
+            let telemetry = rt.profile_telemetry();
+            assert_eq!(
+                telemetry.current_profile,
+                LatencyProfile::Render,
+                "post-plateau hold callback {burst_idx} should keep the committed render profile active"
+            );
+            assert_eq!(
+                telemetry.target_profile,
+                LatencyProfile::Render,
+                "post-plateau hold callback {burst_idx} should suppress immediate scratch retarget churn"
+            );
+            assert_eq!(
+                telemetry.policy_profile,
+                LatencyProfile::Render,
+                "post-plateau hold callback {burst_idx} should keep policy telemetry parked on render"
+            );
+        }
+
+        rt.set_constant_ratio(1.70);
+        rt.set_hint_snapshot(scratch_hints);
+        let mut retarget_output = [0.0f32; 256];
+        let mut retarget_refs = [&mut retarget_output[..]];
+        let _ = rt.process(&input_refs, &mut retarget_refs);
+
+        let telemetry = rt.profile_telemetry();
+        assert_eq!(
+            telemetry.current_profile,
+            LatencyProfile::Render,
+            "retarget begins from the committed render profile"
+        );
+        assert_eq!(
+            telemetry.target_profile,
+            LatencyProfile::Scratch,
+            "once the short post-plateau hold drains, a sustained scratch suggestion should retarget normally"
+        );
+        assert_eq!(
+            telemetry.policy_profile,
+            LatencyProfile::Scratch,
+            "policy telemetry should resume scratch recommendations after the hold window ends"
+        );
     }
 
     #[test]
