@@ -1175,7 +1175,7 @@ impl PhaseVocoder {
         // Apply up to 2.5x ratio with a tapering blend around unity:
         // full strength near ratio≈1.0, gradually reduced as we move away on
         // either side (compression or expansion) to avoid over-locking artifacts.
-        if !self.peaks.is_empty() && hop_ratio < 2.5 {
+        if !self.transient_focus_active() && !self.peaks.is_empty() && hop_ratio < 2.5 {
             let ratio_distance = (hop_ratio - 1.0).abs();
             // For ratios >1.0, taper gradient locking faster to avoid
             // over-locking smearing at larger slowdowns.
@@ -1659,6 +1659,50 @@ mod tests {
         assert!(
             !pv.phase_seed_pending[target_bin],
             "pending flag should clear after first seeded frame"
+        );
+    }
+
+    #[test]
+    fn test_advance_phases_skips_phase_gradient_during_transient_focus() {
+        let sample_rate = 44_100u32;
+        let num_bins = 1024 / 2 + 1;
+        let peak_bin = 20usize;
+        let target_bin = 21usize;
+
+        let configure = |pv: &mut PhaseVocoder| {
+            pv.phase_seed_pending.fill(false);
+            pv.phase_accum.fill(0.0);
+
+            for bin in 0..num_bins {
+                pv.prev_phase[bin] = -pv.expected_phase_advance[bin];
+                let magnitude = if bin == peak_bin {
+                    2.0
+                } else if bin == peak_bin - 1 || bin == peak_bin + 1 {
+                    0.5
+                } else {
+                    0.1
+                };
+                pv.fft_buffer[bin] = Complex::from_polar(magnitude, 0.0);
+            }
+        };
+
+        let mut focused = PhaseVocoder::new(1024, 256, 1.0, sample_rate, 0.0);
+        configure(&mut focused);
+        focused.transient_focus_frames = 1;
+        focused.advance_phases(num_bins, 1.0);
+
+        let mut unfocused = PhaseVocoder::new(1024, 256, 1.0, sample_rate, 0.0);
+        configure(&mut unfocused);
+        unfocused.advance_phases(num_bins, 1.0);
+
+        let independent_phase = focused.expected_phase_advance[target_bin] as f32;
+        assert!(
+            (focused.new_phases[target_bin] - independent_phase).abs() < 1e-6,
+            "transient focus should keep non-peak bins on their independently advanced phase instead of reapplying the gradient field"
+        );
+        assert!(
+            (unfocused.new_phases[target_bin] - independent_phase).abs() > 1e-3,
+            "without transient focus the same non-peak bin should still be pulled by phase-gradient integration"
         );
     }
 
