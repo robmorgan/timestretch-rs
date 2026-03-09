@@ -163,6 +163,19 @@ impl TransientEventScheduler {
     }
 
     #[inline]
+    fn rejected_modulation_hold_cooldown_frames(&self, modulation_overlap_windows: usize) -> usize {
+        if self.hop_size == 0 {
+            return 1;
+        }
+
+        // Rejected low-dominant events should still hold through the currently
+        // overlapping callback footprint so the same physical onset is not
+        // re-evaluated as a fresh reset candidate on the next sub-hop pass.
+        let overlap_frames = self.fft_size.div_ceil(self.hop_size).saturating_sub(1).max(1);
+        overlap_frames.saturating_mul(modulation_overlap_windows.max(1))
+    }
+
+    #[inline]
     fn trigger_requirements(
         &self,
         suppress_low_bands: bool,
@@ -339,6 +352,9 @@ impl TransientEventScheduler {
                     if !self.should_accept_upper_band_reset_during_modulation_hold(
                         sub_flux, low_flux, mid_flux, high_flux, threshold,
                     ) {
+                        self.cooldown_frames = self.rejected_modulation_hold_cooldown_frames(
+                            modulation_overlap_windows,
+                        );
                         self.update_flux_stats(flux);
                         self.prev_flux = flux;
                         self.last_processed_frame_start = Some(absolute_frame_start);
@@ -623,6 +639,30 @@ mod tests {
             strong_modulation,
             base + overlap_frames * (MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS + 2),
             "larger modulation bursts should hold accepted resets through extra overlap windows"
+        );
+    }
+
+    #[test]
+    fn scheduler_rejected_modulation_hold_cooldown_covers_overlap_without_full_reset_hold() {
+        let fft = 1024usize;
+        let hop = 256usize;
+        let overlap_frames = fft.div_ceil(hop).saturating_sub(1);
+        let scheduler = TransientEventScheduler::new(fft, hop, 44_100, 4096);
+
+        let rejected =
+            scheduler.rejected_modulation_hold_cooldown_frames(
+                MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS,
+            );
+        let accepted = scheduler.reset_cooldown_frames(MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS);
+
+        assert_eq!(
+            rejected,
+            overlap_frames * MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS,
+            "rejected modulation-hold events should still hold through the overlapped callback footprint"
+        );
+        assert!(
+            rejected < accepted,
+            "rejected low-dominant events should debounce overlap rescans without blocking as long as a real accepted reset"
         );
     }
 
