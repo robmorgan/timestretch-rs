@@ -28,6 +28,7 @@ const ALGORITHMIC_DELAY_FFT_DENOMINATOR: usize = 2;
 const RATIO_MOTION_FREEZE_TRIGGER: f64 = 7.5e-4;
 const RATIO_MOTION_HISTORY_BLOCKS: usize = 4;
 const AUTO_PROFILE_NEAR_UNITY_PLATEAU_EPS: f64 = 0.005;
+const POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS: usize = 2;
 
 /// Lock-free snapshot mailbox shared between control producers and RT callback.
 ///
@@ -774,7 +775,7 @@ impl RtProcessor {
         self.ratio_motion_freeze_blocks_left =
             self.ratio_motion_freeze_blocks_left.saturating_sub(1);
         if was_active && self.ratio_motion_freeze_blocks_left == 0 && self.auto_profile_switching {
-            self.post_ratio_motion_profile_hold_blocks_left = 1;
+            self.post_ratio_motion_profile_hold_blocks_left = POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS;
         }
     }
 
@@ -3836,15 +3837,33 @@ mod tests {
         assert_eq!(
             second_calm.current_profile,
             LatencyProfile::Scratch,
-            "retargeting away from scratch should still occur via a transition"
+            "the second calm kernel should continue the post-freeze hold instead of immediately retargeting away from scratch"
         );
         assert_eq!(
             second_calm.target_profile,
+            LatencyProfile::Scratch,
+            "the second calm kernel should still keep the scratch target pinned while the extended hold drains"
+        );
+        assert_eq!(
+            second_calm.transition_blocks_left, 0,
+            "the extended post-freeze hold should not queue a render transition on the second calm kernel"
+        );
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        let third_calm = rt.profile_telemetry();
+        assert_eq!(
+            third_calm.current_profile,
+            LatencyProfile::Scratch,
+            "retargeting away from scratch should still occur via a transition after the extended hold drains"
+        );
+        assert_eq!(
+            third_calm.target_profile,
             LatencyProfile::Render,
-            "the second calm kernel should be the first one allowed to retarget away from scratch"
+            "the third calm kernel should be the first one allowed to retarget away from scratch"
         );
         assert!(
-            second_calm.transition_blocks_left > 0,
+            third_calm.transition_blocks_left > 0,
             "retargeting away from scratch should queue a transition instead of snapping instantly"
         );
     }
@@ -4251,16 +4270,34 @@ mod tests {
         assert_eq!(
             resumed.current_profile,
             LatencyProfile::Scratch,
-            "the committed scratch profile should stay active until the queued render transition settles"
+            "the second stable near-unity kernel should still keep the scratch profile active while the extended post-freeze hold drains"
         );
         assert_eq!(
             resumed.target_profile,
-            LatencyProfile::Render,
-            "once the unity callback consumes the hold, the second stable near-unity kernel should be able to retarget away from scratch"
+            LatencyProfile::Scratch,
+            "the second stable near-unity kernel should still keep the scratch target pinned during the extended post-freeze hold"
         );
-        assert!(
-            resumed.transition_blocks_left > 0,
-            "retargeting away from scratch should queue a transition instead of snapping instantly"
+        assert_eq!(
+            resumed.transition_blocks_left, 0,
+            "the extended post-freeze hold should not queue a render transition on the second stable near-unity kernel"
+        );
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+        let resumed = rt.profile_telemetry();
+        assert_eq!(
+            resumed.current_profile,
+            LatencyProfile::Scratch,
+            "the third stable near-unity kernel should still keep the scratch profile active while the extended post-freeze hold drains through the unity handoff"
+        );
+        assert_eq!(
+            resumed.target_profile,
+            LatencyProfile::Scratch,
+            "the third stable near-unity kernel should still keep the scratch target pinned during the extended post-freeze hold"
+        );
+        assert_eq!(
+            resumed.transition_blocks_left, 0,
+            "the extended post-freeze hold should not queue a render transition on the third stable near-unity kernel"
         );
     }
 
