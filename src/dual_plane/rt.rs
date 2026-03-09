@@ -33,6 +33,8 @@ const SCRATCH_EXIT_HYSTERESIS_EXTRA_BLOCKS: usize = 1;
 const DIRECT_SCRATCH_TO_RENDER_EXIT_EXTRA_BLOCKS: usize = 1;
 const UNITY_PLATEAU_EXTRA_PROFILE_HOLD_RATIO: f64 = 0.02;
 const RATIO_CONTINUITY_SLEW_MAX_STEP: f64 = 0.012;
+const RATIO_CONTINUITY_NEAR_UNITY_SLEW_MAX_STEP: f64 = 0.006;
+const RATIO_CONTINUITY_NEAR_UNITY_WINDOW: f64 = 0.05;
 
 /// Lock-free snapshot mailbox shared between control producers and RT callback.
 ///
@@ -2129,12 +2131,30 @@ impl RtProcessor {
         }
 
         let step = ratio - self.active_ratio;
-        if step.abs() <= RATIO_CONTINUITY_SLEW_MAX_STEP {
+        let max_step = self.continuity_slew_max_step(ratio);
+        if step.abs() <= max_step {
             return ratio;
         }
 
-        (self.active_ratio + step.signum() * RATIO_CONTINUITY_SLEW_MAX_STEP)
+        (self.active_ratio + step.signum() * max_step)
             .clamp(self.config.min_ratio, self.config.max_ratio)
+    }
+
+    #[inline]
+    fn continuity_slew_max_step(&self, ratio: f64) -> f64 {
+        let active_delta = self.active_ratio - 1.0;
+        let target_delta = ratio - 1.0;
+        let crosses_unity = active_delta.abs() > RATIO_SNAP_EPS
+            && target_delta.abs() > RATIO_SNAP_EPS
+            && active_delta.signum() != target_delta.signum();
+        let both_near_unity = active_delta.abs() <= RATIO_CONTINUITY_NEAR_UNITY_WINDOW
+            && target_delta.abs() <= RATIO_CONTINUITY_NEAR_UNITY_WINDOW;
+
+        if crosses_unity || both_near_unity {
+            RATIO_CONTINUITY_NEAR_UNITY_SLEW_MAX_STEP
+        } else {
+            RATIO_CONTINUITY_SLEW_MAX_STEP
+        }
     }
 
     #[inline]
@@ -2195,7 +2215,8 @@ const fn algorithmic_delay_frames(fft_size: usize) -> usize {
 mod tests {
     use super::{
         LatencyProfile, QualityTier, RtConfig, RtDelayTelemetry, RtProcessor, RtRuntimeTelemetry,
-        POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS, RATIO_CONTINUITY_SLEW_MAX_STEP,
+        POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS, RATIO_CONTINUITY_NEAR_UNITY_SLEW_MAX_STEP,
+        RATIO_CONTINUITY_SLEW_MAX_STEP,
     };
     use crate::core::types::StretchParams;
     use crate::dual_plane::hints::RenderHints;
@@ -4723,14 +4744,33 @@ mod tests {
 
         assert_eq!(rt.process_block_into(&block, &mut []).unwrap(), 0);
         assert!(
-            (rt.active_ratio() - (1.0 + RATIO_CONTINUITY_SLEW_MAX_STEP)).abs() < 1e-9,
-            "first committed kernel should cap the fast-mod ratio step instead of jumping straight to the requested ratio"
+            (rt.active_ratio() - (1.0 + RATIO_CONTINUITY_NEAR_UNITY_SLEW_MAX_STEP)).abs() < 1e-9,
+            "first near-unity fast-mod kernel should use the tighter continuity slew instead of jumping straight to the requested ratio"
         );
 
         assert_eq!(rt.process_block_into(&block, &mut []).unwrap(), 0);
         assert!(
-            (rt.active_ratio() - (1.0 + 2.0 * RATIO_CONTINUITY_SLEW_MAX_STEP)).abs() < 1e-9,
-            "repeated fast-mod kernels should keep walking the ratio toward the requested target in bounded continuity steps"
+            (rt.active_ratio() - (1.0 + 2.0 * RATIO_CONTINUITY_NEAR_UNITY_SLEW_MAX_STEP)).abs() < 1e-9,
+            "repeated near-unity fast-mod kernels should keep walking the ratio toward the requested target in tighter continuity steps"
+        );
+    }
+
+    #[test]
+    fn auto_profile_fast_modulation_keeps_default_slew_away_from_unity() {
+        let params = StretchParams::new(1.28)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut cfg = RtConfig::new(params, 2048);
+        cfg.latency_profile = LatencyProfile::Mix;
+        cfg.auto_profile_switching = true;
+        let rt = RtProcessor::prepare(cfg).unwrap();
+
+        assert_eq!(
+            rt.continuity_slew_max_step(1.34),
+            RATIO_CONTINUITY_SLEW_MAX_STEP,
+            "off-unity modulation should keep the default continuity slew budget"
         );
     }
 
