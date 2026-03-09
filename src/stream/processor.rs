@@ -167,6 +167,15 @@ fn dual_plane_ratio_in_unity_reset_zone(ratio: f64) -> bool {
     (ratio - 1.0).abs() <= DUAL_PLANE_RATIO_HISTORY_UNITY_RESET_EPS
 }
 
+#[inline]
+fn snap_dual_plane_ratio_to_unity_plateau(ratio: f64) -> f64 {
+    if dual_plane_ratio_in_unity_reset_zone(ratio) {
+        1.0
+    } else {
+        ratio
+    }
+}
+
 /// Stateful linear resampler used for realtime pitch control in stream mode.
 ///
 /// Maintains one-sample look-behind and a fractional source cursor so
@@ -302,6 +311,7 @@ struct DualPlaneDeterministicState {
 
 impl DualPlaneDeterministicState {
     fn from_params(params: &StretchParams, ratio: f64) -> Result<Self, StretchError> {
+        let ratio = snap_dual_plane_ratio_to_unity_plateau(ratio);
         let block_frames = COMMON_CALLBACK_FRAMES;
         let kernel_frames = (params.fft_size * 2).max(block_frames);
         let mut rt_cfg = RtConfig::new(params.clone(), block_frames);
@@ -1546,8 +1556,20 @@ impl StreamProcessor {
 
         self.interpolate_ratio_for_frames(frames);
         self.expected_total_output_samples += input.len() as f64 * self.current_ratio;
-        let processing_ratio = self.processing_ratio();
-        let target_processing_ratio = self.target_ratio * self.pitch_scale;
+        let raw_processing_ratio = self.processing_ratio();
+        let raw_target_processing_ratio = self.target_ratio * self.pitch_scale;
+        let hold_exact_unity_plateau = dual_plane_ratio_in_unity_reset_zone(raw_processing_ratio)
+            && dual_plane_ratio_in_unity_reset_zone(raw_target_processing_ratio);
+        let processing_ratio = if hold_exact_unity_plateau {
+            1.0
+        } else {
+            raw_processing_ratio
+        };
+        let target_processing_ratio = if hold_exact_unity_plateau {
+            1.0
+        } else {
+            raw_target_processing_ratio
+        };
         let sample_rate = self.params.sample_rate;
         let unity_exit_seam_frames = self.params.hop_size.min(DUAL_PLANE_UNITY_EXIT_SEAM_FRAMES);
 
@@ -3476,6 +3498,21 @@ mod tests {
             state.recent_chunk_ratios,
             vec![0.988],
             "the first post-plateau callback should start a fresh opposite-side averaging window"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_deterministic_near_unity_plateau_snaps_to_exact_unity() {
+        let params = StretchParams::new(1.003)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let state = DualPlaneDeterministicState::from_params(&params, 1.003).unwrap();
+
+        assert_eq!(
+            state.last_ratio, 1.0,
+            "deterministic near-unity startup should use the exact-unity RT ratio so tiny plateau callbacks do not churn the seam"
         );
     }
 
