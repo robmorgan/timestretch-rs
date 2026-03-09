@@ -57,6 +57,9 @@ const TRANSIENT_RESET_MODULATION_OVERLAP_RATIO_RANGE: f64 = 0.09;
 /// Minimum extra overlap window when low-band-suppressed modulation is still
 /// crossing or settling around a seam-sensitive unity transition.
 const TRANSIENT_RESET_MODULATION_SEAM_MIN_EXTRA_OVERLAP_WINDOWS: usize = 1;
+/// Wider current-ratio band that keeps transient-reset suppression alive for
+/// the first callback after leaving a unity plateau.
+const TRANSIENT_RESET_NEAR_UNITY_SEAM_EPS: f64 = 0.015;
 /// Deterministic auto-profile hysteresis blocks used to avoid one-kernel churn after short bursts.
 const DETERMINISTIC_AUTO_PROFILE_SWITCH_HYSTERESIS_BLOCKS: usize = 2;
 /// Numerator for the FFT-size latency fraction (3/2 = 1.5x FFT size).
@@ -231,6 +234,13 @@ fn should_snap_dual_plane_first_post_unity_ratio(
 ) -> bool {
     dual_plane_ratio_in_unity_reset_zone(previous_ratio)
         && !dual_plane_ratio_in_unity_reset_zone(requested_ratio)
+}
+
+#[inline]
+fn transient_reset_near_unity_transition(current_ratio: f64, target_ratio: f64) -> bool {
+    dual_plane_ratio_in_unity_reset_zone(current_ratio)
+        || dual_plane_ratio_in_unity_reset_zone(target_ratio)
+        || (current_ratio - 1.0).abs() <= TRANSIENT_RESET_NEAR_UNITY_SEAM_EPS
 }
 
 /// Stateful linear resampler used for realtime pitch control in stream mode.
@@ -2715,9 +2725,8 @@ impl StreamProcessor {
             return false;
         }
 
-        let near_unity_transition = (self.current_ratio - 1.0).abs()
-            <= DUAL_PLANE_RATIO_HISTORY_UNITY_RESET_EPS
-            || (self.target_ratio - 1.0).abs() <= DUAL_PLANE_RATIO_HISTORY_UNITY_RESET_EPS;
+        let near_unity_transition =
+            transient_reset_near_unity_transition(self.current_ratio, self.target_ratio);
         if near_unity_transition {
             return true;
         }
@@ -2745,9 +2754,8 @@ impl StreamProcessor {
             + ((TRANSIENT_RESET_MODULATION_MAX_EXTRA_OVERLAP_WINDOWS as f64) * scaled).round()
                 as usize;
 
-        let near_unity_transition = (self.current_ratio - 1.0).abs()
-            <= DUAL_PLANE_RATIO_HISTORY_UNITY_RESET_EPS
-            || (self.target_ratio - 1.0).abs() <= DUAL_PLANE_RATIO_HISTORY_UNITY_RESET_EPS;
+        let near_unity_transition =
+            transient_reset_near_unity_transition(self.current_ratio, self.target_ratio);
         let current_side = ratio_modulation_side(self.current_ratio);
         let target_side = ratio_modulation_side(self.target_ratio);
         let crosses_unity = current_side != 0 && target_side != 0 && current_side != target_side;
@@ -4266,6 +4274,26 @@ mod tests {
     }
 
     #[test]
+    fn test_transient_reset_modulation_overlap_windows_hold_extra_seam_window_just_after_unity_exit(
+    ) {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+
+        proc.current_ratio = 1.011;
+        proc.target_ratio = 1.04;
+
+        assert_eq!(
+            proc.transient_reset_modulation_overlap_windows(true),
+            3,
+            "the first callback after leaving a unity plateau should keep one extra overlap window while the seam is still near unity"
+        );
+    }
+
+    #[test]
     fn test_transient_reset_modulation_overlap_windows_hold_extra_seam_window_on_same_side_rebound()
     {
         let params = StretchParams::new(1.0)
@@ -4282,6 +4310,30 @@ mod tests {
             proc.transient_reset_modulation_overlap_windows(true),
             3,
             "same-side rebounds toward unity should keep one extra overlap window so a draining seam is not reclassified as a fresh transient"
+        );
+    }
+
+    #[test]
+    fn test_transient_reset_hold_low_bands_just_after_unity_exit() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+
+        proc.current_ratio = 1.011;
+        proc.target_ratio = 1.04;
+        assert!(
+            proc.transient_reset_should_hold_low_bands(),
+            "the first same-side callback after leaving a unity plateau should keep low bands locked while the seam still sits near unity"
+        );
+
+        proc.current_ratio = 0.989;
+        proc.target_ratio = 0.96;
+        assert!(
+            proc.transient_reset_should_hold_low_bands(),
+            "compression exits should also keep low bands locked for the first callback after a unity plateau"
         );
     }
 
