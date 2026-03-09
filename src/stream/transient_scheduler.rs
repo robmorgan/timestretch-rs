@@ -27,9 +27,9 @@ const FLUX_WARMUP_FRAMES: usize = 3;
 const FLUX_MAX_SCAN_FRAMES: usize = 8;
 /// Minimum cooldown frames after an event to avoid duplicate resets.
 const FLUX_RESET_COOLDOWN_FRAMES: usize = 2;
-/// Extra overlap windows to hold accepted resets when modulation has already
-/// forced low bands to stay locked.
-const MODULATION_RESET_COOLDOWN_OVERLAP_WINDOWS: usize = 2;
+/// Base overlap windows used by tests when verifying modulation cooldown scaling.
+#[cfg(test)]
+const MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct TransientSchedulerStats {
@@ -128,7 +128,7 @@ impl TransientEventScheduler {
     }
 
     #[inline]
-    fn reset_cooldown_frames(&self, suppress_low_bands: bool) -> usize {
+    fn reset_cooldown_frames(&self, modulation_overlap_windows: usize) -> usize {
         if self.hop_size == 0 {
             return FLUX_RESET_COOLDOWN_FRAMES;
         }
@@ -139,19 +139,13 @@ impl TransientEventScheduler {
         let overlap_frames = self.fft_size.div_ceil(self.hop_size).saturating_sub(1);
         let mut cooldown_frames = FLUX_RESET_COOLDOWN_FRAMES.max(overlap_frames);
 
-        if suppress_low_bands {
+        if modulation_overlap_windows > 0 {
             // Cross-unity/near-unity modulation already keeps low bands phase
-            // locked. Extend the accepted-event hold by one more overlap
-            // window so the same broadband hit does not retrigger a second
-            // upper-band-only reset while the modulation seam is still
-            // draining through overlapped callbacks. Keep the hold long
-            // enough to cover two extra overlap footprints because the
-            // deterministic path may carry one accepted transient across
-            // several short automation callbacks before the reseeded phase
-            // state has fully settled.
-            cooldown_frames = cooldown_frames.saturating_add(
-                overlap_frames.saturating_mul(MODULATION_RESET_COOLDOWN_OVERLAP_WINDOWS),
-            );
+            // locked. Extend the accepted-event hold so the same broadband hit
+            // does not retrigger a second upper-band-only reset while the
+            // modulation seam is still draining through overlapped callbacks.
+            cooldown_frames = cooldown_frames
+                .saturating_add(overlap_frames.saturating_mul(modulation_overlap_windows));
         }
 
         cooldown_frames
@@ -167,6 +161,7 @@ impl TransientEventScheduler {
         interleaved_stereo: &[f32],
         frame_origin: usize,
         suppress_low_bands: bool,
+        modulation_overlap_windows: usize,
     ) -> Option<[bool; 4]> {
         if self.hop_size == 0 || interleaved_stereo.len() < self.fft_size.saturating_mul(2) {
             return None;
@@ -301,7 +296,7 @@ impl TransientEventScheduler {
                 }
                 self.stats.events_detected_total =
                     self.stats.events_detected_total.saturating_add(1);
-                self.cooldown_frames = self.reset_cooldown_frames(suppress_low_bands);
+                self.cooldown_frames = self.reset_cooldown_frames(modulation_overlap_windows);
             }
 
             self.update_flux_stats(flux);
@@ -389,7 +384,7 @@ impl TransientEventScheduler {
 mod tests {
     use super::{
         TransientEventScheduler, FLUX_RESET_COOLDOWN_FRAMES,
-        MODULATION_RESET_COOLDOWN_OVERLAP_WINDOWS,
+        MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS,
     };
     use std::f32::consts::PI;
 
@@ -411,7 +406,7 @@ mod tests {
         }
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
-        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
+        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0, false, 0);
         assert!(mask.is_some(), "expected transient reset mask");
         let mask = mask.unwrap();
         assert!(
@@ -438,7 +433,7 @@ mod tests {
         }
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
-        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
+        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0, false, 0);
         assert!(
             mask.is_some(),
             "expected reset mask for anti-phase transient content"
@@ -454,9 +449,9 @@ mod tests {
         let stereo = vec![0.0f32; frames * 2];
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
-        let _ = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
+        let _ = scheduler.detect_stereo_reset_mask(&stereo, 0, false, 0);
         scheduler.reset();
-        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
+        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0, false, 0);
         assert!(
             mask.is_none(),
             "silent input should not produce reset mask after reset"
@@ -479,8 +474,8 @@ mod tests {
         }
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
-        let first = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
-        let second = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
+        let first = scheduler.detect_stereo_reset_mask(&stereo, 0, false, 0);
+        let second = scheduler.detect_stereo_reset_mask(&stereo, 0, false, 0);
         assert!(first.is_some(), "first pass should observe transient");
         assert!(
             second.is_none(),
@@ -535,8 +530,9 @@ mod tests {
         let overlap_frames = fft.div_ceil(hop).saturating_sub(1);
         let scheduler = TransientEventScheduler::new(fft, hop, 44_100, 4096);
 
-        let base = scheduler.reset_cooldown_frames(false);
-        let modulation = scheduler.reset_cooldown_frames(true);
+        let base = scheduler.reset_cooldown_frames(0);
+        let modulation =
+            scheduler.reset_cooldown_frames(MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS);
 
         assert_eq!(
             base,
@@ -545,8 +541,26 @@ mod tests {
         );
         assert_eq!(
             modulation,
-            base + overlap_frames * MODULATION_RESET_COOLDOWN_OVERLAP_WINDOWS,
+            base + overlap_frames * MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS,
             "modulation low-band holds should add one extra overlap window of duplicate-reset protection"
+        );
+    }
+
+    #[test]
+    fn scheduler_cooldown_scales_with_requested_modulation_overlap_windows() {
+        let fft = 1024usize;
+        let hop = 256usize;
+        let overlap_frames = fft.div_ceil(hop).saturating_sub(1);
+        let scheduler = TransientEventScheduler::new(fft, hop, 44_100, 4096);
+
+        let base = scheduler.reset_cooldown_frames(0);
+        let strong_modulation =
+            scheduler.reset_cooldown_frames(MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS + 2);
+
+        assert_eq!(
+            strong_modulation,
+            base + overlap_frames * (MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS + 2),
+            "larger modulation bursts should hold accepted resets through extra overlap windows"
         );
     }
 
@@ -566,7 +580,7 @@ mod tests {
         }
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
-        let _ = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
+        let _ = scheduler.detect_stereo_reset_mask(&stereo, 0, false, 0);
         let stats = scheduler.stats();
         assert!(
             stats.events_detected_total > 0,
@@ -600,7 +614,7 @@ mod tests {
         }
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
-        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
+        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0, false, 0);
         assert!(mask.is_some(), "expected tail transient reset mask");
         assert_eq!(
             scheduler.cooldown_frames,
@@ -629,7 +643,7 @@ mod tests {
         }
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, callback_frames);
-        let first = scheduler.detect_stereo_reset_mask(&stereo[..callback_frames * 2], 0, false);
+        let first = scheduler.detect_stereo_reset_mask(&stereo[..callback_frames * 2], 0, false, 0);
         assert!(
             first.is_some(),
             "expected initial tail transient reset mask"
@@ -639,7 +653,7 @@ mod tests {
             Some(3072),
             "tail click should advance the processed-frame cursor to the final schedulable frame"
         );
-        let expected_cooldown = scheduler.reset_cooldown_frames(false);
+        let expected_cooldown = scheduler.reset_cooldown_frames(0);
         assert_eq!(
             scheduler.cooldown_frames, expected_cooldown,
             "detected event should arm the full cooldown"
@@ -651,6 +665,7 @@ mod tests {
             &stereo[shifted_start..shifted_end],
             half_hop,
             false,
+            0,
         );
         assert!(
             second.is_none(),
@@ -696,7 +711,7 @@ mod tests {
         for origin in (0..=8).map(|step| step * half_hop) {
             let start = origin * 2;
             let end = start + callback_frames * 2;
-            let mask = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin, false);
+            let mask = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin, false, 0);
             if mask.is_some() {
                 triggered_origins.push(origin);
             }
@@ -735,7 +750,7 @@ mod tests {
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, callback_frames);
         let expected_last_start = Some(3072usize);
-        let expected_cooldown = scheduler.reset_cooldown_frames(false);
+        let expected_cooldown = scheduler.reset_cooldown_frames(0);
         let mut triggered_origins = Vec::new();
 
         for origin in [
@@ -750,7 +765,7 @@ mod tests {
         ] {
             let start = origin * 2;
             let end = start + callback_frames * 2;
-            let mask = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin, false);
+            let mask = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin, false, 0);
             if mask.is_some() {
                 triggered_origins.push(origin);
             }
@@ -830,7 +845,7 @@ mod tests {
         ] {
             let start = origin * 2;
             let end = start + callback_frames * 2;
-            let mask = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin, false);
+            let mask = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin, false, 0);
             if mask.is_some() {
                 triggered_origins.push(origin);
             }
@@ -868,7 +883,7 @@ mod tests {
         for origin in [0usize, hop, hop * 2, hop * 3] {
             let start = origin * 2;
             let end = start + callback_frames * 2;
-            let _ = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin, false);
+            let _ = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin, false, 0);
         }
 
         let stats = scheduler.stats();
@@ -896,7 +911,7 @@ mod tests {
         }
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
-        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0, false);
+        let mask = scheduler.detect_stereo_reset_mask(&stereo, 0, false, 0);
         assert!(mask.is_some(), "expected first-event reset mask");
 
         let stats = scheduler.stats();

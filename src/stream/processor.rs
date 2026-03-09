@@ -41,6 +41,12 @@ const DUAL_PLANE_UNITY_EXIT_SEAM_FRAMES: usize = 64;
 const DUAL_PLANE_UNITY_EXIT_SEAM_MAX_FRAMES: usize = 128;
 /// Ratio-jump range that scales the unity-exit seam from base to max length.
 const DUAL_PLANE_UNITY_EXIT_SEAM_RATIO_RANGE: f64 = 0.08;
+/// Base overlap windows to hold transient resets during low-band-suppressed modulation.
+const TRANSIENT_RESET_MODULATION_BASE_OVERLAP_WINDOWS: usize = 2;
+/// Additional overlap windows for larger fast-modulation bursts.
+const TRANSIENT_RESET_MODULATION_MAX_EXTRA_OVERLAP_WINDOWS: usize = 2;
+/// Ratio-jump range that scales transient-reset duplicate protection under modulation.
+const TRANSIENT_RESET_MODULATION_OVERLAP_RATIO_RANGE: f64 = 0.09;
 /// Numerator for the FFT-size latency fraction (3/2 = 1.5x FFT size).
 const LATENCY_FFT_NUMERATOR: usize = 3;
 /// Denominator for the FFT-size latency fraction.
@@ -2588,10 +2594,13 @@ impl StreamProcessor {
 
         let stereo = &self.interleaved_scratch[..total_samples];
         let suppress_low_bands = self.transient_reset_should_hold_low_bands();
+        let modulation_overlap_windows =
+            self.transient_reset_modulation_overlap_windows(suppress_low_bands);
         let Some(reset_mask) = self.transient_scheduler.detect_stereo_reset_mask(
             stereo,
             self.input_frames_consumed_total,
             suppress_low_bands,
+            modulation_overlap_windows,
         ) else {
             return;
         };
@@ -2627,6 +2636,19 @@ impl StreamProcessor {
         let current_side = ratio_modulation_side(self.current_ratio);
         let target_side = ratio_modulation_side(self.target_ratio);
         current_side != 0 && target_side != 0 && current_side != target_side
+    }
+
+    #[inline]
+    fn transient_reset_modulation_overlap_windows(&self, suppress_low_bands: bool) -> usize {
+        if !suppress_low_bands {
+            return 0;
+        }
+
+        let ratio_delta = (self.target_ratio - self.current_ratio).abs();
+        let scaled = (ratio_delta / TRANSIENT_RESET_MODULATION_OVERLAP_RATIO_RANGE).clamp(0.0, 1.0);
+        TRANSIENT_RESET_MODULATION_BASE_OVERLAP_WINDOWS
+            + ((TRANSIENT_RESET_MODULATION_MAX_EXTRA_OVERLAP_WINDOWS as f64) * scaled).round()
+                as usize
     }
 
     /// Returns the BPM stored in the params, if any.
@@ -3855,6 +3877,37 @@ mod tests {
         assert_eq!(
             long_ramp, 128,
             "large unity exits should expand the deterministic seam ramp up to the configured cap"
+        );
+    }
+
+    #[test]
+    fn test_transient_reset_modulation_overlap_windows_scale_with_ratio_jump() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+
+        proc.current_ratio = 1.0;
+        proc.target_ratio = 1.03;
+        let modest = proc.transient_reset_modulation_overlap_windows(true);
+
+        proc.target_ratio = 1.12;
+        let strong = proc.transient_reset_modulation_overlap_windows(true);
+
+        assert_eq!(
+            modest, 3,
+            "modest low-band-suppressed modulation should only add one extra overlap window"
+        );
+        assert_eq!(
+            strong, 4,
+            "larger low-band-suppressed modulation should extend duplicate-reset protection farther"
+        );
+        assert_eq!(
+            proc.transient_reset_modulation_overlap_windows(false),
+            0,
+            "when low bands are not being held, modulation overlap protection should stay disabled"
         );
     }
 
