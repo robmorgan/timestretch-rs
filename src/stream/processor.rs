@@ -477,11 +477,26 @@ impl DualPlaneDeterministicState {
         {
             return;
         }
+        let preserved_progress = if self.pending_unity_exit_seam {
+            self.pending_unity_exit_seam_progress_frames
+        } else {
+            0
+        };
+        let preserved_frames = if self.pending_unity_exit_seam {
+            self.pending_unity_exit_seam_frames
+        } else {
+            0
+        };
         self.unity_exit_seam_samples
             .copy_from_slice(&self.last_output_samples);
         self.pending_unity_exit_seam = true;
-        self.pending_unity_exit_seam_frames = ramp_frames;
-        self.pending_unity_exit_seam_progress_frames = 0;
+        self.pending_unity_exit_seam_frames = ramp_frames.max(preserved_frames);
+        // If a short-interval modulation step re-arms the seam while the
+        // previous ramp is still draining, keep the already-consumed progress
+        // so the next callback resumes from the in-flight seam instead of
+        // restarting a fresh click-prone boundary ramp.
+        self.pending_unity_exit_seam_progress_frames =
+            preserved_progress.min(self.pending_unity_exit_seam_frames.saturating_sub(1));
     }
 
     #[inline]
@@ -3981,6 +3996,45 @@ mod tests {
         assert!(
             (final_callback[0][2] - 1.0).abs() < 1e-6,
             "frames beyond the configured seam length should remain at the target output"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_unity_exit_seam_rearm_preserves_inflight_progress() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        let prior_output = [vec![0.4, 0.5, 0.6]];
+        state.capture_last_output_samples(&prior_output, 3);
+        state.arm_unity_exit_seam(8);
+
+        let mut first_callback = [vec![1.0, 1.0, 1.0]];
+        state.apply_pending_unity_exit_seam(&mut first_callback, 3);
+        state.capture_last_output_samples(&first_callback, 3);
+
+        state.arm_unity_exit_seam(8);
+        assert!(
+            state.pending_unity_exit_seam,
+            "rearming a unity-exit seam mid-ramp should keep the seam active"
+        );
+        assert_eq!(
+            state.pending_unity_exit_seam_progress_frames, 3,
+            "rearming during short-interval modulation should preserve the already-drained seam progress"
+        );
+
+        let mut second_callback = [vec![1.0, 1.0, 1.0]];
+        state.apply_pending_unity_exit_seam(&mut second_callback, 3);
+        assert!(
+            (second_callback[0][0] - 0.8518519).abs() < 1e-6,
+            "a re-armed seam should resume from the in-flight progress using the latest emitted anchor instead of restarting from the boundary"
+        );
+        assert_eq!(
+            state.pending_unity_exit_seam_progress_frames, 6,
+            "the re-armed seam should keep accumulating progress after resuming"
         );
     }
 
