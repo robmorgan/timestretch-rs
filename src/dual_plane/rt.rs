@@ -1343,44 +1343,44 @@ impl RtProcessor {
         }
 
         let history_samples = self.unity_history.len();
-        let min_history_samples = self
-            .config
-            .params
-            .fft_size
-            .saturating_mul(self.num_channels);
-        if history_samples < min_history_samples {
+        let history_frames = history_samples / self.num_channels.max(1);
+        if history_frames < self.config.params.hop_size {
             return Ok(());
         }
-        if history_samples > self.interleaved_scratch.len() {
+        let fft_history_frames = self.config.params.fft_size;
+        let priming_frames = history_frames.max(fft_history_frames);
+        let priming_samples = priming_frames.saturating_mul(self.num_channels);
+        if priming_samples > self.interleaved_scratch.len() {
             return Err(StretchError::BufferOverflow {
                 buffer: "rt_unity_history_scratch",
-                requested: history_samples,
+                requested: priming_samples,
                 available: self.interleaved_scratch.len(),
             });
         }
 
+        self.interleaved_scratch[..priming_samples].fill(0.0);
+        let copy_offset = priming_samples.saturating_sub(history_samples);
         let copied = self
             .unity_history
-            .peek_slice(&mut self.interleaved_scratch[..history_samples]);
+            .peek_slice(&mut self.interleaved_scratch[copy_offset..priming_samples]);
         if copied != history_samples {
             return Err(StretchError::InvalidState(
                 "failed to snapshot unity passthrough history",
             ));
         }
 
-        let history_frames = history_samples / self.num_channels.max(1);
         for ch in 0..self.num_channels {
-            if self.channel_input[ch].capacity() < history_frames {
+            if self.channel_input[ch].capacity() < priming_frames {
                 return Err(StretchError::BufferOverflow {
                     buffer: "rt_channel_input",
-                    requested: history_frames,
+                    requested: priming_frames,
                     available: self.channel_input[ch].capacity(),
                 });
             }
-            if self.pv_channel_input[ch].capacity() < history_frames {
+            if self.pv_channel_input[ch].capacity() < priming_frames {
                 return Err(StretchError::BufferOverflow {
                     buffer: "rt_pv_channel_input",
-                    requested: history_frames,
+                    requested: priming_frames,
                     available: self.pv_channel_input[ch].capacity(),
                 });
             }
@@ -1388,7 +1388,7 @@ impl RtProcessor {
             self.pv_channel_input[ch].clear();
         }
 
-        for frame in 0..history_frames {
+        for frame in 0..priming_frames {
             let base = frame * self.num_channels;
             for ch in 0..self.num_channels {
                 self.channel_input[ch].push(self.interleaved_scratch[base + ch]);
@@ -1400,7 +1400,7 @@ impl RtProcessor {
         }
 
         for ch in 0..self.num_channels {
-            for frame in 0..history_frames {
+            for frame in 0..priming_frames {
                 let (_low, high) =
                     self.sub_bass_crossovers[ch].process_sample(self.channel_input[ch][frame]);
                 self.pv_channel_input[ch].push(high);
@@ -1409,8 +1409,8 @@ impl RtProcessor {
 
         // Keep unity-exit warm-starts aligned with the committed-kernel path:
         // transient-heavy regions should be attenuated before they seed the PV.
-        let history_start_frame = (self.input_timeline_frames - history_frames as f64).max(0.0);
-        self.apply_input_domain_transient_mask(history_frames, history_start_frame);
+        let history_start_frame = (self.input_timeline_frames - priming_frames as f64).max(0.0);
+        self.apply_input_domain_transient_mask(priming_frames, history_start_frame);
 
         for ch in 0..self.num_channels {
             self.tonal_output[ch].clear();
@@ -2554,6 +2554,59 @@ mod tests {
         assert!(
             tonal_tail.iter().all(|sample| sample.is_finite()),
             "primed tonal tail must remain finite"
+        );
+    }
+
+    #[test]
+    fn short_unity_plateau_still_primes_tonal_history_on_non_unity_entry() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(128)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 32);
+        cfg.latency_profile = LatencyProfile::Scratch;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let mut unity_output = [0.0f32; 32];
+        for block_idx in 0..2 {
+            let input: Vec<f32> = (0..32)
+                .map(|i| {
+                    let phase = (block_idx * 32 + i) as f32 * 0.031;
+                    phase.sin() * 0.4
+                })
+                .collect();
+            let written = rt.process_block_into(&input, &mut unity_output).unwrap();
+            assert_eq!(written, input.len());
+            assert_eq!(&unity_output[..written], &input[..]);
+        }
+
+        let short_history_frames = rt.unity_history.len();
+        assert!(
+            short_history_frames < rt.config.params.fft_size,
+            "test requires a short unity plateau below one FFT window"
+        );
+
+        rt.set_constant_ratio(1.04);
+        let input: Vec<f32> = (0..32)
+            .map(|i| ((64 + i) as f32 * 0.031).sin() * 0.4)
+            .collect();
+        let written = rt.process_block_into(&input, &mut []).unwrap();
+        assert_eq!(
+            written, 0,
+            "single warm-start block should not render a full kernel"
+        );
+        assert_eq!(rt.input_ring.len(), input.len());
+        assert!(rt.unity_history.is_empty());
+
+        let tonal_tail = rt.vocoders[0].flush_streaming().unwrap();
+        assert!(
+            !tonal_tail.is_empty(),
+            "short unity plateaus should still leave tonal overlap state primed"
+        );
+        assert!(
+            tonal_tail.iter().all(|sample| sample.is_finite()),
+            "short-plateau warm-start tonal tail must remain finite"
         );
     }
 
