@@ -30,6 +30,7 @@ const RATIO_MOTION_HISTORY_BLOCKS: usize = 4;
 const AUTO_PROFILE_NEAR_UNITY_PLATEAU_EPS: f64 = 0.005;
 const POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS: usize = 2;
 const SCRATCH_EXIT_HYSTERESIS_EXTRA_BLOCKS: usize = 1;
+const DIRECT_SCRATCH_TO_RENDER_EXIT_EXTRA_BLOCKS: usize = 1;
 const UNITY_PLATEAU_EXTRA_PROFILE_HOLD_RATIO: f64 = 0.02;
 
 /// Lock-free snapshot mailbox shared between control producers and RT callback.
@@ -1543,6 +1544,12 @@ impl RtProcessor {
             // fast-modulation recovery does not immediately reverse on the
             // first quieter callback after the hold drains.
             required = required.saturating_add(SCRATCH_EXIT_HYSTERESIS_EXTRA_BLOCKS);
+            if suggested == LatencyProfile::Render {
+                // Scratch->render is the widest ladder jump. Ask for one more
+                // calm callback than scratch->mix so fast-mod settles can
+                // drain before the full render retarget begins.
+                required = required.saturating_add(DIRECT_SCRATCH_TO_RENDER_EXIT_EXTRA_BLOCKS);
+            }
         }
         required
     }
@@ -4626,11 +4633,25 @@ mod tests {
 
         let mut output_refs = [&mut output[..]];
         let _ = rt.process(&input_refs, &mut output_refs);
+        let second_render_hold = rt.profile_telemetry();
+        assert_eq!(
+            second_render_hold.target_profile,
+            LatencyProfile::Scratch,
+            "direct scratch-to-render exits should require an extra calm callback beyond the generic scratch-exit confirmation"
+        );
+        assert_eq!(
+            second_render_hold.transition_blocks_left,
+            0,
+            "the extra direct-render exit confirmation should still keep the settled scratch profile pinned on the second calm callback"
+        );
+
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
         let render_retarget = rt.profile_telemetry();
         assert_eq!(
             render_retarget.target_profile,
             LatencyProfile::Render,
-            "once the scratch transition settles, the repeated calm suggestion should be free to retarget back to render"
+            "once the extra direct scratch-to-render confirmation is satisfied, calm suggestions should be free to retarget back to render"
         );
     }
 
