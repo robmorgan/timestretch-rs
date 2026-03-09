@@ -4123,6 +4123,60 @@ mod tests {
     }
 
     #[test]
+    fn test_short_interval_cross_unity_modulation_long_overlap_still_counts_one_reset_event() {
+        let sample_rate = 48_000u32;
+        let chunk_frames = 512usize;
+        let click_range = 1600usize..1620usize;
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(sample_rate)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_dual_plane_deterministic(false).unwrap();
+
+        let ratios = [1.04, 0.96, 1.04, 0.96, 1.04, 0.96, 1.04, 0.96, 1.04, 0.96];
+        let mut total_output = Vec::new();
+
+        for (chunk_idx, ratio) in ratios.into_iter().enumerate() {
+            proc.set_stretch_ratio(ratio).unwrap();
+
+            let mut chunk = Vec::with_capacity(chunk_frames * 2);
+            for frame in 0..chunk_frames {
+                let sample_idx = chunk_idx * chunk_frames + frame;
+                let t = sample_idx as f32 / sample_rate as f32;
+                let click = if click_range.contains(&sample_idx) {
+                    2.0
+                } else {
+                    0.0
+                };
+                chunk.push((2.0 * PI * 220.0 * t).sin() * 0.25 + click);
+                chunk.push((2.0 * PI * 330.0 * t).sin() * 0.20 + click);
+            }
+
+            total_output.extend_from_slice(&proc.process(&chunk).unwrap());
+        }
+
+        let stats = proc.transient_reset_stats();
+        assert_eq!(
+            stats.events_detected_total, 1,
+            "extended short-interval cross-unity modulation should not retrigger one transient after the initial reset"
+        );
+        assert_eq!(
+            stats.reset_band_counts_total[2], 1,
+            "extended short-interval cross-unity modulation should keep the transient to one mid-band reset"
+        );
+        assert_eq!(
+            stats.reset_band_counts_total[3], 1,
+            "extended short-interval cross-unity modulation should keep the transient to one high-band reset"
+        );
+        assert!(
+            total_output.iter().all(|sample| sample.is_finite()),
+            "extended short-interval modulation should remain finite while the cooldown hold drains"
+        );
+    }
+
+    #[test]
     fn test_short_interval_near_unity_plateau_holds_low_band_resets() {
         let sample_rate = 48_000u32;
         let chunk_frames = 512usize;

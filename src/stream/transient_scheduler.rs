@@ -29,7 +29,7 @@ const FLUX_MAX_SCAN_FRAMES: usize = 8;
 const FLUX_RESET_COOLDOWN_FRAMES: usize = 2;
 /// Extra overlap windows to hold accepted resets when modulation has already
 /// forced low bands to stay locked.
-const MODULATION_RESET_COOLDOWN_OVERLAP_WINDOWS: usize = 1;
+const MODULATION_RESET_COOLDOWN_OVERLAP_WINDOWS: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct TransientSchedulerStats {
@@ -144,7 +144,11 @@ impl TransientEventScheduler {
             // locked. Extend the accepted-event hold by one more overlap
             // window so the same broadband hit does not retrigger a second
             // upper-band-only reset while the modulation seam is still
-            // draining through overlapped callbacks.
+            // draining through overlapped callbacks. Keep the hold long
+            // enough to cover two extra overlap footprints because the
+            // deterministic path may carry one accepted transient across
+            // several short automation callbacks before the reseeded phase
+            // state has fully settled.
             cooldown_frames = cooldown_frames.saturating_add(
                 overlap_frames.saturating_mul(MODULATION_RESET_COOLDOWN_OVERLAP_WINDOWS),
             );
