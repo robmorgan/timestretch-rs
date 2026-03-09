@@ -1554,6 +1554,21 @@ impl RtProcessor {
         required
     }
 
+    #[inline]
+    fn remap_direct_scratch_render_exit(&self, suggested: LatencyProfile) -> LatencyProfile {
+        if self.current_profile == LatencyProfile::Scratch
+            && self.target_profile == LatencyProfile::Scratch
+            && suggested == LatencyProfile::Render
+        {
+            // Step down through mix first so fast-mod recovery does not jump
+            // directly from the most defensive kernel into the widest render
+            // ladder while the seam is still settling.
+            LatencyProfile::Mix
+        } else {
+            suggested
+        }
+    }
+
     fn update_profile_policy(&mut self) {
         if !self.auto_profile_switching {
             self.policy_profile = self.target_profile;
@@ -1589,7 +1604,7 @@ impl RtProcessor {
             return;
         }
 
-        let suggested = self.suggest_profile();
+        let suggested = self.remap_direct_scratch_render_exit(self.suggest_profile());
         self.policy_profile = suggested;
         if suggested == self.target_profile {
             self.profile_candidate = suggested;
@@ -4636,22 +4651,33 @@ mod tests {
         let second_render_hold = rt.profile_telemetry();
         assert_eq!(
             second_render_hold.target_profile,
-            LatencyProfile::Scratch,
-            "direct scratch-to-render exits should require an extra calm callback beyond the generic scratch-exit confirmation"
+            LatencyProfile::Mix,
+            "once the generic scratch-exit confirmation is satisfied, calm suggestions should first retarget through mix"
         );
-        assert_eq!(
-            second_render_hold.transition_blocks_left,
-            0,
-            "the extra direct-render exit confirmation should still keep the settled scratch profile pinned on the second calm callback"
+        assert!(
+            second_render_hold.transition_blocks_left > 0,
+            "the second calm callback should begin the scratch-to-mix transition instead of leaving scratch pinned"
         );
+
+        for _ in 0..=second_render_hold.transition_blocks_left {
+            if rt.profile_telemetry().current_profile == LatencyProfile::Mix {
+                break;
+            }
+            let mut output_refs = [&mut output[..]];
+            let _ = rt.process(&input_refs, &mut output_refs);
+        }
+
+        let settled_mix = rt.profile_telemetry();
+        assert_eq!(settled_mix.current_profile, LatencyProfile::Mix);
+        assert_eq!(settled_mix.target_profile, LatencyProfile::Mix);
 
         let mut output_refs = [&mut output[..]];
         let _ = rt.process(&input_refs, &mut output_refs);
-        let render_retarget = rt.profile_telemetry();
+        let render_from_mix = rt.profile_telemetry();
         assert_eq!(
-            render_retarget.target_profile,
+            render_from_mix.target_profile,
             LatencyProfile::Render,
-            "once the extra direct scratch-to-render confirmation is satisfied, calm suggestions should be free to retarget back to render"
+            "after the scratch exit lands on mix, calm suggestions should be free to continue retargeting back to render"
         );
     }
 
