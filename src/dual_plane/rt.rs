@@ -635,14 +635,40 @@ impl RtProcessor {
     }
 
     #[inline]
-    fn clear_pending_auto_profile_candidate_for_unity_plateau(&mut self) {
-        if self.auto_profile_switching && self.current_profile == self.target_profile {
-            self.post_ratio_motion_profile_hold_blocks_left =
-                self.post_ratio_motion_profile_hold_blocks_left.max(1);
-            self.policy_profile = self.current_profile;
-            self.profile_candidate = self.current_profile;
-            self.profile_candidate_streak = 0;
+    fn cancel_inflight_auto_profile_transition(&mut self) {
+        if self.current_profile == self.target_profile {
+            return;
         }
+
+        // Settled unity/near-unity plateaus should stop an in-flight
+        // auto-profile retarget instead of letting the crossfade keep moving
+        // while the modulation seam is trying to stabilize.
+        self.target_profile = self.current_profile;
+        self.profile_transition_blocks_left = 0;
+        self.config.latency_profile = self.current_profile;
+        self.current_profile
+            .apply_governor_defaults(&mut self.config.governor);
+        self.governor.set_config(self.config.governor);
+        self.governor.set_tier(self.current_tier);
+        self.target_tier = self.current_tier;
+        let current_weights = self.current_tier.lane_weights();
+        self.blend_weights = current_weights;
+        self.target_weights = current_weights;
+        self.crossfade_blocks_left = 0;
+    }
+
+    #[inline]
+    fn clear_pending_auto_profile_candidate_for_unity_plateau(&mut self) {
+        if !self.auto_profile_switching {
+            return;
+        }
+
+        self.cancel_inflight_auto_profile_transition();
+        self.post_ratio_motion_profile_hold_blocks_left =
+            self.post_ratio_motion_profile_hold_blocks_left.max(1);
+        self.policy_profile = self.current_profile;
+        self.profile_candidate = self.current_profile;
+        self.profile_candidate_streak = 0;
     }
 
     #[inline]
@@ -1497,6 +1523,15 @@ impl RtProcessor {
     fn update_profile_policy(&mut self) {
         if !self.auto_profile_switching {
             self.policy_profile = self.target_profile;
+            return;
+        }
+        if (self.active_ratio - 1.0).abs() <= AUTO_PROFILE_NEAR_UNITY_PLATEAU_EPS {
+            self.cancel_inflight_auto_profile_transition();
+            self.post_ratio_motion_profile_hold_blocks_left =
+                self.post_ratio_motion_profile_hold_blocks_left.max(1);
+            self.policy_profile = self.current_profile;
+            self.profile_candidate = self.current_profile;
+            self.profile_candidate_streak = 0;
             return;
         }
         if self.ratio_motion_freeze_active() {
@@ -4009,6 +4044,87 @@ mod tests {
             rt.ratio_motion_freeze_blocks_left, 0,
             "near-unity plateau should not rearm the ratio-motion freeze from a tiny settle step"
         );
+    }
+
+    #[test]
+    fn near_unity_plateau_cancels_inflight_auto_profile_transition() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Render;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 0;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+        let scratch_hints = Arc::new(RenderHints {
+            transient_confidence: 0.90,
+            tonal_confidence: 0.10,
+            noise_confidence: 0.20,
+            ..RenderHints::default()
+        });
+        let render_hints = Arc::new(RenderHints {
+            transient_confidence: 0.05,
+            tonal_confidence: 0.95,
+            noise_confidence: 0.05,
+            ..RenderHints::default()
+        });
+
+        rt.set_constant_ratio(1.70);
+        rt.set_hint_snapshot(scratch_hints);
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+
+        let inflight = rt.profile_telemetry();
+        assert_eq!(inflight.current_profile, LatencyProfile::Render);
+        assert_eq!(inflight.target_profile, LatencyProfile::Scratch);
+        assert!(
+            inflight.transition_blocks_left > 0,
+            "test setup should leave a scratch retarget in flight before the plateau"
+        );
+
+        rt.set_constant_ratio(1.004);
+        rt.set_hint_snapshot(render_hints);
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+
+        let plateau = rt.profile_telemetry();
+        assert_eq!(
+            plateau.current_profile,
+            LatencyProfile::Render,
+            "near-unity plateau should keep the committed render profile active"
+        );
+        assert_eq!(
+            plateau.target_profile,
+            LatencyProfile::Render,
+            "near-unity plateau should cancel the in-flight scratch retarget"
+        );
+        assert_eq!(
+            plateau.policy_profile,
+            LatencyProfile::Render,
+            "near-unity plateau should park policy telemetry on the committed render profile"
+        );
+        assert_eq!(
+            plateau.target_tier,
+            QualityTier::Q4,
+            "near-unity plateau should cancel the in-flight scratch tier retarget"
+        );
+        assert_eq!(
+            rt.profile_transition_blocks_left, 0,
+            "near-unity plateau should clear the in-flight profile transition"
+        );
+        assert_eq!(
+            rt.crossfade_blocks_left, 0,
+            "near-unity plateau should clear the in-flight tier crossfade"
+        );
+        assert_weights_close(rt.blend_weights, QualityTier::Q4.lane_weights(), 1e-6);
+        assert_weights_close(rt.target_weights, QualityTier::Q4.lane_weights(), 1e-6);
     }
 
     #[test]
