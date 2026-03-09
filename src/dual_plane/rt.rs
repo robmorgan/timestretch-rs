@@ -27,6 +27,7 @@ const ALGORITHMIC_DELAY_FFT_NUMERATOR: usize = 3;
 const ALGORITHMIC_DELAY_FFT_DENOMINATOR: usize = 2;
 const RATIO_MOTION_FREEZE_TRIGGER: f64 = 7.5e-4;
 const RATIO_MOTION_HISTORY_BLOCKS: usize = 4;
+const AUTO_PROFILE_NEAR_UNITY_PLATEAU_EPS: f64 = 0.005;
 
 /// Lock-free snapshot mailbox shared between control producers and RT callback.
 ///
@@ -688,6 +689,13 @@ impl RtProcessor {
             self.reset_ratio_motion_history();
             // Exact-unity plateaus should not inherit a stale pending
             // candidate from the preceding modulation burst.
+            self.clear_pending_auto_profile_candidate_for_unity_plateau();
+            return;
+        }
+        if (next_ratio - 1.0).abs() <= AUTO_PROFILE_NEAR_UNITY_PLATEAU_EPS {
+            self.reset_ratio_motion_history();
+            // Tiny near-unity plateaus should also drop pending scratch churn
+            // instead of carrying modulation pressure across a settled handoff.
             self.clear_pending_auto_profile_candidate_for_unity_plateau();
             return;
         }
@@ -3959,7 +3967,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_unity_plateau_clears_pending_auto_profile_candidate() {
+    fn near_unity_plateau_clears_pending_auto_profile_candidate() {
         let params = StretchParams::new(1.0)
             .with_sample_rate(48_000)
             .with_channels(1)
@@ -3975,42 +3983,31 @@ mod tests {
         let input = [0.0f32; 128];
         let mut output = [0.0f32; 256];
         let input_refs = [&input[..]];
-        let scratch_hints = Arc::new(RenderHints {
-            transient_confidence: 0.90,
-            tonal_confidence: 0.10,
-            noise_confidence: 0.20,
-            ..RenderHints::default()
-        });
+        rt.active_ratio = 1.02;
+        rt.profile_candidate = LatencyProfile::Scratch;
+        rt.profile_candidate_streak = 2;
 
-        rt.set_constant_ratio(1.0005);
-        rt.set_hint_snapshot(Arc::clone(&scratch_hints));
-        for _ in 0..2 {
-            let mut output_refs = [&mut output[..]];
-            let _ = rt.process(&input_refs, &mut output_refs);
-        }
-        assert_eq!(rt.profile_candidate, LatencyProfile::Scratch);
-        assert_eq!(
-            rt.profile_candidate_streak, 2,
-            "pre-plateau modulation should accumulate a pending scratch candidate"
-        );
-
-        rt.set_constant_ratio(1.0);
+        rt.set_constant_ratio(1.004);
         let mut output_refs = [&mut output[..]];
         let _ = rt.process(&input_refs, &mut output_refs);
 
         assert_eq!(
             rt.profile_candidate,
             LatencyProfile::Render,
-            "exact-unity plateau should clear the stale scratch candidate"
+            "near-unity plateau should clear the stale scratch candidate"
         );
         assert_eq!(
             rt.profile_candidate_streak, 0,
-            "exact-unity plateau should restart hysteresis from the committed profile"
+            "near-unity plateau should restart hysteresis from the committed profile"
         );
         assert_eq!(
             rt.profile_telemetry().policy_profile,
             LatencyProfile::Render,
-            "exact-unity plateau should keep policy telemetry parked on the committed profile"
+            "near-unity plateau should keep policy telemetry parked on the committed profile"
+        );
+        assert_eq!(
+            rt.ratio_motion_freeze_blocks_left, 0,
+            "near-unity plateau should not rearm the ratio-motion freeze from a tiny settle step"
         );
     }
 
