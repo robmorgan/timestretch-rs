@@ -359,7 +359,7 @@ impl PhaseVocoder {
         let ratio_delta = (stretch_ratio - self.stretch_ratio).abs();
         self.stretch_ratio = stretch_ratio;
         self.hop_synthesis = (self.hop_analysis as f64 * stretch_ratio).round() as usize;
-        if ratio_delta >= RATIO_CHANGE_FOCUS_TRIGGER {
+        if ratio_delta >= RATIO_CHANGE_FOCUS_TRIGGER && !self.transient_focus_active() {
             self.transient_focus_frames =
                 self.transient_focus_frames.max(RATIO_CHANGE_FOCUS_FRAMES);
         }
@@ -2295,6 +2295,33 @@ mod tests {
         assert_eq!(
             pv.transient_focus_frames, 0,
             "sub-threshold ratio nudges should not burn the continuity-focus window"
+        );
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_does_not_rearm_continuity_focus_while_active() {
+        let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
+        pv.set_stretch_ratio(1.002);
+        assert_eq!(pv.transient_focus_frames, RATIO_CHANGE_FOCUS_FRAMES);
+
+        pv.transient_focus_frames = 1;
+        pv.set_stretch_ratio(1.004);
+        assert_eq!(
+            pv.transient_focus_frames, 1,
+            "follow-up ratio steps should not keep re-arming continuity focus before the current seam settles"
+        );
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_reengages_continuity_focus_after_window_drains() {
+        let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
+        pv.set_stretch_ratio(1.002);
+        pv.transient_focus_frames = 0;
+
+        pv.set_stretch_ratio(1.004);
+        assert_eq!(
+            pv.transient_focus_frames, RATIO_CHANGE_FOCUS_FRAMES,
+            "a new ratio step should re-engage continuity focus once the prior seam window has drained"
         );
     }
 
