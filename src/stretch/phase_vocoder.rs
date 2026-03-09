@@ -1051,8 +1051,8 @@ impl PhaseVocoder {
     /// accumulated (unnormalized) into `self.output_buf` and
     /// `self.window_sum_buf`, `emit_len` is the number of samples finalized
     /// for streaming emission (`floor(next_synthesis_pos)`), and
-    /// `tail_phase_ratio` is the effective phase ratio used by the newest
-    /// unresolved overlap generated in this call.
+    /// `tail_phase_ratio` is the effective phase ratio used by the first
+    /// overlap that survives past the callback boundary.
     fn process_core(
         &mut self,
         input: &[f32],
@@ -1106,6 +1106,7 @@ impl PhaseVocoder {
             synthesis_scan_pos = synthesis_pos + frame_advance;
         }
         let output_len = max_write_idx.saturating_add(1);
+        let emit_len = snap_near_integer(synthesis_scan_pos).floor() as usize;
 
         // Reuse pre-allocated buffers, growing if needed (never shrinks).
         self.output_buf.resize(output_len, 0.0);
@@ -1114,7 +1115,8 @@ impl PhaseVocoder {
         self.window_sum_buf.fill(0.0);
 
         let mut synthesis_frame_pos = start_synthesis_pos;
-        let mut last_phase_hop_ratio = hop_ratio;
+        let mut carried_tail_phase_ratio = hop_ratio;
+        let mut recorded_carried_tail_phase_ratio = false;
         for frame_idx in 0..num_frames {
             let analysis_pos = frame_idx * self.hop_analysis;
             let synthesis_pos = snap_near_integer(synthesis_frame_pos);
@@ -1127,7 +1129,15 @@ impl PhaseVocoder {
                 &fft_forward,
             );
             self.advance_phases(num_bins, hop_ratio, phase_hop_ratio);
-            last_phase_hop_ratio = phase_hop_ratio;
+            let frame_end = synthesis_floor.saturating_add(
+                self.fft_size
+                    .saturating_sub(1)
+                    .saturating_add(usize::from(frac > SYNTH_POS_EPSILON)),
+            );
+            if !recorded_carried_tail_phase_ratio && frame_end >= emit_len {
+                carried_tail_phase_ratio = phase_hop_ratio;
+                recorded_carried_tail_phase_ratio = true;
+            }
 
             // Save IF-estimated phases before phase locking overwrites them.
             self.if_phases_backup[..num_bins].copy_from_slice(&self.new_phases[..num_bins]);
@@ -1259,10 +1269,9 @@ impl PhaseVocoder {
         }
 
         let next_local_synthesis_pos = snap_near_integer(synthesis_frame_pos);
-        let emit_len = next_local_synthesis_pos.floor() as usize;
         self.synthesis_pos = self.synthesis_emitted as f64 + next_local_synthesis_pos;
 
-        Ok((emit_len, output_len, last_phase_hop_ratio))
+        Ok((emit_len, output_len, carried_tail_phase_ratio))
     }
 
     /// Windows the input frame and transforms to frequency domain.
@@ -2948,6 +2957,78 @@ mod tests {
         assert!(
             (pv.streaming_tail_phase_ratio - pv.stretch_ratio).abs() > 1e-3,
             "the carried phase seam should stay meaningfully offset from the target while the continuity slew is still draining"
+        );
+    }
+
+    #[test]
+    fn test_streaming_tail_phase_ratio_uses_first_overlap_crossing_callback_boundary() {
+        let fft_size = 1024;
+        let hop = 256;
+        let sample_rate = 44_100u32;
+        let num_frames = 6usize;
+        let input_len = fft_size + hop * (num_frames - 1);
+        let input: Vec<f32> = (0..input_len)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
+            })
+            .collect();
+
+        let mut expected = PhaseVocoder::new(fft_size, hop, 1.12, sample_rate, 120.0);
+        expected.set_stretch_ratio(0.82);
+        assert_eq!(
+            expected.ratio_change_phase_total_frames, RATIO_CHANGE_FOCUS_FRAMES,
+            "test setup should leave the base continuity glide active across the callback"
+        );
+        let frame_advance = expected.hop_analysis as f64 * expected.stretch_ratio;
+        let mut synthesis_frame_pos = 0.0f64;
+        for _ in 0..num_frames {
+            let synthesis_pos = snap_near_integer(synthesis_frame_pos);
+            expected.decay_transient_focus();
+            synthesis_frame_pos = synthesis_pos + frame_advance;
+        }
+        let emit_len = snap_near_integer(synthesis_frame_pos).floor() as usize;
+        synthesis_frame_pos = 0.0;
+        expected = PhaseVocoder::new(fft_size, hop, 1.12, sample_rate, 120.0);
+        expected.set_stretch_ratio(0.82);
+        let mut expected_carried_tail_phase_ratio = None;
+        for _ in 0..num_frames {
+            let synthesis_pos = snap_near_integer(synthesis_frame_pos);
+            let synthesis_floor = synthesis_pos.floor() as usize;
+            let frac = synthesis_pos - synthesis_floor as f64;
+            let frame_end = synthesis_floor.saturating_add(
+                fft_size
+                    .saturating_sub(1)
+                    .saturating_add(usize::from(frac > SYNTH_POS_EPSILON)),
+            );
+            let phase_ratio = expected.continuity_focus_phase_ratio(expected.stretch_ratio);
+            if expected_carried_tail_phase_ratio.is_none() && frame_end >= emit_len {
+                expected_carried_tail_phase_ratio = Some(phase_ratio);
+            }
+            expected.decay_transient_focus();
+            synthesis_frame_pos = synthesis_pos + frame_advance;
+        }
+        let expected_carried_tail_phase_ratio = expected_carried_tail_phase_ratio
+            .expect("expected an unresolved overlap past the callback boundary");
+
+        let mut pv = PhaseVocoder::new(fft_size, hop, 1.12, sample_rate, 120.0);
+        pv.set_stretch_ratio(0.82);
+        let output = pv.process_streaming(&input).unwrap();
+        assert!(
+            !output.is_empty(),
+            "streaming pass should emit finalized samples"
+        );
+        assert!(
+            !pv.streaming_tail.is_empty(),
+            "streaming pass should retain unresolved overlap beyond the callback boundary"
+        );
+        assert!(
+            (pv.streaming_tail_phase_ratio - expected_carried_tail_phase_ratio).abs() < 1e-12,
+            "the carried tail should preserve the phase ratio from the first overlap crossing the callback boundary, not the newest frame in the callback"
+        );
+        assert!(
+            pv.streaming_tail_phase_ratio > pv.stretch_ratio + 1e-3,
+            "the earliest unresolved seam should stay meaningfully above the settled target during the in-flight glide"
         );
     }
 
