@@ -1821,7 +1821,14 @@ impl RtProcessor {
         // preview-only callbacks cannot mutate live profile state.
         self.engage_ratio_motion_freeze_if_needed(raw_ratio);
         self.policy_ratio = raw_ratio;
-        let ratio = self.smooth_kernel_ratio_for_continuity(raw_ratio);
+        let ratio = if (raw_ratio - 1.0).abs() <= UNITY_BYPASS_RATIO_EPS {
+            // Exact-unity committed kernels should settle immediately instead
+            // of dragging a stale non-unity slew through the deterministic
+            // path when passthrough is temporarily unavailable.
+            1.0
+        } else {
+            self.smooth_kernel_ratio_for_continuity(raw_ratio)
+        };
         if (ratio - self.active_ratio).abs() > RATIO_SNAP_EPS {
             for vocoder in &mut self.vocoders {
                 vocoder.set_stretch_ratio(ratio);
