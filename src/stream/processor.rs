@@ -21,6 +21,8 @@ const RATIO_SNAP_THRESHOLD: f64 = 0.0001;
 const RATIO_SMOOTHING_TIME_SECS: f64 = 0.050;
 /// Additional slew applied after kernel-window averaging for deterministic dual-plane updates.
 const DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS: f64 = 0.040;
+/// Shorter apply slew for the first callback of a freshly-reset modulation window.
+const DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_TIME_SECS: f64 = 0.015;
 /// Near-unity request band that resets deterministic ratio averaging history.
 ///
 /// Fast modulation often crosses unity without landing on an exact 1.0 callback.
@@ -416,6 +418,15 @@ impl DualPlaneDeterministicState {
         self.unity_exit_seam_samples
             .copy_from_slice(&self.last_output_samples);
         self.pending_unity_exit_seam = true;
+    }
+
+    #[inline]
+    fn ratio_apply_smoothing_time_secs(&self) -> f64 {
+        if self.recent_chunk_ratios.len() <= 1 {
+            DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_TIME_SECS
+        } else {
+            DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS
+        }
     }
 
     fn apply_pending_unity_exit_seam(
@@ -1577,7 +1588,7 @@ impl StreamProcessor {
                     averaged_ratio,
                     frames,
                     sample_rate,
-                    DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS,
+                    state.ratio_apply_smoothing_time_secs(),
                 );
                 if (applied_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
                     if exiting_unity_reset_zone
@@ -3581,6 +3592,64 @@ mod tests {
             state.recent_chunk_ratios,
             vec![1.024],
             "same-side turnaround should start a fresh averaging window at the pivot callback"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_fresh_ratio_window_uses_faster_apply_smoothing() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        let averaged = state.push_chunk_ratio(1.028, 1.028);
+        assert_eq!(state.recent_chunk_ratios, vec![1.028]);
+        assert_eq!(
+            state.ratio_apply_smoothing_time_secs(),
+            DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_TIME_SECS,
+            "the first callback of a fresh modulation window should use the shorter apply slew"
+        );
+
+        let burst_applied = smooth_ratio_toward(
+            state.last_ratio,
+            averaged,
+            COMMON_CALLBACK_FRAMES,
+            params.sample_rate,
+            state.ratio_apply_smoothing_time_secs(),
+        );
+        let default_applied = smooth_ratio_toward(
+            state.last_ratio,
+            averaged,
+            COMMON_CALLBACK_FRAMES,
+            params.sample_rate,
+            DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS,
+        );
+        assert!(
+            burst_applied > default_applied,
+            "the shorter first-window apply slew should converge more quickly toward the fresh modulation burst"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_established_ratio_window_keeps_default_apply_smoothing() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        state.push_chunk_ratio(1.028, 1.028);
+        state.last_ratio = 1.020;
+        state.push_chunk_ratio(1.024, 1.024);
+
+        assert_eq!(state.recent_chunk_ratios.len(), 2);
+        assert_eq!(
+            state.ratio_apply_smoothing_time_secs(),
+            DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS,
+            "once the modulation window has more than one callback, deterministic apply smoothing should fall back to the steady-state slew"
         );
     }
 
