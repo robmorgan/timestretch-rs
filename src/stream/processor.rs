@@ -330,6 +330,7 @@ struct DualPlaneDeterministicState {
     unity_exit_seam_samples: Vec<f32>,
     pending_unity_exit_seam: bool,
     pending_unity_exit_seam_frames: usize,
+    pending_unity_exit_seam_progress_frames: usize,
 }
 
 impl DualPlaneDeterministicState {
@@ -371,6 +372,7 @@ impl DualPlaneDeterministicState {
             unity_exit_seam_samples: vec![0.0; num_channels],
             pending_unity_exit_seam: false,
             pending_unity_exit_seam_frames: 0,
+            pending_unity_exit_seam_progress_frames: 0,
         })
     }
 
@@ -439,6 +441,7 @@ impl DualPlaneDeterministicState {
         if dual_plane_ratio_in_unity_reset_zone(ratio) {
             self.pending_unity_exit_seam = false;
             self.pending_unity_exit_seam_frames = 0;
+            self.pending_unity_exit_seam_progress_frames = 0;
         }
     }
 
@@ -455,6 +458,7 @@ impl DualPlaneDeterministicState {
             .copy_from_slice(&self.last_output_samples);
         self.pending_unity_exit_seam = true;
         self.pending_unity_exit_seam_frames = ramp_frames;
+        self.pending_unity_exit_seam_progress_frames = 0;
     }
 
     #[inline]
@@ -478,19 +482,29 @@ impl DualPlaneDeterministicState {
             return;
         }
 
-        let ramp_len = produced_frames.min(self.pending_unity_exit_seam_frames);
-        let denom = ramp_len.saturating_add(1) as f32;
+        let ramp_total = self.pending_unity_exit_seam_frames;
+        let ramp_remaining =
+            ramp_total.saturating_sub(self.pending_unity_exit_seam_progress_frames);
+        let ramp_len = produced_frames.min(ramp_remaining);
+        let denom = ramp_total.saturating_add(1) as f32;
         for ch in 0..self.num_channels.min(channel_output_buffers.len()) {
             let anchor = self.unity_exit_seam_samples[ch];
             for i in 0..ramp_len.min(channel_output_buffers[ch].len()) {
-                let t = (i + 1) as f32 / denom;
+                let progress = self.pending_unity_exit_seam_progress_frames + i + 1;
+                let t = progress as f32 / denom;
                 let target = channel_output_buffers[ch][i];
                 channel_output_buffers[ch][i] = anchor + (target - anchor) * t;
             }
         }
 
-        self.pending_unity_exit_seam = false;
-        self.pending_unity_exit_seam_frames = 0;
+        self.pending_unity_exit_seam_progress_frames = self
+            .pending_unity_exit_seam_progress_frames
+            .saturating_add(ramp_len);
+        if self.pending_unity_exit_seam_progress_frames >= ramp_total {
+            self.pending_unity_exit_seam = false;
+            self.pending_unity_exit_seam_frames = 0;
+            self.pending_unity_exit_seam_progress_frames = 0;
+        }
     }
 
     fn capture_last_output_samples(
@@ -3844,6 +3858,85 @@ mod tests {
         assert_eq!(
             state.pending_unity_exit_seam_frames, 0,
             "clearing a near-unity seam should also drop any adaptive seam length from the previous burst"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_unity_exit_seam_carries_across_multiple_callbacks() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        let prior_output = [vec![0.4, 0.5, 0.6]];
+        state.capture_last_output_samples(&prior_output, 3);
+        state.arm_unity_exit_seam(8);
+
+        let mut first_callback = [vec![1.0, 1.0, 1.0]];
+        state.apply_pending_unity_exit_seam(&mut first_callback, 3);
+        assert!(
+            state.pending_unity_exit_seam,
+            "a multi-callback unity-exit seam should stay armed until the full ramp has been consumed"
+        );
+        assert_eq!(
+            state.pending_unity_exit_seam_progress_frames, 3,
+            "the carried seam should account for the frames already blended on the first callback"
+        );
+        assert!(
+            (first_callback[0][0] - (0.6 + (1.0 - 0.6) * (1.0 / 9.0) as f32)).abs() < 1e-6,
+            "the first callback should start blending from the anchored unity sample"
+        );
+        assert!(
+            (first_callback[0][2] - (0.6 + (1.0 - 0.6) * (3.0 / 9.0) as f32)).abs() < 1e-6,
+            "the first callback should advance the seam proportionally through the configured ramp"
+        );
+
+        let mut second_callback = [vec![1.0, 1.0, 1.0]];
+        state.apply_pending_unity_exit_seam(&mut second_callback, 3);
+        assert!(
+            state.pending_unity_exit_seam,
+            "the seam should remain active while ramp frames still remain after the second callback"
+        );
+        assert_eq!(
+            state.pending_unity_exit_seam_progress_frames, 6,
+            "the seam progress should accumulate across callbacks instead of restarting"
+        );
+        assert!(
+            (second_callback[0][0] - (0.6 + (1.0 - 0.6) * (4.0 / 9.0) as f32)).abs() < 1e-6,
+            "the second callback should resume from the prior seam progress instead of restarting at the anchor"
+        );
+        assert!(
+            (second_callback[0][2] - (0.6 + (1.0 - 0.6) * (6.0 / 9.0) as f32)).abs() < 1e-6,
+            "the carried seam should continue walking toward the target output over multiple callbacks"
+        );
+
+        let mut final_callback = [vec![1.0, 1.0, 1.0]];
+        state.apply_pending_unity_exit_seam(&mut final_callback, 3);
+        assert!(
+            !state.pending_unity_exit_seam,
+            "once the configured ramp length has been exhausted the carried seam should disarm"
+        );
+        assert_eq!(
+            state.pending_unity_exit_seam_frames, 0,
+            "finishing the seam should clear the stored ramp length"
+        );
+        assert_eq!(
+            state.pending_unity_exit_seam_progress_frames, 0,
+            "finishing the seam should reset the cumulative progress"
+        );
+        assert!(
+            (final_callback[0][0] - (0.6 + (1.0 - 0.6) * (7.0 / 9.0) as f32)).abs() < 1e-6,
+            "the final callback should pick up from the carried seam progress"
+        );
+        assert!(
+            (final_callback[0][1] - (0.6 + (1.0 - 0.6) * (8.0 / 9.0) as f32)).abs() < 1e-6,
+            "the penultimate seam frame should still be blended"
+        );
+        assert!(
+            (final_callback[0][2] - 1.0).abs() < 1e-6,
+            "frames beyond the configured seam length should remain at the target output"
         );
     }
 
