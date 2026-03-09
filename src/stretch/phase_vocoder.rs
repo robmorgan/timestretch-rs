@@ -151,6 +151,8 @@ pub struct PhaseVocoder {
     /// the next normalization pass does not suddenly tighten the overlap
     /// floor at the chunk boundary.
     streaming_tail_ratio: f64,
+    /// Ratio that generated the unresolved carried seam at the chunk boundary.
+    streaming_tail_phase_ratio: f64,
     /// Reusable accumulation buffer for streaming overlap-add.
     streaming_accum_output: Vec<f32>,
     /// Reusable window-sum accumulation buffer for streaming overlap-add.
@@ -374,6 +376,7 @@ impl PhaseVocoder {
             streaming_tail: Vec::new(),
             streaming_tail_window_sum: Vec::new(),
             streaming_tail_ratio: stretch_ratio,
+            streaming_tail_phase_ratio: stretch_ratio,
             streaming_accum_output: Vec::new(),
             streaming_accum_window_sum: Vec::new(),
         }
@@ -414,17 +417,29 @@ impl PhaseVocoder {
         let prior_ratio = self.stretch_ratio;
         let ratio_delta = (stretch_ratio - prior_ratio).abs();
         let mut continuity_phase_from = self.continuity_focus_phase_ratio(prior_ratio);
-        if !self.streaming_tail.is_empty()
-            && ratio_is_meaningfully_above_unity(self.streaming_tail_ratio)
-            && ratio_is_meaningfully_below_unity(continuity_phase_from)
-            && !ratio_is_meaningfully_below_unity(stretch_ratio)
-        {
-            // Short-interval cross-unity modulation can retarget back toward
-            // unity before the previous expansion seam has fully drained. Keep
-            // the seam slew anchored to that carried expansion overlap so the
-            // next callback does not restart from an already-compressed phase
-            // ratio while the older expanded tail is still audible.
-            continuity_phase_from = self.streaming_tail_ratio;
+        if !self.streaming_tail.is_empty() {
+            let carried_phase_ratio = self.streaming_tail_phase_ratio;
+            if ratio_is_meaningfully_above_unity(carried_phase_ratio)
+                && ratio_is_meaningfully_below_unity(continuity_phase_from)
+                && !ratio_is_meaningfully_below_unity(stretch_ratio)
+            {
+                // Short-interval cross-unity modulation can retarget back
+                // toward unity before the previous expansion seam has fully
+                // drained. Keep the seam slew anchored to that carried
+                // expansion overlap so the next callback does not restart from
+                // an already-compressed phase ratio while the older expanded
+                // tail is still audible.
+                continuity_phase_from = carried_phase_ratio;
+            } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
+                && ratio_is_meaningfully_above_unity(continuity_phase_from)
+                && !ratio_is_meaningfully_above_unity(stretch_ratio)
+            {
+                // Mirror the same protection for a carried compression seam so
+                // a rebound back toward unity does not restart from an already
+                // expanded in-flight ratio while the older compressed overlap
+                // is still draining.
+                continuity_phase_from = carried_phase_ratio;
+            }
         }
         let reversed_direction = ratio_change_reverses_inflight_direction(
             continuity_phase_from,
@@ -536,6 +551,7 @@ impl PhaseVocoder {
         self.streaming_tail.clear();
         self.streaming_tail_window_sum.clear();
         self.streaming_tail_ratio = self.stretch_ratio;
+        self.streaming_tail_phase_ratio = self.stretch_ratio;
 
         // Mirror-pad input to stabilize edge normalization.
         //
@@ -748,6 +764,7 @@ impl PhaseVocoder {
             .copy_from_slice(&self.window_sum_buf[..output_len]);
 
         let carried_tail_ratio = self.streaming_tail_ratio;
+        let carried_tail_phase_ratio = self.streaming_tail_phase_ratio;
         let tail_len = self
             .streaming_tail
             .len()
@@ -813,6 +830,13 @@ impl PhaseVocoder {
         } else {
             self.stretch_ratio
         };
+        self.streaming_tail_phase_ratio = if self.streaming_tail.is_empty() {
+            self.stretch_ratio
+        } else if emit_len < tail_len {
+            carried_tail_phase_ratio
+        } else {
+            self.stretch_ratio
+        };
         Ok(())
     }
 
@@ -829,6 +853,7 @@ impl PhaseVocoder {
             self.streaming_tail.clear();
             self.streaming_tail_window_sum.clear();
             self.streaming_tail_ratio = self.stretch_ratio;
+            self.streaming_tail_phase_ratio = self.stretch_ratio;
             self.synthesis_pos = 0.0;
             self.synthesis_emitted = 0;
             output.clear();
@@ -856,6 +881,7 @@ impl PhaseVocoder {
         self.streaming_tail.clear();
         self.streaming_tail_window_sum.clear();
         self.streaming_tail_ratio = self.stretch_ratio;
+        self.streaming_tail_phase_ratio = self.stretch_ratio;
         self.synthesis_pos = 0.0;
         self.synthesis_emitted = 0;
         Ok(())
@@ -2904,6 +2930,78 @@ mod tests {
         assert!(
             !third.is_empty(),
             "the rebound chunk should still emit audio after re-anchoring the seam"
+        );
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_keeps_carried_compression_seam_when_rebounding_toward_unity() {
+        let fft_size = 1024;
+        let hop = 256;
+        let sample_rate = 44100u32;
+        let num_samples = fft_size * 8;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
+            })
+            .collect();
+
+        let mut pv = PhaseVocoder::new(fft_size, hop, 0.96, sample_rate, 120.0);
+        let first_chunk_len = fft_size * 2;
+        let first = pv.process_streaming(&input[..first_chunk_len]).unwrap();
+        assert!(!first.is_empty(), "first streaming chunk should emit audio");
+        assert!(
+            !pv.streaming_tail.is_empty(),
+            "first streaming chunk should retain overlap tail"
+        );
+
+        let mut consumed = ((first_chunk_len - fft_size) / hop + 1) * hop;
+        let short_chunk_len = fft_size;
+
+        pv.set_stretch_ratio(1.12);
+        let second = pv
+            .process_streaming(&input[consumed..consumed + short_chunk_len])
+            .unwrap();
+        assert!(
+            !second.is_empty(),
+            "short follow-up chunk should still emit audio"
+        );
+        assert!(
+            (pv.streaming_tail_phase_ratio - 0.96).abs() < 1e-12,
+            "the prior compression seam should still be carried after the short cross-unity step"
+        );
+
+        consumed += ((short_chunk_len - fft_size) / hop + 1) * hop;
+        let hold = pv
+            .process_streaming(&input[consumed..consumed + short_chunk_len])
+            .unwrap();
+        assert!(
+            !hold.is_empty(),
+            "a second short chunk at the rebound ratio should still emit audio"
+        );
+        assert!(
+            (pv.streaming_tail_phase_ratio - 0.96).abs() < 1e-12,
+            "the carried compression seam should persist until the older overlap fully drains"
+        );
+
+        consumed += ((short_chunk_len - fft_size) / hop + 1) * hop;
+        assert!(
+            ratio_is_meaningfully_above_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
+            "test setup should decay the in-flight expansion seam above unity before the rebound"
+        );
+
+        pv.set_stretch_ratio(0.98);
+        assert!(
+            (pv.ratio_change_phase_from - 0.96).abs() < 1e-12,
+            "rebounding toward unity should restart from the carried compression seam while that overlap tail is still unresolved"
+        );
+
+        let third = pv
+            .process_streaming(&input[consumed..consumed + short_chunk_len])
+            .unwrap();
+        assert!(
+            !third.is_empty(),
+            "the rebound chunk should still emit audio after re-anchoring the compression seam"
         );
     }
 
