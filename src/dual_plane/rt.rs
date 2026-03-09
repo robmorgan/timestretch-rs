@@ -2163,8 +2163,10 @@ impl RtProcessor {
             && active_delta.signum() != target_delta.signum();
         let both_near_unity = active_delta.abs() <= RATIO_CONTINUITY_NEAR_UNITY_WINDOW
             && target_delta.abs() <= RATIO_CONTINUITY_NEAR_UNITY_WINDOW;
+        let settles_toward_near_unity = target_delta.abs() <= RATIO_CONTINUITY_NEAR_UNITY_WINDOW
+            && active_delta.abs() > target_delta.abs() + RATIO_SNAP_EPS;
 
-        if crosses_unity || both_near_unity {
+        if crosses_unity || both_near_unity || settles_toward_near_unity {
             RATIO_CONTINUITY_NEAR_UNITY_SLEW_MAX_STEP
         } else {
             RATIO_CONTINUITY_SLEW_MAX_STEP
@@ -4785,6 +4787,35 @@ mod tests {
             rt.continuity_slew_max_step(1.34),
             RATIO_CONTINUITY_SLEW_MAX_STEP,
             "off-unity modulation should keep the default continuity slew budget"
+        );
+    }
+
+    #[test]
+    fn auto_profile_fast_modulation_tightens_slew_when_settling_back_toward_unity() {
+        let params = StretchParams::new(1.08)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut cfg = RtConfig::new(params, 2048);
+        cfg.latency_profile = LatencyProfile::Mix;
+        cfg.auto_profile_switching = true;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        rt.active_ratio = 1.08;
+
+        assert_eq!(
+            rt.continuity_slew_max_step(1.02),
+            RATIO_CONTINUITY_NEAR_UNITY_SLEW_MAX_STEP,
+            "same-side fast-mod settles into the near-unity seam should use the tighter continuity slew"
+        );
+
+        let block = stereo_sine_block(2048, 48_000, 220.0, 0.0);
+        rt.set_constant_ratio(1.02);
+        assert_eq!(rt.process_block_into(&block, &mut []).unwrap(), 0);
+        assert!(
+            (rt.active_ratio() - (1.08 - RATIO_CONTINUITY_NEAR_UNITY_SLEW_MAX_STEP)).abs() < 1e-9,
+            "the first settle-back kernel should walk toward unity using the tighter continuity step instead of a wider rebound"
         );
     }
 
