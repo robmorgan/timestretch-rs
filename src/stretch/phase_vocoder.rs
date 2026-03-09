@@ -45,6 +45,8 @@ const RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES: usize = 1;
 /// Keep continuity focus active slightly longer when a new step must re-anchor
 /// to an older carried seam that is still farther from unity than the in-flight ratio.
 const RATIO_CHANGE_CARRIED_SEAM_FOCUS_EXTRA_FRAMES: usize = 1;
+/// Hold a far carried seam for one synthesis frame before slewing toward the new target.
+const RATIO_CHANGE_CARRIED_SEAM_HOLD_FRAMES: usize = 1;
 /// Ignore tiny ratio deltas that are below the modulation-seam risk zone.
 const RATIO_CHANGE_FOCUS_TRIGGER: f64 = 1e-3;
 /// Cap extra continuity-focus extension so long tails do not pin identity locking.
@@ -109,6 +111,8 @@ pub struct PhaseVocoder {
     ratio_change_phase_frames: usize,
     /// Total frames scheduled for the current phase-ratio continuity slew.
     ratio_change_phase_total_frames: usize,
+    /// Initial seam-hold frames that should stay pinned to `ratio_change_phase_from`.
+    ratio_change_phase_hold_frames: usize,
     /// Whether spectral envelope preservation is enabled.
     envelope_preservation: bool,
     /// Envelope correction strength (0 = off, 1 = full, >1 stronger).
@@ -359,6 +363,7 @@ impl PhaseVocoder {
             ratio_change_phase_from: stretch_ratio,
             ratio_change_phase_frames: 0,
             ratio_change_phase_total_frames: 0,
+            ratio_change_phase_hold_frames: 0,
             envelope_preservation,
             envelope_strength: 1.0,
             adaptive_envelope_order: true,
@@ -611,6 +616,11 @@ impl PhaseVocoder {
             self.ratio_change_phase_from = continuity_phase_from;
             self.ratio_change_phase_frames = continuity_focus_frames;
             self.ratio_change_phase_total_frames = continuity_focus_frames;
+            self.ratio_change_phase_hold_frames = if reanchored_far_from_inflight {
+                RATIO_CHANGE_CARRIED_SEAM_HOLD_FRAMES.min(continuity_focus_frames)
+            } else {
+                0
+            };
             self.transient_focus_frames = self.transient_focus_frames.max(continuity_focus_frames);
         }
     }
@@ -628,6 +638,7 @@ impl PhaseVocoder {
         self.transient_focus_frames = 0;
         self.ratio_change_phase_frames = 0;
         self.ratio_change_phase_total_frames = 0;
+        self.ratio_change_phase_hold_frames = 0;
         self.ratio_change_phase_from = self.stretch_ratio;
     }
 
@@ -1064,6 +1075,7 @@ impl PhaseVocoder {
             self.transient_focus_frames = 0;
             self.ratio_change_phase_frames = 0;
             self.ratio_change_phase_total_frames = 0;
+            self.ratio_change_phase_hold_frames = 0;
             self.ratio_change_phase_from = self.stretch_ratio;
             self.synthesis_pos = 0.0;
             self.synthesis_emitted = 0;
@@ -1601,8 +1613,16 @@ impl PhaseVocoder {
             .ratio_change_phase_frames
             .min(self.ratio_change_phase_total_frames);
         let completed = self.ratio_change_phase_total_frames - remaining;
-        let progress =
-            (completed as f64 + 1.0) / (self.ratio_change_phase_total_frames as f64 + 1.0);
+        let hold_frames = self
+            .ratio_change_phase_hold_frames
+            .min(self.ratio_change_phase_total_frames);
+        if completed < hold_frames {
+            return self.ratio_change_phase_from;
+        }
+
+        let effective_completed = completed - hold_frames;
+        let effective_total = self.ratio_change_phase_total_frames - hold_frames;
+        let progress = (effective_completed as f64 + 1.0) / (effective_total as f64 + 1.0);
         self.ratio_change_phase_from + (hop_ratio - self.ratio_change_phase_from) * progress
     }
 
@@ -3441,6 +3461,15 @@ mod tests {
         assert!(
             (pv.ratio_change_phase_from - 1.12).abs() < 1e-12,
             "a sub-threshold same-side follow-up nudge should restart from the older carried expansion seam while that overlap tail is still unresolved"
+        );
+        assert!(
+            (pv.continuity_focus_phase_ratio(pv.stretch_ratio) - 1.12).abs() < 1e-12,
+            "a far carried-seam re-anchor should hold the first continuity-focus frame on the older seam before gliding toward the new target"
+        );
+        pv.decay_transient_focus();
+        assert!(
+            pv.continuity_focus_phase_ratio(pv.stretch_ratio) < 1.12,
+            "after the initial seam hold, the restarted continuity slew should resume gliding toward the new target"
         );
         assert_eq!(
             pv.ratio_change_phase_total_frames,
