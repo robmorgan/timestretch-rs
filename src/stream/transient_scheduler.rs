@@ -27,6 +27,9 @@ const FLUX_WARMUP_FRAMES: usize = 3;
 const FLUX_MAX_SCAN_FRAMES: usize = 8;
 /// Minimum cooldown frames after an event to avoid duplicate resets.
 const FLUX_RESET_COOLDOWN_FRAMES: usize = 2;
+/// Extra overlap windows to hold accepted resets when modulation has already
+/// forced low bands to stay locked.
+const MODULATION_RESET_COOLDOWN_OVERLAP_WINDOWS: usize = 1;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct TransientSchedulerStats {
@@ -125,7 +128,7 @@ impl TransientEventScheduler {
     }
 
     #[inline]
-    fn reset_cooldown_frames(&self) -> usize {
+    fn reset_cooldown_frames(&self, suppress_low_bands: bool) -> usize {
         if self.hop_size == 0 {
             return FLUX_RESET_COOLDOWN_FRAMES;
         }
@@ -134,7 +137,20 @@ impl TransientEventScheduler {
         // a detected event so the same click is not reclassified as a fresh
         // transient on the next few callback snapshots.
         let overlap_frames = self.fft_size.div_ceil(self.hop_size).saturating_sub(1);
-        FLUX_RESET_COOLDOWN_FRAMES.max(overlap_frames)
+        let mut cooldown_frames = FLUX_RESET_COOLDOWN_FRAMES.max(overlap_frames);
+
+        if suppress_low_bands {
+            // Cross-unity/near-unity modulation already keeps low bands phase
+            // locked. Extend the accepted-event hold by one more overlap
+            // window so the same broadband hit does not retrigger a second
+            // upper-band-only reset while the modulation seam is still
+            // draining through overlapped callbacks.
+            cooldown_frames = cooldown_frames.saturating_add(
+                overlap_frames.saturating_mul(MODULATION_RESET_COOLDOWN_OVERLAP_WINDOWS),
+            );
+        }
+
+        cooldown_frames
     }
 
     /// Detects a transient event from stereo interleaved input and returns a
@@ -281,7 +297,7 @@ impl TransientEventScheduler {
                 }
                 self.stats.events_detected_total =
                     self.stats.events_detected_total.saturating_add(1);
-                self.cooldown_frames = self.reset_cooldown_frames();
+                self.cooldown_frames = self.reset_cooldown_frames(suppress_low_bands);
             }
 
             self.update_flux_stats(flux);
@@ -367,7 +383,10 @@ impl TransientEventScheduler {
 
 #[cfg(test)]
 mod tests {
-    use super::{TransientEventScheduler, FLUX_RESET_COOLDOWN_FRAMES};
+    use super::{
+        TransientEventScheduler, FLUX_RESET_COOLDOWN_FRAMES,
+        MODULATION_RESET_COOLDOWN_OVERLAP_WINDOWS,
+    };
     use std::f32::consts::PI;
 
     #[test]
@@ -506,6 +525,28 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_extends_cooldown_when_modulation_holds_low_bands() {
+        let fft = 1024usize;
+        let hop = 256usize;
+        let overlap_frames = fft.div_ceil(hop).saturating_sub(1);
+        let scheduler = TransientEventScheduler::new(fft, hop, 44_100, 4096);
+
+        let base = scheduler.reset_cooldown_frames(false);
+        let modulation = scheduler.reset_cooldown_frames(true);
+
+        assert_eq!(
+            base,
+            FLUX_RESET_COOLDOWN_FRAMES.max(overlap_frames),
+            "base cooldown should continue to cover one overlap footprint"
+        );
+        assert_eq!(
+            modulation,
+            base + overlap_frames * MODULATION_RESET_COOLDOWN_OVERLAP_WINDOWS,
+            "modulation low-band holds should add one extra overlap window of duplicate-reset protection"
+        );
+    }
+
+    #[test]
     fn scheduler_stats_accumulate_and_reset() {
         let sr = 44_100u32;
         let fft = 1024usize;
@@ -594,7 +635,7 @@ mod tests {
             Some(3072),
             "tail click should advance the processed-frame cursor to the final schedulable frame"
         );
-        let expected_cooldown = scheduler.reset_cooldown_frames();
+        let expected_cooldown = scheduler.reset_cooldown_frames(false);
         assert_eq!(
             scheduler.cooldown_frames, expected_cooldown,
             "detected event should arm the full cooldown"
@@ -690,7 +731,7 @@ mod tests {
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, callback_frames);
         let expected_last_start = Some(3072usize);
-        let expected_cooldown = scheduler.reset_cooldown_frames();
+        let expected_cooldown = scheduler.reset_cooldown_frames(false);
         let mut triggered_origins = Vec::new();
 
         for origin in [
