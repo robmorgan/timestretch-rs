@@ -21,7 +21,7 @@ const RATIO_SNAP_THRESHOLD: f64 = 0.0001;
 const RATIO_SMOOTHING_TIME_SECS: f64 = 0.050;
 /// Additional slew applied after kernel-window averaging for deterministic dual-plane updates.
 const DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS: f64 = 0.040;
-/// Shorter apply slew for the first two callbacks of a freshly-reset modulation window.
+/// Shorter apply slew for the first three callbacks of a freshly-reset modulation window.
 const DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_TIME_SECS: f64 = 0.015;
 /// Near-unity request band that resets deterministic ratio averaging history.
 ///
@@ -432,7 +432,7 @@ impl DualPlaneDeterministicState {
 
     #[inline]
     fn ratio_apply_smoothing_time_secs(&self) -> f64 {
-        if self.recent_chunk_ratios.len() <= 2 {
+        if self.recent_chunk_ratios.len() <= 3 {
             DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_TIME_SECS
         } else {
             DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS
@@ -3691,7 +3691,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dual_plane_established_ratio_window_keeps_default_apply_smoothing() {
+    fn test_dual_plane_third_fresh_ratio_window_callback_keeps_burst_apply_smoothing() {
         let params = StretchParams::new(1.0)
             .with_sample_rate(48_000)
             .with_channels(2)
@@ -3708,8 +3708,33 @@ mod tests {
         assert_eq!(state.recent_chunk_ratios.len(), 3);
         assert_eq!(
             state.ratio_apply_smoothing_time_secs(),
+            DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_TIME_SECS,
+            "the third callback of a fresh modulation window should keep the shorter apply slew so short automation bursts do not relax back into the steady-state lag mid-seam"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_established_ratio_window_keeps_default_apply_smoothing() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        state.push_chunk_ratio(1.028, 1.028);
+        state.last_ratio = 1.020;
+        state.push_chunk_ratio(1.024, 1.024);
+        state.last_ratio = 1.022;
+        state.push_chunk_ratio(1.021, 1.021);
+        state.last_ratio = 1.0215;
+        state.push_chunk_ratio(1.0205, 1.0205);
+
+        assert_eq!(state.recent_chunk_ratios.len(), 4);
+        assert_eq!(
+            state.ratio_apply_smoothing_time_secs(),
             DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS,
-            "once the fresh modulation window has more than two callbacks, deterministic apply smoothing should fall back to the steady-state slew"
+            "once the fresh modulation window has more than three callbacks, deterministic apply smoothing should fall back to the steady-state slew"
         );
     }
 
