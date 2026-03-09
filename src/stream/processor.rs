@@ -512,11 +512,14 @@ impl DualPlaneDeterministicState {
         let denom = ramp_total.saturating_add(1) as f32;
         for ch in 0..self.num_channels.min(channel_output_buffers.len()) {
             let anchor = self.unity_exit_seam_samples[ch];
+            let Some(&first_target) = channel_output_buffers[ch].first() else {
+                continue;
+            };
+            let seam_offset = anchor - first_target;
             for i in 0..ramp_len.min(channel_output_buffers[ch].len()) {
                 let progress = self.pending_unity_exit_seam_progress_frames + i + 1;
                 let t = progress as f32 / denom;
-                let target = channel_output_buffers[ch][i];
-                channel_output_buffers[ch][i] = anchor + (target - anchor) * t;
+                channel_output_buffers[ch][i] += seam_offset * (1.0 - t);
             }
         }
 
@@ -3972,6 +3975,36 @@ mod tests {
         assert!(
             (final_callback[0][2] - 1.0).abs() < 1e-6,
             "frames beyond the configured seam length should remain at the target output"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_unity_exit_seam_preserves_callback_shape() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        let prior_output = [vec![0.4, 0.5, 0.6]];
+        state.capture_last_output_samples(&prior_output, 3);
+        state.arm_unity_exit_seam(8);
+
+        let mut callback = [vec![1.0, 0.9, 0.8]];
+        state.apply_pending_unity_exit_seam(&mut callback, 3);
+
+        assert!(
+            (callback[0][0] - (0.6 + (1.0 - 0.6) * (1.0 / 9.0) as f32)).abs() < 1e-6,
+            "the first seam sample should still anchor from the prior unity sample"
+        );
+        assert!(
+            (callback[0][1] - (0.9 + (0.6 - 1.0) * (7.0 / 9.0) as f32)).abs() < 1e-6,
+            "the seam should preserve the new callback slope instead of flattening every sample toward the anchor"
+        );
+        assert!(
+            callback[0][1] > callback[0][2],
+            "the carried seam should keep a descending callback descending after the boundary"
         );
     }
 
