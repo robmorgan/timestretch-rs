@@ -163,6 +163,16 @@ fn streaming_tail_normalize_ratio(carried_tail_ratio: f64, current_ratio: f64) -
 }
 
 #[inline]
+fn ratio_is_meaningfully_above_unity(ratio: f64) -> bool {
+    ratio > 1.0 + RATIO_CHANGE_FOCUS_TRIGGER
+}
+
+#[inline]
+fn ratio_is_meaningfully_below_unity(ratio: f64) -> bool {
+    ratio < 1.0 - RATIO_CHANGE_FOCUS_TRIGGER
+}
+
+#[inline]
 fn continuity_focus_frames_for_ratio_change(
     base_frames: usize,
     tail_samples: usize,
@@ -403,7 +413,19 @@ impl PhaseVocoder {
     pub fn set_stretch_ratio(&mut self, stretch_ratio: f64) {
         let prior_ratio = self.stretch_ratio;
         let ratio_delta = (stretch_ratio - prior_ratio).abs();
-        let continuity_phase_from = self.continuity_focus_phase_ratio(prior_ratio);
+        let mut continuity_phase_from = self.continuity_focus_phase_ratio(prior_ratio);
+        if !self.streaming_tail.is_empty()
+            && ratio_is_meaningfully_above_unity(self.streaming_tail_ratio)
+            && ratio_is_meaningfully_below_unity(continuity_phase_from)
+            && !ratio_is_meaningfully_below_unity(stretch_ratio)
+        {
+            // Short-interval cross-unity modulation can retarget back toward
+            // unity before the previous expansion seam has fully drained. Keep
+            // the seam slew anchored to that carried expansion overlap so the
+            // next callback does not restart from an already-compressed phase
+            // ratio while the older expanded tail is still audible.
+            continuity_phase_from = self.streaming_tail_ratio;
+        }
         let reversed_direction = ratio_change_reverses_inflight_direction(
             continuity_phase_from,
             prior_ratio,
@@ -2823,6 +2845,65 @@ mod tests {
         assert!(
             (pv.streaming_tail_ratio - 0.98).abs() < 1e-12,
             "flush should preserve the re-armed current ratio after repeated short-interval modulation"
+        );
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_keeps_carried_expansion_seam_when_rebounding_toward_unity() {
+        let fft_size = 1024;
+        let hop = 256;
+        let sample_rate = 44100u32;
+        let num_samples = fft_size * 8;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
+            })
+            .collect();
+
+        let mut pv = PhaseVocoder::new(fft_size, hop, 1.04, sample_rate, 120.0);
+        let first_chunk_len = fft_size * 2;
+        let first = pv.process_streaming(&input[..first_chunk_len]).unwrap();
+        assert!(!first.is_empty(), "first streaming chunk should emit audio");
+        assert!(
+            !pv.streaming_tail.is_empty(),
+            "first streaming chunk should retain overlap tail"
+        );
+
+        let mut consumed = ((first_chunk_len - fft_size) / hop + 1) * hop;
+        let short_chunk_len = fft_size + hop;
+
+        pv.set_stretch_ratio(0.96);
+        let second = pv
+            .process_streaming(&input[consumed..consumed + short_chunk_len])
+            .unwrap();
+        assert!(
+            !second.is_empty(),
+            "short follow-up chunk should still emit audio"
+        );
+        assert!(
+            (pv.streaming_tail_ratio - 1.04).abs() < 1e-12,
+            "the prior expansion seam should still be carried after the short cross-unity step"
+        );
+
+        consumed += ((short_chunk_len - fft_size) / hop + 1) * hop;
+        assert!(
+            ratio_is_meaningfully_below_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
+            "test setup should decay the in-flight compression seam below unity before the rebound"
+        );
+
+        pv.set_stretch_ratio(1.02);
+        assert!(
+            (pv.ratio_change_phase_from - 1.04).abs() < 1e-12,
+            "rebounding toward unity should restart from the carried expansion seam while that overlap tail is still unresolved"
+        );
+
+        let third = pv
+            .process_streaming(&input[consumed..consumed + short_chunk_len])
+            .unwrap();
+        assert!(
+            !third.is_empty(),
+            "the rebound chunk should still emit audio after re-anchoring the seam"
         );
     }
 
