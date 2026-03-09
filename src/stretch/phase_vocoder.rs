@@ -40,6 +40,8 @@ const ADAPTIVE_FORCE_ROI_RATIO_DISTANCE: f64 = 0.75;
 const TRANSIENT_FOCUS_FRAMES: usize = 3;
 /// Briefly tighten phase locking after a meaningful runtime ratio step.
 const RATIO_CHANGE_FOCUS_FRAMES: usize = 3;
+/// Keep continuity focus active slightly longer when automation reverses direction mid-seam.
+const RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES: usize = 1;
 /// Ignore tiny ratio deltas that are below the modulation-seam risk zone.
 const RATIO_CHANGE_FOCUS_TRIGGER: f64 = 1e-3;
 /// Cap extra continuity-focus extension so long tails do not pin identity locking.
@@ -176,6 +178,20 @@ fn continuity_focus_frames_for_ratio_change(
             .saturating_add(1)
             .min(RATIO_CHANGE_TAIL_FOCUS_MAX_FRAMES),
     )
+}
+
+#[inline]
+fn ratio_change_reverses_inflight_direction(
+    continuity_phase_from: f64,
+    prior_ratio: f64,
+    next_ratio: f64,
+) -> bool {
+    let prior_direction = prior_ratio - continuity_phase_from;
+    let next_direction = next_ratio - prior_ratio;
+
+    prior_direction.abs() >= RATIO_CHANGE_FOCUS_TRIGGER
+        && next_direction.abs() >= RATIO_CHANGE_FOCUS_TRIGGER
+        && prior_direction.signum() != next_direction.signum()
 }
 
 impl PhaseVocoder {
@@ -388,17 +404,26 @@ impl PhaseVocoder {
         let prior_ratio = self.stretch_ratio;
         let ratio_delta = (stretch_ratio - prior_ratio).abs();
         let continuity_phase_from = self.continuity_focus_phase_ratio(prior_ratio);
+        let reversed_direction = ratio_change_reverses_inflight_direction(
+            continuity_phase_from,
+            prior_ratio,
+            stretch_ratio,
+        );
         self.stretch_ratio = stretch_ratio;
         self.hop_synthesis = (self.hop_analysis as f64 * stretch_ratio).round() as usize;
         if ratio_delta >= RATIO_CHANGE_FOCUS_TRIGGER {
             // Fast automation can land another meaningful ratio step before the
             // previous continuity-focus window drains. Refresh the window so
             // late seam frames do not relax back into looser locking mid-burst.
-            let continuity_focus_frames = continuity_focus_frames_for_ratio_change(
+            let mut continuity_focus_frames = continuity_focus_frames_for_ratio_change(
                 RATIO_CHANGE_FOCUS_FRAMES,
                 self.streaming_tail.len(),
                 self.hop_analysis,
             );
+            if reversed_direction {
+                continuity_focus_frames = continuity_focus_frames
+                    .saturating_add(RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES);
+            }
             self.ratio_change_phase_from = continuity_phase_from;
             self.ratio_change_phase_frames = continuity_focus_frames;
             self.ratio_change_phase_total_frames = continuity_focus_frames;
@@ -2443,8 +2468,32 @@ mod tests {
             "a repeated short-interval modulation step should restart from the in-flight effective phase ratio, not the stale previous target"
         );
         assert!(
-            (pv.continuity_focus_phase_ratio(pv.stretch_ratio) - 1.025).abs() < 1e-12,
-            "the restarted seam slew should glide from the current effective ratio into the new target instead of snapping in one callback"
+            (pv.continuity_focus_phase_ratio(pv.stretch_ratio) - 1.032).abs() < 1e-12,
+            "the restarted seam slew should still glide from the current effective ratio into the new target, but a direction reversal now keeps the seam on a slightly longer continuity window"
+        );
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_extends_continuity_focus_for_direction_reversal() {
+        let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
+
+        pv.set_stretch_ratio(1.12);
+        pv.decay_transient_focus();
+        assert!(
+            (pv.continuity_focus_phase_ratio(pv.stretch_ratio) - 1.06).abs() < 1e-12,
+            "test setup should leave an in-flight continuity slew before reversing direction"
+        );
+
+        pv.set_stretch_ratio(0.92);
+        assert_eq!(
+            pv.transient_focus_frames,
+            RATIO_CHANGE_FOCUS_FRAMES + RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES,
+            "direction-reversing ratio steps should hold continuity focus for one extra frame so the seam does not relax too early"
+        );
+        assert_eq!(
+            pv.ratio_change_phase_total_frames,
+            RATIO_CHANGE_FOCUS_FRAMES + RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES,
+            "the phase-ratio slew should use the same extended window as transient focus during a reversal"
         );
     }
 
