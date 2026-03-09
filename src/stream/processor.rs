@@ -198,6 +198,20 @@ fn unity_exit_seam_frames(hop_size: usize, ratio_delta: f64) -> usize {
     base + ((max_frames - base) as f64 * scaled).round() as usize
 }
 
+#[inline]
+fn unity_exit_seam_ratio_delta(
+    previous_ratio: f64,
+    applied_ratio: f64,
+    requested_ratio: f64,
+) -> f64 {
+    let applied_delta = (applied_ratio - previous_ratio).abs();
+    if dual_plane_ratio_in_unity_reset_zone(previous_ratio) {
+        applied_delta.max((requested_ratio - previous_ratio).abs())
+    } else {
+        applied_delta
+    }
+}
+
 /// Stateful linear resampler used for realtime pitch control in stream mode.
 ///
 /// Maintains one-sample look-behind and a fractional source cursor so
@@ -1661,7 +1675,11 @@ impl StreamProcessor {
                     {
                         state.arm_unity_exit_seam(unity_exit_seam_frames(
                             self.params.hop_size,
-                            applied_ratio - state.last_ratio,
+                            unity_exit_seam_ratio_delta(
+                                state.last_ratio,
+                                applied_ratio,
+                                target_processing_ratio,
+                            ),
                         ));
                     }
                     apply_dual_plane_ratio(&mut state.processor, applied_ratio)?;
@@ -3970,6 +3988,34 @@ mod tests {
         assert_eq!(
             long_ramp, 128,
             "large unity exits should expand the deterministic seam ramp up to the configured cap"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_unity_exit_seam_uses_requested_jump_when_apply_smoothing_lags() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+
+        let applied_delta_frames = unity_exit_seam_frames(params.hop_size, 0.012);
+        let requested_delta_frames = unity_exit_seam_frames(
+            params.hop_size,
+            unity_exit_seam_ratio_delta(1.0, 1.012, 1.04),
+        );
+
+        assert_eq!(
+            applied_delta_frames, 74,
+            "test setup expects a small first applied ratio step to keep the legacy seam near the minimum"
+        );
+        assert_eq!(
+            requested_delta_frames, 96,
+            "unity exits should size the seam from the requested burst when smoothing still keeps the applied ratio close to unity"
+        );
+        assert!(
+            requested_delta_frames > applied_delta_frames,
+            "requested post-plateau jumps should extend the deterministic seam beyond the first smoothed ratio step"
         );
     }
 
