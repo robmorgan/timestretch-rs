@@ -600,11 +600,13 @@ impl PhaseVocoder {
                 self.streaming_tail.len(),
                 self.hop_analysis,
             );
-            if reversed_direction || reanchored_far_from_inflight {
-                continuity_focus_frames = continuity_focus_frames.saturating_add(
-                    RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES
-                        .max(RATIO_CHANGE_CARRIED_SEAM_FOCUS_EXTRA_FRAMES),
-                );
+            if reversed_direction {
+                continuity_focus_frames = continuity_focus_frames
+                    .saturating_add(RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES);
+            }
+            if reanchored_far_from_inflight {
+                continuity_focus_frames = continuity_focus_frames
+                    .saturating_add(RATIO_CHANGE_CARRIED_SEAM_FOCUS_EXTRA_FRAMES);
             }
             self.ratio_change_phase_from = continuity_phase_from;
             self.ratio_change_phase_frames = continuity_focus_frames;
@@ -3479,6 +3481,38 @@ mod tests {
                 pv.hop_analysis,
             ) + RATIO_CHANGE_CARRIED_SEAM_FOCUS_EXTRA_FRAMES,
             "re-anchoring a tiny opposite-side follow-up step should refresh continuity focus so the older seam does not snap mid-tail"
+        );
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_stacks_reversal_and_carried_seam_focus_extensions() {
+        let mut pv = PhaseVocoder::new(1024, 256, 1.12, 44_100, 120.0);
+        pv.streaming_tail = vec![0.0; 64];
+        pv.streaming_tail_phase_ratio = 0.92;
+        pv.ratio_change_phase_from = 0.92;
+        pv.ratio_change_phase_total_frames = 4;
+        pv.ratio_change_phase_frames = 2;
+        pv.transient_focus_frames = 2;
+
+        assert!(
+            ratio_is_meaningfully_above_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
+            "test setup should leave the in-flight seam above unity before reversing back toward the carried compression seam"
+        );
+
+        pv.set_stretch_ratio(0.86);
+        assert!(
+            (pv.ratio_change_phase_from - 0.92).abs() < 1e-12,
+            "the restarted continuity slew should re-anchor to the older carried compression seam"
+        );
+        assert_eq!(
+            pv.ratio_change_phase_total_frames,
+            continuity_focus_frames_for_ratio_change(
+                RATIO_CHANGE_FOCUS_FRAMES,
+                pv.streaming_tail.len(),
+                pv.hop_analysis,
+            ) + RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES
+                + RATIO_CHANGE_CARRIED_SEAM_FOCUS_EXTRA_FRAMES,
+            "when a new step both reverses direction and re-anchors to a far carried seam, both continuity-focus extensions should stack"
         );
     }
 
