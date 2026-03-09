@@ -666,25 +666,49 @@ impl PhaseVocoder {
                 .extend_from_slice(&self.streaming_accum_window_sum[emit_len..work_len]);
         }
 
-        let normalize_ratio = if tail_len > 0 {
-            streaming_tail_normalize_ratio(carried_tail_ratio, self.stretch_ratio)
-        } else {
-            self.stretch_ratio
-        };
         output.resize(emit_len, 0.0);
         output[..emit_len].copy_from_slice(&self.streaming_accum_output[..emit_len]);
-        Self::normalize_output(
-            output,
-            &self.streaming_accum_window_sum[..emit_len],
-            normalize_ratio,
-        );
+        let emitted_window_sum = &self.streaming_accum_window_sum[..emit_len];
+        let emitted_max_window_sum = emitted_window_sum.iter().copied().fold(0.0f32, f32::max);
+        let seam_len = tail_len.min(emit_len);
+        if seam_len == 0 {
+            Self::normalize_output_with_window_floor(
+                output,
+                emitted_window_sum,
+                self.stretch_ratio,
+                emitted_max_window_sum,
+            );
+        } else if seam_len == emit_len {
+            Self::normalize_output_with_window_floor(
+                output,
+                emitted_window_sum,
+                streaming_tail_normalize_ratio(carried_tail_ratio, self.stretch_ratio),
+                emitted_max_window_sum,
+            );
+        } else {
+            // Once the carried seam has fully drained inside this callback, switch
+            // the remainder back to the current ratio's normalization floor so a
+            // previous expansion ratio does not keep loosening the whole chunk.
+            Self::normalize_output_with_window_floor(
+                &mut output[..seam_len],
+                &emitted_window_sum[..seam_len],
+                streaming_tail_normalize_ratio(carried_tail_ratio, self.stretch_ratio),
+                emitted_max_window_sum,
+            );
+            Self::normalize_output_with_window_floor(
+                &mut output[seam_len..emit_len],
+                &emitted_window_sum[seam_len..emit_len],
+                self.stretch_ratio,
+                emitted_max_window_sum,
+            );
+        }
         self.synthesis_emitted = self.synthesis_emitted.saturating_add(emit_len);
         self.streaming_tail_ratio = if self.streaming_tail.is_empty() {
             self.stretch_ratio
         } else if emit_len < tail_len {
             // Preserve the more conservative seam ratio only while unresolved
             // overlap from the previous chunk is still present in the carried tail.
-            normalize_ratio
+            streaming_tail_normalize_ratio(carried_tail_ratio, self.stretch_ratio)
         } else {
             self.stretch_ratio
         };
@@ -1182,6 +1206,16 @@ impl PhaseVocoder {
     #[inline]
     fn normalize_output(output: &mut [f32], window_sum: &[f32], stretch_ratio: f64) {
         let max_window_sum = window_sum.iter().copied().fold(0.0f32, f32::max);
+        Self::normalize_output_with_window_floor(output, window_sum, stretch_ratio, max_window_sum);
+    }
+
+    #[inline]
+    fn normalize_output_with_window_floor(
+        output: &mut [f32],
+        window_sum: &[f32],
+        stretch_ratio: f64,
+        max_window_sum: f32,
+    ) {
         // For stretches >1.0, synthesis frames are farther apart and aggressive
         // flooring can over-attenuate low-overlap regions. Relax the floor more
         // strongly with ratio while keeping a safety minimum against blow-ups.
@@ -1340,6 +1374,43 @@ mod tests {
         // Test larger values
         assert!((wrap_phase(10.0 * PI + 0.5) - wrap_phase(0.5)).abs() < 1e-4);
         assert!((wrap_phase(-10.0 * PI - 0.5) - wrap_phase(-0.5)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_normalize_output_with_window_floor_scopes_expansion_floor_to_seam_prefix() {
+        let reference_max_window_sum = 1.0f32;
+        let window_sum = [1.0f32, 0.01, 0.01, 0.01];
+        let mut split_output = vec![1.0f32; window_sum.len()];
+        let mut all_expansion_output = vec![1.0f32; window_sum.len()];
+
+        PhaseVocoder::normalize_output_with_window_floor(
+            &mut split_output[..2],
+            &window_sum[..2],
+            1.18,
+            reference_max_window_sum,
+        );
+        PhaseVocoder::normalize_output_with_window_floor(
+            &mut split_output[2..],
+            &window_sum[2..],
+            0.82,
+            reference_max_window_sum,
+        );
+        PhaseVocoder::normalize_output_with_window_floor(
+            &mut all_expansion_output,
+            &window_sum,
+            1.18,
+            reference_max_window_sum,
+        );
+
+        assert!(
+            (split_output[0] - all_expansion_output[0]).abs() < 1e-6
+                && (split_output[1] - all_expansion_output[1]).abs() < 1e-6,
+            "the unresolved seam prefix should keep the prior expansion ratio floor"
+        );
+        assert!(
+            split_output[2] < all_expansion_output[2] && split_output[3] < all_expansion_output[3],
+            "once the seam prefix drains, the remainder should normalize against the current ratio instead of the prior expansion floor"
+        );
     }
 
     #[test]
