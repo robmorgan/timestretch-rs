@@ -2687,7 +2687,13 @@ impl StreamProcessor {
 
         let current_side = ratio_modulation_side(self.current_ratio);
         let target_side = ratio_modulation_side(self.target_ratio);
-        current_side != 0 && target_side != 0 && current_side != target_side
+        if current_side != 0 && target_side != 0 && current_side != target_side {
+            return true;
+        }
+
+        current_side != 0
+            && current_side == target_side
+            && (self.target_ratio - 1.0).abs() < (self.current_ratio - 1.0).abs()
     }
 
     #[inline]
@@ -4117,6 +4123,37 @@ mod tests {
             proc.transient_reset_modulation_overlap_windows(false),
             0,
             "when low bands are not being held, modulation overlap protection should stay disabled"
+        );
+    }
+
+    #[test]
+    fn test_transient_reset_hold_low_bands_on_same_side_rebound_toward_unity() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+
+        proc.current_ratio = 1.12;
+        proc.target_ratio = 1.02;
+        assert!(
+            proc.transient_reset_should_hold_low_bands(),
+            "same-side rebounds toward unity should keep low bands locked while the prior expansion seam drains"
+        );
+
+        proc.current_ratio = 0.88;
+        proc.target_ratio = 0.98;
+        assert!(
+            proc.transient_reset_should_hold_low_bands(),
+            "same-side rebounds toward unity should also hold low bands during compression recovery"
+        );
+
+        proc.current_ratio = 1.02;
+        proc.target_ratio = 1.12;
+        assert!(
+            !proc.transient_reset_should_hold_low_bands(),
+            "same-side moves farther from unity should not borrow the rebound-specific low-band hold"
         );
     }
 
