@@ -632,7 +632,7 @@ impl PhaseVocoder {
                 padded[start_pad + input.len() + i] = input[input.len() - 1 - i] * fade;
             }
 
-            let (_num_frames, output_len) = self.process_core(&padded, true)?;
+            let (_num_frames, output_len, _) = self.process_core(&padded, true)?;
             let mut output = self.output_buf[..output_len].to_vec();
             Self::normalize_output(
                 &mut output,
@@ -720,7 +720,7 @@ impl PhaseVocoder {
         }
 
         // Fallback: process without padding (short inputs or edge cases).
-        let (_num_frames, output_len) = self.process_core(input, true)?;
+        let (_num_frames, output_len, _) = self.process_core(input, true)?;
         let mut output = self.output_buf[..output_len].to_vec();
         Self::normalize_output(
             &mut output,
@@ -758,7 +758,7 @@ impl PhaseVocoder {
             return Ok(());
         }
 
-        let (emit_len, output_len) = self.process_core(input, false)?;
+        let (emit_len, output_len, last_phase_hop_ratio) = self.process_core(input, false)?;
         if output.capacity() < emit_len {
             return Err(StretchError::BufferOverflow {
                 buffer: "phase_vocoder_stream_output",
@@ -853,7 +853,7 @@ impl PhaseVocoder {
         } else if emit_len < tail_len {
             carried_tail_phase_ratio
         } else {
-            self.stretch_ratio
+            last_phase_hop_ratio
         };
         Ok(())
     }
@@ -907,15 +907,17 @@ impl PhaseVocoder {
 
     /// Shared PV core used by both batch and streaming paths.
     ///
-    /// Returns `(emit_len, output_len)` where `output_len` samples are
+    /// Returns `(emit_len, output_len, tail_phase_ratio)` where `output_len` samples are
     /// accumulated (unnormalized) into `self.output_buf` and
-    /// `self.window_sum_buf`, and `emit_len` is the number of samples
-    /// finalized for streaming emission (`floor(next_synthesis_pos)`).
+    /// `self.window_sum_buf`, `emit_len` is the number of samples finalized
+    /// for streaming emission (`floor(next_synthesis_pos)`), and
+    /// `tail_phase_ratio` is the effective phase ratio used by the newest
+    /// unresolved overlap generated in this call.
     fn process_core(
         &mut self,
         input: &[f32],
         reset_phase_state: bool,
-    ) -> Result<(usize, usize), StretchError> {
+    ) -> Result<(usize, usize, f64), StretchError> {
         if input.len() < self.fft_size {
             return Err(StretchError::InputTooShort {
                 provided: input.len(),
@@ -971,17 +973,20 @@ impl PhaseVocoder {
         self.window_sum_buf.fill(0.0);
 
         let mut synthesis_frame_pos = start_synthesis_pos;
+        let mut last_phase_hop_ratio = hop_ratio;
         for frame_idx in 0..num_frames {
             let analysis_pos = frame_idx * self.hop_analysis;
             let synthesis_pos = snap_near_integer(synthesis_frame_pos);
             let synthesis_floor = synthesis_pos.floor() as usize;
             let frac = synthesis_pos - synthesis_floor as f64;
+            let phase_hop_ratio = self.continuity_focus_phase_ratio(hop_ratio);
 
             self.analyze_frame(
                 &input[analysis_pos..analysis_pos + self.fft_size],
                 &fft_forward,
             );
-            self.advance_phases(num_bins, hop_ratio);
+            self.advance_phases(num_bins, hop_ratio, phase_hop_ratio);
+            last_phase_hop_ratio = phase_hop_ratio;
 
             // Save IF-estimated phases before phase locking overwrites them.
             self.if_phases_backup[..num_bins].copy_from_slice(&self.new_phases[..num_bins]);
@@ -1116,7 +1121,7 @@ impl PhaseVocoder {
         let emit_len = next_local_synthesis_pos.floor() as usize;
         self.synthesis_pos = self.synthesis_emitted as f64 + next_local_synthesis_pos;
 
-        Ok((emit_len, output_len))
+        Ok((emit_len, output_len, last_phase_hop_ratio))
     }
 
     /// Windows the input frame and transforms to frequency domain.
@@ -1160,10 +1165,9 @@ impl PhaseVocoder {
     /// over long signals. The final phases are converted back to f32 for the
     /// spectrum reconstruction step.
     #[inline]
-    fn advance_phases(&mut self, num_bins: usize, hop_ratio: f64) {
+    fn advance_phases(&mut self, num_bins: usize, hop_ratio: f64, phase_hop_ratio: f64) {
         let hop_a = self.hop_analysis as f64;
         let fft = self.fft_size as f64;
-        let phase_hop_ratio = self.continuity_focus_phase_ratio(hop_ratio);
 
         // --- Pass 1: Extract magnitudes and analysis phases ---
         for bin in 0..num_bins {
@@ -1773,7 +1777,7 @@ mod tests {
             pv.fft_buffer[bin] = Complex::from_polar(1.0, phase);
         }
 
-        pv.advance_phases(num_bins, 1.0);
+        pv.advance_phases(num_bins, 1.0, 1.0);
 
         let seeded_phase = pv.analysis_phases[target_bin] as f64;
         assert!(
@@ -1817,11 +1821,11 @@ mod tests {
         let mut focused = PhaseVocoder::new(1024, 256, 1.0, sample_rate, 0.0);
         configure(&mut focused);
         focused.transient_focus_frames = 1;
-        focused.advance_phases(num_bins, 1.0);
+        focused.advance_phases(num_bins, 1.0, 1.0);
 
         let mut unfocused = PhaseVocoder::new(1024, 256, 1.0, sample_rate, 0.0);
         configure(&mut unfocused);
-        unfocused.advance_phases(num_bins, 1.0);
+        unfocused.advance_phases(num_bins, 1.0, 1.0);
 
         let independent_phase = focused.expected_phase_advance[target_bin] as f32;
         assert!(
@@ -2713,6 +2717,66 @@ mod tests {
         assert!(
             (pv.streaming_tail_ratio - 0.82).abs() < 1e-12,
             "flush should clear carried overlap history and re-arm the current ratio"
+        );
+    }
+
+    #[test]
+    fn test_streaming_tail_phase_ratio_tracks_inflight_seam_after_prior_tail_drains() {
+        let fft_size = 1024;
+        let hop = 256;
+        let sample_rate = 44100u32;
+        let num_samples = fft_size * 6;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
+            })
+            .collect();
+
+        let mut pv = PhaseVocoder::new(fft_size, hop, 1.18, sample_rate, 120.0);
+        let first_chunk_len = fft_size * 2;
+        let first = pv.process_streaming(&input[..first_chunk_len]).unwrap();
+        assert!(!first.is_empty(), "first streaming chunk should emit audio");
+        assert!(
+            !pv.streaming_tail.is_empty(),
+            "first streaming chunk should retain overlap tail"
+        );
+
+        let consumed = ((first_chunk_len - fft_size) / hop + 1) * hop;
+        let second_chunk_len = fft_size + hop * 3;
+        pv.set_stretch_ratio(0.82);
+        assert_eq!(
+            pv.ratio_change_phase_total_frames,
+            RATIO_CHANGE_FOCUS_FRAMES + RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES,
+            "test setup should keep the reversed seam active across the short follow-up chunk"
+        );
+        let expected_tail_phase_ratio = pv.ratio_change_phase_from
+            + (pv.stretch_ratio - pv.ratio_change_phase_from)
+                * (pv.ratio_change_phase_total_frames as f64
+                    / (pv.ratio_change_phase_total_frames as f64 + 1.0));
+
+        let second = pv
+            .process_streaming(&input[consumed..consumed + second_chunk_len])
+            .unwrap();
+        assert!(
+            !second.is_empty(),
+            "second streaming chunk should emit audio"
+        );
+        assert!(
+            !pv.streaming_tail.is_empty(),
+            "second streaming chunk should keep a newly generated overlap tail"
+        );
+        assert!(
+            (pv.streaming_tail_ratio - 0.82).abs() < 1e-12,
+            "once the older overlap has drained, normalization should re-arm to the new target ratio"
+        );
+        assert!(
+            (pv.streaming_tail_phase_ratio - expected_tail_phase_ratio).abs() < 1e-12,
+            "the new carried tail should preserve the in-flight phase seam ratio instead of snapping straight to the target"
+        );
+        assert!(
+            (pv.streaming_tail_phase_ratio - pv.stretch_ratio).abs() > 1e-3,
+            "the carried phase seam should stay meaningfully offset from the target while the continuity slew is still draining"
         );
     }
 
