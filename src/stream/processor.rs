@@ -48,6 +48,10 @@ const DUAL_PLANE_UNITY_EXIT_SEAM_FRAMES: usize = 64;
 const DUAL_PLANE_UNITY_EXIT_SEAM_MAX_FRAMES: usize = 128;
 /// Ratio-jump range that scales the unity-exit seam from base to max length.
 const DUAL_PLANE_UNITY_EXIT_SEAM_RATIO_RANGE: f64 = 0.08;
+/// Extra seam frames applied when deterministic modulation leaves a repeated
+/// unity plateau, so the first short burst does not collapse back to the same
+/// shorter ramp used for one-callback plateaus.
+const DUAL_PLANE_REPEATED_UNITY_EXIT_SEAM_EXTRA_FRAMES: usize = 32;
 /// Base overlap windows to hold transient resets during low-band-suppressed modulation.
 const TRANSIENT_RESET_MODULATION_BASE_OVERLAP_WINDOWS: usize = 2;
 /// Additional overlap windows for larger fast-modulation bursts.
@@ -214,6 +218,23 @@ fn unity_exit_seam_frames(hop_size: usize, ratio_delta: f64) -> usize {
 }
 
 #[inline]
+fn repeated_unity_exit_seam_frames(
+    hop_size: usize,
+    ratio_delta: f64,
+    unity_plateau_callbacks: usize,
+) -> usize {
+    let base_frames = unity_exit_seam_frames(hop_size, ratio_delta);
+    let max_frames = hop_size.min(DUAL_PLANE_UNITY_EXIT_SEAM_MAX_FRAMES);
+    if unity_plateau_callbacks <= 1 {
+        base_frames
+    } else {
+        base_frames
+            .saturating_add(DUAL_PLANE_REPEATED_UNITY_EXIT_SEAM_EXTRA_FRAMES)
+            .min(max_frames)
+    }
+}
+
+#[inline]
 fn unity_exit_seam_ratio_delta(
     previous_ratio: f64,
     applied_ratio: f64,
@@ -376,6 +397,7 @@ struct DualPlaneDeterministicState {
     pending_unity_exit_seam: bool,
     pending_unity_exit_seam_frames: usize,
     pending_unity_exit_seam_progress_frames: usize,
+    consecutive_unity_plateau_callbacks: usize,
 }
 
 impl DualPlaneDeterministicState {
@@ -425,6 +447,7 @@ impl DualPlaneDeterministicState {
             pending_unity_exit_seam: false,
             pending_unity_exit_seam_frames: 0,
             pending_unity_exit_seam_progress_frames: 0,
+            consecutive_unity_plateau_callbacks: 0,
         })
     }
 
@@ -494,6 +517,10 @@ impl DualPlaneDeterministicState {
             self.pending_unity_exit_seam = false;
             self.pending_unity_exit_seam_frames = 0;
             self.pending_unity_exit_seam_progress_frames = 0;
+            self.consecutive_unity_plateau_callbacks =
+                self.consecutive_unity_plateau_callbacks.saturating_add(1);
+        } else {
+            self.consecutive_unity_plateau_callbacks = 0;
         }
     }
 
@@ -1740,17 +1767,19 @@ impl StreamProcessor {
                     if exiting_unity_reset_zone
                         && !dual_plane_ratio_in_unity_reset_zone(applied_ratio)
                     {
-                        state.arm_unity_exit_seam(unity_exit_seam_frames(
+                        state.arm_unity_exit_seam(repeated_unity_exit_seam_frames(
                             self.params.hop_size,
                             unity_exit_seam_ratio_delta(
                                 state.last_ratio,
                                 applied_ratio,
                                 target_processing_ratio,
                             ),
+                            state.consecutive_unity_plateau_callbacks,
                         ));
                     }
                     apply_dual_plane_ratio(&mut state.processor, applied_ratio)?;
                     state.last_ratio = applied_ratio;
+                    state.consecutive_unity_plateau_callbacks = 0;
                 }
             }
 
@@ -4200,6 +4229,35 @@ mod tests {
         assert!(
             requested_delta_frames > applied_delta_frames,
             "requested post-plateau jumps should extend the deterministic seam beyond the first smoothed ratio step"
+        );
+    }
+
+    #[test]
+    fn test_repeated_unity_plateau_exit_extends_deterministic_seam() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let ratio_delta = 0.035;
+
+        let single_plateau = repeated_unity_exit_seam_frames(params.hop_size, ratio_delta, 1);
+        let repeated_plateau = repeated_unity_exit_seam_frames(params.hop_size, ratio_delta, 2);
+
+        assert_eq!(
+            single_plateau,
+            unity_exit_seam_frames(params.hop_size, ratio_delta),
+            "a one-callback unity plateau should keep the baseline seam length"
+        );
+        assert_eq!(
+            repeated_plateau,
+            (single_plateau + DUAL_PLANE_REPEATED_UNITY_EXIT_SEAM_EXTRA_FRAMES)
+                .min(DUAL_PLANE_UNITY_EXIT_SEAM_MAX_FRAMES),
+            "repeated unity plateaus should hold the deterministic seam longer before the next burst"
+        );
+        assert!(
+            repeated_plateau > single_plateau,
+            "repeated unity plateaus should lengthen the post-plateau seam ramp"
         );
     }
 
