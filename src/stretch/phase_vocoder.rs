@@ -38,6 +38,10 @@ const ADAPTIVE_SELECTIVE_RATIO_DISTANCE_MAX: f64 = 0.65;
 const ADAPTIVE_FORCE_ROI_RATIO_DISTANCE: f64 = 0.75;
 /// Number of synthesis frames to keep transient-focused locking active.
 const TRANSIENT_FOCUS_FRAMES: usize = 3;
+/// Briefly tighten phase locking after a meaningful runtime ratio step.
+const RATIO_CHANGE_FOCUS_FRAMES: usize = 2;
+/// Ignore tiny ratio deltas that are below the modulation-seam risk zone.
+const RATIO_CHANGE_FOCUS_TRIGGER: f64 = 1e-3;
 /// Phase vocoder state for time stretching.
 pub struct PhaseVocoder {
     fft_size: usize,
@@ -347,12 +351,18 @@ impl PhaseVocoder {
     /// Updates the stretch ratio without resetting phase state.
     ///
     /// This recalculates the synthesis hop size from the new ratio while
-    /// preserving all accumulated phase information. Use this for smooth
-    /// real-time ratio changes that avoid clicks and discontinuities.
+    /// preserving all accumulated phase information. Meaningful runtime ratio
+    /// steps also engage a short continuity-focus window so the first few
+    /// post-change frames prefer tighter phase coherence at the seam.
     #[inline]
     pub fn set_stretch_ratio(&mut self, stretch_ratio: f64) {
+        let ratio_delta = (stretch_ratio - self.stretch_ratio).abs();
         self.stretch_ratio = stretch_ratio;
         self.hop_synthesis = (self.hop_analysis as f64 * stretch_ratio).round() as usize;
+        if ratio_delta >= RATIO_CHANGE_FOCUS_TRIGGER {
+            self.transient_focus_frames =
+                self.transient_focus_frames.max(RATIO_CHANGE_FOCUS_FRAMES);
+        }
     }
 
     /// Resets the phase accumulator and previous-phase buffers.
@@ -2262,6 +2272,30 @@ mod tests {
         let output2 = pv.process(&input).unwrap();
         assert!(!output2.is_empty());
         assert!(output2.len() > output1.len()); // 1.5x should be longer
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_engages_brief_continuity_focus_for_meaningful_step() {
+        let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
+        assert_eq!(pv.transient_focus_frames, 0);
+
+        pv.set_stretch_ratio(1.002);
+        assert_eq!(
+            pv.transient_focus_frames, RATIO_CHANGE_FOCUS_FRAMES,
+            "meaningful runtime ratio steps should briefly tighten post-change phase locking"
+        );
+    }
+
+    #[test]
+    fn test_set_stretch_ratio_ignores_tiny_steps_for_continuity_focus() {
+        let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
+        assert_eq!(pv.transient_focus_frames, 0);
+
+        pv.set_stretch_ratio(1.0005);
+        assert_eq!(
+            pv.transient_focus_frames, 0,
+            "sub-threshold ratio nudges should not burn the continuity-focus window"
+        );
     }
 
     #[test]
