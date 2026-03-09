@@ -37,6 +37,10 @@ const DUAL_PLANE_RATIO_HISTORY_UNITY_RESET_EPS: f64 = 0.005;
 const DUAL_PLANE_RATIO_HISTORY_DIRECTION_RESET_EPS: f64 = 0.003;
 /// Short seam ramp used when deterministic rendering exits exact-unity bypass.
 const DUAL_PLANE_UNITY_EXIT_SEAM_FRAMES: usize = 64;
+/// Maximum seam ramp when large post-unity ratio jumps need extra continuity.
+const DUAL_PLANE_UNITY_EXIT_SEAM_MAX_FRAMES: usize = 128;
+/// Ratio-jump range that scales the unity-exit seam from base to max length.
+const DUAL_PLANE_UNITY_EXIT_SEAM_RATIO_RANGE: f64 = 0.08;
 /// Numerator for the FFT-size latency fraction (3/2 = 1.5x FFT size).
 const LATENCY_FFT_NUMERATOR: usize = 3;
 /// Denominator for the FFT-size latency fraction.
@@ -176,6 +180,18 @@ fn snap_dual_plane_ratio_to_unity_plateau(ratio: f64) -> f64 {
     }
 }
 
+#[inline]
+fn unity_exit_seam_frames(hop_size: usize, ratio_delta: f64) -> usize {
+    let base = hop_size.min(DUAL_PLANE_UNITY_EXIT_SEAM_FRAMES);
+    let max_frames = hop_size.min(DUAL_PLANE_UNITY_EXIT_SEAM_MAX_FRAMES);
+    if max_frames <= base {
+        return base;
+    }
+
+    let scaled = (ratio_delta.abs() / DUAL_PLANE_UNITY_EXIT_SEAM_RATIO_RANGE).clamp(0.0, 1.0);
+    base + ((max_frames - base) as f64 * scaled).round() as usize
+}
+
 /// Stateful linear resampler used for realtime pitch control in stream mode.
 ///
 /// Maintains one-sample look-behind and a fractional source cursor so
@@ -307,6 +323,7 @@ struct DualPlaneDeterministicState {
     has_last_output_samples: bool,
     unity_exit_seam_samples: Vec<f32>,
     pending_unity_exit_seam: bool,
+    pending_unity_exit_seam_frames: usize,
 }
 
 impl DualPlaneDeterministicState {
@@ -347,6 +364,7 @@ impl DualPlaneDeterministicState {
             has_last_output_samples: false,
             unity_exit_seam_samples: vec![0.0; num_channels],
             pending_unity_exit_seam: false,
+            pending_unity_exit_seam_frames: 0,
         })
     }
 
@@ -414,20 +432,23 @@ impl DualPlaneDeterministicState {
         self.last_ratio = ratio;
         if dual_plane_ratio_in_unity_reset_zone(ratio) {
             self.pending_unity_exit_seam = false;
+            self.pending_unity_exit_seam_frames = 0;
         }
     }
 
     #[inline]
-    fn arm_unity_exit_seam(&mut self) {
+    fn arm_unity_exit_seam(&mut self, ramp_frames: usize) {
         if !self.has_last_output_samples
             || self.last_output_samples.len() != self.num_channels
             || self.unity_exit_seam_samples.len() != self.num_channels
+            || ramp_frames == 0
         {
             return;
         }
         self.unity_exit_seam_samples
             .copy_from_slice(&self.last_output_samples);
         self.pending_unity_exit_seam = true;
+        self.pending_unity_exit_seam_frames = ramp_frames;
     }
 
     #[inline]
@@ -443,13 +464,15 @@ impl DualPlaneDeterministicState {
         &mut self,
         channel_output_buffers: &mut [Vec<f32>],
         produced_frames: usize,
-        ramp_frames: usize,
     ) {
-        if !self.pending_unity_exit_seam || produced_frames == 0 || ramp_frames == 0 {
+        if !self.pending_unity_exit_seam
+            || produced_frames == 0
+            || self.pending_unity_exit_seam_frames == 0
+        {
             return;
         }
 
-        let ramp_len = produced_frames.min(ramp_frames);
+        let ramp_len = produced_frames.min(self.pending_unity_exit_seam_frames);
         let denom = ramp_len.saturating_add(1) as f32;
         for ch in 0..self.num_channels.min(channel_output_buffers.len()) {
             let anchor = self.unity_exit_seam_samples[ch];
@@ -461,6 +484,7 @@ impl DualPlaneDeterministicState {
         }
 
         self.pending_unity_exit_seam = false;
+        self.pending_unity_exit_seam_frames = 0;
     }
 
     fn capture_last_output_samples(
@@ -1571,7 +1595,6 @@ impl StreamProcessor {
             raw_target_processing_ratio
         };
         let sample_rate = self.params.sample_rate;
-        let unity_exit_seam_frames = self.params.hop_size.min(DUAL_PLANE_UNITY_EXIT_SEAM_FRAMES);
 
         let produced_frames = {
             let (channel_output_buffers, dual_plane_state) = (
@@ -1616,7 +1639,10 @@ impl StreamProcessor {
                     if exiting_unity_reset_zone
                         && !dual_plane_ratio_in_unity_reset_zone(applied_ratio)
                     {
-                        state.arm_unity_exit_seam();
+                        state.arm_unity_exit_seam(unity_exit_seam_frames(
+                            self.params.hop_size,
+                            applied_ratio - state.last_ratio,
+                        ));
                     }
                     apply_dual_plane_ratio(&mut state.processor, applied_ratio)?;
                     state.last_ratio = applied_ratio;
@@ -1687,11 +1713,7 @@ impl StreamProcessor {
                 channel_output_buffers[ch]
                     .extend_from_slice(&state.output_planar[ch][..produced_frames]);
             }
-            state.apply_pending_unity_exit_seam(
-                channel_output_buffers,
-                produced_frames,
-                unity_exit_seam_frames,
-            );
+            state.apply_pending_unity_exit_seam(channel_output_buffers, produced_frames);
             state.capture_last_output_samples(channel_output_buffers, produced_frames);
             produced_frames
         };
@@ -3747,7 +3769,7 @@ mod tests {
             .with_hop_size(256);
         let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
 
-        state.arm_unity_exit_seam();
+        state.arm_unity_exit_seam(64);
         assert!(
             !state.pending_unity_exit_seam,
             "unity-exit seam smoothing should stay idle until deterministic output has produced a real anchor sample"
@@ -3760,7 +3782,7 @@ mod tests {
             "capturing deterministic output should arm a real seam anchor for later unity exits"
         );
 
-        state.arm_unity_exit_seam();
+        state.arm_unity_exit_seam(64);
         assert!(
             state.pending_unity_exit_seam,
             "once deterministic output has emitted audio, the next exact-unity exit should carry the captured seam anchor"
@@ -3768,6 +3790,10 @@ mod tests {
         assert!(
             (state.unity_exit_seam_samples[0] - 0.375).abs() < 1e-12,
             "unity-exit seam smoothing should anchor from the last emitted sample instead of an initial placeholder"
+        );
+        assert_eq!(
+            state.pending_unity_exit_seam_frames, 64,
+            "arming a unity-exit seam should preserve the requested adaptive ramp length"
         );
     }
 
@@ -3782,7 +3808,7 @@ mod tests {
 
         let channel_output_buffers = [vec![0.125, -0.25, 0.375]];
         state.capture_last_output_samples(&channel_output_buffers, 3);
-        state.arm_unity_exit_seam();
+        state.arm_unity_exit_seam(64);
         assert!(
             state.pending_unity_exit_seam,
             "test setup should arm the carried seam anchor before entering a near-unity plateau"
@@ -3792,6 +3818,43 @@ mod tests {
         assert!(
             !state.pending_unity_exit_seam,
             "entering the near-unity reset zone should clear any stale carried seam before the next modulation burst"
+        );
+        assert_eq!(
+            state.pending_unity_exit_seam_frames, 0,
+            "clearing a near-unity seam should also drop any adaptive seam length from the previous burst"
+        );
+    }
+
+    #[test]
+    fn test_dual_plane_unity_exit_seam_extends_for_larger_ratio_jumps() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
+
+        let channel_output_buffers = [vec![0.125, -0.25, 0.375]];
+        state.capture_last_output_samples(&channel_output_buffers, 3);
+
+        state.arm_unity_exit_seam(unity_exit_seam_frames(params.hop_size, 0.02));
+        let short_ramp = state.pending_unity_exit_seam_frames;
+
+        state.arm_unity_exit_seam(unity_exit_seam_frames(params.hop_size, 0.08));
+        let long_ramp = state.pending_unity_exit_seam_frames;
+
+        assert!(
+            long_ramp > short_ramp,
+            "larger post-unity ratio jumps should carry a longer deterministic seam ramp"
+        );
+        assert_eq!(
+            short_ramp,
+            80,
+            "small unity exits should stay close to the base seam ramp instead of jumping to the maximum"
+        );
+        assert_eq!(
+            long_ramp, 128,
+            "large unity exits should expand the deterministic seam ramp up to the configured cap"
         );
     }
 
