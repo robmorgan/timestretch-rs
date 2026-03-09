@@ -172,7 +172,11 @@ impl TransientEventScheduler {
         // overlapping callback footprint plus almost one more overlap window so
         // the same physical onset is not re-evaluated as a fresh upper-band
         // reset right as the overlap tail drains through adjacent callbacks.
-        let overlap_frames = self.fft_size.div_ceil(self.hop_size).saturating_sub(1).max(1);
+        let overlap_frames = self
+            .fft_size
+            .div_ceil(self.hop_size)
+            .saturating_sub(1)
+            .max(1);
         overlap_frames
             .saturating_mul(modulation_overlap_windows.max(1))
             .saturating_add(overlap_frames.saturating_sub(1))
@@ -355,9 +359,8 @@ impl TransientEventScheduler {
                     if !self.should_accept_upper_band_reset_during_modulation_hold(
                         sub_flux, low_flux, mid_flux, high_flux, threshold,
                     ) {
-                        self.cooldown_frames = self.rejected_modulation_hold_cooldown_frames(
-                            modulation_overlap_windows,
-                        );
+                        self.cooldown_frames = self
+                            .rejected_modulation_hold_cooldown_frames(modulation_overlap_windows);
                         self.update_flux_stats(flux);
                         self.prev_flux = flux;
                         self.last_processed_frame_start = Some(absolute_frame_start);
@@ -652,11 +655,11 @@ mod tests {
         let overlap_frames = fft.div_ceil(hop).saturating_sub(1);
         let scheduler = TransientEventScheduler::new(fft, hop, 44_100, 4096);
 
-        let rejected =
-            scheduler.rejected_modulation_hold_cooldown_frames(
-                MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS,
-            );
-        let accepted = scheduler.reset_cooldown_frames(MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS);
+        let rejected = scheduler.rejected_modulation_hold_cooldown_frames(
+            MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS,
+        );
+        let accepted =
+            scheduler.reset_cooldown_frames(MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS);
 
         assert_eq!(
             rejected,

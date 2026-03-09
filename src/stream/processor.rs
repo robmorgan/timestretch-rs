@@ -47,6 +47,9 @@ const TRANSIENT_RESET_MODULATION_BASE_OVERLAP_WINDOWS: usize = 2;
 const TRANSIENT_RESET_MODULATION_MAX_EXTRA_OVERLAP_WINDOWS: usize = 2;
 /// Ratio-jump range that scales transient-reset duplicate protection under modulation.
 const TRANSIENT_RESET_MODULATION_OVERLAP_RATIO_RANGE: f64 = 0.09;
+/// Minimum extra overlap window when low-band-suppressed modulation is still
+/// crossing or settling around a seam-sensitive unity transition.
+const TRANSIENT_RESET_MODULATION_SEAM_MIN_EXTRA_OVERLAP_WINDOWS: usize = 1;
 /// Deterministic auto-profile hysteresis blocks used to avoid one-kernel churn after short bursts.
 const DETERMINISTIC_AUTO_PROFILE_SWITCH_HYSTERESIS_BLOCKS: usize = 2;
 /// Numerator for the FFT-size latency fraction (3/2 = 1.5x FFT size).
@@ -2728,9 +2731,28 @@ impl StreamProcessor {
 
         let ratio_delta = (self.target_ratio - self.current_ratio).abs();
         let scaled = (ratio_delta / TRANSIENT_RESET_MODULATION_OVERLAP_RATIO_RANGE).clamp(0.0, 1.0);
-        TRANSIENT_RESET_MODULATION_BASE_OVERLAP_WINDOWS
+        let mut overlap_windows = TRANSIENT_RESET_MODULATION_BASE_OVERLAP_WINDOWS
             + ((TRANSIENT_RESET_MODULATION_MAX_EXTRA_OVERLAP_WINDOWS as f64) * scaled).round()
-                as usize
+                as usize;
+
+        let near_unity_transition = (self.current_ratio - 1.0).abs()
+            <= DUAL_PLANE_RATIO_HISTORY_UNITY_RESET_EPS
+            || (self.target_ratio - 1.0).abs() <= DUAL_PLANE_RATIO_HISTORY_UNITY_RESET_EPS;
+        let current_side = ratio_modulation_side(self.current_ratio);
+        let target_side = ratio_modulation_side(self.target_ratio);
+        let crosses_unity = current_side != 0 && target_side != 0 && current_side != target_side;
+        let rebounds_toward_unity = current_side != 0
+            && current_side == target_side
+            && (self.target_ratio - 1.0).abs() < (self.current_ratio - 1.0).abs();
+
+        if near_unity_transition || crosses_unity || rebounds_toward_unity {
+            overlap_windows = overlap_windows.max(
+                TRANSIENT_RESET_MODULATION_BASE_OVERLAP_WINDOWS
+                    + TRANSIENT_RESET_MODULATION_SEAM_MIN_EXTRA_OVERLAP_WINDOWS,
+            );
+        }
+
+        overlap_windows
     }
 
     /// Returns the BPM stored in the params, if any.
@@ -4186,6 +4208,45 @@ mod tests {
             proc.transient_reset_modulation_overlap_windows(false),
             0,
             "when low bands are not being held, modulation overlap protection should stay disabled"
+        );
+    }
+
+    #[test]
+    fn test_transient_reset_modulation_overlap_windows_hold_extra_seam_window_near_unity() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+
+        proc.current_ratio = 1.001;
+        proc.target_ratio = 1.018;
+
+        assert_eq!(
+            proc.transient_reset_modulation_overlap_windows(true),
+            3,
+            "near-unity fast-modulation settles should keep one extra duplicate-reset hold window even when the instantaneous delta alone would round back to the base hold"
+        );
+    }
+
+    #[test]
+    fn test_transient_reset_modulation_overlap_windows_hold_extra_seam_window_on_same_side_rebound()
+    {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(2)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+
+        proc.current_ratio = 1.08;
+        proc.target_ratio = 1.02;
+
+        assert_eq!(
+            proc.transient_reset_modulation_overlap_windows(true),
+            3,
+            "same-side rebounds toward unity should keep one extra overlap window so a draining seam is not reclassified as a fresh transient"
         );
     }
 

@@ -526,7 +526,8 @@ impl PhaseVocoder {
         let continuity_delta = (stretch_ratio - continuity_phase_from).abs();
         self.stretch_ratio = stretch_ratio;
         self.hop_synthesis = (self.hop_analysis as f64 * stretch_ratio).round() as usize;
-        if ratio_delta >= RATIO_CHANGE_FOCUS_TRIGGER || continuity_delta >= RATIO_CHANGE_FOCUS_TRIGGER
+        if ratio_delta >= RATIO_CHANGE_FOCUS_TRIGGER
+            || continuity_delta >= RATIO_CHANGE_FOCUS_TRIGGER
         {
             // Fast automation can land another meaningful ratio step before the
             // previous continuity-focus window drains. Refresh the window so
@@ -3297,8 +3298,8 @@ mod tests {
     }
 
     #[test]
-    fn test_set_stretch_ratio_keeps_same_side_carried_expansion_seam_when_stepping_away_from_unity(
-    ) {
+    fn test_set_stretch_ratio_keeps_same_side_carried_expansion_seam_when_stepping_away_from_unity()
+    {
         let fft_size = 1024;
         let hop = 256;
         let sample_rate = 44100u32;
