@@ -169,10 +169,13 @@ impl TransientEventScheduler {
         }
 
         // Rejected low-dominant events should still hold through the currently
-        // overlapping callback footprint so the same physical onset is not
-        // re-evaluated as a fresh reset candidate on the next sub-hop pass.
+        // overlapping callback footprint plus almost one more overlap window so
+        // the same physical onset is not re-evaluated as a fresh upper-band
+        // reset right as the overlap tail drains through adjacent callbacks.
         let overlap_frames = self.fft_size.div_ceil(self.hop_size).saturating_sub(1).max(1);
-        overlap_frames.saturating_mul(modulation_overlap_windows.max(1))
+        overlap_frames
+            .saturating_mul(modulation_overlap_windows.max(1))
+            .saturating_add(overlap_frames.saturating_sub(1))
     }
 
     #[inline]
@@ -643,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_rejected_modulation_hold_cooldown_covers_overlap_without_full_reset_hold() {
+    fn scheduler_rejected_modulation_hold_cooldown_nearly_matches_full_reset_hold() {
         let fft = 1024usize;
         let hop = 256usize;
         let overlap_frames = fft.div_ceil(hop).saturating_sub(1);
@@ -657,12 +660,13 @@ mod tests {
 
         assert_eq!(
             rejected,
-            overlap_frames * MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS,
-            "rejected modulation-hold events should still hold through the overlapped callback footprint"
+            overlap_frames * MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS
+                + overlap_frames.saturating_sub(1),
+            "rejected modulation-hold events should hold through the overlap tail plus one more near-full window"
         );
         assert!(
             rejected < accepted,
-            "rejected low-dominant events should debounce overlap rescans without blocking as long as a real accepted reset"
+            "rejected low-dominant events should still unblock slightly sooner than a real accepted reset"
         );
     }
 
