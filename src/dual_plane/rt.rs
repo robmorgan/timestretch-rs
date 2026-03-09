@@ -29,6 +29,7 @@ const RATIO_MOTION_FREEZE_TRIGGER: f64 = 7.5e-4;
 const RATIO_MOTION_HISTORY_BLOCKS: usize = 4;
 const AUTO_PROFILE_NEAR_UNITY_PLATEAU_EPS: f64 = 0.005;
 const POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS: usize = 2;
+const UNITY_PLATEAU_EXTRA_PROFILE_HOLD_RATIO: f64 = 0.02;
 
 /// Lock-free snapshot mailbox shared between control producers and RT callback.
 ///
@@ -665,9 +666,17 @@ impl RtProcessor {
         }
 
         self.cancel_inflight_auto_profile_transition();
+        let settle_ratio_delta = (self.active_ratio - 1.0).abs();
+        let mut hold_blocks = POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS;
+        if settle_ratio_delta >= UNITY_PLATEAU_EXTRA_PROFILE_HOLD_RATIO {
+            // Larger settles back onto unity need a slightly longer profile
+            // hold so the deterministic seam can drain before auto mode starts
+            // rebuilding a fresh candidate.
+            hold_blocks = hold_blocks.saturating_add(1);
+        }
         self.post_ratio_motion_profile_hold_blocks_left = self
             .post_ratio_motion_profile_hold_blocks_left
-            .max(POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS);
+            .max(hold_blocks);
         self.policy_profile = self.current_profile;
         self.profile_candidate = self.current_profile;
         self.profile_candidate_streak = 0;
@@ -4236,6 +4245,48 @@ mod tests {
             telemetry.policy_profile,
             LatencyProfile::Scratch,
             "policy telemetry should resume scratch recommendations after the hold window ends"
+        );
+    }
+
+    #[test]
+    fn exact_unity_plateau_extends_profile_hold_after_larger_settle() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(48_000)
+            .with_channels(1)
+            .with_fft_size(64)
+            .with_hop_size(16);
+        let mut cfg = RtConfig::new(params, 128);
+        cfg.latency_profile = LatencyProfile::Render;
+        cfg.auto_profile_switching = true;
+        cfg.profile_switch_hysteresis_blocks = 1;
+        cfg.ratio_motion_freeze_blocks = 0;
+        let mut rt = RtProcessor::prepare(cfg).unwrap();
+
+        let input = [0.0f32; 128];
+        let mut output = [0.0f32; 256];
+        let input_refs = [&input[..]];
+        let scratch_hints = Arc::new(RenderHints {
+            transient_confidence: 0.90,
+            tonal_confidence: 0.10,
+            noise_confidence: 0.20,
+            ..RenderHints::default()
+        });
+
+        rt.active_ratio = 1.035;
+        rt.set_constant_ratio(1.0);
+        rt.set_hint_snapshot(scratch_hints);
+        let mut output_refs = [&mut output[..]];
+        let _ = rt.process(&input_refs, &mut output_refs);
+
+        assert_eq!(
+            rt.post_ratio_motion_profile_hold_blocks_left,
+            POST_RATIO_MOTION_PROFILE_HOLD_BLOCKS + 1,
+            "settling a larger fast-modulation step onto exact unity should hold auto-profile retargeting for one extra block"
+        );
+        assert_eq!(
+            rt.profile_telemetry().policy_profile,
+            LatencyProfile::Render,
+            "the extended unity-settle hold should keep policy telemetry parked on the committed render profile"
         );
     }
 
