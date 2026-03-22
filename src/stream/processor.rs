@@ -874,7 +874,7 @@ impl StreamProcessor {
                     // need less shelf (harmonic content is already well-preserved),
                     // while larger ratios need more to compensate for PV tilt.
                     let ratio_scale = (ratio_distance / 0.3).clamp(0.2, 1.0);
-                    (1.0 + 1.20 * gain_factor * ratio_scale) as f32
+                    (1.0 + 1.40 * gain_factor * ratio_scale) as f32
                 } else {
                     1.0f32
                 };
