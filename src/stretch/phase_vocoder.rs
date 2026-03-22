@@ -1192,11 +1192,11 @@ impl PhaseVocoder {
                         }
                     };
                     let dist_scale = if nearest_dist > 4 {
-                        1.0 + ((nearest_dist - 4) as f64 / 16.0).min(1.0)
+                        1.0 + ((nearest_dist - 4) as f64 / 12.0).min(2.0)
                     } else {
                         1.0
                     };
-                    let bin_if_blend = (if_blend * dist_scale).min(0.15);
+                    let bin_if_blend = (if_blend * dist_scale).min(0.18);
                     let locked = self.new_phases[bin] as f64;
                     let if_est = self.if_phases_backup[bin] as f64;
                     self.new_phases[bin] =
