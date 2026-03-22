@@ -1964,7 +1964,7 @@ impl StreamProcessor {
                 if self.output_energy_ema > 1e-12 && self.input_energy_ema > 1e-12 {
                     let target_gain = (self.input_energy_ema / self.output_energy_ema)
                         .sqrt()
-                        .min(2.5);
+                        .min(3.0);
                     self.energy_gain += GAIN_SMOOTH * (target_gain - self.energy_gain);
                 }
 
