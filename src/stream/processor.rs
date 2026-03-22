@@ -870,7 +870,11 @@ impl StreamProcessor {
                 // tilt. At low gain (harmonic near-unity), shelf is minimal.
                 let base_shelf = if self.energy_gain > 1.02 {
                     let gain_factor = ((self.energy_gain - 1.02) / 0.48).clamp(0.0, 1.0);
-                    (1.0 + 1.20 * gain_factor) as f32
+                    // Scale base shelf max by ratio distance: near-unity ratios
+                    // need less shelf (harmonic content is already well-preserved),
+                    // while larger ratios need more to compensate for PV tilt.
+                    let ratio_scale = (ratio_distance / 0.3).clamp(0.2, 1.0);
+                    (1.0 + 1.20 * gain_factor * ratio_scale) as f32
                 } else {
                     1.0f32
                 };
