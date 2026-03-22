@@ -1969,11 +1969,40 @@ impl StreamProcessor {
                 }
 
                 // Apply gain compensation to output buffers.
-                if (self.energy_gain - 1.0).abs() > 0.01 {
+                // At extreme stretch ratios, the PV naturally loses high-frequency
+                // energy due to phase modifications. Apply a ratio-dependent
+                // high-shelf boost to counteract centroid shift.
+                let ratio_distance = (self.current_ratio - 1.0).abs();
+                let shelf_amount = if ratio_distance > 0.4 {
+                    // Gentle high-shelf: up to 1.15x boost above crossover
+                    // Only at extreme ratios where centroid shift is significant
+                    (1.0 + 0.15 * ((ratio_distance - 0.4) / 0.6).min(1.0)) as f32
+                } else {
+                    1.0f32
+                };
+                let use_shelf = shelf_amount > 1.001;
+
+                if (self.energy_gain - 1.0).abs() > 0.01 || use_shelf {
                     let gain = self.energy_gain as f32;
-                    for ch in 0..num_channels {
-                        for s in self.channel_output_buffers[ch][..min_output_len].iter_mut() {
-                            *s *= gain;
+                    if use_shelf {
+                        // Simple first-order high-shelf via one-pole filter
+                        let lp_coeff = (2.0 * std::f64::consts::PI * 1000.0
+                            / self.params.sample_rate.max(1) as f64)
+                            .min(0.5) as f32;
+                        for ch in 0..num_channels {
+                            let mut lp_state = 0.0f32;
+                            for s in self.channel_output_buffers[ch][..min_output_len].iter_mut() {
+                                lp_state += lp_coeff * (*s - lp_state);
+                                let hp = *s - lp_state;
+                                // Boost high frequencies, keep lows at unity
+                                *s = (lp_state + hp * shelf_amount) * gain;
+                            }
+                        }
+                    } else {
+                        for ch in 0..num_channels {
+                            for s in self.channel_output_buffers[ch][..min_output_len].iter_mut() {
+                                *s *= gain;
+                            }
                         }
                     }
                 }
