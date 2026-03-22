@@ -1,43 +1,45 @@
 # Autoresearch Ideas: Streaming Quality
 
-## Current Score: 933.8/1000
+## Current Score: 944.9/1000
 
-## Achieved
-- ✅ Energy gain compensation — EMA-based input/output RMS tracking with smoothed gain factor (+354 points)
-- ✅ Disable adaptive phase locking in streaming — consistent ROI reduces phase discontinuities (+5.2 points)
-- ✅ Remove per-band energy compensation — tilt approach was regressing quality by ~7 points
-- ✅ Extend sub-bass rigid phase locking to 180Hz for streaming (+8.6 points, harmonic +35!)
-- ✅ GAIN_SMOOTH 0.30 (from 0.25) — marginal +0.2
-- ✅ Quadratic high-shelf filter (threshold 0.4, 80% max, 2000Hz crossover) — +3.1 points
-- ✅ Max energy gain 3.0 (from 2.5) — +0.4 points
+## Current Optimized Parameters
+- Sub-bass rigid phase locking: 180Hz (streaming-only)
+- Phase locking: ROI with adaptive disabled
+- Energy EMA: alpha=0.05, gain_smooth=0.30, max_gain=3.0
+- Base shelf: gain-proportional, max 120%, gain scale 0.45, crossover 2000Hz
+- Ratio shelf: quadratic (t²), threshold 0.4, max 80%, crossover 2000Hz
 
-## Remaining Score Breakdown
-### Weakest cases:
-- percussive 2.0x: composite=0.747 (freq=0.675, centroid=0.321, batch_sim=0.602)
-- percussive 1.5x: composite=0.895 (centroid=0.303, batch_sim=0.837)
-- edm 1.5x: composite=0.922 (centroid=0.240)
-- edm 1.02: composite=0.960 (centroid=0.615 — 19% shift at near-unity, measurement artifact?)
+## Remaining Score Breakdown (latest)
+- edm 1.02: 0.972 (centroid 0.732)
+- edm 1.5: 0.922 (centroid 0.240) ← BIGGEST remaining weakness for EDM
+- edm 2.0: 0.996 (near perfect!)
+- harmonic 1.02: 0.982 (centroid 0.924)
+- harmonic 1.5: 0.982 (centroid 0.934)
+- percussive 1.02: 0.966 (centroid 0.692)
+- percussive 1.5: 0.948 (centroid 0.885)
+- percussive 2.0: 0.792 (freq 0.686, batch_sim 0.584, energy 0.902)
 
 ### Theoretical max improvements:
-- centroid: +38 points (but mostly PV-fundamental)
-- batch_similarity: +17 points (WSOLA vs PV difference)
-- freq_preservation: +12 points (transient energy spreading)
+- percussive 2.0x to 0.90: +13.5 points
+- edm 1.5x to 0.96: +4.8 points
+- percussive 1.02 centroid: +3.9 points
 
-## High Impact (Remaining)
-- **WSOLA integration for transients in streaming** — Would fix percussive batch_similarity and freq_preservation. Complex.
-- **Signal-adaptive shelf** — Track high/low energy ratio to modulate shelf amount instead of pure ratio-based
-- **Add energy compensation to dual-plane path** — Default mode doesn't benefit from gain comp
+## Still Possible
+- **EDM 1.5x centroid fix**: The 24% centroid score is very low despite shelf. May need a fundamentally different approach for mid-ratio centroid.
+- **Percussive 2.0x batch_similarity**: Would need WSOLA integration in streaming
+- **Percussive 2.0x energy_score 0.902**: Shelf is over-boosting energy. Need shelf-aware gain or gentler shelf at 2.0x
 
-## Dead Ends
-- Mono transient phase resets (hurts harmonic quality)
-- Fast EMA warmup / pre-seeding (overshoots on percussive)
-- Per-band energy compensation with IIR tilt (-7 points)
-- BlackmanHarris analysis window (hurts EDM)
-- Persistent shelf filter state (contaminates across chunks)
-- Identity phase locking (ROI consistently better)
-- Envelope preservation toggle (zero effect)
-- Sub-bass 160Hz or 200Hz (180Hz optimal)
-- Cubic shelf curve (hurts EDM)
-- Shelf threshold 0.3 or 0.35 (0.4 optimal)
-- Shelf crossover 3000Hz (2000Hz optimal)
-- Max gain 3.5 (3.0 optimal)
+## Fully Explored (dead ends)
+- Sub-bass cutoff: 180Hz optimal (160, 200 worse)
+- Phase locking: ROI optimal (Identity, Selective worse)
+- EMA alpha: 0.05 optimal (0.04 same)
+- Gain smooth: 0.30 optimal
+- Max gain: 3.0 optimal (2.5 too low, 3.5 no help)
+- Window type: Hann optimal (BlackmanHarris hurts EDM)
+- Envelope preservation: zero effect
+- Per-band gain with IIR tilt: hurts quality
+- Persistent shelf state: hurts quality
+- Shelf crossover: 2000Hz optimal (1000, 1500, 3000 worse)
+- Shelf threshold: 0.4 optimal (0.3, 0.35 worse)
+- Base shelf fixed value: gain-proportional is better
+- EMA pre-seeding/fast warmup: hurts percussive

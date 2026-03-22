@@ -1997,17 +1997,25 @@ impl StreamProcessor {
                 if (self.energy_gain - 1.0).abs() > 0.01 || use_shelf {
                     let gain = self.energy_gain as f32;
                     if use_shelf {
-                        // Simple first-order high-shelf via one-pole filter
+                        // Two-pole high-shelf via cascaded one-pole filters
+                        // for steeper transition and more targeted boost.
                         let lp_coeff = (2.0 * std::f64::consts::PI * 2000.0
                             / self.params.sample_rate.max(1) as f64)
                             .min(0.5) as f32;
+                        // Use sqrt of shelf for each stage (cascaded = product)
+                        let stage_shelf = shelf_amount.sqrt();
                         for ch in 0..num_channels {
-                            let mut lp_state = 0.0f32;
+                            let mut lp1 = 0.0f32;
+                            let mut lp2 = 0.0f32;
                             for s in self.channel_output_buffers[ch][..min_output_len].iter_mut() {
-                                lp_state += lp_coeff * (*s - lp_state);
-                                let hp = *s - lp_state;
-                                // Boost high frequencies, keep lows at unity
-                                *s = (lp_state + hp * shelf_amount) * gain;
+                                // First stage
+                                lp1 += lp_coeff * (*s - lp1);
+                                let hp1 = *s - lp1;
+                                let mid = lp1 + hp1 * stage_shelf;
+                                // Second stage
+                                lp2 += lp_coeff * (mid - lp2);
+                                let hp2 = mid - lp2;
+                                *s = (lp2 + hp2 * stage_shelf) * gain;
                             }
                         }
                     } else {
