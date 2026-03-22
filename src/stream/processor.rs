@@ -840,7 +840,8 @@ impl StreamProcessor {
                     params.envelope_preservation,
                     params.envelope_order,
                 );
-                pv.set_adaptive_phase_locking(params.adaptive_phase_locking);
+                // Disable adaptive phase locking to use the configured mode consistently.
+                pv.set_adaptive_phase_locking(false);
                 pv.set_envelope_strength(params.envelope_strength);
                 pv.set_adaptive_envelope_order(params.adaptive_envelope_order);
                 pv
