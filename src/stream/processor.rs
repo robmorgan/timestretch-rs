@@ -409,8 +409,6 @@ pub struct StreamProcessor {
     energy_gain: f64,
     /// Count of gain compensation calls for warmup tracking.
     gain_call_count: usize,
-    /// Reusable scratch buffer for time-domain resampled input.
-    resample_scratch: Vec<f32>,
 }
 
 impl std::fmt::Debug for StreamProcessor {
@@ -493,7 +491,6 @@ impl StreamProcessor {
             output_energy_ema: 0.0,
             energy_gain: 1.0,
             gain_call_count: 0,
-            resample_scratch: Vec::with_capacity(output_capacity_frames),
         }
     }
 
@@ -1801,7 +1798,6 @@ impl StreamProcessor {
         self.output_energy_ema = 0.0;
         self.energy_gain = 1.0;
         self.gain_call_count = 0;
-        self.resample_scratch.clear();
     }
 
     fn update_vocoder_ratio(&mut self) {
