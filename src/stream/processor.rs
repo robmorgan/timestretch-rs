@@ -409,6 +409,8 @@ pub struct StreamProcessor {
     energy_gain: f64,
     /// Count of gain compensation calls for warmup tracking.
     gain_call_count: usize,
+    /// Reusable scratch buffer for time-domain resampled input.
+    resample_scratch: Vec<f32>,
 }
 
 impl std::fmt::Debug for StreamProcessor {
@@ -491,6 +493,7 @@ impl StreamProcessor {
             output_energy_ema: 0.0,
             energy_gain: 1.0,
             gain_call_count: 0,
+            resample_scratch: Vec::with_capacity(output_capacity_frames),
         }
     }
 
@@ -922,6 +925,33 @@ impl StreamProcessor {
                                 *s *= gain;
                             }
                         }
+                    }
+                }
+            }
+
+            // Time-domain blend: mix a small fraction of linearly-resampled
+            // input into the PV output. Linear resampling preserves transient
+            // shape (at the cost of aliasing), partially restoring kick impact.
+            // Only active at extreme ratios where transient smearing is worst.
+            if (self.current_ratio - 1.0).abs() > 0.5 {
+                let blend = 0.05f32; // 5% time-domain blend
+                let ratio = self.current_ratio;
+                for ch in 0..num_channels {
+                    let in_buf = &self.channel_input_buffers[ch];
+                    let out_buf = &mut self.channel_output_buffers[ch][..min_output_len];
+                    let in_len = in_buf.len();
+                    if in_len < 2 {
+                        continue;
+                    }
+                    for i in 0..min_output_len {
+                        let in_pos = i as f64 / ratio;
+                        let idx = in_pos as usize;
+                        if idx + 1 >= in_len {
+                            break;
+                        }
+                        let frac = (in_pos - idx as f64) as f32;
+                        let interp = in_buf[idx] * (1.0 - frac) + in_buf[idx + 1] * frac;
+                        out_buf[i] = out_buf[i] * (1.0 - blend) + interp * blend;
                     }
                 }
             }
@@ -1755,6 +1785,7 @@ impl StreamProcessor {
         self.output_energy_ema = 0.0;
         self.energy_gain = 1.0;
         self.gain_call_count = 0;
+        self.resample_scratch.clear();
     }
 
     fn update_vocoder_ratio(&mut self) {
