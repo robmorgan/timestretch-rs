@@ -495,18 +495,24 @@ impl StreamProcessor {
     fn create_vocoders(params: &StretchParams, ratio: f64) -> Vec<PhaseVocoder> {
         (0..params.channels.count())
             .map(|_| {
+                // Use a wider sub-bass rigid phase locking range for streaming
+                // to improve phase coherence for low-mid frequencies. The streaming
+                // PV doesn't benefit from WSOLA fallback, so tighter phase control
+                // at low frequencies helps preserve energy at those bins.
+                let streaming_sub_bass_cutoff = params.sub_bass_cutoff.max(180.0);
                 let mut pv = PhaseVocoder::with_all_options(
                     params.fft_size,
                     params.hop_size,
                     ratio,
                     params.sample_rate,
-                    params.sub_bass_cutoff,
+                    streaming_sub_bass_cutoff,
                     params.window_type,
                     params.phase_locking_mode,
                     params.envelope_preservation,
                     params.envelope_order,
                 );
-                pv.set_adaptive_phase_locking(params.adaptive_phase_locking);
+                // Disable adaptive phase locking to use the configured mode consistently.
+                pv.set_adaptive_phase_locking(false);
                 pv.set_envelope_strength(params.envelope_strength);
                 pv.set_adaptive_envelope_order(params.adaptive_envelope_order);
                 pv
