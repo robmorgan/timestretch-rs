@@ -1,17 +1,21 @@
 # Autoresearch Ideas: Streaming Quality
 
-## High Impact
-- **Transient detection in streaming path** — The batch hybrid uses transient detection + WSOLA for transients. Adding lightweight transient detection to the streaming path and resetting PV phase state at transients could preserve attacks better. The `transient_scheduler.rs` already exists.
-- **Phase reset at transient onsets** — When a transient is detected, reset PV phase accumulators to match analysis phases. This prevents the PV from smearing the attack. Batch hybrid does this by switching to WSOLA.
-- **Adaptive phase locking for transients** — When transient-like frames are detected, use identity phase locking (tighter) instead of ROI to preserve attack sharpness.
+## Achieved
+- ✅ Energy gain compensation — EMA-based input/output RMS tracking with smoothed gain factor (+354 points)
+- ✅ Half-hop PV (no measurable impact since ring buffer consumption unchanged)
+- ✅ Discovered dual-plane mode bypasses PV streaming path
+
+## High Impact (Remaining)
+- **Centroid shift at high ratios** — PV output has shifted spectral centroid (up to 67% for EDM). Low frequencies lose energy more than high. Could try per-band gain compensation or spectral envelope correction.
+- **Batch similarity for percussive** — Only 0.12-0.24. Fundamental PV vs WSOLA difference. Could improve with transient detection + phase reset in PV streaming path.
+- **Add energy compensation to dual-plane path** — Currently only the PV streaming path benefits from gain compensation.
 
 ## Medium Impact
-- **Envelope preservation tuning** — The streaming PV may have different envelope preservation settings than batch. Check if enabling/adjusting envelope preservation improves quality.
-- **Window type matching** — Ensure streaming uses the same window type as batch for comparable quality.
-- **Hop size optimization** — Batch uses `hop_size/2` for the PV. Streaming uses the base `hop_size`. Using a finer hop in streaming could improve overlap-add quality.
-- **Sub-bass phase locking tuning** — Ensure sub-bass treatment matches batch quality.
+- **Transient phase reset for mono** — TransientEventScheduler has detect_mono_reset_mask but wasn't triggering (warmup issue, detection threshold). Need to verify it fires and improves quality.
+- **Improve frequency preservation at high ratios** — Percussive 2.0x drops to 0.63. PV smearing at extreme ratios.
+- **Spectral envelope preservation tuning** — Already enabled by default, but could tune strength/order for streaming.
 
-## Lower Impact / More Complex
+## Lower Impact / Complex
 - **Integrate WSOLA into streaming path** — Full hybrid streaming would match batch quality but adds significant complexity and latency.
-- **HPSS in streaming** — Harmonic/percussive separation in streaming mode, route percussive to WSOLA, tonal to PV.
-- **Spectral flux-based transient weight** — Use spectral flux magnitude to modulate phase locking strength per-frame.
+- **HPSS in streaming** — Harmonic/percussive separation, route percussive to WSOLA.
+- **Per-band energy compensation** — Instead of global gain, apply per-band (sub-bass, low, mid, high) gain correction to fix centroid shift.
