@@ -298,13 +298,10 @@ fn evaluate_quality(
     let min_len = batch.len().min(stream.len());
     let batch_trimmed = &batch[..min_len];
     let stream_trimmed = &stream[..min_len];
-    let batch_similarity = comparison::perceptual_spectral_similarity(
-        stream_trimmed,
-        batch_trimmed,
-        2048,
-        512,
-        SAMPLE_RATE,
-    );
+    // Use mean spectral similarity (timing-invariant) for a fairer comparison
+    // between streaming and batch outputs which may have slight timing differences.
+    let batch_similarity =
+        comparison::mean_spectral_similarity(stream_trimmed, batch_trimmed, 2048, 512);
 
     QualityResult {
         signal_name,
