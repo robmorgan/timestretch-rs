@@ -1976,7 +1976,7 @@ impl StreamProcessor {
                 let shelf_amount = if ratio_distance > 0.4 {
                     // Gentle high-shelf: up to 1.15x boost above crossover
                     // Only at extreme ratios where centroid shift is significant
-                    (1.0 + 0.40 * ((ratio_distance - 0.4) / 0.6).min(1.0)) as f32
+                    (1.0 + 0.50 * ((ratio_distance - 0.4) / 0.6).min(1.0)) as f32
                 } else {
                     1.0f32
                 };
