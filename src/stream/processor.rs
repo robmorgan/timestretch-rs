@@ -1973,15 +1973,21 @@ impl StreamProcessor {
                 // energy due to phase modifications. Apply a ratio-dependent
                 // high-shelf boost to counteract centroid shift.
                 let ratio_distance = (self.current_ratio - 1.0).abs();
-                let shelf_amount = if ratio_distance > 0.4 {
-                    // Ratio-dependent high-shelf to counteract centroid shift.
-                    // Use a quadratic curve for steeper onset — less effect at
-                    // moderate ratios (1.5x), stronger at extreme (2x+).
+                // Two-tier shelf: base correction for inherent PV spectral
+                // tilt (always active when gain compensation is active), plus
+                // ratio-dependent boost for centroid shift at extreme ratios.
+                let base_shelf = if self.energy_gain > 1.05 {
+                    1.03f32
+                } else {
+                    1.0f32
+                };
+                let ratio_shelf = if ratio_distance > 0.4 {
                     let t = ((ratio_distance - 0.4) / 0.6).min(1.0);
                     (1.0 + 0.80 * t * t) as f32
                 } else {
                     1.0f32
                 };
+                let shelf_amount = base_shelf * ratio_shelf;
                 let use_shelf = shelf_amount > 1.001;
 
                 if (self.energy_gain - 1.0).abs() > 0.01 || use_shelf {
