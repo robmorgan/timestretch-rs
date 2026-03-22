@@ -1960,7 +1960,7 @@ impl StreamProcessor {
                     ENERGY_EMA_ALPHA * (output_energy - self.output_energy_ema);
 
                 // Compute global gain to match input energy.
-                const GAIN_SMOOTH: f64 = 0.25;
+                const GAIN_SMOOTH: f64 = 0.30;
                 if self.output_energy_ema > 1e-12 && self.input_energy_ema > 1e-12 {
                     let target_gain = (self.input_energy_ema / self.output_energy_ema)
                         .sqrt()
