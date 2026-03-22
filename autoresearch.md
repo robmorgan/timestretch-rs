@@ -54,5 +54,9 @@ Improve the audio quality of the streaming time-stretch algorithm (`StreamProces
 ### Key Insights
 - Streaming PV energy loss is from phase modification destructive interference, NOT normalization bugs
 - Dual-plane mode is default and bypasses `process_available_to_pending` entirely
-- Batch uses WSOLA for transients which fundamentally differs from PV — percussive batch similarity is limited to ~0.12-0.24
-- PV PRESERVES high frequencies better than batch/WSOLA — centroid comparison should use batch as reference
+- Batch uses WSOLA for transients which fundamentally differs from PV — percussive batch similarity is limited
+- PV PRESERVES high frequencies better than batch/WSOLA — centroid comparison should use input as reference
+- Adaptive phase locking mode switching hurts streaming quality (causes phase discontinuities)
+- ROI phase locking is best for streaming (Identity slightly worse, Selective worse)
+- Envelope preservation has no measurable impact on time-stretch quality (mainly helps pitch shift)
+- Current score: 908.7/1000 — remaining gap is fundamental PV limitations at extreme ratios
