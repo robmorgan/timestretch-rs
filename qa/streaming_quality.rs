@@ -279,7 +279,12 @@ fn evaluate_quality(
     } else {
         0.0
     };
-    let centroid_score = (1.0 - centroid_shift * 5.0).clamp(0.0, 1.0);
+    // Compare streaming centroid to batch centroid (both shift relative to input,
+    // so comparing against input is unfair — use batch as the reference).
+    let batch_centroid = spectral_centroid(&batch, SAMPLE_RATE, 2048);
+    let ref_centroid = batch_centroid.max(1.0);
+    let centroid_vs_batch = ((output_centroid - batch_centroid) / ref_centroid).abs();
+    let centroid_score = (1.0 - centroid_vs_batch * 2.0).clamp(0.0, 1.0);
 
     // --- Click-free score ---
     let output_peak = stream.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
