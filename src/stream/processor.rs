@@ -1928,7 +1928,7 @@ impl StreamProcessor {
                 .map(|&s| (s as f64) * (s as f64))
                 .sum::<f64>()
                 / self.channel_input_buffers[0].len().max(1) as f64;
-            const ENERGY_EMA_ALPHA: f64 = 0.15;
+            const ENERGY_EMA_ALPHA: f64 = 0.05;
             self.input_energy_ema += ENERGY_EMA_ALPHA * (input_energy - self.input_energy_ema);
         }
 
@@ -1948,7 +1948,7 @@ impl StreamProcessor {
                     .map(|&s| (s as f64) * (s as f64))
                     .sum::<f64>()
                     / min_output_len.max(1) as f64;
-                const ENERGY_EMA_ALPHA: f64 = 0.15;
+                const ENERGY_EMA_ALPHA: f64 = 0.05;
                 self.output_energy_ema +=
                     ENERGY_EMA_ALPHA * (output_energy - self.output_energy_ema);
 
@@ -1958,7 +1958,7 @@ impl StreamProcessor {
                         .sqrt()
                         .min(6.0);
                     // Smooth gain changes to avoid clicks.
-                    const GAIN_SMOOTH: f64 = 0.08;
+                    const GAIN_SMOOTH: f64 = 0.25;
                     self.energy_gain += GAIN_SMOOTH * (target_gain - self.energy_gain);
                 }
 
