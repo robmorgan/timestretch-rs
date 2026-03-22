@@ -663,6 +663,12 @@ pub struct StreamProcessor {
     expected_total_output_samples: f64,
     /// Total output samples emitted to the caller for the current stream.
     total_output_emitted_samples: usize,
+    /// Running estimate of input energy (EMA of per-frame RMS²).
+    input_energy_ema: f64,
+    /// Running estimate of output energy (EMA of per-frame RMS²).
+    output_energy_ema: f64,
+    /// Smoothed gain compensation factor applied to output to preserve input energy.
+    energy_gain: f64,
     /// Realtime pitch scale applied in stream mode.
     pitch_scale: f64,
     /// Stateful per-channel resamplers for realtime pitch control.
@@ -778,6 +784,9 @@ impl StreamProcessor {
             input_frames_consumed_total: 0,
             expected_total_output_samples: 0.0,
             total_output_emitted_samples: 0,
+            input_energy_ema: 0.0,
+            output_energy_ema: 0.0,
+            energy_gain: 1.0,
             pitch_scale: 1.0,
             pitch_resamplers: (0..num_channels)
                 .map(|_| LinearResamplerState::new())
@@ -823,17 +832,12 @@ impl StreamProcessor {
     }
 
     /// Creates PhaseVocoder instances for each channel.
-    ///
-    /// Uses a finer analysis hop (half the configured hop_size) to match
-    /// batch hybrid quality. More overlapping analysis windows improve
-    /// window-sum smoothness and reduce spectral distortion.
     fn create_vocoders(params: &StretchParams, ratio: f64) -> Vec<PhaseVocoder> {
-        let pv_hop = params.hop_size / 2;
         (0..params.channels.count())
             .map(|_| {
                 let mut pv = PhaseVocoder::with_all_options(
                     params.fft_size,
-                    pv_hop,
+                    params.hop_size,
                     ratio,
                     params.sample_rate,
                     params.sub_bass_cutoff,
@@ -1922,6 +1926,17 @@ impl StreamProcessor {
             self.apply_transient_scheduled_phase_reset(total_frames);
         }
 
+        // Track input energy for gain compensation.
+        {
+            let input_energy = self.channel_input_buffers[0]
+                .iter()
+                .map(|&s| (s as f64) * (s as f64))
+                .sum::<f64>()
+                / self.channel_input_buffers[0].len().max(1) as f64;
+            const ENERGY_EMA_ALPHA: f64 = 0.1;
+            self.input_energy_ema += ENERGY_EMA_ALPHA * (input_energy - self.input_energy_ema);
+        }
+
         let min_output_len = self.process_channels(num_channels)?;
         let consumed_frames = self.consume_processed_input(total_frames, num_channels);
         self.input_frames_consumed_total = self
@@ -1930,6 +1945,39 @@ impl StreamProcessor {
 
         if min_output_len > 0 {
             self.decode_output_mid_side(num_channels, min_output_len);
+
+            // Track output energy and compute gain compensation.
+            {
+                let output_energy = self.channel_output_buffers[0][..min_output_len]
+                    .iter()
+                    .map(|&s| (s as f64) * (s as f64))
+                    .sum::<f64>()
+                    / min_output_len.max(1) as f64;
+                const ENERGY_EMA_ALPHA: f64 = 0.1;
+                self.output_energy_ema +=
+                    ENERGY_EMA_ALPHA * (output_energy - self.output_energy_ema);
+
+                // Compute gain to match input energy.
+                if self.output_energy_ema > 1e-12 && self.input_energy_ema > 1e-12 {
+                    let target_gain = (self.input_energy_ema / self.output_energy_ema)
+                        .sqrt()
+                        .min(4.0);
+                    // Smooth gain changes to avoid clicks.
+                    const GAIN_SMOOTH: f64 = 0.05;
+                    self.energy_gain += GAIN_SMOOTH * (target_gain - self.energy_gain);
+                }
+
+                // Apply gain compensation to output buffers.
+                if (self.energy_gain - 1.0).abs() > 0.01 {
+                    let gain = self.energy_gain as f32;
+                    for ch in 0..num_channels {
+                        for s in self.channel_output_buffers[ch][..min_output_len].iter_mut() {
+                            *s *= gain;
+                        }
+                    }
+                }
+            }
+
             self.emit_channel_output_to_pending(min_output_len, num_channels)?;
         }
 
@@ -2684,6 +2732,9 @@ impl StreamProcessor {
         self.initialized = false;
         self.transient_scheduler.reset();
         self.input_frames_consumed_total = 0;
+        self.input_energy_ema = 0.0;
+        self.output_energy_ema = 0.0;
+        self.energy_gain = 1.0;
 
         self.vocoders = Self::create_vocoders(&self.params, self.params.stretch_ratio);
         self.vocoder_hop = self.params.hop_size / 2;
