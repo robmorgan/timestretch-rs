@@ -1482,12 +1482,27 @@ impl PhaseVocoder {
                     }
                 };
 
+                // Attenuate gradient blend for bins far from their anchor peak.
+                // Distant bins have less acoustic relationship to the peak,
+                // so independent phase evolution is more appropriate.
+                let peak_distance = if bin > nearest_peak {
+                    bin - nearest_peak
+                } else {
+                    nearest_peak - bin
+                };
+                let distance_fade = if peak_distance > 8 {
+                    (1.0 - ((peak_distance - 8) as f64 / 24.0).min(1.0)).max(0.0)
+                } else {
+                    1.0
+                };
+                let effective_blend = gradient_blend * distance_fade;
+
                 let gradient =
                     self.analysis_phases[bin] as f64 - self.analysis_phases[nearest_peak] as f64;
                 let propagated = self.new_phases[nearest_peak] as f64 + gradient;
                 let independent = self.new_phases[bin] as f64;
                 self.new_phases[bin] =
-                    ((1.0 - gradient_blend) * independent + gradient_blend * propagated) as f32;
+                    ((1.0 - effective_blend) * independent + effective_blend * propagated) as f32;
             }
         }
     }
