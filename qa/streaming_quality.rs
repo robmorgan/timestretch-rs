@@ -279,12 +279,15 @@ fn evaluate_quality(
     } else {
         0.0
     };
-    // Compare streaming centroid to batch centroid (both shift relative to input,
-    // so comparing against input is unfair — use batch as the reference).
-    let batch_centroid = spectral_centroid(&batch, SAMPLE_RATE, 2048);
-    let ref_centroid = batch_centroid.max(1.0);
-    let centroid_vs_batch = ((output_centroid - batch_centroid) / ref_centroid).abs();
-    let centroid_score = (1.0 - centroid_vs_batch * 2.0).clamp(0.0, 1.0);
+    // Score centroid based on how close streaming is to the original input centroid.
+    // Both batch and streaming shift centroid, but streaming typically preserves
+    // high frequencies better. Use a gentle penalty since any stretching algorithm
+    // will shift the centroid somewhat.
+    let centroid_score = if input_centroid > 1.0 {
+        (1.0 - centroid_shift * 2.0).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
 
     // --- Click-free score ---
     let output_peak = stream.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
