@@ -3,10 +3,7 @@
 //! Run with: cargo test --features qa-harnesses --release --test streaming_quality -- --nocapture
 
 use std::f32::consts::PI;
-use timestretch::{
-    analysis::comparison,
-    stretch, EdmPreset, StreamProcessor, StretchParams,
-};
+use timestretch::{analysis::comparison, stretch, EdmPreset, StreamProcessor, StretchParams};
 
 const SAMPLE_RATE: u32 = 44_100;
 const TWO_PI: f32 = 2.0 * PI;
@@ -166,22 +163,33 @@ fn evaluate_quality(
     let fft_size = 2048;
     let hop_size = 512;
 
-    let spectral_sim = comparison::spectral_similarity(stream_trimmed, batch_trimmed, fft_size, hop_size);
+    let spectral_sim =
+        comparison::spectral_similarity(stream_trimmed, batch_trimmed, fft_size, hop_size);
     let perceptual_sim = comparison::perceptual_spectral_similarity(
-        stream_trimmed, batch_trimmed, fft_size, hop_size, SAMPLE_RATE,
+        stream_trimmed,
+        batch_trimmed,
+        fft_size,
+        hop_size,
+        SAMPLE_RATE,
     );
     let xcorr = comparison::cross_correlation(
         &stream_trimmed[..min_len.min(SAMPLE_RATE as usize * 5)],
         &batch_trimmed[..min_len.min(SAMPLE_RATE as usize * 5)],
     );
-    let flux_sim = comparison::spectral_flux_similarity(stream_trimmed, batch_trimmed, fft_size, hop_size);
+    let flux_sim =
+        comparison::spectral_flux_similarity(stream_trimmed, batch_trimmed, fft_size, hop_size);
 
     let batch_rms = rms(batch_trimmed);
     let stream_rms = rms(stream_trimmed);
-    let rms_ratio = if batch_rms > 1e-9 { stream_rms / batch_rms } else { 1.0 };
+    let rms_ratio = if batch_rms > 1e-9 {
+        stream_rms / batch_rms
+    } else {
+        1.0
+    };
 
     let expected_len = (input.len() as f64 * ratio).round() as usize;
-    let length_error_pct = ((stream.len() as f64 - expected_len as f64) / expected_len as f64 * 100.0).abs();
+    let length_error_pct =
+        ((stream.len() as f64 - expected_len as f64) / expected_len as f64 * 100.0).abs();
 
     QualityResult {
         signal_name,
