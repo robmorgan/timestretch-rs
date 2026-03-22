@@ -47,48 +47,10 @@
 //! processor.flush_into(&mut remaining).unwrap();
 //! ```
 //!
-//! For fixed host callback buffers, deterministic mode also exposes
-//! interleaved process/flush methods that never depend on `Vec` append
-//! semantics. Use the budget helpers to size those buffers from the public
-//! contract instead of relying on hardcoded guesses:
-//!
-//! ```no_run
-//! use timestretch::{EdmPreset, StreamProcessor, StretchParams};
-//!
-//! let params = StretchParams::new(1.02)
-//!     .with_preset(EdmPreset::DjBeatmatch)
-//!     .with_sample_rate(44_100)
-//!     .with_channels(2);
-//! let mut processor = StreamProcessor::new(params);
-//!
-//! let input_chunk = vec![0.0f32; 256 * 2];
-//! let callback_capacity = processor
-//!     .max_next_process_interleaved_output_samples(input_chunk.len())
-//!     .unwrap();
-//! let mut callback_output = vec![0.0f32; callback_capacity];
-//! let written = processor
-//!     .process_interleaved_into(&input_chunk, &mut callback_output)
-//!     .unwrap();
-//! let _host_frames = &callback_output[..written];
-//!
-//! let flush_capacity = processor
-//!     .max_flush_interleaved_output_samples()
-//!     .unwrap();
-//! if flush_capacity > callback_output.len() {
-//!     callback_output.resize(flush_capacity, 0.0);
-//! }
-//! let flushed = processor
-//!     .flush_interleaved_into(&mut callback_output)
-//!     .unwrap();
-//! let _tail_chunk = &callback_output[..flushed];
-//! assert_eq!(processor.max_flush_interleaved_output_samples().unwrap(), 0);
-//! ```
-
 use rustfft::{num_complex::Complex, FftPlanner};
 
 pub mod analysis;
 pub mod core;
-pub mod dual_plane;
 pub mod error;
 pub mod io;
 pub mod stream;
@@ -102,10 +64,6 @@ pub use core::types::{
     Sample, StretchParams, TransientThresholdPolicy,
 };
 pub use core::window::WindowType;
-pub use dual_plane::{
-    DualPlaneProcessor, LatencyProfile, QualityTier, RenderHints, RtConfig, RtControlSender,
-    RtDelayTelemetry, RtProcessor, RtProfileTelemetry, RtRuntimeTelemetry, TimeWarpMap, WarpAnchor,
-};
 pub use error::StretchError;
 pub use stream::{StreamProcessor, TransientResetStats};
 pub use stretch::phase_locking::PhaseLockingMode;

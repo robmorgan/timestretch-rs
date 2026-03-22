@@ -130,16 +130,16 @@ Notes:
 - [x] Reduce remaining transient timing deltas on `tone_stack` cases (especially 0.50x and 4.00x) in `quality_report.csv`.
 - [x] Tighten high-band leakage in vocal envelope mode (`delta_unexpected_energy_vocal_minus_off`).
 
-## Phase D - Dual-Plane Migration Completion (Open)
+## Phase D - Streaming Runtime Cleanup (Open)
 
-### D1. Make Dual-Plane Deterministic the Default Runtime
-- [x] Route deterministic streaming through `DualPlaneProcessor` by default (remove opt-in toggle requirement).
-- [x] Remove legacy hybrid rerender path.
-- [x] Keep behavior-compatible fallback for unsupported deterministic features until parity is complete.
+### D1. Consolidate on the Plain Streaming Runtime
+- [x] Remove the dual-plane deterministic runtime and its public API.
+- [x] Keep `StreamProcessor` as the single supported realtime path.
+- [ ] Revisit any remaining historical planning text that assumes dual-plane still exists.
 
 Acceptance:
-- New `StreamProcessor` instances use dual-plane deterministic backend without calling `set_dual_plane_deterministic(true)`.
-- Existing callers can still explicitly select legacy rerender mode.
+- `StreamProcessor` is the only supported realtime runtime surface.
+- No public docs or tests require dual-plane-specific configuration.
 
 ### D2. Complete Callback/Control Decoupling
 - [x] Replace callback-time `Mutex<Receiver<...>>` snapshot polling with lock-free snapshot handoff (RCU-style latest-value read).

@@ -87,8 +87,6 @@ fn generate_percussive_signal(sample_rate: u32, duration_secs: f32) -> Vec<f32> 
 fn stream_stretch(input: &[f32], params: StretchParams, chunk_size: usize) -> Vec<f32> {
     let ratio = params.stretch_ratio;
     let mut processor = StreamProcessor::new(params);
-    // Disable dual-plane deterministic mode to test the PV streaming path directly.
-    processor.set_dual_plane_deterministic(false).unwrap();
     let estimated_output = (input.len() as f64 * ratio * 1.5) as usize + 65536;
     let mut output = Vec::with_capacity(estimated_output);
     for chunk in input.chunks(chunk_size) {

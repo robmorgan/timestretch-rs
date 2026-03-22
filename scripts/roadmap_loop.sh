@@ -9,7 +9,7 @@ ROADMAP_PATH="$REPO_ROOT/ROADMAP.md"
 MODEL="${MODEL:-gpt-5.4}"
 ITERATIONS="${ITERATIONS:-5}"
 STATE_DIR_INPUT="${STATE_DIR:-.codex-loop}"
-TEST_CMD="${TEST_CMD:-cargo test --test dual_plane_rt --test realtime_allocations --test realtime_dj_conditions}"
+TEST_CMD="${TEST_CMD:-cargo test --test realtime_allocations --test realtime_dj_conditions}"
 SMOKE_CMD="$TEST_CMD"
 PROMPT_SCOPE="full"
 FAILURE_POLICY="stop"
@@ -703,7 +703,7 @@ Requirements:
 - If the active stage is Stage 1, do not spend the iteration on coverage-only, test-only, or refactor-only work.
 - For Stage 1, the slice must include a runtime behavior change intended to reduce the fast-modulation artifact, not just more instrumentation or guards around it.
 - For Stage 1, only add tests or QA coverage when they are directly paired with the runtime fix in the same slice.
-- For Stage 1, prefer work that reruns quality_gate_dual_plane_fast_modulation_artifacts after the change or materially increases the chance that gate will improve on the next iteration.
+- For Stage 1, prefer work that reruns the most relevant streaming-quality gate after the change or materially increases the chance that gate will improve on the next iteration.
 - End with a Commit message: line containing a single git subject that states what actually changed.
 - Then include a concise summary of files changed, checks run, and remaining risk.
 
@@ -777,7 +777,7 @@ stage_test_commands_auto() {
     case "$stage_number" in
         1)
             cat <<'EOF'
-cargo test --features qa-harnesses --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture
+cargo test --features qa-harnesses --release --test streaming_quality -- --nocapture
 EOF
             ;;
         2)

@@ -42,29 +42,26 @@ artifacts, improvements elsewhere will not matter.
 
 ### Primary Files
 
-- `src/dual_plane/rt.rs`
 - `src/stream/processor.rs`
 - `src/stream/transient_scheduler.rs`
 - `src/stretch/phase_vocoder.rs`
-- `qa/quality_gates.rs`
+- `qa/streaming_quality.rs`
 
 ### Work
 
-- Fix ratio-transition continuity in the dual-plane deterministic path.
-- Reduce profile-switch churn and improve hysteresis for automation-heavy use.
+- Fix ratio-transition continuity in the streaming path.
 - Tighten transient reset scheduling so fast modulation does not over-trigger
   phase resets.
 - Review how phase state is preserved or reseeded during rapid ratio changes.
-- Add additional focused tests around repeated short-interval modulation, not
-  just the existing one gate.
+- Add focused tests around short-interval modulation and callback boundaries.
 
 ### Exit Criteria
 
-- `cargo test --features qa-harnesses --release --test quality_gates quality_gate_dual_plane_fast_modulation_artifacts -- --nocapture`
+- `cargo test --features qa-harnesses --release --test streaming_quality -- --nocapture`
   passes with margin, not barely.
 - Release-mode modulation no longer produces obvious clicks, roughness, or
   discontinuities on synthetic DJ-like material.
-- Fixes do not regress steady-state deterministic streaming quality.
+- Fixes do not regress steady-state streaming quality.
 
 ## [ ] Stage 2: Replace Binary Segment Routing with Confidence-Based Blending
 
@@ -116,7 +113,6 @@ confidence estimates.
 - `src/analysis/transient.rs`
 - `src/analysis/adaptive_snapshot.rs`
 - `src/analysis/beat.rs`
-- `src/dual_plane/analysis_plane.rs`
 
 ### Work
 

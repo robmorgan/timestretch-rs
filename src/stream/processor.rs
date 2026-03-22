@@ -1,14 +1,12 @@
 //! Real-time streaming time-stretch processor.
 
+use crate::analysis::transient::{detect_transients_with_options, TransientDetectionOptions};
 use crate::core::ring_buffer::RingBuffer;
 use crate::core::types::{QualityMode, StretchParams};
 use crate::core::window::WindowType;
-use crate::dual_plane::{
-    DualPlaneProcessor, LatencyProfile, RtConfig, RtDelayTelemetry, RtProfileTelemetry,
-    RtRuntimeTelemetry,
-};
 use crate::error::StretchError;
 use crate::stream::transient_scheduler::{TransientEventScheduler, TransientSchedulerStats};
+use crate::stretch::hybrid::HybridStretcher;
 use crate::stretch::phase_vocoder::PhaseVocoder;
 use crate::stretch::stereo::StereoMode;
 
@@ -19,53 +17,6 @@ const RATIO_SNAP_THRESHOLD: f64 = 0.0001;
 /// Smoothing is time-based (not callback-based), so behavior stays stable
 /// across 64/128/256/1024 frame callbacks.
 const RATIO_SMOOTHING_TIME_SECS: f64 = 0.050;
-/// Additional slew applied after kernel-window averaging for deterministic dual-plane updates.
-const DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS: f64 = 0.040;
-/// Shorter apply slew for the first three callbacks of a freshly-reset modulation window.
-const DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_TIME_SECS: f64 = 0.015;
-/// Requested/applied ratio lag that keeps deterministic burst smoothing active.
-///
-/// Fast modulation can keep the applied ratio one or two callbacks behind the
-/// requested burst even after the history window is no longer "fresh". Keep the
-/// shorter apply slew alive while that lag is still material so transitions do
-/// not relax back into the slower steady-state ramp mid-burst.
-const DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_LAG_EPS: f64 = 0.006;
-/// Near-unity request band that resets deterministic ratio averaging history.
-///
-/// Fast modulation often crosses unity without landing on an exact 1.0 callback.
-/// Treat a small plateau around unity as a fresh boundary so the next burst does
-/// not average against stale opposite-side history.
-const DUAL_PLANE_RATIO_HISTORY_UNITY_RESET_EPS: f64 = 0.005;
-/// Requested-ratio delta required before same-side trend reversals reset averaging.
-///
-/// Short automation bursts can pivot before crossing unity. Resetting the
-/// deterministic averaging window on a material turnaround keeps the next burst
-/// from being smeared by stale pre-turnaround ratios.
-const DUAL_PLANE_RATIO_HISTORY_DIRECTION_RESET_EPS: f64 = 0.003;
-/// Short seam ramp used when deterministic rendering exits exact-unity bypass.
-const DUAL_PLANE_UNITY_EXIT_SEAM_FRAMES: usize = 64;
-/// Maximum seam ramp when large post-unity ratio jumps need extra continuity.
-const DUAL_PLANE_UNITY_EXIT_SEAM_MAX_FRAMES: usize = 128;
-/// Ratio-jump range that scales the unity-exit seam from base to max length.
-const DUAL_PLANE_UNITY_EXIT_SEAM_RATIO_RANGE: f64 = 0.08;
-/// Extra seam frames applied when deterministic modulation leaves a repeated
-/// unity plateau, so the first short burst does not collapse back to the same
-/// shorter ramp used for one-callback plateaus.
-const DUAL_PLANE_REPEATED_UNITY_EXIT_SEAM_EXTRA_FRAMES: usize = 32;
-/// Base overlap windows to hold transient resets during low-band-suppressed modulation.
-const TRANSIENT_RESET_MODULATION_BASE_OVERLAP_WINDOWS: usize = 2;
-/// Additional overlap windows for larger fast-modulation bursts.
-const TRANSIENT_RESET_MODULATION_MAX_EXTRA_OVERLAP_WINDOWS: usize = 2;
-/// Ratio-jump range that scales transient-reset duplicate protection under modulation.
-const TRANSIENT_RESET_MODULATION_OVERLAP_RATIO_RANGE: f64 = 0.09;
-/// Minimum extra overlap window when low-band-suppressed modulation is still
-/// crossing or settling around a seam-sensitive unity transition.
-const TRANSIENT_RESET_MODULATION_SEAM_MIN_EXTRA_OVERLAP_WINDOWS: usize = 1;
-/// Wider current-ratio band that keeps transient-reset suppression alive for
-/// the first callback after leaving a unity plateau.
-const TRANSIENT_RESET_NEAR_UNITY_SEAM_EPS: f64 = 0.015;
-/// Deterministic auto-profile hysteresis blocks used to avoid one-kernel churn after short bursts.
-const DETERMINISTIC_AUTO_PROFILE_SWITCH_HYSTERESIS_BLOCKS: usize = 2;
 /// Numerator for the FFT-size latency fraction (3/2 = 1.5x FFT size).
 const LATENCY_FFT_NUMERATOR: usize = 3;
 /// Denominator for the FFT-size latency fraction.
@@ -81,6 +32,12 @@ const MIN_CALLBACK_FRAMES: usize = 64;
 const COMMON_CALLBACK_FRAMES: usize = 256;
 /// Iteration slack for bounded dynamic loops in the real-time path.
 const LOOP_GUARD_SLACK: usize = 8;
+/// Cross-fade length (in samples) at hybrid streaming chunk boundaries.
+///
+/// Smooths phase discontinuities caused by re-rendering overlapping audio
+/// with fresh PV phase state on each call.
+const HYBRID_STREAM_CROSSFADE_SAMPLES: usize = 3072;
+
 /// Computes the minimum number of frames required before processing can begin.
 #[inline]
 const fn min_latency_frames(fft_size: usize) -> usize {
@@ -133,135 +90,131 @@ fn stream_capacity_frames(params: &StretchParams) -> usize {
         .saturating_add(params.fft_size)
 }
 
-#[inline]
-fn latency_profile_for_quality(mode: QualityMode) -> LatencyProfile {
-    match mode {
-        QualityMode::LowLatency => LatencyProfile::Scratch,
-        QualityMode::Balanced => LatencyProfile::Mix,
-        QualityMode::MaxQuality => LatencyProfile::Render,
+/// Persistent hybrid-streaming state.
+///
+/// Keeps a bounded per-channel rolling tail and emits only the newly rendered
+/// region on each call.
+struct HybridStreamingState {
+    stretchers: Vec<HybridStretcher>,
+    rolling_inputs: Vec<RingBuffer<f32>>,
+    rolling_scratch: Vec<Vec<f32>>,
+    tail_output_lens: Vec<usize>,
+    last_ratio: f64,
+    max_tail_frames: usize,
+    /// Per-channel held-back samples from the previous delta's tail,
+    /// used for cross-fading at chunk boundaries to smooth phase
+    /// discontinuities from fresh PV state on each re-render.
+    crossfade_held: Vec<Vec<f32>>,
+    /// Input samples accumulated (per channel) since the last hybrid render.
+    ///
+    /// Starts at `usize::MAX` so the very first render triggers immediately
+    /// once the minimum-latency threshold is met. After each render it resets
+    /// to zero, and subsequent renders are deferred until at least `fft_size`
+    /// new samples have accumulated. This prevents tiny per-chunk deltas
+    /// whose crossfade regions dominate the output and create spectral-flux
+    /// artifacts (false onsets).
+    input_accumulated: usize,
+    /// Reused scratch for pre-trim input lengths per channel.
+    pre_trim_lens: Vec<usize>,
+    /// Reused scratch for rendered output lengths per channel.
+    rendered_lens: Vec<usize>,
+}
+
+impl HybridStreamingState {
+    fn new(params: &StretchParams, ratio: f64, capacity_frames: usize) -> Self {
+        let num_channels = params.channels.count();
+        let mut per_channel = params.clone();
+        per_channel.stretch_ratio = ratio;
+        // Disable elastic timing in streaming: the re-rendering approach
+        // snapshots a rolling window and extracts a delta.  Elastic timing
+        // redistributes stretch ratios across beat-anchored segments, so
+        // shifting the rolling window changes the per-segment ratios for
+        // ALL segments, not just the new ones.  This makes the skip
+        // estimate (which assumes uniform stretch) unreliable, causing
+        // catastrophic spectral degradation for far-from-unity ratios.
+        per_channel.elastic_timing = false;
+        // Keep a generous tail so that transient detection and HPSS have
+        // enough context to produce results consistent with full-batch
+        // processing.  Fifty-six FFT windows (~5.2 s at 4096/44100) gives
+        // the PV enough warmup frames and the transient detector enough
+        // beat-level context for stable segmentation across chunks.
+        // The larger window also ensures full signal context is
+        // available for short clips (≤5 s), closing the quality gap
+        // between streaming and batch rendering.
+        let max_tail_frames = params.fft_size * 56;
+        // The rolling buffer must hold the retained tail context PLUS a full
+        // input batch so that tail samples are not discarded prematurely.
+        let rolling_capacity = capacity_frames + max_tail_frames;
+        let crossfade_capacity =
+            (params.fft_size.saturating_mul(8)).max(HYBRID_STREAM_CROSSFADE_SAMPLES);
+
+        Self {
+            stretchers: (0..num_channels)
+                .map(|_| HybridStretcher::new(per_channel.clone()))
+                .collect(),
+            rolling_inputs: (0..num_channels)
+                .map(|_| RingBuffer::with_capacity(rolling_capacity))
+                .collect(),
+            rolling_scratch: (0..num_channels)
+                .map(|_| Vec::with_capacity(rolling_capacity))
+                .collect(),
+            tail_output_lens: vec![0; num_channels],
+            last_ratio: ratio,
+            max_tail_frames,
+            crossfade_held: (0..num_channels)
+                .map(|_| Vec::with_capacity(crossfade_capacity))
+                .collect(),
+            input_accumulated: usize::MAX,
+            pre_trim_lens: vec![0; num_channels],
+            rendered_lens: vec![0; num_channels],
+        }
     }
-}
 
-#[inline]
-fn apply_dual_plane_ratio(
-    processor: &mut DualPlaneProcessor,
-    ratio: f64,
-) -> Result<(), StretchError> {
-    let ratio = validate_positive_finite_ratio(ratio, "dual-plane ratio")?;
-    processor.rt_mut().set_constant_ratio(ratio);
-    Ok(())
-}
-
-#[inline]
-fn smooth_ratio_toward(
-    current: f64,
-    target: f64,
-    frames: usize,
-    sample_rate: u32,
-    tau_secs: f64,
-) -> f64 {
-    if frames == 0 || (target - current).abs() <= RATIO_SNAP_THRESHOLD {
-        return target;
+    fn reset(&mut self, params: &StretchParams, ratio: f64, capacity_frames: usize) {
+        *self = Self::new(params, ratio, capacity_frames);
     }
 
-    let tau_frames = (sample_rate as f64 * tau_secs).max(1.0);
-    let alpha = 1.0 - (-(frames as f64) / tau_frames).exp();
-    let next = current + alpha * (target - current);
-    if (next - target).abs() < RATIO_SNAP_THRESHOLD {
-        target
-    } else {
-        next
-    }
-}
-
-#[inline]
-fn dual_plane_supports_pitch_scale(scale: f64) -> bool {
-    scale.is_finite() && scale > 0.0
-}
-
-#[inline]
-fn ratio_modulation_side(ratio: f64) -> i8 {
-    let delta = ratio - 1.0;
-    if delta.abs() <= RATIO_SNAP_THRESHOLD {
-        0
-    } else if delta > 0.0 {
-        1
-    } else {
-        -1
-    }
-}
-
-#[inline]
-fn dual_plane_ratio_in_unity_reset_zone(ratio: f64) -> bool {
-    (ratio - 1.0).abs() <= DUAL_PLANE_RATIO_HISTORY_UNITY_RESET_EPS
-}
-
-#[inline]
-fn snap_dual_plane_ratio_to_unity_plateau(ratio: f64) -> f64 {
-    if dual_plane_ratio_in_unity_reset_zone(ratio) {
-        1.0
-    } else {
-        ratio
-    }
-}
-
-#[inline]
-fn unity_exit_seam_frames(hop_size: usize, ratio_delta: f64) -> usize {
-    let base = hop_size.min(DUAL_PLANE_UNITY_EXIT_SEAM_FRAMES);
-    let max_frames = hop_size.min(DUAL_PLANE_UNITY_EXIT_SEAM_MAX_FRAMES);
-    if max_frames <= base {
-        return base;
+    fn update_ratio(&mut self, ratio: f64) {
+        if (ratio - self.last_ratio).abs() <= RATIO_SNAP_THRESHOLD {
+            return;
+        }
+        for stretcher in &mut self.stretchers {
+            stretcher.set_stretch_ratio(ratio);
+        }
+        self.last_ratio = ratio;
     }
 
-    let scaled = (ratio_delta.abs() / DUAL_PLANE_UNITY_EXIT_SEAM_RATIO_RANGE).clamp(0.0, 1.0);
-    base + ((max_frames - base) as f64 * scaled).round() as usize
-}
-
-#[inline]
-fn repeated_unity_exit_seam_frames(
-    hop_size: usize,
-    ratio_delta: f64,
-    unity_plateau_callbacks: usize,
-) -> usize {
-    let base_frames = unity_exit_seam_frames(hop_size, ratio_delta);
-    let max_frames = hop_size.min(DUAL_PLANE_UNITY_EXIT_SEAM_MAX_FRAMES);
-    if unity_plateau_callbacks <= 1 {
-        base_frames
-    } else {
-        base_frames
-            .saturating_add(DUAL_PLANE_REPEATED_UNITY_EXIT_SEAM_EXTRA_FRAMES)
-            .min(max_frames)
+    fn retain_tail(&mut self) {
+        for input in &mut self.rolling_inputs {
+            if input.len() > self.max_tail_frames {
+                input.discard(input.len() - self.max_tail_frames);
+            }
+        }
     }
-}
 
-#[inline]
-fn unity_exit_seam_ratio_delta(
-    previous_ratio: f64,
-    applied_ratio: f64,
-    requested_ratio: f64,
-) -> f64 {
-    let applied_delta = (applied_ratio - previous_ratio).abs();
-    if dual_plane_ratio_in_unity_reset_zone(previous_ratio) {
-        applied_delta.max((requested_ratio - previous_ratio).abs())
-    } else {
-        applied_delta
+    /// Rebase rolling buffers when ratio changes so already-emitted history
+    /// remains immutable while preserving a small bounded analysis tail.
+    fn rebase_after_ratio_change(&mut self) {
+        self.retain_tail();
+        self.tail_output_lens.fill(0);
+        self.input_accumulated = usize::MAX;
     }
-}
 
-#[inline]
-fn should_snap_dual_plane_first_post_unity_ratio(
-    previous_ratio: f64,
-    requested_ratio: f64,
-) -> bool {
-    dual_plane_ratio_in_unity_reset_zone(previous_ratio)
-        && !dual_plane_ratio_in_unity_reset_zone(requested_ratio)
-}
-
-#[inline]
-fn transient_reset_near_unity_transition(current_ratio: f64, target_ratio: f64) -> bool {
-    dual_plane_ratio_in_unity_reset_zone(current_ratio)
-        || dual_plane_ratio_in_unity_reset_zone(target_ratio)
-        || (current_ratio - 1.0).abs() <= TRANSIENT_RESET_NEAR_UNITY_SEAM_EPS
+    fn update_tail_output_estimates_from_rendered(&mut self) {
+        for (idx, input) in self.rolling_inputs.iter().enumerate() {
+            let tail_len = input.len();
+            if self.pre_trim_lens[idx] > 0 {
+                // Scale the actual rendered length by the proportion of input
+                // retained as tail — more accurate than `tail_len * ratio`
+                // because it reflects real PV hop quantisation.
+                self.tail_output_lens[idx] = ((self.rendered_lens[idx] as f64) * tail_len as f64
+                    / self.pre_trim_lens[idx] as f64)
+                    .round() as usize;
+            } else {
+                self.tail_output_lens[idx] = 0;
+            }
+        }
+    }
 }
 
 /// Stateful linear resampler used for realtime pitch control in stream mode.
@@ -364,6 +317,20 @@ impl LinearResamplerState {
 /// - no `Vec::drain`
 /// - no front-removal shifts
 /// - deterministic memory bounds
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingEngine {
+    /// Default deterministic stream engine with bounded per-callback work.
+    ///
+    /// This engine uses persistent phase-vocoder state and avoids full rolling
+    /// re-renders of historical context in callback paths.
+    Deterministic,
+    /// Legacy rolling-window hybrid re-render engine.
+    ///
+    /// This mode can provide stronger transient handling for selected content,
+    /// but has higher callback-cost variability and is intended as opt-in.
+    LegacyHybridRerender,
+}
+
 /// Aggregated transient-reset telemetry from deterministic stream processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransientResetStats {
@@ -377,256 +344,9 @@ pub struct TransientResetStats {
     pub input_frames_consumed_total: usize,
 }
 
-struct DualPlaneDeterministicState {
-    processor: DualPlaneProcessor,
-    num_channels: usize,
-    block_frames: usize,
-    input_planar: Vec<Vec<f32>>,
-    output_planar: Vec<Vec<f32>>,
-    flush_interleaved: Vec<f32>,
-    ratio_window_blocks: usize,
-    recent_chunk_ratios: Vec<f64>,
-    last_requested_unity_reset_zone: bool,
-    last_requested_ratio: f64,
-    last_requested_direction: i8,
-    last_ratio_history_side: i8,
-    last_ratio: f64,
-    last_output_samples: Vec<f32>,
-    has_last_output_samples: bool,
-    unity_exit_seam_samples: Vec<f32>,
-    pending_unity_exit_seam: bool,
-    pending_unity_exit_seam_frames: usize,
-    pending_unity_exit_seam_progress_frames: usize,
-    consecutive_unity_plateau_callbacks: usize,
-}
-
-impl DualPlaneDeterministicState {
-    fn from_params(params: &StretchParams, ratio: f64) -> Result<Self, StretchError> {
-        let ratio = snap_dual_plane_ratio_to_unity_plateau(ratio);
-        let block_frames = COMMON_CALLBACK_FRAMES;
-        let kernel_frames = (params.fft_size * 2).max(block_frames);
-        let mut rt_cfg = RtConfig::new(params.clone(), block_frames);
-        rt_cfg.latency_profile = latency_profile_for_quality(params.quality_mode);
-        rt_cfg.auto_profile_switching = true;
-        rt_cfg.profile_switch_hysteresis_blocks =
-            DETERMINISTIC_AUTO_PROFILE_SWITCH_HYSTERESIS_BLOCKS;
-        // The deterministic stream path should keep auto-profile switching,
-        // but its chunked offline-style processing is not the callback-safety
-        // case that justifies RT scratch-bias freezes during every short
-        // modulation step. Let the deterministic path ride out brief DJ-style
-        // bursts on Mix and only retarget once the plateau is actually stable.
-        rt_cfg.ratio_motion_freeze_blocks = 0;
-        rt_cfg.min_ratio = 0.05;
-        rt_cfg.max_ratio = 8.0;
-        let max_output_frames = ((rt_cfg.kernel_frames as f64 * rt_cfg.max_ratio).ceil() as usize)
-            .saturating_add(params.fft_size);
-
-        let mut processor = DualPlaneProcessor::prepare(rt_cfg)?;
-        apply_dual_plane_ratio(&mut processor, ratio)?;
-        let num_channels = params.channels.count().max(1);
-
-        Ok(Self {
-            processor,
-            num_channels,
-            block_frames,
-            input_planar: (0..num_channels).map(|_| vec![0.0; block_frames]).collect(),
-            output_planar: (0..num_channels)
-                .map(|_| vec![0.0; max_output_frames])
-                .collect(),
-            flush_interleaved: Vec::with_capacity(max_output_frames.saturating_mul(num_channels)),
-            ratio_window_blocks: kernel_frames.div_ceil(block_frames).max(1),
-            recent_chunk_ratios: Vec::new(),
-            last_requested_unity_reset_zone: false,
-            last_requested_ratio: ratio,
-            last_requested_direction: 0,
-            last_ratio_history_side: 0,
-            last_ratio: ratio,
-            last_output_samples: vec![0.0; num_channels],
-            has_last_output_samples: false,
-            unity_exit_seam_samples: vec![0.0; num_channels],
-            pending_unity_exit_seam: false,
-            pending_unity_exit_seam_frames: 0,
-            pending_unity_exit_seam_progress_frames: 0,
-            consecutive_unity_plateau_callbacks: 0,
-        })
-    }
-
-    #[inline]
-    fn push_chunk_ratio(&mut self, ratio: f64, requested_ratio: f64) -> f64 {
-        let requested_unity_reset_zone =
-            (requested_ratio - 1.0).abs() <= DUAL_PLANE_RATIO_HISTORY_UNITY_RESET_EPS;
-        if requested_unity_reset_zone || self.last_requested_unity_reset_zone {
-            self.recent_chunk_ratios.clear();
-            self.last_ratio_history_side = 0;
-        }
-        let next_side = ratio_modulation_side(ratio);
-        let requested_side = ratio_modulation_side(requested_ratio);
-        let requested_delta = requested_ratio - self.last_requested_ratio;
-        let requested_direction =
-            if requested_delta.abs() <= DUAL_PLANE_RATIO_HISTORY_DIRECTION_RESET_EPS {
-                0
-            } else if requested_delta > 0.0 {
-                1
-            } else {
-                -1
-            };
-        if requested_side != 0
-            && requested_side == ratio_modulation_side(self.last_requested_ratio)
-            && self.recent_chunk_ratios.len() >= 2
-            && requested_direction != 0
-            && self.last_requested_direction != 0
-            && requested_direction != self.last_requested_direction
-        {
-            self.recent_chunk_ratios.clear();
-        }
-        let effective_side = if requested_side != 0 {
-            requested_side
-        } else {
-            next_side
-        };
-        if effective_side != 0
-            && self.last_ratio_history_side != 0
-            && effective_side != self.last_ratio_history_side
-        {
-            // Drop stale opposite-side history as soon as the requested
-            // modulation flips across unity, even if smoothing has not yet
-            // carried the applied ratio onto the new side.
-            self.recent_chunk_ratios.clear();
-        }
-        if self.recent_chunk_ratios.len() == self.ratio_window_blocks {
-            self.recent_chunk_ratios.remove(0);
-        }
-        self.recent_chunk_ratios.push(ratio);
-        self.last_requested_unity_reset_zone = requested_unity_reset_zone;
-        self.last_requested_ratio = requested_ratio;
-        self.last_requested_direction = requested_direction;
-        self.last_ratio_history_side = effective_side;
-        let sum: f64 = self.recent_chunk_ratios.iter().sum();
-        sum / self.recent_chunk_ratios.len().max(1) as f64
-    }
-
-    #[inline]
-    fn reset_ratio_history(&mut self, ratio: f64) {
-        self.recent_chunk_ratios.clear();
-        self.last_requested_unity_reset_zone = false;
-        self.last_requested_ratio = ratio;
-        self.last_requested_direction = 0;
-        self.last_ratio_history_side = 0;
-        self.last_ratio = ratio;
-        if dual_plane_ratio_in_unity_reset_zone(ratio) {
-            self.pending_unity_exit_seam = false;
-            self.pending_unity_exit_seam_frames = 0;
-            self.pending_unity_exit_seam_progress_frames = 0;
-            self.consecutive_unity_plateau_callbacks =
-                self.consecutive_unity_plateau_callbacks.saturating_add(1);
-        } else {
-            self.consecutive_unity_plateau_callbacks = 0;
-        }
-    }
-
-    #[inline]
-    fn arm_unity_exit_seam(&mut self, ramp_frames: usize) {
-        if !self.has_last_output_samples
-            || self.last_output_samples.len() != self.num_channels
-            || self.unity_exit_seam_samples.len() != self.num_channels
-            || ramp_frames == 0
-        {
-            return;
-        }
-        let preserved_progress = if self.pending_unity_exit_seam {
-            self.pending_unity_exit_seam_progress_frames
-        } else {
-            0
-        };
-        let preserved_frames = if self.pending_unity_exit_seam {
-            self.pending_unity_exit_seam_frames
-        } else {
-            0
-        };
-        self.unity_exit_seam_samples
-            .copy_from_slice(&self.last_output_samples);
-        self.pending_unity_exit_seam = true;
-        self.pending_unity_exit_seam_frames = ramp_frames.max(preserved_frames);
-        // If a short-interval modulation step re-arms the seam while the
-        // previous ramp is still draining, keep the already-consumed progress
-        // so the next callback resumes from the in-flight seam instead of
-        // restarting a fresh click-prone boundary ramp.
-        self.pending_unity_exit_seam_progress_frames =
-            preserved_progress.min(self.pending_unity_exit_seam_frames.saturating_sub(1));
-    }
-
-    #[inline]
-    fn ratio_apply_smoothing_time_secs(&self) -> f64 {
-        if self.recent_chunk_ratios.len() <= 3
-            || (self.last_requested_ratio - self.last_ratio).abs()
-                >= DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_LAG_EPS
-        {
-            DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_TIME_SECS
-        } else {
-            DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS
-        }
-    }
-
-    fn apply_pending_unity_exit_seam(
-        &mut self,
-        channel_output_buffers: &mut [Vec<f32>],
-        produced_frames: usize,
-    ) {
-        if !self.pending_unity_exit_seam
-            || produced_frames == 0
-            || self.pending_unity_exit_seam_frames == 0
-        {
-            return;
-        }
-
-        let ramp_total = self.pending_unity_exit_seam_frames;
-        let ramp_remaining =
-            ramp_total.saturating_sub(self.pending_unity_exit_seam_progress_frames);
-        let ramp_len = produced_frames.min(ramp_remaining);
-        let denom = ramp_total.saturating_add(1) as f32;
-        for ch in 0..self.num_channels.min(channel_output_buffers.len()) {
-            let anchor = self.unity_exit_seam_samples[ch];
-            let Some(&first_target) = channel_output_buffers[ch].first() else {
-                continue;
-            };
-            let seam_offset = anchor - first_target;
-            for i in 0..ramp_len.min(channel_output_buffers[ch].len()) {
-                let progress = self.pending_unity_exit_seam_progress_frames + i + 1;
-                let t = progress as f32 / denom;
-                channel_output_buffers[ch][i] += seam_offset * (1.0 - t);
-            }
-        }
-
-        self.pending_unity_exit_seam_progress_frames = self
-            .pending_unity_exit_seam_progress_frames
-            .saturating_add(ramp_len);
-        if self.pending_unity_exit_seam_progress_frames >= ramp_total {
-            self.pending_unity_exit_seam = false;
-            self.pending_unity_exit_seam_frames = 0;
-            self.pending_unity_exit_seam_progress_frames = 0;
-        }
-    }
-
-    fn capture_last_output_samples(
-        &mut self,
-        channel_output_buffers: &[Vec<f32>],
-        produced_frames: usize,
-    ) {
-        if produced_frames == 0 {
-            return;
-        }
-
-        for ch in 0..self.num_channels.min(channel_output_buffers.len()) {
-            if let Some(&sample) = channel_output_buffers[ch].get(produced_frames - 1) {
-                self.last_output_samples[ch] = sample;
-            }
-        }
-        self.has_last_output_samples = true;
-    }
-}
-
 pub struct StreamProcessor {
     params: StretchParams,
+    capacity_frames_per_channel: usize,
     input_ring: RingBuffer<f32>,
     pending_output: RingBuffer<f32>,
     /// Current stretch ratio (can be changed on the fly).
@@ -647,6 +367,21 @@ pub struct StreamProcessor {
     interleaved_scratch: Vec<f32>,
     /// Source BPM (set when created via `from_tempo`, enables `set_tempo`).
     source_bpm: Option<f64>,
+    /// Enables the legacy rolling-window hybrid re-render engine.
+    ///
+    /// Prefer [`StreamingEngine::Deterministic`] for real-time callback
+    /// stability. Keep this flag only as a compatibility bridge for callers
+    /// still opting into historical hybrid streaming behavior.
+    use_hybrid: bool,
+    /// Persistent hybrid streaming state (rolling bounded tail + incremental output).
+    hybrid_state: HybridStreamingState,
+    /// Indicates that hybrid rolling buffers should rebase on the next process call.
+    hybrid_pending_rebase: bool,
+    /// When enabled, hybrid mode uses the allocation-free realtime-safe path.
+    ///
+    /// This trades hybrid transient rendering quality for hard-RT callback
+    /// behavior by routing through the preallocated PV streaming path.
+    hybrid_realtime_strict: bool,
     /// Persistent transient event scheduler for deterministic stream mode.
     transient_scheduler: TransientEventScheduler,
     /// Absolute count of per-channel input frames consumed from `input_ring`.
@@ -660,35 +395,12 @@ pub struct StreamProcessor {
     expected_total_output_samples: f64,
     /// Total output samples emitted to the caller for the current stream.
     total_output_emitted_samples: usize,
-    /// Running estimate of input energy (EMA of per-frame RMS²).
-    input_energy_ema: f64,
-    /// Running estimate of output energy (EMA of per-frame RMS²).
-    output_energy_ema: f64,
-    /// Smoothed gain compensation factor applied to output to preserve input energy.
-    energy_gain: f64,
-
     /// Realtime pitch scale applied in stream mode.
     pitch_scale: f64,
     /// Stateful per-channel resamplers for realtime pitch control.
     pitch_resamplers: Vec<LinearResamplerState>,
     /// Reusable per-channel output buffers for pitch-resampled data.
     pitch_output_buffers: Vec<Vec<f32>>,
-    /// Whether a fixed-buffer flush drain is currently in progress.
-    fixed_flush_pending: bool,
-    /// Whether the deterministic backend has fully emitted its flush tail.
-    fixed_flush_source_exhausted: bool,
-    /// Whether pitch-resampler tail flush has already been applied.
-    fixed_flush_pitch_tail_flushed: bool,
-    /// Whether fixed-buffer flush length reconciliation has already run.
-    fixed_flush_length_reconciled: bool,
-    /// Scratch used to reconcile fixed-buffer flush tails without reallocating.
-    fixed_flush_scratch: Vec<f32>,
-    /// Whether deterministic mode prefers the dual-plane backend.
-    dual_plane_preferred: bool,
-    /// Optional active dual-plane deterministic backend state.
-    dual_plane_deterministic: Option<DualPlaneDeterministicState>,
-    /// Deferred pitch-scale change requested while a fixed-buffer flush drain is active.
-    pending_pitch_scale: Option<f64>,
 }
 
 impl std::fmt::Debug for StreamProcessor {
@@ -699,38 +411,13 @@ impl std::fmt::Debug for StreamProcessor {
             .field("target_ratio", &self.target_ratio)
             .field("vocoder_ratio", &self.vocoder_ratio)
             .field("pitch_scale", &self.pitch_scale)
+            .field("hybrid_realtime_strict", &self.hybrid_realtime_strict)
             .field("initialized", &self.initialized)
-            .field("fixed_flush_pending", &self.fixed_flush_pending)
-            .field(
-                "dual_plane_deterministic",
-                &self.dual_plane_deterministic.is_some(),
-            )
-            .field("pending_pitch_scale", &self.pending_pitch_scale)
-            .field("dual_plane_preferred", &self.dual_plane_preferred)
             .field("source_bpm", &self.source_bpm)
             .field("input_ring_len", &self.input_ring.len())
             .field("pending_output_len", &self.pending_output.len())
             .finish()
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FixedProcessInterleavedBudget {
-    num_channels: usize,
-    block_frames: usize,
-    required_samples: usize,
-}
-
-#[inline]
-fn align_interleaved_samples_up(samples: usize, num_channels: usize) -> usize {
-    if num_channels <= 1 {
-        return samples;
-    }
-
-    samples
-        .saturating_add(num_channels.saturating_sub(1))
-        .saturating_div(num_channels)
-        .saturating_mul(num_channels)
 }
 
 impl StreamProcessor {
@@ -755,6 +442,7 @@ impl StreamProcessor {
         let channel_output_buffers = (0..num_channels)
             .map(|_| Vec::with_capacity(output_capacity_frames))
             .collect();
+        let hybrid_state = HybridStreamingState::new(&params, ratio, capacity_frames_per_channel);
         let transient_scheduler = TransientEventScheduler::new(
             params.fft_size,
             params.hop_size,
@@ -762,8 +450,9 @@ impl StreamProcessor {
             capacity_frames_per_channel,
         );
 
-        let mut me = Self {
+        Self {
             params,
+            capacity_frames_per_channel,
             input_ring: RingBuffer::with_capacity(capacity_samples),
             pending_output: RingBuffer::with_capacity(output_capacity_samples),
             current_ratio: ratio,
@@ -775,14 +464,14 @@ impl StreamProcessor {
             channel_output_buffers,
             interleaved_scratch: vec![0.0; capacity_samples],
             source_bpm,
+            use_hybrid: false,
+            hybrid_state,
+            hybrid_pending_rebase: false,
+            hybrid_realtime_strict: false,
             transient_scheduler,
             input_frames_consumed_total: 0,
             expected_total_output_samples: 0.0,
             total_output_emitted_samples: 0,
-            input_energy_ema: 0.0,
-            output_energy_ema: 0.0,
-            energy_gain: 1.0,
-
             pitch_scale: 1.0,
             pitch_resamplers: (0..num_channels)
                 .map(|_| LinearResamplerState::new())
@@ -790,40 +479,6 @@ impl StreamProcessor {
             pitch_output_buffers: (0..num_channels)
                 .map(|_| Vec::with_capacity(pitch_output_capacity_frames))
                 .collect(),
-            fixed_flush_pending: false,
-            fixed_flush_source_exhausted: false,
-            fixed_flush_pitch_tail_flushed: false,
-            fixed_flush_length_reconciled: false,
-            fixed_flush_scratch: Vec::with_capacity(output_capacity_samples),
-            dual_plane_preferred: true,
-            dual_plane_deterministic: None,
-            pending_pitch_scale: None,
-        };
-        me.ensure_default_dual_plane_backend();
-        me
-    }
-
-    #[inline]
-    fn is_fresh_stream(&self) -> bool {
-        !self.initialized && self.input_ring.is_empty() && self.pending_output.is_empty()
-    }
-
-    #[inline]
-    fn should_activate_dual_plane(&self) -> bool {
-        self.dual_plane_preferred && dual_plane_supports_pitch_scale(self.pitch_scale)
-    }
-
-    fn ensure_default_dual_plane_backend(&mut self) {
-        if self.dual_plane_deterministic.is_some() || !self.should_activate_dual_plane() {
-            return;
-        }
-        if !self.is_fresh_stream() {
-            return;
-        }
-        if let Ok(state) =
-            DualPlaneDeterministicState::from_params(&self.params, self.processing_ratio())
-        {
-            self.dual_plane_deterministic = Some(state);
         }
     }
 
@@ -831,24 +486,18 @@ impl StreamProcessor {
     fn create_vocoders(params: &StretchParams, ratio: f64) -> Vec<PhaseVocoder> {
         (0..params.channels.count())
             .map(|_| {
-                // Use a wider sub-bass rigid phase locking range for streaming
-                // to improve phase coherence for low-mid frequencies. The streaming
-                // PV doesn't benefit from WSOLA fallback, so tighter phase control
-                // at low frequencies helps preserve energy at those bins.
-                let streaming_sub_bass_cutoff = params.sub_bass_cutoff.max(180.0);
                 let mut pv = PhaseVocoder::with_all_options(
                     params.fft_size,
                     params.hop_size,
                     ratio,
                     params.sample_rate,
-                    streaming_sub_bass_cutoff,
+                    params.sub_bass_cutoff,
                     params.window_type,
                     params.phase_locking_mode,
                     params.envelope_preservation,
                     params.envelope_order,
                 );
-                // Disable adaptive phase locking to use the configured mode consistently.
-                pv.set_adaptive_phase_locking(false);
+                pv.set_adaptive_phase_locking(params.adaptive_phase_locking);
                 pv.set_envelope_strength(params.envelope_strength);
                 pv.set_adaptive_envelope_order(params.adaptive_envelope_order);
                 pv
@@ -868,188 +517,6 @@ impl StreamProcessor {
         Ok(out)
     }
 
-    /// Returns a deterministic upper bound for fixed-buffer process output.
-    ///
-    /// The returned value is the maximum number of new interleaved samples the
-    /// deterministic fixed-buffer path may need to queue while consuming
-    /// `input_samples` of new input. If `output` in
-    /// [`StreamProcessor::process_interleaved_into`] is at least this large,
-    /// the call will not reject for `stream_process_interleaved_output`
-    /// capacity, regardless of current pending-output depth.
-    ///
-    /// This helper is available when the deterministic dual-plane backend is
-    /// active. The returned sample count is always aligned to whole frames.
-    pub fn max_process_interleaved_output_samples(
-        &mut self,
-        input_samples: usize,
-    ) -> Result<usize, StretchError> {
-        Ok(self
-            .fixed_process_interleaved_budget(input_samples)?
-            .required_samples)
-    }
-
-    /// Returns a deterministic upper bound for the next fixed-buffer process callback output.
-    ///
-    /// The returned value includes both interleaved samples already queued for
-    /// draining and the maximum number of new interleaved samples the
-    /// deterministic fixed-buffer path may emit while consuming `input_samples`
-    /// of new input. If `output` in [`StreamProcessor::process_interleaved_into`]
-    /// is at least this large, the next call can drain the current queue and
-    /// accept `input_samples` of new input without leaving host-visible backlog
-    /// above the deterministic backend.
-    ///
-    /// This helper is equivalent to adding
-    /// [`StreamProcessor::queued_interleaved_output_samples`] and
-    /// [`StreamProcessor::max_process_interleaved_output_samples`], but keeps
-    /// next-callback sizing in one frame-aligned public call.
-    pub fn max_next_process_interleaved_output_samples(
-        &mut self,
-        input_samples: usize,
-    ) -> Result<usize, StretchError> {
-        let FixedProcessInterleavedBudget {
-            num_channels,
-            required_samples,
-            ..
-        } = self.fixed_process_interleaved_budget(input_samples)?;
-        if !self.pending_output.len().is_multiple_of(num_channels) {
-            return Err(StretchError::InvalidState(
-                "queued fixed-buffer output lost interleaved frame alignment",
-            ));
-        }
-
-        Ok(self.pending_output.len().saturating_add(required_samples))
-    }
-
-    /// Returns the exact number of interleaved samples already queued for fixed-buffer draining.
-    ///
-    /// This counts host-visible samples currently buffered above the
-    /// deterministic dual-plane backend. Hosts can add this value to
-    /// [`StreamProcessor::max_process_interleaved_output_samples`] to size an
-    /// output buffer large enough to drain the current queue and capture all
-    /// new output from the next [`StreamProcessor::process_interleaved_into`]
-    /// call.
-    ///
-    /// This helper is available when the deterministic dual-plane backend is
-    /// active. The returned sample count is always aligned to whole frames.
-    pub fn queued_interleaved_output_samples(&mut self) -> Result<usize, StretchError> {
-        self.ensure_default_dual_plane_backend();
-        let Some(state_meta) = self.dual_plane_deterministic.as_ref() else {
-            return Err(StretchError::InvalidState(
-                "dual-plane deterministic backend is unavailable",
-            ));
-        };
-
-        let num_channels = state_meta.num_channels.max(1);
-        if !self.pending_output.len().is_multiple_of(num_channels) {
-            return Err(StretchError::InvalidState(
-                "queued fixed-buffer output lost interleaved frame alignment",
-            ));
-        }
-
-        Ok(self.pending_output.len())
-    }
-
-    /// Returns a deterministic upper bound for remaining fixed-buffer flush output.
-    ///
-    /// The returned value is a conservative upper bound for the number of
-    /// interleaved samples still required to drain the current stream tail. If `output` in
-    /// [`StreamProcessor::flush_interleaved_into`] is at least this large, the
-    /// remaining tail drains in one call from the current stream state.
-    ///
-    /// This helper is available when the deterministic dual-plane backend is
-    /// active. The returned sample count is always aligned to whole frames.
-    pub fn max_flush_interleaved_output_samples(&mut self) -> Result<usize, StretchError> {
-        self.ensure_default_dual_plane_backend();
-        let Some(state_meta) = self.dual_plane_deterministic.as_ref() else {
-            return Err(StretchError::InvalidState(
-                "dual-plane deterministic backend is unavailable",
-            ));
-        };
-
-        let num_channels = state_meta.num_channels.max(1);
-        let remaining = self.remaining_expected_flush_samples();
-        if remaining == 0 && self.pending_output.is_empty() {
-            return Ok(0);
-        }
-
-        Ok(align_interleaved_samples_up(
-            remaining.saturating_add(self.pending_output.capacity()),
-            num_channels,
-        ))
-    }
-
-    /// Processes a chunk of deterministic interleaved audio into a fixed buffer.
-    ///
-    /// Returns the number of interleaved samples written to `output`.
-    /// Only full frames are written; any trailing partial-frame capacity in
-    /// `output` is ignored.
-    ///
-    /// This host-facing fixed-buffer contract is available when the
-    /// deterministic dual-plane backend is active. Produced samples that do
-    /// not fit in `output` remain queued for later calls.
-    pub fn process_interleaved_into(
-        &mut self,
-        input: &[f32],
-        output: &mut [f32],
-    ) -> Result<usize, StretchError> {
-        let FixedProcessInterleavedBudget {
-            num_channels,
-            block_frames,
-            required_samples,
-        } = self.fixed_process_interleaved_budget(input.len())?;
-        if input.iter().any(|s| !s.is_finite()) {
-            return Err(StretchError::NonFiniteInput);
-        }
-
-        let aligned_capacity = output
-            .len()
-            .saturating_div(num_channels)
-            .saturating_mul(num_channels);
-        let available_budget = aligned_capacity.saturating_add(self.pending_output.available());
-        if required_samples > available_budget {
-            return Err(StretchError::BufferOverflow {
-                buffer: "stream_process_interleaved_output",
-                requested: required_samples,
-                available: available_budget,
-            });
-        }
-
-        self.initialized = true;
-
-        let mut written_total = 0usize;
-        if aligned_capacity > 0 {
-            written_total += self.drain_pending_to_buffer(&mut output[..aligned_capacity])?;
-        }
-
-        let mut offset = 0usize;
-        while offset < input.len() {
-            let remaining_frames = (input.len() - offset) / num_channels;
-            let frames = remaining_frames.min(block_frames);
-            if frames == 0 {
-                break;
-            }
-
-            let end = offset + frames * num_channels;
-            self.process_dual_plane_chunk_to_pending(&input[offset..end])?;
-            if written_total < aligned_capacity {
-                written_total +=
-                    self.drain_pending_to_buffer(&mut output[written_total..aligned_capacity])?;
-            }
-            offset = end;
-        }
-
-        if input.is_empty() {
-            self.interpolate_ratio_for_frames(COMMON_CALLBACK_FRAMES);
-            self.apply_current_dual_plane_ratio()?;
-        }
-
-        if written_total < aligned_capacity {
-            written_total +=
-                self.drain_pending_to_buffer(&mut output[written_total..aligned_capacity])?;
-        }
-        Ok(written_total)
-    }
-
     /// Processes a chunk of interleaved audio, appending output to `output`.
     ///
     /// This is the real-time API. It does not grow internal buffers in the
@@ -1059,20 +526,11 @@ impl StreamProcessor {
         input: &[f32],
         output: &mut Vec<f32>,
     ) -> Result<(), StretchError> {
-        if self.fixed_flush_pending {
-            return Err(StretchError::InvalidState(
-                "fixed-buffer flush output must be fully drained before new input",
-            ));
-        }
         if input.iter().any(|s| !s.is_finite()) {
             return Err(StretchError::NonFiniteInput);
         }
 
         self.initialized = true;
-
-        if self.dual_plane_deterministic.is_some() {
-            return self.process_into_dual_plane(input, output);
-        }
 
         // Fast passthrough for unity ratio: skip PV/WSOLA processing to
         // produce bit-exact output and eliminate windowing/overlap-add drift.
@@ -1147,18 +605,7 @@ impl StreamProcessor {
     ///
     /// Returns the number of samples written to `output`.
     pub fn flush_into(&mut self, output: &mut Vec<f32>) -> Result<usize, StretchError> {
-        if self.fixed_flush_pending {
-            return Err(StretchError::InvalidState(
-                "fixed-buffer flush output must be fully drained before Vec flush",
-            ));
-        }
         let before = output.len();
-        if self.dual_plane_deterministic.is_some() {
-            let written = self.flush_into_dual_plane(output)?;
-            self.expected_total_output_samples = 0.0;
-            self.total_output_emitted_samples = 0;
-            return Ok(written);
-        }
         let num_channels = self.params.channels.count();
         if self.params.hop_size == 0 {
             return Err(StretchError::InvalidState("hop_size must be > 0"));
@@ -1212,13 +659,39 @@ impl StreamProcessor {
             self.process_available_to_pending(false)?;
         }
 
-        self.flush_vocoder_tails_to_pending(num_channels)?;
+        if !self.use_hybrid {
+            self.flush_vocoder_tails_to_pending(num_channels)?;
+        }
 
         let remaining_frames = self.input_ring.len() / num_channels.max(1);
         self.input_frames_consumed_total = self
             .input_frames_consumed_total
             .saturating_add(remaining_frames);
         self.input_ring.clear();
+        if self.use_hybrid {
+            // Emit any held-back cross-fade tails before resetting state.
+            // These tails are in M/S space and need decoding to L/R.
+            let mut held_min_len = usize::MAX;
+            for ch in 0..num_channels {
+                let held = &self.hybrid_state.crossfade_held[ch];
+                if !held.is_empty() {
+                    self.channel_output_buffers[ch].clear();
+                    self.channel_output_buffers[ch].extend_from_slice(held);
+                    held_min_len = held_min_len.min(held.len());
+                }
+            }
+            if held_min_len != usize::MAX && held_min_len > 0 {
+                self.decode_output_mid_side(num_channels, held_min_len);
+                self.emit_channel_output_to_pending(held_min_len, num_channels)?;
+            }
+
+            self.hybrid_state.reset(
+                &self.params,
+                self.current_ratio,
+                self.capacity_frames_per_channel,
+            );
+            self.hybrid_pending_rebase = false;
+        }
 
         self.flush_pitch_resampler_to_pending(num_channels)?;
         self.reset_pitch_resamplers();
@@ -1258,621 +731,6 @@ impl StreamProcessor {
         let mut out = Vec::with_capacity(self.pending_output.capacity());
         self.flush_into(&mut out)?;
         Ok(out)
-    }
-
-    /// Flushes remaining deterministic interleaved samples into a fixed buffer.
-    ///
-    /// This host-facing fixed-buffer contract is available when the
-    /// deterministic dual-plane backend is active. If more output remains than
-    /// fits in `output`, call again until this method returns `0`. No new
-    /// input may be processed until the flush tail has been fully drained.
-    pub fn flush_interleaved_into(&mut self, output: &mut [f32]) -> Result<usize, StretchError> {
-        self.ensure_default_dual_plane_backend();
-        if self.dual_plane_deterministic.is_none() {
-            return Err(StretchError::InvalidState(
-                "dual-plane deterministic backend is unavailable",
-            ));
-        }
-
-        self.flush_interleaved_into_dual_plane(output)
-    }
-
-    fn process_into_dual_plane(
-        &mut self,
-        input: &[f32],
-        output: &mut Vec<f32>,
-    ) -> Result<(), StretchError> {
-        let Some(state_meta) = self.dual_plane_deterministic.as_ref() else {
-            return Err(StretchError::InvalidState(
-                "dual-plane deterministic state is unavailable",
-            ));
-        };
-        let num_channels = state_meta.num_channels.max(1);
-        let block_frames = state_meta.block_frames;
-        if !input.len().is_multiple_of(num_channels) {
-            return Err(StretchError::InvalidFormat(format!(
-                "input sample count {} is not a multiple of channel count {}",
-                input.len(),
-                num_channels
-            )));
-        }
-
-        let mut offset = 0usize;
-        while offset < input.len() {
-            let remaining_frames = (input.len() - offset) / num_channels;
-            let frames = remaining_frames.min(block_frames);
-            if frames == 0 {
-                break;
-            }
-
-            let end = offset + frames * num_channels;
-            self.process_dual_plane_chunk_to_pending(&input[offset..end])?;
-            let _ = self.drain_pending_to_output(output)?;
-            offset = end;
-        }
-
-        if input.is_empty() {
-            self.interpolate_ratio_for_frames(COMMON_CALLBACK_FRAMES);
-            self.apply_current_dual_plane_ratio()?;
-        }
-
-        let _ = self.drain_pending_to_output(output)?;
-        Ok(())
-    }
-
-    fn flush_into_dual_plane(&mut self, output: &mut Vec<f32>) -> Result<usize, StretchError> {
-        let Some(_state) = self.dual_plane_deterministic.as_ref() else {
-            return Err(StretchError::InvalidState(
-                "dual-plane deterministic state is unavailable",
-            ));
-        };
-
-        let num_channels = self.params.channels.count().max(1);
-        let before = output.len();
-        let flushed_samples = {
-            let Some(state) = self.dual_plane_deterministic.as_mut() else {
-                return Err(StretchError::InvalidState(
-                    "dual-plane deterministic state became unavailable",
-                ));
-            };
-            state.flush_interleaved.clear();
-            state.processor.flush(&mut state.flush_interleaved)?;
-            state.flush_interleaved.len()
-        };
-
-        if !flushed_samples.is_multiple_of(num_channels) {
-            return Err(StretchError::InvalidState(
-                "dual-plane flush emitted non-interleaved sample count",
-            ));
-        }
-
-        let max_chunk_frames = self
-            .channel_output_buffers
-            .iter()
-            .take(num_channels)
-            .map(|buf| buf.capacity())
-            .min()
-            .unwrap_or(0);
-        if max_chunk_frames == 0 && flushed_samples > 0 {
-            return Err(StretchError::BufferOverflow {
-                buffer: "stream_channel_output",
-                requested: 1,
-                available: 0,
-            });
-        }
-
-        let total_frames = flushed_samples / num_channels;
-        let mut offset = 0usize;
-        let mut iterations = 0usize;
-        let max_iterations = total_frames
-            .saturating_add(max_chunk_frames.saturating_sub(1))
-            .saturating_div(max_chunk_frames.max(1))
-            .saturating_add(LOOP_GUARD_SLACK);
-        while offset < flushed_samples {
-            iterations = iterations.saturating_add(1);
-            if iterations > max_iterations {
-                return Err(StretchError::InvalidState(
-                    "dual-plane flush chunking iteration bound exceeded",
-                ));
-            }
-
-            let remaining_frames = (flushed_samples - offset) / num_channels;
-            let chunk_frames = remaining_frames.min(max_chunk_frames.max(1));
-            if chunk_frames == 0 {
-                return Err(StretchError::InvalidState(
-                    "dual-plane flush chunking made zero progress",
-                ));
-            }
-
-            {
-                let (channel_output_buffers, dual_plane_state) = (
-                    &mut self.channel_output_buffers,
-                    &mut self.dual_plane_deterministic,
-                );
-                let Some(state) = dual_plane_state.as_mut() else {
-                    return Err(StretchError::InvalidState(
-                        "dual-plane deterministic state became unavailable",
-                    ));
-                };
-
-                for ch in 0..num_channels {
-                    if channel_output_buffers[ch].capacity() < chunk_frames {
-                        return Err(StretchError::BufferOverflow {
-                            buffer: "stream_channel_output",
-                            requested: chunk_frames,
-                            available: channel_output_buffers[ch].capacity(),
-                        });
-                    }
-                    channel_output_buffers[ch].clear();
-                }
-
-                for frame in 0..chunk_frames {
-                    let base = offset + frame * num_channels;
-                    for ch in 0..num_channels {
-                        channel_output_buffers[ch].push(state.flush_interleaved[base + ch]);
-                    }
-                }
-            }
-
-            self.emit_channel_output_to_pending(chunk_frames, num_channels)?;
-            let _ = self.drain_pending_to_output(output)?;
-            offset += chunk_frames * num_channels;
-        }
-
-        self.flush_pitch_resampler_to_pending(num_channels)?;
-        self.reset_pitch_resamplers();
-        let _ = self.drain_pending_to_output(output)?;
-        Ok(output.len().saturating_sub(before))
-    }
-
-    fn flush_interleaved_into_dual_plane(
-        &mut self,
-        output: &mut [f32],
-    ) -> Result<usize, StretchError> {
-        let num_channels = self.params.channels.count().max(1);
-        let aligned_capacity = output
-            .len()
-            .saturating_div(num_channels)
-            .saturating_mul(num_channels);
-
-        if !self.fixed_flush_pending {
-            self.fixed_flush_pending = true;
-            self.fixed_flush_source_exhausted = false;
-            self.fixed_flush_pitch_tail_flushed = false;
-            self.fixed_flush_length_reconciled = false;
-        }
-
-        let mut written_total = 0usize;
-        loop {
-            if written_total < aligned_capacity {
-                let written =
-                    self.drain_pending_to_buffer(&mut output[written_total..aligned_capacity])?;
-                written_total += written;
-                if written_total == aligned_capacity {
-                    return Ok(written_total);
-                }
-            }
-
-            if !self.fixed_flush_source_exhausted {
-                if self.flush_next_dual_plane_chunk_to_pending()? > 0 {
-                    continue;
-                }
-                self.fixed_flush_source_exhausted = true;
-            }
-
-            if !self.fixed_flush_pitch_tail_flushed {
-                self.flush_pitch_resampler_to_pending(num_channels)?;
-                self.reset_pitch_resamplers();
-                self.fixed_flush_pitch_tail_flushed = true;
-                if !self.pending_output.is_empty() {
-                    continue;
-                }
-            }
-
-            if !self.fixed_flush_length_reconciled {
-                self.reconcile_fixed_flush_pending_output(num_channels)?;
-                self.fixed_flush_length_reconciled = true;
-                if !self.pending_output.is_empty() {
-                    continue;
-                }
-            }
-
-            if self.pending_output.is_empty() {
-                self.finish_fixed_flush_drain();
-                return Ok(written_total);
-            }
-
-            if aligned_capacity == 0 {
-                return Err(StretchError::BufferOverflow {
-                    buffer: "stream_flush_interleaved_output",
-                    requested: num_channels,
-                    available: 0,
-                });
-            }
-
-            return Ok(written_total);
-        }
-    }
-
-    fn flush_next_dual_plane_chunk_to_pending(&mut self) -> Result<usize, StretchError> {
-        let Some(_state) = self.dual_plane_deterministic.as_ref() else {
-            return Err(StretchError::InvalidState(
-                "dual-plane deterministic state is unavailable",
-            ));
-        };
-
-        let num_channels = self.params.channels.count().max(1);
-        let max_chunk_frames = self
-            .channel_output_buffers
-            .iter()
-            .take(num_channels)
-            .map(|buf| buf.capacity())
-            .min()
-            .unwrap_or(0);
-        if max_chunk_frames == 0 {
-            return Err(StretchError::BufferOverflow {
-                buffer: "stream_channel_output",
-                requested: 1,
-                available: 0,
-            });
-        }
-
-        let written = {
-            let Some(state) = self.dual_plane_deterministic.as_mut() else {
-                return Err(StretchError::InvalidState(
-                    "dual-plane deterministic state became unavailable",
-                ));
-            };
-            let chunk_samples = max_chunk_frames.saturating_mul(num_channels);
-            if state.flush_interleaved.len() != chunk_samples {
-                state.flush_interleaved.resize(chunk_samples, 0.0);
-            }
-            state
-                .processor
-                .flush_into(&mut state.flush_interleaved[..])?
-        };
-        if written == 0 {
-            return Ok(0);
-        }
-        if !written.is_multiple_of(num_channels) {
-            return Err(StretchError::InvalidState(
-                "dual-plane flush emitted non-interleaved sample count",
-            ));
-        }
-
-        let chunk_frames = written / num_channels;
-        {
-            let (channel_output_buffers, dual_plane_state) = (
-                &mut self.channel_output_buffers,
-                &mut self.dual_plane_deterministic,
-            );
-            let Some(state) = dual_plane_state.as_mut() else {
-                return Err(StretchError::InvalidState(
-                    "dual-plane deterministic state became unavailable",
-                ));
-            };
-
-            for ch in 0..num_channels {
-                if channel_output_buffers[ch].capacity() < chunk_frames {
-                    return Err(StretchError::BufferOverflow {
-                        buffer: "stream_channel_output",
-                        requested: chunk_frames,
-                        available: channel_output_buffers[ch].capacity(),
-                    });
-                }
-                channel_output_buffers[ch].clear();
-            }
-
-            for frame in 0..chunk_frames {
-                let base = frame * num_channels;
-                for ch in 0..num_channels {
-                    channel_output_buffers[ch].push(state.flush_interleaved[base + ch]);
-                }
-            }
-        }
-
-        self.emit_channel_output_to_pending(chunk_frames, num_channels)?;
-        Ok(written)
-    }
-
-    fn apply_current_dual_plane_ratio(&mut self) -> Result<(), StretchError> {
-        let processing_ratio = self.processing_ratio();
-        let Some(state) = self.dual_plane_deterministic.as_mut() else {
-            return Err(StretchError::InvalidState(
-                "dual-plane deterministic state is unavailable",
-            ));
-        };
-        if processing_ratio == 1.0 {
-            if state.last_ratio != 1.0 {
-                apply_dual_plane_ratio(&mut state.processor, 1.0)?;
-            }
-            state.reset_ratio_history(1.0);
-            return Ok(());
-        }
-        if (processing_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
-            apply_dual_plane_ratio(&mut state.processor, processing_ratio)?;
-            state.last_ratio = processing_ratio;
-        }
-        Ok(())
-    }
-
-    fn max_dual_plane_pending_samples_for_frames(
-        &self,
-        input_frames: usize,
-    ) -> Result<usize, StretchError> {
-        let Some(state) = self.dual_plane_deterministic.as_ref() else {
-            return Err(StretchError::InvalidState(
-                "dual-plane deterministic state is unavailable",
-            ));
-        };
-
-        let num_channels = state.num_channels.max(1);
-        let dual_plane_frames = state
-            .output_planar
-            .iter()
-            .take(num_channels)
-            .map(Vec::len)
-            .min()
-            .unwrap_or(0);
-        let max_frames = if (self.pitch_scale - 1.0).abs() < RATIO_SNAP_THRESHOLD {
-            dual_plane_frames.min(
-                self.channel_output_buffers
-                    .iter()
-                    .take(num_channels)
-                    .map(|buf| buf.capacity())
-                    .min()
-                    .unwrap_or(0),
-            )
-        } else {
-            self.pitch_output_buffers
-                .iter()
-                .take(num_channels)
-                .map(|buf| buf.capacity())
-                .min()
-                .unwrap_or(0)
-        };
-
-        let ratio_hint = self.current_ratio.max(self.target_ratio).max(1.0);
-        let estimated_frames = ((input_frames as f64) * ratio_hint).ceil() as usize;
-        let bounded_frames = estimated_frames
-            .saturating_add(self.params.fft_size)
-            .saturating_add(4)
-            .min(max_frames);
-
-        Ok(bounded_frames.saturating_mul(num_channels))
-    }
-
-    fn fixed_process_interleaved_budget(
-        &mut self,
-        input_samples: usize,
-    ) -> Result<FixedProcessInterleavedBudget, StretchError> {
-        if self.fixed_flush_pending {
-            return Err(StretchError::InvalidState(
-                "fixed-buffer flush output must be fully drained before new input",
-            ));
-        }
-        self.ensure_default_dual_plane_backend();
-        let Some(state_meta) = self.dual_plane_deterministic.as_ref() else {
-            return Err(StretchError::InvalidState(
-                "dual-plane deterministic backend is unavailable",
-            ));
-        };
-        let num_channels = state_meta.num_channels.max(1);
-        if !input_samples.is_multiple_of(num_channels) {
-            return Err(StretchError::InvalidFormat(format!(
-                "input sample count {} is not a multiple of channel count {}",
-                input_samples, num_channels
-            )));
-        }
-
-        let mut required_samples = 0usize;
-        let mut remaining_frames = input_samples / num_channels;
-        while remaining_frames > 0 {
-            let frames = remaining_frames.min(state_meta.block_frames);
-            required_samples = required_samples
-                .saturating_add(self.max_dual_plane_pending_samples_for_frames(frames)?);
-            remaining_frames -= frames;
-        }
-
-        Ok(FixedProcessInterleavedBudget {
-            num_channels,
-            block_frames: state_meta.block_frames,
-            required_samples,
-        })
-    }
-
-    #[inline]
-    fn remaining_expected_flush_samples(&self) -> usize {
-        let expected_total = self.expected_total_output_samples.round().max(0.0) as usize;
-        expected_total.saturating_sub(self.total_output_emitted_samples)
-    }
-
-    fn process_dual_plane_chunk_to_pending(&mut self, input: &[f32]) -> Result<(), StretchError> {
-        if input.is_empty() {
-            return Ok(());
-        }
-
-        let Some(state_meta) = self.dual_plane_deterministic.as_ref() else {
-            return Err(StretchError::InvalidState(
-                "dual-plane deterministic state is unavailable",
-            ));
-        };
-        let num_channels = state_meta.num_channels.max(1);
-        let block_frames = state_meta.block_frames;
-        if !input.len().is_multiple_of(num_channels) {
-            return Err(StretchError::InvalidFormat(format!(
-                "input sample count {} is not a multiple of channel count {}",
-                input.len(),
-                num_channels
-            )));
-        }
-
-        let frames = input.len() / num_channels;
-        if frames > block_frames {
-            return Err(StretchError::InvalidFormat(format!(
-                "input frame count {} exceeds deterministic block size {}",
-                frames, block_frames
-            )));
-        }
-
-        self.interpolate_ratio_for_frames(frames);
-        self.expected_total_output_samples += input.len() as f64 * self.current_ratio;
-        let raw_processing_ratio = self.processing_ratio();
-        let raw_target_processing_ratio = self.target_ratio * self.pitch_scale;
-        let hold_exact_unity_plateau = dual_plane_ratio_in_unity_reset_zone(raw_processing_ratio)
-            && dual_plane_ratio_in_unity_reset_zone(raw_target_processing_ratio);
-        let processing_ratio = if hold_exact_unity_plateau {
-            1.0
-        } else {
-            raw_processing_ratio
-        };
-        let target_processing_ratio = if hold_exact_unity_plateau {
-            1.0
-        } else {
-            raw_target_processing_ratio
-        };
-        let sample_rate = self.params.sample_rate;
-
-        let produced_frames = {
-            let (channel_output_buffers, dual_plane_state) = (
-                &mut self.channel_output_buffers,
-                &mut self.dual_plane_deterministic,
-            );
-            let Some(state) = dual_plane_state.as_mut() else {
-                return Err(StretchError::InvalidState(
-                    "dual-plane deterministic state became unavailable",
-                ));
-            };
-            if state.input_planar.len() != num_channels || state.output_planar.len() != num_channels
-            {
-                return Err(StretchError::InvalidState(
-                    "dual-plane planar buffers do not match channel count",
-                ));
-            }
-            if channel_output_buffers.len() < num_channels {
-                return Err(StretchError::InvalidState(
-                    "channel output buffers do not match channel count",
-                ));
-            }
-
-            if processing_ratio == 1.0 {
-                if state.last_ratio != 1.0 {
-                    apply_dual_plane_ratio(&mut state.processor, 1.0)?;
-                }
-                state.reset_ratio_history(1.0);
-            } else {
-                let exiting_unity_reset_zone =
-                    dual_plane_ratio_in_unity_reset_zone(state.last_ratio);
-                let snap_first_post_unity_ratio = should_snap_dual_plane_first_post_unity_ratio(
-                    state.last_ratio,
-                    target_processing_ratio,
-                );
-                let averaged_ratio =
-                    state.push_chunk_ratio(processing_ratio, target_processing_ratio);
-                let applied_ratio = if snap_first_post_unity_ratio {
-                    target_processing_ratio
-                } else {
-                    smooth_ratio_toward(
-                        state.last_ratio,
-                        averaged_ratio,
-                        frames,
-                        sample_rate,
-                        state.ratio_apply_smoothing_time_secs(),
-                    )
-                };
-                if (applied_ratio - state.last_ratio).abs() > RATIO_SNAP_THRESHOLD {
-                    if exiting_unity_reset_zone
-                        && !dual_plane_ratio_in_unity_reset_zone(applied_ratio)
-                    {
-                        state.arm_unity_exit_seam(repeated_unity_exit_seam_frames(
-                            self.params.hop_size,
-                            unity_exit_seam_ratio_delta(
-                                state.last_ratio,
-                                applied_ratio,
-                                target_processing_ratio,
-                            ),
-                            state.consecutive_unity_plateau_callbacks,
-                        ));
-                    }
-                    apply_dual_plane_ratio(&mut state.processor, applied_ratio)?;
-                    state.last_ratio = applied_ratio;
-                    state.consecutive_unity_plateau_callbacks = 0;
-                }
-            }
-
-            for frame in 0..frames {
-                let base = frame * num_channels;
-                for ch in 0..num_channels {
-                    state.input_planar[ch][frame] = input[base + ch];
-                }
-            }
-
-            let produced_frames = if num_channels == 1 {
-                let input_refs = [&state.input_planar[0][..frames]];
-                let mut output_refs = [state.output_planar[0].as_mut_slice()];
-                let (_consumed, produced) = state
-                    .processor
-                    .rt_mut()
-                    .process(&input_refs, &mut output_refs);
-                produced
-            } else if num_channels == 2 {
-                let input_refs = [
-                    &state.input_planar[0][..frames],
-                    &state.input_planar[1][..frames],
-                ];
-                let (left_out, right_out) = state.output_planar.split_at_mut(1);
-                let mut output_refs = [left_out[0].as_mut_slice(), right_out[0].as_mut_slice()];
-                let (_consumed, produced) = state
-                    .processor
-                    .rt_mut()
-                    .process(&input_refs, &mut output_refs);
-                produced
-            } else {
-                let input_refs: Vec<&[f32]> = state
-                    .input_planar
-                    .iter()
-                    .take(num_channels)
-                    .map(|channel| &channel[..frames])
-                    .collect();
-                let mut output_refs: Vec<&mut [f32]> = state
-                    .output_planar
-                    .iter_mut()
-                    .take(num_channels)
-                    .map(|channel| channel.as_mut_slice())
-                    .collect();
-                let (_consumed, produced) = state
-                    .processor
-                    .rt_mut()
-                    .process(&input_refs, &mut output_refs);
-                produced
-            };
-
-            for ch in 0..num_channels {
-                if channel_output_buffers[ch].capacity() < produced_frames {
-                    return Err(StretchError::BufferOverflow {
-                        buffer: "stream_channel_output",
-                        requested: produced_frames,
-                        available: channel_output_buffers[ch].capacity(),
-                    });
-                }
-                if state.output_planar[ch].len() < produced_frames {
-                    return Err(StretchError::InvalidState(
-                        "dual-plane output planar shorter than produced frame count",
-                    ));
-                }
-                channel_output_buffers[ch].clear();
-                channel_output_buffers[ch]
-                    .extend_from_slice(&state.output_planar[ch][..produced_frames]);
-            }
-            state.apply_pending_unity_exit_seam(channel_output_buffers, produced_frames);
-            state.capture_last_output_samples(channel_output_buffers, produced_frames);
-            produced_frames
-        };
-
-        if produced_frames > 0 {
-            self.emit_channel_output_to_pending(produced_frames, num_channels)?;
-        }
-        Ok(())
     }
 
     fn push_input_samples(&mut self, input: &[f32]) -> Result<(), StretchError> {
@@ -1923,20 +781,25 @@ impl StreamProcessor {
         self.collect_channel_inputs(total_frames, num_channels)?;
         self.encode_input_mid_side(num_channels);
 
+        if self.use_hybrid && !self.hybrid_realtime_strict {
+            let min_output_len =
+                self.process_hybrid_persistent_channels(num_channels, require_min_latency)?;
+            let consumed = total_frames * num_channels;
+            self.input_ring.discard(consumed);
+            self.input_frames_consumed_total = self
+                .input_frames_consumed_total
+                .saturating_add(total_frames);
+
+            if min_output_len > 0 {
+                self.decode_output_mid_side(num_channels, min_output_len);
+                self.emit_channel_output_to_pending(min_output_len, num_channels)?;
+            }
+            return Ok(());
+        }
+
         self.update_vocoder_ratio();
         if num_channels == 2 {
             self.apply_transient_scheduled_phase_reset(total_frames);
-        }
-
-        // Track input energy for gain compensation.
-        {
-            let input_energy = self.channel_input_buffers[0]
-                .iter()
-                .map(|&s| (s as f64) * (s as f64))
-                .sum::<f64>()
-                / self.channel_input_buffers[0].len().max(1) as f64;
-            const ENERGY_EMA_ALPHA: f64 = 0.05;
-            self.input_energy_ema += ENERGY_EMA_ALPHA * (input_energy - self.input_energy_ema);
         }
 
         let min_output_len = self.process_channels(num_channels)?;
@@ -1947,87 +810,6 @@ impl StreamProcessor {
 
         if min_output_len > 0 {
             self.decode_output_mid_side(num_channels, min_output_len);
-
-            // Track output energy and compute gain compensation.
-            {
-                let output_energy = self.channel_output_buffers[0][..min_output_len]
-                    .iter()
-                    .map(|&s| (s as f64) * (s as f64))
-                    .sum::<f64>()
-                    / min_output_len.max(1) as f64;
-                const ENERGY_EMA_ALPHA: f64 = 0.05;
-                self.output_energy_ema +=
-                    ENERGY_EMA_ALPHA * (output_energy - self.output_energy_ema);
-
-                // Compute global gain to match input energy.
-                const GAIN_SMOOTH: f64 = 0.30;
-                if self.output_energy_ema > 1e-12 && self.input_energy_ema > 1e-12 {
-                    let target_gain = (self.input_energy_ema / self.output_energy_ema)
-                        .sqrt()
-                        .min(3.0);
-                    self.energy_gain += GAIN_SMOOTH * (target_gain - self.energy_gain);
-                }
-
-                // Apply gain compensation to output buffers.
-                // At extreme stretch ratios, the PV naturally loses high-frequency
-                // energy due to phase modifications. Apply a ratio-dependent
-                // high-shelf boost to counteract centroid shift.
-                let ratio_distance = (self.current_ratio - 1.0).abs();
-                // Two-tier shelf: base correction for inherent PV spectral
-                // tilt (always active when gain compensation is active), plus
-                // ratio-dependent boost for centroid shift at extreme ratios.
-                // Scale base shelf proportionally to energy gain: more gain
-                // means more PV energy loss, which correlates with more spectral
-                // tilt. At low gain (harmonic near-unity), shelf is minimal.
-                let base_shelf = if self.energy_gain > 1.02 {
-                    let gain_factor = ((self.energy_gain - 1.02) / 0.48).clamp(0.0, 1.0);
-                    (1.0 + 1.20 * gain_factor) as f32
-                } else {
-                    1.0f32
-                };
-                let ratio_shelf = if ratio_distance > 0.4 {
-                    let t = ((ratio_distance - 0.4) / 0.6).min(1.0);
-                    (1.0 + 0.80 * t * t) as f32
-                } else {
-                    1.0f32
-                };
-                let shelf_amount = base_shelf * ratio_shelf;
-                let use_shelf = shelf_amount > 1.001;
-
-                if (self.energy_gain - 1.0).abs() > 0.01 || use_shelf {
-                    let gain = self.energy_gain as f32;
-                    if use_shelf {
-                        // Two-pole high-shelf via cascaded one-pole filters
-                        // for steeper transition and more targeted boost.
-                        let lp_coeff = (2.0 * std::f64::consts::PI * 2000.0
-                            / self.params.sample_rate.max(1) as f64)
-                            .min(0.5) as f32;
-                        // Use sqrt of shelf for each stage (cascaded = product)
-                        let stage_shelf = shelf_amount.sqrt();
-                        for ch in 0..num_channels {
-                            let mut lp1 = 0.0f32;
-                            let mut lp2 = 0.0f32;
-                            for s in self.channel_output_buffers[ch][..min_output_len].iter_mut() {
-                                // First stage
-                                lp1 += lp_coeff * (*s - lp1);
-                                let hp1 = *s - lp1;
-                                let mid = lp1 + hp1 * stage_shelf;
-                                // Second stage
-                                lp2 += lp_coeff * (mid - lp2);
-                                let hp2 = mid - lp2;
-                                *s = (lp2 + hp2 * stage_shelf) * gain;
-                            }
-                        }
-                    } else {
-                        for ch in 0..num_channels {
-                            for s in self.channel_output_buffers[ch][..min_output_len].iter_mut() {
-                                *s *= gain;
-                            }
-                        }
-                    }
-                }
-            }
-
             self.emit_channel_output_to_pending(min_output_len, num_channels)?;
         }
 
@@ -2321,119 +1103,261 @@ impl StreamProcessor {
         Ok(written)
     }
 
-    fn drain_pending_to_buffer(&mut self, output: &mut [f32]) -> Result<usize, StretchError> {
-        let pending = self.pending_output.len();
-        if pending == 0 || output.is_empty() {
-            return Ok(0);
-        }
-
-        let num_channels = self.params.channels.count().max(1);
-        let target = pending
-            .min(output.len())
-            .saturating_div(num_channels)
-            .saturating_mul(num_channels);
-        if target == 0 {
-            return Ok(0);
-        }
-
-        let mut written = 0usize;
-        let mut chunk = [0.0f32; 512];
-        let mut iterations = 0usize;
-        let max_iterations = target
-            .saturating_add(chunk.len().saturating_sub(1))
-            .saturating_div(chunk.len())
-            .saturating_add(LOOP_GUARD_SLACK);
-        while written < target {
-            iterations = iterations.saturating_add(1);
-            if iterations > max_iterations {
-                return Err(StretchError::InvalidState(
-                    "pending-output buffer drain iteration bound exceeded",
-                ));
+    fn append_hybrid_input(&mut self, num_channels: usize) -> Result<(), StretchError> {
+        let mut first_ch_pushed = 0;
+        for ch in 0..num_channels {
+            let input = &self.channel_input_buffers[ch];
+            let rb = &mut self.hybrid_state.rolling_inputs[ch];
+            if input.len() > rb.available() {
+                rb.discard(input.len() - rb.available());
             }
-            let take = (target - written).min(chunk.len());
-            let n = self.pending_output.pop_slice(&mut chunk[..take]);
-            if n == 0 {
-                return Err(StretchError::InvalidState(
-                    "pending-output buffer drain made zero progress",
-                ));
-            }
-            output[written..written + n].copy_from_slice(&chunk[..n]);
-            written += n;
-        }
-
-        self.total_output_emitted_samples += written;
-        Ok(written)
-    }
-
-    fn reconcile_fixed_flush_pending_output(
-        &mut self,
-        num_channels: usize,
-    ) -> Result<(), StretchError> {
-        let expected_total = self.expected_total_output_samples.round() as isize;
-        let projected_total = self
-            .total_output_emitted_samples
-            .saturating_add(self.pending_output.len()) as isize;
-        let correction = expected_total - projected_total;
-        if correction == 0 {
-            return Ok(());
-        }
-
-        let pending = self.pending_output.len();
-        self.fixed_flush_scratch.resize(pending, 0.0);
-        let copied = self
-            .pending_output
-            .peek_slice(&mut self.fixed_flush_scratch[..pending]);
-        if copied != pending {
-            return Err(StretchError::InvalidState(
-                "fixed-buffer flush scratch copy did not capture full pending output",
-            ));
-        }
-
-        if correction > 0 {
-            let need = correction as usize;
-            if need > self.pending_output.available() {
+            let pushed = rb.push_slice(input);
+            if pushed != input.len() {
                 return Err(StretchError::BufferOverflow {
-                    buffer: "stream_pending_output",
-                    requested: need,
-                    available: self.pending_output.available(),
+                    buffer: "stream_hybrid_input",
+                    requested: input.len(),
+                    available: pushed,
                 });
             }
-            extend_with_tonal_tail(&mut self.fixed_flush_scratch, need, 0);
-        } else {
-            let trim = ((-correction) as usize).min(self.fixed_flush_scratch.len());
-            self.fixed_flush_scratch
-                .truncate(self.fixed_flush_scratch.len().saturating_sub(trim));
+            if ch == 0 {
+                first_ch_pushed = pushed;
+            }
         }
-
-        if !self.fixed_flush_scratch.len().is_multiple_of(num_channels) {
-            return Err(StretchError::InvalidState(
-                "fixed-buffer flush correction broke interleaved frame alignment",
-            ));
-        }
-
-        self.pending_output.clear();
-        let pushed = self.pending_output.push_slice(&self.fixed_flush_scratch);
-        if pushed != self.fixed_flush_scratch.len() {
-            return Err(StretchError::BufferOverflow {
-                buffer: "stream_pending_output",
-                requested: self.fixed_flush_scratch.len(),
-                available: pushed,
-            });
-        }
-
+        self.hybrid_state.input_accumulated = self
+            .hybrid_state
+            .input_accumulated
+            .saturating_add(first_ch_pushed);
         Ok(())
     }
 
-    fn finish_fixed_flush_drain(&mut self) {
-        self.fixed_flush_pending = false;
-        self.fixed_flush_source_exhausted = false;
-        self.fixed_flush_pitch_tail_flushed = false;
-        self.fixed_flush_length_reconciled = false;
-        self.expected_total_output_samples = 0.0;
-        self.total_output_emitted_samples = 0;
-        if let Some(scale) = self.pending_pitch_scale.take() {
-            self.apply_pitch_scale_now(scale);
+    fn process_hybrid_persistent_channels(
+        &mut self,
+        num_channels: usize,
+        allow_defer: bool,
+    ) -> Result<usize, StretchError> {
+        if self.hybrid_pending_rebase {
+            self.hybrid_state.rebase_after_ratio_change();
+            self.hybrid_pending_rebase = false;
         }
+        self.hybrid_state.update_ratio(self.processing_ratio());
+
+        self.append_hybrid_input(num_channels)?;
+
+        // Accumulate enough new input before re-rendering.  With small
+        // input chunks (e.g. 1024 samples) the output delta per render is
+        // tiny and almost entirely consumed by the crossfade, producing
+        // spectral-flux spikes at chunk boundaries that manifest as false
+        // onsets.  Batching input to at least fft_size new samples per
+        // render makes each delta large enough for the crossfade to be a
+        // minor fraction, eliminating these artifacts.
+        // Use 2× the FFT size for ratios far from unity (|r-1| > 0.1).
+        // Higher thresholds reduce crossfade fraction but accumulate more
+        // context change between renders, causing the skip estimate to
+        // drift (HPSS segmentation shifts as the rolling window moves).
+        // 2× balances crossfade fraction (~35%) against skip accuracy.
+        // Using 2× for ALL ratios: near-unity ratios had 71% crossfade
+        // at 1× which destroyed transient timing in house tracks;
+        // at 2× the crossfade fraction drops to ~36%, preserving
+        // more of each render's original onset positions.  Skip drift
+        // is minimal for near-unity because the output-to-input ratio
+        // is nearly constant across segments.
+        let accum_threshold = self.params.fft_size * 2;
+        if allow_defer && self.hybrid_state.input_accumulated < accum_threshold {
+            return Ok(0);
+        }
+
+        let mut min_output_len = usize::MAX;
+        self.hybrid_state.pre_trim_lens.fill(0);
+        self.hybrid_state.rendered_lens.fill(0);
+
+        // Phase 1: Snapshot all channels from rolling buffers.
+        for ch in 0..num_channels {
+            let len = self.hybrid_state.rolling_inputs[ch].len();
+            self.hybrid_state.rolling_scratch[ch].resize(len, 0.0);
+            let copied = self.hybrid_state.rolling_inputs[ch]
+                .peek_slice(&mut self.hybrid_state.rolling_scratch[ch]);
+            if copied != len {
+                return Err(StretchError::InvalidState(
+                    "failed to snapshot hybrid rolling ring",
+                ));
+            }
+        }
+
+        // Phase 2: For stereo M/S, detect shared transients from mid channel
+        // so both channels use identical segmentation. This prevents phase
+        // misalignment when decoded back to L/R, matching the batch path's
+        // shared onset detection in stretch_mid_side().
+        let shared_onsets: Option<(Vec<usize>, Vec<f32>)> = if num_channels == 2
+            && self.params.stereo_mode == StereoMode::MidSide
+            && !self.hybrid_state.rolling_scratch[0].is_empty()
+        {
+            let mid = &self.hybrid_state.rolling_scratch[0];
+            let fft = self.params.fft_size.min(2048);
+            let hop = self.params.hop_size.min(512);
+            let map = detect_transients_with_options(
+                mid,
+                self.params.sample_rate,
+                fft,
+                hop,
+                self.params.transient_sensitivity,
+                TransientDetectionOptions::from_stretch_params(&self.params),
+            );
+            let onsets = map.onsets.clone();
+            let strengths = if map.strengths.len() == onsets.len() {
+                map.strengths.clone()
+            } else {
+                vec![1.0; onsets.len()]
+            };
+            Some((onsets, strengths))
+        } else {
+            None
+        };
+
+        // Phase 3: Process each channel and extract deltas.
+        for ch in 0..num_channels {
+            let rendered = if let Some((ref onsets, ref strengths)) = shared_onsets {
+                self.hybrid_state.stretchers[ch].process_with_onsets(
+                    &self.hybrid_state.rolling_scratch[ch],
+                    onsets,
+                    strengths,
+                )?
+            } else {
+                self.hybrid_state.stretchers[ch].process(&self.hybrid_state.rolling_scratch[ch])?
+            };
+            let skip = self.hybrid_state.tail_output_lens[ch].min(rendered.len());
+            let delta_len = rendered.len().saturating_sub(skip);
+
+            if self.channel_output_buffers[ch].capacity() < delta_len {
+                return Err(StretchError::BufferOverflow {
+                    buffer: "stream_hybrid_output",
+                    requested: delta_len,
+                    available: self.channel_output_buffers[ch].capacity(),
+                });
+            }
+
+            self.hybrid_state.pre_trim_lens[ch] = self.hybrid_state.rolling_scratch[ch].len();
+            self.hybrid_state.rendered_lens[ch] = rendered.len();
+
+            self.channel_output_buffers[ch].clear();
+
+            // Cross-fade at the chunk boundary to smooth phase discontinuities.
+            // The hybrid stretcher creates a fresh PV on each call, so the
+            // absolute phase of the rendered output may differ between
+            // consecutive calls for the overlapping tail region. Without
+            // cross-fading, this creates clicks at chunk boundaries.
+            //
+            // Scale crossfade with the stretch ratio: larger ratios produce
+            // synthesis frames farther apart, amplifying phase divergence
+            // between consecutive PV renderings.
+            let ratio_scale = self.hybrid_state.last_ratio.max(1.0);
+            let xfade_base =
+                (HYBRID_STREAM_CROSSFADE_SAMPLES as f64 * ratio_scale).round() as usize;
+            let xfade = xfade_base.min(skip).min(delta_len * 7 / 8);
+            let held = &self.hybrid_state.crossfade_held[ch];
+            if !held.is_empty() && xfade > 0 {
+                // Cross-fade: blend the held-back samples (previous delta end)
+                // with the current rendering's prediction of that region
+                // (rendered[skip-xfade..skip]).
+                let overlap = &rendered[skip - xfade..skip];
+                let n = held.len().min(xfade).min(overlap.len());
+
+                // Adaptive crossfade: when held and overlap have very
+                // different content (low correlation), a transient likely
+                // appeared in one region but not the other.  A long
+                // crossfade would smear the transient's attack, hurting
+                // TP.  Shorten the crossfade to preserve sharpness while
+                // still preventing clicks.
+                let actual_xfade = if n >= 128 && (self.hybrid_state.last_ratio - 1.0).abs() > 0.1 {
+                    let check = n.min(256);
+                    let (mut dot, mut he, mut oe) = (0.0f64, 0.0f64, 0.0f64);
+                    for i in 0..check {
+                        let h = held[i] as f64;
+                        let o = overlap[i] as f64;
+                        dot += h * o;
+                        he += h * h;
+                        oe += o * o;
+                    }
+                    let denom = (he * oe).sqrt();
+                    let corr = if denom > 1e-12 {
+                        (dot / denom).clamp(-1.0, 1.0)
+                    } else {
+                        1.0
+                    };
+
+                    if corr > 0.8 {
+                        // High-correlation tonal content: the two renderings
+                        // have similar magnitudes but potentially different PV
+                        // phases. A long crossfade blends two phase-mismatched
+                        // signals, creating FM artifacts (amplitude modulation
+                        // that broadens spectral peaks and increases LSD).
+                        // A shorter crossfade reduces the affected region while
+                        // remaining smooth enough to avoid clicks.
+                        (n / 2).max(128)
+                    } else if corr < 0.3 {
+                        // Also require an energy imbalance to distinguish
+                        // a genuine transient onset (one region loud, the
+                        // other quiet) from normal PV phase divergence on
+                        // tonal content (both regions similarly loud but
+                        // phase-shifted).
+                        let h_rms = (he / check as f64).sqrt();
+                        let o_rms = (oe / check as f64).sqrt();
+                        let imbalance = h_rms.max(o_rms) / (h_rms.min(o_rms) + 1e-12);
+                        if imbalance > 4.0 {
+                            // Transient onset — shorten crossfade
+                            (n / 4).max(64)
+                        } else {
+                            n
+                        }
+                    } else {
+                        n
+                    }
+                } else {
+                    n
+                };
+
+                for i in 0..actual_xfade {
+                    let t = (i as f32 + 0.5) / actual_xfade as f32;
+                    let s = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
+                    self.channel_output_buffers[ch].push(held[i] * (1.0 - s) + overlap[i] * s);
+                }
+                // If crossfade was shortened, emit the remaining held
+                // samples directly to avoid dropping the transient tail.
+                if actual_xfade < n {
+                    self.channel_output_buffers[ch].extend_from_slice(&overlap[actual_xfade..n]);
+                }
+            }
+
+            // Always hold back a crossfade-sized tail, even on the first
+            // render (when skip=0 and xfade=0).  Without this, the first
+            // render emits all output with no holdback, creating a raw
+            // waveform splice at the render-1→render-2 boundary.  That
+            // discontinuity triggers false onset detection in spectral-
+            // flux-based metrics.  By holding back on every render, the
+            // next render always has crossfade material available.
+            let holdback = xfade_base.min(delta_len * 7 / 8);
+
+            // Emit the new delta, holding back the tail for next cross-fade.
+            let emit_end = delta_len.saturating_sub(holdback);
+            self.channel_output_buffers[ch].extend_from_slice(&rendered[skip..skip + emit_end]);
+
+            // Save the tail for the next cross-fade.
+            let held_tail = &mut self.hybrid_state.crossfade_held[ch];
+            held_tail.clear();
+            held_tail.extend_from_slice(&rendered[skip + emit_end..skip + delta_len]);
+
+            min_output_len = min_output_len.min(self.channel_output_buffers[ch].len());
+        }
+
+        self.hybrid_state.input_accumulated = 0;
+        self.hybrid_state.retain_tail();
+        self.hybrid_state
+            .update_tail_output_estimates_from_rendered();
+
+        Ok(if min_output_len == usize::MAX {
+            0
+        } else {
+            min_output_len
+        })
     }
 
     fn flush_vocoder_tails_to_pending(&mut self, num_channels: usize) -> Result<(), StretchError> {
@@ -2522,137 +1446,57 @@ impl StreamProcessor {
     /// for invalid values.
     pub fn try_set_stretch_ratio(&mut self, ratio: f64) -> Result<(), StretchError> {
         let ratio = validate_positive_finite_ratio(ratio, "stretch ratio")?;
+        if (ratio - self.target_ratio).abs() > RATIO_SNAP_THRESHOLD {
+            self.hybrid_pending_rebase = true;
+        }
         self.target_ratio = ratio;
         Ok(())
     }
 
-    /// Explicitly enables or disables dual-plane backend preference for deterministic mode.
+    /// Enables or disables the legacy rolling-window hybrid re-render mode.
     ///
-    /// Change before streaming begins.
-    pub fn set_dual_plane_deterministic(&mut self, enabled: bool) -> Result<(), StretchError> {
-        if !self.is_fresh_stream() {
-            return Err(StretchError::InvalidState(
-                "set_dual_plane_deterministic requires a fresh stream (call reset first)",
-            ));
+    /// This is equivalent to selecting
+    /// [`StreamingEngine::LegacyHybridRerender`] when enabled and
+    /// [`StreamingEngine::Deterministic`] when disabled.
+    pub fn set_hybrid_mode(&mut self, enabled: bool) {
+        if enabled && !self.use_hybrid {
+            self.hybrid_state.reset(
+                &self.params,
+                self.current_ratio,
+                self.capacity_frames_per_channel,
+            );
+            self.hybrid_pending_rebase = false;
         }
+        if self.use_hybrid != enabled {
+            self.reset_pitch_resamplers();
+        }
+        self.use_hybrid = enabled;
+    }
 
-        self.dual_plane_preferred = enabled;
-        if enabled {
-            if !dual_plane_supports_pitch_scale(self.pitch_scale) {
-                return Err(StretchError::InvalidState(
-                    "dual-plane deterministic backend requires finite positive pitch_scale",
-                ));
-            }
-            let state =
-                DualPlaneDeterministicState::from_params(&self.params, self.processing_ratio())?;
-            self.dual_plane_deterministic = Some(state);
+    /// Returns whether hybrid processing mode is enabled.
+    pub fn is_hybrid_mode(&self) -> bool {
+        self.use_hybrid
+    }
+
+    /// Selects the streaming engine implementation.
+    ///
+    /// [`StreamingEngine::Deterministic`] is the recommended real-time path.
+    /// [`StreamingEngine::LegacyHybridRerender`] keeps the previous
+    /// rolling-window hybrid behavior as an explicit opt-in mode.
+    pub fn set_streaming_engine(&mut self, engine: StreamingEngine) {
+        match engine {
+            StreamingEngine::Deterministic => self.set_hybrid_mode(false),
+            StreamingEngine::LegacyHybridRerender => self.set_hybrid_mode(true),
+        }
+    }
+
+    /// Returns the currently selected streaming engine.
+    pub fn streaming_engine(&self) -> StreamingEngine {
+        if self.use_hybrid {
+            StreamingEngine::LegacyHybridRerender
         } else {
-            self.dual_plane_deterministic = None;
+            StreamingEngine::Deterministic
         }
-        Ok(())
-    }
-
-    /// Returns whether deterministic processing is delegated to dual-plane RT.
-    pub fn is_dual_plane_deterministic(&self) -> bool {
-        self.dual_plane_deterministic.is_some()
-    }
-
-    /// Sets the deterministic dual-plane latency profile.
-    pub fn set_deterministic_latency_profile(
-        &mut self,
-        profile: LatencyProfile,
-    ) -> Result<(), StretchError> {
-        if self.fixed_flush_pending {
-            return Err(StretchError::InvalidState(
-                "deterministic latency profile cannot change until fixed-buffer flush output is fully drained",
-            ));
-        }
-        self.ensure_default_dual_plane_backend();
-        let Some(state) = self.dual_plane_deterministic.as_mut() else {
-            return Err(StretchError::InvalidState(
-                "dual-plane deterministic backend is unavailable",
-            ));
-        };
-        state.processor.set_latency_profile(profile);
-        Ok(())
-    }
-
-    /// Enables or disables deterministic dual-plane auto profile switching.
-    pub fn set_deterministic_auto_profile_switching(
-        &mut self,
-        enabled: bool,
-    ) -> Result<(), StretchError> {
-        if self.fixed_flush_pending {
-            return Err(StretchError::InvalidState(
-                "deterministic auto profile switching cannot change until fixed-buffer flush output is fully drained",
-            ));
-        }
-        self.ensure_default_dual_plane_backend();
-        let Some(state) = self.dual_plane_deterministic.as_mut() else {
-            return Err(StretchError::InvalidState(
-                "dual-plane deterministic backend is unavailable",
-            ));
-        };
-        state.processor.set_auto_profile_switching(enabled);
-        Ok(())
-    }
-
-    /// Returns deterministic dual-plane profile telemetry when active.
-    pub fn deterministic_profile_telemetry(&self) -> Option<RtProfileTelemetry> {
-        self.dual_plane_deterministic
-            .as_ref()
-            .map(|state| state.processor.profile_telemetry())
-    }
-
-    /// Returns cumulative deterministic dual-plane runtime telemetry when active.
-    pub fn deterministic_runtime_telemetry(&self) -> Option<RtRuntimeTelemetry> {
-        self.dual_plane_deterministic
-            .as_ref()
-            .map(|state| state.processor.runtime_telemetry())
-    }
-
-    /// Returns exact deterministic dual-plane delay telemetry when active.
-    pub fn deterministic_delay_telemetry(&self) -> Option<RtDelayTelemetry> {
-        self.dual_plane_deterministic.as_ref().map(|state| {
-            let mut telemetry = state.processor.delay_telemetry();
-            // Account for host-visible samples already moved above the RT
-            // core into the stream-layer pending ring.
-            telemetry.buffered_output_frames = telemetry
-                .buffered_output_frames
-                .saturating_add(self.pending_output.len() / self.params.channels.count().max(1));
-            telemetry.total_frames = telemetry
-                .algorithmic_frames
-                .saturating_add(telemetry.buffered_input_frames)
-                .saturating_add(telemetry.buffered_output_frames)
-                .saturating_add(telemetry.profile_frames)
-                .saturating_add(telemetry.tier_frames);
-            telemetry
-        })
-    }
-
-    /// Returns the exact current host-visible delay in audio frames for deterministic mode.
-    ///
-    /// This includes algorithmic delay, buffered input/output, and current
-    /// profile/tier contributions. Returns `None` when deterministic
-    /// dual-plane telemetry is unavailable.
-    pub fn current_delay_frames(&self) -> Option<usize> {
-        self.deterministic_delay_telemetry()
-            .map(|telemetry| telemetry.total_frames)
-    }
-
-    /// Returns the exact current host-visible delay in audio frames for deterministic mode.
-    ///
-    /// This historical alias returns the same frame count as
-    /// [`StreamProcessor::current_delay_frames`], not an interleaved scalar
-    /// sample count.
-    pub fn current_delay_samples(&self) -> Option<usize> {
-        self.current_delay_frames()
-    }
-
-    /// Returns the exact current host-visible delay in seconds for deterministic mode.
-    pub fn current_delay_secs(&self) -> Option<f64> {
-        self.current_delay_frames()
-            .map(|frames| frames as f64 / self.params.sample_rate as f64)
     }
 
     /// Returns cumulative transient-reset telemetry for the current stream.
@@ -2666,6 +1510,24 @@ impl StreamProcessor {
             reset_band_counts_total,
             input_frames_consumed_total: self.input_frames_consumed_total,
         }
+    }
+
+    /// Enables or disables strict realtime-safe behavior while hybrid mode is on.
+    ///
+    /// Strict mode routes processing through the preallocated PV stream path to
+    /// guarantee no heap growth in callbacks. This flag only matters when
+    /// [`StreamingEngine::LegacyHybridRerender`] is selected.
+    pub fn set_hybrid_realtime_strict(&mut self, enabled: bool) {
+        if self.hybrid_realtime_strict != enabled {
+            self.hybrid_pending_rebase = true;
+            self.reset_pitch_resamplers();
+        }
+        self.hybrid_realtime_strict = enabled;
+    }
+
+    /// Returns whether strict realtime-safe hybrid mode is enabled.
+    pub fn is_hybrid_realtime_strict(&self) -> bool {
+        self.hybrid_realtime_strict
     }
 
     /// Changes the target BPM, smoothly adjusting the stretch ratio.
@@ -2683,18 +1545,14 @@ impl StreamProcessor {
     ///
     /// Stream mode applies pitch scale by rendering with an internal stretch
     /// ratio of `stretch_ratio * pitch_scale` and then resampling the rendered
-    /// stream per channel by `1.0 / pitch_scale` to preserve target tempo. If
-    /// a fixed-buffer flush drain is active, the change takes effect after the
-    /// remaining tail has been fully drained.
+    /// stream per channel by `1.0 / pitch_scale` to preserve target tempo.
     pub fn set_pitch_scale(&mut self, scale: f64) -> Result<(), StretchError> {
         let scale = validate_positive_finite_ratio(scale, "pitch scale")?;
-        if self.fixed_flush_pending {
-            self.pending_pitch_scale = Some(scale);
-            return Ok(());
+        if (scale - self.pitch_scale).abs() > RATIO_SNAP_THRESHOLD {
+            self.hybrid_pending_rebase = true;
+            self.reset_pitch_resamplers();
         }
-
-        self.pending_pitch_scale = None;
-        self.apply_pitch_scale_now(scale);
+        self.pitch_scale = scale;
         Ok(())
     }
 
@@ -2738,31 +1596,14 @@ impl StreamProcessor {
         self.source_bpm.map(|src| src / self.target_ratio)
     }
 
-    /// Returns the minimum latency in audio frames.
-    ///
-    /// For exact current deterministic delay, use
-    /// [`StreamProcessor::current_delay_frames`] or
-    /// [`StreamProcessor::deterministic_delay_telemetry`].
-    pub fn latency_frames(&self) -> usize {
+    /// Returns the minimum latency in samples.
+    pub fn latency_samples(&self) -> usize {
         min_latency_frames(self.params.fft_size)
     }
 
-    /// Returns the minimum latency in audio frames.
-    ///
-    /// This historical alias returns the same frame count as
-    /// [`StreamProcessor::latency_frames`], not an interleaved scalar sample
-    /// count.
-    pub fn latency_samples(&self) -> usize {
-        self.latency_frames()
-    }
-
     /// Returns the minimum latency in seconds.
-    ///
-    /// For exact current deterministic delay, use
-    /// [`StreamProcessor::current_delay_secs`] or
-    /// [`StreamProcessor::deterministic_delay_telemetry`].
     pub fn latency_secs(&self) -> f64 {
-        self.latency_frames() as f64 / self.params.sample_rate as f64
+        self.latency_samples() as f64 / self.params.sample_rate as f64
     }
 
     /// Resets the processor state.
@@ -2782,24 +1623,18 @@ impl StreamProcessor {
         self.initialized = false;
         self.transient_scheduler.reset();
         self.input_frames_consumed_total = 0;
-        self.input_energy_ema = 0.0;
-        self.output_energy_ema = 0.0;
-        self.energy_gain = 1.0;
 
         self.vocoders = Self::create_vocoders(&self.params, self.params.stretch_ratio);
+        self.hybrid_state.reset(
+            &self.params,
+            self.params.stretch_ratio,
+            self.capacity_frames_per_channel,
+        );
+        self.hybrid_pending_rebase = false;
         self.expected_total_output_samples = 0.0;
         self.total_output_emitted_samples = 0;
         self.pitch_scale = 1.0;
         self.reset_pitch_resamplers();
-        self.fixed_flush_pending = false;
-        self.fixed_flush_source_exhausted = false;
-        self.fixed_flush_pitch_tail_flushed = false;
-        self.fixed_flush_length_reconciled = false;
-        self.fixed_flush_scratch.clear();
-        self.pending_pitch_scale = None;
-
-        self.dual_plane_deterministic = None;
-        self.ensure_default_dual_plane_backend();
     }
 
     fn update_vocoder_ratio(&mut self) {
@@ -2809,16 +1644,6 @@ impl StreamProcessor {
                 voc.set_stretch_ratio(processing_ratio);
             }
             self.vocoder_ratio = processing_ratio;
-        }
-    }
-
-    fn apply_pitch_scale_now(&mut self, scale: f64) {
-        if (scale - self.pitch_scale).abs() > RATIO_SNAP_THRESHOLD {
-            self.reset_pitch_resamplers();
-        }
-        self.pitch_scale = scale;
-        if dual_plane_supports_pitch_scale(scale) {
-            self.ensure_default_dual_plane_backend();
         }
     }
 
@@ -2833,15 +1658,10 @@ impl StreamProcessor {
         }
 
         let stereo = &self.interleaved_scratch[..total_samples];
-        let suppress_low_bands = self.transient_reset_should_hold_low_bands();
-        let modulation_overlap_windows =
-            self.transient_reset_modulation_overlap_windows(suppress_low_bands);
-        let Some(reset_mask) = self.transient_scheduler.detect_stereo_reset_mask(
-            stereo,
-            self.input_frames_consumed_total,
-            suppress_low_bands,
-            modulation_overlap_windows,
-        ) else {
+        let Some(reset_mask) = self
+            .transient_scheduler
+            .detect_stereo_reset_mask(stereo, self.input_frames_consumed_total, false, 0)
+        else {
             return;
         };
 
@@ -2857,61 +1677,6 @@ impl StreamProcessor {
         for vocoder in &mut self.vocoders {
             vocoder.reset_phase_state_bands(reset_mask, self.params.sample_rate);
         }
-    }
-
-    #[inline]
-    fn transient_reset_should_hold_low_bands(&self) -> bool {
-        let ratio_delta = (self.target_ratio - self.current_ratio).abs();
-        if ratio_delta <= 0.015 {
-            return false;
-        }
-
-        let near_unity_transition =
-            transient_reset_near_unity_transition(self.current_ratio, self.target_ratio);
-        if near_unity_transition {
-            return true;
-        }
-
-        let current_side = ratio_modulation_side(self.current_ratio);
-        let target_side = ratio_modulation_side(self.target_ratio);
-        if current_side != 0 && target_side != 0 && current_side != target_side {
-            return true;
-        }
-
-        current_side != 0
-            && current_side == target_side
-            && (self.target_ratio - 1.0).abs() < (self.current_ratio - 1.0).abs()
-    }
-
-    #[inline]
-    fn transient_reset_modulation_overlap_windows(&self, suppress_low_bands: bool) -> usize {
-        if !suppress_low_bands {
-            return 0;
-        }
-
-        let ratio_delta = (self.target_ratio - self.current_ratio).abs();
-        let scaled = (ratio_delta / TRANSIENT_RESET_MODULATION_OVERLAP_RATIO_RANGE).clamp(0.0, 1.0);
-        let mut overlap_windows = TRANSIENT_RESET_MODULATION_BASE_OVERLAP_WINDOWS
-            + ((TRANSIENT_RESET_MODULATION_MAX_EXTRA_OVERLAP_WINDOWS as f64) * scaled).round()
-                as usize;
-
-        let near_unity_transition =
-            transient_reset_near_unity_transition(self.current_ratio, self.target_ratio);
-        let current_side = ratio_modulation_side(self.current_ratio);
-        let target_side = ratio_modulation_side(self.target_ratio);
-        let crosses_unity = current_side != 0 && target_side != 0 && current_side != target_side;
-        let rebounds_toward_unity = current_side != 0
-            && current_side == target_side
-            && (self.target_ratio - 1.0).abs() < (self.current_ratio - 1.0).abs();
-
-        if near_unity_transition || crosses_unity || rebounds_toward_unity {
-            overlap_windows = overlap_windows.max(
-                TRANSIENT_RESET_MODULATION_BASE_OVERLAP_WINDOWS
-                    + TRANSIENT_RESET_MODULATION_SEAM_MIN_EXTRA_OVERLAP_WINDOWS,
-            );
-        }
-
-        overlap_windows
     }
 
     /// Returns the BPM stored in the params, if any.
@@ -3168,12 +1933,10 @@ mod tests {
     fn test_stream_processor_latency() {
         let params = StretchParams::new(1.0)
             .with_sample_rate(44100)
-            .with_channels(2)
             .with_fft_size(4096);
 
         let proc = StreamProcessor::new(params);
         // 4096 * 3 / 2 = 6144 (1.5x FFT size for reduced latency)
-        assert_eq!(proc.latency_frames(), 6144);
         assert_eq!(proc.latency_samples(), 6144);
         assert!((proc.latency_secs() - 6144.0 / 44100.0).abs() < 1e-6);
     }
@@ -3242,90 +2005,13 @@ mod tests {
         }
 
         // A sine wave at 440 Hz has max sample-to-sample diff of about
-        // 2*pi*440/44100 ≈ 0.063. Allow up to 0.5 for phase vocoder artifacts,
-        // but clicks would show as 1.0+ jumps.
+        // 2*pi*440/44100 ≈ 0.063. Plain streaming can produce somewhat larger
+        // seam deltas during live ratio changes than the removed deterministic
+        // path, but obvious clicks still show up as near-full-scale jumps.
         assert!(
             max_diff < 1.0,
             "Detected likely click artifact: max sample diff = {} (expected < 1.0)",
             max_diff
-        );
-    }
-
-    #[test]
-    fn test_stream_processor_dual_plane_unity_exit_seam_is_smoothed() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(44_100)
-            .with_channels(1);
-        let mut proc = StreamProcessor::new(params);
-        assert!(proc.is_dual_plane_deterministic());
-
-        let chunk_size = 4096 * 2;
-        let signal: Vec<f32> = (0..chunk_size * 4)
-            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44_100.0).sin())
-            .collect();
-
-        let mut output = Vec::with_capacity(signal.len() * 2);
-        proc.process_into(&signal[..chunk_size * 3], &mut output)
-            .unwrap();
-        let boundary = output.len();
-        assert!(
-            boundary > 0,
-            "unity pre-roll should emit deterministic output"
-        );
-
-        proc.set_stretch_ratio(1.05).unwrap();
-        proc.process_into(&signal[chunk_size * 3..], &mut output)
-            .unwrap();
-
-        assert!(
-            output.len() > boundary,
-            "non-unity follow-up chunk should emit output after the unity exit"
-        );
-
-        let seam_diff = (output[boundary] - output[boundary - 1]).abs();
-        assert!(
-            seam_diff < 0.5,
-            "exact-unity exit should not hard-jump at the first non-unity output sample (diff={})",
-            seam_diff
-        );
-    }
-
-    #[test]
-    fn test_stream_processor_dual_plane_near_unity_exit_seam_is_smoothed() {
-        let params = StretchParams::new(1.003)
-            .with_sample_rate(44_100)
-            .with_channels(1);
-        let mut proc = StreamProcessor::new(params);
-        assert!(proc.is_dual_plane_deterministic());
-
-        let chunk_size = 4096 * 2;
-        let signal: Vec<f32> = (0..chunk_size * 4)
-            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44_100.0).sin())
-            .collect();
-
-        let mut output = Vec::with_capacity(signal.len() * 2);
-        proc.process_into(&signal[..chunk_size * 3], &mut output)
-            .unwrap();
-        let boundary = output.len();
-        assert!(
-            boundary > 0,
-            "near-unity pre-roll should emit deterministic output"
-        );
-
-        proc.set_stretch_ratio(1.03).unwrap();
-        proc.process_into(&signal[chunk_size * 3..], &mut output)
-            .unwrap();
-
-        assert!(
-            output.len() > boundary,
-            "off-unity follow-up chunk should emit output after the near-unity exit"
-        );
-
-        let seam_diff = (output[boundary] - output[boundary - 1]).abs();
-        assert!(
-            seam_diff < 0.5,
-            "near-unity exit should not hard-jump at the first post-plateau output sample (diff={})",
-            seam_diff
         );
     }
 
@@ -3485,9 +2171,7 @@ mod tests {
         let input: Vec<f32> = (0..44100)
             .map(|i| (2.0 * PI * freq * i as f32 / 44100.0).sin() * 0.8)
             .collect();
-        // `process_into` is fixed-capacity; reserve generous headroom so this
-        // test validates deterministic routing/output, not buffer sizing.
-        let mut output = Vec::with_capacity(input.len() * 8);
+        let mut output = Vec::with_capacity(input.len() * 2);
         for chunk in input.chunks(1024) {
             proc.process_into(chunk, &mut output).unwrap();
         }
@@ -3572,1206 +2256,54 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_processor_dual_plane_deterministic_toggle() {
-        let params = StretchParams::new(1.02)
-            .with_sample_rate(44_100)
-            .with_channels(2);
-        let mut proc = StreamProcessor::new(params);
-        assert!(proc.is_dual_plane_deterministic());
-        proc.set_dual_plane_deterministic(false).unwrap();
-        assert!(!proc.is_dual_plane_deterministic());
-        proc.set_dual_plane_deterministic(true).unwrap();
-        assert!(proc.is_dual_plane_deterministic());
-    }
-
-    #[test]
-    fn test_stream_processor_dual_plane_deterministic_requires_fresh_stream() {
-        let params = StretchParams::new(1.02)
-            .with_sample_rate(44_100)
-            .with_channels(2);
-        let mut proc = StreamProcessor::new(params);
-        let input = vec![0.0f32; 256 * 2];
-        let _ = proc.process(&input).unwrap();
-        let err = proc.set_dual_plane_deterministic(true).unwrap_err();
-        assert!(matches!(err, StretchError::InvalidState(_)));
-    }
-
-    #[test]
-    fn test_stream_processor_dual_plane_deterministic_accepts_pitch_scale() {
-        let params = StretchParams::new(1.02)
-            .with_sample_rate(44_100)
-            .with_channels(2);
-        let mut proc = StreamProcessor::new(params);
-        assert!(proc.is_dual_plane_deterministic());
-        proc.set_pitch_scale(1.05).unwrap();
-        assert!(proc.is_dual_plane_deterministic());
-    }
-
-    #[test]
-    fn test_stream_processor_dual_plane_deterministic_keeps_backend_on_pitch_scale_after_stream_start(
-    ) {
-        let params = StretchParams::new(1.02)
-            .with_sample_rate(44_100)
-            .with_channels(2);
-        let mut proc = StreamProcessor::new(params);
-        let input = vec![0.0f32; 256 * 2];
-        let _ = proc.process(&input).unwrap();
-        proc.set_pitch_scale(1.05).unwrap();
-        assert!(proc.is_dual_plane_deterministic());
-    }
-
-    #[test]
-    fn test_stream_processor_dual_plane_unity_passthrough_reengages_after_ratio_roundtrip() {
+    fn test_stream_processor_hybrid_mode_default() {
         let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-        assert!(proc.is_dual_plane_deterministic());
-
-        let frames = 256usize;
-        let mut input = vec![0.0f32; frames * 2];
-        for i in 0..frames {
-            input[i * 2] = (i as f32 * 0.011).sin() * 0.35;
-            input[i * 2 + 1] = (i as f32 * 0.019).cos() * 0.28;
-        }
-
-        let mut output = Vec::with_capacity(input.len() * 16);
-        proc.set_stretch_ratio(1.35).unwrap();
-        for _ in 0..8 {
-            proc.process_into(&input, &mut output).unwrap();
-        }
-
-        proc.set_stretch_ratio(1.0).unwrap();
-        for _ in 0..300 {
-            proc.interpolate_ratio();
-        }
-
-        let before = output.len();
-        proc.process_into(&input, &mut output).unwrap();
-        let produced = &output[before..];
-        assert_eq!(produced.len(), input.len());
-        assert_eq!(produced, &input[..]);
-    }
-
-    #[test]
-    fn test_dual_plane_deterministic_ratio_history_resets_on_cross_unity_modulation() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        let first_average = state.push_chunk_ratio(1.035, 1.035);
-        assert!((first_average - 1.035).abs() < 1e-9);
-        let plateau_average = state.push_chunk_ratio(1.025, 1.025);
-        assert!((plateau_average - 1.03).abs() < 1e-9);
-        assert_eq!(state.recent_chunk_ratios.len(), 2);
-
-        let cross_unity_average = state.push_chunk_ratio(0.965, 0.965);
-        assert!(
-            (cross_unity_average - 0.965).abs() < 1e-9,
-            "cross-unity modulation should clear stale opposite-side history before averaging"
-        );
-        assert_eq!(state.recent_chunk_ratios, vec![0.965]);
-    }
-
-    #[test]
-    fn test_dual_plane_deterministic_ratio_history_resets_on_requested_cross_unity() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        let first_average = state.push_chunk_ratio(1.035, 1.035);
-        assert!((first_average - 1.035).abs() < 1e-9);
-        let plateau_average = state.push_chunk_ratio(1.025, 1.025);
-        assert!((plateau_average - 1.03).abs() < 1e-9);
-        assert_eq!(state.recent_chunk_ratios.len(), 2);
-
-        let requested_cross_unity_average = state.push_chunk_ratio(1.012, 0.965);
-        assert!(
-            (requested_cross_unity_average - 1.012).abs() < 1e-9,
-            "an opposite-side modulation request should clear stale same-side history before the smoothed ratio fully crosses unity"
-        );
-        assert_eq!(
-            state.recent_chunk_ratios,
-            vec![1.012],
-            "requested cross-unity modulation should start a fresh averaging window from the first transition callback"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_deterministic_ratio_history_resets_on_requested_exact_unity() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        let first_average = state.push_chunk_ratio(1.035, 1.035);
-        assert!((first_average - 1.035).abs() < 1e-9);
-        let plateau_average = state.push_chunk_ratio(1.025, 1.025);
-        assert!((plateau_average - 1.03).abs() < 1e-9);
-        assert_eq!(state.recent_chunk_ratios.len(), 2);
-
-        let requested_unity_average = state.push_chunk_ratio(1.012, 1.0);
-        assert!(
-            (requested_unity_average - 1.012).abs() < 1e-9,
-            "an exact-unity request should clear stale same-side history before smoothing finishes returning to unity"
-        );
-        assert_eq!(
-            state.recent_chunk_ratios,
-            vec![1.012],
-            "a requested exact-unity plateau should start a fresh averaging window for the next modulation step"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_deterministic_ratio_history_resets_when_leaving_requested_exact_unity_plateau(
-    ) {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        assert!((state.push_chunk_ratio(1.035, 1.035) - 1.035).abs() < 1e-9);
-        assert!((state.push_chunk_ratio(1.025, 1.025) - 1.03).abs() < 1e-9);
-        assert_eq!(state.recent_chunk_ratios.len(), 2);
-
-        let requested_unity_average = state.push_chunk_ratio(1.012, 1.0);
-        assert!((requested_unity_average - 1.012).abs() < 1e-9);
-        let plateau_tail_average = state.push_chunk_ratio(1.004, 1.0);
-        assert!(
-            (plateau_tail_average - 1.004).abs() < 1e-9,
-            "each exact-unity hold callback should keep its own fresh averaging window"
-        );
-
-        let resumed_modulation_average = state.push_chunk_ratio(1.028, 1.028);
-        assert!(
-            (resumed_modulation_average - 1.028).abs() < 1e-9,
-            "leaving a requested exact-unity plateau should drop stale near-unity history before averaging resumes"
-        );
-        assert_eq!(
-            state.recent_chunk_ratios,
-            vec![1.028],
-            "the first post-plateau modulation callback should start a fresh same-side averaging window"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_deterministic_ratio_history_resets_on_requested_near_unity_plateau() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        assert!((state.push_chunk_ratio(1.035, 1.035) - 1.035).abs() < 1e-9);
-        assert!((state.push_chunk_ratio(1.025, 1.025) - 1.03).abs() < 1e-9);
-        assert_eq!(state.recent_chunk_ratios.len(), 2);
-
-        let requested_near_unity_average = state.push_chunk_ratio(1.012, 1.004);
-        assert!(
-            (requested_near_unity_average - 1.012).abs() < 1e-9,
-            "a near-unity request should clear the prior off-unity averaging window before smoothing finishes settling"
-        );
-        assert_eq!(
-            state.recent_chunk_ratios,
-            vec![1.012],
-            "the first near-unity hold callback should start a fresh averaging window"
-        );
-
-        let plateau_tail_average = state.push_chunk_ratio(1.006, 1.003);
-        assert!(
-            (plateau_tail_average - 1.006).abs() < 1e-9,
-            "each near-unity hold callback should keep its own fresh averaging window"
-        );
-
-        let resumed_below_unity_average = state.push_chunk_ratio(0.988, 0.965);
-        assert!(
-            (resumed_below_unity_average - 0.988).abs() < 1e-9,
-            "leaving a near-unity plateau should drop stale pre-plateau history before the next short burst"
-        );
-        assert_eq!(
-            state.recent_chunk_ratios,
-            vec![0.988],
-            "the first post-plateau callback should start a fresh opposite-side averaging window"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_deterministic_near_unity_plateau_snaps_to_exact_unity() {
-        let params = StretchParams::new(1.003)
-            .with_sample_rate(48_000)
-            .with_channels(1)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let state = DualPlaneDeterministicState::from_params(&params, 1.003).unwrap();
-
-        assert_eq!(
-            state.last_ratio, 1.0,
-            "deterministic near-unity startup should use the exact-unity RT ratio so tiny plateau callbacks do not churn the seam"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_deterministic_ratio_history_resets_across_repeated_unity_plateaus() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        assert!((state.push_chunk_ratio(1.035, 1.035) - 1.035).abs() < 1e-9);
-        assert!((state.push_chunk_ratio(1.025, 1.025) - 1.03).abs() < 1e-9);
-        assert_eq!(state.recent_chunk_ratios.len(), 2);
-
-        let first_unity_hold_average = state.push_chunk_ratio(1.012, 1.0);
-        assert!(
-            (first_unity_hold_average - 1.012).abs() < 1e-9,
-            "the first exact-unity hold callback should clear the prior off-unity averaging window"
-        );
-        let second_unity_hold_average = state.push_chunk_ratio(1.004, 1.0);
-        assert!(
-            (second_unity_hold_average - 1.004).abs() < 1e-9,
-            "each repeated exact-unity hold callback should keep its own fresh averaging window"
-        );
-
-        let first_below_unity_average = state.push_chunk_ratio(0.988, 0.965);
-        assert!(
-            (first_below_unity_average - 0.988).abs() < 1e-9,
-            "leaving a repeated exact-unity plateau should drop stale above-unity history before the first short below-unity burst"
-        );
-        let second_below_unity_average = state.push_chunk_ratio(0.976, 0.965);
-        assert!(
-            (second_below_unity_average - 0.982).abs() < 1e-9,
-            "the second callback of a short below-unity burst should average only against the current burst"
-        );
-
-        let third_unity_hold_average = state.push_chunk_ratio(0.994, 1.0);
-        assert!(
-            (third_unity_hold_average - 0.994).abs() < 1e-9,
-            "returning to exact unity should clear the short below-unity burst immediately"
-        );
-        let fourth_unity_hold_average = state.push_chunk_ratio(0.999, 1.0);
-        assert!(
-            (fourth_unity_hold_average - 0.999).abs() < 1e-9,
-            "repeated exact-unity callbacks should continue isolating their own averaging windows"
-        );
-
-        let resumed_above_unity_average = state.push_chunk_ratio(1.018, 1.025);
-        assert!(
-            (resumed_above_unity_average - 1.018).abs() < 1e-9,
-            "the first post-plateau callback of the next short above-unity burst should start a fresh same-side window"
-        );
-        assert_eq!(
-            state.recent_chunk_ratios,
-            vec![1.018],
-            "repeated exact-unity plateaus should prevent stale opposite-side history from leaking into the next short burst"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_deterministic_ratio_history_resets_on_requested_bounce_before_crossing_unity(
-    ) {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        assert!((state.push_chunk_ratio(1.035, 1.035) - 1.035).abs() < 1e-9);
-        assert!((state.push_chunk_ratio(1.025, 1.025) - 1.03).abs() < 1e-9);
-        assert_eq!(state.recent_chunk_ratios.len(), 2);
-
-        let toward_below_unity = state.push_chunk_ratio(1.012, 0.965);
-        assert!(
-            (toward_below_unity - 1.012).abs() < 1e-9,
-            "a requested cross-unity move should start a fresh window immediately even before the applied ratio crosses unity"
-        );
-        assert_eq!(state.recent_chunk_ratios, vec![1.012]);
-
-        let bounced_back_above_unity = state.push_chunk_ratio(1.021, 1.03);
-        assert!(
-            (bounced_back_above_unity - 1.021).abs() < 1e-9,
-            "a one-callback bounce back above unity should not average against the stale pre-bounce transition history"
-        );
-        assert_eq!(
-            state.recent_chunk_ratios,
-            vec![1.021],
-            "rapid requested direction flips should segment ratio history by requested modulation side, not by the still-lagging applied ratio"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_deterministic_ratio_history_resets_on_same_side_requested_turnaround() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        assert!((state.push_chunk_ratio(1.035, 1.035) - 1.035).abs() < 1e-9);
-        assert!((state.push_chunk_ratio(1.028, 1.028) - 1.0315).abs() < 1e-9);
-        assert!((state.push_chunk_ratio(1.020, 1.020) - 1.0276666666666667).abs() < 1e-9);
-
-        let turned_back_up = state.push_chunk_ratio(1.024, 1.024);
-        assert!(
-            (turned_back_up - 1.024).abs() < 1e-9,
-            "same-side requested turnaround should reset stale descending history instead of averaging through the pivot"
-        );
-        assert_eq!(
-            state.recent_chunk_ratios,
-            vec![1.024],
-            "same-side turnaround should start a fresh averaging window at the pivot callback"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_fresh_ratio_window_uses_faster_apply_smoothing() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        let averaged = state.push_chunk_ratio(1.028, 1.028);
-        assert_eq!(state.recent_chunk_ratios, vec![1.028]);
-        assert_eq!(
-            state.ratio_apply_smoothing_time_secs(),
-            DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_TIME_SECS,
-            "the first callback of a fresh modulation window should use the shorter apply slew"
-        );
-
-        let burst_applied = smooth_ratio_toward(
-            state.last_ratio,
-            averaged,
-            COMMON_CALLBACK_FRAMES,
-            params.sample_rate,
-            state.ratio_apply_smoothing_time_secs(),
-        );
-        let default_applied = smooth_ratio_toward(
-            state.last_ratio,
-            averaged,
-            COMMON_CALLBACK_FRAMES,
-            params.sample_rate,
-            DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS,
-        );
-        assert!(
-            burst_applied > default_applied,
-            "the shorter first-window apply slew should converge more quickly toward the fresh modulation burst"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_second_fresh_ratio_window_callback_keeps_burst_apply_smoothing() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        state.push_chunk_ratio(1.028, 1.028);
-        state.last_ratio = 1.020;
-        state.push_chunk_ratio(1.024, 1.024);
-
-        assert_eq!(state.recent_chunk_ratios.len(), 2);
-        assert_eq!(
-            state.ratio_apply_smoothing_time_secs(),
-            DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_TIME_SECS,
-            "the second callback of a fresh modulation window should keep the shorter apply slew so short bursts converge before the seam ends"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_third_fresh_ratio_window_callback_keeps_burst_apply_smoothing() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        state.push_chunk_ratio(1.028, 1.028);
-        state.last_ratio = 1.020;
-        state.push_chunk_ratio(1.024, 1.024);
-        state.last_ratio = 1.022;
-        state.push_chunk_ratio(1.021, 1.021);
-
-        assert_eq!(state.recent_chunk_ratios.len(), 3);
-        assert_eq!(
-            state.ratio_apply_smoothing_time_secs(),
-            DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_TIME_SECS,
-            "the third callback of a fresh modulation window should keep the shorter apply slew so short automation bursts do not relax back into the steady-state lag mid-seam"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_established_ratio_window_keeps_default_apply_smoothing() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        state.push_chunk_ratio(1.028, 1.028);
-        state.last_ratio = 1.020;
-        state.push_chunk_ratio(1.024, 1.024);
-        state.last_ratio = 1.022;
-        state.push_chunk_ratio(1.021, 1.021);
-        state.last_ratio = 1.0215;
-        state.push_chunk_ratio(1.0205, 1.0205);
-
-        assert_eq!(state.recent_chunk_ratios.len(), 4);
-        assert_eq!(
-            state.ratio_apply_smoothing_time_secs(),
-            DUAL_PLANE_RATIO_APPLY_SMOOTHING_TIME_SECS,
-            "once the fresh modulation window has more than three callbacks, deterministic apply smoothing should fall back to the steady-state slew"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_established_ratio_window_keeps_burst_apply_smoothing_while_lagging_target() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        state.push_chunk_ratio(1.028, 1.028);
-        state.last_ratio = 1.020;
-        state.push_chunk_ratio(1.024, 1.024);
-        state.last_ratio = 1.022;
-        state.push_chunk_ratio(1.021, 1.021);
-        state.last_ratio = 1.012;
-        state.push_chunk_ratio(1.0205, 1.0205);
-
-        assert_eq!(state.recent_chunk_ratios.len(), 4);
-        assert_eq!(
-            state.ratio_apply_smoothing_time_secs(),
-            DUAL_PLANE_RATIO_APPLY_SMOOTHING_BURST_TIME_SECS,
-            "an established modulation window should keep the shorter apply slew while the applied ratio still materially trails the requested burst"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_unity_exit_seam_requires_real_prior_output() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(1)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        state.arm_unity_exit_seam(64);
-        assert!(
-            !state.pending_unity_exit_seam,
-            "unity-exit seam smoothing should stay idle until deterministic output has produced a real anchor sample"
-        );
-
-        let channel_output_buffers = [vec![0.125, -0.25, 0.375]];
-        state.capture_last_output_samples(&channel_output_buffers, 3);
-        assert!(
-            state.has_last_output_samples,
-            "capturing deterministic output should arm a real seam anchor for later unity exits"
-        );
-
-        state.arm_unity_exit_seam(64);
-        assert!(
-            state.pending_unity_exit_seam,
-            "once deterministic output has emitted audio, the next exact-unity exit should carry the captured seam anchor"
-        );
-        assert!(
-            (state.unity_exit_seam_samples[0] - 0.375).abs() < 1e-12,
-            "unity-exit seam smoothing should anchor from the last emitted sample instead of an initial placeholder"
-        );
-        assert_eq!(
-            state.pending_unity_exit_seam_frames, 64,
-            "arming a unity-exit seam should preserve the requested adaptive ramp length"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_ratio_history_reset_clears_pending_near_unity_exit_seam() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(1)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        let channel_output_buffers = [vec![0.125, -0.25, 0.375]];
-        state.capture_last_output_samples(&channel_output_buffers, 3);
-        state.arm_unity_exit_seam(64);
-        assert!(
-            state.pending_unity_exit_seam,
-            "test setup should arm the carried seam anchor before entering a near-unity plateau"
-        );
-
-        state.reset_ratio_history(1.003);
-        assert!(
-            !state.pending_unity_exit_seam,
-            "entering the near-unity reset zone should clear any stale carried seam before the next modulation burst"
-        );
-        assert_eq!(
-            state.pending_unity_exit_seam_frames, 0,
-            "clearing a near-unity seam should also drop any adaptive seam length from the previous burst"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_unity_exit_seam_carries_across_multiple_callbacks() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(1)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        let prior_output = [vec![0.4, 0.5, 0.6]];
-        state.capture_last_output_samples(&prior_output, 3);
-        state.arm_unity_exit_seam(8);
-
-        let mut first_callback = [vec![1.0, 1.0, 1.0]];
-        state.apply_pending_unity_exit_seam(&mut first_callback, 3);
-        assert!(
-            state.pending_unity_exit_seam,
-            "a multi-callback unity-exit seam should stay armed until the full ramp has been consumed"
-        );
-        assert_eq!(
-            state.pending_unity_exit_seam_progress_frames, 3,
-            "the carried seam should account for the frames already blended on the first callback"
-        );
-        assert!(
-            (first_callback[0][0] - (0.6 + (1.0 - 0.6) * (1.0 / 9.0) as f32)).abs() < 1e-6,
-            "the first callback should start blending from the anchored unity sample"
-        );
-        assert!(
-            (first_callback[0][2] - (0.6 + (1.0 - 0.6) * (3.0 / 9.0) as f32)).abs() < 1e-6,
-            "the first callback should advance the seam proportionally through the configured ramp"
-        );
-
-        let mut second_callback = [vec![1.0, 1.0, 1.0]];
-        state.apply_pending_unity_exit_seam(&mut second_callback, 3);
-        assert!(
-            state.pending_unity_exit_seam,
-            "the seam should remain active while ramp frames still remain after the second callback"
-        );
-        assert_eq!(
-            state.pending_unity_exit_seam_progress_frames, 6,
-            "the seam progress should accumulate across callbacks instead of restarting"
-        );
-        assert!(
-            (second_callback[0][0] - (0.6 + (1.0 - 0.6) * (4.0 / 9.0) as f32)).abs() < 1e-6,
-            "the second callback should resume from the prior seam progress instead of restarting at the anchor"
-        );
-        assert!(
-            (second_callback[0][2] - (0.6 + (1.0 - 0.6) * (6.0 / 9.0) as f32)).abs() < 1e-6,
-            "the carried seam should continue walking toward the target output over multiple callbacks"
-        );
-
-        let mut final_callback = [vec![1.0, 1.0, 1.0]];
-        state.apply_pending_unity_exit_seam(&mut final_callback, 3);
-        assert!(
-            !state.pending_unity_exit_seam,
-            "once the configured ramp length has been exhausted the carried seam should disarm"
-        );
-        assert_eq!(
-            state.pending_unity_exit_seam_frames, 0,
-            "finishing the seam should clear the stored ramp length"
-        );
-        assert_eq!(
-            state.pending_unity_exit_seam_progress_frames, 0,
-            "finishing the seam should reset the cumulative progress"
-        );
-        assert!(
-            (final_callback[0][0] - (0.6 + (1.0 - 0.6) * (7.0 / 9.0) as f32)).abs() < 1e-6,
-            "the final callback should pick up from the carried seam progress"
-        );
-        assert!(
-            (final_callback[0][1] - (0.6 + (1.0 - 0.6) * (8.0 / 9.0) as f32)).abs() < 1e-6,
-            "the penultimate seam frame should still be blended"
-        );
-        assert!(
-            (final_callback[0][2] - 1.0).abs() < 1e-6,
-            "frames beyond the configured seam length should remain at the target output"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_unity_exit_seam_rearm_preserves_inflight_progress() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(1)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        let prior_output = [vec![0.4, 0.5, 0.6]];
-        state.capture_last_output_samples(&prior_output, 3);
-        state.arm_unity_exit_seam(8);
-
-        let mut first_callback = [vec![1.0, 1.0, 1.0]];
-        state.apply_pending_unity_exit_seam(&mut first_callback, 3);
-        state.capture_last_output_samples(&first_callback, 3);
-
-        state.arm_unity_exit_seam(8);
-        assert!(
-            state.pending_unity_exit_seam,
-            "rearming a unity-exit seam mid-ramp should keep the seam active"
-        );
-        assert_eq!(
-            state.pending_unity_exit_seam_progress_frames, 3,
-            "rearming during short-interval modulation should preserve the already-drained seam progress"
-        );
-
-        let mut second_callback = [vec![1.0, 1.0, 1.0]];
-        state.apply_pending_unity_exit_seam(&mut second_callback, 3);
-        assert!(
-            (second_callback[0][0] - 0.8518519).abs() < 1e-6,
-            "a re-armed seam should resume from the in-flight progress using the latest emitted anchor instead of restarting from the boundary"
-        );
-        assert_eq!(
-            state.pending_unity_exit_seam_progress_frames, 6,
-            "the re-armed seam should keep accumulating progress after resuming"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_unity_exit_seam_preserves_callback_shape() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(1)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        let prior_output = [vec![0.4, 0.5, 0.6]];
-        state.capture_last_output_samples(&prior_output, 3);
-        state.arm_unity_exit_seam(8);
-
-        let mut callback = [vec![1.0, 0.9, 0.8]];
-        state.apply_pending_unity_exit_seam(&mut callback, 3);
-
-        assert!(
-            (callback[0][0] - (0.6 + (1.0 - 0.6) * (1.0 / 9.0) as f32)).abs() < 1e-6,
-            "the first seam sample should still anchor from the prior unity sample"
-        );
-        assert!(
-            (callback[0][1] - (0.9 + (0.6 - 1.0) * (7.0 / 9.0) as f32)).abs() < 1e-6,
-            "the seam should preserve the new callback slope instead of flattening every sample toward the anchor"
-        );
-        assert!(
-            callback[0][1] > callback[0][2],
-            "the carried seam should keep a descending callback descending after the boundary"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_unity_exit_seam_extends_for_larger_ratio_jumps() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(1)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut state = DualPlaneDeterministicState::from_params(&params, 1.0).unwrap();
-
-        let channel_output_buffers = [vec![0.125, -0.25, 0.375]];
-        state.capture_last_output_samples(&channel_output_buffers, 3);
-
-        state.arm_unity_exit_seam(unity_exit_seam_frames(params.hop_size, 0.02));
-        let short_ramp = state.pending_unity_exit_seam_frames;
-
-        state.arm_unity_exit_seam(unity_exit_seam_frames(params.hop_size, 0.08));
-        let long_ramp = state.pending_unity_exit_seam_frames;
-
-        assert!(
-            long_ramp > short_ramp,
-            "larger post-unity ratio jumps should carry a longer deterministic seam ramp"
-        );
-        assert_eq!(
-            short_ramp,
-            80,
-            "small unity exits should stay close to the base seam ramp instead of jumping to the maximum"
-        );
-        assert_eq!(
-            long_ramp, 128,
-            "large unity exits should expand the deterministic seam ramp up to the configured cap"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_unity_exit_seam_uses_requested_jump_when_apply_smoothing_lags() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(1)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-
-        let applied_delta_frames = unity_exit_seam_frames(params.hop_size, 0.012);
-        let requested_delta_frames = unity_exit_seam_frames(
-            params.hop_size,
-            unity_exit_seam_ratio_delta(1.0, 1.012, 1.04),
-        );
-
-        assert_eq!(
-            applied_delta_frames, 74,
-            "test setup expects a small first applied ratio step to keep the legacy seam near the minimum"
-        );
-        assert_eq!(
-            requested_delta_frames, 96,
-            "unity exits should size the seam from the requested burst when smoothing still keeps the applied ratio close to unity"
-        );
-        assert!(
-            requested_delta_frames > applied_delta_frames,
-            "requested post-plateau jumps should extend the deterministic seam beyond the first smoothed ratio step"
-        );
-    }
-
-    #[test]
-    fn test_repeated_unity_plateau_exit_extends_deterministic_seam() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(1)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let ratio_delta = 0.035;
-
-        let single_plateau = repeated_unity_exit_seam_frames(params.hop_size, ratio_delta, 1);
-        let repeated_plateau = repeated_unity_exit_seam_frames(params.hop_size, ratio_delta, 2);
-
-        assert_eq!(
-            single_plateau,
-            unity_exit_seam_frames(params.hop_size, ratio_delta),
-            "a one-callback unity plateau should keep the baseline seam length"
-        );
-        assert_eq!(
-            repeated_plateau,
-            (single_plateau + DUAL_PLANE_REPEATED_UNITY_EXIT_SEAM_EXTRA_FRAMES)
-                .min(DUAL_PLANE_UNITY_EXIT_SEAM_MAX_FRAMES),
-            "repeated unity plateaus should hold the deterministic seam longer before the next burst"
-        );
-        assert!(
-            repeated_plateau > single_plateau,
-            "repeated unity plateaus should lengthen the post-plateau seam ramp"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_first_post_unity_callback_snaps_to_requested_ratio() {
-        assert!(
-            should_snap_dual_plane_first_post_unity_ratio(1.0, 1.035),
-            "the first callback after an exact-unity plateau should apply the requested above-unity ratio directly"
-        );
-        assert!(
-            should_snap_dual_plane_first_post_unity_ratio(0.997, 0.965),
-            "the first callback after a near-unity plateau should apply the requested below-unity ratio directly"
-        );
-        assert!(
-            !should_snap_dual_plane_first_post_unity_ratio(1.0, 1.003),
-            "near-unity hold callbacks should keep snapping parked at exact unity instead of rearming a post-plateau jump"
-        );
-        assert!(
-            !should_snap_dual_plane_first_post_unity_ratio(1.02, 1.035),
-            "once deterministic rendering has already left the unity reset zone, later callbacks should return to the normal apply smoothing path"
-        );
-    }
-
-    #[test]
-    fn test_transient_reset_modulation_overlap_windows_scale_with_ratio_jump() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-
-        proc.current_ratio = 1.0;
-        proc.target_ratio = 1.03;
-        let modest = proc.transient_reset_modulation_overlap_windows(true);
-
-        proc.target_ratio = 1.12;
-        let strong = proc.transient_reset_modulation_overlap_windows(true);
-
-        assert_eq!(
-            modest, 3,
-            "modest low-band-suppressed modulation should only add one extra overlap window"
-        );
-        assert_eq!(
-            strong, 4,
-            "larger low-band-suppressed modulation should extend duplicate-reset protection farther"
-        );
-        assert_eq!(
-            proc.transient_reset_modulation_overlap_windows(false),
-            0,
-            "when low bands are not being held, modulation overlap protection should stay disabled"
-        );
-    }
-
-    #[test]
-    fn test_transient_reset_modulation_overlap_windows_hold_extra_seam_window_near_unity() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-
-        proc.current_ratio = 1.001;
-        proc.target_ratio = 1.018;
-
-        assert_eq!(
-            proc.transient_reset_modulation_overlap_windows(true),
-            3,
-            "near-unity fast-modulation settles should keep one extra duplicate-reset hold window even when the instantaneous delta alone would round back to the base hold"
-        );
-    }
-
-    #[test]
-    fn test_transient_reset_modulation_overlap_windows_hold_extra_seam_window_just_after_unity_exit(
-    ) {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-
-        proc.current_ratio = 1.011;
-        proc.target_ratio = 1.04;
-
-        assert_eq!(
-            proc.transient_reset_modulation_overlap_windows(true),
-            3,
-            "the first callback after leaving a unity plateau should keep one extra overlap window while the seam is still near unity"
-        );
-    }
-
-    #[test]
-    fn test_transient_reset_modulation_overlap_windows_hold_extra_seam_window_on_same_side_rebound()
-    {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-
-        proc.current_ratio = 1.08;
-        proc.target_ratio = 1.02;
-
-        assert_eq!(
-            proc.transient_reset_modulation_overlap_windows(true),
-            3,
-            "same-side rebounds toward unity should keep one extra overlap window so a draining seam is not reclassified as a fresh transient"
-        );
-    }
-
-    #[test]
-    fn test_transient_reset_hold_low_bands_just_after_unity_exit() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-
-        proc.current_ratio = 1.011;
-        proc.target_ratio = 1.04;
-        assert!(
-            proc.transient_reset_should_hold_low_bands(),
-            "the first same-side callback after leaving a unity plateau should keep low bands locked while the seam still sits near unity"
-        );
-
-        proc.current_ratio = 0.989;
-        proc.target_ratio = 0.96;
-        assert!(
-            proc.transient_reset_should_hold_low_bands(),
-            "compression exits should also keep low bands locked for the first callback after a unity plateau"
-        );
-    }
-
-    #[test]
-    fn test_transient_reset_hold_low_bands_on_same_side_rebound_toward_unity() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-
-        proc.current_ratio = 1.12;
-        proc.target_ratio = 1.02;
-        assert!(
-            proc.transient_reset_should_hold_low_bands(),
-            "same-side rebounds toward unity should keep low bands locked while the prior expansion seam drains"
-        );
-
-        proc.current_ratio = 0.88;
-        proc.target_ratio = 0.98;
-        assert!(
-            proc.transient_reset_should_hold_low_bands(),
-            "same-side rebounds toward unity should also hold low bands during compression recovery"
-        );
-
-        proc.current_ratio = 1.02;
-        proc.target_ratio = 1.12;
-        assert!(
-            !proc.transient_reset_should_hold_low_bands(),
-            "same-side moves farther from unity should not borrow the rebound-specific low-band hold"
-        );
-    }
-
-    #[test]
-    fn test_stream_processor_dual_plane_profile_telemetry_available() {
-        let params = StretchParams::new(1.02)
-            .with_sample_rate(44_100)
-            .with_channels(2);
+            .with_sample_rate(44100)
+            .with_channels(1);
         let proc = StreamProcessor::new(params);
-        let telemetry = proc
-            .deterministic_profile_telemetry()
-            .expect("dual-plane telemetry should be available by default");
-        assert!(telemetry.auto_switching_enabled);
+        assert!(!proc.is_hybrid_mode());
     }
 
     #[test]
-    fn test_stream_processor_dual_plane_runtime_telemetry_available() {
-        let params = StretchParams::new(1.02)
-            .with_sample_rate(44_100)
-            .with_channels(2);
+    fn test_stream_processor_hybrid_mode_toggle() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+
+        proc.set_hybrid_mode(true);
+        assert!(proc.is_hybrid_mode());
+
+        proc.set_hybrid_mode(false);
+        assert!(!proc.is_hybrid_mode());
+    }
+
+    #[test]
+    fn test_stream_processor_streaming_engine_default() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
         let proc = StreamProcessor::new(params);
-        let telemetry = proc
-            .deterministic_runtime_telemetry()
-            .expect("dual-plane runtime telemetry should be available by default");
-        assert_eq!(telemetry, RtRuntimeTelemetry::default());
+        assert_eq!(proc.streaming_engine(), StreamingEngine::Deterministic);
     }
 
     #[test]
-    fn test_stream_processor_dual_plane_delay_telemetry_tracks_buffering() {
-        let params = StretchParams::new(1.02)
-            .with_sample_rate(44_100)
-            .with_channels(1)
-            .with_fft_size(64)
-            .with_hop_size(16);
+    fn test_stream_processor_streaming_engine_toggle() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
         let mut proc = StreamProcessor::new(params);
 
-        let initial = proc
-            .deterministic_delay_telemetry()
-            .expect("dual-plane delay telemetry should be available by default");
-        assert_eq!(initial.algorithmic_frames, 96);
-        assert_eq!(initial.buffered_input_frames, 0);
-        assert_eq!(initial.buffered_output_frames, 0);
-        assert_eq!(initial.total_frames, 96);
-
-        let mut output = Vec::with_capacity(128);
-        proc.process_into(&[0.0; 32], &mut output).unwrap();
-        assert!(output.is_empty());
-
-        let buffered = proc
-            .deterministic_delay_telemetry()
-            .expect("dual-plane delay telemetry should remain available");
-        assert_eq!(buffered.algorithmic_frames, 96);
-        assert_eq!(buffered.buffered_input_frames, 32);
-        assert_eq!(buffered.buffered_output_frames, 0);
-        assert_eq!(buffered.total_frames, 128);
-
-        proc.flush_into(&mut output).unwrap();
-        let flushed = proc
-            .deterministic_delay_telemetry()
-            .expect("dual-plane delay telemetry should remain available");
-        assert_eq!(flushed.buffered_input_frames, 0);
-        assert_eq!(flushed.buffered_output_frames, 0);
-        assert_eq!(flushed.total_frames, 96);
-    }
-
-    #[test]
-    fn test_stream_processor_dual_plane_delay_telemetry_includes_stream_pending_output() {
-        let params = StretchParams::new(1.03)
-            .with_sample_rate(44_100)
-            .with_channels(1)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-
-        let input: Vec<f32> = (0..(256 * 16))
-            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44_100.0).sin() * 0.5)
-            .collect();
-        let mut callback_output = [0.0f32; 0];
-        for chunk in input.chunks(256) {
-            proc.process_interleaved_into(chunk, &mut callback_output)
-                .unwrap();
-            if !proc.pending_output.is_empty() {
-                break;
-            }
-        }
-
-        assert!(
-            !proc.pending_output.is_empty(),
-            "expected bounded callback output to leave samples queued"
-        );
-
-        let rt = proc
-            .dual_plane_deterministic
-            .as_ref()
-            .expect("dual-plane telemetry should be available")
-            .processor
-            .delay_telemetry();
-        let stream_pending_frames = proc.pending_output.len();
-        let telemetry = proc
-            .deterministic_delay_telemetry()
-            .expect("dual-plane delay telemetry should be available");
-
+        proc.set_streaming_engine(StreamingEngine::LegacyHybridRerender);
         assert_eq!(
-            telemetry.buffered_output_frames,
-            rt.buffered_output_frames + stream_pending_frames
+            proc.streaming_engine(),
+            StreamingEngine::LegacyHybridRerender
         );
-        assert_eq!(
-            telemetry.total_frames,
-            rt.total_frames + stream_pending_frames
-        );
-    }
+        assert!(proc.is_hybrid_mode());
 
-    #[test]
-    fn test_stream_processor_dual_plane_delay_telemetry_tracks_pending_drain() {
-        let params = StretchParams::new(1.03)
-            .with_sample_rate(44_100)
-            .with_channels(1)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-
-        let input: Vec<f32> = (0..(256 * 16))
-            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44_100.0).sin() * 0.5)
-            .collect();
-        let mut callback_output = [0.0f32; 0];
-        for chunk in input.chunks(256) {
-            proc.process_interleaved_into(chunk, &mut callback_output)
-                .unwrap();
-            if proc.pending_output.len() >= 32 {
-                break;
-            }
-        }
-
-        assert!(
-            proc.pending_output.len() >= 32,
-            "expected enough queued output to validate drain telemetry"
-        );
-
-        let before = proc
-            .deterministic_delay_telemetry()
-            .expect("dual-plane delay telemetry should be available");
-        let pending_before = proc.pending_output.len();
-
-        let mut drain = [0.0f32; 13];
-        let written = proc.process_interleaved_into(&[], &mut drain).unwrap();
-        assert!(written > 0);
-        assert!(proc.pending_output.len() < pending_before);
-
-        let after = proc
-            .deterministic_delay_telemetry()
-            .expect("dual-plane delay telemetry should be available");
-
-        assert_eq!(
-            before.buffered_output_frames - after.buffered_output_frames,
-            written
-        );
-        assert_eq!(before.total_frames - after.total_frames, written);
-    }
-
-    #[test]
-    fn test_stream_processor_current_delay_accessors_match_exact_telemetry() {
-        let params = StretchParams::new(1.03)
-            .with_sample_rate(44_100)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-
-        let input: Vec<f32> = (0..(256 * 16))
-            .flat_map(|i| {
-                let t = i as f32 / 44_100.0;
-                [
-                    (2.0 * PI * 220.0 * t).sin() * 0.5,
-                    (2.0 * PI * 330.0 * t).sin() * 0.35,
-                ]
-            })
-            .collect();
-        let mut callback_output = [0.0f32; 0];
-        for chunk in input.chunks(256 * 2) {
-            proc.process_interleaved_into(chunk, &mut callback_output)
-                .unwrap();
-            if !proc.pending_output.is_empty() {
-                break;
-            }
-        }
-
-        let telemetry = proc
-            .deterministic_delay_telemetry()
-            .expect("dual-plane delay telemetry should be available");
-        assert_eq!(proc.current_delay_frames(), Some(telemetry.total_frames));
-        assert_eq!(proc.current_delay_samples(), Some(telemetry.total_frames));
-        assert_eq!(
-            proc.current_delay_secs(),
-            Some(telemetry.total_frames as f64 / 44_100.0)
-        );
-    }
-
-    #[test]
-    fn test_stream_processor_set_deterministic_latency_profile() {
-        let params = StretchParams::new(1.02)
-            .with_sample_rate(44_100)
-            .with_channels(2);
-        let mut proc = StreamProcessor::new(params);
-        proc.set_deterministic_latency_profile(LatencyProfile::Scratch)
-            .unwrap();
-        let telemetry = proc
-            .deterministic_profile_telemetry()
-            .expect("dual-plane telemetry should be available");
-        assert_eq!(telemetry.target_profile, LatencyProfile::Scratch);
-        assert!(!telemetry.auto_switching_enabled);
-    }
-
-    #[test]
-    fn test_stream_processor_dual_plane_deterministic_produces_output() {
-        let params = StretchParams::new(1.03)
-            .with_sample_rate(44_100)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-        proc.set_dual_plane_deterministic(true).unwrap();
-
-        let mut input = Vec::with_capacity(256 * 2 * 8);
-        for i in 0..(256 * 8) {
-            let t = i as f32 / 44_100.0;
-            let l = (2.0 * std::f32::consts::PI * 110.0 * t).sin() * 0.3;
-            let r = (2.0 * std::f32::consts::PI * 220.0 * t).sin() * 0.3;
-            input.push(l);
-            input.push(r);
-        }
-
-        let mut output = Vec::with_capacity(input.len() * 2);
-        for chunk in input.chunks(256 * 2) {
-            proc.process_into(chunk, &mut output).unwrap();
-        }
-        proc.flush_into(&mut output).unwrap();
-        assert!(!output.is_empty());
+        proc.set_streaming_engine(StreamingEngine::Deterministic);
+        assert_eq!(proc.streaming_engine(), StreamingEngine::Deterministic);
+        assert!(!proc.is_hybrid_mode());
     }
 
     #[test]
@@ -4784,446 +2316,6 @@ mod tests {
         assert_eq!(stats.events_detected_total, 0);
         assert_eq!(stats.reset_band_counts_total, [0, 0, 0, 0]);
         assert_eq!(stats.input_frames_consumed_total, 0);
-    }
-
-    #[test]
-    fn test_short_interval_cross_unity_modulation_does_not_spuriously_trigger_transient_resets() {
-        let sample_rate = 48_000u32;
-        let chunk_frames = 256usize;
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(sample_rate)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-        proc.set_dual_plane_deterministic(false).unwrap();
-
-        let ratios = [1.04, 0.96, 1.04, 0.96, 1.04, 0.96, 1.04, 0.96, 1.04, 0.96];
-        let mut total_output = Vec::new();
-
-        for (chunk_idx, ratio) in ratios.into_iter().enumerate() {
-            proc.set_stretch_ratio(ratio).unwrap();
-
-            let mut chunk = Vec::with_capacity(chunk_frames * 2);
-            for frame in 0..chunk_frames {
-                let sample_idx = chunk_idx * chunk_frames + frame;
-                let t = sample_idx as f32 / sample_rate as f32;
-                chunk.push((2.0 * PI * 220.0 * t).sin() * 0.25);
-                chunk.push((2.0 * PI * 330.0 * t).sin() * 0.20);
-            }
-
-            total_output.extend_from_slice(&proc.process(&chunk).unwrap());
-        }
-
-        let stats = proc.transient_reset_stats();
-        assert_eq!(
-            stats.events_detected_total, 0,
-            "smooth stereo modulation should not schedule transient resets without actual onsets"
-        );
-        assert_eq!(
-            stats.reset_band_counts_total,
-            [0, 0, 0, 0],
-            "smooth stereo modulation should not increment per-band transient reset telemetry"
-        );
-        assert!(
-            stats.input_frames_consumed_total >= chunk_frames * 2,
-            "test should drive the stream far enough to exercise scheduler analysis"
-        );
-        assert!(
-            total_output.iter().all(|sample| sample.is_finite()),
-            "modulated stream output should remain finite"
-        );
-    }
-
-    #[test]
-    fn test_short_interval_cross_unity_modulation_does_not_retrigger_one_real_transient() {
-        let sample_rate = 48_000u32;
-        let chunk_frames = 512usize;
-        let click_range = 1600usize..1620usize;
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(sample_rate)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-        proc.set_dual_plane_deterministic(false).unwrap();
-
-        let ratios = [1.04, 0.96, 1.04, 0.96, 1.04, 0.96];
-        let mut total_output = Vec::new();
-
-        for (chunk_idx, ratio) in ratios.into_iter().enumerate() {
-            proc.set_stretch_ratio(ratio).unwrap();
-
-            let mut chunk = Vec::with_capacity(chunk_frames * 2);
-            for frame in 0..chunk_frames {
-                let sample_idx = chunk_idx * chunk_frames + frame;
-                let t = sample_idx as f32 / sample_rate as f32;
-                let click = if click_range.contains(&sample_idx) {
-                    2.0
-                } else {
-                    0.0
-                };
-                chunk.push((2.0 * PI * 220.0 * t).sin() * 0.25 + click);
-                chunk.push((2.0 * PI * 330.0 * t).sin() * 0.20 + click);
-            }
-
-            total_output.extend_from_slice(&proc.process(&chunk).unwrap());
-        }
-
-        let stats = proc.transient_reset_stats();
-        assert_eq!(
-            stats.events_detected_total, 1,
-            "one real transient should schedule exactly one reset event across short-interval modulation"
-        );
-        assert_eq!(
-            stats.reset_band_counts_total[2], 1,
-            "one real transient should only contribute one mid-band reset across short-interval modulation"
-        );
-        assert_eq!(
-            stats.reset_band_counts_total[3], 1,
-            "one real transient should only contribute one high-band reset across short-interval modulation"
-        );
-        assert!(
-            total_output.iter().all(|sample| sample.is_finite()),
-            "modulated stream output should remain finite while the transient overlap drains"
-        );
-    }
-
-    #[test]
-    fn test_short_interval_cross_unity_modulation_holds_low_band_resets() {
-        let sample_rate = 48_000u32;
-        let chunk_frames = 512usize;
-        let click_range = 1600usize..1620usize;
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(sample_rate)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-        proc.set_dual_plane_deterministic(false).unwrap();
-
-        let ratios = [1.04, 0.96, 1.04, 0.96, 1.04, 0.96];
-
-        for (chunk_idx, ratio) in ratios.into_iter().enumerate() {
-            proc.set_stretch_ratio(ratio).unwrap();
-
-            let mut chunk = Vec::with_capacity(chunk_frames * 2);
-            for frame in 0..chunk_frames {
-                let sample_idx = chunk_idx * chunk_frames + frame;
-                let t = sample_idx as f32 / sample_rate as f32;
-                let click = if click_range.contains(&sample_idx) {
-                    2.0
-                } else {
-                    0.0
-                };
-                chunk.push((2.0 * PI * 60.0 * t).sin() * 0.35 + click);
-                chunk.push((2.0 * PI * 90.0 * t).sin() * 0.30 + click);
-            }
-
-            let output = proc.process(&chunk).unwrap();
-            assert!(
-                output.iter().all(|sample| sample.is_finite()),
-                "modulated stream output should remain finite while low-band reset holds are active"
-            );
-        }
-
-        let stats = proc.transient_reset_stats();
-        assert_eq!(
-            stats.events_detected_total, 1,
-            "one real transient should still schedule exactly one reset event during cross-unity modulation"
-        );
-        assert_eq!(
-            stats.reset_band_counts_total[0], 0,
-            "cross-unity modulation should keep sub-band phase resets locked for a single transient"
-        );
-        assert_eq!(
-            stats.reset_band_counts_total[1], 0,
-            "cross-unity modulation should keep low-band phase resets locked for a single transient"
-        );
-        assert_eq!(
-            stats.reset_band_counts_total[2], 1,
-            "cross-unity modulation should still allow one mid-band reset for the real transient"
-        );
-        assert_eq!(
-            stats.reset_band_counts_total[3], 1,
-            "cross-unity modulation should still allow one high-band reset for the real transient"
-        );
-    }
-
-    #[test]
-    fn test_short_interval_cross_unity_modulation_long_overlap_still_counts_one_reset_event() {
-        let sample_rate = 48_000u32;
-        let chunk_frames = 512usize;
-        let click_range = 1600usize..1620usize;
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(sample_rate)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-        proc.set_dual_plane_deterministic(false).unwrap();
-
-        let ratios = [1.04, 0.96, 1.04, 0.96, 1.04, 0.96, 1.04, 0.96, 1.04, 0.96];
-        let mut total_output = Vec::new();
-
-        for (chunk_idx, ratio) in ratios.into_iter().enumerate() {
-            proc.set_stretch_ratio(ratio).unwrap();
-
-            let mut chunk = Vec::with_capacity(chunk_frames * 2);
-            for frame in 0..chunk_frames {
-                let sample_idx = chunk_idx * chunk_frames + frame;
-                let t = sample_idx as f32 / sample_rate as f32;
-                let click = if click_range.contains(&sample_idx) {
-                    2.0
-                } else {
-                    0.0
-                };
-                chunk.push((2.0 * PI * 220.0 * t).sin() * 0.25 + click);
-                chunk.push((2.0 * PI * 330.0 * t).sin() * 0.20 + click);
-            }
-
-            total_output.extend_from_slice(&proc.process(&chunk).unwrap());
-        }
-
-        let stats = proc.transient_reset_stats();
-        assert_eq!(
-            stats.events_detected_total, 1,
-            "extended short-interval cross-unity modulation should not retrigger one transient after the initial reset"
-        );
-        assert_eq!(
-            stats.reset_band_counts_total[2], 1,
-            "extended short-interval cross-unity modulation should keep the transient to one mid-band reset"
-        );
-        assert_eq!(
-            stats.reset_band_counts_total[3], 1,
-            "extended short-interval cross-unity modulation should keep the transient to one high-band reset"
-        );
-        assert!(
-            total_output.iter().all(|sample| sample.is_finite()),
-            "extended short-interval modulation should remain finite while the cooldown hold drains"
-        );
-    }
-
-    #[test]
-    fn test_short_interval_near_unity_plateau_holds_low_band_resets() {
-        let sample_rate = 48_000u32;
-        let chunk_frames = 512usize;
-        let click_range = 1600usize..1620usize;
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(sample_rate)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-        proc.set_dual_plane_deterministic(false).unwrap();
-
-        let ratios = [1.04, 1.004, 1.04, 1.004, 1.04, 1.004];
-
-        for (chunk_idx, ratio) in ratios.into_iter().enumerate() {
-            proc.set_stretch_ratio(ratio).unwrap();
-
-            let mut chunk = Vec::with_capacity(chunk_frames * 2);
-            for frame in 0..chunk_frames {
-                let sample_idx = chunk_idx * chunk_frames + frame;
-                let t = sample_idx as f32 / sample_rate as f32;
-                let click = if click_range.contains(&sample_idx) {
-                    2.0
-                } else {
-                    0.0
-                };
-                chunk.push((2.0 * PI * 60.0 * t).sin() * 0.35 + click);
-                chunk.push((2.0 * PI * 90.0 * t).sin() * 0.30 + click);
-            }
-
-            let output = proc.process(&chunk).unwrap();
-            assert!(
-                output.iter().all(|sample| sample.is_finite()),
-                "modulated stream output should remain finite while near-unity low-band reset holds are active"
-            );
-        }
-
-        let stats = proc.transient_reset_stats();
-        assert_eq!(
-            stats.events_detected_total, 1,
-            "one real transient should still schedule exactly one reset event across repeated near-unity plateaus"
-        );
-        assert_eq!(
-            stats.reset_band_counts_total[0], 0,
-            "near-unity plateaus should keep sub-band phase resets locked for a single transient"
-        );
-        assert_eq!(
-            stats.reset_band_counts_total[1], 0,
-            "near-unity plateaus should keep low-band phase resets locked for a single transient"
-        );
-        assert_eq!(
-            stats.reset_band_counts_total[2], 1,
-            "near-unity plateaus should still allow one mid-band reset for the real transient"
-        );
-        assert_eq!(
-            stats.reset_band_counts_total[3], 1,
-            "near-unity plateaus should still allow one high-band reset for the real transient"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_short_interval_cross_unity_modulation_avoids_profile_churn() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(1)
-            .with_fft_size(64)
-            .with_hop_size(16);
-        let mut proc = StreamProcessor::new(params);
-        assert!(
-            proc.is_dual_plane_deterministic(),
-            "deterministic stream should default to the dual-plane backend"
-        );
-
-        let initial = proc
-            .deterministic_profile_telemetry()
-            .expect("dual-plane telemetry should be available");
-        assert_eq!(initial.current_profile, LatencyProfile::Mix);
-        assert_eq!(initial.target_profile, LatencyProfile::Mix);
-        assert_eq!(initial.policy_profile, LatencyProfile::Mix);
-        assert!(
-            initial.auto_switching_enabled,
-            "dual-plane deterministic profile switching should default to auto mode"
-        );
-
-        let chunk = [0.0f32; 256];
-        for (step_idx, ratio) in [1.035, 0.975, 1.025, 0.965, 1.035, 0.975]
-            .into_iter()
-            .enumerate()
-        {
-            proc.set_stretch_ratio(ratio).unwrap();
-            let output = proc.process(&chunk).unwrap();
-            assert!(
-                output.iter().all(|sample| sample.is_finite()),
-                "deterministic modulation should keep output finite during step {step_idx}"
-            );
-            let telemetry = proc
-                .deterministic_profile_telemetry()
-                .expect("dual-plane telemetry should remain available during modulation");
-            assert_eq!(
-                telemetry.current_profile,
-                LatencyProfile::Mix,
-                "short-interval deterministic modulation should keep the active profile on mix during step {step_idx}"
-            );
-            assert_eq!(
-                telemetry.target_profile,
-                LatencyProfile::Mix,
-                "short-interval deterministic modulation should keep the target profile on mix during step {step_idx}"
-            );
-            assert!(
-                telemetry.policy_profile == LatencyProfile::Mix,
-                "short-interval deterministic modulation should keep the policy profile on mix during step {step_idx}"
-            );
-            assert!(
-                telemetry.auto_switching_enabled,
-                "auto profile switching should remain enabled during deterministic modulation"
-            );
-        }
-        assert!(
-            proc.flush()
-                .unwrap()
-                .iter()
-                .all(|sample| sample.is_finite()),
-            "deterministic modulation flush should remain finite"
-        );
-    }
-
-    #[test]
-    fn test_dual_plane_short_interval_cross_unity_modulation_can_still_retarget_to_scratch() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(48_000)
-            .with_channels(1)
-            .with_fft_size(64)
-            .with_hop_size(16);
-        let mut proc = StreamProcessor::new(params);
-        assert!(
-            proc.is_dual_plane_deterministic(),
-            "deterministic stream should default to the dual-plane backend"
-        );
-
-        let chunk = [0.0f32; 256];
-        for (step_idx, ratio) in [1.035, 0.975, 1.025, 0.965, 1.035, 0.975]
-            .into_iter()
-            .enumerate()
-        {
-            proc.set_stretch_ratio(ratio).unwrap();
-            let output = proc.process(&chunk).unwrap();
-            assert!(
-                output.iter().all(|sample| sample.is_finite()),
-                "deterministic modulation should keep output finite during step {step_idx}"
-            );
-        }
-
-        let after_modulation = proc
-            .deterministic_profile_telemetry()
-            .expect("dual-plane telemetry should remain available after modulation");
-        assert_eq!(
-            after_modulation.current_profile,
-            LatencyProfile::Mix,
-            "short-interval modulation should leave the committed profile parked on mix before the stable plateau begins"
-        );
-        assert_eq!(
-            after_modulation.target_profile,
-            LatencyProfile::Mix,
-            "short-interval modulation should not leave a stale scratch retarget queued once the modulation burst ends"
-        );
-
-        proc.set_stretch_ratio(1.70).unwrap();
-        let first_plateau = proc.process(&chunk).unwrap();
-        assert!(
-            first_plateau.iter().all(|sample| sample.is_finite()),
-            "the first stable post-modulation scratch plateau callback should keep output finite"
-        );
-        let first_plateau_telemetry = proc
-            .deterministic_profile_telemetry()
-            .expect("dual-plane telemetry should remain available on the first stable plateau");
-        assert_eq!(
-            first_plateau_telemetry.current_profile,
-            LatencyProfile::Mix,
-            "one stable scratch-biased callback should not immediately commit scratch after a short modulation burst"
-        );
-        assert_eq!(
-            first_plateau_telemetry.target_profile,
-            LatencyProfile::Mix,
-            "one stable scratch-biased callback should not immediately retarget away from mix after a short modulation burst"
-        );
-
-        let mut saw_scratch_target = false;
-        let mut saw_scratch_current = false;
-        for settle_idx in 0..16 {
-            let output = proc.process(&chunk).unwrap();
-            assert!(
-                output.iter().all(|sample| sample.is_finite()),
-                "stable post-modulation scratch plateau should keep output finite during settle step {settle_idx}"
-            );
-            let telemetry = proc
-                .deterministic_profile_telemetry()
-                .expect("dual-plane telemetry should remain available while the plateau settles");
-            saw_scratch_target |= telemetry.target_profile == LatencyProfile::Scratch;
-            saw_scratch_current |= telemetry.current_profile == LatencyProfile::Scratch;
-            if saw_scratch_target && saw_scratch_current {
-                break;
-            }
-        }
-
-        assert!(
-            saw_scratch_target,
-            "once the rapid modulation stops, a stable scratch-biased plateau should still be able to retarget away from mix"
-        );
-        assert!(
-            saw_scratch_current,
-            "once hysteresis and the profile transition settle, the stable scratch-biased plateau should still be able to commit scratch"
-        );
-        assert!(
-            proc.flush()
-                .unwrap()
-                .iter()
-                .all(|sample| sample.is_finite()),
-            "stable post-modulation plateau flush should remain finite"
-        );
     }
 
     #[test]
@@ -5240,6 +2332,156 @@ mod tests {
         let (mid, side) = stereo_channel_reset_masks(full);
         assert_eq!(mid, full);
         assert_eq!(side, [false, false, false, true]);
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_realtime_strict_toggle() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        assert!(!proc.is_hybrid_realtime_strict());
+
+        proc.set_hybrid_realtime_strict(true);
+        assert!(proc.is_hybrid_realtime_strict());
+
+        proc.set_hybrid_realtime_strict(false);
+        assert!(!proc.is_hybrid_realtime_strict());
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_realtime_strict_produces_output() {
+        let params = StretchParams::new(1.15)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+        proc.set_hybrid_realtime_strict(true);
+
+        let signal: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44100.0).sin() * 0.8)
+            .collect();
+
+        let mut out = Vec::with_capacity(signal.len() * 2);
+        for chunk in signal.chunks(1024) {
+            proc.process_into(chunk, &mut out).unwrap();
+        }
+        proc.flush_into(&mut out).unwrap();
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_produces_output() {
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_preset(crate::core::types::EdmPreset::HouseLoop);
+
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        let chunk_size = 4096;
+        let signal: Vec<f32> = (0..chunk_size * 4)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+
+        let mut total_output = Vec::new();
+        for chunk in signal.chunks(chunk_size) {
+            if let Ok(out) = proc.process(chunk) {
+                total_output.extend_from_slice(&out);
+            }
+        }
+        if let Ok(out) = proc.flush() {
+            total_output.extend_from_slice(&out);
+        }
+
+        assert!(
+            !total_output.is_empty(),
+            "Hybrid mode should produce output"
+        );
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_stretch_ratio() {
+        let params = StretchParams::new(1.5)
+            .with_sample_rate(44100)
+            .with_channels(1);
+
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        // Feed enough data in one go for reliable ratio measurement
+        let num_samples = 44100 * 2;
+        let signal: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+
+        let mut total_output = Vec::new();
+        if let Ok(out) = proc.process(&signal) {
+            total_output.extend_from_slice(&out);
+        }
+        if let Ok(out) = proc.flush() {
+            total_output.extend_from_slice(&out);
+        }
+
+        if !total_output.is_empty() {
+            let ratio = total_output.len() as f64 / signal.len() as f64;
+            assert!(
+                (0.4..=2.2).contains(&ratio),
+                "Hybrid stretch ratio {} out of expected real-time range",
+                ratio
+            );
+            assert!(total_output.iter().all(|s| s.is_finite()));
+        }
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_state_persists_across_calls() {
+        let params = StretchParams::new(1.25)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_preset(crate::core::types::EdmPreset::HouseLoop);
+
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        let signal: Vec<f32> = (0..44100 * 3)
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44100.0).sin())
+            .collect();
+
+        let _ = proc.process(&signal[..16384]).unwrap();
+        let emitted_after_first = proc.hybrid_state.tail_output_lens[0];
+        assert!(
+            emitted_after_first > 0,
+            "Expected hybrid state to emit output after first call"
+        );
+
+        let _ = proc.process(&signal[16384..32768]).unwrap();
+        let emitted_after_second = proc.hybrid_state.tail_output_lens[0];
+        assert!(
+            emitted_after_second > 0,
+            "Hybrid emitted estimate should remain valid across calls ({} -> {})",
+            emitted_after_first,
+            emitted_after_second
+        );
+    }
+
+    #[test]
+    fn test_stream_processor_hybrid_rejects_nan() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+
+        let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
+
+        let mut chunk = vec![0.0f32; 4096];
+        chunk[100] = f32::NAN;
+        assert!(matches!(
+            proc.process(&chunk),
+            Err(crate::error::StretchError::NonFiniteInput)
+        ));
     }
 
     // --- process_into tests ---
@@ -5359,12 +2601,13 @@ mod tests {
         let mut proc = StreamProcessor::new(params);
         let mut output = Vec::with_capacity(200_000);
 
-        // First small chunk: unity ratio takes the passthrough path.
+        // Small chunks may or may not emit immediately depending on the
+        // current streaming priming strategy, but they must never shrink output.
         let small = vec![0.0f32; 1024];
         let before_small = output.len();
         proc.process_into(&small, &mut output).unwrap();
         let written_small = output.len() - before_small;
-        assert_eq!(written_small, small.len());
+        assert!(written_small <= small.len());
 
         // Large chunk: should produce output
         let big: Vec<f32> = (0..44100)
@@ -5412,633 +2655,65 @@ mod tests {
     }
 
     #[test]
-    fn test_process_interleaved_into_matches_vec_process_and_flush_when_drained_in_chunks() {
-        let params = StretchParams::new(1.03)
-            .with_sample_rate(44_100)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut vec_proc = StreamProcessor::new(params.clone());
-        let mut fixed_proc = StreamProcessor::new(params);
-        vec_proc.set_dual_plane_deterministic(true).unwrap();
-        fixed_proc.set_dual_plane_deterministic(true).unwrap();
-        vec_proc.set_pitch_scale(1.05).unwrap();
-        fixed_proc.set_pitch_scale(1.05).unwrap();
-
-        let mut input = Vec::with_capacity(256 * 2 * 12);
-        for i in 0..(256 * 12) {
-            let t = i as f32 / 44_100.0;
-            input.push((2.0 * PI * 110.0 * t).sin() * 0.3);
-            input.push((2.0 * PI * 330.0 * t).sin() * 0.25);
-        }
-
-        let mut expected = Vec::with_capacity(input.len() * 2);
-        let mut actual = Vec::with_capacity(input.len() * 2);
-        let mut chunk = vec![0.0f32; 74];
-        for input_chunk in input.chunks(256 * 2) {
-            vec_proc.process_into(input_chunk, &mut expected).unwrap();
-            let written = fixed_proc
-                .process_interleaved_into(input_chunk, &mut chunk)
-                .unwrap();
-            actual.extend_from_slice(&chunk[..written]);
-        }
-
-        vec_proc.flush_into(&mut expected).unwrap();
-
-        loop {
-            let written = fixed_proc.flush_interleaved_into(&mut chunk).unwrap();
-            if written == 0 {
-                break;
-            }
-            actual.extend_from_slice(&chunk[..written]);
-        }
-
-        assert_eq!(expected.len(), actual.len());
-        for (idx, (&lhs, &rhs)) in expected.iter().zip(actual.iter()).enumerate() {
-            assert!(
-                (lhs - rhs).abs() < 1e-6,
-                "Mismatch at sample {idx}: {lhs} vs {rhs}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_process_interleaved_into_rejects_when_output_budget_is_too_small() {
+    fn test_process_into_hybrid_mode() {
         let params = StretchParams::new(1.5)
-            .with_sample_rate(44_100)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_preset(crate::core::types::EdmPreset::HouseLoop);
+
         let mut proc = StreamProcessor::new(params);
-        proc.set_dual_plane_deterministic(true).unwrap();
+        proc.set_hybrid_mode(true);
 
-        let input = vec![0.0f32; 256 * 2 * 16];
-        let caps_before = proc.capacities();
-        let mut output = [0.0f32; 0];
-        let err = proc
-            .process_interleaved_into(&input, &mut output)
-            .unwrap_err();
+        let signal: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
 
-        assert!(matches!(
-            err,
-            StretchError::BufferOverflow {
-                buffer: "stream_process_interleaved_output",
-                ..
-            }
-        ));
-        assert_eq!(proc.capacities(), caps_before);
+        let mut output = Vec::with_capacity(signal.len() * 3);
+        proc.process_into(&signal, &mut output).unwrap();
+        proc.flush_into(&mut output).unwrap();
+
+        assert!(
+            !output.is_empty(),
+            "Hybrid process_into should produce output"
+        );
     }
 
     #[test]
-    fn test_max_process_interleaved_output_samples_matches_process_capacity_floor() {
+    fn test_stream_processor_hybrid_stereo() {
         let params = StretchParams::new(1.5)
-            .with_sample_rate(44_100)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-        proc.set_dual_plane_deterministic(true).unwrap();
-
-        let input = vec![0.0f32; 256 * 2 * 16];
-        let budget = proc
-            .max_process_interleaved_output_samples(input.len())
-            .unwrap();
-        let (_, pending_len, _, pending_cap) = proc.capacities();
-        let min_output = budget.saturating_sub(pending_cap.saturating_sub(pending_len));
-
-        assert!(
-            min_output >= 2,
-            "expected host-visible output floor, got {min_output}"
-        );
-        assert_eq!(budget % 2, 0);
-
-        let caps_before = proc.capacities();
-        let mut too_small = vec![0.0f32; min_output - 2];
-        let err = proc
-            .process_interleaved_into(&input, &mut too_small)
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            StretchError::BufferOverflow {
-                buffer: "stream_process_interleaved_output",
-                ..
-            }
-        ));
-        assert_eq!(proc.capacities(), caps_before);
-
-        let mut just_enough = vec![0.0f32; min_output];
-        let written = proc
-            .process_interleaved_into(&input, &mut just_enough)
-            .unwrap();
-        assert!(written <= just_enough.len());
-    }
-
-    #[test]
-    fn test_max_next_process_interleaved_output_samples_matches_combined_helpers() {
-        let params = StretchParams::new(1.03)
-            .with_sample_rate(44_100)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-        proc.set_dual_plane_deterministic(true).unwrap();
-        proc.set_pitch_scale(1.05).unwrap();
-
-        let mut input = Vec::with_capacity(256 * 2 * 12);
-        for i in 0..(256 * 12) {
-            let t = i as f32 / 44_100.0;
-            input.push((2.0 * PI * 110.0 * t).sin() * 0.3);
-            input.push((2.0 * PI * 330.0 * t).sin() * 0.25);
-        }
-
-        let input_chunk_len = 256 * 2;
-        let no_pending_budget = proc
-            .max_next_process_interleaved_output_samples(input_chunk_len)
-            .unwrap();
-        assert_eq!(
-            no_pending_budget,
-            proc.max_process_interleaved_output_samples(input_chunk_len)
-                .unwrap()
-        );
-        assert_eq!(no_pending_budget % 2, 0);
-
-        let mut callback_output = [0.0f32; 6];
-        for chunk in input.chunks(input_chunk_len) {
-            let _ = proc
-                .process_interleaved_into(chunk, &mut callback_output)
-                .unwrap();
-            if proc.queued_interleaved_output_samples().unwrap() >= 24 {
-                break;
-            }
-        }
-
-        let queued = proc.queued_interleaved_output_samples().unwrap();
-        assert!(
-            queued >= 24,
-            "expected queued output to validate combined budget"
-        );
-
-        let combined = proc
-            .max_next_process_interleaved_output_samples(input_chunk_len)
-            .unwrap();
-        let expected = queued.saturating_add(
-            proc.max_process_interleaved_output_samples(input_chunk_len)
-                .unwrap(),
-        );
-        assert_eq!(combined, expected);
-        assert_eq!(combined % 2, 0);
-    }
-
-    #[test]
-    fn test_queued_interleaved_output_samples_tracks_pending_drain() {
-        let params = StretchParams::new(1.03)
-            .with_sample_rate(44_100)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-        proc.set_dual_plane_deterministic(true).unwrap();
-        proc.set_pitch_scale(1.05).unwrap();
-
-        let mut input = Vec::with_capacity(256 * 2 * 12);
-        for i in 0..(256 * 12) {
-            let t = i as f32 / 44_100.0;
-            input.push((2.0 * PI * 110.0 * t).sin() * 0.3);
-            input.push((2.0 * PI * 330.0 * t).sin() * 0.25);
-        }
-
-        let mut callback_output = [0.0f32; 6];
-        for chunk in input.chunks(256 * 2) {
-            let _ = proc
-                .process_interleaved_into(chunk, &mut callback_output)
-                .unwrap();
-            if proc.queued_interleaved_output_samples().unwrap() >= 24 {
-                break;
-            }
-        }
-
-        let queued_before = proc.queued_interleaved_output_samples().unwrap();
-        assert!(
-            queued_before >= 24,
-            "expected queued output to validate fixed-buffer drain accounting"
-        );
-        assert_eq!(queued_before % 2, 0);
-
-        let mut partial_drain = [0.0f32; 8];
-        let written = proc
-            .process_interleaved_into(&[], &mut partial_drain)
-            .unwrap();
-        assert!(written > 0);
-        assert_eq!(
-            proc.queued_interleaved_output_samples().unwrap(),
-            queued_before - written
-        );
-
-        let remaining = proc.queued_interleaved_output_samples().unwrap();
-        let mut rest = vec![0.0f32; remaining];
-        let drained = proc.process_interleaved_into(&[], &mut rest).unwrap();
-        assert_eq!(drained, remaining);
-        assert_eq!(proc.queued_interleaved_output_samples().unwrap(), 0);
-    }
-
-    #[test]
-    fn test_max_flush_interleaved_output_samples_drains_remaining_tail_in_one_call() {
-        let params = StretchParams::new(1.03)
-            .with_sample_rate(44_100)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut vec_proc = StreamProcessor::new(params.clone());
-        let mut fixed_proc = StreamProcessor::new(params);
-        vec_proc.set_dual_plane_deterministic(true).unwrap();
-        fixed_proc.set_dual_plane_deterministic(true).unwrap();
-        vec_proc.set_pitch_scale(1.05).unwrap();
-        fixed_proc.set_pitch_scale(1.05).unwrap();
-
-        let mut input = Vec::with_capacity(256 * 2 * 12);
-        for i in 0..(256 * 12) {
-            let t = i as f32 / 44_100.0;
-            input.push((2.0 * PI * 110.0 * t).sin() * 0.3);
-            input.push((2.0 * PI * 330.0 * t).sin() * 0.25);
-        }
-
-        let mut expected = Vec::with_capacity(input.len() * 2);
-        let mut actual = Vec::with_capacity(input.len() * 2);
-        let mut callback_output = vec![0.0f32; 74];
-        for input_chunk in input.chunks(256 * 2) {
-            vec_proc.process_into(input_chunk, &mut expected).unwrap();
-            let written = fixed_proc
-                .process_interleaved_into(input_chunk, &mut callback_output)
-                .unwrap();
-            actual.extend_from_slice(&callback_output[..written]);
-        }
-
-        vec_proc.flush_into(&mut expected).unwrap();
-
-        let remaining = fixed_proc.max_flush_interleaved_output_samples().unwrap();
-        assert!(remaining > 0);
-
-        let mut flush_output = vec![0.0f32; remaining];
-        let written = fixed_proc
-            .flush_interleaved_into(&mut flush_output)
-            .unwrap();
-        assert!(written <= remaining);
-        actual.extend_from_slice(&flush_output[..written]);
-
-        assert_eq!(
-            fixed_proc.max_flush_interleaved_output_samples().unwrap(),
-            0
-        );
-        assert_eq!(
-            fixed_proc
-                .flush_interleaved_into(&mut flush_output)
-                .unwrap(),
-            0
-        );
-        assert_eq!(expected.len(), actual.len());
-        for (idx, (&lhs, &rhs)) in expected.iter().zip(actual.iter()).enumerate() {
-            assert!(
-                (lhs - rhs).abs() < 1e-6,
-                "Mismatch at sample {idx}: {lhs} vs {rhs}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_max_flush_interleaved_output_samples_tracks_partial_tail_drain() {
-        let params = StretchParams::new(1.04)
-            .with_sample_rate(44_100)
-            .with_channels(1)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-        proc.set_dual_plane_deterministic(true).unwrap();
-
-        let input: Vec<f32> = (0..(256 * 16))
-            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44_100.0).sin() * 0.7)
-            .collect();
-        let mut callback_output = [0.0f32; 64];
-        for chunk in input.chunks(256) {
-            let _ = proc
-                .process_interleaved_into(chunk, &mut callback_output)
-                .unwrap();
-        }
-
-        let mut first_chunk = [0.0f32; 8];
-        let first_written = proc.flush_interleaved_into(&mut first_chunk).unwrap();
-        assert!(first_written > 0);
-        assert!(proc.fixed_flush_pending);
-
-        let remaining = proc.max_flush_interleaved_output_samples().unwrap();
-        assert!(remaining > 0);
-
-        let mut rest = vec![0.0f32; remaining];
-        let written = proc.flush_interleaved_into(&mut rest).unwrap();
-        assert!(written <= remaining);
-        assert_eq!(proc.max_flush_interleaved_output_samples().unwrap(), 0);
-        assert_eq!(proc.flush_interleaved_into(&mut rest).unwrap(), 0);
-        assert!(!proc.fixed_flush_pending);
-    }
-
-    #[test]
-    fn test_flush_interleaved_into_matches_vec_flush_when_drained_in_chunks() {
-        let params = StretchParams::new(1.03)
-            .with_sample_rate(44_100)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut vec_proc = StreamProcessor::new(params.clone());
-        let mut fixed_proc = StreamProcessor::new(params);
-        vec_proc.set_dual_plane_deterministic(true).unwrap();
-        fixed_proc.set_dual_plane_deterministic(true).unwrap();
-        vec_proc.set_pitch_scale(1.05).unwrap();
-        fixed_proc.set_pitch_scale(1.05).unwrap();
-
-        let mut input = Vec::with_capacity(256 * 2 * 12);
-        for i in 0..(256 * 12) {
-            let t = i as f32 / 44_100.0;
-            input.push((2.0 * PI * 110.0 * t).sin() * 0.3);
-            input.push((2.0 * PI * 330.0 * t).sin() * 0.25);
-        }
-
-        let mut expected = Vec::with_capacity(input.len() * 2);
-        let mut actual = Vec::with_capacity(input.len() * 2);
-        for chunk in input.chunks(256 * 2) {
-            vec_proc.process_into(chunk, &mut expected).unwrap();
-            fixed_proc.process_into(chunk, &mut actual).unwrap();
-        }
-
-        vec_proc.flush_into(&mut expected).unwrap();
-
-        let mut chunk = vec![0.0f32; 74];
-        loop {
-            let written = fixed_proc.flush_interleaved_into(&mut chunk).unwrap();
-            if written == 0 {
-                break;
-            }
-            actual.extend_from_slice(&chunk[..written]);
-        }
-
-        assert_eq!(expected.len(), actual.len());
-        for (idx, (&lhs, &rhs)) in expected.iter().zip(actual.iter()).enumerate() {
-            assert!(
-                (lhs - rhs).abs() < 1e-6,
-                "Mismatch at sample {idx}: {lhs} vs {rhs}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_reconcile_fixed_flush_pending_output_appends_final_frame_aligned_tail() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(44_100)
+            .with_sample_rate(44100)
             .with_channels(2);
+
         let mut proc = StreamProcessor::new(params);
+        proc.set_hybrid_mode(true);
 
-        assert_eq!(proc.pending_output.push_slice(&[0.0, 0.0, 0.0, 0.0]), 4);
-        proc.total_output_emitted_samples = 4;
-        proc.expected_total_output_samples = 10.0;
-
-        proc.reconcile_fixed_flush_pending_output(2).unwrap();
-
-        let mut pending = vec![1.0f32; proc.pending_output.len()];
-        let copied = proc.pending_output.peek_slice(&mut pending);
-        assert_eq!(copied, 6);
-        assert_eq!(pending, vec![0.0; 6]);
-    }
-
-    #[test]
-    fn test_reconcile_fixed_flush_pending_output_trims_remaining_tail() {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(44_100)
-            .with_channels(2);
-        let mut proc = StreamProcessor::new(params);
-
-        assert_eq!(
-            proc.pending_output
-                .push_slice(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),
-            6
-        );
-        proc.total_output_emitted_samples = 4;
-        proc.expected_total_output_samples = 8.0;
-
-        proc.reconcile_fixed_flush_pending_output(2).unwrap();
-
-        let mut pending = vec![0.0f32; proc.pending_output.len()];
-        let copied = proc.pending_output.peek_slice(&mut pending);
-        assert_eq!(copied, 4);
-        assert_eq!(pending, vec![0.1, 0.2, 0.3, 0.4]);
-    }
-
-    #[test]
-    fn test_flush_interleaved_into_requires_tail_to_drain_before_new_input() {
-        let params = StretchParams::new(1.04)
-            .with_sample_rate(44_100)
-            .with_channels(1)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-        proc.set_dual_plane_deterministic(true).unwrap();
-
-        let input: Vec<f32> = (0..(256 * 16))
-            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44_100.0).sin() * 0.7)
-            .collect();
-        let mut streamed = Vec::with_capacity(input.len() * 2);
-        for chunk in input.chunks(256) {
-            proc.process_into(chunk, &mut streamed).unwrap();
+        let num_frames = 44100;
+        let mut signal = vec![0.0f32; num_frames * 2];
+        for i in 0..num_frames {
+            let t = i as f32 / 44100.0;
+            signal[i * 2] = (2.0 * PI * 440.0 * t).sin();
+            signal[i * 2 + 1] = (2.0 * PI * 880.0 * t).sin();
         }
 
-        let mut chunk = [0.0f32; 8];
-        let first_written = proc.flush_interleaved_into(&mut chunk).unwrap();
-        assert!(first_written > 0);
-        assert!(proc.fixed_flush_pending);
-
-        let err = proc.process_into(&input[..256], &mut streamed).unwrap_err();
-        assert_eq!(
-            err,
-            StretchError::InvalidState(
-                "fixed-buffer flush output must be fully drained before new input"
-            )
-        );
-
-        loop {
-            if proc.flush_interleaved_into(&mut chunk).unwrap() == 0 {
-                break;
+        let mut total_output = Vec::new();
+        for chunk in signal.chunks(4096 * 2) {
+            if let Ok(out) = proc.process(chunk) {
+                total_output.extend_from_slice(&out);
             }
         }
-
-        assert!(!proc.fixed_flush_pending);
-        assert!(proc.process_into(&input[..256], &mut streamed).is_ok());
-    }
-
-    #[test]
-    fn test_pitch_scale_change_waits_for_fixed_flush_tail_drain() {
-        let params = StretchParams::new(1.03)
-            .with_sample_rate(44_100)
-            .with_channels(2)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut control = StreamProcessor::new(params.clone());
-        let mut retuned = StreamProcessor::new(params);
-        control.set_dual_plane_deterministic(true).unwrap();
-        retuned.set_dual_plane_deterministic(true).unwrap();
-        control.set_pitch_scale(1.05).unwrap();
-        retuned.set_pitch_scale(1.05).unwrap();
-
-        let mut input = Vec::with_capacity(256 * 2 * 12);
-        for i in 0..(256 * 12) {
-            let t = i as f32 / 44_100.0;
-            input.push((2.0 * PI * 110.0 * t).sin() * 0.3);
-            input.push((2.0 * PI * 330.0 * t).sin() * 0.25);
+        if let Ok(out) = proc.flush() {
+            total_output.extend_from_slice(&out);
         }
 
-        let mut control_streamed = Vec::with_capacity(input.len() * 2);
-        let mut retuned_streamed = Vec::with_capacity(input.len() * 2);
-        for chunk in input.chunks(256 * 2) {
-            control.process_into(chunk, &mut control_streamed).unwrap();
-            retuned.process_into(chunk, &mut retuned_streamed).unwrap();
-        }
-        assert_eq!(control_streamed.len(), retuned_streamed.len());
-        for (idx, (&lhs, &rhs)) in control_streamed
-            .iter()
-            .zip(retuned_streamed.iter())
-            .enumerate()
-        {
-            assert!(
-                (lhs - rhs).abs() < 1e-6,
-                "Mismatch at streamed sample {idx}: {lhs} vs {rhs}"
-            );
-        }
-
-        let control_flush_budget = control.max_flush_interleaved_output_samples().unwrap();
-        let retuned_flush_budget = retuned.max_flush_interleaved_output_samples().unwrap();
-        assert!(control_flush_budget > 2);
-        assert_eq!(control_flush_budget, retuned_flush_budget);
-
-        let mut control_tail = Vec::new();
-        let mut retuned_tail = Vec::new();
-        let mut first_control = [0.0f32; 2];
-        let mut first_retuned = [0.0f32; 2];
-        let control_written = control.flush_interleaved_into(&mut first_control).unwrap();
-        let retuned_written = retuned.flush_interleaved_into(&mut first_retuned).unwrap();
-        assert_eq!(control_written, retuned_written);
-        assert!(retuned_written > 0);
-        assert!(control.fixed_flush_pending);
-        assert!(retuned.fixed_flush_pending);
-        control_tail.extend_from_slice(&first_control[..control_written]);
-        retuned_tail.extend_from_slice(&first_retuned[..retuned_written]);
-
-        retuned.set_pitch_scale(1.19).unwrap();
-        assert!(retuned.fixed_flush_pending);
-        assert_eq!(retuned.pending_pitch_scale, Some(1.19));
-        assert!((retuned.pitch_scale() - 1.05).abs() < 1e-9);
-
-        let mut control_chunk = [0.0f32; 13];
-        let mut retuned_chunk = [0.0f32; 13];
-        loop {
-            let control_written = control.flush_interleaved_into(&mut control_chunk).unwrap();
-            let retuned_written = retuned.flush_interleaved_into(&mut retuned_chunk).unwrap();
-            assert_eq!(control_written, retuned_written);
-            control_tail.extend_from_slice(&control_chunk[..control_written]);
-            retuned_tail.extend_from_slice(&retuned_chunk[..retuned_written]);
-            assert_eq!(control.fixed_flush_pending, retuned.fixed_flush_pending);
-            if !retuned.fixed_flush_pending {
-                break;
-            }
-        }
-
-        assert_eq!(control_tail.len(), retuned_tail.len());
-        for (idx, (&lhs, &rhs)) in control_tail.iter().zip(retuned_tail.iter()).enumerate() {
-            assert!(
-                (lhs - rhs).abs() < 1e-6,
-                "Mismatch at flushed sample {idx}: {lhs} vs {rhs}"
-            );
-        }
-
-        assert!(!retuned.fixed_flush_pending);
-        assert_eq!(retuned.pending_pitch_scale, None);
-        assert!((retuned.pitch_scale() - 1.19).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_deterministic_profile_configuration_rejected_during_fixed_flush_tail_drain() {
-        let params = StretchParams::new(1.04)
-            .with_sample_rate(44_100)
-            .with_channels(1)
-            .with_fft_size(1024)
-            .with_hop_size(256);
-        let mut proc = StreamProcessor::new(params);
-        proc.set_dual_plane_deterministic(true).unwrap();
-
-        let input: Vec<f32> = (0..(256 * 16))
-            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44_100.0).sin() * 0.7)
-            .collect();
-        let mut callback_output = [0.0f32; 64];
-        for chunk in input.chunks(256) {
-            let _ = proc
-                .process_interleaved_into(chunk, &mut callback_output)
-                .unwrap();
-        }
-
-        let mut first_chunk = [0.0f32; 8];
-        let first_written = proc.flush_interleaved_into(&mut first_chunk).unwrap();
-        assert!(first_written > 0);
-        assert!(proc.fixed_flush_pending);
-
-        let telemetry_before = proc
-            .deterministic_profile_telemetry()
-            .expect("dual-plane telemetry should be available");
-
-        let profile_err = proc
-            .set_deterministic_latency_profile(LatencyProfile::Scratch)
-            .unwrap_err();
-        assert_eq!(
-            profile_err,
-            StretchError::InvalidState(
-                "deterministic latency profile cannot change until fixed-buffer flush output is fully drained"
-            )
+        assert!(
+            !total_output.is_empty(),
+            "Hybrid stereo should produce output"
         );
-
-        let auto_err = proc
-            .set_deterministic_auto_profile_switching(false)
-            .unwrap_err();
         assert_eq!(
-            auto_err,
-            StretchError::InvalidState(
-                "deterministic auto profile switching cannot change until fixed-buffer flush output is fully drained"
-            )
+            total_output.len() % 2,
+            0,
+            "Stereo output must have even sample count"
         );
-
-        let telemetry_during = proc
-            .deterministic_profile_telemetry()
-            .expect("dual-plane telemetry should stay available during drain");
-        assert_eq!(telemetry_before, telemetry_during);
-
-        let mut rest = [0.0f32; 64];
-        loop {
-            if proc.flush_interleaved_into(&mut rest).unwrap() == 0 {
-                break;
-            }
-        }
-        assert!(!proc.fixed_flush_pending);
-
-        proc.set_deterministic_auto_profile_switching(false)
-            .unwrap();
-        let telemetry_after_auto = proc
-            .deterministic_profile_telemetry()
-            .expect("dual-plane telemetry should stay available after drain");
-        assert!(!telemetry_after_auto.auto_switching_enabled);
-
-        proc.set_deterministic_latency_profile(LatencyProfile::Scratch)
-            .unwrap();
-        let telemetry_after_profile = proc
-            .deterministic_profile_telemetry()
-            .expect("dual-plane telemetry should stay available after profile change");
-        assert_eq!(
-            telemetry_after_profile.target_profile,
-            LatencyProfile::Scratch
-        );
-        assert!(!telemetry_after_profile.auto_switching_enabled);
     }
 
     #[test]

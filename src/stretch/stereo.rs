@@ -76,6 +76,10 @@ pub fn stretch_mid_side(
     right: &[f32],
     params: &StretchParams,
 ) -> Result<(Vec<f32>, Vec<f32>), StretchError> {
+    if should_use_independent_fallback(left, right) {
+        return stretch_independent(left, right, params);
+    }
+
     let (mid, side) = encode_mid_side(left, right);
     let (shared_onsets, shared_strengths) = build_shared_onset_map(&mid, params);
 
@@ -111,6 +115,44 @@ pub fn stretch_mid_side(
 
     // Decode back to L/R
     Ok(decode_mid_side(&mid_aligned, &side_aligned))
+}
+
+fn should_use_independent_fallback(left: &[f32], right: &[f32]) -> bool {
+    let left_rms = rms(left);
+    let right_rms = rms(right);
+    let floor = 1e-6;
+
+    (left_rms > floor && right_rms <= floor) || (right_rms > floor && left_rms <= floor)
+}
+
+fn stretch_independent(
+    left: &[f32],
+    right: &[f32],
+    params: &StretchParams,
+) -> Result<(Vec<f32>, Vec<f32>), StretchError> {
+    let target_len = params.output_length(left.len().min(right.len()));
+
+    let left_out = if left.iter().all(|&s| s == 0.0) {
+        vec![0.0; target_len]
+    } else {
+        force_channel_length(HybridStretcher::new(params.clone()).process(left)?, target_len)
+    };
+
+    let right_out = if right.iter().all(|&s| s == 0.0) {
+        vec![0.0; target_len]
+    } else {
+        force_channel_length(HybridStretcher::new(params.clone()).process(right)?, target_len)
+    };
+
+    Ok((left_out, right_out))
+}
+
+fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let energy: f32 = samples.iter().map(|s| s * s).sum();
+    (energy / samples.len() as f32).sqrt()
 }
 
 /// Builds a shared transient/beat map from the Mid channel.

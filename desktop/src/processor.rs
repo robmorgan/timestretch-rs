@@ -3,19 +3,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use timestretch::{DualPlaneProcessor, EdmPreset, RtConfig, StretchParams, TimeWarpMap};
+use timestretch::{EdmPreset, StreamProcessor, StretchError, StretchParams};
 
 use crate::audio_engine::RingProducer;
 use crate::state::{AtomicPosition, PresetChoice, SharedStateHandle, StopFlag, Transport};
 
-/// Fixed block size for dual-plane RT processing (in frames).
+/// Fixed chunk size for desktop stream processing (in frames).
 const CHUNK_FRAMES: usize = 1024;
 const CHANNELS: u32 = 2;
 /// Extra callback cushion to absorb scheduling jitter at stream start.
 const START_PREROLL_CALLBACKS: usize = 2;
 const RATIO_UPDATE_EPSILON: f64 = 1e-4;
-const RATIO_WARP_HORIZON_FRAMES: usize = CHUNK_FRAMES * 16;
-const MAX_OUTPUT_FRAMES_PER_CALL: usize = CHUNK_FRAMES * 4;
 
 /// Start the processing thread. Returns a stop flag handle.
 #[allow(clippy::too_many_arguments)]
@@ -32,16 +30,12 @@ pub fn start_processing_thread(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let (mut processor, mut preroll_target_samples) = build_processor(&state, sample_rate);
-        update_quality_tier_state(&state, processor.quality_tier());
         let mut last_ratio = f64::NAN;
-        let mut src_pos: usize = 0; // position in working_audio samples (interleaved)
+        let mut src_pos: usize = 0;
         let chunk_samples = CHUNK_FRAMES * CHANNELS as usize;
         let mut processed_chunk = Vec::with_capacity(chunk_samples * 6);
-        let mut input_planar = vec![vec![0.0f32; CHUNK_FRAMES]; CHANNELS as usize];
-        let mut output_planar = vec![vec![0.0f32; MAX_OUTPUT_FRAMES_PER_CALL]; CHANNELS as usize];
         let mut stream_started = false;
 
-        // Keep output muted until enough stretched samples are buffered.
         stream_active.store(false, Ordering::Relaxed);
 
         loop {
@@ -49,22 +43,13 @@ pub fn start_processing_thread(
                 break;
             }
 
-            let (
-                transport,
-                stretch_ratio,
-                seek_req,
-                pitch_changed,
-                preset_changed,
-                latency_profile_changed,
-                pitch_semi,
-            ) = {
+            let (transport, stretch_ratio, seek_req, pitch_changed, preset_changed, pitch_semi) = {
                 let mut st = state.lock().unwrap();
                 let t = st.transport;
                 let r = st.stretch_ratio;
                 let s = st.seek_request.take();
                 let pc = st.pitch_changed;
                 let prc = st.preset_changed;
-                let lpc = st.latency_profile_changed;
                 let ps = st.pitch_semitones;
                 if pc {
                     st.pitch_changed = false;
@@ -72,23 +57,17 @@ pub fn start_processing_thread(
                 if prc {
                     st.preset_changed = false;
                 }
-                if lpc {
-                    st.latency_profile_changed = false;
-                }
-                (t, r, s, pc, prc, lpc, ps)
+                (t, r, s, pc, prc, ps)
             };
 
-            // Handle preset change - rebuild processor and flush stale audio
-            if preset_changed || latency_profile_changed {
+            if preset_changed {
                 (processor, preroll_target_samples) = build_processor(&state, sample_rate);
-                update_quality_tier_state(&state, processor.quality_tier());
                 last_ratio = f64::NAN;
                 flush_ring.store(true, Ordering::Release);
                 stream_active.store(false, Ordering::Relaxed);
                 stream_started = false;
             }
 
-            // Handle pitch change - re-process entire source
             if pitch_changed {
                 {
                     let mut st = state.lock().unwrap();
@@ -96,7 +75,6 @@ pub fn start_processing_thread(
                 }
 
                 if pitch_semi.abs() < 0.01 {
-                    // No pitch shift, use original
                     working_audio = source_audio.as_ref().clone();
                 } else {
                     let factor = 2.0_f64.powf(pitch_semi as f64 / 12.0);
@@ -105,9 +83,7 @@ pub fn start_processing_thread(
                         .with_channels(CHANNELS)
                         .with_normalize(true);
                     match timestretch::pitch_shift(&source_audio, &params, factor) {
-                        Ok(shifted) => {
-                            working_audio = shifted;
-                        }
+                        Ok(shifted) => working_audio = shifted,
                         Err(e) => {
                             log::error!("Pitch shift failed: {e}");
                             working_audio = source_audio.as_ref().clone();
@@ -115,13 +91,9 @@ pub fn start_processing_thread(
                     }
                 }
 
-                // Rebuild processor to reset RT state.
                 (processor, preroll_target_samples) = build_processor(&state, sample_rate);
-                update_quality_tier_state(&state, processor.quality_tier());
                 last_ratio = f64::NAN;
-                // Clamp src_pos to new working audio length
-                let max_pos = working_audio.len();
-                if src_pos > max_pos {
+                if src_pos > working_audio.len() {
                     src_pos = 0;
                 }
 
@@ -132,48 +104,35 @@ pub fn start_processing_thread(
                 }
             }
 
-            // Handle seek - flush stale audio and re-enter preroll
             if let Some(seek_frame) = seek_req {
                 src_pos = (seek_frame * CHANNELS as usize).min(working_audio.len());
                 (processor, preroll_target_samples) = build_processor(&state, sample_rate);
-                update_quality_tier_state(&state, processor.quality_tier());
                 last_ratio = f64::NAN;
                 flush_ring.store(true, Ordering::Release);
                 stream_active.store(false, Ordering::Relaxed);
                 stream_started = false;
             }
 
-            // Only process if playing
             if transport != Transport::Playing {
                 thread::sleep(Duration::from_millis(10));
                 continue;
             }
 
-            // Update warp-map ratio snapshot.
-            if let Err(err) =
-                maybe_update_ratio_warp(&mut processor, &mut last_ratio, stretch_ratio)
-            {
+            if let Err(err) = maybe_update_ratio(&mut processor, &mut last_ratio, stretch_ratio) {
                 log::error!("Invalid stretch ratio {stretch_ratio}: {err}");
                 thread::sleep(Duration::from_millis(5));
                 continue;
             }
 
-            // Check if we have audio to process
             if src_pos >= working_audio.len() {
-                // End of audio
-                // Flush remaining samples
                 let mut flushed = Vec::with_capacity(chunk_samples * 8);
-                if let Ok(()) = processor.flush(&mut flushed) {
+                if let Ok(_written) = processor.flush_into(&mut flushed) {
                     push_to_ring(&mut producer, &flushed);
                 }
-                update_quality_tier_state(&state, processor.quality_tier());
-                // Short clips can end before reaching the normal preroll target.
-                // If we have anything buffered, start the stream so the tail can play.
                 if !stream_started && producer.occupied_len() > 0 {
                     stream_started = true;
                     stream_active.store(true, Ordering::Relaxed);
                 }
-                // Signal stop
                 {
                     let mut st = state.lock().unwrap();
                     st.transport = Transport::Stopped;
@@ -181,36 +140,25 @@ pub fn start_processing_thread(
                 }
                 src_pos = 0;
                 (processor, preroll_target_samples) = build_processor(&state, sample_rate);
-                update_quality_tier_state(&state, processor.quality_tier());
                 last_ratio = f64::NAN;
                 continue;
             }
 
-            // Don't push if ring buffer is too full
             let available_space = producer.vacant_len();
             if available_space < chunk_samples * 4 {
                 thread::sleep(Duration::from_millis(5));
                 continue;
             }
 
-            // Get next chunk
             let end = (src_pos + chunk_samples).min(working_audio.len());
             let chunk = &working_audio[src_pos..end];
             src_pos = end;
 
-            // Update position
             let frame_pos = src_pos / CHANNELS as usize;
             position.store(frame_pos);
 
-            // Process through dual-plane processor.
             processed_chunk.clear();
-            match process_input_chunk(
-                &mut processor,
-                chunk,
-                &mut processed_chunk,
-                &mut input_planar,
-                &mut output_planar,
-            ) {
+            match process_input_chunk(&mut processor, chunk, &mut processed_chunk) {
                 Ok(()) => {
                     if !processed_chunk.is_empty() {
                         push_to_ring(&mut producer, &processed_chunk);
@@ -219,11 +167,8 @@ pub fn start_processing_thread(
                         stream_started = true;
                         stream_active.store(true, Ordering::Relaxed);
                     }
-                    update_quality_tier_state(&state, processor.quality_tier());
                 }
-                Err(e) => {
-                    log::error!("Stream processing error: {e}");
-                }
+                Err(e) => log::error!("Stream processing error: {e}"),
             }
         }
 
@@ -231,70 +176,56 @@ pub fn start_processing_thread(
     })
 }
 
-fn build_processor(state: &SharedStateHandle, sample_rate: u32) -> (DualPlaneProcessor, usize) {
+fn build_processor(state: &SharedStateHandle, sample_rate: u32) -> (StreamProcessor, usize) {
     let st = state.lock().unwrap();
     let ratio = st.stretch_ratio;
-    let latency_profile = st.latency_profile;
 
-    if st.preset == PresetChoice::DjBeatmatch {
+    let params = if st.preset == PresetChoice::DjBeatmatch {
         let detected_bpm = st.detected_bpm;
         let target_bpm = if st.target_bpm.is_finite() && st.target_bpm > 0.0 {
             st.target_bpm
         } else {
             detected_bpm
         };
-        if detected_bpm.is_finite()
+        let base_ratio = if detected_bpm.is_finite()
             && detected_bpm > 0.0
             && target_bpm.is_finite()
             && target_bpm > 0.0
         {
-            let base_ratio = detected_bpm / target_bpm;
-            let params = StretchParams::new(base_ratio)
-                .with_sample_rate(sample_rate)
-                .with_channels(CHANNELS)
-                .with_preset(EdmPreset::DjBeatmatch);
+            detected_bpm / target_bpm
+        } else {
+            ratio
+        };
 
-            let mut cfg = RtConfig::new(params.clone(), CHUNK_FRAMES);
-            cfg.latency_profile = latency_profile;
-            let mut processor = DualPlaneProcessor::prepare(cfg)
-                .expect("valid dual-plane RT config for desktop DJ");
-            if let Err(err) = force_ratio_warp(&mut processor, ratio) {
-                log::warn!("failed to apply ratio {ratio} to low-latency DJ processor: {err}");
-            }
-            let preroll = startup_preroll_target_samples(&params);
-            return (processor, preroll);
-        }
-
-        // Fallback if BPM metadata is unavailable.
-        let params = StretchParams::new(ratio)
+        let mut params = StretchParams::new(base_ratio)
             .with_sample_rate(sample_rate)
             .with_channels(CHANNELS)
             .with_preset(EdmPreset::DjBeatmatch);
-        let mut cfg = RtConfig::new(params.clone(), CHUNK_FRAMES);
-        cfg.latency_profile = latency_profile;
-        let mut processor =
-            DualPlaneProcessor::prepare(cfg).expect("valid dual-plane RT config fallback");
-        if let Err(err) = force_ratio_warp(&mut processor, ratio) {
-            log::warn!("failed to apply ratio {ratio} in fallback processor: {err}");
+        if detected_bpm.is_finite() && detected_bpm > 0.0 {
+            params = params.with_bpm(detected_bpm);
         }
-        let preroll = startup_preroll_target_samples(&params);
-        return (processor, preroll);
-    }
+        params
+    } else {
+        let mut params = StretchParams::new(ratio)
+            .with_sample_rate(sample_rate)
+            .with_channels(CHANNELS)
+            .with_normalize(true);
+        if let Some(preset) = st.preset.to_edm_preset() {
+            params = params.with_preset(preset);
+        }
+        if st.detected_bpm.is_finite() && st.detected_bpm > 0.0 {
+            params = params.with_bpm(st.detected_bpm);
+        }
+        params
+    };
+    drop(st);
 
-    let mut params = StretchParams::new(ratio)
-        .with_sample_rate(sample_rate)
-        .with_channels(CHANNELS)
-        .with_normalize(true);
-    if let Some(preset) = st.preset.to_edm_preset() {
-        params = params.with_preset(preset);
-    }
-    let mut cfg = RtConfig::new(params.clone(), CHUNK_FRAMES);
-    cfg.latency_profile = latency_profile;
-    let mut processor = DualPlaneProcessor::prepare(cfg).expect("valid dual-plane RT config");
-    if let Err(err) = force_ratio_warp(&mut processor, ratio) {
+    let preroll = startup_preroll_target_samples(&params);
+    let mut processor = StreamProcessor::new(params);
+    if let Err(err) = processor.set_stretch_ratio(ratio) {
         log::warn!("failed to apply initial ratio {ratio}: {err}");
     }
-    let preroll = startup_preroll_target_samples(&params);
+
     (processor, preroll)
 }
 
@@ -306,87 +237,35 @@ fn startup_preroll_target_samples(params: &StretchParams) -> usize {
         .max(callback_cushion_samples)
 }
 
-fn maybe_update_ratio_warp(
-    processor: &mut DualPlaneProcessor,
+fn maybe_update_ratio(
+    processor: &mut StreamProcessor,
     last_ratio: &mut f64,
     ratio: f64,
-) -> Result<(), timestretch::StretchError> {
+) -> Result<(), StretchError> {
     if !ratio.is_finite() || ratio <= 0.0 {
-        return Err(timestretch::StretchError::InvalidRatio(format!(
+        return Err(StretchError::InvalidRatio(format!(
             "stretch ratio must be finite and > 0.0, got {ratio}"
         )));
     }
     if (*last_ratio - ratio).abs() <= RATIO_UPDATE_EPSILON {
         return Ok(());
     }
-    force_ratio_warp(processor, ratio)?;
+    processor.set_stretch_ratio(ratio)?;
     *last_ratio = ratio;
     Ok(())
 }
 
-fn force_ratio_warp(
-    processor: &mut DualPlaneProcessor,
-    ratio: f64,
-) -> Result<(), timestretch::StretchError> {
-    let map = Arc::new(TimeWarpMap::from_ratio(ratio, RATIO_WARP_HORIZON_FRAMES)?);
-    if !processor.publish_warp_map(map.clone()) {
-        processor.rt_mut().set_warp_map_snapshot(map);
-    }
-    Ok(())
-}
-
 fn process_input_chunk(
-    processor: &mut DualPlaneProcessor,
+    processor: &mut StreamProcessor,
     input: &[f32],
     output: &mut Vec<f32>,
-    input_planar: &mut [Vec<f32>],
-    output_planar: &mut [Vec<f32>],
-) -> Result<(), timestretch::StretchError> {
+) -> Result<(), StretchError> {
     if input.is_empty() {
         return Ok(());
     }
-    if input_planar.len() != CHANNELS as usize || output_planar.len() != CHANNELS as usize {
-        return Err(timestretch::StretchError::InvalidFormat(
-            "desktop planar scratch channel count mismatch".to_string(),
-        ));
-    }
 
-    let block_samples = CHUNK_FRAMES * CHANNELS as usize;
-    let mut offset = 0usize;
-    while offset < input.len() {
-        let take = (input.len() - offset).min(block_samples);
-        let frames = take / CHANNELS as usize;
-        if frames == 0 {
-            break;
-        }
-
-        if input_planar[0].len() < frames || output_planar[0].is_empty() {
-            return Err(timestretch::StretchError::InvalidFormat(
-                "desktop planar scratch capacity mismatch".to_string(),
-            ));
-        }
-
-        for frame in 0..frames {
-            let base = offset + frame * CHANNELS as usize;
-            input_planar[0][frame] = input[base];
-            input_planar[1][frame] = input[base + 1];
-        }
-
-        let input_refs = [&input_planar[0][..frames], &input_planar[1][..frames]];
-        let (left_out, right_out) = output_planar.split_at_mut(1);
-        let mut output_refs = [left_out[0].as_mut_slice(), right_out[0].as_mut_slice()];
-
-        let (_consumed, produced_frames) = processor.process(&input_refs, &mut output_refs);
-        if produced_frames > 0 {
-            for frame in 0..produced_frames {
-                output.push(output_refs[0][frame]);
-                output.push(output_refs[1][frame]);
-            }
-        }
-
-        offset += frames * CHANNELS as usize;
-    }
-    Ok(())
+    output.reserve(input.len().saturating_mul(2));
+    processor.process_into(input, output)
 }
 
 fn push_to_ring(producer: &mut RingProducer, data: &[f32]) {
@@ -394,13 +273,8 @@ fn push_to_ring(producer: &mut RingProducer, data: &[f32]) {
     while offset < data.len() {
         let pushed = producer.push_slice(&data[offset..]);
         if pushed == 0 {
-            // Ring buffer full, yield
             thread::sleep(Duration::from_millis(1));
         }
         offset += pushed;
     }
-}
-
-fn update_quality_tier_state(state: &SharedStateHandle, tier: timestretch::QualityTier) {
-    state.lock().unwrap().current_quality_tier = tier;
 }

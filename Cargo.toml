@@ -40,7 +40,6 @@ opt-level = 3
 lto = true
 
 [workspace]
-members = ["timestretch_rt"]
 exclude = ["desktop", "web"]
 
 [[test]]
@@ -51,11 +50,6 @@ required-features = ["qa-harnesses"]
 [[test]]
 name = "quality_benchmark"
 path = "qa/quality_benchmark.rs"
-required-features = ["qa-harnesses"]
-
-[[test]]
-name = "quality_gates"
-path = "qa/quality_gates.rs"
 required-features = ["qa-harnesses"]
 
 [[test]]
