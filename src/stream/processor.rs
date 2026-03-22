@@ -1986,7 +1986,7 @@ impl StreamProcessor {
                     let gain = self.energy_gain as f32;
                     if use_shelf {
                         // Simple first-order high-shelf via one-pole filter
-                        let lp_coeff = (2.0 * std::f64::consts::PI * 1000.0
+                        let lp_coeff = (2.0 * std::f64::consts::PI * 2000.0
                             / self.params.sample_rate.max(1) as f64)
                             .min(0.5) as f32;
                         for ch in 0..num_channels {
