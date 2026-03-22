@@ -1172,9 +1172,35 @@ impl PhaseVocoder {
                     if self.peaks.binary_search(&bin).is_ok() {
                         continue; // Peak bins keep their locked phase
                     }
+                    // Distance-adaptive IF: bins far from peaks get more IF blend
+                    // since they benefit less from phase locking and more from
+                    // independent frequency tracking.
+                    let nearest_dist = match self.peaks.binary_search(&bin) {
+                        Ok(_) => 0,
+                        Err(idx) => {
+                            let lower = if idx > 0 {
+                                bin - self.peaks[idx - 1]
+                            } else {
+                                usize::MAX
+                            };
+                            let upper = if idx < self.peaks.len() {
+                                self.peaks[idx] - bin
+                            } else {
+                                usize::MAX
+                            };
+                            lower.min(upper)
+                        }
+                    };
+                    let dist_scale = if nearest_dist > 4 {
+                        1.0 + ((nearest_dist - 4) as f64 / 16.0).min(1.0)
+                    } else {
+                        1.0
+                    };
+                    let bin_if_blend = (if_blend * dist_scale).min(0.15);
                     let locked = self.new_phases[bin] as f64;
                     let if_est = self.if_phases_backup[bin] as f64;
-                    self.new_phases[bin] = ((1.0 - if_blend) * locked + if_blend * if_est) as f32;
+                    self.new_phases[bin] =
+                        ((1.0 - bin_if_blend) * locked + bin_if_blend * if_est) as f32;
                 }
             }
 
