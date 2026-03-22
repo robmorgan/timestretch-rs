@@ -407,6 +407,8 @@ pub struct StreamProcessor {
     output_energy_ema: f64,
     /// Smoothed energy gain factor applied to output.
     energy_gain: f64,
+    /// Count of gain compensation calls for warmup tracking.
+    gain_call_count: usize,
 }
 
 impl std::fmt::Debug for StreamProcessor {
@@ -488,6 +490,7 @@ impl StreamProcessor {
             input_energy_ema: 0.0,
             output_energy_ema: 0.0,
             energy_gain: 1.0,
+            gain_call_count: 0,
         }
     }
 
@@ -824,8 +827,15 @@ impl StreamProcessor {
                 .map(|&s| (s as f64) * (s as f64))
                 .sum::<f64>()
                 / self.channel_input_buffers[0].len().max(1) as f64;
-            const ENERGY_EMA_ALPHA: f64 = 0.05;
-            self.input_energy_ema += ENERGY_EMA_ALPHA * (input_energy - self.input_energy_ema);
+            // Fast warmup for the first 10 calls to converge quickly,
+            // then settle to stable tracking.
+            let ema_alpha = if self.gain_call_count < 10 {
+                0.20
+            } else {
+                0.05
+            };
+            self.input_energy_ema += ema_alpha * (input_energy - self.input_energy_ema);
+            self.gain_call_count = self.gain_call_count.saturating_add(1);
         }
 
         let min_output_len = self.process_channels(num_channels)?;
@@ -844,9 +854,12 @@ impl StreamProcessor {
                     .map(|&s| (s as f64) * (s as f64))
                     .sum::<f64>()
                     / min_output_len.max(1) as f64;
-                const ENERGY_EMA_ALPHA: f64 = 0.05;
-                self.output_energy_ema +=
-                    ENERGY_EMA_ALPHA * (output_energy - self.output_energy_ema);
+                let ema_alpha = if self.gain_call_count < 10 {
+                    0.20
+                } else {
+                    0.05
+                };
+                self.output_energy_ema += ema_alpha * (output_energy - self.output_energy_ema);
 
                 // Compute global gain to match input energy.
                 const GAIN_SMOOTH: f64 = 0.30;
@@ -1749,6 +1762,7 @@ impl StreamProcessor {
         self.input_energy_ema = 0.0;
         self.output_energy_ema = 0.0;
         self.energy_gain = 1.0;
+        self.gain_call_count = 0;
     }
 
     fn update_vocoder_ratio(&mut self) {

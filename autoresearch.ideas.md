@@ -1,45 +1,31 @@
 # Autoresearch Ideas: Streaming Quality
 
-## Current Score: 944.9/1000
+## Current Score: 950.7/1000 (124 experiments)
+
+## Status: Near ceiling for PV-only streaming architecture
+The remaining ~49 points require architectural changes (WSOLA integration, content-adaptive processing). All parameter tuning has been exhaustively explored.
 
 ## Current Optimized Parameters
 - Sub-bass rigid phase locking: 180Hz (streaming-only)
-- Phase locking: ROI with adaptive disabled
-- Energy EMA: alpha=0.05, gain_smooth=0.30, max_gain=3.0
-- Base shelf: gain-proportional, max 120%, gain scale 0.45, crossover 2000Hz
-- Ratio shelf: quadratic (t²), threshold 0.4, max 80%, crossover 2000Hz
+- Phase locking: ROI with adaptive disabled  
+- Phase gradient blend: 0.20
+- Energy EMA: alpha=0.05, gain_smooth=0.30, max_gain=3.0, sqrt gain formula
+- Base shelf: gain-proportional with ratio_scale, max 140%, crossover 2000Hz
+- Base shelf threshold: 1.02, gain denominator 0.48
+- Ratio scale: (ratio_distance / 0.3).clamp(0.2, 1.0)
+- Ratio shelf: quadratic (t²), threshold 0.4, max 80%
+- Two-pole cascaded shelf filter
 
-## Remaining Score Breakdown (latest)
-- edm 1.02: 0.972 (centroid 0.732)
-- edm 1.5: 0.922 (centroid 0.240) ← BIGGEST remaining weakness for EDM
-- edm 2.0: 0.996 (near perfect!)
-- harmonic 1.02: 0.982 (centroid 0.924)
-- harmonic 1.5: 0.982 (centroid 0.934)
-- percussive 1.02: 0.966 (centroid 0.692)
-- percussive 1.5: 0.948 (centroid 0.885)
-- percussive 2.0: 0.792 (freq 0.686, batch_sim 0.584, energy 0.902)
+## Remaining Score Breakdown
+| Case | Score | Main Weakness | Points Available |
+|------|-------|--------------|-----------------|
+| percussive 2.0x | 0.800 | freq=0.676, batch_sim=0.587 | ~25 avg |
+| edm 1.5x | 0.923 | centroid=0.255 | ~9.6 avg |
+| percussive 1.5x | 0.947 | batch_sim=0.832 | ~6.4 avg |
+| harmonic 1.02 | 0.983 | centroid=0.943 | ~2.1 avg |
+| edm 1.02 | 0.969 | centroid=0.704 | ~3.9 avg |
 
-### Theoretical max improvements:
-- percussive 2.0x to 0.90: +13.5 points
-- edm 1.5x to 0.96: +4.8 points
-- percussive 1.02 centroid: +3.9 points
-
-## Still Possible
-- **EDM 1.5x centroid fix**: The 24% centroid score is very low despite shelf. May need a fundamentally different approach for mid-ratio centroid.
-- **Percussive 2.0x batch_similarity**: Would need WSOLA integration in streaming
-- **Percussive 2.0x energy_score 0.902**: Shelf is over-boosting energy. Need shelf-aware gain or gentler shelf at 2.0x
-
-## Fully Explored (dead ends)
-- Sub-bass cutoff: 180Hz optimal (160, 200 worse)
-- Phase locking: ROI optimal (Identity, Selective worse)
-- EMA alpha: 0.05 optimal (0.04 same)
-- Gain smooth: 0.30 optimal
-- Max gain: 3.0 optimal (2.5 too low, 3.5 no help)
-- Window type: Hann optimal (BlackmanHarris hurts EDM)
-- Envelope preservation: zero effect
-- Per-band gain with IIR tilt: hurts quality
-- Persistent shelf state: hurts quality
-- Shelf crossover: 2000Hz optimal (1000, 1500, 3000 worse)
-- Shelf threshold: 0.4 optimal (0.3, 0.35 worse)
-- Base shelf fixed value: gain-proportional is better
-- EMA pre-seeding/fast warmup: hurts percussive
+## Architectural Changes Needed (not parameter tuning)
+1. **Streaming WSOLA integration**: Detect transients in mono streaming path, render transient regions with WSOLA, crossfade with PV output. Would improve percussive 2.0x batch_similarity dramatically.
+2. **Content-adaptive shelf**: Harmonic and EDM/percussive at same ratio need different shelf amounts. Need spectral content classification that doesn't hurt percussive.
+3. **Mid-frequency energy correction**: EDM 1.5x centroid drops 37% (646→407Hz). No HF shelf can fix this. Need band-specific or frequency-domain correction.
