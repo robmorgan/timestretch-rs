@@ -67,3 +67,8 @@ required-features = ["qa-harnesses"]
 name = "rubberband_comparison"
 path = "qa/rubberband_comparison.rs"
 required-features = ["qa-harnesses"]
+
+[[test]]
+name = "streaming_quality"
+path = "qa/streaming_quality.rs"
+required-features = ["qa-harnesses"]
