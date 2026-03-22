@@ -1976,8 +1976,12 @@ impl StreamProcessor {
                 // Two-tier shelf: base correction for inherent PV spectral
                 // tilt (always active when gain compensation is active), plus
                 // ratio-dependent boost for centroid shift at extreme ratios.
+                // Scale base shelf proportionally to energy gain: more gain
+                // means more PV energy loss, which correlates with more spectral
+                // tilt. At low gain (harmonic near-unity), shelf is minimal.
                 let base_shelf = if self.energy_gain > 1.05 {
-                    1.18f32
+                    let gain_factor = ((self.energy_gain - 1.05) / 0.45).clamp(0.0, 1.0);
+                    (1.0 + 0.18 * gain_factor) as f32
                 } else {
                     1.0f32
                 };
