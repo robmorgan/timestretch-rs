@@ -639,6 +639,9 @@ pub struct StreamProcessor {
     initialized: bool,
     /// Persistent PhaseVocoder instances, one per channel.
     vocoders: Vec<PhaseVocoder>,
+    /// The actual hop size used by the vocoders (may be half of params.hop_size
+    /// for improved quality via higher overlap).
+    vocoder_hop: usize,
     /// Reusable per-channel deinterleave buffers.
     channel_input_buffers: Vec<Vec<f32>>,
     /// Reusable per-channel stretched output buffers.
@@ -691,6 +694,7 @@ impl std::fmt::Debug for StreamProcessor {
             .field("current_ratio", &self.current_ratio)
             .field("target_ratio", &self.target_ratio)
             .field("vocoder_ratio", &self.vocoder_ratio)
+            .field("vocoder_hop", &self.vocoder_hop)
             .field("pitch_scale", &self.pitch_scale)
             .field("initialized", &self.initialized)
             .field("fixed_flush_pending", &self.fixed_flush_pending)
@@ -755,6 +759,7 @@ impl StreamProcessor {
             capacity_frames_per_channel,
         );
 
+        let vocoder_hop = params.hop_size / 2;
         let mut me = Self {
             params,
             input_ring: RingBuffer::with_capacity(capacity_samples),
@@ -764,6 +769,7 @@ impl StreamProcessor {
             vocoder_ratio: ratio,
             initialized: false,
             vocoders,
+            vocoder_hop,
             channel_input_buffers,
             channel_output_buffers,
             interleaved_scratch: vec![0.0; capacity_samples],
@@ -817,12 +823,17 @@ impl StreamProcessor {
     }
 
     /// Creates PhaseVocoder instances for each channel.
+    ///
+    /// Uses a finer analysis hop (half the configured hop_size) to match
+    /// batch hybrid quality. More overlapping analysis windows improve
+    /// window-sum smoothness and reduce spectral distortion.
     fn create_vocoders(params: &StretchParams, ratio: f64) -> Vec<PhaseVocoder> {
+        let pv_hop = params.hop_size / 2;
         (0..params.channels.count())
             .map(|_| {
                 let mut pv = PhaseVocoder::with_all_options(
                     params.fft_size,
-                    params.hop_size,
+                    pv_hop,
                     ratio,
                     params.sample_rate,
                     params.sub_bass_cutoff,
@@ -2675,6 +2686,7 @@ impl StreamProcessor {
         self.input_frames_consumed_total = 0;
 
         self.vocoders = Self::create_vocoders(&self.params, self.params.stretch_ratio);
+        self.vocoder_hop = self.params.hop_size / 2;
         self.expected_total_output_samples = 0.0;
         self.total_output_emitted_samples = 0;
         self.pitch_scale = 1.0;
