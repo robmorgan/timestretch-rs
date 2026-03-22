@@ -127,7 +127,6 @@ fn main() {
         total_output_samples,
         total_output_samples as f64 / sample_rate as f64
     );
-
 }
 
 /// Generates a simple house-style pattern with kicks and a pad.

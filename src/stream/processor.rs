@@ -401,6 +401,12 @@ pub struct StreamProcessor {
     pitch_resamplers: Vec<LinearResamplerState>,
     /// Reusable per-channel output buffers for pitch-resampled data.
     pitch_output_buffers: Vec<Vec<f32>>,
+    /// EMA-tracked input energy (RMS²) for gain compensation.
+    input_energy_ema: f64,
+    /// EMA-tracked output energy (RMS²) for gain compensation.
+    output_energy_ema: f64,
+    /// Smoothed energy gain factor applied to output.
+    energy_gain: f64,
 }
 
 impl std::fmt::Debug for StreamProcessor {
@@ -479,6 +485,9 @@ impl StreamProcessor {
             pitch_output_buffers: (0..num_channels)
                 .map(|_| Vec::with_capacity(pitch_output_capacity_frames))
                 .collect(),
+            input_energy_ema: 0.0,
+            output_energy_ema: 0.0,
+            energy_gain: 1.0,
         }
     }
 
@@ -802,6 +811,17 @@ impl StreamProcessor {
             self.apply_transient_scheduled_phase_reset(total_frames);
         }
 
+        // Track input energy for gain compensation.
+        {
+            let input_energy = self.channel_input_buffers[0]
+                .iter()
+                .map(|&s| (s as f64) * (s as f64))
+                .sum::<f64>()
+                / self.channel_input_buffers[0].len().max(1) as f64;
+            const ENERGY_EMA_ALPHA: f64 = 0.05;
+            self.input_energy_ema += ENERGY_EMA_ALPHA * (input_energy - self.input_energy_ema);
+        }
+
         let min_output_len = self.process_channels(num_channels)?;
         let consumed_frames = self.consume_processed_input(total_frames, num_channels);
         self.input_frames_consumed_total = self
@@ -810,6 +830,87 @@ impl StreamProcessor {
 
         if min_output_len > 0 {
             self.decode_output_mid_side(num_channels, min_output_len);
+
+            // Track output energy and compute gain compensation.
+            {
+                let output_energy = self.channel_output_buffers[0][..min_output_len]
+                    .iter()
+                    .map(|&s| (s as f64) * (s as f64))
+                    .sum::<f64>()
+                    / min_output_len.max(1) as f64;
+                const ENERGY_EMA_ALPHA: f64 = 0.05;
+                self.output_energy_ema +=
+                    ENERGY_EMA_ALPHA * (output_energy - self.output_energy_ema);
+
+                // Compute global gain to match input energy.
+                const GAIN_SMOOTH: f64 = 0.30;
+                if self.output_energy_ema > 1e-12 && self.input_energy_ema > 1e-12 {
+                    let target_gain = (self.input_energy_ema / self.output_energy_ema)
+                        .sqrt()
+                        .min(3.0);
+                    self.energy_gain += GAIN_SMOOTH * (target_gain - self.energy_gain);
+                }
+
+                // Apply gain compensation to output buffers.
+                // At extreme stretch ratios, the PV naturally loses high-frequency
+                // energy due to phase modifications. Apply a ratio-dependent
+                // high-shelf boost to counteract centroid shift.
+                let ratio_distance = (self.current_ratio - 1.0).abs();
+                // Two-tier shelf: base correction for inherent PV spectral
+                // tilt (always active when gain compensation is active), plus
+                // ratio-dependent boost for centroid shift at extreme ratios.
+                // Scale base shelf proportionally to energy gain: more gain
+                // means more PV energy loss, which correlates with more spectral
+                // tilt. At low gain (harmonic near-unity), shelf is minimal.
+                let base_shelf = if self.energy_gain > 1.02 {
+                    let gain_factor = ((self.energy_gain - 1.02) / 0.48).clamp(0.0, 1.0);
+                    (1.0 + 1.20 * gain_factor) as f32
+                } else {
+                    1.0f32
+                };
+                let ratio_shelf = if ratio_distance > 0.4 {
+                    let t = ((ratio_distance - 0.4) / 0.6).min(1.0);
+                    (1.0 + 0.80 * t * t) as f32
+                } else {
+                    1.0f32
+                };
+                let shelf_amount = base_shelf * ratio_shelf;
+                let use_shelf = shelf_amount > 1.001;
+
+                if (self.energy_gain - 1.0).abs() > 0.01 || use_shelf {
+                    let gain = self.energy_gain as f32;
+                    if use_shelf {
+                        // Two-pole high-shelf via cascaded one-pole filters
+                        // for steeper transition and more targeted boost.
+                        let lp_coeff = (2.0 * std::f64::consts::PI * 2000.0
+                            / self.params.sample_rate.max(1) as f64)
+                            .min(0.5) as f32;
+                        // Use sqrt of shelf for each stage (cascaded = product)
+                        let stage_shelf = shelf_amount.sqrt();
+                        for ch in 0..num_channels {
+                            let mut lp1 = 0.0f32;
+                            let mut lp2 = 0.0f32;
+                            for s in self.channel_output_buffers[ch][..min_output_len].iter_mut() {
+                                // First stage
+                                lp1 += lp_coeff * (*s - lp1);
+                                let hp1 = *s - lp1;
+                                let mid = lp1 + hp1 * stage_shelf;
+                                // Second stage
+                                lp2 += lp_coeff * (mid - lp2);
+                                let hp2 = mid - lp2;
+                                *s = (lp2 + hp2 * stage_shelf) * gain;
+                            }
+                        }
+                    } else {
+                        for ch in 0..num_channels {
+                            for s in self.channel_output_buffers[ch][..min_output_len].iter_mut() {
+                                *s *= gain;
+                            }
+                        }
+                    }
+                }
+            }
+
             self.emit_channel_output_to_pending(min_output_len, num_channels)?;
         }
 
@@ -1635,6 +1736,9 @@ impl StreamProcessor {
         self.total_output_emitted_samples = 0;
         self.pitch_scale = 1.0;
         self.reset_pitch_resamplers();
+        self.input_energy_ema = 0.0;
+        self.output_energy_ema = 0.0;
+        self.energy_gain = 1.0;
     }
 
     fn update_vocoder_ratio(&mut self) {
@@ -1658,10 +1762,12 @@ impl StreamProcessor {
         }
 
         let stereo = &self.interleaved_scratch[..total_samples];
-        let Some(reset_mask) = self
-            .transient_scheduler
-            .detect_stereo_reset_mask(stereo, self.input_frames_consumed_total, false, 0)
-        else {
+        let Some(reset_mask) = self.transient_scheduler.detect_stereo_reset_mask(
+            stereo,
+            self.input_frames_consumed_total,
+            false,
+            0,
+        ) else {
             return;
         };
 

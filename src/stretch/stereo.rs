@@ -135,13 +135,19 @@ fn stretch_independent(
     let left_out = if left.iter().all(|&s| s == 0.0) {
         vec![0.0; target_len]
     } else {
-        force_channel_length(HybridStretcher::new(params.clone()).process(left)?, target_len)
+        force_channel_length(
+            HybridStretcher::new(params.clone()).process(left)?,
+            target_len,
+        )
     };
 
     let right_out = if right.iter().all(|&s| s == 0.0) {
         vec![0.0; target_len]
     } else {
-        force_channel_length(HybridStretcher::new(params.clone()).process(right)?, target_len)
+        force_channel_length(
+            HybridStretcher::new(params.clone()).process(right)?,
+            target_len,
+        )
     };
 
     Ok((left_out, right_out))

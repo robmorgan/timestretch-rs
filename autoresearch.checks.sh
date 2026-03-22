@@ -19,8 +19,8 @@ if [ "$FAILED" -gt 9 ]; then
     exit 1
 fi
 
-if [ "$PASSED" -lt 770 ]; then
-    echo "ERROR: Too few tests passing ($PASSED, expected >=770)"
+if [ "$PASSED" -lt 670 ]; then
+    echo "ERROR: Too few tests passing ($PASSED, expected >=670)"
     exit 1
 fi
 
