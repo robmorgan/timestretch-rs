@@ -1974,9 +1974,11 @@ impl StreamProcessor {
                 // high-shelf boost to counteract centroid shift.
                 let ratio_distance = (self.current_ratio - 1.0).abs();
                 let shelf_amount = if ratio_distance > 0.4 {
-                    // Gentle high-shelf: up to 1.15x boost above crossover
-                    // Only at extreme ratios where centroid shift is significant
-                    (1.0 + 0.70 * ((ratio_distance - 0.4) / 0.6).min(1.0)) as f32
+                    // Ratio-dependent high-shelf to counteract centroid shift.
+                    // Use a quadratic curve for steeper onset — less effect at
+                    // moderate ratios (1.5x), stronger at extreme (2x+).
+                    let t = ((ratio_distance - 0.4) / 0.6).min(1.0);
+                    (1.0 + 0.80 * t * t) as f32
                 } else {
                     1.0f32
                 };
