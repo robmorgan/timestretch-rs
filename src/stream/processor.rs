@@ -1956,7 +1956,7 @@ impl StreamProcessor {
                 if self.output_energy_ema > 1e-12 && self.input_energy_ema > 1e-12 {
                     let target_gain = (self.input_energy_ema / self.output_energy_ema)
                         .sqrt()
-                        .min(6.0);
+                        .min(2.5);
                     // Smooth gain changes to avoid clicks.
                     const GAIN_SMOOTH: f64 = 0.25;
                     self.energy_gain += GAIN_SMOOTH * (target_gain - self.energy_gain);
