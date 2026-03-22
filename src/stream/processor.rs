@@ -666,6 +666,22 @@ pub struct StreamProcessor {
     output_energy_ema: f64,
     /// Smoothed gain compensation factor applied to output to preserve input energy.
     energy_gain: f64,
+    /// Per-band energy tracking for low frequencies (input).
+    input_low_energy_ema: f64,
+    /// Per-band energy tracking for low frequencies (output).
+    output_low_energy_ema: f64,
+    /// Per-band energy tracking for high frequencies (input).
+    input_high_energy_ema: f64,
+    /// Per-band energy tracking for high frequencies (output).
+    output_high_energy_ema: f64,
+    /// Low-band gain compensation factor.
+    low_gain: f64,
+    /// High-band gain compensation factor.
+    high_gain: f64,
+    /// IIR low-pass filter state for input band splitting.
+    input_lp_state: f64,
+    /// IIR low-pass filter state for output band splitting.
+    output_lp_state: f64,
     /// Realtime pitch scale applied in stream mode.
     pitch_scale: f64,
     /// Stateful per-channel resamplers for realtime pitch control.
@@ -781,6 +797,14 @@ impl StreamProcessor {
             input_energy_ema: 0.0,
             output_energy_ema: 0.0,
             energy_gain: 1.0,
+            input_low_energy_ema: 0.0,
+            output_low_energy_ema: 0.0,
+            input_high_energy_ema: 0.0,
+            output_high_energy_ema: 0.0,
+            low_gain: 1.0,
+            high_gain: 1.0,
+            input_lp_state: 0.0,
+            output_lp_state: 0.0,
             pitch_scale: 1.0,
             pitch_resamplers: (0..num_channels)
                 .map(|_| LinearResamplerState::new())
@@ -1921,15 +1945,36 @@ impl StreamProcessor {
             self.apply_transient_scheduled_phase_reset(total_frames);
         }
 
-        // Track input energy for gain compensation.
+        // Track input energy (total + per-band) for gain compensation.
+        // Use a simple first-order IIR low-pass at ~500 Hz to split bands.
         {
-            let input_energy = self.channel_input_buffers[0]
-                .iter()
-                .map(|&s| (s as f64) * (s as f64))
-                .sum::<f64>()
-                / self.channel_input_buffers[0].len().max(1) as f64;
+            let lp_coeff = (2.0 * std::f64::consts::PI * 500.0
+                / self.params.sample_rate.max(1) as f64)
+                .min(0.5);
+            let input_buf = &self.channel_input_buffers[0];
+            let n = input_buf.len().max(1) as f64;
+            let mut input_energy = 0.0f64;
+            let mut low_energy = 0.0f64;
+            let mut high_energy = 0.0f64;
+            let mut lp = self.input_lp_state;
+            for &s in input_buf.iter() {
+                let sf = s as f64;
+                input_energy += sf * sf;
+                lp += lp_coeff * (sf - lp);
+                let hp = sf - lp;
+                low_energy += lp * lp;
+                high_energy += hp * hp;
+            }
+            self.input_lp_state = lp;
+            input_energy /= n;
+            low_energy /= n;
+            high_energy /= n;
             const ENERGY_EMA_ALPHA: f64 = 0.05;
             self.input_energy_ema += ENERGY_EMA_ALPHA * (input_energy - self.input_energy_ema);
+            self.input_low_energy_ema +=
+                ENERGY_EMA_ALPHA * (low_energy - self.input_low_energy_ema);
+            self.input_high_energy_ema +=
+                ENERGY_EMA_ALPHA * (high_energy - self.input_high_energy_ema);
         }
 
         let min_output_len = self.process_channels(num_channels)?;
@@ -1941,29 +1986,100 @@ impl StreamProcessor {
         if min_output_len > 0 {
             self.decode_output_mid_side(num_channels, min_output_len);
 
-            // Track output energy and compute gain compensation.
+            // Track output energy (total + per-band) and compute gain compensation.
             {
-                let output_energy = self.channel_output_buffers[0][..min_output_len]
-                    .iter()
-                    .map(|&s| (s as f64) * (s as f64))
-                    .sum::<f64>()
-                    / min_output_len.max(1) as f64;
+                let lp_coeff = (2.0 * std::f64::consts::PI * 500.0
+                    / self.params.sample_rate.max(1) as f64)
+                    .min(0.5);
+                let output_buf = &self.channel_output_buffers[0][..min_output_len];
+                let n = min_output_len.max(1) as f64;
+                let mut output_energy = 0.0f64;
+                let mut low_energy = 0.0f64;
+                let mut high_energy = 0.0f64;
+                let mut lp = self.output_lp_state;
+                for &s in output_buf.iter() {
+                    let sf = s as f64;
+                    output_energy += sf * sf;
+                    lp += lp_coeff * (sf - lp);
+                    let hp = sf - lp;
+                    low_energy += lp * lp;
+                    high_energy += hp * hp;
+                }
+                self.output_lp_state = lp;
+                output_energy /= n;
+                low_energy /= n;
+                high_energy /= n;
+
                 const ENERGY_EMA_ALPHA: f64 = 0.05;
                 self.output_energy_ema +=
                     ENERGY_EMA_ALPHA * (output_energy - self.output_energy_ema);
+                self.output_low_energy_ema +=
+                    ENERGY_EMA_ALPHA * (low_energy - self.output_low_energy_ema);
+                self.output_high_energy_ema +=
+                    ENERGY_EMA_ALPHA * (high_energy - self.output_high_energy_ema);
 
-                // Compute gain to match input energy.
+                // Compute per-band gain to preserve spectral balance.
+                const GAIN_SMOOTH: f64 = 0.25;
+                const MAX_BAND_GAIN: f64 = 3.0;
+                if self.output_low_energy_ema > 1e-12 && self.input_low_energy_ema > 1e-12 {
+                    let target = (self.input_low_energy_ema / self.output_low_energy_ema)
+                        .sqrt()
+                        .min(MAX_BAND_GAIN);
+                    self.low_gain += GAIN_SMOOTH * (target - self.low_gain);
+                }
+                if self.output_high_energy_ema > 1e-12 && self.input_high_energy_ema > 1e-12 {
+                    let target = (self.input_high_energy_ema / self.output_high_energy_ema)
+                        .sqrt()
+                        .min(MAX_BAND_GAIN);
+                    self.high_gain += GAIN_SMOOTH * (target - self.high_gain);
+                }
+
+                // Also maintain global gain for overall energy.
                 if self.output_energy_ema > 1e-12 && self.input_energy_ema > 1e-12 {
                     let target_gain = (self.input_energy_ema / self.output_energy_ema)
                         .sqrt()
                         .min(2.5);
-                    // Smooth gain changes to avoid clicks.
-                    const GAIN_SMOOTH: f64 = 0.25;
                     self.energy_gain += GAIN_SMOOTH * (target_gain - self.energy_gain);
                 }
 
-                // Apply gain compensation to output buffers.
-                if (self.energy_gain - 1.0).abs() > 0.01 {
+                // Apply per-band gain to output using IIR band split.
+                // Only apply per-band correction if bands diverge significantly.
+                let band_ratio = if self.high_gain > 1e-6 {
+                    self.low_gain / self.high_gain
+                } else {
+                    1.0
+                };
+                let use_per_band = (band_ratio - 1.0).abs() > 0.1;
+
+                if use_per_band {
+                    for ch in 0..num_channels {
+                        let mut lp_s = if ch == 0 { self.output_lp_state } else { 0.0 };
+                        // Re-split and apply per-band gains.
+                        // We need to re-run the filter on the output to get consistent
+                        // band separation. But we already computed band energies above.
+                        // Simpler approach: apply a blend of low_gain and high_gain
+                        // weighted by frequency content.
+                        // Actually, let's use the global gain adjusted by the
+                        // low/high imbalance ratio.
+                        let _ = lp_s; // unused, using simpler approach below
+                        let avg_gain = self.energy_gain;
+                        // Tilt the gain: if low_gain > high_gain, boost lows more.
+                        // Apply a mild spectral tilt via per-sample IIR.
+                        let tilt_factor =
+                            (self.low_gain / self.high_gain.max(0.01)).clamp(0.5, 2.0);
+                        let mut tilt_lp = 0.0f64;
+                        for s in self.channel_output_buffers[ch][..min_output_len].iter_mut() {
+                            let sf = *s as f64;
+                            tilt_lp += lp_coeff * (sf - tilt_lp);
+                            let hp = sf - tilt_lp;
+                            // Apply different gains to low and high components
+                            let out = tilt_lp * avg_gain * tilt_factor.sqrt()
+                                + hp * avg_gain / tilt_factor.sqrt();
+                            *s = out as f32;
+                        }
+                    }
+                } else if (self.energy_gain - 1.0).abs() > 0.01 {
+                    // Simple global gain when bands are balanced.
                     let gain = self.energy_gain as f32;
                     for ch in 0..num_channels {
                         for s in self.channel_output_buffers[ch][..min_output_len].iter_mut() {
@@ -2730,6 +2846,14 @@ impl StreamProcessor {
         self.input_energy_ema = 0.0;
         self.output_energy_ema = 0.0;
         self.energy_gain = 1.0;
+        self.input_low_energy_ema = 0.0;
+        self.output_low_energy_ema = 0.0;
+        self.input_high_energy_ema = 0.0;
+        self.output_high_energy_ema = 0.0;
+        self.low_gain = 1.0;
+        self.high_gain = 1.0;
+        self.input_lp_state = 0.0;
+        self.output_lp_state = 0.0;
 
         self.vocoders = Self::create_vocoders(&self.params, self.params.stretch_ratio);
         self.expected_total_output_samples = 0.0;
