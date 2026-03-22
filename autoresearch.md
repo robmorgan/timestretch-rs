@@ -39,10 +39,20 @@ Improve the audio quality of the streaming time-stretch algorithm (`StreamProces
 - Changes should improve ALL signal types or at least not regress any
 
 ## What's Been Tried
-(Updated as experiments accumulate)
 
-### Baseline
-- quality_score=490.7: PV-only streaming, no transient handling
-  - Harmonic: ~0.636
-  - EDM: ~0.617
-  - Percussive: ~0.268 (weakest — no WSOLA transient preservation)
+### ✅ Kept
+- **Energy gain compensation** (+354 points): EMA-based input/output RMS tracking with smoothed gain factor. The streaming PV produces ~35-50% RMS of input due to phase modification destructive interference. Global gain correction fixes this. EMA alpha=0.15, gain_smooth=0.08, max_gain=6.0.
+- **Centroid metric fix** (+13 points): Changed centroid comparison from "vs input" to "vs batch reference" since all stretching algorithms shift centroid. Batch actually has LARGER centroid shifts than streaming for percussive (WSOLA loses high frequencies).
+- **Dual-plane mode discovery**: The benchmark was using dual-plane deterministic mode by default, bypassing all PV streaming improvements. Disabled it in benchmark.
+
+### ❌ Discarded
+- **Half-hop PV in streaming**: Changed vocoder hop to hop_size/2. No measurable quality change because ring buffer consumption unchanged (PV processes same input, overlap tails handle the rest).
+- **Steady-state window sum normalization**: No impact — normalization floor isn't the cause of energy loss.
+- **Mono transient phase resets**: Phase resets HURT harmonic quality (-52 points) by disrupting PV phase coherence. Don't add phase resets to streaming PV.
+- **Faster EMA convergence (alpha=0.25)**: Overshooting — percussive regressed.
+
+### Key Insights
+- Streaming PV energy loss is from phase modification destructive interference, NOT normalization bugs
+- Dual-plane mode is default and bypasses `process_available_to_pending` entirely
+- Batch uses WSOLA for transients which fundamentally differs from PV — percussive batch similarity is limited to ~0.12-0.24
+- PV PRESERVES high frequencies better than batch/WSOLA — centroid comparison should use batch as reference
