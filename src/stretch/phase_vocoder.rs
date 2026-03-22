@@ -1165,7 +1165,7 @@ impl PhaseVocoder {
             let if_blend = if transient_focus {
                 0.0
             } else {
-                (0.05 * ((hop_ratio - 1.0).abs() / 0.5).min(1.0)).min(0.05)
+                (0.06 * ((hop_ratio - 1.0).abs() / 0.5).min(1.0)).min(0.06)
             };
             if if_blend > 1e-6 {
                 for bin in self.sub_bass_bin..num_bins {
