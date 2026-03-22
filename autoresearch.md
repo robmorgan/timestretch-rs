@@ -59,4 +59,6 @@ Improve the audio quality of the streaming time-stretch algorithm (`StreamProces
 - Adaptive phase locking mode switching hurts streaming quality (causes phase discontinuities)
 - ROI phase locking is best for streaming (Identity slightly worse, Selective worse)
 - Envelope preservation has no measurable impact on time-stretch quality (mainly helps pitch shift)
-- Current score: 908.7/1000 — remaining gap is fundamental PV limitations at extreme ratios
+- Current score: 911.8/1000 — remaining gap is fundamental PV limitations at extreme ratios
+- Energy gain compensation parameters: EMA alpha=0.05 (stable tracking), gain_smooth=0.25 (responsive), max_gain=2.5 (prevents overshoot)
+- Slower EMA alpha works better because percussive content has bursty energy that destabilizes fast tracking
