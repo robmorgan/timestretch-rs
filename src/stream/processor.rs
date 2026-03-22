@@ -934,7 +934,7 @@ impl StreamProcessor {
             // shape (at the cost of aliasing), partially restoring kick impact.
             // Only active at extreme ratios where transient smearing is worst.
             if (self.current_ratio - 1.0).abs() > 0.5 {
-                let blend = 0.05f32; // 5% time-domain blend
+                let blend = 0.03f32; // 3% time-domain blend
                 let ratio = self.current_ratio;
                 for ch in 0..num_channels {
                     let in_buf = &self.channel_input_buffers[ch];
