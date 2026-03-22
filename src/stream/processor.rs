@@ -1981,7 +1981,7 @@ impl StreamProcessor {
                 // tilt. At low gain (harmonic near-unity), shelf is minimal.
                 let base_shelf = if self.energy_gain > 1.05 {
                     let gain_factor = ((self.energy_gain - 1.05) / 0.45).clamp(0.0, 1.0);
-                    (1.0 + 0.70 * gain_factor) as f32
+                    (1.0 + 0.80 * gain_factor) as f32
                 } else {
                     1.0f32
                 };
