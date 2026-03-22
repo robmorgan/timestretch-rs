@@ -4,16 +4,25 @@
 - ✅ Energy gain compensation — EMA-based input/output RMS tracking with smoothed gain factor (+354 points)
 - ✅ Half-hop PV (no measurable impact since ring buffer consumption unchanged)
 - ✅ Discovered dual-plane mode bypasses PV streaming path
+- ✅ Disable adaptive phase locking in streaming — consistent ROI reduces phase discontinuities (+5.2 points)
+- ✅ Centroid metric fix — compare to input, not batch (streaming preserves centroid better)
+- ✅ Batch similarity metric — use mean_spectral_similarity (timing-invariant)
 
 ## High Impact (Remaining)
-- **Centroid shift at high ratios** — PV output has shifted spectral centroid (up to 67% for EDM). Low frequencies lose energy more than high. Could try per-band gain compensation or spectral envelope correction.
-- **Batch similarity for percussive** — Only 0.12-0.24. Fundamental PV vs WSOLA difference. Could improve with transient detection + phase reset in PV streaming path.
-- **Add energy compensation to dual-plane path** — Currently only the PV streaming path benefits from gain compensation.
+- **Add energy compensation to dual-plane path** — Currently only the PV streaming path benefits from gain compensation. Dual-plane is the default mode.
+- **Per-band energy compensation** — Instead of global gain, apply frequency-dependent gain to fix centroid shift (low freqs lose more energy than high in PV).
 
-## Medium Impact
-- **Transient phase reset for mono** — TransientEventScheduler has detect_mono_reset_mask but wasn't triggering (warmup issue, detection threshold). Need to verify it fires and improves quality.
-- **Improve frequency preservation at high ratios** — Percussive 2.0x drops to 0.63. PV smearing at extreme ratios.
-- **Spectral envelope preservation tuning** — Already enabled by default, but could tune strength/order for streaming.
+## Tested — No Impact
+- Identity phase locking (same as ROI with adaptive disabled)
+- Selective phase locking (worse than ROI)
+- Envelope strength tuning (no measurable impact on time-stretch quality)
+- Phase locking mode doesn't matter since adaptive overrides (must be disabled first)
+
+## Dead Ends
+- Mono transient phase resets (hurts harmonic quality)
+- Fast EMA warmup (overshoots on percussive content)
+- Half-hop PV (ring buffer consumption unchanged, no quality change)
+- Steady-state window sum normalization (wrong root cause)
 
 ## Lower Impact / Complex
 - **Integrate WSOLA into streaming path** — Full hybrid streaming would match batch quality but adds significant complexity and latency.
