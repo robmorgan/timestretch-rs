@@ -1977,7 +1977,7 @@ impl StreamProcessor {
                 // tilt (always active when gain compensation is active), plus
                 // ratio-dependent boost for centroid shift at extreme ratios.
                 let base_shelf = if self.energy_gain > 1.05 {
-                    1.10f32
+                    1.12f32
                 } else {
                     1.0f32
                 };
