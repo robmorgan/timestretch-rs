@@ -1092,8 +1092,13 @@ impl StreamProcessor {
                     }
 
                     if wsola_min_len > 0 {
-                        // Store WSOLA output as overlay and set crossfade window.
-                        let overlay_len = wsola_min_len.min(min_output_len);
+                        // At extreme ratios, use full WSOLA output for cross-chunk
+                        // transient continuity. At normal ratios, limit to PV output.
+                        let overlay_len = if ratio_distance > 0.8 {
+                            wsola_min_len
+                        } else {
+                            wsola_min_len.min(min_output_len)
+                        };
                         for ch in 0..num_channels {
                             self.wsola_overlay_buffers[ch].clear();
                             self.wsola_overlay_buffers[ch]
