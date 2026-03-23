@@ -1,6 +1,6 @@
 [package]
 name = "timestretch"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Pure Rust audio time stretching library optimized for EDM"
 license = "MIT"
@@ -9,12 +9,13 @@ keywords = ["audio", "dsp", "time-stretching", "phase-vocoder", "edm"]
 categories = ["multimedia::audio", "algorithms"]
 readme = "README.md"
 repository = "https://github.com/robmorgan/timestretch-rs"
-exclude = ["samples", "optimize", ".metamorph", "web", "desktop"]
+exclude = ["samples", "optimize", "web", "desktop"]
 
 [dependencies]
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+arc-swap = "1.7"
 
 [[bin]]
 name = "timestretch-cli"
@@ -27,11 +28,46 @@ path = "test_audio/generate.rs"
 
 [features]
 cli = []
+qa-harnesses = []
 
 [dev-dependencies]
 toml = "0.8"
 sha2 = "0.10"
+hound = "3"
 
 [profile.release]
 opt-level = 3
 lto = true
+
+[workspace]
+exclude = ["desktop", "web"]
+
+[[test]]
+name = "benchmarks"
+path = "qa/benchmarks.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
+name = "quality_benchmark"
+path = "qa/quality_benchmark.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
+name = "reference_quality"
+path = "qa/reference_quality.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
+name = "rubberband_comparison"
+path = "qa/rubberband_comparison.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
+name = "streaming_quality"
+path = "qa/streaming_quality.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
+name = "quality_gates"
+path = "tests/quality_gates.rs"
+required-features = ["qa-harnesses"]

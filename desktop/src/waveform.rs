@@ -100,10 +100,7 @@ pub fn paint_waveform(
         };
 
         painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(x, top),
-                egui::pos2(x + bar_width, bottom),
-            ),
+            egui::Rect::from_min_max(egui::pos2(x, top), egui::pos2(x + bar_width, bottom)),
             0.0,
             color,
         );

@@ -4,7 +4,7 @@
 //! a range of factors, presets, and channel layouts.
 
 use std::f32::consts::PI;
-use timestretch::{pitch_shift, EdmPreset, StretchParams};
+use timestretch::{pitch_shift, EdmPreset, EnvelopePreset, StretchParams};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -44,6 +44,62 @@ fn rms(samples: &[f32]) -> f32 {
         return 0.0;
     }
     (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f64;
+    let mut aa = 0.0f64;
+    let mut bb = 0.0f64;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let xf = x as f64;
+        let yf = y as f64;
+        dot += xf * yf;
+        aa += xf * xf;
+        bb += yf * yf;
+    }
+    if aa <= 1e-12 || bb <= 1e-12 {
+        return 0.0;
+    }
+    (dot / (aa.sqrt() * bb.sqrt())) as f32
+}
+
+fn vowel_like_mono(sample_rate: u32, duration_secs: f32) -> Vec<f32> {
+    let n = (sample_rate as f32 * duration_secs) as usize;
+    let f0 = 130.0f32;
+    let formants = [700.0f32, 1200.0, 2600.0];
+    let bandwidths = [120.0f32, 170.0, 220.0];
+    let mut out = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let t = i as f32 / sample_rate as f32;
+        let mut s = 0.0f32;
+        let mut k = 1usize;
+        while (k as f32 * f0) < sample_rate as f32 * 0.45 {
+            let freq = k as f32 * f0;
+            let mut env = 0.0f32;
+            for (&f, &bw) in formants.iter().zip(bandwidths.iter()) {
+                let d = (freq - f) / bw;
+                env += (-0.5 * d * d).exp();
+            }
+            s += (2.0 * PI * freq * t).sin() * env / k as f32;
+            k += 1;
+        }
+        out.push(s);
+    }
+
+    let peak = out.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-6);
+    for x in &mut out {
+        *x = *x * 0.7 / peak;
+    }
+    out
+}
+
+fn formant_band_profile(samples: &[f32], sample_rate: u32) -> [f32; 3] {
+    [
+        energy_at_freq(samples, 700.0, sample_rate),
+        energy_at_freq(samples, 1200.0, sample_rate),
+        energy_at_freq(samples, 2600.0, sample_rate),
+    ]
 }
 
 fn assert_no_nan_inf(samples: &[f32], label: &str) {
@@ -361,4 +417,43 @@ fn test_pitch_shift_no_nan_inf_sweep() {
         let output = pitch_shift(&input, &params, factor).unwrap();
         assert_no_nan_inf(&output, &format!("factor {}", factor));
     }
+}
+
+// ── Formant-preservation controls ───────────────────────────────────────────
+
+#[test]
+fn test_pitch_shift_vocal_envelope_preset_tracks_formant_profile() {
+    let sample_rate = 44_100;
+    let input = vowel_like_mono(sample_rate, 1.0);
+    let base = StretchParams::new(1.0)
+        .with_sample_rate(sample_rate)
+        .with_channels(1);
+
+    let off_params = base.clone().with_envelope_preset(EnvelopePreset::Off);
+    let vocal_params = base
+        .clone()
+        .with_envelope_preset(EnvelopePreset::Vocal)
+        .with_envelope_strength(1.4);
+
+    let shifted_off = pitch_shift(&input, &off_params, 1.35).unwrap();
+    let shifted_vocal = pitch_shift(&input, &vocal_params, 1.35).unwrap();
+
+    assert_eq!(shifted_off.len(), input.len());
+    assert_eq!(shifted_vocal.len(), input.len());
+    assert_no_nan_inf(&shifted_off, "formant off");
+    assert_no_nan_inf(&shifted_vocal, "formant vocal");
+
+    let input_profile = formant_band_profile(&input, sample_rate);
+    let off_profile = formant_band_profile(&shifted_off, sample_rate);
+    let vocal_profile = formant_band_profile(&shifted_vocal, sample_rate);
+
+    let off_sim = cosine_similarity(&input_profile, &off_profile);
+    let vocal_sim = cosine_similarity(&input_profile, &vocal_profile);
+
+    assert!(
+        vocal_sim >= off_sim - 0.02,
+        "Vocal formant profile should be at least as close to input as off profile (off={:.4}, vocal={:.4})",
+        off_sim,
+        vocal_sim
+    );
 }

@@ -14,6 +14,7 @@
 use rustfft::{num_complex::Complex, FftPlanner};
 
 use crate::core::fft::COMPLEX_ZERO;
+use crate::core::types::{StretchParams, TransientThresholdPolicy};
 
 /// Weight of spectral flux in the combined onset detection function.
 const FLUX_WEIGHT: f32 = 0.6;
@@ -49,6 +50,41 @@ pub struct TransientMap {
     /// Each element is `[sub_bass, low, mid, high]` flux for that analysis frame.
     /// Band boundaries: sub-bass <100Hz, low 100-500Hz, mid 500-4000Hz, high >4000Hz.
     pub per_frame_band_flux: Vec<[f32; 4]>,
+}
+
+/// Configuration for onset lookahead confirmation.
+///
+/// These controls tune how aggressively isolated one-frame spikes are rejected.
+#[derive(Debug, Clone, Copy)]
+pub struct TransientDetectionOptions {
+    /// Number of future frames to inspect before confirming a candidate onset.
+    /// `0` disables lookahead confirmation.
+    pub lookahead_confirm_frames: usize,
+    /// Relaxation factor applied to the local threshold for future-frame checks.
+    /// Lower values accept weaker continuation; range: `[0.0, 1.0]`.
+    pub lookahead_threshold_relax: f32,
+    /// Relative continuation threshold versus the candidate peak.
+    /// Range: `[0.0, 1.0]`.
+    pub lookahead_peak_retain_ratio: f32,
+    /// Multiplier above local threshold that bypasses lookahead checks entirely.
+    /// Values `< 1.0` are treated as `1.0` at runtime.
+    pub strong_spike_bypass_multiplier: f32,
+    /// Adaptive threshold policy (median window, floor, onset-gap profile).
+    pub threshold_policy: TransientThresholdPolicy,
+}
+
+impl TransientDetectionOptions {
+    /// Builds transient-detection options from user-facing stretch parameters.
+    #[inline]
+    pub fn from_stretch_params(params: &StretchParams) -> Self {
+        Self {
+            lookahead_confirm_frames: params.transient_lookahead_frames,
+            lookahead_threshold_relax: params.transient_lookahead_threshold_relax,
+            lookahead_peak_retain_ratio: params.transient_lookahead_peak_retain_ratio,
+            strong_spike_bypass_multiplier: params.transient_strong_spike_bypass_multiplier,
+            threshold_policy: params.transient_threshold_policy.sanitized(),
+        }
+    }
 }
 
 /// Band boundary frequencies for per-band flux (Hz).
@@ -389,6 +425,26 @@ pub fn detect_transients(
     hop_size: usize,
     sensitivity: f32,
 ) -> TransientMap {
+    let default_params = StretchParams::default();
+    detect_transients_with_options(
+        samples,
+        sample_rate,
+        fft_size,
+        hop_size,
+        sensitivity,
+        TransientDetectionOptions::from_stretch_params(&default_params),
+    )
+}
+
+/// Detects transients in a mono signal with configurable lookahead confirmation.
+pub fn detect_transients_with_options(
+    samples: &[f32],
+    sample_rate: u32,
+    fft_size: usize,
+    hop_size: usize,
+    sensitivity: f32,
+    options: TransientDetectionOptions,
+) -> TransientMap {
     if samples.len() < fft_size {
         return TransientMap {
             onsets: vec![],
@@ -406,14 +462,12 @@ pub fn detect_transients(
         compute_phase_deviation(samples, sample_rate, fft_size, hop_size);
     let combined = combine_detection_functions(&flux_values, &energy_envelope, &phase_deviation);
 
-    // Use sensitivity-aware gap: high sensitivity (>0.6) uses smaller gap
-    // to detect rapid hi-hat patterns
-    let min_gap = if sensitivity > 0.6 {
-        MIN_ONSET_GAP_FRAMES_HIGH_SENS
-    } else {
-        MIN_ONSET_GAP_FRAMES
-    };
-    let onsets = adaptive_threshold_with_gap(&combined, sensitivity, hop_size, min_gap);
+    // Use policy-configured sensitivity-aware gap to detect rapid patterns.
+    let min_gap = options
+        .threshold_policy
+        .sanitized()
+        .min_gap_for_sensitivity(sensitivity);
+    let onsets = adaptive_threshold_with_gap(&combined, sensitivity, hop_size, min_gap, options);
 
     // Compute onset strengths from detection function values
     let strengths = compute_onset_strengths(&combined, &onsets, hop_size);
@@ -478,15 +532,12 @@ fn compute_bin_weights(fft_size: usize, sample_rate: u32) -> Vec<f32> {
         .collect()
 }
 
-/// Number of frames in the local median window for adaptive thresholding.
-const MEDIAN_WINDOW_FRAMES: usize = 11;
-/// Minimum gap between detected onsets in frames (~46ms at typical hop sizes).
-const MIN_ONSET_GAP_FRAMES: usize = 4;
-/// Reduced minimum gap for high-sensitivity presets (~23ms), allowing rapid
-/// hi-hat pattern detection (16th notes at 124 BPM = 121ms apart).
-const MIN_ONSET_GAP_FRAMES_HIGH_SENS: usize = 2;
-/// Floor added to threshold to avoid false positives in near-silence.
-const THRESHOLD_FLOOR: f32 = 0.01;
+impl Default for TransientDetectionOptions {
+    fn default() -> Self {
+        let params = StretchParams::default();
+        Self::from_stretch_params(&params)
+    }
+}
 
 /// Adaptive thresholding with a configurable minimum gap between onsets.
 ///
@@ -498,19 +549,27 @@ fn adaptive_threshold_with_gap(
     sensitivity: f32,
     hop_size: usize,
     min_gap_frames: usize,
+    options: TransientDetectionOptions,
 ) -> Vec<usize> {
     if flux.is_empty() {
         return vec![];
     }
 
-    let half_window = MEDIAN_WINDOW_FRAMES / 2;
+    let threshold_policy = options.threshold_policy.sanitized();
+    let half_window = threshold_policy.median_window_frames / 2;
     // Higher sensitivity = lower threshold = more detections
-    let threshold_multiplier = 1.0 + (1.0 - sensitivity) * 3.5;
+    let threshold_multiplier =
+        1.0 + (1.0 - sensitivity).max(0.0) * threshold_policy.threshold_sensitivity_slope.max(0.0);
 
     let mut onsets = Vec::new();
     let mut last_onset: Option<usize> = None;
     // Reusable sort buffer to avoid per-frame allocation
-    let mut local = Vec::with_capacity(MEDIAN_WINDOW_FRAMES);
+    let mut local = Vec::with_capacity(threshold_policy.median_window_frames);
+
+    let lookahead_frames = options.lookahead_confirm_frames;
+    let threshold_relax = options.lookahead_threshold_relax.clamp(0.0, 1.0);
+    let peak_retain_ratio = options.lookahead_peak_retain_ratio.clamp(0.0, 1.0);
+    let strong_bypass_multiplier = options.strong_spike_bypass_multiplier.max(1.0);
 
     for (i, &flux_val) in flux.iter().enumerate() {
         // Compute local median
@@ -521,9 +580,23 @@ fn adaptive_threshold_with_gap(
         local.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = local[local.len() / 2];
 
-        let threshold = median * threshold_multiplier + THRESHOLD_FLOOR;
+        let threshold = median * threshold_multiplier + threshold_policy.threshold_floor;
 
         if flux_val > threshold {
+            let strong_spike = flux_val > threshold * strong_bypass_multiplier;
+            if !strong_spike && lookahead_frames > 0 && i + 1 < flux.len() {
+                let lookahead_end = i.saturating_add(lookahead_frames).min(flux.len() - 1);
+                let relaxed_threshold = threshold * threshold_relax;
+                let retain_level = flux_val * peak_retain_ratio;
+                let confirmed = flux[i + 1..=lookahead_end]
+                    .iter()
+                    .any(|&future| future > relaxed_threshold || future > retain_level);
+
+                if !confirmed {
+                    continue;
+                }
+            }
+
             // Check minimum gap
             if let Some(last) = last_onset {
                 if i - last < min_gap_frames {
@@ -575,7 +648,11 @@ mod tests {
 
     /// Test helper: adaptive_threshold with default gap.
     fn adaptive_threshold(flux: &[f32], sensitivity: f32, hop_size: usize) -> Vec<usize> {
-        adaptive_threshold_with_gap(flux, sensitivity, hop_size, MIN_ONSET_GAP_FRAMES)
+        let options = TransientDetectionOptions::default();
+        let min_gap = options
+            .threshold_policy
+            .min_gap_for_sensitivity(sensitivity);
+        adaptive_threshold_with_gap(flux, sensitivity, hop_size, min_gap, options)
     }
 
     #[test]
@@ -784,6 +861,75 @@ mod tests {
         );
         // Onset position should be flux_index * hop_size
         assert_eq!(result[0], 25 * 512);
+    }
+
+    #[test]
+    fn test_adaptive_threshold_lookahead_rejects_weak_isolated_spike() {
+        let mut flux = vec![0.0f32; 50];
+        flux[25] = 0.02; // above floor, but below strong-spike bypass
+
+        let result = adaptive_threshold_with_gap(
+            &flux,
+            0.5,
+            512,
+            TransientDetectionOptions::default()
+                .threshold_policy
+                .min_gap_for_sensitivity(0.5),
+            TransientDetectionOptions::default(),
+        );
+        assert!(
+            result.is_empty(),
+            "Weak isolated spike should be rejected by lookahead confirmation"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_threshold_lookahead_zero_detects_weak_isolated_spike() {
+        let mut flux = vec![0.0f32; 50];
+        flux[25] = 0.02;
+
+        let result = adaptive_threshold_with_gap(
+            &flux,
+            0.5,
+            512,
+            TransientDetectionOptions::default()
+                .threshold_policy
+                .min_gap_for_sensitivity(0.5),
+            TransientDetectionOptions {
+                lookahead_confirm_frames: 0,
+                ..TransientDetectionOptions::default()
+            },
+        );
+        assert_eq!(result, vec![25 * 512]);
+    }
+
+    #[test]
+    fn test_default_options_match_stretch_params_defaults() {
+        let params = StretchParams::default();
+        let options = TransientDetectionOptions::default();
+        assert_eq!(
+            options.lookahead_confirm_frames,
+            params.transient_lookahead_frames
+        );
+        assert!(
+            (options.lookahead_threshold_relax - params.transient_lookahead_threshold_relax).abs()
+                < 1e-6
+        );
+        assert!(
+            (options.lookahead_peak_retain_ratio - params.transient_lookahead_peak_retain_ratio)
+                .abs()
+                < 1e-6
+        );
+        assert!(
+            (options.strong_spike_bypass_multiplier
+                - params.transient_strong_spike_bypass_multiplier)
+                .abs()
+                < 1e-6
+        );
+        assert_eq!(
+            options.threshold_policy,
+            params.transient_threshold_policy.sanitized()
+        );
     }
 
     #[test]

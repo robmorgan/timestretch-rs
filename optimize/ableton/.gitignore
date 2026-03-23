@@ -1,0 +1,7 @@
+logs/
+refs/ableton/*.wav
+refs/library/*.wav
+template/base_template Project/
+template/base_template.xml
+__pycache__/
+scripts/__pycache__/

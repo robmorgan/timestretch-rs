@@ -1,6 +1,4 @@
 .DS_Store
-.metamorph/
-agent_logs/
 /target
 Cargo.lock
 *.wav
@@ -9,3 +7,5 @@ web/pkg/
 web/target/
 desktop/target/
 benchmarks/audio/
+.codex-loop/
+.codex-plan-loop/

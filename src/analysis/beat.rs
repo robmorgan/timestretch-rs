@@ -16,6 +16,10 @@ const BEAT_SENSITIVITY: f32 = 0.4;
 const MIN_EDM_BPM: f64 = 100.0;
 /// Maximum EDM BPM for octave normalization.
 const MAX_EDM_BPM: f64 = 160.0;
+/// Hard bound for octave-normalization loop steps.
+const MAX_BPM_NORMALIZATION_STEPS: usize = 32;
+/// Hard bound for dynamically generated beat/subdivision grid points.
+const MAX_GRID_POINTS: usize = 1_000_000;
 
 /// PLL interval correction gain. Controls how quickly the beat interval
 /// adapts to phase errors from detected onsets. Higher values adapt faster
@@ -169,14 +173,26 @@ fn estimate_bpm_from_intervals(intervals: &[usize], sample_rate: u32) -> f64 {
     sorted.sort();
     let median_interval = sorted[sorted.len() / 2];
 
+    if median_interval == 0 {
+        return 0.0;
+    }
     let raw_bpm = 60.0 * sample_rate as f64 / median_interval as f64;
+    if !raw_bpm.is_finite() || raw_bpm <= 0.0 {
+        return 0.0;
+    }
 
     // Snap to reasonable EDM BPM range
     let mut bpm = raw_bpm;
-    while bpm > MAX_EDM_BPM {
+    for _ in 0..MAX_BPM_NORMALIZATION_STEPS {
+        if bpm <= MAX_EDM_BPM {
+            break;
+        }
         bpm /= 2.0;
     }
-    while bpm < MIN_EDM_BPM && bpm > 0.0 {
+    for _ in 0..MAX_BPM_NORMALIZATION_STEPS {
+        if !(bpm < MIN_EDM_BPM && bpm > 0.0) {
+            break;
+        }
         bpm *= 2.0;
     }
 
@@ -196,9 +212,17 @@ fn quantize_to_grid(onsets: &[usize], beat_interval: usize) -> Vec<usize> {
     let first = onsets[0];
     let last = *onsets.last().unwrap_or(&first);
 
+    let max_points = last
+        .saturating_sub(first)
+        .saturating_div(beat_interval)
+        .saturating_add(2)
+        .min(MAX_GRID_POINTS);
     let mut grid = Vec::new();
     let mut pos = first;
-    while pos <= last + beat_interval / 2 {
+    for _ in 0..max_points {
+        if pos > last + beat_interval / 2 {
+            break;
+        }
         grid.push(pos);
         pos += beat_interval;
     }
@@ -224,7 +248,7 @@ fn quantize_to_grid(onsets: &[usize], beat_interval: usize) -> Vec<usize> {
 /// # Returns
 /// Fractional-sample beat grid positions.
 fn quantize_to_grid_pll(onsets: &[f64], _intervals: &[f64], initial_interval: f64) -> Vec<f64> {
-    if onsets.is_empty() || initial_interval <= 0.0 {
+    if onsets.is_empty() || initial_interval <= 0.0 || !initial_interval.is_finite() {
         return onsets.to_vec();
     }
 
@@ -239,7 +263,7 @@ fn quantize_to_grid_pll(onsets: &[f64], _intervals: &[f64], initial_interval: f6
     for &onset in onsets.iter().skip(1) {
         // Find nearest grid position for this onset
         let relative = onset - first - grid_offset;
-        if beat_interval <= 0.0 {
+        if beat_interval <= 0.0 || !beat_interval.is_finite() {
             break;
         }
         let nearest_grid_idx = (relative / beat_interval).round();
@@ -249,7 +273,7 @@ fn quantize_to_grid_pll(onsets: &[f64], _intervals: &[f64], initial_interval: f6
         let phase_error = onset - nearest_grid_pos;
 
         // Apply PLL corrections
-        beat_interval += PLL_ALPHA * phase_error / nearest_grid_idx.max(1.0);
+        beat_interval += PLL_ALPHA * phase_error / nearest_grid_idx.abs().max(1.0);
         grid_offset += PLL_BETA * phase_error;
 
         // Ensure interval stays positive and reasonable (within 50% of initial)
@@ -261,8 +285,15 @@ fn quantize_to_grid_pll(onsets: &[f64], _intervals: &[f64], initial_interval: f6
     let mut pos = first + grid_offset;
 
     // Ensure grid starts at or before the first onset
-    while pos > first + beat_interval * 0.5 {
+    let max_back_steps = onsets.len().saturating_mul(8).max(64);
+    for _ in 0..max_back_steps {
+        if pos <= first + beat_interval * 0.5 {
+            break;
+        }
         pos -= beat_interval;
+    }
+    if pos > first + beat_interval * 0.5 {
+        pos = first;
     }
     // Don't start before sample 0
     if pos < 0.0 {
@@ -270,7 +301,13 @@ fn quantize_to_grid_pll(onsets: &[f64], _intervals: &[f64], initial_interval: f6
     }
 
     let end = last + beat_interval * 0.5;
-    while pos <= end {
+    let max_grid_points = (((end - pos) / beat_interval).max(0.0).ceil() as usize)
+        .saturating_add(2)
+        .min(MAX_GRID_POINTS);
+    for _ in 0..max_grid_points {
+        if pos > end {
+            break;
+        }
         grid.push(pos);
         pos += beat_interval;
     }
@@ -315,9 +352,13 @@ pub fn generate_subdivision_grid(
         return Vec::new();
     }
     let estimated_count = (total_samples as f64 / sub_interval).ceil() as usize + 1;
-    let mut grid = Vec::with_capacity(estimated_count);
+    let max_points = estimated_count.min(MAX_GRID_POINTS);
+    let mut grid = Vec::with_capacity(max_points);
     let mut pos = 0.0;
-    while pos < total_samples as f64 {
+    for _ in 0..max_points {
+        if pos >= total_samples as f64 {
+            break;
+        }
         grid.push(pos);
         pos += sub_interval;
     }

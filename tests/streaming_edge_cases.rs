@@ -60,7 +60,8 @@ fn test_streaming_rapid_ratio_changes() {
     let mut total_output = Vec::new();
     let ratios = [1.0, 1.05, 0.95, 1.1, 0.9, 1.02, 0.98];
     for (chunk_idx, &ratio) in ratios.iter().enumerate() {
-        proc.set_stretch_ratio(ratio);
+        proc.set_stretch_ratio(ratio)
+            .expect("valid rapid-change ratio");
         let output = proc.process(&input).unwrap();
         total_output.extend_from_slice(&output);
 
@@ -112,7 +113,8 @@ fn test_streaming_flush_continuity_under_rapid_ratio_automation() {
     let mut pre_flush = Vec::new();
 
     for chunk_idx in 0..56 {
-        proc.set_stretch_ratio(ratios[chunk_idx % ratios.len()]);
+        proc.set_stretch_ratio(ratios[chunk_idx % ratios.len()])
+            .expect("valid rapid automation ratio");
         let chunk = automation_chunk(sample_cursor, chunk_size, 44100.0);
         sample_cursor += chunk_size;
         let out = proc.process(&chunk).unwrap();

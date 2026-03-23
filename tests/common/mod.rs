@@ -213,12 +213,8 @@ pub fn run_streaming_mono(
     input: &[f32],
     params: StretchParams,
     chunk_size: usize,
-    hybrid: bool,
 ) -> Result<Vec<f32>, StretchError> {
     let mut processor = StreamProcessor::new(params);
-    if hybrid {
-        processor.set_hybrid_mode(true);
-    }
 
     let mut output = Vec::new();
     for chunk in input.chunks(chunk_size.max(1)) {

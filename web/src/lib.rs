@@ -43,8 +43,10 @@ impl TimeStretchNode {
     }
 
     /// Smoothly change the stretch ratio (interpolated over time).
-    pub fn set_stretch_ratio(&mut self, ratio: f64) {
-        self.processor.set_stretch_ratio(ratio);
+    pub fn set_stretch_ratio(&mut self, ratio: f64) -> Result<(), JsValue> {
+        self.processor
+            .set_stretch_ratio(ratio)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Reset all internal state (call when seeking or changing presets).

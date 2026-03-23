@@ -52,21 +52,6 @@ fn stream_stretch(input: &[f32], params: StretchParams, chunk_size: usize) -> Ve
     output
 }
 
-fn stream_stretch_hybrid(input: &[f32], params: StretchParams, chunk_size: usize) -> Vec<f32> {
-    let mut processor = StreamProcessor::new(params);
-    processor.set_hybrid_mode(true);
-    let mut output = Vec::new();
-    for chunk in input.chunks(chunk_size) {
-        if let Ok(out) = processor.process(chunk) {
-            output.extend_from_slice(&out);
-        }
-    }
-    if let Ok(remaining) = processor.flush() {
-        output.extend_from_slice(&remaining);
-    }
-    output
-}
-
 // ========== Length parity across stretch ratios ==========
 
 #[test]
@@ -335,33 +320,6 @@ fn test_parity_stereo_both_channels() {
     assert!(batch_r_rms > 0.1, "Batch R should have energy");
     assert!(stream_l_rms > 0.1, "Stream L should have energy");
     assert!(stream_r_rms > 0.1, "Stream R should have energy");
-}
-
-// ========== Hybrid streaming vs batch parity ==========
-
-#[test]
-fn test_parity_hybrid_streaming_closer_to_batch() {
-    // Hybrid streaming mode should produce results closer to batch
-    // than PV-only streaming, since batch also uses hybrid algorithm.
-    let sample_rate = 44100;
-    let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
-
-    let params = StretchParams::new(1.5)
-        .with_sample_rate(sample_rate)
-        .with_channels(1);
-
-    let batch = stretch(&input, &params).unwrap();
-    let stream_pv = stream_stretch(&input, params.clone(), 4096);
-    let stream_hybrid = stream_stretch_hybrid(&input, params, 4096);
-
-    let batch_rms = rms(&batch);
-    let pv_rms = rms(&stream_pv);
-    let hybrid_rms = rms(&stream_hybrid);
-
-    // All three should produce non-trivial output
-    assert!(batch_rms > 0.1, "Batch should have energy");
-    assert!(pv_rms > 0.1, "PV stream should have energy");
-    assert!(hybrid_rms > 0.1, "Hybrid stream should have energy");
 }
 
 // ========== Chunk size independence ==========

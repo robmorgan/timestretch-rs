@@ -1,0 +1,57 @@
+[
+  {
+    "id": "music-sounds-better",
+    "source": "../references/house/12247392_Music Sounds Better With You_(Original Mix).wav",
+    "source_bpm": 124.0,
+    "targets": [
+      {"target_bpm": 115.0, "ratio": 1.0783},
+      {"target_bpm": 128.0, "ratio": 0.9688},
+      {"target_bpm": 100.0, "ratio": 1.2400}
+    ],
+    "stereo": true
+  },
+  {
+    "id": "gimme-gimme-gimme",
+    "source": "../references/house/13061141_Gimme! Gimme! Gimme!_(Sgt Slick's Melbourne Recut).wav",
+    "source_bpm": 123.0,
+    "targets": [
+      {"target_bpm": 115.0, "ratio": 1.0696},
+      {"target_bpm": 128.0, "ratio": 0.9609},
+      {"target_bpm": 100.0, "ratio": 1.2300}
+    ],
+    "stereo": true
+  },
+  {
+    "id": "hot-stuff",
+    "source": "../references/house/14220825_Hot Stuff_(Original Mix).wav",
+    "source_bpm": 120.0,
+    "targets": [
+      {"target_bpm": 115.0, "ratio": 1.0435},
+      {"target_bpm": 128.0, "ratio": 0.9375},
+      {"target_bpm": 100.0, "ratio": 1.2000}
+    ],
+    "stereo": true
+  },
+  {
+    "id": "somebody-to-love",
+    "source": "../references/house/15650709_Somebody To Love_(Extended Mix).wav",
+    "source_bpm": 128.0,
+    "targets": [
+      {"target_bpm": 115.0, "ratio": 1.1130},
+      {"target_bpm": 135.0, "ratio": 0.9481},
+      {"target_bpm": 100.0, "ratio": 1.2800}
+    ],
+    "stereo": true
+  },
+  {
+    "id": "cold-heart",
+    "source": "../references/house/15836669_Cold Heart_(PNAU Extended Mix).wav",
+    "source_bpm": 116.0,
+    "targets": [
+      {"target_bpm": 124.0, "ratio": 0.9355},
+      {"target_bpm": 128.0, "ratio": 0.9063},
+      {"target_bpm": 100.0, "ratio": 1.1600}
+    ],
+    "stereo": true
+  }
+]

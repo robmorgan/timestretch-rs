@@ -88,7 +88,7 @@ impl SharedState {
             stretch_ratio: 1.0,
             pitch_semitones: 0.0,
             volume: 0.8,
-            preset: PresetChoice::None,
+            preset: PresetChoice::DjBeatmatch,
             position_frames: 0,
             total_frames: 0,
             sample_rate: 44100,

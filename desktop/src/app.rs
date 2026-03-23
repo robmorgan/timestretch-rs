@@ -51,8 +51,9 @@ impl TimeStretchApp {
         let position = Arc::new(AtomicPosition::new());
 
         // Try to create audio engine to detect default sample rate
+        let dummy_flush = Arc::new(AtomicBool::new(false));
         let (audio_engine, output_sample_rate) =
-            match AudioEngine::new(state.clone(), stream_active.clone(), None) {
+            match AudioEngine::new(state.clone(), stream_active.clone(), None, dummy_flush) {
                 Ok((engine, _producer)) => {
                     let sr = engine.output_sample_rate;
                     // We'll create a new engine when loading a file
@@ -80,7 +81,7 @@ impl TimeStretchApp {
             stretch_ratio: 1.0,
             pitch_semitones: 0.0,
             volume: 0.8,
-            preset: PresetChoice::None,
+            preset: PresetChoice::DjBeatmatch,
             target_bpm_text: String::new(),
             error_message: None,
         }
@@ -170,14 +171,19 @@ impl TimeStretchApp {
 
         // Create audio engine with ring buffer, matching the source file's sample rate
         // so playback speed is correct regardless of the device's native rate.
-        let (engine, producer) =
-            match AudioEngine::new(self.state.clone(), self.stream_active.clone(), Some(sample_rate)) {
-                Ok((e, p)) => (e, p),
-                Err(e) => {
-                    self.error_message = Some(format!("Audio error: {e}"));
-                    return;
-                }
-            };
+        let flush_ring = Arc::new(AtomicBool::new(false));
+        let (engine, producer) = match AudioEngine::new(
+            self.state.clone(),
+            self.stream_active.clone(),
+            Some(sample_rate),
+            flush_ring.clone(),
+        ) {
+            Ok((e, p)) => (e, p),
+            Err(e) => {
+                self.error_message = Some(format!("Audio error: {e}"));
+                return;
+            }
+        };
         self.audio_engine = Some(engine);
 
         // Prepare working audio (with pitch shift if needed)
@@ -187,7 +193,8 @@ impl TimeStretchApp {
             let factor = 2.0_f64.powf(self.pitch_semitones as f64 / 12.0);
             let params = timestretch::StretchParams::new(1.0)
                 .with_sample_rate(sample_rate)
-                .with_channels(2);
+                .with_channels(2)
+                .with_normalize(true);
             match timestretch::pitch_shift(&source, &params, factor) {
                 Ok(shifted) => shifted,
                 Err(e) => {
@@ -216,6 +223,7 @@ impl TimeStretchApp {
             self.position.clone(),
             self.stream_active.clone(),
             stop_flag,
+            flush_ring,
         );
 
         self.processing_handle = Some(handle);
@@ -389,10 +397,7 @@ impl TimeStretchApp {
             }
 
             if ui
-                .add_enabled(
-                    transport != Transport::Stopped,
-                    egui::Button::new("Stop"),
-                )
+                .add_enabled(transport != Transport::Stopped, egui::Button::new("Stop"))
                 .clicked()
             {
                 self.stop_playback();
@@ -456,14 +461,11 @@ impl TimeStretchApp {
                             egui::TextEdit::singleline(&mut self.target_bpm_text)
                                 .desired_width(60.0),
                         );
-                        if response.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                        {
+                        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             if let Ok(target) = self.target_bpm_text.parse::<f64>() {
                                 if target > 0.0 && detected_bpm > 0.0 {
                                     self.stretch_ratio = detected_bpm / target;
-                                    self.stretch_ratio =
-                                        self.stretch_ratio.clamp(0.5, 2.0);
+                                    self.stretch_ratio = self.stretch_ratio.clamp(0.5, 2.0);
                                     let mut st = self.state.lock().unwrap();
                                     st.stretch_ratio = self.stretch_ratio;
                                     st.target_bpm = target;
@@ -522,10 +524,7 @@ impl TimeStretchApp {
                 let pitch_processing = self.state.lock().unwrap().pitch_processing;
                 if pitch_processing {
                     ui.label("");
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        "Processing pitch shift...",
-                    );
+                    ui.colored_label(egui::Color32::YELLOW, "Processing pitch shift...");
                     ui.end_row();
                     ctx_request_repaint(ui);
                 }

@@ -79,21 +79,12 @@ fn main() {
     );
 
     // --- Stretch the original ---
-    // Compute the actual stretch ratio from the reference file's duration,
-    // rather than from declared BPMs. This ensures we compare at the same
-    // stretch ratio Ableton actually used.
-    let orig_duration = original.data.len() as f64
-        / (original.sample_rate as f64 * original.channels.count() as f64);
-    let ref_duration_secs = reference.data.len() as f64
-        / (reference.sample_rate as f64 * reference.channels.count() as f64);
-    let ratio = ref_duration_secs / orig_duration;
-    let effective_target_bpm = SOURCE_BPM / ratio;
-    println!(
-        "\nStretching at ratio {ratio:.4} (matching reference duration {ref_duration_secs:.1}s)"
-    );
-    println!(
-        "  Declared: {SOURCE_BPM} -> {TARGET_BPM} BPM, Effective: {SOURCE_BPM} -> {effective_target_bpm:.1} BPM"
-    );
+    // Use BPM-based ratio so the output is genuinely at the target BPM.
+    // The reference may have a slightly different duration (Ableton trims
+    // or warps non-uniformly), but the comparison code handles length
+    // mismatches by using the shorter of the two signals.
+    let ratio = SOURCE_BPM / TARGET_BPM;
+    println!("\nStretching at ratio {ratio:.4} ({SOURCE_BPM} -> {TARGET_BPM} BPM)");
 
     let params = StretchParams::new(ratio)
         .with_preset(EdmPreset::DjBeatmatch)
@@ -164,7 +155,7 @@ fn main() {
     // RMS energy diagnostic: compare input vs output energy in 30s windows
     print_rms_diagnostic(&orig_mono, &out_mono, sample_rate);
 
-    run_comparison(&ref_mono, &out_mono, sample_rate, effective_target_bpm);
+    run_comparison(&ref_mono, &out_mono, sample_rate, TARGET_BPM);
 }
 
 /// Runs the self-test: benchmarks library output against itself.
