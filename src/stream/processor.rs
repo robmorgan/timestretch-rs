@@ -1139,6 +1139,47 @@ impl StreamProcessor {
                     }
                 }
 
+                // Apply the same high-shelf filter to WSOLA overlay for spectral
+                // consistency with the shelf-boosted PV output.
+                let wsola_shelf = {
+                    let rd = (self.current_ratio - 1.0).abs();
+                    let bs = if self.energy_gain > 1.02 {
+                        let gf = ((self.energy_gain - 1.02) / 0.48).clamp(0.0, 1.0);
+                        let rs = (rd / 0.3).clamp(0.2, 1.0);
+                        (1.0 + 1.40 * gf * rs) as f32
+                    } else {
+                        1.0f32
+                    };
+                    let rsh = if rd > 0.4 {
+                        let t = ((rd - 0.4) / 0.6).min(1.0);
+                        (1.0 + 0.80 * t * t) as f32
+                    } else {
+                        1.0f32
+                    };
+                    bs * rsh
+                };
+                if self.wsola_overlay_pos == 0
+                    && !self.wsola_overlay_buffers[0].is_empty()
+                    && wsola_shelf > 1.001
+                {
+                    let lp_coeff = (2.0 * std::f64::consts::PI * 2000.0
+                        / self.params.sample_rate.max(1) as f64)
+                        .min(0.5) as f32;
+                    let stage_shelf = wsola_shelf.sqrt();
+                    for ch_buf in &mut self.wsola_overlay_buffers {
+                        let mut lp1 = 0.0f32;
+                        let mut lp2 = 0.0f32;
+                        for s in ch_buf.iter_mut() {
+                            lp1 += lp_coeff * (*s - lp1);
+                            let hp1 = *s - lp1;
+                            let mid = lp1 + hp1 * stage_shelf;
+                            lp2 += lp_coeff * (mid - lp2);
+                            let hp2 = mid - lp2;
+                            *s = lp2 + hp2 * stage_shelf;
+                        }
+                    }
+                }
+
                 // Apply active WSOLA overlay: crossfade WSOLA over PV output.
                 if self.wsola_overlay_remaining > 0 {
                     let total = self.wsola_overlay_total.max(1);
