@@ -1,29 +1,42 @@
-# Autoresearch: Streaming Quality — Final Report
+# Autoresearch Ideas Backlog
 
-## Score: 953.8/1000 (203+ experiments, 490 → 953.8 = +464 points)
+## Current Best
+- **953.9 / 1000** on current branch head
+- Best kept path so far: **per-bin PV flux tracking used only to drive post-gain flux-adaptive resample blending**
+- Important constraint: **PV-internal per-bin magnitude/phase modifications have consistently hurt quality**
 
-## Per-Bin Transient Detection: Implemented and Tested (Failed)
-The Rubber Band-style per-bin spectral flux approach was fully implemented:
-- Per-bin HWR spectral flux computation (prev_magnitudes tracking)
-- Identity phase locking override for transient bins → WORSE (-4.3 pts, disrupts IF accumulation)
-- Per-bin magnitude boost with mean threshold → WORSE (-8.3 pts, too aggressive)
-- Conservative threshold (12x, 20x) → WORSE (-2 pts, still triggers on harmonic vibrato)  
-- Local median outlier detection → WORSE (-1.8 pts, vibrato = localized flux spikes)
-- Broadband gate (>40% bins rising) → WORSE (-2.4 pts, EDM kicks ARE broadband)
+## Pruned / Closed Paths
+- Per-bin identity locking overrides
+- Per-bin magnitude boosts
+- Conservative / local-median / broadband-gated per-bin transient detectors inside PV
+- Frame-level phase-gradient attenuation inside PV
+- Lowering resample-blend threshold below ratio-distance `> 0.5`
+- Uniform WSOLA blend in streaming
+- Anti-aliased LP on blended resample path
 
-### Root Cause: Energy Compensation Conflict
-Per-frame magnitude modification fundamentally conflicts with the post-PV energy gain compensation:
-- Magnitude boost adds energy to specific frames
-- The energy EMA then compensates, reducing gain globally
-- Net effect: boosted frames get partially undone, non-boosted frames get under-compensated
-- Result: worse energy balance overall
+These are stale unless a fundamentally new mechanism appears. Do not retry minor threshold variants.
 
-### What Rubber Band Does Differently  
-Rubber Band R3 doesn't have a separate energy gain compensation step. Its phase locking IS the quality mechanism. Our architecture has gain/shelf compensation that accounts for PV's energy loss, and any PV-internal modification creates feedback with that compensation.
+## Promising Next Ideas
+- **Band-limited blend path**
+  - Keep the PV as the full-band backbone, but blend only an attack-focused band from the cubic-resampled signal.
+  - Candidate: high-passed or mid/high-only blended path so the resample contributes transient edge without destabilizing low-frequency PV coherence.
+  - Rationale: current full-band blend helps percussive 2.0x but is limited by aliasing / tonal contamination.
 
-## Architecture at True Ceiling
-The 953.8 score cannot be improved within the current architecture because:
-1. PV transient smearing → can't fix with per-bin detection (tested 5 variants)
-2. Energy compensation conflict → PV-internal changes destabilize gain tracking
-3. Content detection → harmonic vibrato is indistinguishable from transient onset at per-bin level
-4. Metric weights → centroid (10%) can never justify energy (25%) degradation
+- **Flux-adaptive blend EQ on the blended path only**
+  - On strong transient frames, shape only the blended signal (not the PV output) with a gentle transient-focused tilt.
+  - Candidate: slightly attenuate sub-bass and/or emphasize attack band before mixing.
+  - Rationale: preserve the resample path’s transient edge while reducing the low-frequency artifacts that cap further blend increases.
+
+- **Transient residual blend instead of raw resample blend**
+  - Derive a lightweight residual from the input (e.g. input minus a cheap low-passed or smoothed version) and blend that residual into the PV output.
+  - Rationale: batch/reference gap is mostly attack sharpness, not sustained tonal content.
+
+- **Per-case diagnostic pass for percussive 2.0x**
+  - Inspect whether remaining loss is mostly `40 Hz`, `200 Hz`, or batch similarity mismatch.
+  - Rationale: the dominant remaining weakness is still percussive `2.0x`; targeted diagnostics may reveal a cleaner downstream-only lever.
+
+## Guardrails
+- Avoid PV-internal magnitude edits unless they also rethink/replace the downstream energy compensation.
+- Avoid per-bin phase-locking overrides; they disrupt IF accumulation.
+- Prefer downstream/post-gain shaping over core PV changes.
+- Do not overfit to benchmark quirks; keep changes plausible for real audio, not just synthetic cases.

@@ -934,7 +934,7 @@ impl StreamProcessor {
             // frames get more blend (up to 8%) to preserve attack shape, while
             // steady-state frames get less (down to 2%) to let the PV shine.
             if (self.current_ratio - 1.0).abs() > 0.5 {
-                let base_blend = 0.04f32;
+                let base_blend = 0.045f32;
                 let flux_factor = self.compute_flux_blend_factor();
                 let blend = (base_blend * flux_factor).clamp(0.01, 0.10);
                 let ratio = self.current_ratio;
