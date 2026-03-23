@@ -166,11 +166,11 @@ pub fn hpss(
         let use_smooth = smooth_radius > 0;
 
         if use_smooth {
-            for bin in 0..num_bins {
+            for (bin, smoothed) in h_mask_smooth.iter_mut().enumerate().take(num_bins) {
                 let start = bin.saturating_sub(smooth_radius);
                 let end = (bin + smooth_radius + 1).min(num_bins);
                 let sum: f32 = h_mask_buf[start..end].iter().sum();
-                h_mask_smooth[bin] = sum / (end - start) as f32;
+                *smoothed = sum / (end - start) as f32;
             }
         }
 

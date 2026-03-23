@@ -940,7 +940,7 @@ impl StreamProcessor {
                     if in_len < 2 {
                         continue;
                     }
-                    for i in 0..min_output_len {
+                    for (i, sample) in out_buf.iter_mut().enumerate().take(min_output_len) {
                         let in_pos = i as f64 / ratio;
                         let idx = in_pos as usize;
                         if idx + 2 >= in_len || idx == 0 {
@@ -948,7 +948,7 @@ impl StreamProcessor {
                             if idx + 1 < in_len {
                                 let frac = (in_pos - idx as f64) as f32;
                                 let interp = in_buf[idx] * (1.0 - frac) + in_buf[idx + 1] * frac;
-                                out_buf[i] = out_buf[i] * (1.0 - blend) + interp * blend;
+                                *sample = *sample * (1.0 - blend) + interp * blend;
                             }
                             continue;
                         }
@@ -964,7 +964,7 @@ impl StreamProcessor {
                                 * (p2 - p0
                                     + t * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3
                                         + t * (-p0 + 3.0 * p1 - 3.0 * p2 + p3)));
-                        out_buf[i] = out_buf[i] * (1.0 - blend) + interp * blend;
+                        *sample = *sample * (1.0 - blend) + interp * blend;
                     }
                 }
             }

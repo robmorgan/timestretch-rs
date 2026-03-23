@@ -66,3 +66,8 @@ required-features = ["qa-harnesses"]
 name = "streaming_quality"
 path = "qa/streaming_quality.rs"
 required-features = ["qa-harnesses"]
+
+[[test]]
+name = "quality_gates"
+path = "tests/quality_gates.rs"
+required-features = ["qa-harnesses"]

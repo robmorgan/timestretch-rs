@@ -813,12 +813,12 @@ impl PhaseVocoder {
                         // Only correct if the edge is significantly quieter
                         if edge_rms < ss_rms * 0.7 && edge_rms > 1e-8 {
                             let gain = (ss_rms / edge_rms).min(4.0) as f32;
-                            for i in 0..correction_len {
+                            for (i, sample) in result.iter_mut().enumerate().take(correction_len) {
                                 // Cubic Hermite ramp: zero derivative at both
                                 // endpoints for smoother spectral transition.
                                 let t = i as f32 / correction_len as f32;
                                 let g = 1.0 + (gain - 1.0) * (1.0 - 3.0 * t * t + 2.0 * t * t * t);
-                                result[i] *= g;
+                                *sample *= g;
                             }
                         }
                     }
@@ -1511,11 +1511,7 @@ impl PhaseVocoder {
                 // Attenuate gradient blend for bins far from their anchor peak.
                 // Distant bins have less acoustic relationship to the peak,
                 // so independent phase evolution is more appropriate.
-                let peak_distance = if bin > nearest_peak {
-                    bin - nearest_peak
-                } else {
-                    nearest_peak - bin
-                };
+                let peak_distance = bin.abs_diff(nearest_peak);
                 let distance_fade = if peak_distance > 8 {
                     (1.0 - ((peak_distance - 8) as f64 / 24.0).min(1.0)).max(0.0)
                 } else {
