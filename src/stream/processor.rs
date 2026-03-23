@@ -1110,11 +1110,11 @@ impl StreamProcessor {
                             let progress = pos as f32 / total as f32;
                             // First 30% is WSOLA-dominant (attack copy), then linear
                             // crossfade to PV for the decay portion.
-                            let wsola_weight = if progress < 0.3 {
-                                0.85
+                            let wsola_weight = if progress < 0.25 {
+                                0.90
                             } else {
-                                let t = (progress - 0.3) / 0.7;
-                                0.85 * (1.0 - t)
+                                let t = (progress - 0.25) / 0.75;
+                                0.90 * (1.0 - t * t)
                             };
                             out[i] = out[i] * (1.0 - wsola_weight) + overlay[pos] * wsola_weight;
                         }
