@@ -1122,7 +1122,7 @@ impl StreamProcessor {
                             // more of the transient waveform shape.
                             let progress = pos as f32 / total as f32;
                             let (peak_weight, attack_end) = if ratio_distance > 0.8 {
-                                (1.0f32, 0.85f32) // extreme: full WSOLA takeover
+                                (1.0f32, 0.95f32) // extreme: full WSOLA takeover
                             } else if ratio_distance > 0.4 {
                                 (0.95f32, 0.35f32) // moderate: stronger WSOLA
                             } else {
