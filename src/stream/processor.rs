@@ -450,6 +450,8 @@ impl StreamProcessor {
         let num_channels = params.channels.count();
         let source_bpm = params.bpm;
         let sample_rate = params.sample_rate;
+        let wsola_seg_size = params.wsola_segment_size;
+        let wsola_search = params.wsola_search_range;
 
         let capacity_frames_per_channel = stream_capacity_frames(&params);
         let capacity_samples = capacity_frames_per_channel.saturating_mul(num_channels);
@@ -510,8 +512,17 @@ impl StreamProcessor {
             prev_blend_input_rms: 0.0,
             wsola_instances: (0..num_channels)
                 .map(|_| {
-                    let seg = (sample_rate as f64 * 0.030).round() as usize; // 30ms
-                    let search = (sample_rate as f64 * 0.015).round() as usize; // 15ms
+                    // Use preset-configured WSOLA parameters for consistency with batch path.
+                    let seg = if wsola_seg_size > 0 {
+                        wsola_seg_size
+                    } else {
+                        (sample_rate as f64 * 0.030).round() as usize
+                    };
+                    let search = if wsola_search > 0 {
+                        wsola_search
+                    } else {
+                        (sample_rate as f64 * 0.015).round() as usize
+                    };
                     let mut w = Wsola::new(seg, search, ratio);
                     w.set_equal_power_crossfade();
                     w.reserve_output_capacity(capacity_frames_per_channel, ratio.max(2.5));
