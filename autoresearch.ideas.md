@@ -1,27 +1,29 @@
 # Autoresearch: Streaming Quality — Final Report
 
-## Score: 953.8/1000 (200+ experiments across 10 sessions, 490 → 953.8 = +464 points)
+## Score: 953.8/1000 (203+ experiments, 490 → 953.8 = +464 points)
 
-## Status: DEFINITIVELY COMPLETE
-All approaches exhausted including:
-- Every PV parameter (gradient, IF, sub-bass, window, hop, phase locking mode)
-- Every gain/shelf parameter (EMA, smooth, max, threshold, crossover, order, scaling)
-- Streaming WSOLA integration (worse than simple resample blend due to tonal artifacts)
-- Content-adaptive processing (can't distinguish harmonic from EDM at same ratio)
-- Spectral flux / onset detection (triggers on harmonic content too)
-- Per-window envelope matching (disrupts smooth PV output)
-- Various post-processing approaches (transient expansion, magnitude pre-emphasis)
+## Per-Bin Transient Detection: Implemented and Tested (Failed)
+The Rubber Band-style per-bin spectral flux approach was fully implemented:
+- Per-bin HWR spectral flux computation (prev_magnitudes tracking)
+- Identity phase locking override for transient bins → WORSE (-4.3 pts, disrupts IF accumulation)
+- Per-bin magnitude boost with mean threshold → WORSE (-8.3 pts, too aggressive)
+- Conservative threshold (12x, 20x) → WORSE (-2 pts, still triggers on harmonic vibrato)  
+- Local median outlier detection → WORSE (-1.8 pts, vibrato = localized flux spikes)
+- Broadband gate (>40% bins rising) → WORSE (-2.4 pts, EDM kicks ARE broadband)
 
-## Architecture Notes
-- Batch uses HPSS (DjBeatmatch/HouseLoop presets) splitting harmonic+percussive → PV+WSOLA
-- Streaming uses PV-only (can't do HPSS in RT path without allocation)
-- Batch PV uses 120Hz sub-bass; streaming uses 180Hz (better for streaming quality)
-- The 4% cubic resample blend at >1.5x ratio is optimal: outperforms WSOLA blend
+### Root Cause: Energy Compensation Conflict
+Per-frame magnitude modification fundamentally conflicts with the post-PV energy gain compensation:
+- Magnitude boost adds energy to specific frames
+- The energy EMA then compensates, reducing gain globally
+- Net effect: boosted frames get partially undone, non-boosted frames get under-compensated
+- Result: worse energy balance overall
 
-## Remaining ~46 Points — Unreachable
-| Case | Score | Root Cause |
-|------|-------|-----------|
-| perc 2.0x | 0.825 | PV transient smearing (freq=0.688, batch=0.609) |
-| edm 1.5x | 0.923 | Sub-bass dominance (centroid=0.258) |
-| edm 1.02 | 0.969 | PV mild centroid shift (centroid=0.702) |
-| perc 1.5x | 0.955 | PV vs batch HPSS difference (batch=0.827) |
+### What Rubber Band Does Differently  
+Rubber Band R3 doesn't have a separate energy gain compensation step. Its phase locking IS the quality mechanism. Our architecture has gain/shelf compensation that accounts for PV's energy loss, and any PV-internal modification creates feedback with that compensation.
+
+## Architecture at True Ceiling
+The 953.8 score cannot be improved within the current architecture because:
+1. PV transient smearing → can't fix with per-bin detection (tested 5 variants)
+2. Energy compensation conflict → PV-internal changes destabilize gain tracking
+3. Content detection → harmonic vibrato is indistinguishable from transient onset at per-bin level
+4. Metric weights → centroid (10%) can never justify energy (25%) degradation
