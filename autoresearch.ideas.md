@@ -1,8 +1,8 @@
 # Autoresearch Ideas Backlog
 
 ## Current Best
-- **954.0 / 1000** on current branch head
-- Best kept path so far: **per-bin PV flux tracking used only to drive post-gain flux-adaptive resample blending**
+- **954.1 / 1000** on current branch head
+- Best kept path so far: **per-bin PV flux tracking plus a simple onset-energy rise cue to drive post-gain adaptive resample blending**
 - Important constraint: **PV-internal per-bin magnitude/phase modifications have consistently hurt quality**
 
 ## Pruned / Closed Paths

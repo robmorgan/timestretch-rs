@@ -10,6 +10,9 @@ use crate::processor;
 use crate::state::*;
 use crate::waveform::{self, WaveformPeaks};
 
+const MIN_STRETCH_RATIO: f64 = 0.25;
+const MAX_STRETCH_RATIO: f64 = 4.0;
+
 pub struct TimeStretchApp {
     state: SharedStateHandle,
     position: Arc<AtomicPosition>,
@@ -45,6 +48,11 @@ pub struct TimeStretchApp {
 }
 
 impl TimeStretchApp {
+    #[inline]
+    fn clamp_stretch_ratio(ratio: f64) -> f64 {
+        ratio.clamp(MIN_STRETCH_RATIO, MAX_STRETCH_RATIO)
+    }
+
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let state = Arc::new(Mutex::new(SharedState::new()));
         let stream_active = Arc::new(AtomicBool::new(false));
@@ -423,7 +431,10 @@ impl TimeStretchApp {
                 ui.horizontal(|ui| {
                     let old_ratio = self.stretch_ratio;
                     ui.add(
-                        egui::Slider::new(&mut self.stretch_ratio, 0.5..=2.0)
+                        egui::Slider::new(
+                            &mut self.stretch_ratio,
+                            MIN_STRETCH_RATIO..=MAX_STRETCH_RATIO,
+                        )
                             .text("x")
                             .fixed_decimals(2),
                     );
@@ -464,11 +475,13 @@ impl TimeStretchApp {
                         if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             if let Ok(target) = self.target_bpm_text.parse::<f64>() {
                                 if target > 0.0 && detected_bpm > 0.0 {
-                                    self.stretch_ratio = detected_bpm / target;
-                                    self.stretch_ratio = self.stretch_ratio.clamp(0.5, 2.0);
+                                    self.stretch_ratio =
+                                        Self::clamp_stretch_ratio(detected_bpm / target);
+                                    let effective_target = detected_bpm / self.stretch_ratio;
+                                    self.target_bpm_text = format!("{effective_target:.1}");
                                     let mut st = self.state.lock().unwrap();
                                     st.stretch_ratio = self.stretch_ratio;
-                                    st.target_bpm = target;
+                                    st.target_bpm = effective_target;
                                 }
                             }
                         }
