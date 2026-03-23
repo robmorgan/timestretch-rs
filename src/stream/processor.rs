@@ -1108,6 +1108,30 @@ impl StreamProcessor {
                         self.wsola_overlay_total = overlay_len;
                         self.wsola_overlay_pos = 0;
                     }
+
+                    // Pre-normalize WSOLA overlay energy to match input energy.
+                    // The WSOLA output may have slight energy loss from segment
+                    // crossfade dips. Compare actual WSOLA energy to input energy
+                    // and apply per-overlay correction for accurate energy matching.
+                    if self.wsola_overlay_pos == 0 && !self.wsola_overlay_buffers[0].is_empty() {
+                        let in_buf = &self.channel_input_buffers[0];
+                        let ws_buf = &self.wsola_overlay_buffers[0];
+                        let in_rms_sq =
+                            in_buf.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>()
+                                / in_buf.len().max(1) as f64;
+                        // Compare WSOLA energy to expected output energy (input * ratio_factor)
+                        let ws_rms_sq =
+                            ws_buf.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>()
+                                / ws_buf.len().max(1) as f64;
+                        if ws_rms_sq > 1e-12 && in_rms_sq > 1e-12 {
+                            let correction = (in_rms_sq / ws_rms_sq).sqrt().min(3.0) as f32;
+                            for ch_buf in &mut self.wsola_overlay_buffers {
+                                for s in ch_buf.iter_mut() {
+                                    *s *= correction;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Apply active WSOLA overlay: crossfade WSOLA over PV output.
@@ -1137,10 +1161,9 @@ impl StreamProcessor {
                                 let t = (progress - attack_end) / (1.0 - attack_end);
                                 peak_weight * (1.0 - t * t)
                             };
-                            // WSOLA preserves most energy but has slight crossfade dips
-                            // at segment boundaries. Apply half the PV gain delta.
-                            let wsola_gain = self.energy_gain as f32;
-                            let wsola_sample = overlay[pos] * wsola_gain;
+                            // Apply PV gain on top of per-overlay normalization
+                            // for spectral consistency with shelf-boosted PV output.
+                            let wsola_sample = overlay[pos] * self.energy_gain as f32;
                             out[i] = out[i] * (1.0 - wsola_weight) + wsola_sample * wsola_weight;
                         }
                     }
