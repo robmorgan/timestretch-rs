@@ -930,8 +930,13 @@ impl StreamProcessor {
             // input into the PV output. Linear resampling preserves transient
             // shape (at the cost of aliasing), partially restoring kick impact.
             // Only active at extreme ratios where transient smearing is worst.
+            // Blend amount is modulated by per-bin spectral flux: transient
+            // frames get more blend (up to 8%) to preserve attack shape, while
+            // steady-state frames get less (down to 2%) to let the PV shine.
             if (self.current_ratio - 1.0).abs() > 0.5 {
-                let blend = 0.04f32; // 4% time-domain blend
+                let base_blend = 0.04f32;
+                let flux_factor = self.compute_flux_blend_factor();
+                let blend = (base_blend * flux_factor).clamp(0.02, 0.08);
                 let ratio = self.current_ratio;
                 for ch in 0..num_channels {
                     let in_buf = &self.channel_input_buffers[ch];
@@ -1808,6 +1813,36 @@ impl StreamProcessor {
             }
             self.vocoder_ratio = processing_ratio;
         }
+    }
+
+    /// Computes a blend multiplier (0.5×–2.0×) from the PV's per-frame flux.
+    ///
+    /// Transient frames (many bins rising) get more time-domain blend to
+    /// preserve attack shape; steady-state frames get less to let the PV's
+    /// tonal quality dominate.
+    fn compute_flux_blend_factor(&self) -> f32 {
+        // Use channel 0's vocoder flux (mid channel for stereo M/S).
+        let flux = match self.vocoders.first().and_then(|v| v.last_frame_flux()) {
+            Some(f) => f,
+            None => return 1.0,
+        };
+
+        let num_bins = self.params.fft_size / 2 + 1;
+        if num_bins == 0 {
+            return 1.0;
+        }
+
+        // Fraction of bins that are rising — indicator of impulsive onset.
+        let rising_fraction = flux.total_bins_rising as f32 / num_bins as f32;
+        // Fraction of bins with significant flux (4× mean threshold).
+        let transient_fraction = flux.transient_bin_count as f32 / num_bins as f32;
+
+        // Combine: high rising_fraction AND high transient_fraction = impulsive.
+        // Pure vibrato has high rising_fraction but low transient_fraction.
+        let impulsiveness = (rising_fraction * 2.0).min(1.0) * (transient_fraction * 8.0).min(1.0);
+
+        // Map to 0.5–2.0 range: 0.5 for steady state, 2.0 for strong transient.
+        0.5 + 1.5 * impulsiveness
     }
 
     fn apply_transient_scheduled_phase_reset(&mut self, total_frames: usize) {

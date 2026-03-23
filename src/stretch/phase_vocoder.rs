@@ -51,6 +51,27 @@ const RATIO_CHANGE_CARRIED_SEAM_HOLD_FRAMES: usize = 1;
 const RATIO_CHANGE_FOCUS_TRIGGER: f64 = 1e-3;
 /// Cap extra continuity-focus extension so long tails do not pin identity locking.
 const RATIO_CHANGE_TAIL_FOCUS_MAX_FRAMES: usize = 6;
+/// Aggregated per-frame spectral flux from the PV's own analysis pass.
+///
+/// Computed as half-wave rectified (onset-only) magnitude differences,
+/// summed per frequency band. Available after each `process_streaming_into`
+/// call for downstream transient-adaptive processing (e.g. blend modulation).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PerFrameFlux {
+    /// Flux in the sub-bass region (below `sub_bass_bin`, typically <180Hz).
+    pub sub_bass: f32,
+    /// Flux in the low band (sub_bass_bin to ~500Hz).
+    pub low: f32,
+    /// Flux in the mid band (~500Hz to ~4000Hz).
+    pub mid: f32,
+    /// Flux in the high band (>4000Hz).
+    pub high: f32,
+    /// Number of bins with flux exceeding a significance threshold.
+    pub transient_bin_count: u16,
+    /// Total number of bins with any positive flux (onset).
+    pub total_bins_rising: u16,
+}
+
 /// Phase vocoder state for time stretching.
 pub struct PhaseVocoder {
     fft_size: usize,
@@ -164,6 +185,16 @@ pub struct PhaseVocoder {
     streaming_accum_output: Vec<f32>,
     /// Reusable window-sum accumulation buffer for streaming overlap-add.
     streaming_accum_window_sum: Vec<f32>,
+    /// Previous frame magnitudes for per-bin spectral flux computation.
+    flux_prev_magnitudes: Vec<f32>,
+    /// Whether `flux_prev_magnitudes` has been seeded with at least one frame.
+    flux_has_prev: bool,
+    /// Bin index for the 500 Hz band boundary (low/mid split).
+    flux_low_end_bin: usize,
+    /// Bin index for the 4000 Hz band boundary (mid/high split).
+    flux_mid_end_bin: usize,
+    /// Per-frame flux from the most recent `process_core` call (last frame).
+    last_frame_flux: Option<PerFrameFlux>,
 }
 
 #[inline]
@@ -387,6 +418,13 @@ impl PhaseVocoder {
             streaming_tail_phase_ratio: stretch_ratio,
             streaming_accum_output: Vec::new(),
             streaming_accum_window_sum: Vec::new(),
+            flux_prev_magnitudes: vec![0.0; num_bins],
+            flux_has_prev: false,
+            flux_low_end_bin: ((500.0 * fft_size as f32 / sample_rate as f32).floor() as usize)
+                .min(num_bins.saturating_sub(1)),
+            flux_mid_end_bin: ((4000.0 * fft_size as f32 / sample_rate as f32).floor() as usize)
+                .min(num_bins.saturating_sub(1)),
+            last_frame_flux: None,
         }
     }
 
@@ -400,6 +438,15 @@ impl PhaseVocoder {
     #[inline]
     pub fn hop_analysis(&self) -> usize {
         self.hop_analysis
+    }
+
+    /// Returns the per-frame spectral flux from the most recent processing call.
+    ///
+    /// Available after `process_streaming_into` or `process`. Returns `None`
+    /// if no frames have been processed yet.
+    #[inline]
+    pub fn last_frame_flux(&self) -> Option<&PerFrameFlux> {
+        self.last_frame_flux.as_ref()
     }
 
     /// Returns the synthesis hop size.
@@ -1129,6 +1176,7 @@ impl PhaseVocoder {
                 &fft_forward,
             );
             self.advance_phases(num_bins, hop_ratio, phase_hop_ratio);
+            self.compute_frame_flux(num_bins);
             let frame_end = synthesis_floor.saturating_add(
                 self.fft_size
                     .saturating_sub(1)
@@ -1527,6 +1575,72 @@ impl PhaseVocoder {
                     ((1.0 - effective_blend) * independent + effective_blend * propagated) as f32;
             }
         }
+    }
+
+    /// Computes per-bin spectral flux from the current magnitudes and updates
+    /// `last_frame_flux`. Uses half-wave rectification (onset-only).
+    ///
+    /// Must be called after `advance_phases` which populates `self.magnitudes`.
+    #[inline]
+    fn compute_frame_flux(&mut self, num_bins: usize) {
+        if !self.flux_has_prev {
+            // First frame: seed prev_magnitudes, no flux to compute.
+            self.flux_prev_magnitudes[..num_bins].copy_from_slice(&self.magnitudes[..num_bins]);
+            self.flux_has_prev = true;
+            self.last_frame_flux = Some(PerFrameFlux::default());
+            return;
+        }
+
+        let mut sub_bass_flux = 0.0f32;
+        let mut low_flux = 0.0f32;
+        let mut mid_flux = 0.0f32;
+        let mut high_flux = 0.0f32;
+        let mut transient_bin_count = 0u16;
+        let mut total_bins_rising = 0u16;
+        // Running sum for mean computation (for threshold).
+        let mut flux_sum = 0.0f32;
+        let mut flux_count = 0u16;
+
+        for bin in 1..num_bins {
+            let diff = self.magnitudes[bin] - self.flux_prev_magnitudes[bin];
+            if diff > 0.0 {
+                total_bins_rising += 1;
+                flux_sum += diff;
+                flux_count += 1;
+
+                if bin < self.sub_bass_bin {
+                    sub_bass_flux += diff;
+                } else if bin < self.flux_low_end_bin {
+                    low_flux += diff;
+                } else if bin < self.flux_mid_end_bin {
+                    mid_flux += diff;
+                } else {
+                    high_flux += diff;
+                }
+            }
+        }
+
+        // Count bins with flux significantly above the mean (transient-like).
+        if flux_count > 0 {
+            let mean_flux = flux_sum / flux_count as f32;
+            let threshold = mean_flux * 4.0; // 4× mean = significant onset
+            for bin in 1..num_bins {
+                let diff = self.magnitudes[bin] - self.flux_prev_magnitudes[bin];
+                if diff > threshold {
+                    transient_bin_count += 1;
+                }
+            }
+        }
+
+        self.flux_prev_magnitudes[..num_bins].copy_from_slice(&self.magnitudes[..num_bins]);
+        self.last_frame_flux = Some(PerFrameFlux {
+            sub_bass: sub_bass_flux,
+            low: low_flux,
+            mid: mid_flux,
+            high: high_flux,
+            transient_bin_count,
+            total_bins_rising,
+        });
     }
 
     /// Reconstructs the complex spectrum from magnitudes and phases,
