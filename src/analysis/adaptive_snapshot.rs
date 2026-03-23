@@ -1,7 +1,6 @@
 //! Shared adaptive analysis snapshot for hybrid and dual-plane paths.
 
 use crate::analysis::beat::{default_subdivision_for_preset, detect_beats, snap_to_subdivision};
-use crate::analysis::frequency::{compute_band_energy, FrequencyBands};
 use crate::analysis::transient::{
     detect_transients_with_options, TransientDetectionOptions, TransientMap,
 };
@@ -39,13 +38,6 @@ pub(crate) struct AdaptiveAnalysisSnapshot {
     pub transient_map: TransientMap,
     pub onsets: Vec<usize>,
     pub strengths: Vec<f32>,
-    pub transient_confidence: f32,
-    pub beat_confidence: f32,
-    pub tonal_confidence: f32,
-    pub noise_confidence: f32,
-    pub lane_bias: [f32; 3],
-    pub ratio_bias: f64,
-    pub transient_mask: Vec<f32>,
 }
 
 /// Shared segmentation primitive used by legacy hybrid and dual-plane policy.
@@ -158,69 +150,10 @@ pub(crate) fn analyze_adaptive_snapshot_mono(
         }
     }
 
-    let mut transient_onsets = Vec::with_capacity(onsets.len());
-    let mut transient_strengths = Vec::with_capacity(strengths.len());
-    for (i, &onset) in onsets.iter().enumerate() {
-        let strength = strengths.get(i).copied().unwrap_or(1.0);
-        if strength_marks_transient(strength) {
-            transient_onsets.push(onset);
-            transient_strengths.push(strength);
-        }
-    }
-    let transient_mask = build_transient_mask(
-        input.len(),
-        params.sample_rate,
-        params.transient_region_secs,
-        &transient_onsets,
-        &transient_strengths,
-    );
-
-    let duration_secs = input.len() as f32 / params.sample_rate.max(1) as f32;
-    let transient_density = transient_onsets.len() as f32 / duration_secs.max(1e-3);
-    let transient_confidence = (transient_density / 8.0).clamp(0.0, 1.0);
-
-    let beat_confidence = if input.len() >= params.sample_rate as usize {
-        if let Some(artifact) = confident_pre {
-            beat_confidence_from_stats(artifact.beat_positions.len(), artifact.bpm)
-                * artifact.confidence.clamp(0.0, 1.0)
-        } else {
-            let grid =
-                detected_beat_grid.get_or_insert_with(|| detect_beats(input, params.sample_rate));
-            beat_confidence_from_stats(grid.beats.len(), grid.bpm)
-        }
-    } else {
-        0.0
-    };
-
-    let analysis_fft = params.fft_size.min(2048).max(256);
-    let tonal_confidence = if input.len() >= analysis_fft {
-        let (sub, low, mid, high) = compute_band_energy(
-            &input[..analysis_fft],
-            analysis_fft,
-            params.sample_rate,
-            &FrequencyBands::default(),
-        );
-        let total = sub + low + mid + high + 1e-9;
-        ((sub + low + mid) / total).clamp(0.0, 1.0)
-    } else {
-        0.5
-    };
-    let noise_confidence = (1.0 - tonal_confidence).clamp(0.0, 1.0);
-    let lane_bias = [transient_confidence, tonal_confidence, noise_confidence];
-    let ratio_bias =
-        ((beat_confidence as f64 - transient_confidence as f64) * 0.04).clamp(-0.08, 0.08);
-
     AdaptiveAnalysisSnapshot {
         transient_map,
         onsets,
         strengths,
-        transient_confidence,
-        beat_confidence,
-        tonal_confidence,
-        noise_confidence,
-        lane_bias,
-        ratio_bias,
-        transient_mask,
     }
 }
 
@@ -234,16 +167,6 @@ fn empty_transient_map(hop_size: usize) -> TransientMap {
         hop_size: hop_size.max(1),
         per_frame_band_flux: Vec::new(),
     }
-}
-
-#[inline]
-fn beat_confidence_from_stats(beat_count: usize, bpm: f64) -> f32 {
-    if bpm <= 0.0 || beat_count < 2 {
-        return 0.0;
-    }
-    let beat_count = (beat_count.min(16) as f32) / 16.0;
-    let bpm_center_error = ((bpm - 128.0).abs() / 96.0).clamp(0.0, 1.0) as f32;
-    (beat_count * (1.0 - bpm_center_error)).clamp(0.0, 1.0)
 }
 
 /// Returns true when an anchor strength encodes a real transient.
@@ -463,46 +386,6 @@ pub(crate) fn generate_subdivision_grid_with_phase(
         pos += sub_interval;
     }
     grid
-}
-
-/// Builds a smoothed transient mask in input timeline space.
-pub(crate) fn build_transient_mask(
-    input_len: usize,
-    sample_rate: u32,
-    transient_region_secs: f64,
-    onsets: &[usize],
-    strengths: &[f32],
-) -> Vec<f32> {
-    if input_len == 0 {
-        return Vec::new();
-    }
-
-    let mut mask = vec![0.0f32; input_len];
-    if onsets.is_empty() {
-        return mask;
-    }
-
-    let region_samples = (transient_region_secs * f64::from(sample_rate)).round() as usize;
-    let half_width = (region_samples / 2).max(8) as isize;
-
-    for (idx, &onset) in onsets.iter().enumerate() {
-        let center = onset.min(input_len.saturating_sub(1)) as isize;
-        let strength = strengths.get(idx).copied().unwrap_or(1.0).clamp(0.0, 1.0);
-        let start = (center - half_width).max(0) as usize;
-        let end = (center + half_width).min(input_len.saturating_sub(1) as isize) as usize;
-        for i in start..=end {
-            let dist = (i as isize - center).unsigned_abs() as f32 / half_width as f32;
-            let tri = (1.0 - dist).max(0.0) * strength;
-            mask[i] = mask[i].max(tri);
-        }
-    }
-
-    for i in 1..input_len {
-        let prev = mask[i - 1];
-        let cur = mask[i];
-        mask[i] = (0.7 * prev + 0.3 * cur).clamp(0.0, 1.0);
-    }
-    mask
 }
 
 #[cfg(test)]
