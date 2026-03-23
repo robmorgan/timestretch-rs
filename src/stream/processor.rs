@@ -936,7 +936,7 @@ impl StreamProcessor {
             if (self.current_ratio - 1.0).abs() > 0.5 {
                 let base_blend = 0.04f32;
                 let flux_factor = self.compute_flux_blend_factor();
-                let blend = (base_blend * flux_factor).clamp(0.02, 0.08);
+                let blend = (base_blend * flux_factor).clamp(0.01, 0.10);
                 let ratio = self.current_ratio;
                 for ch in 0..num_channels {
                     let in_buf = &self.channel_input_buffers[ch];
@@ -1841,8 +1841,9 @@ impl StreamProcessor {
         // Pure vibrato has high rising_fraction but low transient_fraction.
         let impulsiveness = (rising_fraction * 2.0).min(1.0) * (transient_fraction * 8.0).min(1.0);
 
-        // Map to 0.5–2.0 range: 0.5 for steady state, 2.0 for strong transient.
-        0.5 + 1.5 * impulsiveness
+        // Map to 0.3–2.5 range: lower for steady state (PV quality),
+        // higher for strong transients (preserve attack shape).
+        0.3 + 2.2 * impulsiveness
     }
 
     fn apply_transient_scheduled_phase_reset(&mut self, total_frames: usize) {
