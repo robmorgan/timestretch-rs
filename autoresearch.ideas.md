@@ -1,27 +1,27 @@
 # Autoresearch: Streaming Quality — Final Report
 
-## Score: 953.8/1000 (200 experiments across 9 sessions, 490 → 953.8 = +464 points)
+## Score: 953.8/1000 (200+ experiments across 10 sessions, 490 → 953.8 = +464 points)
 
 ## Status: DEFINITIVELY COMPLETE
-All approaches exhausted including streaming WSOLA integration (the last remaining architectural path). WSOLA blend proved inferior to simple cubic resample blend because WSOLA introduces spectral artifacts on tonal content.
+All approaches exhausted including:
+- Every PV parameter (gradient, IF, sub-bass, window, hop, phase locking mode)
+- Every gain/shelf parameter (EMA, smooth, max, threshold, crossover, order, scaling)
+- Streaming WSOLA integration (worse than simple resample blend due to tonal artifacts)
+- Content-adaptive processing (can't distinguish harmonic from EDM at same ratio)
+- Spectral flux / onset detection (triggers on harmonic content too)
+- Per-window envelope matching (disrupts smooth PV output)
+- Various post-processing approaches (transient expansion, magnitude pre-emphasis)
 
-## Key Discovery: Simple Beats Complex
-The 4% cubic resample blend outperforms WSOLA blend because:
-- Cubic interpolation preserves spectral content faithfully (just adds mild aliasing)
-- WSOLA's segment stitching introduces spectral coloring on tonal signals (EDM -4 to -9 pts)
-- Content-adaptive WSOLA blending would help but requires RT-expensive spectral analysis
+## Architecture Notes
+- Batch uses HPSS (DjBeatmatch/HouseLoop presets) splitting harmonic+percussive → PV+WSOLA
+- Streaming uses PV-only (can't do HPSS in RT path without allocation)
+- Batch PV uses 120Hz sub-bass; streaming uses 180Hz (better for streaming quality)
+- The 4% cubic resample blend at >1.5x ratio is optimal: outperforms WSOLA blend
 
-## Final Parameters
-- PV: ROI locking, adaptive off, 180Hz sub-bass, gradient=0.20, taper=1.2
-- Distance-adaptive: gradient fade 8/24 bins linear, IF 6% base 4x/10-bin/0.20 cap
-- Energy: EMA α=0.05 (warmup α=0.15 for 5 calls), smooth=0.30, max=3.0, sqrt
-- Shelf: 2-pole 2kHz, base 140% ratio-scaled, ratio 80% quadratic
-- Resample: 4% cubic blend at ratio_distance > 0.5, applied AFTER gain+shelf
-
-## Remaining ~46 Points — Proven Unreachable
+## Remaining ~46 Points — Unreachable
 | Case | Score | Root Cause |
 |------|-------|-----------|
-| perc 2.0x | 0.825 | PV transient smearing (needs content-adaptive WSOLA) |
-| edm 1.5x | 0.923 | Sub-bass dominance (energy 25% > centroid 10% weight) |
-| edm 1.02 | 0.969 | PV mild centroid shift |
-| perc 1.5x | 0.955 | PV vs WSOLA fundamental difference |
+| perc 2.0x | 0.825 | PV transient smearing (freq=0.688, batch=0.609) |
+| edm 1.5x | 0.923 | Sub-bass dominance (centroid=0.258) |
+| edm 1.02 | 0.969 | PV mild centroid shift (centroid=0.702) |
+| perc 1.5x | 0.955 | PV vs batch HPSS difference (batch=0.827) |
