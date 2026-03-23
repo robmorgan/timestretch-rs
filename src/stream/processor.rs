@@ -409,6 +409,8 @@ pub struct StreamProcessor {
     energy_gain: f64,
     /// Count of gain compensation calls for warmup tracking.
     gain_call_count: usize,
+    /// Previous input-frame RMS for simple onset-energy tracking on the helper path.
+    prev_blend_input_rms: f32,
 }
 
 impl std::fmt::Debug for StreamProcessor {
@@ -491,6 +493,7 @@ impl StreamProcessor {
             output_energy_ema: 0.0,
             energy_gain: 1.0,
             gain_call_count: 0,
+            prev_blend_input_rms: 0.0,
         }
     }
 
@@ -713,6 +716,7 @@ impl StreamProcessor {
 
         self.flush_pitch_resampler_to_pending(num_channels)?;
         self.reset_pitch_resamplers();
+        self.prev_blend_input_rms = 0.0;
 
         let _ = self.drain_pending_to_output(output)?;
 
@@ -935,7 +939,22 @@ impl StreamProcessor {
             // steady-state frames get less (down to 2%) to let the PV shine.
             if (self.current_ratio - 1.0).abs() > 0.5 {
                 let base_blend = 0.045f32;
-                let flux_factor = self.compute_flux_blend_factor();
+                let mut flux_factor = self.compute_flux_blend_factor();
+                let input_rms = (self.channel_input_buffers[0]
+                    .iter()
+                    .map(|&s| s * s)
+                    .sum::<f32>()
+                    / self.channel_input_buffers[0].len().max(1) as f32)
+                    .sqrt();
+                let prev_input_rms = self.prev_blend_input_rms;
+                let onset_rise = (input_rms - prev_input_rms).max(0.0);
+                self.prev_blend_input_rms = input_rms;
+                let onset_boost = if prev_input_rms > 1e-6 {
+                    (onset_rise / prev_input_rms.max(1e-6)).min(1.0)
+                } else {
+                    0.0
+                };
+                flux_factor *= 1.0 + 0.35 * onset_boost;
                 let blend = (base_blend * flux_factor).clamp(0.01, 0.10);
                 let ratio = self.current_ratio;
                 for ch in 0..num_channels {
@@ -1803,6 +1822,7 @@ impl StreamProcessor {
         self.output_energy_ema = 0.0;
         self.energy_gain = 1.0;
         self.gain_call_count = 0;
+        self.prev_blend_input_rms = 0.0;
     }
 
     fn update_vocoder_ratio(&mut self) {
