@@ -1137,7 +1137,11 @@ impl StreamProcessor {
                                 let t = (progress - attack_end) / (1.0 - attack_end);
                                 peak_weight * (1.0 - t * t)
                             };
-                            out[i] = out[i] * (1.0 - wsola_weight) + overlay[pos] * wsola_weight;
+                            // WSOLA preserves most energy but has slight crossfade dips
+                            // at segment boundaries. Apply half the PV gain delta.
+                            let wsola_gain = 1.0 + (self.energy_gain as f32 - 1.0) * 0.7;
+                            let wsola_sample = overlay[pos] * wsola_gain;
+                            out[i] = out[i] * (1.0 - wsola_weight) + wsola_sample * wsola_weight;
                         }
                     }
                     self.wsola_overlay_pos += apply_len;
