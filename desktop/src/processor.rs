@@ -125,7 +125,8 @@ pub fn start_processing_thread(
             }
 
             if src_pos >= working_audio.len() {
-                let mut flushed = Vec::with_capacity(chunk_samples * 8);
+                let mut flushed = Vec::new();
+                reserve_flush_output_capacity(&processor, &mut flushed);
                 if let Ok(_written) = processor.flush_into(&mut flushed) {
                     push_to_ring(&mut producer, &flushed);
                 }
@@ -264,8 +265,34 @@ fn process_input_chunk(
         return Ok(());
     }
 
-    output.reserve(input.len().saturating_mul(2));
+    reserve_process_output_capacity(processor, input.len(), output);
     processor.process_into(input, output)
+}
+
+fn reserve_process_output_capacity(
+    processor: &StreamProcessor,
+    input_len: usize,
+    output: &mut Vec<f32>,
+) {
+    let ratio_hint = processor
+        .current_stretch_ratio()
+        .max(processor.target_stretch_ratio())
+        .max(1.0);
+    let (_, _, _, pending_capacity) = processor.capacities();
+    let required = ((input_len as f64) * ratio_hint).ceil() as usize + pending_capacity;
+    let available = output.capacity().saturating_sub(output.len());
+    if required > available {
+        output.reserve(required - available);
+    }
+}
+
+fn reserve_flush_output_capacity(processor: &StreamProcessor, output: &mut Vec<f32>) {
+    let (_, _, _, pending_capacity) = processor.capacities();
+    let required = pending_capacity.saturating_mul(2);
+    let available = output.capacity().saturating_sub(output.len());
+    if required > available {
+        output.reserve(required - available);
+    }
 }
 
 fn push_to_ring(producer: &mut RingProducer, data: &[f32]) {
