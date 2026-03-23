@@ -84,7 +84,15 @@ let params = StretchParams::new(1.02)
     .with_quality_mode(QualityMode::Balanced);
 
 let mut processor = StreamProcessor::new(params);
-let mut output_chunk = Vec::with_capacity(8192); // pre-allocate once
+let (_, _, _, pending_capacity) = processor.capacities();
+let ratio_hint = processor
+    .current_stretch_ratio()
+    .max(processor.target_stretch_ratio())
+    .max(1.0);
+let input_samples_per_chunk = 1024 * 2; // 1024 stereo frames
+let estimated_output = (input_samples_per_chunk as f64 * ratio_hint).ceil() as usize
+    + pending_capacity;
+let mut output_chunk = Vec::with_capacity(estimated_output);
 
 // Feed chunks as they arrive from your audio driver
 loop {
@@ -98,9 +106,12 @@ loop {
 processor.set_stretch_ratio(1.05).expect("valid ratio");
 
 // Flush remaining samples when done
-let mut remaining = Vec::with_capacity(8192);
+let mut remaining = Vec::with_capacity(pending_capacity * 2);
 processor.flush_into(&mut remaining).unwrap();
 ```
+
+If you do not want to manage `Vec` capacity yourself, use
+`StreamProcessor::process()` / `StreamProcessor::flush()` instead.
 
 ### Fixed-Buffer Realtime Callbacks
 
@@ -354,13 +365,13 @@ cargo test --features qa-harnesses --release --test benchmarks -- --nocapture
 ./benchmarks/run_m0_baseline.sh
 
 # Quality-gate benchmark subset (CI-enforced)
-cargo test --features qa-harnesses --test quality_gates -- --nocapture
+cargo test --features qa-harnesses --release --test quality_gates -- --nocapture
 
 # Strict callback-budget gate (same mode used in CI quality-gates job)
 TIMESTRETCH_STRICT_CALLBACK_BUDGET=1 cargo test --features qa-harnesses --release --test quality_gates -- --nocapture
 
 # Emit quality dashboard CSV artifacts (one file per quality gate)
-TIMESTRETCH_QUALITY_DASHBOARD_DIR=target/quality_dashboard cargo test --features qa-harnesses --test quality_gates -- --nocapture
+TIMESTRETCH_QUALITY_DASHBOARD_DIR=target/quality_dashboard cargo test --features qa-harnesses --release --test quality_gates -- --nocapture
 
 # Reference-quality comparison (strict corpus required)
 TIMESTRETCH_STRICT_REFERENCE_BENCHMARK=1 TIMESTRETCH_REFERENCE_MAX_SECONDS=30 cargo test --features qa-harnesses --test reference_quality -- --nocapture
