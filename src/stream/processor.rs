@@ -1125,9 +1125,14 @@ impl StreamProcessor {
                                 / ws_buf.len().max(1) as f64;
                         if ws_rms_sq > 1e-12 && in_rms_sq > 1e-12 {
                             let correction = (in_rms_sq / ws_rms_sq).sqrt().min(3.0) as f32;
-                            for ch_buf in &mut self.wsola_overlay_buffers {
-                                for s in ch_buf.iter_mut() {
-                                    *s *= correction;
+                            // Only boost if WSOLA is quieter than input (correction > 1).
+                            // If WSOLA is already louder, leave it to avoid over-amplification
+                            // when combined with the PV gain applied in the overlay loop.
+                            if correction > 1.0 {
+                                for ch_buf in &mut self.wsola_overlay_buffers {
+                                    for s in ch_buf.iter_mut() {
+                                        *s *= correction;
+                                    }
                                 }
                             }
                         }
