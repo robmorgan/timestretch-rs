@@ -1037,7 +1037,7 @@ impl StreamProcessor {
             // its output over the PV output. WSOLA preserves waveform shape
             // for kicks/snares while the PV handles tonal content.
             let ratio_distance = (self.current_ratio - 1.0).abs();
-            if ratio_distance > 0.4 {
+            if ratio_distance > 0.01 {
                 // Arm a new WSOLA overlay on strong onsets.
                 let flux_factor = self.compute_flux_blend_factor();
                 let input_rms = (self.channel_input_buffers[0]
