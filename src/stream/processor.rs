@@ -1107,14 +1107,19 @@ impl StreamProcessor {
                                 break;
                             }
                             // Crossfade: start with WSOLA dominant, transition to PV.
+                            // At extreme ratios, extend WSOLA dominance to preserve
+                            // more of the transient waveform shape.
                             let progress = pos as f32 / total as f32;
-                            // First 30% is WSOLA-dominant (attack copy), then linear
-                            // crossfade to PV for the decay portion.
-                            let wsola_weight = if progress < 0.25 {
-                                0.90
+                            let (peak_weight, attack_end) = if ratio_distance > 0.8 {
+                                (0.95f32, 0.35f32) // extreme: longer attack, higher weight
                             } else {
-                                let t = (progress - 0.25) / 0.75;
-                                0.90 * (1.0 - t * t)
+                                (0.90f32, 0.25f32) // normal
+                            };
+                            let wsola_weight = if progress < attack_end {
+                                peak_weight
+                            } else {
+                                let t = (progress - attack_end) / (1.0 - attack_end);
+                                peak_weight * (1.0 - t * t)
                             };
                             out[i] = out[i] * (1.0 - wsola_weight) + overlay[pos] * wsola_weight;
                         }
