@@ -1,7 +1,7 @@
 # Autoresearch Ideas Backlog
 
 ## Current Best
-- **954.1 / 1000** on current branch head (`e479be4`)
+- **955.9 / 1000** on current branch head (`c0add4c`)
 - Best kept path: **per-bin PV flux tracking + onset-energy rise cue → post-gain adaptive resample blend**
 
 ## Confirmed Optimal Parameters (Do Not Retry)
