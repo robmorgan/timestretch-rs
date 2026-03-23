@@ -1,57 +1,48 @@
 # Autoresearch Ideas Backlog
 
 ## Current Best
-- **954.1 / 1000** on current branch head
-- Best kept path so far: **per-bin PV flux tracking plus a simple onset-energy rise cue to drive post-gain adaptive resample blending**
-- Important constraint: **PV-internal per-bin magnitude/phase modifications have consistently hurt quality**
+- **954.1 / 1000** on current branch head (`e479be4`)
+- Best kept path: **per-bin PV flux tracking + onset-energy rise cue → post-gain adaptive resample blend**
+
+## Confirmed Optimal Parameters (Do Not Retry)
+- `PHASE_GRADIENT_BLEND = 0.20` — both 0.16 and 0.24 regress
+- `GAIN_SMOOTH = 0.30` — 0.25 regresses percussive
+- Shelf cutoff: **2000 Hz** — 1200 and 3200 both regress
+- `base_shelf` coefficient: **1.40** — 1.55 hurts percussive
+- `ratio_shelf` threshold: **0.4** — 0.3 crashes harmonic
+- `ratio_shelf` ramp: **quadratic (t²)** — linear hurts harmonic
+- Adaptive blend base: **4.5%** — 4.0% and 5.0%+ tie or regress
+- Blend floor/cap/helper-shape variants: all effectively exhausted
+- Sub-bass cutoff: **180 Hz** — 200 Hz crashes percussive (run 204)
 
 ## Pruned / Closed Paths
-- Per-bin identity locking overrides
-- Per-bin magnitude boosts
-- Conservative / local-median / broadband-gated per-bin transient detectors inside PV
-- Frame-level phase-gradient attenuation inside PV
-- Lowering resample-blend threshold below ratio-distance `> 0.5`
-- Uniform WSOLA blend in streaming
-- Anti-aliased LP on blended resample path
+- All per-bin PV-internal modifications (identity, magnitude, phase-gradient)
+- All blend-source shaping (HP-only, residual, low-boost, high-boost, mixed)
+- All blend timing/state (EMA, attack/release, micro-handoff ramps)
+- All ratio-gated shelf extensions (threshold, ramp, gain-gating, centroid-gating via input centroid)
+- Scheduler-coupled blend boosts
+- Extreme-ratio low-band reset widening
 
-These are stale unless a fundamentally new mechanism appears. Do not retry minor threshold variants.
+## Remaining Promising Ideas
+- **True streaming hybrid overlay — TESTED & PLATEAU**
+  - Implemented as a 6ms attack-copy crossfade from 70% direct resample to PV, gated by PV flux.
+  - **Result: ties 954.1** even with aggressive parameters (70% start, all ratios > 0.4).
+  - The energy gain EMA absorbs the extra energy, and the DFT-based benchmark metrics are insensitive to attack-shape improvements.
+  - **Conclusion: 954.1 is likely a benchmark measurement ceiling, not an algorithm ceiling.**
+  - Further gains would require changes to the benchmark metrics (e.g. adding waveform-level cross-correlation or attack-shape measures).
+  - A full WSOLA overlay with alignment state is unlikely to move the needle given this result.
 
-## Promising Next Ideas
-- **Stateful streaming hybrid overlay**
-  - Keep the deterministic PV backbone, but add a tiny stateful WSOLA-style transient overlay path only for detected onsets.
-  - Key requirement: maintain input/output correspondence across callbacks so the overlay is time-aligned, unlike the failed naive WSOLA blend.
-  - This is the most promising broader redesign if local helper tweaks are exhausted.
-
-- **Streaming transient attack copy / decay handoff**
-  - Borrow the batch hybrid idea more directly: copy a very short attack anchor from input/resample path, then hand off to PV for decay.
-  - Needs explicit stream-state bookkeeping for attack windows and overlap boundaries.
-
-- **Unified onset model for stream mode**
-  - Combine PV per-bin flux with low-frequency onset-energy tracking, since remaining weakness is percussive 2.0x and likely kick-dominated.
-  - Could drive either helper blending or a future hybrid overlay more reliably than spectral flux alone.
-
-- **Band-limited blend path**
-  - Keep the PV as the full-band backbone, but blend only an attack-focused band from the cubic-resampled signal.
-  - Pure high-pass-only blend was tried and regressed (`953.6`), so any revisit should retain some low/full-band component.
-  - Candidate: mixed full-band + band-limited helper rather than HP-only.
-  - Rationale: current full-band blend helps percussive 2.0x but is limited by aliasing / tonal contamination.
-
-- **Flux-adaptive blend EQ on the blended path only**
-  - On strong transient frames, shape only the blended signal (not the PV output) with a gentle transient-focused tilt.
-  - Candidate: slightly attenuate sub-bass and/or emphasize attack band before mixing.
-  - Rationale: preserve the resample path’s transient edge while reducing the low-frequency artifacts that cap further blend increases.
-
-- **Transient residual blend instead of raw resample blend**
-  - Tried as a lightweight one-pole residual helper and tied the current best.
-  - If revisited, it should be as part of a broader diagnostic/architectural change, not another local helper variant.
-
-- **Per-case diagnostic pass for percussive 2.0x**
-  - Inspect whether remaining loss is mostly `40 Hz`, `200 Hz`, or batch similarity mismatch.
-  - Rationale: the dominant remaining weakness is still percussive `2.0x`; targeted diagnostics may reveal a cleaner downstream-only lever.
+- **EDM 1.5x centroid correction — DEAD END**
+  - PV preserves spectral magnitudes by design (only changes phases).
+  - Centroid shift is a **time-domain OLA artifact** from phase cancellation, not a spectral magnitude shift.
+  - Analysis/synthesis centroid tracking in the PV is useless because they're always nearly identical.
+  - The existing shelf+gain already compensates for OLA energy loss at the time-domain level.
+  - Any ratio-gated shelf increase at 1.5x hurts harmonic content (even 8% = -9.6 points).
+  - There is no content-adaptive proxy that reliably discriminates EDM from harmonic at the same ratio.
+  - **Closed: the remaining 7 centroid points at EDM 1.5x are architecturally unreachable without true content classification.**
 
 ## Guardrails
-- Avoid PV-internal magnitude edits unless they also rethink/replace the downstream energy compensation.
-- Avoid per-bin phase-locking overrides; they disrupt IF accumulation.
-- Prefer downstream/post-gain shaping over core PV changes.
-- Scalar retunes of the current adaptive full-band blend (base/floor/cap/helper mix) are effectively exhausted; do not keep sweeping them blindly.
-- Do not overfit to benchmark quirks; keep changes plausible for real audio, not just synthetic cases.
+- All scalar parameter sweeps are exhausted; do not retry minor variants.
+- PV-internal modifications conflict with energy compensation; avoid.
+- Prefer genuinely new architectural mechanisms over parameter tuning.
+- Do not overfit to benchmark quirks.

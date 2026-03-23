@@ -9,6 +9,7 @@ use crate::stream::transient_scheduler::{TransientEventScheduler, TransientSched
 use crate::stretch::hybrid::HybridStretcher;
 use crate::stretch::phase_vocoder::PhaseVocoder;
 use crate::stretch::stereo::StereoMode;
+use crate::stretch::wsola::Wsola;
 
 /// Threshold below which ratio differences are considered negligible.
 const RATIO_SNAP_THRESHOLD: f64 = 0.0001;
@@ -411,6 +412,18 @@ pub struct StreamProcessor {
     gain_call_count: usize,
     /// Previous input-frame RMS for simple onset-energy tracking on the helper path.
     prev_blend_input_rms: f32,
+    /// Per-channel WSOLA instances for transient overlay processing.
+    wsola_instances: Vec<Wsola>,
+    /// Per-channel WSOLA output scratch buffers.
+    wsola_output_buffers: Vec<Vec<f32>>,
+    /// Remaining output samples where WSOLA overlay is crossfaded over PV.
+    wsola_overlay_remaining: usize,
+    /// Total length of the current WSOLA overlay crossfade window.
+    wsola_overlay_total: usize,
+    /// Per-channel WSOLA overlay samples (pre-rendered).
+    wsola_overlay_buffers: Vec<Vec<f32>>,
+    /// Current read position within the WSOLA overlay buffers.
+    wsola_overlay_pos: usize,
 }
 
 impl std::fmt::Debug for StreamProcessor {
@@ -436,6 +449,7 @@ impl StreamProcessor {
         let ratio = params.stretch_ratio;
         let num_channels = params.channels.count();
         let source_bpm = params.bpm;
+        let sample_rate = params.sample_rate;
 
         let capacity_frames_per_channel = stream_capacity_frames(&params);
         let capacity_samples = capacity_frames_per_channel.saturating_mul(num_channels);
@@ -494,6 +508,25 @@ impl StreamProcessor {
             energy_gain: 1.0,
             gain_call_count: 0,
             prev_blend_input_rms: 0.0,
+            wsola_instances: (0..num_channels)
+                .map(|_| {
+                    let seg = (sample_rate as f64 * 0.030).round() as usize; // 30ms
+                    let search = (sample_rate as f64 * 0.015).round() as usize; // 15ms
+                    let mut w = Wsola::new(seg, search, ratio);
+                    w.set_equal_power_crossfade();
+                    w.reserve_output_capacity(capacity_frames_per_channel, ratio.max(2.5));
+                    w
+                })
+                .collect(),
+            wsola_output_buffers: (0..num_channels)
+                .map(|_| Vec::with_capacity(output_capacity_frames))
+                .collect(),
+            wsola_overlay_remaining: 0,
+            wsola_overlay_total: 0,
+            wsola_overlay_buffers: (0..num_channels)
+                .map(|_| Vec::with_capacity(output_capacity_frames))
+                .collect(),
+            wsola_overlay_pos: 0,
         }
     }
 
@@ -717,6 +750,12 @@ impl StreamProcessor {
         self.flush_pitch_resampler_to_pending(num_channels)?;
         self.reset_pitch_resamplers();
         self.prev_blend_input_rms = 0.0;
+        self.wsola_overlay_remaining = 0;
+        self.wsola_overlay_total = 0;
+        self.wsola_overlay_pos = 0;
+        for buf in &mut self.wsola_overlay_buffers {
+            buf.clear();
+        }
 
         let _ = self.drain_pending_to_output(output)?;
 
@@ -990,6 +1029,99 @@ impl StreamProcessor {
                                         + t * (-p0 + 3.0 * p1 - 3.0 * p2 + p3)));
                         *sample = *sample * (1.0 - blend) + interp * blend;
                     }
+                }
+            }
+
+            // Streaming WSOLA-PV hybrid overlay: when a strong transient is
+            // detected at extreme ratios, run WSOLA on the input and crossfade
+            // its output over the PV output. WSOLA preserves waveform shape
+            // for kicks/snares while the PV handles tonal content.
+            let ratio_distance = (self.current_ratio - 1.0).abs();
+            if ratio_distance > 0.4 {
+                // Arm a new WSOLA overlay on strong onsets.
+                let flux_factor = self.compute_flux_blend_factor();
+                let input_rms = (self.channel_input_buffers[0]
+                    .iter()
+                    .map(|&s| s * s)
+                    .sum::<f32>()
+                    / self.channel_input_buffers[0].len().max(1) as f32)
+                    .sqrt();
+                let prev_rms = self.prev_blend_input_rms;
+                let onset_rise = (input_rms - prev_rms).max(0.0);
+                let onset_strength = if prev_rms > 1e-6 {
+                    (onset_rise / prev_rms.max(1e-6)).min(1.0)
+                } else {
+                    0.0
+                };
+
+                let should_arm_wsola = self.wsola_overlay_remaining == 0
+                    && (flux_factor > 0.8 || onset_strength > 0.10);
+
+                if should_arm_wsola {
+                    // Run WSOLA on channel input buffers and store results.
+                    let ratio = self.current_ratio;
+                    let mut wsola_min_len = usize::MAX;
+                    for ch in 0..num_channels {
+                        let in_buf = &self.channel_input_buffers[ch];
+                        if in_buf.len() < self.wsola_instances[ch].segment_size() {
+                            wsola_min_len = 0;
+                            break;
+                        }
+                        self.wsola_instances[ch].set_stretch_ratio(ratio);
+                        self.wsola_output_buffers[ch].clear();
+                        if self.wsola_instances[ch]
+                            .process_into(in_buf, &mut self.wsola_output_buffers[ch])
+                            .is_ok()
+                        {
+                            wsola_min_len = wsola_min_len.min(self.wsola_output_buffers[ch].len());
+                        } else {
+                            wsola_min_len = 0;
+                            break;
+                        }
+                    }
+
+                    if wsola_min_len > 0 {
+                        // Store WSOLA output as overlay and set crossfade window.
+                        let overlay_len = wsola_min_len.min(min_output_len);
+                        for ch in 0..num_channels {
+                            self.wsola_overlay_buffers[ch].clear();
+                            self.wsola_overlay_buffers[ch]
+                                .extend_from_slice(&self.wsola_output_buffers[ch][..overlay_len]);
+                        }
+                        self.wsola_overlay_remaining = overlay_len;
+                        self.wsola_overlay_total = overlay_len;
+                        self.wsola_overlay_pos = 0;
+                    }
+                }
+
+                // Apply active WSOLA overlay: crossfade WSOLA over PV output.
+                if self.wsola_overlay_remaining > 0 {
+                    let total = self.wsola_overlay_total.max(1);
+                    let apply_len = self.wsola_overlay_remaining.min(min_output_len);
+                    for ch in 0..num_channels {
+                        let overlay = &self.wsola_overlay_buffers[ch];
+                        let out = &mut self.channel_output_buffers[ch][..min_output_len];
+                        for i in 0..apply_len {
+                            let pos = self.wsola_overlay_pos + i;
+                            if pos >= overlay.len() {
+                                break;
+                            }
+                            // Crossfade: start with WSOLA dominant, transition to PV.
+                            let progress = pos as f32 / total as f32;
+                            // First 30% is WSOLA-dominant (attack copy), then linear
+                            // crossfade to PV for the decay portion.
+                            let wsola_weight = if progress < 0.3 {
+                                0.85
+                            } else {
+                                let t = (progress - 0.3) / 0.7;
+                                0.85 * (1.0 - t)
+                            };
+                            out[i] = out[i] * (1.0 - wsola_weight) + overlay[pos] * wsola_weight;
+                        }
+                    }
+                    self.wsola_overlay_pos += apply_len;
+                    self.wsola_overlay_remaining =
+                        self.wsola_overlay_remaining.saturating_sub(apply_len);
                 }
             }
 
@@ -1823,6 +1955,12 @@ impl StreamProcessor {
         self.energy_gain = 1.0;
         self.gain_call_count = 0;
         self.prev_blend_input_rms = 0.0;
+        self.wsola_overlay_remaining = 0;
+        self.wsola_overlay_total = 0;
+        self.wsola_overlay_pos = 0;
+        for buf in &mut self.wsola_overlay_buffers {
+            buf.clear();
+        }
     }
 
     fn update_vocoder_ratio(&mut self) {
