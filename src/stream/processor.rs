@@ -410,6 +410,14 @@ pub struct StreamProcessor {
     energy_gain: f64,
     /// Count of gain compensation calls for warmup tracking.
     gain_call_count: usize,
+    /// EMA-tracked high-frequency input energy for spectral shape correction.
+    input_hf_energy_ema: f64,
+    /// EMA-tracked high-frequency output energy for spectral shape correction.
+    output_hf_energy_ema: f64,
+    /// High-pass filter state for input HF energy measurement.
+    hf_input_hp_state: f64,
+    /// High-pass filter state for output HF energy measurement.
+    hf_output_hp_state: f64,
     /// Previous input-frame RMS for simple onset-energy tracking on the helper path.
     prev_blend_input_rms: f32,
     /// Per-channel WSOLA instances for transient overlay processing.
@@ -509,6 +517,10 @@ impl StreamProcessor {
             output_energy_ema: 0.0,
             energy_gain: 1.0,
             gain_call_count: 0,
+            input_hf_energy_ema: 0.0,
+            output_hf_energy_ema: 0.0,
+            hf_input_hp_state: 0.0,
+            hf_output_hp_state: 0.0,
             prev_blend_input_rms: 0.0,
             wsola_instances: (0..num_channels)
                 .map(|_| {
@@ -893,6 +905,21 @@ impl StreamProcessor {
             };
             self.input_energy_ema += ema_alpha * (input_energy - self.input_energy_ema);
             self.gain_call_count = self.gain_call_count.saturating_add(1);
+
+            // Track high-frequency input energy using a one-pole high-pass.
+            let hp_coeff = (2.0 * std::f64::consts::PI * 2000.0
+                / self.params.sample_rate.max(1) as f64)
+                .min(0.5);
+            let mut hp_state = self.hf_input_hp_state;
+            let mut hf_energy = 0.0f64;
+            for &s in &self.channel_input_buffers[0] {
+                hp_state += hp_coeff * (s as f64 - hp_state);
+                let hp = s as f64 - hp_state;
+                hf_energy += hp * hp;
+            }
+            self.hf_input_hp_state = hp_state;
+            hf_energy /= self.channel_input_buffers[0].len().max(1) as f64;
+            self.input_hf_energy_ema += ema_alpha * (hf_energy - self.input_hf_energy_ema);
         }
 
         let min_output_len = self.process_channels(num_channels)?;
@@ -918,6 +945,22 @@ impl StreamProcessor {
                     0.05 + 0.07 * (rd / 0.5).min(1.0)
                 };
                 self.output_energy_ema += ema_alpha_out * (output_energy - self.output_energy_ema);
+
+                // Track high-frequency output energy.
+                let hp_coeff_out = (2.0 * std::f64::consts::PI * 2000.0
+                    / self.params.sample_rate.max(1) as f64)
+                    .min(0.5);
+                let mut hp_state_out = self.hf_output_hp_state;
+                let mut hf_energy_out = 0.0f64;
+                for &s in &self.channel_output_buffers[0][..min_output_len] {
+                    hp_state_out += hp_coeff_out * (s as f64 - hp_state_out);
+                    let hp = s as f64 - hp_state_out;
+                    hf_energy_out += hp * hp;
+                }
+                self.hf_output_hp_state = hp_state_out;
+                hf_energy_out /= min_output_len.max(1) as f64;
+                self.output_hf_energy_ema +=
+                    ema_alpha_out * (hf_energy_out - self.output_hf_energy_ema);
 
                 // Compute global gain to match input energy.
                 const GAIN_SMOOTH: f64 = 0.30;
@@ -953,11 +996,30 @@ impl StreamProcessor {
                 } else {
                     1.0f32
                 };
-                let ratio_shelf = if ratio_distance > 0.4 {
-                    let t = ((ratio_distance - 0.4) / 0.6).min(1.0);
-                    (1.0 + 0.80 * t * t) as f32
+                // HF-energy-driven shelf: directly measured HF loss drives
+                // additional correction. Only active when total energy_gain is
+                // low (< 1.10) — high energy_gain means broadband loss from
+                // transient smearing where shelf hurts batch_sim.
+                let hf_shelf = if self.output_hf_energy_ema > 1e-12
+                    && self.input_hf_energy_ema > 1e-12
+                    && self.gain_call_count > 3
+                    && self.energy_gain < 1.10
+                {
+                    let hf_ratio = (self.input_hf_energy_ema / self.output_hf_energy_ema).sqrt();
+                    if hf_ratio > 1.08 {
+                        ((hf_ratio - 1.0) * 0.4 + 1.0).min(1.6) as f32
+                    } else {
+                        1.0f32
+                    }
                 } else {
                     1.0f32
+                };
+                let ratio_shelf = if ratio_distance > 0.4 {
+                    let t = ((ratio_distance - 0.4) / 0.6).min(1.0);
+                    let fixed = (1.0 + 0.80 * t * t) as f32;
+                    fixed.max(hf_shelf)
+                } else {
+                    hf_shelf
                 };
                 let shelf_amount = base_shelf * ratio_shelf;
                 let use_shelf = shelf_amount > 1.001;
