@@ -1007,7 +1007,7 @@ impl StreamProcessor {
                 {
                     let hf_ratio = (self.input_hf_energy_ema / self.output_hf_energy_ema).sqrt();
                     if hf_ratio > 1.08 {
-                        ((hf_ratio - 1.0) * 0.5 + 1.0).min(1.6) as f32
+                        ((hf_ratio - 1.0) * 0.6 + 1.0).min(1.6) as f32
                     } else {
                         1.0f32
                     }
