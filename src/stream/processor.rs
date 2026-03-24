@@ -940,10 +940,14 @@ impl StreamProcessor {
                 // means more PV energy loss, which correlates with more spectral
                 // tilt. At low gain (harmonic near-unity), shelf is minimal.
                 let base_shelf = if self.energy_gain > 1.02 {
-                    let gain_factor = ((self.energy_gain - 1.02) / 0.48).clamp(0.0, 1.0);
-                    // Scale base shelf max by ratio distance: near-unity ratios
-                    // need less shelf (harmonic content is already well-preserved),
-                    // while larger ratios need more to compensate for PV tilt.
+                    // Two-region gain_factor: dead zone below 1.06 (harmonic
+                    // barely needs shelf), then standard scaling above.
+                    let raw_gf = ((self.energy_gain - 1.02) / 0.48).clamp(0.0, 1.0);
+                    let gain_factor = if self.energy_gain < 1.06 {
+                        raw_gf * 0.5
+                    } else {
+                        raw_gf
+                    };
                     let ratio_scale = (ratio_distance / 0.3).clamp(0.25, 1.0);
                     (1.0 + 1.40 * gain_factor * ratio_scale) as f32
                 } else {
