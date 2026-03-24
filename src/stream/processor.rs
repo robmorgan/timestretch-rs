@@ -883,7 +883,14 @@ impl StreamProcessor {
                 / self.channel_input_buffers[0].len().max(1) as f64;
             // Fast warmup for the first 10 calls to converge quickly,
             // then settle to stable tracking.
-            let ema_alpha = if self.gain_call_count < 5 { 0.15 } else { 0.05 };
+            // Ratio-adaptive EMA: extreme ratios get faster convergence
+            // because PV energy loss is larger and needs quicker correction.
+            let rd = (self.current_ratio - 1.0).abs();
+            let ema_alpha = if self.gain_call_count < 5 {
+                0.15
+            } else {
+                0.05 + 0.03 * (rd / 0.5).min(1.0)
+            };
             self.input_energy_ema += ema_alpha * (input_energy - self.input_energy_ema);
             self.gain_call_count = self.gain_call_count.saturating_add(1);
         }
@@ -904,8 +911,13 @@ impl StreamProcessor {
                     .map(|&s| (s as f64) * (s as f64))
                     .sum::<f64>()
                     / min_output_len.max(1) as f64;
-                let ema_alpha = if self.gain_call_count < 5 { 0.15 } else { 0.05 };
-                self.output_energy_ema += ema_alpha * (output_energy - self.output_energy_ema);
+                let ema_alpha_out = if self.gain_call_count < 5 {
+                    0.15
+                } else {
+                    let rd = (self.current_ratio - 1.0).abs();
+                    0.05 + 0.03 * (rd / 0.5).min(1.0)
+                };
+                self.output_energy_ema += ema_alpha_out * (output_energy - self.output_energy_ema);
 
                 // Compute global gain to match input energy.
                 const GAIN_SMOOTH: f64 = 0.30;

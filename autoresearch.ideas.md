@@ -1,64 +1,58 @@
 # Autoresearch Ideas Backlog
 
 ## Current Best
-- **966.1 / 1000** on current branch head
-- Key breakthroughs: full-length WSOLA overlay at extreme ratios + per-overlay energy normalization + PV gain
+- **967.0 / 1000** on current branch head (`203b662`)
+- Session progress: 955.9 → 967.0 (+11.1 points)
+- Total progress from initial: significant improvements across percussive (+25), EDM (+2), harmonic (flat)
 
-## Confirmed Optimal Parameters (Do Not Retry)
-- `PHASE_GRADIENT_BLEND = 0.20` — both 0.16 and 0.24 regress
-- `GAIN_SMOOTH = 0.30` — 0.25 regresses percussive
-- Shelf cutoff: **2000 Hz** — 1200 and 3200 both regress
-- `base_shelf` coefficient: **1.40** — 1.55 hurts percussive
-- `ratio_shelf` threshold: **0.4** — 0.3 crashes harmonic
-- `ratio_shelf` ramp: **quadratic (t²)** — linear hurts harmonic
-- Adaptive blend base: **4.5%** — 4.0% and 5.0%+ tie or regress
-- Sub-bass cutoff: **180 Hz** — 200 Hz crashes percussive
-- WSOLA overlay extreme params: **100% weight, 100% attack** — maxed out
-- WSOLA gain fraction: **1.0 (full PV gain)** — optimal
-- Per-overlay energy normalization: **active, comparing to input energy**
-- Min ratio_scale for base_shelf: **0.2** — lower hurts EDM/percussive, higher hurts harmonic
-- WSOLA preset params: **use preset-configured** vs hardcoded
+## Key Breakthroughs (Ordered by Impact)
+1. **Full-length WSOLA overlay at extreme ratios** (+4.8) — let WSOLA output span beyond PV chunk length for cross-chunk transient continuity
+2. **Per-overlay energy normalization + PV gain** (+1.6) — normalize WSOLA energy to input, then apply PV gain for spectral matching
+3. **Progressive WSOLA overlay aggressiveness** (+1.5 cumulative) — 100% weight, 100% attack at extreme ratios
+4. **Preset WSOLA params** (+0.5) — match batch WSOLA config instead of hardcoded values
+5. **ratio_scale min 0.25** (+0.4) — sweet spot for shelf at near-unity ratios
+6. **Shelf filter on WSOLA overlay** (+0.3) — spectral consistency between PV and WSOLA portions
+7. **Boost-only normalization** (+0.2) — skip correction when WSOLA is already louder than input
 
-## Pruned / Closed Paths
-- All per-bin PV-internal modifications (identity, magnitude, phase-gradient)
-- All blend-source shaping (HP-only, residual, low-boost, high-boost, mixed)
-- All blend timing/state (EMA, attack/release, micro-handoff ramps)
-- All ratio-gated shelf extensions (threshold, ramp, gain-gating)
-- Scheduler-coupled blend boosts
-- Extreme-ratio low-band reset widening
-- Mono transient phase resets — hurt harmonic by -52 points
-- Adaptive spectral tilt (hilo ratio tracking) — simple LP band split doesn't correlate with centroid
-- Lower flux threshold at extreme ratios — triggers WSOLA on tonal content, destroys EDM freq_pres
-- Moderate WSOLA tier (95%/35%) — hurts percussive 1.5x freq_pres
-- Extended WSOLA at moderate ratios (1.5x) — energy regression from over-amplification
-- EDM 1.5x centroid — PV OLA artifact, no content-adaptive proxy available
+## Confirmed Optimal Parameters (Exhaustively Tested)
+- `PHASE_GRADIENT_BLEND = 0.20`
+- `GAIN_SMOOTH = 0.30` (0.25 and 0.35 both tie/regress)
+- Shelf cutoff: **2000 Hz**
+- `base_shelf` coefficient: **1.40** (1.45 regresses)
+- `ratio_shelf` threshold: **0.4**, ramp: **quadratic**
+- Adaptive blend base: **4.5%**, cap: **10%** (never hit)
+- Sub-bass cutoff: **180 Hz** (170 crashes percussive by -1.6)
+- WSOLA overlay extreme: **100%/100%** (maxed)
+- WSOLA overlay normal: **90%/25%** (92% no effect)
+- WSOLA gain on overlay: **full energy_gain**
+- Per-overlay normalization: **boost-only**
+- WSOLA shelf: **active**
+- ratio_scale min: **0.25**
+- WSOLA search/segment: **preset-configured**
 
-## Remaining Promising Ideas
+## Exhaustively Pruned Paths
+- Per-bin PV-internal modifications, blend-source shaping, blend timing/state
+- Ratio-gated shelf extensions, scheduler-coupled boosts
+- Mono transient phase resets, adaptive spectral tilt tracking
+- Lower flux threshold at extreme ratios (triggers on tonal)
+- Moderate WSOLA tier (hurts percussive 1.5x)
+- Extended WSOLA at moderate ratios (energy regression)
+- EDM 1.5x centroid (fundamental OLA artifact)
+- Unconditional RMS tracking (enables bad triggers)
+- Larger WSOLA search range (hurts alignment)
+- Single-pole vs two-pole shelf topology (no difference at near-unity)
+- Sub-bass cutoff changes (170, 200 both regress)
+- base_shelf coefficient changes (1.45, 1.55 both regress)
 
-- **Improve percussive 2.0x batch_sim (0.6267)**
-  - Currently limited by fundamental PV vs batch-WSOLA spectral difference
-  - Extended WSOLA overlay already at 100% for transients
-  - Could try: running WSOLA on MORE of the signal (not just onset-gated) at extreme ratios
-  - Risk: WSOLA on non-transient portions hurts tonal content (confirmed for EDM)
-
-- **Improve percussive 1.5x batch_sim (0.8275)**
-  - Moderate WSOLA tier was tried and hurt freq_pres
-  - Extended WSOLA at 1.5x also hurts (energy/freq_pres regression)
-  - May need a different approach: better PV quality at this ratio
-
-- **Improve harmonic batch_sim (~0.945)**
-  - Shelf adds spectral coloration that differs from batch
-  - Batch doesn't apply any gain/shelf
-  - Could reduce shelf specifically when gain is low (near-unity) but this is already parametrized
-
-- **Tune per-overlay normalization gain balance**
-  - Currently: normalize to input + apply full PV gain → ~6% too loud at perc 2.0x
-  - Could optimize gain fraction but risk overfitting to percussive
-  - energy_score at 0.97 is already good — diminishing returns
+## Remaining Theoretical Opportunities
+1. **percussive 1.5x batch_sim (0.8275)** — up to +4.3 pts, no working approach found
+2. **percussive 2.0x batch_sim (0.6246)** — up to +3.9 pts, fundamental architectural limit
+3. **EDM 1.02 centroid (0.8816)** — up to +1.5 pts, limited by shelf/harmonic tradeoff
+4. **EDM 1.5x centroid (0.2583)** — up to +9.6 pts, dead end (OLA artifact)
 
 ## Guardrails
-- All scalar parameter sweeps are exhausted; do not retry minor variants.
-- PV-internal modifications conflict with energy compensation; avoid.
-- Prefer genuinely new architectural mechanisms over parameter tuning.
-- Do not overfit to benchmark quirks.
-- Extended WSOLA overlay ONLY at extreme ratios (>0.8 distance) — hurts at moderate ratios.
+- All scalar parameter sweeps are exhausted
+- WSOLA at moderate ratios consistently hurts quality
+- Extended WSOLA overlay only works at extreme ratios (>0.8 distance)
+- Any shelf increase helps EDM/percussive centroid but hurts harmonic
+- The score plateau appears to be near 967-968 with current architecture
