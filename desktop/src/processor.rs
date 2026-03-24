@@ -6,7 +6,9 @@ use std::time::Duration;
 use timestretch::{EdmPreset, QualityMode, StreamProcessor, StretchError, StretchParams};
 
 use crate::audio_engine::RingProducer;
-use crate::state::{AtomicPosition, PresetChoice, SharedStateHandle, StopFlag, Transport};
+use crate::state::{
+    AtomicPosition, PresetChoice, SharedStateHandle, StopFlag, StreamProfile, Transport,
+};
 
 /// Fixed chunk size for desktop stream processing (in frames).
 const CHUNK_FRAMES: usize = 1024;
@@ -213,16 +215,27 @@ fn desktop_stream_params(
             st.stretch_ratio
         };
 
-        // Live desktop playback should match the CLI's desktop-style DJ stream
-        // profile: smaller FFT and low-latency mode avoid the large mid-playback
-        // warmup hit of the full DjBeatmatch preset.
-        return StretchParams::new(base_ratio)
-            .with_sample_rate(sample_rate)
-            .with_channels(CHANNELS)
-            .with_quality_mode(QualityMode::LowLatency)
-            .with_fft_size(1024)
-            .with_hop_size(256)
-            .with_normalize(true);
+        let mut params = match st.stream_profile {
+            // Lowest-latency profile for responsive live control.
+            StreamProfile::Live => StretchParams::new(base_ratio)
+                .with_sample_rate(sample_rate)
+                .with_channels(CHANNELS)
+                .with_quality_mode(QualityMode::LowLatency)
+                .with_fft_size(1024)
+                .with_hop_size(256)
+                .with_normalize(true),
+            // Higher-quality realtime profile: larger FFT and full DJ preset
+            // reduce robotic PV character at the cost of more latency/CPU.
+            StreamProfile::Quality => StretchParams::new(base_ratio)
+                .with_sample_rate(sample_rate)
+                .with_channels(CHANNELS)
+                .with_preset(EdmPreset::DjBeatmatch)
+                .with_normalize(true),
+        };
+        if detected_bpm.is_finite() && detected_bpm > 0.0 {
+            params = params.with_bpm(detected_bpm);
+        }
+        return params;
     }
 
     let mut params = StretchParams::new(st.stretch_ratio)
@@ -323,6 +336,7 @@ mod tests {
     fn desktop_dj_beatmatch_uses_low_latency_stream_profile() {
         let mut state = SharedState::new();
         state.preset = PresetChoice::DjBeatmatch;
+        state.stream_profile = StreamProfile::Live;
         state.detected_bpm = 126.0;
         state.target_bpm = 128.0;
 
@@ -333,6 +347,26 @@ mod tests {
         assert_eq!(params.hop_size, 256);
         assert!(params.normalize);
         assert!(params.preset.is_none());
+        assert_eq!(params.bpm, Some(126.0));
+        assert!((params.stretch_ratio - (126.0 / 128.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn desktop_dj_quality_profile_uses_full_preset() {
+        let mut state = SharedState::new();
+        state.preset = PresetChoice::DjBeatmatch;
+        state.stream_profile = StreamProfile::Quality;
+        state.detected_bpm = 126.0;
+        state.target_bpm = 128.0;
+
+        let params = desktop_stream_params(&state, 44_100);
+
+        assert_eq!(params.quality_mode, QualityMode::Balanced);
+        assert_eq!(params.preset, Some(EdmPreset::DjBeatmatch));
+        assert_eq!(params.fft_size, 4096);
+        assert_eq!(params.hop_size, 1024);
+        assert_eq!(params.bpm, Some(126.0));
+        assert!(params.normalize);
         assert!((params.stretch_ratio - (126.0 / 128.0)).abs() < 1e-9);
     }
 

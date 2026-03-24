@@ -41,6 +41,7 @@ pub struct TimeStretchApp {
     pitch_semitones: f32,
     volume: f32,
     preset: PresetChoice,
+    stream_profile: StreamProfile,
     target_bpm_text: String,
 
     // Error messages
@@ -90,6 +91,7 @@ impl TimeStretchApp {
             pitch_semitones: 0.0,
             volume: 0.8,
             preset: PresetChoice::DjBeatmatch,
+            stream_profile: StreamProfile::Live,
             target_bpm_text: String::new(),
             error_message: None,
         }
@@ -149,6 +151,7 @@ impl TimeStretchApp {
                     st.pitch_semitones = self.pitch_semitones;
                     st.volume = self.volume;
                     st.preset = self.preset;
+                    st.stream_profile = self.stream_profile;
                 }
 
                 self.source_audio = Some(samples);
@@ -505,6 +508,28 @@ impl TimeStretchApp {
                     if self.preset != old_preset {
                         let mut st = self.state.lock().unwrap();
                         st.preset = self.preset;
+                        st.preset_changed = true;
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Playback:");
+                ui.horizontal(|ui| {
+                    let old_profile = self.stream_profile;
+                    egui::ComboBox::from_id_salt("stream_profile_combo")
+                        .selected_text(self.stream_profile.label())
+                        .show_ui(ui, |ui| {
+                            for &profile in StreamProfile::ALL {
+                                ui.selectable_value(
+                                    &mut self.stream_profile,
+                                    profile,
+                                    profile.label(),
+                                );
+                            }
+                        });
+                    if self.stream_profile != old_profile {
+                        let mut st = self.state.lock().unwrap();
+                        st.stream_profile = self.stream_profile;
                         st.preset_changed = true;
                     }
                 });

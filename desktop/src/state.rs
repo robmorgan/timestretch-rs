@@ -52,6 +52,23 @@ impl PresetChoice {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StreamProfile {
+    Live,
+    Quality,
+}
+
+impl StreamProfile {
+    pub const ALL: &'static [StreamProfile] = &[StreamProfile::Live, StreamProfile::Quality];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            StreamProfile::Live => "Live",
+            StreamProfile::Quality => "Quality",
+        }
+    }
+}
+
 /// State shared between UI, processing, and audio threads.
 pub struct SharedState {
     pub transport: Transport,
@@ -59,6 +76,7 @@ pub struct SharedState {
     pub pitch_semitones: f32,
     pub volume: f32,
     pub preset: PresetChoice,
+    pub stream_profile: StreamProfile,
 
     /// Current playback position in source frames.
     pub position_frames: usize,
@@ -89,6 +107,7 @@ impl SharedState {
             pitch_semitones: 0.0,
             volume: 0.8,
             preset: PresetChoice::DjBeatmatch,
+            stream_profile: StreamProfile::Live,
             position_frames: 0,
             total_frames: 0,
             sample_rate: 44100,
