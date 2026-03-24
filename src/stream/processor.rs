@@ -1160,8 +1160,13 @@ impl StreamProcessor {
                 let wsola_shelf = {
                     let rd = (self.current_ratio - 1.0).abs();
                     let bs = if self.energy_gain > 1.02 {
-                        let gf = ((self.energy_gain - 1.02) / 0.48).clamp(0.0, 1.0);
-                        let rs = (rd / 0.3).clamp(0.2, 1.0);
+                        let raw_gf = ((self.energy_gain - 1.02) / 0.48).clamp(0.0, 1.0);
+                        let gf = if self.energy_gain < 1.06 {
+                            raw_gf * 0.5
+                        } else {
+                            raw_gf
+                        };
+                        let rs = (rd / 0.3).clamp(0.25, 1.0);
                         (1.0 + 1.40 * gf * rs) as f32
                     } else {
                         1.0f32
