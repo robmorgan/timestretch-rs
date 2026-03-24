@@ -418,6 +418,14 @@ pub struct StreamProcessor {
     hf_input_hp_state: f64,
     /// High-pass filter state for output HF energy measurement.
     hf_output_hp_state: f64,
+    /// EMA-tracked mid-band input energy (500-2000 Hz) for centroid correction.
+    input_mid_energy_ema: f64,
+    /// EMA-tracked mid-band output energy (500-2000 Hz) for centroid correction.
+    output_mid_energy_ema: f64,
+    /// Bandpass filter states for input mid-band measurement [hp_state, lp_state].
+    mid_input_bp_state: [f64; 2],
+    /// Bandpass filter states for output mid-band measurement [hp_state, lp_state].
+    mid_output_bp_state: [f64; 2],
     /// Previous input-frame RMS for simple onset-energy tracking on the helper path.
     prev_blend_input_rms: f32,
     /// Per-channel WSOLA instances for transient overlay processing.
@@ -521,6 +529,10 @@ impl StreamProcessor {
             output_hf_energy_ema: 0.0,
             hf_input_hp_state: 0.0,
             hf_output_hp_state: 0.0,
+            input_mid_energy_ema: 0.0,
+            output_mid_energy_ema: 0.0,
+            mid_input_bp_state: [0.0; 2],
+            mid_output_bp_state: [0.0; 2],
             prev_blend_input_rms: 0.0,
             wsola_instances: (0..num_channels)
                 .map(|_| {
@@ -923,6 +935,26 @@ impl StreamProcessor {
             // shape changes are often rapid (transient onsets).
             let hf_alpha = (ema_alpha * 1.5).min(0.20);
             self.input_hf_energy_ema += hf_alpha * (hf_energy - self.input_hf_energy_ema);
+
+            // Track mid-band input energy (500-2000 Hz) via bandpass.
+            let mid_hp_c = (2.0 * std::f64::consts::PI * 500.0
+                / self.params.sample_rate.max(1) as f64)
+                .min(0.5);
+            let mid_lp_c = (2.0 * std::f64::consts::PI * 2000.0
+                / self.params.sample_rate.max(1) as f64)
+                .min(0.5);
+            let mut m_hp = self.mid_input_bp_state[0];
+            let mut m_lp = self.mid_input_bp_state[1];
+            let mut mid_e = 0.0f64;
+            for &s in &self.channel_input_buffers[0] {
+                m_hp += mid_hp_c * (s as f64 - m_hp);
+                let hp_s = s as f64 - m_hp;
+                m_lp += mid_lp_c * (hp_s - m_lp);
+                mid_e += m_lp * m_lp;
+            }
+            self.mid_input_bp_state = [m_hp, m_lp];
+            mid_e /= self.channel_input_buffers[0].len().max(1) as f64;
+            self.input_mid_energy_ema += hf_alpha * (mid_e - self.input_mid_energy_ema);
         }
 
         let min_output_len = self.process_channels(num_channels)?;
@@ -965,6 +997,26 @@ impl StreamProcessor {
                 let hf_alpha_out = (ema_alpha_out * 1.5).min(0.20);
                 self.output_hf_energy_ema +=
                     hf_alpha_out * (hf_energy_out - self.output_hf_energy_ema);
+
+                // Track mid-band output energy (500-2000 Hz).
+                let mid_hp_c2 = (2.0 * std::f64::consts::PI * 500.0
+                    / self.params.sample_rate.max(1) as f64)
+                    .min(0.5);
+                let mid_lp_c2 = (2.0 * std::f64::consts::PI * 2000.0
+                    / self.params.sample_rate.max(1) as f64)
+                    .min(0.5);
+                let mut m_hp2 = self.mid_output_bp_state[0];
+                let mut m_lp2 = self.mid_output_bp_state[1];
+                let mut mid_e2 = 0.0f64;
+                for &s in &self.channel_output_buffers[0][..min_output_len] {
+                    m_hp2 += mid_hp_c2 * (s as f64 - m_hp2);
+                    let hp_s = s as f64 - m_hp2;
+                    m_lp2 += mid_lp_c2 * (hp_s - m_lp2);
+                    mid_e2 += m_lp2 * m_lp2;
+                }
+                self.mid_output_bp_state = [m_hp2, m_lp2];
+                mid_e2 /= min_output_len.max(1) as f64;
+                self.output_mid_energy_ema += hf_alpha_out * (mid_e2 - self.output_mid_energy_ema);
 
                 // Compute global gain to match input energy.
                 const GAIN_SMOOTH: f64 = 0.30;
@@ -1069,6 +1121,41 @@ impl StreamProcessor {
             // Blend amount is modulated by per-bin spectral flux: transient
             // frames get more blend (up to 8%) to preserve attack shape, while
             // steady-state frames get less (down to 2%) to let the PV shine.
+            // Mid-band spectral correction: when the 500-2000 Hz range loses
+            // energy (measured via bandpass tracking), apply a gentle additive
+            // boost to the mid-band content. This addresses centroid drop in
+            // the frequency range that high-shelf at 2kHz misses.
+            if self.output_mid_energy_ema > 1e-12
+                && self.input_mid_energy_ema > 1e-12
+                && self.gain_call_count > 5
+                && self.energy_gain < 1.20
+                && min_output_len > 0
+            {
+                let mid_ratio = (self.input_mid_energy_ema / self.output_mid_energy_ema).sqrt();
+                if mid_ratio > 1.10 {
+                    // Extract mid-band and add a fraction back for gentle boost.
+                    // Amount proportional to measured loss, clamped to prevent
+                    // over-correction.
+                    let boost = ((mid_ratio - 1.0) * 0.25).min(0.12) as f32;
+                    let bp_hp = (2.0 * std::f64::consts::PI * 500.0
+                        / self.params.sample_rate.max(1) as f64)
+                        .min(0.5) as f32;
+                    let bp_lp = (2.0 * std::f64::consts::PI * 2000.0
+                        / self.params.sample_rate.max(1) as f64)
+                        .min(0.5) as f32;
+                    for ch in 0..num_channels {
+                        let mut hp_st = 0.0f32;
+                        let mut lp_st = 0.0f32;
+                        for s in self.channel_output_buffers[ch][..min_output_len].iter_mut() {
+                            hp_st += bp_hp * (*s - hp_st);
+                            let hp_out = *s - hp_st;
+                            lp_st += bp_lp * (hp_out - lp_st);
+                            *s += lp_st * boost;
+                        }
+                    }
+                }
+            }
+
             if (self.current_ratio - 1.0).abs() > 0.5 {
                 let base_blend = 0.045f32;
                 let mut flux_factor = self.compute_flux_blend_factor();
