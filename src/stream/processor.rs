@@ -889,7 +889,7 @@ impl StreamProcessor {
             let ema_alpha = if self.gain_call_count < 5 {
                 0.15
             } else {
-                0.05 + 0.03 * (rd / 0.5).min(1.0)
+                0.05 + 0.05 * (rd / 0.5).min(1.0)
             };
             self.input_energy_ema += ema_alpha * (input_energy - self.input_energy_ema);
             self.gain_call_count = self.gain_call_count.saturating_add(1);
@@ -915,7 +915,7 @@ impl StreamProcessor {
                     0.15
                 } else {
                     let rd = (self.current_ratio - 1.0).abs();
-                    0.05 + 0.03 * (rd / 0.5).min(1.0)
+                    0.05 + 0.05 * (rd / 0.5).min(1.0)
                 };
                 self.output_energy_ema += ema_alpha_out * (output_energy - self.output_energy_ema);
 
