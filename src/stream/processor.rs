@@ -919,7 +919,10 @@ impl StreamProcessor {
             }
             self.hf_input_hp_state = hp_state;
             hf_energy /= self.channel_input_buffers[0].len().max(1) as f64;
-            self.input_hf_energy_ema += ema_alpha * (hf_energy - self.input_hf_energy_ema);
+            // HF energy uses faster EMA for quicker convergence since spectral
+            // shape changes are often rapid (transient onsets).
+            let hf_alpha = (ema_alpha * 1.5).min(0.20);
+            self.input_hf_energy_ema += hf_alpha * (hf_energy - self.input_hf_energy_ema);
         }
 
         let min_output_len = self.process_channels(num_channels)?;
@@ -959,8 +962,9 @@ impl StreamProcessor {
                 }
                 self.hf_output_hp_state = hp_state_out;
                 hf_energy_out /= min_output_len.max(1) as f64;
+                let hf_alpha_out = (ema_alpha_out * 1.5).min(0.20);
                 self.output_hf_energy_ema +=
-                    ema_alpha_out * (hf_energy_out - self.output_hf_energy_ema);
+                    hf_alpha_out * (hf_energy_out - self.output_hf_energy_ema);
 
                 // Compute global gain to match input energy.
                 const GAIN_SMOOTH: f64 = 0.30;
