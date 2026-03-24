@@ -1384,7 +1384,8 @@ impl StreamProcessor {
                             // Apply PV gain on top of per-overlay normalization
                             // for spectral consistency with shelf-boosted PV output.
                             let wsola_sample = overlay[pos] * self.energy_gain as f32;
-                            *out_sample = *out_sample * (1.0 - wsola_weight) + wsola_sample * wsola_weight;
+                            *out_sample =
+                                *out_sample * (1.0 - wsola_weight) + wsola_sample * wsola_weight;
                         }
                     }
                     self.wsola_overlay_pos += apply_len;
