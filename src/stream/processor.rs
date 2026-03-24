@@ -1361,7 +1361,7 @@ impl StreamProcessor {
                     for ch in 0..num_channels {
                         let overlay = &self.wsola_overlay_buffers[ch];
                         let out = &mut self.channel_output_buffers[ch][..min_output_len];
-                        for i in 0..apply_len {
+                        for (i, out_sample) in out[..apply_len].iter_mut().enumerate() {
                             let pos = self.wsola_overlay_pos + i;
                             if pos >= overlay.len() {
                                 break;
@@ -1384,7 +1384,7 @@ impl StreamProcessor {
                             // Apply PV gain on top of per-overlay normalization
                             // for spectral consistency with shelf-boosted PV output.
                             let wsola_sample = overlay[pos] * self.energy_gain as f32;
-                            out[i] = out[i] * (1.0 - wsola_weight) + wsola_sample * wsola_weight;
+                            *out_sample = *out_sample * (1.0 - wsola_weight) + wsola_sample * wsola_weight;
                         }
                     }
                     self.wsola_overlay_pos += apply_len;
