@@ -1003,7 +1003,7 @@ impl StreamProcessor {
                 let hf_shelf = if self.output_hf_energy_ema > 1e-12
                     && self.input_hf_energy_ema > 1e-12
                     && self.gain_call_count > 3
-                    && self.energy_gain < 1.10
+                    && self.energy_gain < 1.15
                 {
                     let hf_ratio = (self.input_hf_energy_ema / self.output_hf_energy_ema).sqrt();
                     if hf_ratio > 1.08 {
