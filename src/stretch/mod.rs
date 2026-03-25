@@ -12,6 +12,6 @@ pub mod wsola;
 pub use hybrid::HybridStretcher;
 pub use multi_resolution::MultiResolutionStretcher;
 pub use phase_locking::PhaseLockingMode;
-pub use phase_vocoder::PhaseVocoder;
+pub use phase_vocoder::{PerFrameFlux, PhaseVocoder};
 pub use stereo::StereoMode;
 pub use wsola::Wsola;

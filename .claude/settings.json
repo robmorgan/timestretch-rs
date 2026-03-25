@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if jq -r '.tool_input.command // \"\"' | grep -q '^git commit'; then cargo fmt --all --check 2>&1; if [ $? -ne 0 ]; then echo '{\"decision\":\"block\",\"reason\":\"cargo fmt found unformatted code — run cargo fmt before committing\"}'; exit 0; fi; cargo clippy --all-targets -- -D warnings 2>&1; if [ $? -ne 0 ]; then echo '{\"decision\":\"block\",\"reason\":\"cargo clippy found warnings — fix them before committing\"}'; fi; fi",
+            "timeout": 120,
+            "statusMessage": "Running fmt + clippy pre-commit checks..."
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -3,10 +3,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use timestretch::{EdmPreset, StreamProcessor, StretchError, StretchParams};
+use timestretch::{EdmPreset, QualityMode, StreamProcessor, StretchError, StretchParams};
 
 use crate::audio_engine::RingProducer;
-use crate::state::{AtomicPosition, PresetChoice, SharedStateHandle, StopFlag, Transport};
+use crate::state::{
+    AtomicPosition, PresetChoice, SharedStateHandle, StopFlag, StreamProfile, Transport,
+};
 
 /// Fixed chunk size for desktop stream processing (in frames).
 const CHUNK_FRAMES: usize = 1024;
@@ -180,8 +182,23 @@ pub fn start_processing_thread(
 fn build_processor(state: &SharedStateHandle, sample_rate: u32) -> (StreamProcessor, usize) {
     let st = state.lock().unwrap();
     let ratio = st.stretch_ratio;
+    let params = desktop_stream_params(&st, sample_rate);
+    drop(st);
 
-    let params = if st.preset == PresetChoice::DjBeatmatch {
+    let preroll = startup_preroll_target_samples(&params);
+    let mut processor = StreamProcessor::new(params);
+    if let Err(err) = processor.set_stretch_ratio(ratio) {
+        log::warn!("failed to apply initial ratio {ratio}: {err}");
+    }
+
+    (processor, preroll)
+}
+
+fn desktop_stream_params(
+    st: &crate::state::SharedState,
+    sample_rate: u32,
+) -> StretchParams {
+    if st.preset == PresetChoice::DjBeatmatch {
         let detected_bpm = st.detected_bpm;
         let target_bpm = if st.target_bpm.is_finite() && st.target_bpm > 0.0 {
             st.target_bpm
@@ -195,39 +212,43 @@ fn build_processor(state: &SharedStateHandle, sample_rate: u32) -> (StreamProces
         {
             detected_bpm / target_bpm
         } else {
-            ratio
+            st.stretch_ratio
         };
 
-        let mut params = StretchParams::new(base_ratio)
-            .with_sample_rate(sample_rate)
-            .with_channels(CHANNELS)
-            .with_preset(EdmPreset::DjBeatmatch);
+        let mut params = match st.stream_profile {
+            // Lowest-latency profile for responsive live control.
+            StreamProfile::Live => StretchParams::new(base_ratio)
+                .with_sample_rate(sample_rate)
+                .with_channels(CHANNELS)
+                .with_quality_mode(QualityMode::LowLatency)
+                .with_fft_size(1024)
+                .with_hop_size(256)
+                .with_normalize(true),
+            // Higher-quality realtime profile: larger FFT and full DJ preset
+            // reduce robotic PV character at the cost of more latency/CPU.
+            StreamProfile::Quality => StretchParams::new(base_ratio)
+                .with_sample_rate(sample_rate)
+                .with_channels(CHANNELS)
+                .with_preset(EdmPreset::DjBeatmatch)
+                .with_normalize(true),
+        };
         if detected_bpm.is_finite() && detected_bpm > 0.0 {
             params = params.with_bpm(detected_bpm);
         }
-        params
-    } else {
-        let mut params = StretchParams::new(ratio)
-            .with_sample_rate(sample_rate)
-            .with_channels(CHANNELS)
-            .with_normalize(true);
-        if let Some(preset) = st.preset.to_edm_preset() {
-            params = params.with_preset(preset);
-        }
-        if st.detected_bpm.is_finite() && st.detected_bpm > 0.0 {
-            params = params.with_bpm(st.detected_bpm);
-        }
-        params
-    };
-    drop(st);
-
-    let preroll = startup_preroll_target_samples(&params);
-    let mut processor = StreamProcessor::new(params);
-    if let Err(err) = processor.set_stretch_ratio(ratio) {
-        log::warn!("failed to apply initial ratio {ratio}: {err}");
+        return params;
     }
 
-    (processor, preroll)
+    let mut params = StretchParams::new(st.stretch_ratio)
+        .with_sample_rate(sample_rate)
+        .with_channels(CHANNELS)
+        .with_normalize(true);
+    if let Some(preset) = st.preset.to_edm_preset() {
+        params = params.with_preset(preset);
+    }
+    if st.detected_bpm.is_finite() && st.detected_bpm > 0.0 {
+        params = params.with_bpm(st.detected_bpm);
+    }
+    params
 }
 
 fn startup_preroll_target_samples(params: &StretchParams) -> usize {
@@ -303,5 +324,66 @@ fn push_to_ring(producer: &mut RingProducer, data: &[f32]) {
             thread::sleep(Duration::from_millis(1));
         }
         offset += pushed;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::SharedState;
+
+    #[test]
+    fn desktop_dj_beatmatch_uses_low_latency_stream_profile() {
+        let mut state = SharedState::new();
+        state.preset = PresetChoice::DjBeatmatch;
+        state.stream_profile = StreamProfile::Live;
+        state.detected_bpm = 126.0;
+        state.target_bpm = 128.0;
+
+        let params = desktop_stream_params(&state, 44_100);
+
+        assert_eq!(params.quality_mode, QualityMode::LowLatency);
+        assert_eq!(params.fft_size, 1024);
+        assert_eq!(params.hop_size, 256);
+        assert!(params.normalize);
+        assert!(params.preset.is_none());
+        assert_eq!(params.bpm, Some(126.0));
+        assert!((params.stretch_ratio - (126.0 / 128.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn desktop_dj_quality_profile_uses_full_preset() {
+        let mut state = SharedState::new();
+        state.preset = PresetChoice::DjBeatmatch;
+        state.stream_profile = StreamProfile::Quality;
+        state.detected_bpm = 126.0;
+        state.target_bpm = 128.0;
+
+        let params = desktop_stream_params(&state, 44_100);
+
+        assert_eq!(params.quality_mode, QualityMode::Balanced);
+        assert_eq!(params.preset, Some(EdmPreset::DjBeatmatch));
+        assert_eq!(params.fft_size, 4096);
+        assert_eq!(params.hop_size, 1024);
+        assert_eq!(params.bpm, Some(126.0));
+        assert!(params.normalize);
+        assert!((params.stretch_ratio - (126.0 / 128.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn desktop_non_dj_presets_keep_standard_profile() {
+        let mut state = SharedState::new();
+        state.preset = PresetChoice::HouseLoop;
+        state.stretch_ratio = 1.08;
+        state.detected_bpm = 124.0;
+
+        let params = desktop_stream_params(&state, 48_000);
+
+        assert_eq!(params.quality_mode, QualityMode::Balanced);
+        assert_eq!(params.preset, Some(EdmPreset::HouseLoop));
+        assert_eq!(params.fft_size, 4096);
+        assert_eq!(params.hop_size, 1024);
+        assert_eq!(params.bpm, Some(124.0));
+        assert!(params.normalize);
     }
 }

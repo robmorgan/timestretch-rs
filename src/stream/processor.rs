@@ -9,6 +9,7 @@ use crate::stream::transient_scheduler::{TransientEventScheduler, TransientSched
 use crate::stretch::hybrid::HybridStretcher;
 use crate::stretch::phase_vocoder::PhaseVocoder;
 use crate::stretch::stereo::StereoMode;
+use crate::stretch::wsola::Wsola;
 
 /// Threshold below which ratio differences are considered negligible.
 const RATIO_SNAP_THRESHOLD: f64 = 0.0001;
@@ -409,6 +410,36 @@ pub struct StreamProcessor {
     energy_gain: f64,
     /// Count of gain compensation calls for warmup tracking.
     gain_call_count: usize,
+    /// EMA-tracked high-frequency input energy for spectral shape correction.
+    input_hf_energy_ema: f64,
+    /// EMA-tracked high-frequency output energy for spectral shape correction.
+    output_hf_energy_ema: f64,
+    /// High-pass filter state for input HF energy measurement.
+    hf_input_hp_state: f64,
+    /// High-pass filter state for output HF energy measurement.
+    hf_output_hp_state: f64,
+    /// EMA-tracked mid-band input energy (500-2000 Hz) for centroid correction.
+    input_mid_energy_ema: f64,
+    /// EMA-tracked mid-band output energy (500-2000 Hz) for centroid correction.
+    output_mid_energy_ema: f64,
+    /// Bandpass filter states for input mid-band measurement [hp_state, lp_state].
+    mid_input_bp_state: [f64; 2],
+    /// Bandpass filter states for output mid-band measurement [hp_state, lp_state].
+    mid_output_bp_state: [f64; 2],
+    /// Previous input-frame RMS for simple onset-energy tracking on the helper path.
+    prev_blend_input_rms: f32,
+    /// Per-channel WSOLA instances for transient overlay processing.
+    wsola_instances: Vec<Wsola>,
+    /// Per-channel WSOLA output scratch buffers.
+    wsola_output_buffers: Vec<Vec<f32>>,
+    /// Remaining output samples where WSOLA overlay is crossfaded over PV.
+    wsola_overlay_remaining: usize,
+    /// Total length of the current WSOLA overlay crossfade window.
+    wsola_overlay_total: usize,
+    /// Per-channel WSOLA overlay samples (pre-rendered).
+    wsola_overlay_buffers: Vec<Vec<f32>>,
+    /// Current read position within the WSOLA overlay buffers.
+    wsola_overlay_pos: usize,
 }
 
 impl std::fmt::Debug for StreamProcessor {
@@ -434,6 +465,9 @@ impl StreamProcessor {
         let ratio = params.stretch_ratio;
         let num_channels = params.channels.count();
         let source_bpm = params.bpm;
+        let sample_rate = params.sample_rate;
+        let wsola_seg_size = params.wsola_segment_size;
+        let wsola_search = params.wsola_search_range;
 
         let capacity_frames_per_channel = stream_capacity_frames(&params);
         let capacity_samples = capacity_frames_per_channel.saturating_mul(num_channels);
@@ -491,6 +525,43 @@ impl StreamProcessor {
             output_energy_ema: 0.0,
             energy_gain: 1.0,
             gain_call_count: 0,
+            input_hf_energy_ema: 0.0,
+            output_hf_energy_ema: 0.0,
+            hf_input_hp_state: 0.0,
+            hf_output_hp_state: 0.0,
+            input_mid_energy_ema: 0.0,
+            output_mid_energy_ema: 0.0,
+            mid_input_bp_state: [0.0; 2],
+            mid_output_bp_state: [0.0; 2],
+            prev_blend_input_rms: 0.0,
+            wsola_instances: (0..num_channels)
+                .map(|_| {
+                    // Use preset-configured WSOLA parameters for consistency with batch path.
+                    let seg = if wsola_seg_size > 0 {
+                        wsola_seg_size
+                    } else {
+                        (sample_rate as f64 * 0.030).round() as usize
+                    };
+                    let search = if wsola_search > 0 {
+                        wsola_search
+                    } else {
+                        (sample_rate as f64 * 0.015).round() as usize
+                    };
+                    let mut w = Wsola::new(seg, search, ratio);
+                    w.set_equal_power_crossfade();
+                    w.reserve_output_capacity(capacity_frames_per_channel, ratio.max(2.5));
+                    w
+                })
+                .collect(),
+            wsola_output_buffers: (0..num_channels)
+                .map(|_| Vec::with_capacity(output_capacity_frames))
+                .collect(),
+            wsola_overlay_remaining: 0,
+            wsola_overlay_total: 0,
+            wsola_overlay_buffers: (0..num_channels)
+                .map(|_| Vec::with_capacity(output_capacity_frames))
+                .collect(),
+            wsola_overlay_pos: 0,
         }
     }
 
@@ -713,6 +784,13 @@ impl StreamProcessor {
 
         self.flush_pitch_resampler_to_pending(num_channels)?;
         self.reset_pitch_resamplers();
+        self.prev_blend_input_rms = 0.0;
+        self.wsola_overlay_remaining = 0;
+        self.wsola_overlay_total = 0;
+        self.wsola_overlay_pos = 0;
+        for buf in &mut self.wsola_overlay_buffers {
+            buf.clear();
+        }
 
         let _ = self.drain_pending_to_output(output)?;
 
@@ -829,9 +907,54 @@ impl StreamProcessor {
                 / self.channel_input_buffers[0].len().max(1) as f64;
             // Fast warmup for the first 10 calls to converge quickly,
             // then settle to stable tracking.
-            let ema_alpha = if self.gain_call_count < 5 { 0.15 } else { 0.05 };
+            // Ratio-adaptive EMA: extreme ratios get faster convergence
+            // because PV energy loss is larger and needs quicker correction.
+            let rd = (self.current_ratio - 1.0).abs();
+            let ema_alpha = if self.gain_call_count < 5 {
+                0.15
+            } else {
+                0.05 + 0.07 * (rd / 0.5).min(1.0)
+            };
             self.input_energy_ema += ema_alpha * (input_energy - self.input_energy_ema);
             self.gain_call_count = self.gain_call_count.saturating_add(1);
+
+            // Track high-frequency input energy using a one-pole high-pass.
+            let hp_coeff = (2.0 * std::f64::consts::PI * 2000.0
+                / self.params.sample_rate.max(1) as f64)
+                .min(0.5);
+            let mut hp_state = self.hf_input_hp_state;
+            let mut hf_energy = 0.0f64;
+            for &s in &self.channel_input_buffers[0] {
+                hp_state += hp_coeff * (s as f64 - hp_state);
+                let hp = s as f64 - hp_state;
+                hf_energy += hp * hp;
+            }
+            self.hf_input_hp_state = hp_state;
+            hf_energy /= self.channel_input_buffers[0].len().max(1) as f64;
+            // HF energy uses faster EMA for quicker convergence since spectral
+            // shape changes are often rapid (transient onsets).
+            let hf_alpha = (ema_alpha * 1.5).min(0.20);
+            self.input_hf_energy_ema += hf_alpha * (hf_energy - self.input_hf_energy_ema);
+
+            // Track mid-band input energy (500-2000 Hz) via bandpass.
+            let mid_hp_c = (2.0 * std::f64::consts::PI * 500.0
+                / self.params.sample_rate.max(1) as f64)
+                .min(0.5);
+            let mid_lp_c = (2.0 * std::f64::consts::PI * 2000.0
+                / self.params.sample_rate.max(1) as f64)
+                .min(0.5);
+            let mut m_hp = self.mid_input_bp_state[0];
+            let mut m_lp = self.mid_input_bp_state[1];
+            let mut mid_e = 0.0f64;
+            for &s in &self.channel_input_buffers[0] {
+                m_hp += mid_hp_c * (s as f64 - m_hp);
+                let hp_s = s as f64 - m_hp;
+                m_lp += mid_lp_c * (hp_s - m_lp);
+                mid_e += m_lp * m_lp;
+            }
+            self.mid_input_bp_state = [m_hp, m_lp];
+            mid_e /= self.channel_input_buffers[0].len().max(1) as f64;
+            self.input_mid_energy_ema += hf_alpha * (mid_e - self.input_mid_energy_ema);
         }
 
         let min_output_len = self.process_channels(num_channels)?;
@@ -850,8 +973,50 @@ impl StreamProcessor {
                     .map(|&s| (s as f64) * (s as f64))
                     .sum::<f64>()
                     / min_output_len.max(1) as f64;
-                let ema_alpha = if self.gain_call_count < 5 { 0.15 } else { 0.05 };
-                self.output_energy_ema += ema_alpha * (output_energy - self.output_energy_ema);
+                let ema_alpha_out = if self.gain_call_count < 5 {
+                    0.15
+                } else {
+                    let rd = (self.current_ratio - 1.0).abs();
+                    0.05 + 0.07 * (rd / 0.5).min(1.0)
+                };
+                self.output_energy_ema += ema_alpha_out * (output_energy - self.output_energy_ema);
+
+                // Track high-frequency output energy.
+                let hp_coeff_out = (2.0 * std::f64::consts::PI * 2000.0
+                    / self.params.sample_rate.max(1) as f64)
+                    .min(0.5);
+                let mut hp_state_out = self.hf_output_hp_state;
+                let mut hf_energy_out = 0.0f64;
+                for &s in &self.channel_output_buffers[0][..min_output_len] {
+                    hp_state_out += hp_coeff_out * (s as f64 - hp_state_out);
+                    let hp = s as f64 - hp_state_out;
+                    hf_energy_out += hp * hp;
+                }
+                self.hf_output_hp_state = hp_state_out;
+                hf_energy_out /= min_output_len.max(1) as f64;
+                let hf_alpha_out = (ema_alpha_out * 1.5).min(0.20);
+                self.output_hf_energy_ema +=
+                    hf_alpha_out * (hf_energy_out - self.output_hf_energy_ema);
+
+                // Track mid-band output energy (500-2000 Hz).
+                let mid_hp_c2 = (2.0 * std::f64::consts::PI * 500.0
+                    / self.params.sample_rate.max(1) as f64)
+                    .min(0.5);
+                let mid_lp_c2 = (2.0 * std::f64::consts::PI * 2000.0
+                    / self.params.sample_rate.max(1) as f64)
+                    .min(0.5);
+                let mut m_hp2 = self.mid_output_bp_state[0];
+                let mut m_lp2 = self.mid_output_bp_state[1];
+                let mut mid_e2 = 0.0f64;
+                for &s in &self.channel_output_buffers[0][..min_output_len] {
+                    m_hp2 += mid_hp_c2 * (s as f64 - m_hp2);
+                    let hp_s = s as f64 - m_hp2;
+                    m_lp2 += mid_lp_c2 * (hp_s - m_lp2);
+                    mid_e2 += m_lp2 * m_lp2;
+                }
+                self.mid_output_bp_state = [m_hp2, m_lp2];
+                mid_e2 /= min_output_len.max(1) as f64;
+                self.output_mid_energy_ema += hf_alpha_out * (mid_e2 - self.output_mid_energy_ema);
 
                 // Compute global gain to match input energy.
                 const GAIN_SMOOTH: f64 = 0.30;
@@ -874,20 +1039,43 @@ impl StreamProcessor {
                 // means more PV energy loss, which correlates with more spectral
                 // tilt. At low gain (harmonic near-unity), shelf is minimal.
                 let base_shelf = if self.energy_gain > 1.02 {
-                    let gain_factor = ((self.energy_gain - 1.02) / 0.48).clamp(0.0, 1.0);
-                    // Scale base shelf max by ratio distance: near-unity ratios
-                    // need less shelf (harmonic content is already well-preserved),
-                    // while larger ratios need more to compensate for PV tilt.
-                    let ratio_scale = (ratio_distance / 0.3).clamp(0.2, 1.0);
+                    // Two-region gain_factor: dead zone below 1.06 (harmonic
+                    // barely needs shelf), then standard scaling above.
+                    let raw_gf = ((self.energy_gain - 1.02) / 0.48).clamp(0.0, 1.0);
+                    let gain_factor = if self.energy_gain < 1.06 {
+                        raw_gf * 0.5
+                    } else {
+                        raw_gf
+                    };
+                    let ratio_scale = (ratio_distance / 0.3).clamp(0.25, 1.0);
                     (1.0 + 1.40 * gain_factor * ratio_scale) as f32
+                } else {
+                    1.0f32
+                };
+                // HF-energy-driven shelf: directly measured HF loss drives
+                // additional correction. Only active when total energy_gain is
+                // low (< 1.10) — high energy_gain means broadband loss from
+                // transient smearing where shelf hurts batch_sim.
+                let hf_shelf = if self.output_hf_energy_ema > 1e-12
+                    && self.input_hf_energy_ema > 1e-12
+                    && self.gain_call_count > 3
+                    && self.energy_gain < 1.20
+                {
+                    let hf_ratio = (self.input_hf_energy_ema / self.output_hf_energy_ema).sqrt();
+                    if hf_ratio > 1.08 {
+                        ((hf_ratio - 1.0) * 0.8 + 1.0).min(1.6) as f32
+                    } else {
+                        1.0f32
+                    }
                 } else {
                     1.0f32
                 };
                 let ratio_shelf = if ratio_distance > 0.4 {
                     let t = ((ratio_distance - 0.4) / 0.6).min(1.0);
-                    (1.0 + 0.80 * t * t) as f32
+                    let fixed = (1.0 + 0.80 * t * t) as f32;
+                    fixed.max(hf_shelf)
                 } else {
-                    1.0f32
+                    hf_shelf
                 };
                 let shelf_amount = base_shelf * ratio_shelf;
                 let use_shelf = shelf_amount > 1.001;
@@ -930,8 +1118,63 @@ impl StreamProcessor {
             // input into the PV output. Linear resampling preserves transient
             // shape (at the cost of aliasing), partially restoring kick impact.
             // Only active at extreme ratios where transient smearing is worst.
+            // Blend amount is modulated by per-bin spectral flux: transient
+            // frames get more blend (up to 8%) to preserve attack shape, while
+            // steady-state frames get less (down to 2%) to let the PV shine.
+            // Mid-band spectral correction: when the 500-2000 Hz range loses
+            // energy (measured via bandpass tracking), apply a gentle additive
+            // boost to the mid-band content. This addresses centroid drop in
+            // the frequency range that high-shelf at 2kHz misses.
+            if self.output_mid_energy_ema > 1e-12
+                && self.input_mid_energy_ema > 1e-12
+                && self.gain_call_count > 5
+                && self.energy_gain < 1.20
+                && min_output_len > 0
+            {
+                let mid_ratio = (self.input_mid_energy_ema / self.output_mid_energy_ema).sqrt();
+                if mid_ratio > 1.10 {
+                    // Extract mid-band and add a fraction back for gentle boost.
+                    // Amount proportional to measured loss, clamped to prevent
+                    // over-correction.
+                    let boost = ((mid_ratio - 1.0) * 0.25).min(0.12) as f32;
+                    let bp_hp = (2.0 * std::f64::consts::PI * 500.0
+                        / self.params.sample_rate.max(1) as f64)
+                        .min(0.5) as f32;
+                    let bp_lp = (2.0 * std::f64::consts::PI * 2000.0
+                        / self.params.sample_rate.max(1) as f64)
+                        .min(0.5) as f32;
+                    for ch in 0..num_channels {
+                        let mut hp_st = 0.0f32;
+                        let mut lp_st = 0.0f32;
+                        for s in self.channel_output_buffers[ch][..min_output_len].iter_mut() {
+                            hp_st += bp_hp * (*s - hp_st);
+                            let hp_out = *s - hp_st;
+                            lp_st += bp_lp * (hp_out - lp_st);
+                            *s += lp_st * boost;
+                        }
+                    }
+                }
+            }
+
             if (self.current_ratio - 1.0).abs() > 0.5 {
-                let blend = 0.04f32; // 4% time-domain blend
+                let base_blend = 0.045f32;
+                let mut flux_factor = self.compute_flux_blend_factor();
+                let input_rms = (self.channel_input_buffers[0]
+                    .iter()
+                    .map(|&s| s * s)
+                    .sum::<f32>()
+                    / self.channel_input_buffers[0].len().max(1) as f32)
+                    .sqrt();
+                let prev_input_rms = self.prev_blend_input_rms;
+                let onset_rise = (input_rms - prev_input_rms).max(0.0);
+                self.prev_blend_input_rms = input_rms;
+                let onset_boost = if prev_input_rms > 1e-6 {
+                    (onset_rise / prev_input_rms.max(1e-6)).min(1.0)
+                } else {
+                    0.0
+                };
+                flux_factor *= 1.0 + 0.35 * onset_boost;
+                let blend = (base_blend * flux_factor).clamp(0.01, 0.10);
                 let ratio = self.current_ratio;
                 for ch in 0..num_channels {
                     let in_buf = &self.channel_input_buffers[ch];
@@ -966,6 +1209,188 @@ impl StreamProcessor {
                                         + t * (-p0 + 3.0 * p1 - 3.0 * p2 + p3)));
                         *sample = *sample * (1.0 - blend) + interp * blend;
                     }
+                }
+            }
+
+            // Streaming WSOLA-PV hybrid overlay: when a strong transient is
+            // detected at extreme ratios, run WSOLA on the input and crossfade
+            // its output over the PV output. WSOLA preserves waveform shape
+            // for kicks/snares while the PV handles tonal content.
+            let ratio_distance = (self.current_ratio - 1.0).abs();
+            if ratio_distance > 0.01 {
+                // Arm a new WSOLA overlay on strong onsets.
+                let flux_factor = self.compute_flux_blend_factor();
+                let input_rms = (self.channel_input_buffers[0]
+                    .iter()
+                    .map(|&s| s * s)
+                    .sum::<f32>()
+                    / self.channel_input_buffers[0].len().max(1) as f32)
+                    .sqrt();
+                let prev_rms = self.prev_blend_input_rms;
+                let onset_rise = (input_rms - prev_rms).max(0.0);
+                let onset_strength = if prev_rms > 1e-6 {
+                    (onset_rise / prev_rms.max(1e-6)).min(1.0)
+                } else {
+                    0.0
+                };
+
+                let should_arm_wsola = self.wsola_overlay_remaining == 0
+                    && (flux_factor > 0.8 || onset_strength > 0.10);
+
+                if should_arm_wsola {
+                    // Run WSOLA on channel input buffers and store results.
+                    let ratio = self.current_ratio;
+                    let mut wsola_min_len = usize::MAX;
+                    for ch in 0..num_channels {
+                        let in_buf = &self.channel_input_buffers[ch];
+                        if in_buf.len() < self.wsola_instances[ch].segment_size() {
+                            wsola_min_len = 0;
+                            break;
+                        }
+                        self.wsola_instances[ch].set_stretch_ratio(ratio);
+                        self.wsola_output_buffers[ch].clear();
+                        if self.wsola_instances[ch]
+                            .process_into(in_buf, &mut self.wsola_output_buffers[ch])
+                            .is_ok()
+                        {
+                            wsola_min_len = wsola_min_len.min(self.wsola_output_buffers[ch].len());
+                        } else {
+                            wsola_min_len = 0;
+                            break;
+                        }
+                    }
+
+                    if wsola_min_len > 0 {
+                        // At extreme ratios, use full WSOLA output for cross-chunk
+                        // transient continuity. At normal ratios, limit to PV output.
+                        let overlay_len = if ratio_distance > 0.8 {
+                            wsola_min_len
+                        } else {
+                            wsola_min_len.min(min_output_len)
+                        };
+                        for ch in 0..num_channels {
+                            self.wsola_overlay_buffers[ch].clear();
+                            self.wsola_overlay_buffers[ch]
+                                .extend_from_slice(&self.wsola_output_buffers[ch][..overlay_len]);
+                        }
+                        self.wsola_overlay_remaining = overlay_len;
+                        self.wsola_overlay_total = overlay_len;
+                        self.wsola_overlay_pos = 0;
+                    }
+
+                    // Pre-normalize WSOLA overlay energy to match input energy.
+                    // The WSOLA output may have slight energy loss from segment
+                    // crossfade dips. Compare actual WSOLA energy to input energy
+                    // and apply per-overlay correction for accurate energy matching.
+                    if self.wsola_overlay_pos == 0 && !self.wsola_overlay_buffers[0].is_empty() {
+                        let in_buf = &self.channel_input_buffers[0];
+                        let ws_buf = &self.wsola_overlay_buffers[0];
+                        let in_rms_sq =
+                            in_buf.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>()
+                                / in_buf.len().max(1) as f64;
+                        // Compare WSOLA energy to expected output energy (input * ratio_factor)
+                        let ws_rms_sq =
+                            ws_buf.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>()
+                                / ws_buf.len().max(1) as f64;
+                        if ws_rms_sq > 1e-12 && in_rms_sq > 1e-12 {
+                            let correction = (in_rms_sq / ws_rms_sq).sqrt().min(3.0) as f32;
+                            // Only boost if WSOLA is quieter than input (correction > 1).
+                            // If WSOLA is already louder, leave it to avoid over-amplification
+                            // when combined with the PV gain applied in the overlay loop.
+                            if correction > 1.0 {
+                                for ch_buf in &mut self.wsola_overlay_buffers {
+                                    for s in ch_buf.iter_mut() {
+                                        *s *= correction;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Apply the same high-shelf filter to WSOLA overlay for spectral
+                // consistency with the shelf-boosted PV output.
+                let wsola_shelf = {
+                    let rd = (self.current_ratio - 1.0).abs();
+                    let bs = if self.energy_gain > 1.02 {
+                        let raw_gf = ((self.energy_gain - 1.02) / 0.48).clamp(0.0, 1.0);
+                        let gf = if self.energy_gain < 1.06 {
+                            raw_gf * 0.5
+                        } else {
+                            raw_gf
+                        };
+                        let rs = (rd / 0.3).clamp(0.25, 1.0);
+                        (1.0 + 1.40 * gf * rs) as f32
+                    } else {
+                        1.0f32
+                    };
+                    let rsh = if rd > 0.4 {
+                        let t = ((rd - 0.4) / 0.6).min(1.0);
+                        (1.0 + 0.80 * t * t) as f32
+                    } else {
+                        1.0f32
+                    };
+                    bs * rsh
+                };
+                if self.wsola_overlay_pos == 0
+                    && !self.wsola_overlay_buffers[0].is_empty()
+                    && wsola_shelf > 1.001
+                {
+                    let lp_coeff = (2.0 * std::f64::consts::PI * 2000.0
+                        / self.params.sample_rate.max(1) as f64)
+                        .min(0.5) as f32;
+                    let stage_shelf = wsola_shelf.sqrt();
+                    for ch_buf in &mut self.wsola_overlay_buffers {
+                        let mut lp1 = 0.0f32;
+                        let mut lp2 = 0.0f32;
+                        for s in ch_buf.iter_mut() {
+                            lp1 += lp_coeff * (*s - lp1);
+                            let hp1 = *s - lp1;
+                            let mid = lp1 + hp1 * stage_shelf;
+                            lp2 += lp_coeff * (mid - lp2);
+                            let hp2 = mid - lp2;
+                            *s = lp2 + hp2 * stage_shelf;
+                        }
+                    }
+                }
+
+                // Apply active WSOLA overlay: crossfade WSOLA over PV output.
+                if self.wsola_overlay_remaining > 0 {
+                    let total = self.wsola_overlay_total.max(1);
+                    let apply_len = self.wsola_overlay_remaining.min(min_output_len);
+                    for ch in 0..num_channels {
+                        let overlay = &self.wsola_overlay_buffers[ch];
+                        let out = &mut self.channel_output_buffers[ch][..min_output_len];
+                        for (i, out_sample) in out[..apply_len].iter_mut().enumerate() {
+                            let pos = self.wsola_overlay_pos + i;
+                            if pos >= overlay.len() {
+                                break;
+                            }
+                            // Crossfade: start with WSOLA dominant, transition to PV.
+                            // At extreme ratios, extend WSOLA dominance to preserve
+                            // more of the transient waveform shape.
+                            let progress = pos as f32 / total as f32;
+                            let (peak_weight, attack_end) = if ratio_distance > 0.8 {
+                                (1.0f32, 1.0f32) // extreme: pure WSOLA for entire overlay
+                            } else {
+                                (0.90f32, 0.25f32) // normal
+                            };
+                            let wsola_weight = if progress < attack_end {
+                                peak_weight
+                            } else {
+                                let t = (progress - attack_end) / (1.0 - attack_end);
+                                peak_weight * (1.0 - t * t)
+                            };
+                            // Apply PV gain on top of per-overlay normalization
+                            // for spectral consistency with shelf-boosted PV output.
+                            let wsola_sample = overlay[pos] * self.energy_gain as f32;
+                            *out_sample =
+                                *out_sample * (1.0 - wsola_weight) + wsola_sample * wsola_weight;
+                        }
+                    }
+                    self.wsola_overlay_pos += apply_len;
+                    self.wsola_overlay_remaining =
+                        self.wsola_overlay_remaining.saturating_sub(apply_len);
                 }
             }
 
@@ -1798,6 +2223,13 @@ impl StreamProcessor {
         self.output_energy_ema = 0.0;
         self.energy_gain = 1.0;
         self.gain_call_count = 0;
+        self.prev_blend_input_rms = 0.0;
+        self.wsola_overlay_remaining = 0;
+        self.wsola_overlay_total = 0;
+        self.wsola_overlay_pos = 0;
+        for buf in &mut self.wsola_overlay_buffers {
+            buf.clear();
+        }
     }
 
     fn update_vocoder_ratio(&mut self) {
@@ -1808,6 +2240,37 @@ impl StreamProcessor {
             }
             self.vocoder_ratio = processing_ratio;
         }
+    }
+
+    /// Computes a blend multiplier (0.5×–2.0×) from the PV's per-frame flux.
+    ///
+    /// Transient frames (many bins rising) get more time-domain blend to
+    /// preserve attack shape; steady-state frames get less to let the PV's
+    /// tonal quality dominate.
+    fn compute_flux_blend_factor(&self) -> f32 {
+        // Use channel 0's vocoder flux (mid channel for stereo M/S).
+        let flux = match self.vocoders.first().and_then(|v| v.last_frame_flux()) {
+            Some(f) => f,
+            None => return 1.0,
+        };
+
+        let num_bins = self.params.fft_size / 2 + 1;
+        if num_bins == 0 {
+            return 1.0;
+        }
+
+        // Fraction of bins that are rising — indicator of impulsive onset.
+        let rising_fraction = flux.total_bins_rising as f32 / num_bins as f32;
+        // Fraction of bins with significant flux (4× mean threshold).
+        let transient_fraction = flux.transient_bin_count as f32 / num_bins as f32;
+
+        // Combine: high rising_fraction AND high transient_fraction = impulsive.
+        // Pure vibrato has high rising_fraction but low transient_fraction.
+        let impulsiveness = (rising_fraction * 2.0).min(1.0) * (transient_fraction * 8.0).min(1.0);
+
+        // Map to 0.3–2.5 range: lower for steady state (PV quality),
+        // higher for strong transients (preserve attack shape).
+        0.3 + 2.2 * impulsiveness
     }
 
     fn apply_transient_scheduled_phase_reset(&mut self, total_frames: usize) {

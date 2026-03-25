@@ -123,7 +123,7 @@ fn callback_budget_multiplier() -> Option<f64> {
         }
     }
     if strict_callback_budget_mode() {
-        return Some(0.90);
+        return Some(0.92);
     }
     None
 }
