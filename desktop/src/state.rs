@@ -54,16 +54,27 @@ impl PresetChoice {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StreamProfile {
+    /// Lowest latency (~35 ms, 1024 FFT). Tightest nudge feel, most PV
+    /// coloration ("robotic" character on tonal material).
     Live,
+    /// Balanced default (~70 ms, 2048 FFT). Measured to close most of the
+    /// spectral-quality gap to Quality at half its latency.
+    Club,
+    /// Highest quality (~139 ms, 4096 FFT + full DJ preset). Laggy controls.
     Quality,
 }
 
 impl StreamProfile {
-    pub const ALL: &'static [StreamProfile] = &[StreamProfile::Live, StreamProfile::Quality];
+    pub const ALL: &'static [StreamProfile] = &[
+        StreamProfile::Live,
+        StreamProfile::Club,
+        StreamProfile::Quality,
+    ];
 
     pub fn label(&self) -> &'static str {
         match self {
             StreamProfile::Live => "Live",
+            StreamProfile::Club => "Club",
             StreamProfile::Quality => "Quality",
         }
     }
@@ -91,12 +102,8 @@ pub struct SharedState {
 
     /// Set by UI to request a seek.
     pub seek_request: Option<usize>,
-    /// Set by UI when pitch changes (requires re-processing).
-    pub pitch_changed: bool,
     /// Set by UI when preset changes (requires rebuilding processor).
     pub preset_changed: bool,
-    /// Set by processing thread when it finishes loading pitch-shifted audio.
-    pub pitch_processing: bool,
 }
 
 impl SharedState {
@@ -107,16 +114,14 @@ impl SharedState {
             pitch_semitones: 0.0,
             volume: 0.8,
             preset: PresetChoice::DjBeatmatch,
-            stream_profile: StreamProfile::Live,
+            stream_profile: StreamProfile::Club,
             position_frames: 0,
             total_frames: 0,
             sample_rate: 44100,
             detected_bpm: 0.0,
             target_bpm: 0.0,
             seek_request: None,
-            pitch_changed: false,
             preset_changed: false,
-            pitch_processing: false,
         }
     }
 

@@ -197,29 +197,11 @@ impl TimeStretchApp {
         };
         self.audio_engine = Some(engine);
 
-        // Prepare working audio (with pitch shift if needed)
-        let working_audio = if self.pitch_semitones.abs() < 0.01 {
-            source.as_ref().clone()
-        } else {
-            let factor = 2.0_f64.powf(self.pitch_semitones as f64 / 12.0);
-            let params = timestretch::StretchParams::new(1.0)
-                .with_sample_rate(sample_rate)
-                .with_channels(2)
-                .with_normalize(true);
-            match timestretch::pitch_shift(&source, &params, factor) {
-                Ok(shifted) => shifted,
-                Err(e) => {
-                    log::error!("Pitch shift failed: {e}");
-                    source.as_ref().clone()
-                }
-            }
-        };
-
-        // Update state
+        // Pitch is applied live by the stream processor; no pre-render pass.
         {
             let mut st = self.state.lock().unwrap();
             st.transport = Transport::Playing;
-            st.total_frames = working_audio.len() / 2;
+            st.total_frames = source.len() / 2;
         }
 
         let stop_flag = Arc::new(StopFlag::new());
@@ -228,7 +210,6 @@ impl TimeStretchApp {
         let handle = processor::start_processing_thread(
             self.state.clone(),
             source,
-            working_audio,
             producer,
             sample_rate,
             self.position.clone(),
@@ -438,8 +419,8 @@ impl TimeStretchApp {
                             &mut self.stretch_ratio,
                             MIN_STRETCH_RATIO..=MAX_STRETCH_RATIO,
                         )
-                            .text("x")
-                            .fixed_decimals(2),
+                        .text("x")
+                        .fixed_decimals(2),
                     );
                     if (self.stretch_ratio - old_ratio).abs() > 0.001 {
                         let mut st = self.state.lock().unwrap();
@@ -535,7 +516,7 @@ impl TimeStretchApp {
                 });
                 ui.end_row();
 
-                // Pitch shift
+                // Pitch shift (realtime: applied live by the stream processor)
                 ui.label("Pitch Shift:");
                 ui.horizontal(|ui| {
                     let old_pitch = self.pitch_semitones;
@@ -544,28 +525,17 @@ impl TimeStretchApp {
                             .text("st")
                             .fixed_decimals(1),
                     );
-                    if (self.pitch_semitones - old_pitch).abs() > 0.01 {
+                    if (self.pitch_semitones - old_pitch).abs() > 0.001 {
                         let mut st = self.state.lock().unwrap();
                         st.pitch_semitones = self.pitch_semitones;
-                        st.pitch_changed = true;
                     }
-                    if ui.button("Reset").clicked() && self.pitch_semitones.abs() > 0.01 {
+                    if ui.button("Reset").clicked() && self.pitch_semitones.abs() > 0.001 {
                         self.pitch_semitones = 0.0;
                         let mut st = self.state.lock().unwrap();
                         st.pitch_semitones = 0.0;
-                        st.pitch_changed = true;
                     }
                 });
                 ui.end_row();
-
-                // Pitch processing indicator
-                let pitch_processing = self.state.lock().unwrap().pitch_processing;
-                if pitch_processing {
-                    ui.label("");
-                    ui.colored_label(egui::Color32::YELLOW, "Processing pitch shift...");
-                    ui.end_row();
-                    ctx_request_repaint(ui);
-                }
 
                 // Volume
                 ui.label("Volume:");
@@ -584,8 +554,4 @@ impl TimeStretchApp {
                 ui.end_row();
             });
     }
-}
-
-fn ctx_request_repaint(ui: &egui::Ui) {
-    ui.ctx().request_repaint();
 }

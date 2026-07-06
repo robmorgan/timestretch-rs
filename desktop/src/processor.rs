@@ -16,13 +16,14 @@ const CHANNELS: u32 = 2;
 /// Extra callback cushion to absorb scheduling jitter at stream start.
 const START_PREROLL_CALLBACKS: usize = 2;
 const RATIO_UPDATE_EPSILON: f64 = 1e-4;
+/// Smallest semitone change worth forwarding to the stream processor.
+const PITCH_UPDATE_EPSILON_SEMITONES: f32 = 0.001;
 
 /// Start the processing thread. Returns a stop flag handle.
 #[allow(clippy::too_many_arguments)]
 pub fn start_processing_thread(
     state: SharedStateHandle,
     source_audio: Arc<Vec<f32>>,
-    mut working_audio: Vec<f32>,
     mut producer: RingProducer,
     sample_rate: u32,
     position: Arc<AtomicPosition>,
@@ -33,6 +34,7 @@ pub fn start_processing_thread(
     thread::spawn(move || {
         let (mut processor, mut preroll_target_samples) = build_processor(&state, sample_rate);
         let mut last_ratio = f64::NAN;
+        let mut last_pitch_semi = f32::NAN;
         let mut src_pos: usize = 0;
         let chunk_samples = CHUNK_FRAMES * CHANNELS as usize;
         let mut processed_chunk = Vec::with_capacity(chunk_samples * 6);
@@ -45,71 +47,46 @@ pub fn start_processing_thread(
                 break;
             }
 
-            let (transport, stretch_ratio, seek_req, pitch_changed, preset_changed, pitch_semi) = {
+            let (transport, stretch_ratio, seek_req, preset_changed, pitch_semi) = {
                 let mut st = state.lock().unwrap();
                 let t = st.transport;
                 let r = st.stretch_ratio;
                 let s = st.seek_request.take();
-                let pc = st.pitch_changed;
                 let prc = st.preset_changed;
                 let ps = st.pitch_semitones;
-                if pc {
-                    st.pitch_changed = false;
-                }
                 if prc {
                     st.preset_changed = false;
                 }
-                (t, r, s, pc, prc, ps)
+                (t, r, s, prc, ps)
             };
 
             if preset_changed {
                 (processor, preroll_target_samples) = build_processor(&state, sample_rate);
                 last_ratio = f64::NAN;
+                last_pitch_semi = f32::NAN;
                 flush_ring.store(true, Ordering::Release);
                 stream_active.store(false, Ordering::Relaxed);
                 stream_started = false;
             }
 
-            if pitch_changed {
-                {
-                    let mut st = state.lock().unwrap();
-                    st.pitch_processing = true;
-                }
-
-                if pitch_semi.abs() < 0.01 {
-                    working_audio = source_audio.as_ref().clone();
-                } else {
-                    let factor = 2.0_f64.powf(pitch_semi as f64 / 12.0);
-                    let params = StretchParams::new(1.0)
-                        .with_sample_rate(sample_rate)
-                        .with_channels(CHANNELS)
-                        .with_normalize(true);
-                    match timestretch::pitch_shift(&source_audio, &params, factor) {
-                        Ok(shifted) => working_audio = shifted,
-                        Err(e) => {
-                            log::error!("Pitch shift failed: {e}");
-                            working_audio = source_audio.as_ref().clone();
-                        }
-                    }
-                }
-
-                (processor, preroll_target_samples) = build_processor(&state, sample_rate);
-                last_ratio = f64::NAN;
-                if src_pos > working_audio.len() {
-                    src_pos = 0;
-                }
-
-                {
-                    let mut st = state.lock().unwrap();
-                    st.pitch_processing = false;
-                    st.total_frames = working_audio.len() / CHANNELS as usize;
+            // Realtime pitch: applied directly to the stream processor. The
+            // library glides to the new value click-free, so no re-render,
+            // no processor rebuild, and no ring flush is needed.
+            if (pitch_semi - last_pitch_semi).abs() > PITCH_UPDATE_EPSILON_SEMITONES
+                || last_pitch_semi.is_nan()
+            {
+                let factor = 2.0_f64.powf(pitch_semi as f64 / 12.0);
+                match processor.set_pitch_scale(factor) {
+                    Ok(()) => last_pitch_semi = pitch_semi,
+                    Err(err) => log::error!("Invalid pitch scale {factor}: {err}"),
                 }
             }
 
             if let Some(seek_frame) = seek_req {
-                src_pos = (seek_frame * CHANNELS as usize).min(working_audio.len());
+                src_pos = (seek_frame * CHANNELS as usize).min(source_audio.len());
                 (processor, preroll_target_samples) = build_processor(&state, sample_rate);
                 last_ratio = f64::NAN;
+                last_pitch_semi = f32::NAN;
                 flush_ring.store(true, Ordering::Release);
                 stream_active.store(false, Ordering::Relaxed);
                 stream_started = false;
@@ -126,7 +103,7 @@ pub fn start_processing_thread(
                 continue;
             }
 
-            if src_pos >= working_audio.len() {
+            if src_pos >= source_audio.len() {
                 let mut flushed = Vec::new();
                 reserve_flush_output_capacity(&processor, &mut flushed);
                 if let Ok(_written) = processor.flush_into(&mut flushed) {
@@ -144,6 +121,7 @@ pub fn start_processing_thread(
                 src_pos = 0;
                 (processor, preroll_target_samples) = build_processor(&state, sample_rate);
                 last_ratio = f64::NAN;
+                last_pitch_semi = f32::NAN;
                 continue;
             }
 
@@ -153,8 +131,8 @@ pub fn start_processing_thread(
                 continue;
             }
 
-            let end = (src_pos + chunk_samples).min(working_audio.len());
-            let chunk = &working_audio[src_pos..end];
+            let end = (src_pos + chunk_samples).min(source_audio.len());
+            let chunk = &source_audio[src_pos..end];
             src_pos = end;
 
             let frame_pos = src_pos / CHANNELS as usize;
@@ -182,6 +160,7 @@ pub fn start_processing_thread(
 fn build_processor(state: &SharedStateHandle, sample_rate: u32) -> (StreamProcessor, usize) {
     let st = state.lock().unwrap();
     let ratio = st.stretch_ratio;
+    let pitch_semi = st.pitch_semitones;
     let params = desktop_stream_params(&st, sample_rate);
     drop(st);
 
@@ -190,14 +169,15 @@ fn build_processor(state: &SharedStateHandle, sample_rate: u32) -> (StreamProces
     if let Err(err) = processor.set_stretch_ratio(ratio) {
         log::warn!("failed to apply initial ratio {ratio}: {err}");
     }
+    let pitch_scale = 2.0_f64.powf(pitch_semi as f64 / 12.0);
+    if let Err(err) = processor.set_pitch_scale(pitch_scale) {
+        log::warn!("failed to apply initial pitch scale {pitch_scale}: {err}");
+    }
 
     (processor, preroll)
 }
 
-fn desktop_stream_params(
-    st: &crate::state::SharedState,
-    sample_rate: u32,
-) -> StretchParams {
+fn desktop_stream_params(st: &crate::state::SharedState, sample_rate: u32) -> StretchParams {
     if st.preset == PresetChoice::DjBeatmatch {
         let detected_bpm = st.detected_bpm;
         let target_bpm = if st.target_bpm.is_finite() && st.target_bpm > 0.0 {
@@ -223,6 +203,17 @@ fn desktop_stream_params(
                 .with_quality_mode(QualityMode::LowLatency)
                 .with_fft_size(1024)
                 .with_hop_size(256)
+                .with_normalize(true),
+            // Balanced default: a 2048 FFT halves Quality's latency while
+            // closing most of the spectral gap to it (measured ~0.9966 vs
+            // 0.9996 mean spectral similarity to the source under a ratio
+            // ride; Live/1024 sits at 0.9904).
+            StreamProfile::Club => StretchParams::new(base_ratio)
+                .with_sample_rate(sample_rate)
+                .with_channels(CHANNELS)
+                .with_quality_mode(QualityMode::Balanced)
+                .with_fft_size(2048)
+                .with_hop_size(512)
                 .with_normalize(true),
             // Higher-quality realtime profile: larger FFT and full DJ preset
             // reduce robotic PV character at the cost of more latency/CPU.
@@ -349,6 +340,30 @@ mod tests {
         assert!(params.preset.is_none());
         assert_eq!(params.bpm, Some(126.0));
         assert!((params.stretch_ratio - (126.0 / 128.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn desktop_dj_club_profile_uses_mid_fft() {
+        let mut state = SharedState::new();
+        state.preset = PresetChoice::DjBeatmatch;
+        state.stream_profile = StreamProfile::Club;
+        state.detected_bpm = 126.0;
+        state.target_bpm = 128.0;
+
+        let params = desktop_stream_params(&state, 44_100);
+
+        assert_eq!(params.quality_mode, QualityMode::Balanced);
+        assert_eq!(params.fft_size, 2048);
+        assert_eq!(params.hop_size, 512);
+        assert!(params.normalize);
+        assert!(params.preset.is_none());
+        assert!((params.stretch_ratio - (126.0 / 128.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn desktop_default_profile_is_club() {
+        let state = SharedState::new();
+        assert_eq!(state.stream_profile, StreamProfile::Club);
     }
 
     #[test]
