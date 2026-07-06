@@ -1,6 +1,9 @@
 //! Real-time streaming time-stretch processor.
 
+use std::sync::Arc;
+
 use crate::analysis::transient::{detect_transients_with_options, TransientDetectionOptions};
+use crate::core::resample::{SincInterpTable, StreamingSincResampler};
 use crate::core::ring_buffer::RingBuffer;
 use crate::core::types::{QualityMode, StretchParams};
 use crate::core::window::WindowType;
@@ -38,6 +41,24 @@ const LOOP_GUARD_SLACK: usize = 8;
 /// Smooths phase discontinuities caused by re-rendering overlapping audio
 /// with fresh PV phase state on each call.
 const HYBRID_STREAM_CROSSFADE_SAMPLES: usize = 3072;
+/// Frames over which end-of-stream padding fades from the last real input
+/// frame to silence (~5.8 ms at 44.1 kHz) instead of cutting hard to zero.
+const FLUSH_PAD_FADE_FRAMES: usize = 256;
+/// Samples over which a freshly armed WSOLA overlay ramps in (~2.9 ms).
+///
+/// The overlay splices WSOLA-rendered audio (arbitrary phase relative to the
+/// PV output) over the stream; starting it at full weight is an audible
+/// click whenever the two signals disagree at the splice point.
+const WSOLA_OVERLAY_FADE_IN_SAMPLES: usize = 128;
+/// In-flight processing-ratio delta above which the transient scheduler and
+/// WSOLA overlay arming enter modulation-hold. ~0.2% ratio ≈ 3.5 cents;
+/// below this a ratio seam is inaudible.
+const MODULATION_HOLD_MIN_RATIO_DELTA: f64 = 0.002;
+/// Cap on modulation overlap windows so trigger desensitization stays
+/// bounded (threshold scale <= 1.32, spike ratio <= 1.2x, cooldown extension
+/// <= 4 overlap footprints). Long gestures stay protected anyway because the
+/// in-flight delta is re-evaluated on every scheduler pass.
+const MODULATION_HOLD_MAX_OVERLAP_WINDOWS: usize = 4;
 
 /// Computes the minimum number of frames required before processing can begin.
 #[inline]
@@ -332,6 +353,24 @@ pub enum StreamingEngine {
     LegacyHybridRerender,
 }
 
+/// Quality of the realtime pitch resampler used when `pitch_scale != 1.0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamPitchQuality {
+    /// Kaiser-windowed sinc resampling with ratio-adaptive anti-aliasing
+    /// (default).
+    ///
+    /// Keeps pitch-up material (hats, cymbals, vocals) alias-free at the cost
+    /// of a few dozen multiply-adds per output sample and up to
+    /// [`crate::core::resample::STREAM_SINC_MAX_HALF_TAPS`] samples of extra
+    /// buffering while pitch is engaged.
+    Sinc,
+    /// Legacy linear interpolation.
+    ///
+    /// Cheapest possible pitch control; audibly aliases bright material when
+    /// pitching up. Kept as an explicit low-CPU/emergency fallback.
+    Linear,
+}
+
 /// Aggregated transient-reset telemetry from deterministic stream processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransientResetStats {
@@ -396,9 +435,31 @@ pub struct StreamProcessor {
     expected_total_output_samples: f64,
     /// Total output samples emitted to the caller for the current stream.
     total_output_emitted_samples: usize,
-    /// Realtime pitch scale applied in stream mode.
+    /// Realtime pitch scale applied in stream mode (smoothed toward
+    /// `target_pitch_scale` alongside the stretch-ratio glide).
     pitch_scale: f64,
-    /// Stateful per-channel resamplers for realtime pitch control.
+    /// Target pitch scale set by [`StreamProcessor::set_pitch_scale`].
+    target_pitch_scale: f64,
+    /// Selected realtime pitch resampler quality.
+    pitch_quality: StreamPitchQuality,
+    /// Stateful per-channel sinc resamplers for realtime pitch control.
+    ///
+    /// Each holds an `Arc` of the shared Kaiser-sinc prototype table.
+    sinc_pitch_resamplers: Vec<StreamingSincResampler>,
+    /// True once the pitch resampler has processed any samples this stream.
+    ///
+    /// While engaged, the resampler stays in the signal path even at unity
+    /// pitch (a bit-clean passthrough) so returning to `pitch_scale == 1.0`
+    /// never splices its held lookahead out of the stream.
+    pitch_resampler_engaged: bool,
+    /// True once the PV processing path has consumed input this stream.
+    ///
+    /// While engaged, the bit-exact unity passthrough stays disabled even if
+    /// the ratio settles back to exactly 1.0: switching between the raw
+    /// input and the PV's rendered stream mid-playback is a phase-arbitrary
+    /// splice (a full-scale click on tonal content) plus a re-warmup gap.
+    dsp_engaged: bool,
+    /// Stateful per-channel linear resamplers (legacy pitch fallback).
     pitch_resamplers: Vec<LinearResamplerState>,
     /// Reusable per-channel output buffers for pitch-resampled data.
     pitch_output_buffers: Vec<Vec<f32>>,
@@ -491,6 +552,7 @@ impl StreamProcessor {
             params.sample_rate,
             capacity_frames_per_channel,
         );
+        let sinc_table = SincInterpTable::new_stream_default();
 
         Self {
             params,
@@ -515,6 +577,13 @@ impl StreamProcessor {
             expected_total_output_samples: 0.0,
             total_output_emitted_samples: 0,
             pitch_scale: 1.0,
+            target_pitch_scale: 1.0,
+            pitch_quality: StreamPitchQuality::Sinc,
+            sinc_pitch_resamplers: (0..num_channels)
+                .map(|_| StreamingSincResampler::new(Arc::clone(&sinc_table)))
+                .collect(),
+            pitch_resampler_engaged: false,
+            dsp_engaged: false,
             pitch_resamplers: (0..num_channels)
                 .map(|_| LinearResamplerState::new())
                 .collect(),
@@ -626,6 +695,9 @@ impl StreamProcessor {
         if (self.target_ratio - 1.0).abs() < RATIO_SNAP_THRESHOLD
             && (self.current_ratio - 1.0).abs() < RATIO_SNAP_THRESHOLD
             && (self.pitch_scale - 1.0).abs() < RATIO_SNAP_THRESHOLD
+            && (self.target_pitch_scale - 1.0).abs() < RATIO_SNAP_THRESHOLD
+            && !self.pitch_resampler_engaged
+            && !self.dsp_engaged
         {
             let available = output.capacity().saturating_sub(output.len());
             if input.len() > available {
@@ -637,6 +709,10 @@ impl StreamProcessor {
             }
             output.extend_from_slice(input);
             return Ok(());
+        }
+
+        if !input.is_empty() {
+            self.dsp_engaged = true;
         }
 
         let num_channels = self.params.channels.count().max(1);
@@ -713,35 +789,45 @@ impl StreamProcessor {
                         available: self.input_ring.available(),
                     });
                 }
-                let zeros = [0.0f32; 256];
-                let mut remaining = missing;
-                let mut iterations = 0usize;
-                let max_iterations = missing
-                    .saturating_add(zeros.len().saturating_sub(1))
-                    .saturating_div(zeros.len())
-                    .saturating_add(LOOP_GUARD_SLACK);
-                while remaining > 0 {
-                    iterations = iterations.saturating_add(1);
-                    if iterations > max_iterations {
-                        return Err(StretchError::InvalidState(
-                            "flush zero-padding iteration bound exceeded",
-                        ));
+                // Pad with a short fade-out continuation of the last input
+                // frame instead of raw zeros: a hard cut to zero mid-waveform
+                // is an input discontinuity that the vocoder faithfully
+                // reproduces as an audible click in the flush tail. (Flush is
+                // not the realtime callback; allocation here is fine.)
+                let existing = self.input_ring.len();
+                let mut last_frame = vec![0.0f32; num_channels.max(1)];
+                if existing >= num_channels && num_channels > 0 {
+                    let mut ring_copy = vec![0.0f32; existing];
+                    let copied = self.input_ring.peek_slice(&mut ring_copy);
+                    if copied == existing {
+                        last_frame.copy_from_slice(&ring_copy[existing - num_channels..]);
                     }
-                    let chunk = remaining.min(zeros.len());
-                    if chunk == 0 {
-                        return Err(StretchError::InvalidState(
-                            "flush zero-padding made zero progress",
-                        ));
-                    }
-                    let pushed = self.input_ring.push_slice(&zeros[..chunk]);
-                    if pushed != chunk {
-                        return Err(StretchError::BufferOverflow {
-                            buffer: "stream_input_ring",
-                            requested: chunk,
-                            available: pushed,
-                        });
-                    }
-                    remaining -= chunk;
+                }
+                let channel_phase = if num_channels > 0 {
+                    existing % num_channels
+                } else {
+                    0
+                };
+                let fade_frames = (missing / num_channels.max(1)).min(FLUSH_PAD_FADE_FRAMES);
+                let mut pad = Vec::with_capacity(missing);
+                for i in 0..missing {
+                    let frame_idx = i / num_channels.max(1);
+                    let ch = (channel_phase + i) % num_channels.max(1);
+                    let sample = if frame_idx < fade_frames {
+                        let t = 1.0 - (frame_idx + 1) as f32 / fade_frames.max(1) as f32;
+                        last_frame[ch] * t
+                    } else {
+                        0.0
+                    };
+                    pad.push(sample);
+                }
+                let pushed = self.input_ring.push_slice(&pad);
+                if pushed != missing {
+                    return Err(StretchError::BufferOverflow {
+                        buffer: "stream_input_ring",
+                        requested: missing,
+                        available: pushed,
+                    });
                 }
             }
 
@@ -813,12 +899,17 @@ impl StreamProcessor {
                 output.truncate(output.len().saturating_sub(trim));
                 self.total_output_emitted_samples =
                     self.total_output_emitted_samples.saturating_sub(trim);
+                // Truncation can cut mid-waveform; fade the new end so the
+                // stream does not click against the silence that follows.
+                let remaining_here = output.len().saturating_sub(before);
+                fade_out_tail(output, 128.min(remaining_here));
             }
         }
 
         // Start a fresh accounting window after flush.
         self.expected_total_output_samples = 0.0;
         self.total_output_emitted_samples = 0;
+        self.dsp_engaged = false;
         Ok(output.len().saturating_sub(before))
     }
 
@@ -894,9 +985,7 @@ impl StreamProcessor {
         }
 
         self.update_vocoder_ratio();
-        if num_channels == 2 {
-            self.apply_transient_scheduled_phase_reset(total_frames);
-        }
+        self.apply_transient_scheduled_phase_reset(total_frames, num_channels);
 
         // Track input energy for gain compensation.
         {
@@ -1234,8 +1323,15 @@ impl StreamProcessor {
                     0.0
                 };
 
+                // PV-side flux spikes whenever the stretch ratio steps, so
+                // during an in-flight ratio/pitch slew it is a false onset
+                // signal: arming the overlay on it splices phase-arbitrary
+                // WSOLA audio over steady tonal content. While modulating,
+                // require an input-domain onset (RMS rise), which is
+                // ratio-independent.
+                let modulating = self.modulation_hold_overlap_windows() > 0;
                 let should_arm_wsola = self.wsola_overlay_remaining == 0
-                    && (flux_factor > 0.8 || onset_strength > 0.10);
+                    && ((flux_factor > 0.8 && !modulating) || onset_strength > 0.10);
 
                 if should_arm_wsola {
                     // Run WSOLA on channel input buffers and store results.
@@ -1381,6 +1477,14 @@ impl StreamProcessor {
                                 let t = (progress - attack_end) / (1.0 - attack_end);
                                 peak_weight * (1.0 - t * t)
                             };
+                            // Ramp the overlay in over a few ms: WSOLA output
+                            // has arbitrary phase relative to the PV stream,
+                            // so switching to it at full weight in one sample
+                            // is an audible click at the splice.
+                            let fade_in = ((pos + 1) as f32
+                                / WSOLA_OVERLAY_FADE_IN_SAMPLES.min(total / 4).max(1) as f32)
+                                .min(1.0);
+                            let wsola_weight = wsola_weight * fade_in;
                             // Apply PV gain on top of per-overlay normalization
                             // for spectral consistency with shelf-boosted PV output.
                             let wsola_sample = overlay[pos] * self.energy_gain as f32;
@@ -1550,13 +1654,38 @@ impl StreamProcessor {
         self.current_ratio * self.pitch_scale
     }
 
+    /// Returns how many FFT-window footprints the in-flight ratio/pitch slew
+    /// will span before settling to `RATIO_SNAP_THRESHOLD`, capped at
+    /// `MODULATION_HOLD_MAX_OVERLAP_WINDOWS`. Zero means steady state.
+    ///
+    /// "Windows" is the unit the transient scheduler's modulation-hold
+    /// machinery scales its cooldowns and trigger thresholds by: how many
+    /// overlapping analysis footprints the seam disturbance persists. The
+    /// control EMA reaches the snap threshold after `tau * ln(delta/snap)`
+    /// samples, which this converts to FFT footprints.
+    fn modulation_hold_overlap_windows(&self) -> usize {
+        let target_processing = self.target_ratio * self.target_pitch_scale;
+        let delta = (target_processing - self.processing_ratio()).abs();
+        if delta < MODULATION_HOLD_MIN_RATIO_DELTA {
+            return 0;
+        }
+        let tau = self.params.sample_rate.max(1) as f64 * RATIO_SMOOTHING_TIME_SECS;
+        let settle_samples = tau * (delta / RATIO_SNAP_THRESHOLD).ln().max(0.0);
+        ((settle_samples / self.params.fft_size.max(1) as f64).ceil() as usize)
+            .clamp(1, MODULATION_HOLD_MAX_OVERLAP_WINDOWS)
+    }
+
     fn reset_pitch_resamplers(&mut self) {
         for resampler in &mut self.pitch_resamplers {
+            resampler.reset();
+        }
+        for resampler in &mut self.sinc_pitch_resamplers {
             resampler.reset();
         }
         for buf in &mut self.pitch_output_buffers {
             buf.clear();
         }
+        self.pitch_resampler_engaged = false;
     }
 
     fn emit_channel_output_to_pending(
@@ -1568,10 +1697,17 @@ impl StreamProcessor {
             return Ok(());
         }
 
-        if (self.pitch_scale - 1.0).abs() < RATIO_SNAP_THRESHOLD {
+        // The resampler stays engaged once pitch has been used this stream:
+        // at unity it degenerates to a bit-clean passthrough, which avoids
+        // splicing its held lookahead out of the stream when a pitch sweep
+        // returns to 1.0.
+        let pitch_active = self.pitch_resampler_engaged
+            || (self.pitch_scale - 1.0).abs() >= RATIO_SNAP_THRESHOLD
+            || (self.target_pitch_scale - 1.0).abs() >= RATIO_SNAP_THRESHOLD;
+        if !pitch_active {
             return self.interleave_to_pending(min_output_len, num_channels);
         }
-        let resample_ratio = 1.0 / self.pitch_scale;
+        self.pitch_resampler_engaged = true;
 
         let mut pitch_min_output_len = usize::MAX;
         for ch in 0..num_channels {
@@ -1581,11 +1717,25 @@ impl StreamProcessor {
                 ));
             }
 
-            self.pitch_resamplers[ch].process_into(
-                &self.channel_output_buffers[ch][..min_output_len],
-                resample_ratio,
-                &mut self.pitch_output_buffers[ch],
-            )?;
+            match self.pitch_quality {
+                StreamPitchQuality::Sinc => {
+                    // The sinc resampler consumes the source at `pitch_scale`
+                    // samples per output sample and ramps toward it from the
+                    // previous block's step internally.
+                    self.sinc_pitch_resamplers[ch].process_into(
+                        &self.channel_output_buffers[ch][..min_output_len],
+                        self.pitch_scale,
+                        &mut self.pitch_output_buffers[ch],
+                    )?;
+                }
+                StreamPitchQuality::Linear => {
+                    self.pitch_resamplers[ch].process_into(
+                        &self.channel_output_buffers[ch][..min_output_len],
+                        1.0 / self.pitch_scale,
+                        &mut self.pitch_output_buffers[ch],
+                    )?;
+                }
+            }
             pitch_min_output_len = pitch_min_output_len.min(self.pitch_output_buffers[ch].len());
         }
 
@@ -1625,15 +1775,22 @@ impl StreamProcessor {
         &mut self,
         num_channels: usize,
     ) -> Result<(), StretchError> {
-        if (self.pitch_scale - 1.0).abs() < RATIO_SNAP_THRESHOLD {
+        if !self.pitch_resampler_engaged {
             return Ok(());
         }
-        let resample_ratio = 1.0 / self.pitch_scale;
 
         let mut min_output_len = usize::MAX;
         for ch in 0..num_channels {
-            self.pitch_resamplers[ch]
-                .flush_into(resample_ratio, &mut self.pitch_output_buffers[ch])?;
+            match self.pitch_quality {
+                StreamPitchQuality::Sinc => {
+                    self.sinc_pitch_resamplers[ch]
+                        .flush_into(self.pitch_scale, &mut self.pitch_output_buffers[ch])?;
+                }
+                StreamPitchQuality::Linear => {
+                    self.pitch_resamplers[ch]
+                        .flush_into(1.0 / self.pitch_scale, &mut self.pitch_output_buffers[ch])?;
+                }
+            }
             min_output_len = min_output_len.min(self.pitch_output_buffers[ch].len());
         }
 
@@ -1944,6 +2101,10 @@ impl StreamProcessor {
         })
     }
 
+    // TODO(stage-1 follow-up): tails drained here (and by the pitch
+    // resampler flush) skip the energy-gain/shelf corrections that normal
+    // chunks receive in `process_available_to_pending`, leaving a small gain
+    // seam at the flush boundary at far-from-unity ratios.
     fn flush_vocoder_tails_to_pending(&mut self, num_channels: usize) -> Result<(), StretchError> {
         let mut min_output_len = usize::MAX;
         for ch in 0..num_channels {
@@ -2130,19 +2291,57 @@ impl StreamProcessor {
     /// Stream mode applies pitch scale by rendering with an internal stretch
     /// ratio of `stretch_ratio * pitch_scale` and then resampling the rendered
     /// stream per channel by `1.0 / pitch_scale` to preserve target tempo.
+    ///
+    /// The applied pitch glides toward the new value over ~50 ms so nudges
+    /// and sweeps stay click-free. With the default
+    /// [`StreamPitchQuality::Sinc`] resampler, engaging pitch adds a small
+    /// amount of buffering (8–[`crate::core::resample::STREAM_SINC_MAX_HALF_TAPS`]
+    /// samples of kernel lookahead) on top of [`Self::latency_samples`]; the
+    /// resampled output itself stays sample-aligned.
     pub fn set_pitch_scale(&mut self, scale: f64) -> Result<(), StretchError> {
         let scale = validate_positive_finite_ratio(scale, "pitch scale")?;
-        if (scale - self.pitch_scale).abs() > RATIO_SNAP_THRESHOLD {
+        if (scale - self.target_pitch_scale).abs() > RATIO_SNAP_THRESHOLD {
             self.hybrid_pending_rebase = true;
-            self.reset_pitch_resamplers();
         }
-        self.pitch_scale = scale;
+        // The applied pitch glides toward the target with the same time
+        // constant as stretch-ratio changes (see
+        // `interpolate_ratio_for_frames`), so pitch nudges and sweeps stay
+        // click-free instead of splicing a resampler discontinuity.
+        self.target_pitch_scale = scale;
         Ok(())
     }
 
     /// Returns the current realtime pitch-scale control value.
+    ///
+    /// This is the most recently set target; the internally applied pitch
+    /// glides toward it over the smoothing window.
+    #[allow(clippy::misnamed_getters)]
     pub fn pitch_scale(&self) -> f64 {
-        self.pitch_scale
+        self.target_pitch_scale
+    }
+
+    /// Selects the realtime pitch resampler quality.
+    ///
+    /// Defaults to [`StreamPitchQuality::Sinc`]. Switching mid-stream flushes
+    /// the active resampler's held lookahead into the output (a short splice
+    /// may be audible), so prefer selecting the quality before streaming.
+    pub fn set_pitch_resampler_quality(
+        &mut self,
+        quality: StreamPitchQuality,
+    ) -> Result<(), StretchError> {
+        if quality == self.pitch_quality {
+            return Ok(());
+        }
+        let num_channels = self.params.channels.count();
+        self.flush_pitch_resampler_to_pending(num_channels)?;
+        self.reset_pitch_resamplers();
+        self.pitch_quality = quality;
+        Ok(())
+    }
+
+    /// Returns the selected realtime pitch resampler quality.
+    pub fn pitch_resampler_quality(&self) -> StreamPitchQuality {
+        self.pitch_quality
     }
 
     /// Returns the source BPM if available.
@@ -2218,7 +2417,9 @@ impl StreamProcessor {
         self.expected_total_output_samples = 0.0;
         self.total_output_emitted_samples = 0;
         self.pitch_scale = 1.0;
+        self.target_pitch_scale = 1.0;
         self.reset_pitch_resamplers();
+        self.dsp_engaged = false;
         self.input_energy_ema = 0.0;
         self.output_energy_ema = 0.0;
         self.energy_gain = 1.0;
@@ -2273,27 +2474,55 @@ impl StreamProcessor {
         0.3 + 2.2 * impulsiveness
     }
 
-    fn apply_transient_scheduled_phase_reset(&mut self, total_frames: usize) {
+    fn apply_transient_scheduled_phase_reset(&mut self, total_frames: usize, num_channels: usize) {
         if total_frames < self.params.fft_size {
             return;
         }
 
-        let total_samples = total_frames.saturating_mul(2);
+        // The scheduler analyzes mono or stereo snapshots; other channel
+        // counts fall outside the deterministic reset path.
+        if num_channels != 1 && num_channels != 2 {
+            return;
+        }
+
+        let total_samples = total_frames.saturating_mul(num_channels);
         if total_samples == 0 || total_samples > self.interleaved_scratch.len() {
             return;
         }
 
-        let stereo = &self.interleaved_scratch[..total_samples];
-        let Some(reset_mask) = self.transient_scheduler.detect_stereo_reset_mask(
-            stereo,
-            self.input_frames_consumed_total,
-            false,
-            0,
-        ) else {
+        // While a ratio/pitch slew is in flight, engage the scheduler's
+        // modulation-hold: low bands stay phase-locked (a low-band reset on
+        // top of an in-flight seam compounds it) and triggers tighten in
+        // proportion to how long the slew will persist.
+        let modulation_overlap_windows = self.modulation_hold_overlap_windows();
+        let suppress_low_bands = modulation_overlap_windows > 0;
+
+        // `interleaved_scratch` still holds the raw input snapshot here (the
+        // M/S encode only rewrites the per-channel buffers).
+        let snapshot = &self.interleaved_scratch[..total_samples];
+        let reset_mask = if num_channels == 1 {
+            self.transient_scheduler.detect_mono_reset_mask(
+                snapshot,
+                self.input_frames_consumed_total,
+                suppress_low_bands,
+                modulation_overlap_windows,
+            )
+        } else {
+            self.transient_scheduler.detect_stereo_reset_mask(
+                snapshot,
+                self.input_frames_consumed_total,
+                suppress_low_bands,
+                modulation_overlap_windows,
+            )
+        };
+        let Some(reset_mask) = reset_mask else {
             return;
         };
 
-        if self.params.stereo_mode == StereoMode::MidSide && self.vocoders.len() == 2 {
+        if num_channels == 2
+            && self.params.stereo_mode == StereoMode::MidSide
+            && self.vocoders.len() == 2
+        {
             let (mid_mask, side_mask) = stereo_channel_reset_masks(reset_mask);
             self.vocoders[0].reset_phase_state_bands(mid_mask, self.params.sample_rate);
             if side_mask.iter().any(|&b| b) {
@@ -2312,7 +2541,7 @@ impl StreamProcessor {
         self.params.bpm
     }
 
-    /// Callback-size-agnostic ratio interpolation.
+    /// Callback-size-agnostic ratio and pitch interpolation.
     fn interpolate_ratio_for_frames(&mut self, frames: usize) {
         let tau_frames = (self.params.sample_rate as f64 * RATIO_SMOOTHING_TIME_SECS).max(1.0);
         let alpha = 1.0 - (-(frames as f64) / tau_frames).exp();
@@ -2320,6 +2549,11 @@ impl StreamProcessor {
 
         if (self.current_ratio - self.target_ratio).abs() < RATIO_SNAP_THRESHOLD {
             self.current_ratio = self.target_ratio;
+        }
+
+        self.pitch_scale += alpha * (self.target_pitch_scale - self.pitch_scale);
+        if (self.pitch_scale - self.target_pitch_scale).abs() < RATIO_SNAP_THRESHOLD {
+            self.pitch_scale = self.target_pitch_scale;
         }
     }
 
@@ -2342,7 +2576,7 @@ fn stereo_channel_reset_masks(full_mask: [bool; 4]) -> ([bool; 4], [bool; 4]) {
 }
 
 #[inline]
-fn estimate_period_from_tail(tail: &[f32]) -> Option<usize> {
+fn estimate_period_from_tail(tail: &[f32]) -> Option<f64> {
     if tail.len() < 32 {
         return None;
     }
@@ -2381,27 +2615,30 @@ fn estimate_period_from_tail(tail: &[f32]) -> Option<usize> {
     }
 
     if n == 0 {
-        None
-    } else {
-        Some((sum / n).max(1))
+        return None;
     }
+    // Fractional period: integer rounding here drifts the synthesized phase
+    // by up to half a sample per cycle across the splice region, which is
+    // audible as a click at the splice boundary.
+    Some((sum as f64 / n as f64).max(1.0))
 }
 
 #[inline]
-fn fit_tonal_tail(samples: &[f32], global_start: usize, period: usize) -> Option<(f64, f64, f64)> {
-    if samples.is_empty() || period == 0 {
+fn fit_tonal_tail(samples: &[f32], global_start: usize, period: f64) -> Option<(f64, f64, f64)> {
+    if samples.is_empty() || period < 1.0 {
         return None;
     }
 
-    let fit_len = (period * 12).min(samples.len()).max(period * 3);
+    let period_len = period.round().max(1.0) as usize;
+    let fit_len = (period_len * 12).min(samples.len()).max(period_len * 3);
     let fit_start = samples.len().saturating_sub(fit_len);
     let fit = &samples[fit_start..];
-    if fit.len() < period * 2 {
+    if fit.len() < period_len * 2 {
         return None;
     }
 
     let mean = fit.iter().map(|&s| s as f64).sum::<f64>() / fit.len() as f64;
-    let w = 2.0 * std::f64::consts::PI / period as f64;
+    let w = 2.0 * std::f64::consts::PI / period;
 
     let mut cc = 0.0f64;
     let mut ss = 0.0f64;
@@ -2426,24 +2663,11 @@ fn fit_tonal_tail(samples: &[f32], global_start: usize, period: usize) -> Option
         return None;
     }
 
-    let mut a = (xc * ss - xs * cs) / det;
-    let mut b = (xs * cc - xc * cs) / det;
-
-    let fit_amp = (a * a + b * b).sqrt();
-    let tail_peak = samples
-        .iter()
-        .rev()
-        .take(period * 4)
-        .map(|v| v.abs() as f64)
-        .fold(0.0, f64::max);
-    if fit_amp > 1e-9 && tail_peak > 0.0 {
-        let floor_amp = tail_peak * 0.95;
-        if fit_amp < floor_amp {
-            let scale = floor_amp / fit_amp;
-            a *= scale;
-            b *= scale;
-        }
-    }
+    // Raw least-squares amplitude: the synthesized tail must continue the
+    // *actual* (possibly decayed) tail level. Flooring the amplitude toward
+    // the tail peak used to force a level jump at the splice point.
+    let a = (xc * ss - xs * cs) / det;
+    let b = (xs * cc - xc * cs) / det;
 
     Some((a, b, mean))
 }
@@ -2452,6 +2676,12 @@ fn fit_tonal_tail(samples: &[f32], global_start: usize, period: usize) -> Option
 ///
 /// This keeps end-of-stream length correction from introducing flat or noisy
 /// tails that would skew chunk-level pitch and envelope checks.
+///
+/// Continuity at the splice: the fitted sinusoid is gain-matched to the RMS
+/// of the real tail region it replaces and blended in with a linear
+/// crossfade (both signals are phase-aligned tonal content via the LSQ fit,
+/// so they sum coherently), instead of hard-overwriting from `synth_start` —
+/// the hard rewrite used to click at the splice boundary.
 fn extend_with_tonal_tail(output: &mut Vec<f32>, count: usize, floor: usize) {
     if count == 0 {
         return;
@@ -2470,25 +2700,80 @@ fn extend_with_tonal_tail(output: &mut Vec<f32>, count: usize, floor: usize) {
     let analysis = &output[analysis_start..analysis_end];
     if let Some(period) = estimate_period_from_tail(analysis) {
         if let Some((a, b, mean)) = fit_tonal_tail(analysis, analysis_start, period) {
-            let w = 2.0 * std::f64::consts::PI / period as f64;
+            let w = 2.0 * std::f64::consts::PI / period;
             let rewritten = output.len().saturating_sub(synth_start);
-            for i in 0..rewritten {
-                let n = (synth_start + i) as f64;
-                let y = a * (w * n).cos() + b * (w * n).sin() + mean;
-                output[synth_start + i] = y as f32;
+
+            // Evaluate the fitted sinusoid over the blend region.
+            let synth: Vec<f64> = (0..rewritten)
+                .map(|i| {
+                    let n = (synth_start + i) as f64;
+                    a * (w * n).cos() + b * (w * n).sin() + mean
+                })
+                .collect();
+
+            // Gain-match the synthetic tail to the level of the real region
+            // it blends over, so it continues the decayed tail rather than
+            // the pre-decay fit amplitude.
+            let real_rms = {
+                let sum: f64 = output[synth_start..]
+                    .iter()
+                    .map(|&s| (s as f64) * (s as f64))
+                    .sum();
+                (sum / rewritten.max(1) as f64).sqrt()
+            };
+            let synth_rms = {
+                let sum: f64 = synth.iter().map(|&s| s * s).sum();
+                (sum / synth.len().max(1) as f64).sqrt()
+            };
+            let gain = if synth_rms > 1e-9 && real_rms > 1e-9 {
+                (real_rms / synth_rms).clamp(0.25, 4.0)
+            } else {
+                1.0
+            };
+
+            // Linear crossfade real -> synth across the blend region. The
+            // fade starts near 0 (C0-continuous at synth_start) and ends
+            // near 1 (the appended region continues from pure synth).
+            for (i, &s) in synth.iter().enumerate() {
+                let t = (i + 1) as f64 / (rewritten + 1) as f64;
+                let real = output[synth_start + i] as f64;
+                output[synth_start + i] = (real * (1.0 - t) + s * gain * t) as f32;
             }
+
             let start = output.len();
             for i in 0..count {
                 let n = (start + i) as f64;
-                let y = a * (w * n).cos() + b * (w * n).sin() + mean;
+                let y = (a * (w * n).cos() + b * (w * n).sin() + mean) * gain;
                 output.push(y as f32);
             }
             return;
         }
     }
 
+    // No tonal fit: decay linearly from the last sample instead of holding
+    // it as DC (a DC hold ends the stream with a step to silence).
     let pad = *output.last().unwrap_or(&0.0);
-    output.resize(output.len() + count, pad);
+    let start = output.len();
+    output.reserve(count);
+    for i in 0..count {
+        let t = 1.0 - (i + 1) as f32 / count as f32;
+        output.push(pad * t);
+    }
+    debug_assert_eq!(output.len(), start + count);
+}
+
+/// Applies a linear fade-out over the last `fade_len` samples.
+fn fade_out_tail(output: &mut [f32], fade_len: usize) {
+    let len = output.len();
+    let fade = fade_len.min(len);
+    if fade == 0 {
+        return;
+    }
+    let start = len - fade;
+    for (i, s) in output[start..].iter_mut().enumerate() {
+        let t = 1.0 - (i + 1) as f32 / fade as f32;
+        *s *= t;
+    }
 }
 
 #[cfg(test)]
@@ -2507,6 +2792,145 @@ mod tests {
             }
         }
         crossings as f64 * sample_rate as f64 / samples.len() as f64
+    }
+
+    #[test]
+    fn test_modulation_hold_zero_at_steady_state() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1);
+        let proc = StreamProcessor::new(params);
+        assert_eq!(proc.modulation_hold_overlap_windows(), 0);
+    }
+
+    #[test]
+    fn test_modulation_hold_engages_and_scales_with_step() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+
+        proc.set_stretch_ratio(1.004).unwrap();
+        let small = proc.modulation_hold_overlap_windows();
+        assert!(small >= 1, "small step should engage hold, got {}", small);
+
+        proc.set_stretch_ratio(1.08).unwrap();
+        let large = proc.modulation_hold_overlap_windows();
+        assert!(
+            large >= small,
+            "hold should be monotone in step size: {} < {}",
+            large,
+            small
+        );
+        assert_eq!(
+            large, MODULATION_HOLD_MAX_OVERLAP_WINDOWS,
+            "a 1.0 -> 1.08 snap should hit the cap"
+        );
+    }
+
+    #[test]
+    fn test_modulation_hold_engages_for_pitch_slew() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_pitch_scale(1.05).unwrap();
+        assert!(proc.modulation_hold_overlap_windows() >= 1);
+    }
+
+    #[test]
+    fn test_modulation_hold_decays_after_settling() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_stretch_ratio(1.04).unwrap();
+        assert!(proc.modulation_hold_overlap_windows() >= 1);
+
+        // ~700 ms of audio lets the 50 ms control EMA settle to the target.
+        let input: Vec<f32> = (0..30_000)
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44100.0).sin() * 0.5)
+            .collect();
+        let mut output = Vec::with_capacity(input.len() * 2 + 65_536);
+        for chunk in input.chunks(256) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        assert_eq!(
+            proc.modulation_hold_overlap_windows(),
+            0,
+            "hold should release once the slew settles"
+        );
+    }
+
+    #[test]
+    fn test_extend_with_tonal_tail_splice_continuity() {
+        // Decaying 220 Hz sine: the splice into the synthesized tail and the
+        // append boundary must both stay within the tone's natural slew.
+        let sr = 44_100.0f32;
+        let freq = 220.0f32;
+        let n = 8192usize;
+        let mut output: Vec<f32> = (0..n)
+            .map(|i| {
+                let decay = 1.0 - 0.5 * i as f32 / n as f32;
+                0.5 * decay * (2.0 * PI * freq * i as f32 / sr).sin()
+            })
+            .collect();
+
+        let count = 700usize;
+        extend_with_tonal_tail(&mut output, count, 0);
+        assert_eq!(output.len(), n + count);
+
+        let natural_slew = 0.5 * 2.0 * PI * freq / sr;
+        let mut worst = (0usize, 0.0f32);
+        for (i, w) in output.windows(2).enumerate() {
+            let d = (w[1] - w[0]).abs();
+            if d > worst.1 {
+                worst = (i, d);
+            }
+        }
+        assert!(
+            worst.1 <= natural_slew * 1.5,
+            "tonal-tail splice discontinuity at {}: |delta|={:.4} > {:.4}",
+            worst.0,
+            worst.1,
+            natural_slew * 1.5
+        );
+    }
+
+    #[test]
+    fn test_extend_with_tonal_tail_fallback_decays() {
+        // Non-tonal tail (no zero crossings): fallback must decay to zero
+        // instead of holding the last sample as DC.
+        let mut output = vec![0.3f32; 100];
+        extend_with_tonal_tail(&mut output, 64, 0);
+        assert_eq!(output.len(), 164);
+        assert!(output[100..].windows(2).all(|w| w[1] <= w[0] + 1e-6));
+        assert!(output.last().unwrap().abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_fade_out_tail() {
+        let mut output = vec![1.0f32; 256];
+        fade_out_tail(&mut output, 128);
+        assert!((output[127] - 1.0).abs() < 1e-6);
+        assert!(output[128] < 1.0);
+        assert!(output.last().unwrap().abs() < 1e-6);
+        for w in output[128..].windows(2) {
+            assert!(w[1] <= w[0]);
+        }
+
+        // Degenerate cases must not panic.
+        fade_out_tail(&mut [], 16);
+        fade_out_tail(&mut output, 0);
+        let mut short = vec![0.5f32; 4];
+        fade_out_tail(&mut short, 128);
+        assert!(short.last().unwrap().abs() < 1e-6);
     }
 
     #[test]
@@ -2783,6 +3207,39 @@ mod tests {
         assert!(proc.set_pitch_scale(0.0).is_err());
         assert!(proc.set_pitch_scale(f64::NAN).is_err());
         assert!((proc.pitch_scale() - 1.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_stream_processor_pitch_quality_selection() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        assert_eq!(proc.pitch_resampler_quality(), StreamPitchQuality::Sinc);
+        proc.set_pitch_resampler_quality(StreamPitchQuality::Linear)
+            .unwrap();
+        assert_eq!(proc.pitch_resampler_quality(), StreamPitchQuality::Linear);
+
+        // The linear fallback still applies a measurable pitch shift.
+        proc.set_pitch_scale(1.08).unwrap();
+        let input: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44100.0).sin() * 0.8)
+            .collect();
+        let mut output = Vec::with_capacity(input.len() * 2);
+        for chunk in input.chunks(1024) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        proc.flush_into(&mut output).unwrap();
+        let trim = 4096usize.min(output.len() / 4);
+        let end = output.len().saturating_sub(trim).max(trim + 2);
+        let measured = estimate_freq_zero_crossings(&output[trim..end], 44100);
+        assert!(
+            measured > 460.0,
+            "linear fallback should still shift pitch, got {:.3} Hz",
+            measured
+        );
     }
 
     #[test]

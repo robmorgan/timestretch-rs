@@ -231,3 +231,112 @@ fn process_into_hybrid_realtime_strict_no_heap_growth_after_warmup() {
         realloc_bytes
     );
 }
+
+#[test]
+fn process_into_pitch_scaled_steady_state_no_heap_growth_after_warmup() {
+    let _guard = ALLOC_TEST_MUTEX
+        .lock()
+        .expect("allocation test mutex poisoned");
+    const SAMPLE_RATE: u32 = 44_100;
+    const CHANNELS: u32 = 2;
+    const CHUNK_FRAMES: usize = 256;
+    const WARMUP_ITERS: usize = 64;
+    const MEASURE_ITERS: usize = 96;
+
+    let params = StretchParams::new(1.05)
+        .with_sample_rate(SAMPLE_RATE)
+        .with_channels(CHANNELS)
+        .with_preset(EdmPreset::DjBeatmatch);
+    let mut processor = StreamProcessor::new(params);
+    processor.set_hybrid_mode(false);
+    // Engage the (default sinc) pitch resampler path before warmup.
+    processor
+        .set_pitch_scale(1.06)
+        .expect("pitch scale should be accepted");
+
+    let chunk = test_chunk_stereo(CHUNK_FRAMES, SAMPLE_RATE as f32);
+    let max_samples = chunk.len() * (WARMUP_ITERS + MEASURE_ITERS) * 8;
+    let mut output = Vec::with_capacity(max_samples);
+
+    for _ in 0..WARMUP_ITERS {
+        processor
+            .process_into(&chunk, &mut output)
+            .expect("warmup process_into should succeed");
+    }
+    output.clear();
+
+    begin_alloc_tracking();
+    for _ in 0..MEASURE_ITERS {
+        processor
+            .process_into(&chunk, &mut output)
+            .expect("steady-state pitch process_into should succeed");
+    }
+    let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
+
+    assert_eq!(
+        alloc_calls + realloc_calls,
+        0,
+        "pitch-scaled process_into allocated: alloc_calls={}, realloc_calls={}, alloc_bytes={}, realloc_bytes={}",
+        alloc_calls,
+        realloc_calls,
+        alloc_bytes,
+        realloc_bytes
+    );
+}
+
+#[test]
+fn process_into_pitch_sweep_no_heap_growth_after_warmup() {
+    let _guard = ALLOC_TEST_MUTEX
+        .lock()
+        .expect("allocation test mutex poisoned");
+    const SAMPLE_RATE: u32 = 44_100;
+    const CHANNELS: u32 = 2;
+    const CHUNK_FRAMES: usize = 256;
+    const WARMUP_ITERS: usize = 64;
+    const MEASURE_ITERS: usize = 96;
+
+    let params = StretchParams::new(1.05)
+        .with_sample_rate(SAMPLE_RATE)
+        .with_channels(CHANNELS)
+        .with_preset(EdmPreset::DjBeatmatch);
+    let mut processor = StreamProcessor::new(params);
+    processor.set_hybrid_mode(false);
+    processor
+        .set_pitch_scale(1.02)
+        .expect("pitch scale should be accepted");
+
+    let chunk = test_chunk_stereo(CHUNK_FRAMES, SAMPLE_RATE as f32);
+    let max_samples = chunk.len() * (WARMUP_ITERS + MEASURE_ITERS) * 8;
+    let mut output = Vec::with_capacity(max_samples);
+
+    for _ in 0..WARMUP_ITERS {
+        processor
+            .process_into(&chunk, &mut output)
+            .expect("warmup process_into should succeed");
+    }
+    output.clear();
+
+    // Sweep the pitch control inside the tracked region: the DJ use case is
+    // continuous pitch modulation, and set_pitch_scale must stay alloc-free.
+    begin_alloc_tracking();
+    for i in 0..MEASURE_ITERS {
+        let scale = 1.02 + 0.08 * (i as f64 / MEASURE_ITERS as f64);
+        processor
+            .set_pitch_scale(scale)
+            .expect("pitch scale should be accepted");
+        processor
+            .process_into(&chunk, &mut output)
+            .expect("pitch-sweep process_into should succeed");
+    }
+    let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
+
+    assert_eq!(
+        alloc_calls + realloc_calls,
+        0,
+        "pitch-sweep process_into allocated: alloc_calls={}, realloc_calls={}, alloc_bytes={}, realloc_bytes={}",
+        alloc_calls,
+        realloc_calls,
+        alloc_bytes,
+        realloc_bytes
+    );
+}

@@ -268,6 +268,75 @@ impl TransientEventScheduler {
             self.right_buffer.push(frame[1]);
         }
 
+        self.scan_frames(
+            frames,
+            absolute_frame_origin,
+            true,
+            suppress_low_bands,
+            modulation_overlap_windows,
+        )
+    }
+
+    /// Detects a transient event from a mono input snapshot and returns a
+    /// per-band reset mask when detected.
+    ///
+    /// Mirrors [`Self::detect_stereo_reset_mask`]; all flux statistics,
+    /// cooldowns, and mask routing are shared, only the per-frame magnitude
+    /// source differs (single channel instead of an L/R average).
+    pub(crate) fn detect_mono_reset_mask(
+        &mut self,
+        mono: &[f32],
+        frame_origin: usize,
+        suppress_low_bands: bool,
+        modulation_overlap_windows: usize,
+    ) -> Option<[bool; 4]> {
+        if self.hop_size == 0 || mono.len() < self.fft_size {
+            return None;
+        }
+
+        let mut frames = mono.len();
+        if frames < self.fft_size.saturating_add(self.hop_size) {
+            return None;
+        }
+
+        let mut start_sample = 0usize;
+        let mut absolute_frame_origin = frame_origin;
+        if frames > self.max_frames {
+            let drop_frames = frames - self.max_frames;
+            start_sample = drop_frames;
+            frames = self.max_frames;
+            absolute_frame_origin = absolute_frame_origin.saturating_add(drop_frames);
+        }
+
+        if self.left_buffer.capacity() < frames {
+            return None;
+        }
+        self.left_buffer.clear();
+        self.left_buffer
+            .extend_from_slice(&mono[start_sample..start_sample + frames]);
+
+        self.scan_frames(
+            frames,
+            absolute_frame_origin,
+            false,
+            suppress_low_bands,
+            modulation_overlap_windows,
+        )
+    }
+
+    /// Shared per-frame flux scan over the prepared channel buffers.
+    ///
+    /// Reads `left_buffer` (and `right_buffer` when `stereo`) and runs the
+    /// incremental spectral-flux transient detection, returning the combined
+    /// reset mask for the first accepted event, if any.
+    fn scan_frames(
+        &mut self,
+        frames: usize,
+        absolute_frame_origin: usize,
+        stereo: bool,
+        suppress_low_bands: bool,
+        modulation_overlap_windows: usize,
+    ) -> Option<[bool; 4]> {
         let num_frames = (frames - self.fft_size) / self.hop_size + 1;
         if num_frames < 2 {
             return None;
@@ -292,7 +361,6 @@ impl TransientEventScheduler {
             }
 
             let left_frame = &self.left_buffer[start..start + self.fft_size];
-            let right_frame = &self.right_buffer[start..start + self.fft_size];
 
             for (dst, (&sample, &window)) in self
                 .fft_buffer
@@ -304,19 +372,22 @@ impl TransientEventScheduler {
             self.fft_forward
                 .process_with_scratch(&mut self.fft_buffer, &mut self.fft_scratch);
 
-            for bin in 1..self.num_bins {
-                self.left_magnitudes[bin] = self.fft_buffer[bin].norm();
-            }
+            if stereo {
+                for bin in 1..self.num_bins {
+                    self.left_magnitudes[bin] = self.fft_buffer[bin].norm();
+                }
 
-            for (dst, (&sample, &window)) in self
-                .fft_buffer
-                .iter_mut()
-                .zip(right_frame.iter().zip(self.window.iter()))
-            {
-                *dst = Complex::new(sample * window, 0.0);
+                let right_frame = &self.right_buffer[start..start + self.fft_size];
+                for (dst, (&sample, &window)) in self
+                    .fft_buffer
+                    .iter_mut()
+                    .zip(right_frame.iter().zip(self.window.iter()))
+                {
+                    *dst = Complex::new(sample * window, 0.0);
+                }
+                self.fft_forward
+                    .process_with_scratch(&mut self.fft_buffer, &mut self.fft_scratch);
             }
-            self.fft_forward
-                .process_with_scratch(&mut self.fft_buffer, &mut self.fft_scratch);
 
             let mut sub_flux = 0.0f64;
             let mut low_flux = 0.0f64;
@@ -324,10 +395,13 @@ impl TransientEventScheduler {
             let mut high_flux = 0.0f64;
 
             for bin in 1..self.num_bins {
-                // Average per-channel magnitudes. This avoids mid-channel
-                // cancellation for anti-phase/wide stereo transients.
-                let right_mag = self.fft_buffer[bin].norm();
-                let mag = (self.left_magnitudes[bin] + right_mag) * 0.5;
+                let mag = if stereo {
+                    // Average per-channel magnitudes. This avoids mid-channel
+                    // cancellation for anti-phase/wide stereo transients.
+                    (self.left_magnitudes[bin] + self.fft_buffer[bin].norm()) * 0.5
+                } else {
+                    self.fft_buffer[bin].norm()
+                };
                 let diff = (mag - self.prev_magnitudes[bin]).max(0.0) as f64;
                 if bin <= self.sub_end_bin {
                     sub_flux += diff;
@@ -571,6 +645,74 @@ mod tests {
         assert!(
             second.is_none(),
             "second pass with same origin should not reprocess duplicate frames"
+        );
+    }
+
+    #[test]
+    fn scheduler_detects_mono_click_transient() {
+        let sr = 44_100u32;
+        let fft = 1024usize;
+        let hop = 256usize;
+        let frames = 4096usize;
+        let mut mono = vec![0.0f32; frames];
+        for (i, sample) in mono.iter_mut().enumerate() {
+            let t = i as f32 / sr as f32;
+            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
+            let click = if (3400..3420).contains(&i) { 2.0 } else { 0.0 };
+            *sample = base + click;
+        }
+
+        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
+        let mask = scheduler.detect_mono_reset_mask(&mono, 0, false, 0);
+        assert!(mask.is_some(), "expected mono transient reset mask");
+        let mask = mask.unwrap();
+        assert!(
+            mask[2] || mask[3],
+            "expected at least mid/high reset for mono click transient, got {:?}",
+            mask
+        );
+    }
+
+    #[test]
+    fn scheduler_mono_skips_duplicate_frames_for_same_origin() {
+        let sr = 44_100u32;
+        let fft = 1024usize;
+        let hop = 256usize;
+        let frames = 4096usize;
+        let mut mono = vec![0.0f32; frames];
+        for (i, sample) in mono.iter_mut().enumerate() {
+            let t = i as f32 / sr as f32;
+            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
+            let click = if (3400..3420).contains(&i) { 2.0 } else { 0.0 };
+            *sample = base + click;
+        }
+
+        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
+        let first = scheduler.detect_mono_reset_mask(&mono, 0, false, 0);
+        let second = scheduler.detect_mono_reset_mask(&mono, 0, false, 0);
+        assert!(first.is_some(), "first mono pass should observe transient");
+        assert!(
+            second.is_none(),
+            "second mono pass with same origin should not reprocess duplicate frames"
+        );
+    }
+
+    #[test]
+    fn scheduler_mono_ignores_steady_tone() {
+        let sr = 44_100u32;
+        let fft = 1024usize;
+        let hop = 256usize;
+        let frames = 4096usize;
+        let mono: Vec<f32> = (0..frames)
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / sr as f32).sin() * 0.3)
+            .collect();
+
+        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
+        let mask = scheduler.detect_mono_reset_mask(&mono, 0, false, 0);
+        assert!(
+            mask.is_none(),
+            "steady mono tone should not trigger phase resets, got {:?}",
+            mask
         );
     }
 

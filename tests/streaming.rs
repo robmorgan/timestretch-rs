@@ -779,3 +779,104 @@ fn test_streaming_normalize_with_window() {
         );
     }
 }
+
+// ===================== REALTIME PITCH MODULATION =====================
+
+/// Sweeping the pitch control every callback must not produce clicks or
+/// zipper discontinuities: pitch changes glide instead of hard-resetting the
+/// pitch resampler state.
+#[test]
+fn test_streaming_pitch_sweep_no_zipper() {
+    let sample_rate = 44100u32;
+    let freq = 1000.0f32;
+    let num_samples = sample_rate as usize * 2;
+    let input = sine_wave(freq, sample_rate, num_samples);
+
+    let params = StretchParams::new(1.0)
+        .with_sample_rate(sample_rate)
+        .with_channels(1)
+        .with_fft_size(1024)
+        .with_hop_size(256);
+    let mut processor = StreamProcessor::new(params);
+
+    let chunk = 256usize;
+    let n_chunks = num_samples / chunk;
+    let mut output: Vec<f32> = Vec::with_capacity(num_samples * 3);
+    for (ci, block) in input.chunks(chunk).enumerate() {
+        // Ramp the pitch control from 1.0 to 1.12 across the stream.
+        let scale = 1.0 + 0.12 * (ci as f64 / (n_chunks - 1) as f64);
+        processor.set_pitch_scale(scale).unwrap();
+        processor.process_into(block, &mut output).unwrap();
+    }
+    processor.flush_into(&mut output).unwrap();
+
+    // Max sample-to-sample slew of a 1 kHz sine at <= 1.12x pitch, with
+    // headroom for PV overlap-add ripple. A resampler-reset click is a
+    // near-full-scale jump and blows well past this bound. The scan covers
+    // the FULL output including the end-of-stream flush region.
+    let max_slew = 2.0 * PI * freq * 1.12 / sample_rate as f32 * 2.5;
+    let skip = 8192; // settle PV warmup and gain EMA
+    for (i, w) in output[skip..].windows(2).enumerate() {
+        let d = (w[1] - w[0]).abs();
+        assert!(
+            d <= max_slew,
+            "zipper/click at output sample {}: |delta| = {:.4} > {:.4}",
+            skip + i,
+            d,
+            max_slew
+        );
+    }
+
+    // The tail of the stream should sit near the final shifted frequency.
+    let tail_start = output.len().saturating_sub(sample_rate as usize / 2);
+    let tail = &output[tail_start..output.len().saturating_sub(2048)];
+    let e_shifted = spectral_energy_at_freq(tail, sample_rate, freq * 1.12);
+    let e_original = spectral_energy_at_freq(tail, sample_rate, freq);
+    assert!(
+        e_shifted > e_original * 2.0,
+        "expected pitch-shifted tone to dominate at stream tail: shifted={:.4} original={:.4}",
+        e_shifted,
+        e_original
+    );
+}
+
+/// Mono streams must get the same transient-driven phase resets as stereo:
+/// the scheduler previously only ran for 2-channel streams, leaving mono
+/// transients to smear.
+#[test]
+fn test_streaming_mono_transient_phase_resets() {
+    let sample_rate = 44100u32;
+    let num_samples = sample_rate as usize * 2;
+
+    // Click train over a quiet tonal bed (EDM-style four-on-the-floor).
+    let mut input: Vec<f32> = (0..num_samples)
+        .map(|i| 0.2 * (2.0 * PI * 220.0 * i as f32 / sample_rate as f32).sin())
+        .collect();
+    let click_period = sample_rate as usize / 2; // 120 BPM
+    for start in (click_period / 2..num_samples).step_by(click_period) {
+        for s in input.iter_mut().skip(start).take(24) {
+            *s += 1.5;
+        }
+    }
+
+    let params = StretchParams::new(1.25)
+        .with_sample_rate(sample_rate)
+        .with_channels(1)
+        .with_fft_size(1024)
+        .with_hop_size(256);
+    let mut processor = StreamProcessor::new(params);
+
+    let mut output: Vec<f32> = Vec::with_capacity(num_samples * 3);
+    for chunk in input.chunks(256) {
+        processor.process_into(chunk, &mut output).unwrap();
+    }
+    processor.flush_into(&mut output).unwrap();
+
+    let stats = processor.transient_reset_stats();
+    assert!(
+        stats.events_detected_total > 0,
+        "mono stream should schedule transient phase resets, got {:?}",
+        stats
+    );
+    assert!(!output.is_empty());
+}
