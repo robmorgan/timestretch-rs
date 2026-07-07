@@ -53,8 +53,17 @@ pub(crate) fn analyze_adaptive_snapshot_mono(
     input: &[f32],
     params: &StretchParams,
 ) -> AdaptiveAnalysisSnapshot {
+    let confident_pre = params.pre_analysis.as_ref().filter(|artifact| {
+        artifact.is_usable(params.sample_rate, params.beat_snap_confidence_threshold)
+    });
+
+    // A usable artifact is authoritative for transients (even when it holds
+    // none), so online detection is skipped entirely — that is the CPU win
+    // and the offline analysis is non-causal, hence at least as accurate.
     let transient_map = if input.is_empty() {
         empty_transient_map(params.hop_size.max(1))
+    } else if let Some(artifact) = confident_pre {
+        transient_map_from_artifact(artifact, input.len())
     } else {
         detect_transients_with_options(
             input,
@@ -65,12 +74,6 @@ pub(crate) fn analyze_adaptive_snapshot_mono(
             TransientDetectionOptions::from_stretch_params(params),
         )
     };
-
-    let confident_pre = params.pre_analysis.as_ref().filter(|artifact| {
-        artifact.sample_rate == params.sample_rate
-            && artifact.is_confident(params.beat_snap_confidence_threshold)
-            && !artifact.beat_positions.is_empty()
-    });
 
     let mut onsets = transient_map.onsets.clone();
     let mut strengths = if transient_map.strengths.len() == transient_map.onsets.len() {
@@ -154,6 +157,54 @@ pub(crate) fn analyze_adaptive_snapshot_mono(
         transient_map,
         onsets,
         strengths,
+    }
+}
+
+/// Reconstructs a sparse [`TransientMap`] from a pre-analysis artifact.
+///
+/// Onsets past `input_len` are dropped (batch inputs are assumed to be the
+/// analyzed file from source frame 0). Band flux is written only at onset
+/// frames; artifacts without band flux (version 1) leave the map empty there,
+/// which downstream degrades to full four-band phase resets.
+fn transient_map_from_artifact(
+    artifact: &crate::core::preanalysis::PreAnalysisArtifact,
+    input_len: usize,
+) -> TransientMap {
+    let hop = if artifact.analysis_hop_size > 0 {
+        artifact.analysis_hop_size
+    } else {
+        TRANSIENT_MAX_HOP
+    };
+
+    let has_band_flux = artifact.onset_band_flux.len() == artifact.transient_onsets.len();
+    let mut per_frame_band_flux = if has_band_flux {
+        vec![[0.0f32; 4]; input_len / hop + 1]
+    } else {
+        Vec::new()
+    };
+
+    let mut onsets = Vec::with_capacity(artifact.transient_onsets.len());
+    let mut onsets_fractional = Vec::with_capacity(artifact.transient_onsets.len());
+    let mut strengths = Vec::with_capacity(artifact.transient_onsets.len());
+    for (i, &onset) in artifact.transient_onsets.iter().enumerate() {
+        if onset >= input_len {
+            continue;
+        }
+        onsets.push(onset);
+        onsets_fractional.push(onset as f64);
+        strengths.push(artifact.strength_at(i));
+        if has_band_flux {
+            per_frame_band_flux[onset / hop] = artifact.onset_band_flux[i];
+        }
+    }
+
+    TransientMap {
+        onsets,
+        onsets_fractional,
+        strengths,
+        flux: Vec::new(),
+        hop_size: hop,
+        per_frame_band_flux,
     }
 }
 

@@ -162,7 +162,35 @@ fn rms(samples: &[f32]) -> f32 {
 }
 
 /// Builds a shared transient/beat map from the Mid channel.
+///
+/// A usable pre-analysis artifact is authoritative: its onsets and beats were
+/// computed on the same mid downmix offline, so online detection is skipped.
 fn build_shared_onset_map(mid: &[f32], params: &StretchParams) -> (Vec<usize>, Vec<f32>) {
+    let artifact = params.pre_analysis.as_ref().filter(|artifact| {
+        artifact.is_usable(params.sample_rate, params.beat_snap_confidence_threshold)
+    });
+
+    if let Some(artifact) = artifact {
+        let mut onsets = Vec::with_capacity(artifact.transient_onsets.len());
+        let mut strengths = Vec::with_capacity(artifact.transient_onsets.len());
+        for (i, &onset) in artifact.transient_onsets.iter().enumerate() {
+            if onset >= mid.len() {
+                continue;
+            }
+            onsets.push(onset);
+            strengths.push(artifact.strength_at(i));
+        }
+        if params.beat_aware && mid.len() >= STEREO_MIN_SAMPLES_FOR_BEAT_DETECTION {
+            return merge_onsets_and_beats(
+                &onsets,
+                &strengths,
+                &artifact.beat_positions,
+                mid.len(),
+            );
+        }
+        return (onsets, strengths);
+    }
+
     let transient_map = detect_transients_with_options(
         mid,
         params.sample_rate,

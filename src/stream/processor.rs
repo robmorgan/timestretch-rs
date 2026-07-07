@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
+use crate::analysis::adaptive_snapshot::merge_onsets_and_beats;
 use crate::analysis::transient::{detect_transients_with_options, TransientDetectionOptions};
+use crate::core::preanalysis::PreAnalysisArtifact;
 use crate::core::resample::{SincInterpTable, StreamingSincResampler};
 use crate::core::ring_buffer::RingBuffer;
 use crate::core::types::{QualityMode, StretchParams};
@@ -59,6 +61,11 @@ const MODULATION_HOLD_MIN_RATIO_DELTA: f64 = 0.002;
 /// <= 4 overlap footprints). Long gestures stay protected anyway because the
 /// in-flight delta is re-evaluated on every scheduler pass.
 const MODULATION_HOLD_MAX_OVERLAP_WINDOWS: usize = 4;
+
+/// Minimum artifact onset strength for a low-band (100-500 Hz) phase reset.
+const ARTIFACT_LOW_BAND_RESET_STRENGTH: f32 = 0.45;
+/// Minimum artifact onset strength for a sub-bass (<100 Hz) phase reset.
+const ARTIFACT_SUB_BASS_RESET_STRENGTH: f32 = 0.7;
 
 /// Computes the minimum number of frames required before processing can begin.
 #[inline]
@@ -140,6 +147,14 @@ struct HybridStreamingState {
     pre_trim_lens: Vec<usize>,
     /// Reused scratch for rendered output lengths per channel.
     rendered_lens: Vec<usize>,
+    /// Absolute source frame of the rolling window's first retained frame.
+    ///
+    /// Advanced on every front-discard (overflow and tail retention) so
+    /// pre-analysis artifact positions can be mapped into window-relative
+    /// onsets. All channels discard in lockstep; channel 0 is authoritative.
+    window_base_abs: usize,
+    /// True once `window_base_abs` has been anchored by the first append.
+    window_base_valid: bool,
 }
 
 impl HybridStreamingState {
@@ -155,6 +170,11 @@ impl HybridStreamingState {
         // estimate (which assumes uniform stretch) unreliable, causing
         // catastrophic spectral degradation for far-from-unity ratios.
         per_channel.elastic_timing = false;
+        // The rolling window is window-relative while artifact positions are
+        // absolute source frames; the streaming path maps them explicitly
+        // (see `window_base_abs`), so the stretchers must never consume the
+        // artifact through their own batch-oriented analysis.
+        per_channel.pre_analysis = None;
         // Keep a generous tail so that transient detection and HPSS have
         // enough context to produce results consistent with full-batch
         // processing.  Fifty-six FFT windows (~5.2 s at 4096/44100) gives
@@ -189,6 +209,8 @@ impl HybridStreamingState {
             input_accumulated: usize::MAX,
             pre_trim_lens: vec![0; num_channels],
             rendered_lens: vec![0; num_channels],
+            window_base_abs: 0,
+            window_base_valid: false,
         }
     }
 
@@ -207,9 +229,13 @@ impl HybridStreamingState {
     }
 
     fn retain_tail(&mut self) {
-        for input in &mut self.rolling_inputs {
+        for (ch, input) in self.rolling_inputs.iter_mut().enumerate() {
             if input.len() > self.max_tail_frames {
-                input.discard(input.len() - self.max_tail_frames);
+                let discarded = input.len() - self.max_tail_frames;
+                input.discard(discarded);
+                if ch == 0 {
+                    self.window_base_abs = self.window_base_abs.saturating_add(discarded);
+                }
             }
         }
     }
@@ -374,9 +400,16 @@ pub enum StreamPitchQuality {
 /// Aggregated transient-reset telemetry from deterministic stream processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransientResetStats {
-    /// Number of transient events detected by the scheduler.
+    /// Number of transient events detected by the online scheduler.
     pub events_detected_total: u64,
-    /// Number of times each reset band was selected across all events.
+    /// Number of phase resets scheduled from pre-analysis artifact onsets.
+    ///
+    /// When a usable artifact is attached, artifact scheduling replaces the
+    /// online scheduler, so this and `events_detected_total` are mutually
+    /// exclusive within one stream.
+    pub artifact_events_scheduled_total: u64,
+    /// Number of times each reset band was selected across all events
+    /// (online-scheduled and artifact-scheduled combined).
     ///
     /// Layout: `[sub_bass, low, mid, high]`.
     pub reset_band_counts_total: [u64; 4],
@@ -428,6 +461,28 @@ pub struct StreamProcessor {
     ///
     /// This provides a stable timeline for incremental transient scheduling.
     input_frames_consumed_total: usize,
+    /// Absolute source frame of the first frame pushed after creation/reset.
+    ///
+    /// Set via [`StreamProcessor::set_source_position`] so pre-analysis
+    /// artifact positions stay aligned when streaming starts mid-file
+    /// (seek/cue rebuild flows).
+    source_start_frames: usize,
+    /// Frames emitted by the unity passthrough fast path, which bypasses
+    /// `input_ring` and never advances `input_frames_consumed_total`.
+    passthrough_frames_total: usize,
+    /// Cached result of the artifact usability gate (recomputed whenever the
+    /// artifact changes; never in the audio callback).
+    artifact_active: bool,
+    /// Monotonic cursor into the artifact's `transient_onsets` for the
+    /// deterministic engine's scheduled phase resets.
+    artifact_onset_cursor: usize,
+    /// Count of phase resets scheduled from artifact onsets.
+    artifact_events_scheduled_total: u64,
+    /// Per-band counts of artifact-scheduled resets `[sub, low, mid, high]`.
+    artifact_reset_band_counts_total: [u64; 4],
+    /// Artifact onsets merged with beat anchors (absolute source frames),
+    /// precomputed for the legacy hybrid re-render engine.
+    artifact_merged_anchors: (Vec<usize>, Vec<f32>),
     /// Expected total output samples across the current stream.
     ///
     /// Accumulated from input samples and the effective interpolated ratio,
@@ -554,7 +609,7 @@ impl StreamProcessor {
         );
         let sinc_table = SincInterpTable::new_stream_default();
 
-        Self {
+        let mut processor = Self {
             params,
             capacity_frames_per_channel,
             input_ring: RingBuffer::with_capacity(capacity_samples),
@@ -574,6 +629,13 @@ impl StreamProcessor {
             hybrid_realtime_strict: false,
             transient_scheduler,
             input_frames_consumed_total: 0,
+            source_start_frames: 0,
+            passthrough_frames_total: 0,
+            artifact_active: false,
+            artifact_onset_cursor: 0,
+            artifact_events_scheduled_total: 0,
+            artifact_reset_band_counts_total: [0; 4],
+            artifact_merged_anchors: (Vec::new(), Vec::new()),
             expected_total_output_samples: 0.0,
             total_output_emitted_samples: 0,
             pitch_scale: 1.0,
@@ -631,7 +693,9 @@ impl StreamProcessor {
                 .map(|_| Vec::with_capacity(output_capacity_frames))
                 .collect(),
             wsola_overlay_pos: 0,
-        }
+        };
+        processor.refresh_artifact_state();
+        processor
     }
 
     /// Creates PhaseVocoder instances for each channel.
@@ -708,6 +772,9 @@ impl StreamProcessor {
                 });
             }
             output.extend_from_slice(input);
+            self.passthrough_frames_total = self
+                .passthrough_frames_total
+                .saturating_add(input.len() / self.params.channels.count().max(1));
             return Ok(());
         }
 
@@ -985,7 +1052,14 @@ impl StreamProcessor {
         }
 
         self.update_vocoder_ratio();
-        self.apply_transient_scheduled_phase_reset(total_frames, num_channels);
+        // Exclusive: artifact-scheduled resets replace the online scheduler
+        // when a usable artifact is attached (never both, or transients
+        // would double-reset).
+        if self.artifact_active {
+            self.apply_artifact_scheduled_phase_reset(total_frames, num_channels);
+        } else {
+            self.apply_transient_scheduled_phase_reset(total_frames, num_channels);
+        }
 
         // Track input energy for gain compensation.
         {
@@ -1601,25 +1675,26 @@ impl StreamProcessor {
         })
     }
 
-    fn consume_processed_input(&mut self, total_frames: usize, num_channels: usize) -> usize {
+    /// Per-channel frames a render pass over `total_frames` will consume.
+    ///
+    /// Shared between `consume_processed_input` and artifact reset span math
+    /// so the two cannot drift.
+    #[inline]
+    fn frames_consumed_for(&self, total_frames: usize) -> usize {
         let hop = self.params.hop_size;
-        if hop == 0 {
+        if hop == 0 || total_frames < self.params.fft_size {
             return 0;
         }
-        let num_frames_processed = if total_frames >= self.params.fft_size {
-            (total_frames - self.params.fft_size) / hop + 1
-        } else {
-            0
-        };
-        let samples_consumed = if num_frames_processed > 0 {
-            (num_frames_processed * hop) * num_channels
-        } else {
-            0
-        };
+        ((total_frames - self.params.fft_size) / hop + 1) * hop
+    }
+
+    fn consume_processed_input(&mut self, total_frames: usize, num_channels: usize) -> usize {
+        let frames_consumed = self.frames_consumed_for(total_frames);
+        let samples_consumed = frames_consumed * num_channels;
         if samples_consumed > 0 {
             self.input_ring.discard(samples_consumed);
         }
-        num_frames_processed.saturating_mul(hop)
+        frames_consumed
     }
 
     fn interleave_to_pending(
@@ -1845,10 +1920,25 @@ impl StreamProcessor {
     }
 
     fn append_hybrid_input(&mut self, num_channels: usize) -> Result<(), StretchError> {
+        // The frames being appended start at the input ring's current
+        // absolute position (the hybrid branch consumes the whole ring
+        // right after this call, so appends and consumption stay 1:1).
+        let append_base = self.ring_start_abs();
         let mut first_ch_pushed = 0;
         for ch in 0..num_channels {
             let input = &self.channel_input_buffers[ch];
             let rb = &mut self.hybrid_state.rolling_inputs[ch];
+            if ch == 0 {
+                if rb.is_empty() && !self.hybrid_state.window_base_valid {
+                    self.hybrid_state.window_base_abs = append_base;
+                    self.hybrid_state.window_base_valid = true;
+                } else if input.len() > rb.available() {
+                    self.hybrid_state.window_base_abs = self
+                        .hybrid_state
+                        .window_base_abs
+                        .saturating_add(input.len() - rb.available());
+                }
+            }
             if input.len() > rb.available() {
                 rb.discard(input.len() - rb.available());
             }
@@ -1924,35 +2014,51 @@ impl StreamProcessor {
             }
         }
 
-        // Phase 2: For stereo M/S, detect shared transients from mid channel
-        // so both channels use identical segmentation. This prevents phase
-        // misalignment when decoded back to L/R, matching the batch path's
-        // shared onset detection in stretch_mid_side().
-        let shared_onsets: Option<(Vec<usize>, Vec<f32>)> = if num_channels == 2
-            && self.params.stereo_mode == StereoMode::MidSide
-            && !self.hybrid_state.rolling_scratch[0].is_empty()
-        {
-            let mid = &self.hybrid_state.rolling_scratch[0];
-            let fft = self.params.fft_size.min(2048);
-            let hop = self.params.hop_size.min(512);
-            let map = detect_transients_with_options(
-                mid,
-                self.params.sample_rate,
-                fft,
-                hop,
-                self.params.transient_sensitivity,
-                TransientDetectionOptions::from_stretch_params(&self.params),
-            );
-            let onsets = map.onsets.clone();
-            let strengths = if map.strengths.len() == onsets.len() {
-                map.strengths.clone()
+        // Phase 2: Build shared segmentation anchors for all channels.
+        //
+        // With a usable pre-analysis artifact, the precomputed onset/beat
+        // anchors (absolute source frames) are mapped into the rolling
+        // window — no online detection, and the mono path below skips its
+        // per-render full adaptive analysis. Without an artifact, stereo
+        // M/S falls back to detecting shared transients from the mid
+        // channel so both channels use identical segmentation (preventing
+        // phase misalignment on L/R decode, matching stretch_mid_side()).
+        let rolling_len = self.hybrid_state.rolling_scratch[0].len();
+        let shared_onsets: Option<(Vec<usize>, Vec<f32>)> =
+            if self.artifact_active && self.hybrid_state.window_base_valid && rolling_len > 0 {
+                let base = self.hybrid_state.window_base_abs;
+                let (positions, strengths) = &self.artifact_merged_anchors;
+                let start = positions.partition_point(|&p| p < base);
+                let end = positions.partition_point(|&p| p < base + rolling_len);
+                let window_onsets: Vec<usize> =
+                    positions[start..end].iter().map(|&p| p - base).collect();
+                let window_strengths: Vec<f32> = strengths[start..end].to_vec();
+                Some((window_onsets, window_strengths))
+            } else if num_channels == 2
+                && self.params.stereo_mode == StereoMode::MidSide
+                && rolling_len > 0
+            {
+                let mid = &self.hybrid_state.rolling_scratch[0];
+                let fft = self.params.fft_size.min(2048);
+                let hop = self.params.hop_size.min(512);
+                let map = detect_transients_with_options(
+                    mid,
+                    self.params.sample_rate,
+                    fft,
+                    hop,
+                    self.params.transient_sensitivity,
+                    TransientDetectionOptions::from_stretch_params(&self.params),
+                );
+                let onsets = map.onsets.clone();
+                let strengths = if map.strengths.len() == onsets.len() {
+                    map.strengths.clone()
+                } else {
+                    vec![1.0; onsets.len()]
+                };
+                Some((onsets, strengths))
             } else {
-                vec![1.0; onsets.len()]
+                None
             };
-            Some((onsets, strengths))
-        } else {
-            None
-        };
 
         // Phase 3: Process each channel and extract deltas.
         for ch in 0..num_channels {
@@ -2248,10 +2354,14 @@ impl StreamProcessor {
     pub fn transient_reset_stats(&self) -> TransientResetStats {
         let TransientSchedulerStats {
             events_detected_total,
-            reset_band_counts_total,
+            mut reset_band_counts_total,
         } = self.transient_scheduler.stats();
+        for (band, count) in reset_band_counts_total.iter_mut().enumerate() {
+            *count = count.saturating_add(self.artifact_reset_band_counts_total[band]);
+        }
         TransientResetStats {
             events_detected_total,
+            artifact_events_scheduled_total: self.artifact_events_scheduled_total,
             reset_band_counts_total,
             input_frames_consumed_total: self.input_frames_consumed_total,
         }
@@ -2406,6 +2516,13 @@ impl StreamProcessor {
         self.initialized = false;
         self.transient_scheduler.reset();
         self.input_frames_consumed_total = 0;
+        // The timeline returns to source frame 0; seek flows call
+        // `set_source_position` again after reset.
+        self.source_start_frames = 0;
+        self.passthrough_frames_total = 0;
+        self.artifact_events_scheduled_total = 0;
+        self.artifact_reset_band_counts_total = [0; 4];
+        self.reposition_artifact_cursor();
 
         self.vocoders = Self::create_vocoders(&self.params, self.params.stretch_ratio);
         self.hybrid_state.reset(
@@ -2536,9 +2653,204 @@ impl StreamProcessor {
         }
     }
 
+    /// Schedules per-band phase resets from pre-analysis artifact onsets.
+    ///
+    /// Replaces the online [`TransientEventScheduler`] when a usable artifact
+    /// is attached: the artifact's offline onsets are ground truth, so no
+    /// detection heuristics run here. Allocation-free — a monotonic cursor
+    /// over the onset slice plus band-mask accumulation.
+    ///
+    /// Reset granularity matches the online scheduler: one combined mask per
+    /// render pass, applied at the current render rather than sample-timed.
+    fn apply_artifact_scheduled_phase_reset(&mut self, total_frames: usize, num_channels: usize) {
+        if total_frames < self.params.fft_size {
+            return;
+        }
+        // Mirror the deterministic reset path's channel-count support.
+        if num_channels != 1 && num_channels != 2 {
+            return;
+        }
+
+        // The absolute source span this render pass will consume. Computed
+        // before consumption via the same arithmetic as
+        // `consume_processed_input`.
+        let span_len = self.frames_consumed_for(total_frames);
+        if span_len == 0 {
+            return;
+        }
+        let span_start = self.ring_start_abs();
+        let span_end = span_start.saturating_add(span_len);
+
+        let Some(artifact) = self.params.pre_analysis.as_ref() else {
+            return;
+        };
+        let onsets = &artifact.transient_onsets;
+        let mut cursor = self.artifact_onset_cursor;
+        let mut mask = [false; 4];
+        let mut events = 0u64;
+        while cursor < onsets.len() && onsets[cursor] < span_end {
+            // Onsets behind the span (possible after underfull warmup
+            // passes) are skipped silently.
+            if onsets[cursor] >= span_start {
+                let strength = artifact.strength_at(cursor);
+                // Upper bands always re-lock on a transient (mirrors the
+                // online scheduler's deterministic upper-band policy); low
+                // and sub-bass resets are reserved for strong hits.
+                mask[2] = true;
+                mask[3] = true;
+                if strength >= ARTIFACT_LOW_BAND_RESET_STRENGTH {
+                    mask[1] = true;
+                }
+                if strength >= ARTIFACT_SUB_BASS_RESET_STRENGTH {
+                    mask[0] = true;
+                }
+                events += 1;
+            }
+            cursor += 1;
+        }
+        self.artifact_onset_cursor = cursor;
+        if events == 0 {
+            return;
+        }
+
+        // While a ratio/pitch slew is in flight, keep low bands phase-locked
+        // (same low-band suppression the online scheduler applies).
+        if self.modulation_hold_overlap_windows() > 0 {
+            mask[0] = false;
+            mask[1] = false;
+        }
+
+        self.artifact_events_scheduled_total =
+            self.artifact_events_scheduled_total.saturating_add(events);
+        for (band, &selected) in mask.iter().enumerate() {
+            if selected {
+                self.artifact_reset_band_counts_total[band] =
+                    self.artifact_reset_band_counts_total[band].saturating_add(1);
+            }
+        }
+
+        if num_channels == 2
+            && self.params.stereo_mode == StereoMode::MidSide
+            && self.vocoders.len() == 2
+        {
+            let (mid_mask, side_mask) = stereo_channel_reset_masks(mask);
+            self.vocoders[0].reset_phase_state_bands(mid_mask, self.params.sample_rate);
+            if side_mask.iter().any(|&b| b) {
+                self.vocoders[1].reset_phase_state_bands(side_mask, self.params.sample_rate);
+            }
+            return;
+        }
+
+        for vocoder in &mut self.vocoders {
+            vocoder.reset_phase_state_bands(mask, self.params.sample_rate);
+        }
+    }
+
     /// Returns the BPM stored in the params, if any.
     pub fn bpm(&self) -> Option<f64> {
         self.params.bpm
+    }
+
+    /// Absolute source frame of the next input frame awaiting consumption.
+    ///
+    /// This is the timeline pre-analysis artifact positions are compared
+    /// against: `source start + passthrough frames + DSP-consumed frames`.
+    #[inline]
+    fn ring_start_abs(&self) -> usize {
+        self.source_start_frames
+            .saturating_add(self.passthrough_frames_total)
+            .saturating_add(self.input_frames_consumed_total)
+    }
+
+    /// Tells the processor the absolute source frame of the next pushed
+    /// input frame.
+    ///
+    /// Call this on a fresh or freshly-[`reset`](Self::reset) processor,
+    /// before any input, when streaming starts mid-file (seek/cue rebuild
+    /// flows) so pre-analysis artifact positions stay aligned. `reset()`
+    /// returns the timeline to source frame 0; call this again afterwards
+    /// if needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StretchError::InvalidState`] once any input has been
+    /// pushed or processed.
+    pub fn set_source_position(&mut self, source_frame: usize) -> Result<(), StretchError> {
+        if self.input_frames_consumed_total > 0
+            || self.passthrough_frames_total > 0
+            || !self.input_ring.is_empty()
+            || self.dsp_engaged
+        {
+            return Err(StretchError::InvalidState(
+                "set_source_position requires a fresh or freshly-reset processor",
+            ));
+        }
+        self.source_start_frames = source_frame;
+        self.reposition_artifact_cursor();
+        Ok(())
+    }
+
+    /// Returns the absolute source frame of the next frame to be consumed.
+    pub fn source_position(&self) -> usize {
+        self.ring_start_abs()
+    }
+
+    /// Attaches or clears an offline pre-analysis artifact.
+    ///
+    /// When the artifact is usable (sample-rate match, confident, non-empty),
+    /// its beat/onset data drives transient handling instead of online
+    /// detection. This precomputes derived views and is **not** RT-safe:
+    /// call it at build/rebuild time, never from an audio callback.
+    pub fn set_pre_analysis(&mut self, artifact: Option<PreAnalysisArtifact>) {
+        self.params.pre_analysis = artifact;
+        self.refresh_artifact_state();
+    }
+
+    /// Recomputes the cached artifact gate and derived anchor views from
+    /// `params.pre_analysis`.
+    fn refresh_artifact_state(&mut self) {
+        let usable = self.params.pre_analysis.as_ref().filter(|artifact| {
+            artifact.is_usable(
+                self.params.sample_rate,
+                self.params.beat_snap_confidence_threshold,
+            )
+            // The onset cursor relies on ascending positions; artifacts from
+            // `analyze_for_dj` always satisfy this.
+            && artifact.transient_onsets.is_sorted()
+            && artifact.beat_positions.is_sorted()
+        });
+
+        match usable {
+            Some(artifact) => {
+                let strengths: Vec<f32> = (0..artifact.transient_onsets.len())
+                    .map(|i| artifact.strength_at(i))
+                    .collect();
+                self.artifact_merged_anchors = merge_onsets_and_beats(
+                    &artifact.transient_onsets,
+                    &strengths,
+                    &artifact.beat_positions,
+                    usize::MAX,
+                );
+                self.artifact_active = true;
+            }
+            None => {
+                self.artifact_merged_anchors = (Vec::new(), Vec::new());
+                self.artifact_active = false;
+            }
+        }
+        self.reposition_artifact_cursor();
+    }
+
+    /// Repositions the onset cursor to the first artifact onset at or after
+    /// the current absolute source position.
+    fn reposition_artifact_cursor(&mut self) {
+        let position = self.ring_start_abs();
+        self.artifact_onset_cursor = match self.params.pre_analysis.as_ref() {
+            Some(artifact) => artifact
+                .transient_onsets
+                .partition_point(|&onset| onset < position),
+            None => 0,
+        };
     }
 
     /// Callback-size-agnostic ratio and pitch interpolation.
@@ -2792,6 +3104,74 @@ mod tests {
             }
         }
         crossings as f64 * sample_rate as f64 / samples.len() as f64
+    }
+
+    #[test]
+    fn test_hybrid_window_base_tracks_discards() {
+        let params = StretchParams::new(1.1)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut state = HybridStreamingState::new(&params, 1.1, 4096);
+        assert!(!state.window_base_valid);
+
+        // Anchor the base as append_hybrid_input would on first append.
+        state.window_base_abs = 500;
+        state.window_base_valid = true;
+        let fill = vec![0.0f32; state.max_tail_frames + 300];
+        state.rolling_inputs[0].push_slice(&fill);
+
+        // Tail retention discards from the front and must advance the base.
+        state.retain_tail();
+        assert_eq!(state.window_base_abs, 800);
+        assert_eq!(state.rolling_inputs[0].len(), state.max_tail_frames);
+
+        // A no-op retention leaves the base untouched.
+        state.retain_tail();
+        assert_eq!(state.window_base_abs, 800);
+
+        // Rebase after a ratio change goes through the same path.
+        let drain = state.rolling_inputs[0].len();
+        state.rolling_inputs[0].discard(drain);
+        state.rolling_inputs[0].push_slice(&fill);
+        state.rebase_after_ratio_change();
+        assert_eq!(state.window_base_abs, 1100);
+
+        // A full reset invalidates the anchor.
+        state.reset(&params, 1.1, 4096);
+        assert!(!state.window_base_valid);
+        assert_eq!(state.window_base_abs, 0);
+    }
+
+    #[test]
+    fn test_append_hybrid_input_anchors_and_advances_window_base() {
+        let params = StretchParams::new(1.1)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256)
+            .with_beat_snap_confidence_threshold(0.1);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_source_position(10_000).expect("fresh position");
+
+        // First append anchors the base at the ring's absolute position.
+        proc.channel_input_buffers[0].clear();
+        proc.channel_input_buffers[0].extend_from_slice(&vec![0.0f32; 2048]);
+        proc.append_hybrid_input(1).expect("append");
+        assert!(proc.hybrid_state.window_base_valid);
+        assert_eq!(proc.hybrid_state.window_base_abs, 10_000);
+
+        // Overflow the rolling ring: the front-discard advances the base.
+        let capacity = proc.hybrid_state.rolling_inputs[0].capacity();
+        let available = proc.hybrid_state.rolling_inputs[0].available();
+        let overflow = 64usize;
+        proc.channel_input_buffers[0].clear();
+        proc.channel_input_buffers[0].extend_from_slice(&vec![0.0f32; available + overflow]);
+        // Grow the scratch buffer for this synthetic oversized append.
+        proc.channel_input_buffers[0].reserve(capacity);
+        proc.append_hybrid_input(1).expect("append with overflow");
+        assert_eq!(proc.hybrid_state.window_base_abs, 10_000 + overflow);
     }
 
     #[test]

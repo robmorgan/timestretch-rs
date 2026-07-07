@@ -20,8 +20,11 @@ external DSP dependency is [`rustfft`](https://crates.io/crates/rustfft).
   stream chunks for smoother continuity
 - **Streaming API** — process audio in chunks for real-time use with dynamic
   stretch ratio and tempo changes
-- **Offline pre-analysis pipeline** — optional reusable artifact (BPM, phase,
-  confidence, transient map) for safer beat/onset alignment at runtime
+- **Analyze-on-load pre-analysis** — analyze a track once (CLI `analyze` or
+  `analyze_for_dj`), persist the artifact (BPM, beat grid, transient onsets
+  with strengths, content hash), and every stretch path — batch and both
+  streaming engines — consumes it in place of online detection, with
+  `set_source_position` keeping onsets aligned across seeks
 - **Stereo coherence hardening** — shared onset/timing map and deterministic
   channel length agreement in mid/side mode
 - **Sub-bass phase locking** — locks phase below 120 Hz to prevent bass smearing

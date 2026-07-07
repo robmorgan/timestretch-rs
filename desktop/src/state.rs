@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use timestretch::EdmPreset;
+use timestretch::{EdmPreset, PreAnalysisArtifact};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Transport {
@@ -104,6 +104,16 @@ pub struct SharedState {
     pub seek_request: Option<usize>,
     /// Set by UI when preset changes (requires rebuilding processor).
     pub preset_changed: bool,
+
+    /// Offline pre-analysis of the loaded track (beat grid, onsets).
+    ///
+    /// Arrives asynchronously from the analysis thread after load and is
+    /// consumed at the next processor rebuild (seek/preset/EOF); running
+    /// processors are never hot-swapped.
+    pub pre_analysis: Option<Arc<PreAnalysisArtifact>>,
+    /// Bumped on every file load; a background analysis result is discarded
+    /// unless its generation still matches (guards rapid successive loads).
+    pub analysis_generation: u64,
 }
 
 impl SharedState {
@@ -122,6 +132,8 @@ impl SharedState {
             target_bpm: 0.0,
             seek_request: None,
             preset_changed: false,
+            pre_analysis: None,
+            analysis_generation: 0,
         }
     }
 

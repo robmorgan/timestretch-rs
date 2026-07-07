@@ -2194,7 +2194,15 @@ impl StretchParams {
         self
     }
 
-    /// Attaches an offline pre-analysis artifact for runtime beat snapping.
+    /// Attaches an offline pre-analysis artifact.
+    ///
+    /// When the artifact is usable (sample-rate match, confident, non-empty),
+    /// it is authoritative: online transient detection is skipped in favor of
+    /// its onset/beat data. Positions are absolute source frames, so batch
+    /// input must be the entire analyzed file starting at source frame 0;
+    /// positions past the end of the input are ignored. Streaming consumers
+    /// use `StreamProcessor::set_source_position` to stay aligned after
+    /// seeks.
     pub fn with_pre_analysis(mut self, artifact: PreAnalysisArtifact) -> Self {
         self.pre_analysis = Some(artifact);
         self
@@ -3973,6 +3981,7 @@ mod tests {
             confidence: 0.8,
             beat_positions: vec![0, 22050],
             transient_onsets: vec![0, 22050],
+            ..Default::default()
         };
         let params = StretchParams::new(1.0).with_pre_analysis(artifact.clone());
         let stored = params.pre_analysis.expect("artifact should be present");

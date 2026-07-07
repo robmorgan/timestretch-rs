@@ -340,3 +340,85 @@ fn process_into_pitch_sweep_no_heap_growth_after_warmup() {
         realloc_bytes
     );
 }
+
+#[test]
+fn process_into_with_preanalysis_artifact_no_heap_growth_after_warmup() {
+    let _guard = ALLOC_TEST_MUTEX
+        .lock()
+        .expect("allocation test mutex poisoned");
+    const SAMPLE_RATE: u32 = 44_100;
+    const CHANNELS: u32 = 2;
+    const CHUNK_FRAMES: usize = 256;
+    const WARMUP_ITERS: usize = 64;
+    const MEASURE_ITERS: usize = 96;
+
+    // A large artifact (thousands of onsets) so the cursor path is exercised
+    // across the measured span, including several scheduled resets.
+    let onset_spacing = 2048usize;
+    let transient_onsets: Vec<usize> = (1..4000).map(|i| i * onset_spacing).collect();
+    let transient_strengths = vec![0.9f32; transient_onsets.len()];
+    let beat_positions: Vec<usize> = (1..2000).map(|i| i * 20_671).collect();
+    let artifact = timestretch::PreAnalysisArtifact {
+        version: timestretch::PREANALYSIS_VERSION,
+        sample_rate: SAMPLE_RATE,
+        bpm: 128.0,
+        downbeat_offset_samples: 0,
+        confidence: 0.95,
+        beat_positions,
+        transient_onsets,
+        transient_strengths,
+        onset_band_flux: Vec::new(),
+        analysis_hop_size: 512,
+        source_len_samples: 0,
+        content_hash: 0,
+    };
+
+    let params = StretchParams::new(1.05)
+        .with_sample_rate(SAMPLE_RATE)
+        .with_channels(CHANNELS)
+        .with_preset(EdmPreset::DjBeatmatch)
+        .with_pre_analysis(artifact)
+        .with_beat_snap_confidence_threshold(0.1);
+    let mut processor = StreamProcessor::new(params);
+    processor.set_hybrid_mode(false);
+
+    let chunk = test_chunk_stereo(CHUNK_FRAMES, SAMPLE_RATE as f32);
+    let max_samples = chunk.len() * (WARMUP_ITERS + MEASURE_ITERS) * 8;
+    let mut output = Vec::with_capacity(max_samples);
+
+    for _ in 0..WARMUP_ITERS {
+        processor
+            .process_into(&chunk, &mut output)
+            .expect("warmup process_into should succeed");
+    }
+    output.clear();
+
+    begin_alloc_tracking();
+    for i in 0..MEASURE_ITERS {
+        // Exercise the modulation-hold branch of artifact scheduling too.
+        if i == MEASURE_ITERS / 2 {
+            processor
+                .set_stretch_ratio(1.08)
+                .expect("ratio change should be accepted");
+        }
+        processor
+            .process_into(&chunk, &mut output)
+            .expect("steady-state process_into should succeed");
+    }
+    let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
+
+    let stats = processor.transient_reset_stats();
+    assert!(
+        stats.artifact_events_scheduled_total > 0,
+        "artifact scheduling must have been active during the measurement"
+    );
+    assert_eq!(
+        alloc_calls + realloc_calls,
+        0,
+        "artifact-driven steady-state process_into allocated: alloc_calls={}, realloc_calls={}, alloc_bytes={}, realloc_bytes={}",
+        alloc_calls,
+        realloc_calls,
+        alloc_bytes,
+        realloc_bytes
+    );
+}

@@ -545,6 +545,72 @@ need definitions and tests even where the answer is "the host does it".
 - Keylock degrades gracefully (blend), never catastrophically.
 - 48/96 kHz produce equivalent quality metrics to 44.1 kHz.
 
+## [x] Stage 14: Analyze-on-Load Pre-Analysis Everywhere
+
+Automation: auto
+
+### Why
+
+Commercial DJ products analyze tracks once on import and let the engine
+consume the stored beatgrid/onset map; offline analysis is non-causal and
+strictly better than per-chunk online detection, and it frees realtime CPU.
+The `PreAnalysisArtifact` existed but was only consumed by batch mono beat
+snapping — no stretch path used its transient onsets, and nothing produced
+or persisted it in real workflows.
+
+### Primary Files
+
+- `src/core/preanalysis.rs`
+- `src/analysis/preanalysis.rs`
+- `src/analysis/adaptive_snapshot.rs`
+- `src/stretch/stereo.rs`
+- `src/stream/processor.rs`
+- `src/cli.rs`
+- `desktop/src/app.rs`, `desktop/src/processor.rs`
+
+### Work
+
+- Artifact schema v2: version, content binding (source length + FNV-1a
+  hash), per-onset strengths and band flux, analysis hop size; v1 JSON
+  stays readable. Gates: `is_usable` (runtime) and `matches_source`
+  (load boundary).
+- All four stretch paths consume a usable artifact authoritatively
+  (online detection skipped): batch mono, batch stereo M/S, deterministic
+  RT engine (artifact-scheduled per-band phase resets, allocation-free
+  cursor, strength-based band thresholds, modulation-hold suppression),
+  legacy hybrid re-render engine (absolute window-base tracking maps
+  artifact anchors into the rolling window; mono skips per-render
+  adaptive analysis).
+- `StreamProcessor::set_source_position` + `source_position`: absolute
+  source-frame timeline (including unity passthrough) so artifact
+  positions survive seek-rebuild flows. `set_pre_analysis` for rebuild
+  wiring; artifact telemetry in `TransientResetStats`.
+- Producers: `timestretch-cli analyze` writes a `.tsanalysis.json`
+  sidecar; `--pre-analysis` validates and warn-falls-back when stale.
+  Desktop analyzes on load in a background thread (generation-guarded),
+  caches the sidecar, threads the artifact into every processor rebuild,
+  and anchors rebuilds at the correct source position (fixing preset
+  changes mid-track implicitly rebuilding at frame 0).
+
+### Deferred Follow-Ups
+
+- Thread a sparse per-band transient map through `process_with_onsets` so
+  the artifact path keeps per-band resets in the legacy hybrid engine
+  (currently full four-band resets, matching prior streaming behavior).
+- Tempo curve (per-region BPM) in the artifact for drifting material.
+- Warm-start seek (Stage 11) builds on this stage's position bookkeeping.
+
+### Exit Criteria
+
+- All four paths consume artifacts with parity-or-better transient
+  preservation vs online detection (`tests/preanalysis_pipeline.rs`,
+  `tests/streaming_preanalysis.rs`). ✓
+- Zero-alloc steady state with a large artifact attached
+  (`tests/realtime_allocations.rs`). ✓
+- Seek-offset streaming schedules exactly the onsets past the seek point. ✓
+- CLI and desktop produce/persist/validate artifacts end-to-end. ✓
+- Version 1 artifact JSON remains readable. ✓
+
 ## Not a Priority Yet
 
 These should stay secondary until the quality roadmap above is complete:

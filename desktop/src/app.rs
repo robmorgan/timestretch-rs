@@ -136,10 +136,11 @@ impl TimeStretchApp {
                 } else {
                     String::new()
                 };
+                let num_channels = bpm_buffer.channels.count();
                 let samples = Arc::new(bpm_buffer.into_data());
 
                 // Update shared state
-                {
+                let analysis_generation = {
                     let mut st = self.state.lock().unwrap();
                     st.sample_rate = sample_rate;
                     st.total_frames = num_frames;
@@ -152,7 +153,24 @@ impl TimeStretchApp {
                     st.volume = self.volume;
                     st.preset = self.preset;
                     st.stream_profile = self.stream_profile;
-                }
+                    st.pre_analysis = None;
+                    st.analysis_generation += 1;
+                    st.analysis_generation
+                };
+
+                // Analyze-on-load: a matching sidecar is used immediately;
+                // otherwise a background thread analyzes once and caches the
+                // result next to the file. `detect_bpm_buffer` above keeps
+                // the UI BPM instant either way — the artifact upgrades
+                // subsequent processor rebuilds when it lands.
+                spawn_pre_analysis(
+                    self.state.clone(),
+                    samples.clone(),
+                    num_channels,
+                    sample_rate,
+                    sidecar_path(&path),
+                    analysis_generation,
+                );
 
                 self.source_audio = Some(samples);
                 self.file_path = Some(path);
@@ -554,4 +572,63 @@ impl TimeStretchApp {
                 ui.end_row();
             });
     }
+}
+
+/// Sidecar artifact path for a loaded audio file: `<file>.tsanalysis.json`.
+fn sidecar_path(audio_path: &std::path::Path) -> PathBuf {
+    let mut os = audio_path.as_os_str().to_os_string();
+    os.push(".tsanalysis.json");
+    PathBuf::from(os)
+}
+
+/// Loads a matching sidecar artifact or analyzes the track on a background
+/// thread, storing the result in shared state for the next processor rebuild.
+///
+/// The result is discarded if another file was loaded in the meantime
+/// (`generation` mismatch). Sidecar writes are best-effort: a read-only
+/// volume must not break analysis.
+fn spawn_pre_analysis(
+    state: SharedStateHandle,
+    samples: Arc<Vec<f32>>,
+    num_channels: usize,
+    sample_rate: u32,
+    sidecar: PathBuf,
+    generation: u64,
+) {
+    std::thread::spawn(move || {
+        let analysis_signal = timestretch::downmix_to_mid(&samples, num_channels);
+
+        let artifact = match timestretch::read_preanalysis_json(&sidecar) {
+            Ok(cached) if cached.matches_source(&analysis_signal, sample_rate) => {
+                log::info!("Pre-analysis: using cached sidecar {}", sidecar.display());
+                cached
+            }
+            _ => {
+                let start = std::time::Instant::now();
+                let fresh = timestretch::analyze_for_dj(&analysis_signal, sample_rate);
+                log::info!(
+                    "Pre-analysis: {:.1} BPM, confidence {:.2}, {} beats, {} onsets ({:.2}s)",
+                    fresh.bpm,
+                    fresh.confidence,
+                    fresh.beat_positions.len(),
+                    fresh.transient_onsets.len(),
+                    start.elapsed().as_secs_f64()
+                );
+                if let Err(e) = timestretch::write_preanalysis_json(&sidecar, &fresh) {
+                    log::warn!(
+                        "Pre-analysis: could not cache sidecar {}: {e}",
+                        sidecar.display()
+                    );
+                }
+                fresh
+            }
+        };
+
+        let mut st = state.lock().unwrap();
+        if st.analysis_generation == generation {
+            st.pre_analysis = Some(Arc::new(artifact));
+        } else {
+            log::info!("Pre-analysis: discarding stale result (newer file loaded)");
+        }
+    });
 }

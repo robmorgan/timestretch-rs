@@ -32,7 +32,7 @@ pub fn start_processing_thread(
     flush_ring: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let (mut processor, mut preroll_target_samples) = build_processor(&state, sample_rate);
+        let (mut processor, mut preroll_target_samples) = build_processor(&state, sample_rate, 0);
         let mut last_ratio = f64::NAN;
         let mut last_pitch_semi = f32::NAN;
         let mut src_pos: usize = 0;
@@ -61,7 +61,10 @@ pub fn start_processing_thread(
             };
 
             if preset_changed {
-                (processor, preroll_target_samples) = build_processor(&state, sample_rate);
+                // Rebuild at the current position (not source frame 0) so
+                // artifact positions stay aligned mid-track.
+                (processor, preroll_target_samples) =
+                    build_processor(&state, sample_rate, src_pos / CHANNELS as usize);
                 last_ratio = f64::NAN;
                 last_pitch_semi = f32::NAN;
                 flush_ring.store(true, Ordering::Release);
@@ -84,7 +87,8 @@ pub fn start_processing_thread(
 
             if let Some(seek_frame) = seek_req {
                 src_pos = (seek_frame * CHANNELS as usize).min(source_audio.len());
-                (processor, preroll_target_samples) = build_processor(&state, sample_rate);
+                (processor, preroll_target_samples) =
+                    build_processor(&state, sample_rate, src_pos / CHANNELS as usize);
                 last_ratio = f64::NAN;
                 last_pitch_semi = f32::NAN;
                 flush_ring.store(true, Ordering::Release);
@@ -119,7 +123,7 @@ pub fn start_processing_thread(
                     st.position_frames = 0;
                 }
                 src_pos = 0;
-                (processor, preroll_target_samples) = build_processor(&state, sample_rate);
+                (processor, preroll_target_samples) = build_processor(&state, sample_rate, 0);
                 last_ratio = f64::NAN;
                 last_pitch_semi = f32::NAN;
                 continue;
@@ -157,7 +161,11 @@ pub fn start_processing_thread(
     })
 }
 
-fn build_processor(state: &SharedStateHandle, sample_rate: u32) -> (StreamProcessor, usize) {
+fn build_processor(
+    state: &SharedStateHandle,
+    sample_rate: u32,
+    source_start_frames: usize,
+) -> (StreamProcessor, usize) {
     let st = state.lock().unwrap();
     let ratio = st.stretch_ratio;
     let pitch_semi = st.pitch_semitones;
@@ -166,6 +174,12 @@ fn build_processor(state: &SharedStateHandle, sample_rate: u32) -> (StreamProces
 
     let preroll = startup_preroll_target_samples(&params);
     let mut processor = StreamProcessor::new(params);
+    // Anchor the fresh processor to its position in the source so
+    // pre-analysis artifact positions stay aligned across seek/preset/EOF
+    // rebuilds. Must run before any input is pushed.
+    if let Err(err) = processor.set_source_position(source_start_frames) {
+        log::warn!("failed to set source position {source_start_frames}: {err}");
+    }
     if let Err(err) = processor.set_stretch_ratio(ratio) {
         log::warn!("failed to apply initial ratio {ratio}: {err}");
     }
@@ -226,6 +240,9 @@ fn desktop_stream_params(st: &crate::state::SharedState, sample_rate: u32) -> St
         if detected_bpm.is_finite() && detected_bpm > 0.0 {
             params = params.with_bpm(detected_bpm);
         }
+        if let Some(artifact) = st.pre_analysis.as_ref() {
+            params = params.with_pre_analysis((**artifact).clone());
+        }
         return params;
     }
 
@@ -238,6 +255,9 @@ fn desktop_stream_params(st: &crate::state::SharedState, sample_rate: u32) -> St
     }
     if st.detected_bpm.is_finite() && st.detected_bpm > 0.0 {
         params = params.with_bpm(st.detected_bpm);
+    }
+    if let Some(artifact) = st.pre_analysis.as_ref() {
+        params = params.with_pre_analysis((**artifact).clone());
     }
     params
 }
@@ -400,5 +420,40 @@ mod tests {
         assert_eq!(params.hop_size, 1024);
         assert_eq!(params.bpm, Some(124.0));
         assert!(params.normalize);
+    }
+
+    #[test]
+    fn desktop_stream_params_attach_pre_analysis_in_all_profiles() {
+        let artifact = timestretch::PreAnalysisArtifact {
+            sample_rate: 44_100,
+            bpm: 126.0,
+            confidence: 0.9,
+            beat_positions: vec![0, 21_000],
+            transient_onsets: vec![0, 21_000],
+            ..Default::default()
+        };
+
+        let mut state = SharedState::new();
+        state.detected_bpm = 126.0;
+        state.target_bpm = 128.0;
+        state.pre_analysis = Some(std::sync::Arc::new(artifact));
+
+        for profile in StreamProfile::ALL {
+            state.preset = PresetChoice::DjBeatmatch;
+            state.stream_profile = *profile;
+            let params = desktop_stream_params(&state, 44_100);
+            assert!(
+                params.pre_analysis.is_some(),
+                "profile {:?} must carry the artifact",
+                profile
+            );
+        }
+
+        state.preset = PresetChoice::HouseLoop;
+        let params = desktop_stream_params(&state, 44_100);
+        assert!(
+            params.pre_analysis.is_some(),
+            "non-DJ presets must carry the artifact too"
+        );
     }
 }
