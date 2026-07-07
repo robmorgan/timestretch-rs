@@ -56,11 +56,18 @@ const WSOLA_OVERLAY_FADE_IN_SAMPLES: usize = 128;
 /// WSOLA overlay arming enter modulation-hold. ~0.2% ratio ≈ 3.5 cents;
 /// below this a ratio seam is inaudible.
 const MODULATION_HOLD_MIN_RATIO_DELTA: f64 = 0.002;
-/// Cap on modulation overlap windows so trigger desensitization stays
-/// bounded (threshold scale <= 1.32, spike ratio <= 1.2x, cooldown extension
-/// <= 4 overlap footprints). Long gestures stay protected anyway because the
-/// in-flight delta is re-evaluated on every scheduler pass.
-const MODULATION_HOLD_MAX_OVERLAP_WINDOWS: usize = 4;
+/// Time cap on the modulation-hold budget: how long (in absolute audio time)
+/// trigger desensitization may persist after a control change. Chosen so the
+/// window cap equals the legacy 4 windows at the reference 4096-FFT /
+/// 44.1 kHz configuration; smaller FFT sizes get proportionally more (and
+/// shorter) windows covering the same time span. The scheduler scales its
+/// per-window desensitization steps by `fft/4096`, keeping the ceilings
+/// constant (threshold scale <= 1.32, spike ratio <= 1.2x). Long gestures
+/// stay protected anyway because the in-flight delta is re-evaluated on
+/// every scheduler pass.
+const MODULATION_HOLD_MAX_SECS: f64 = 0.371;
+/// Hard ceiling for the derived modulation-hold window cap.
+const MODULATION_HOLD_MAX_WINDOWS_CEILING: usize = 16;
 
 /// Minimum artifact onset strength for a low-band (100-500 Hz) phase reset.
 const ARTIFACT_LOW_BAND_RESET_STRENGTH: f32 = 0.45;
@@ -1793,7 +1800,18 @@ impl StreamProcessor {
         let tau = self.params.sample_rate.max(1) as f64 * RATIO_SMOOTHING_TIME_SECS;
         let settle_samples = tau * (delta / RATIO_SNAP_THRESHOLD).ln().max(0.0);
         ((settle_samples / self.params.fft_size.max(1) as f64).ceil() as usize)
-            .clamp(1, MODULATION_HOLD_MAX_OVERLAP_WINDOWS)
+            .clamp(1, self.modulation_hold_max_overlap_windows())
+    }
+
+    /// Time-based cap on the modulation-hold window budget: the same
+    /// absolute hold time regardless of FFT size (4 windows at the reference
+    /// 4096-FFT / 44.1 kHz configuration, 16 at 1024).
+    #[inline]
+    fn modulation_hold_max_overlap_windows(&self) -> usize {
+        let window_secs =
+            self.params.fft_size.max(1) as f64 / self.params.sample_rate.max(1) as f64;
+        ((MODULATION_HOLD_MAX_SECS / window_secs).ceil() as usize)
+            .clamp(1, MODULATION_HOLD_MAX_WINDOWS_CEILING)
     }
 
     fn reset_pitch_resamplers(&mut self) {
@@ -3301,10 +3319,48 @@ mod tests {
             large,
             small
         );
-        assert_eq!(
-            large, MODULATION_HOLD_MAX_OVERLAP_WINDOWS,
-            "a 1.0 -> 1.08 snap should hit the cap"
+        assert!(
+            large <= proc.modulation_hold_max_overlap_windows(),
+            "hold must stay within the time-based cap: {} > {}",
+            large,
+            proc.modulation_hold_max_overlap_windows()
         );
+    }
+
+    #[test]
+    fn test_modulation_hold_cap_is_time_based() {
+        // Reference configuration reproduces the legacy 4-window cap.
+        let reference = StreamProcessor::new(
+            StretchParams::new(1.0)
+                .with_sample_rate(44100)
+                .with_channels(1)
+                .with_fft_size(4096)
+                .with_hop_size(1024),
+        );
+        assert_eq!(reference.modulation_hold_max_overlap_windows(), 4);
+
+        // Smaller windows get a proportionally larger budget covering the
+        // same absolute time (~0.37 s).
+        let low_latency = StreamProcessor::new(
+            StretchParams::new(1.0)
+                .with_sample_rate(44100)
+                .with_channels(1)
+                .with_fft_size(1024)
+                .with_hop_size(256),
+        );
+        assert_eq!(low_latency.modulation_hold_max_overlap_windows(), 16);
+
+        // A 1.0 -> 1.08 snap at the reference config still hits the cap
+        // (the legacy behavior this budget was tuned for).
+        let mut proc = StreamProcessor::new(
+            StretchParams::new(1.0)
+                .with_sample_rate(44100)
+                .with_channels(1)
+                .with_fft_size(4096)
+                .with_hop_size(1024),
+        );
+        proc.set_stretch_ratio(1.08).unwrap();
+        assert_eq!(proc.modulation_hold_overlap_windows(), 4);
     }
 
     #[test]
