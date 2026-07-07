@@ -293,6 +293,13 @@ impl StreamingSincResampler {
         STREAM_SINC_HALF_TAPS
     }
 
+    /// Half-span of the kernel at the most recent step: the number of input
+    /// samples held back as lookahead. [`STREAM_SINC_HALF_TAPS`] at unity or
+    /// pitch-down, up to [`STREAM_SINC_MAX_HALF_TAPS`] when pitching up.
+    pub fn current_half_span(&self) -> usize {
+        Self::half_span_for_step(self.prev_step)
+    }
+
     /// Normalized kernel cutoff for a given step (1.0 = input Nyquist).
     ///
     /// For step <= 1 the kernel is a pure interpolator (delta at unity). For

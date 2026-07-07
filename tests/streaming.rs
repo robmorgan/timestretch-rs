@@ -785,11 +785,22 @@ fn test_streaming_normalize_with_window() {
 /// Sweeping the pitch control every callback must not produce clicks or
 /// zipper discontinuities: pitch changes glide instead of hard-resetting the
 /// pitch resampler state.
+///
+/// Runs at several stream lengths: the residual input left in the ring at
+/// flush time depends on the total length, and a flush splice bug (vocoder
+/// tails once bypassed the engaged pitch resampler) only manifested at some
+/// residue phases.
 #[test]
 fn test_streaming_pitch_sweep_no_zipper() {
+    for extra in [0usize, 512, 1536, 2560] {
+        run_pitch_sweep_no_zipper(extra);
+    }
+}
+
+fn run_pitch_sweep_no_zipper(extra_samples: usize) {
     let sample_rate = 44100u32;
     let freq = 1000.0f32;
-    let num_samples = sample_rate as usize * 2;
+    let num_samples = sample_rate as usize * 2 + extra_samples;
     let input = sine_wave(freq, sample_rate, num_samples);
 
     let params = StretchParams::new(1.0)
@@ -820,7 +831,8 @@ fn test_streaming_pitch_sweep_no_zipper() {
         let d = (w[1] - w[0]).abs();
         assert!(
             d <= max_slew,
-            "zipper/click at output sample {}: |delta| = {:.4} > {:.4}",
+            "extra={}: zipper/click at output sample {}: |delta| = {:.4} > {:.4}",
+            extra_samples,
             skip + i,
             d,
             max_slew
@@ -834,7 +846,8 @@ fn test_streaming_pitch_sweep_no_zipper() {
     let e_original = spectral_energy_at_freq(tail, sample_rate, freq);
     assert!(
         e_shifted > e_original * 2.0,
-        "expected pitch-shifted tone to dominate at stream tail: shifted={:.4} original={:.4}",
+        "extra={}: expected pitch-shifted tone to dominate at stream tail: shifted={:.4} original={:.4}",
+        extra_samples,
         e_shifted,
         e_original
     );

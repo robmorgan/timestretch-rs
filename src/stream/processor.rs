@@ -397,6 +397,41 @@ pub enum StreamPitchQuality {
     Linear,
 }
 
+/// Breakdown of a [`StreamProcessor`]'s current effective latency.
+///
+/// Produced by [`StreamProcessor::latency_report`]. All figures reflect the
+/// *current control targets*, so a ratio or pitch change updates the report
+/// at the control call, not after the ~50 ms glide.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StreamLatencyReport {
+    /// Input-buffering floor in frames: `fft_size * 3/2`.
+    pub base_gate_frames: usize,
+    /// Actual buffering gate in frames at the current target processing
+    /// ratio: equals `base_gate_frames` inside the `[0.9, 1.1]` ratio band,
+    /// `fft_size * 2` outside it.
+    pub effective_gate_frames: usize,
+    /// Kernel lookahead of the realtime pitch resampler in samples: 0 when
+    /// pitch is inactive; 16 (sinc, unity/pitch-down) up to 80 (sinc,
+    /// pitch-up); 1 for the linear fallback.
+    pub pitch_lookahead_samples: usize,
+    /// Time constant of the ratio/pitch control glide in seconds (~0.050).
+    /// Control changes become fully audible a few time constants after the
+    /// buffering delay, not instantly.
+    pub control_smoothing_secs: f64,
+    /// Sample rate the frame figures are expressed against.
+    pub sample_rate: u32,
+    /// Total effective latency in frames:
+    /// `effective_gate_frames + pitch_lookahead_samples`.
+    pub total_frames: usize,
+}
+
+impl StreamLatencyReport {
+    /// Total effective latency in seconds.
+    pub fn total_secs(&self) -> f64 {
+        self.total_frames as f64 / self.sample_rate.max(1) as f64
+    }
+}
+
 /// Aggregated transient-reset telemetry from deterministic stream processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransientResetStats {
@@ -1026,7 +1061,8 @@ impl StreamProcessor {
         }
 
         if require_min_latency {
-            let min_frames = effective_min_frames(self.params.fft_size, self.processing_ratio());
+            let min_frames =
+                effective_min_frames(self.params.fft_size, self.target_processing_ratio());
             if total_frames < min_frames {
                 return Ok(());
             }
@@ -1729,6 +1765,17 @@ impl StreamProcessor {
         self.current_ratio * self.pitch_scale
     }
 
+    /// Processing ratio at the current control targets.
+    ///
+    /// The buffering gate is computed from this rather than the glided
+    /// [`Self::processing_ratio`]: targets change only at control calls, so
+    /// the gate cannot flip while a 50 ms glide passes through the ratio
+    /// band boundary.
+    #[inline]
+    fn target_processing_ratio(&self) -> f64 {
+        self.target_ratio * self.target_pitch_scale
+    }
+
     /// Returns how many FFT-window footprints the in-flight ratio/pitch slew
     /// will span before settling to `RATIO_SNAP_THRESHOLD`, capped at
     /// `MODULATION_HOLD_MAX_OVERLAP_WINDOWS`. Zero means steady state.
@@ -1739,8 +1786,7 @@ impl StreamProcessor {
     /// control EMA reaches the snap threshold after `tau * ln(delta/snap)`
     /// samples, which this converts to FFT footprints.
     fn modulation_hold_overlap_windows(&self) -> usize {
-        let target_processing = self.target_ratio * self.target_pitch_scale;
-        let delta = (target_processing - self.processing_ratio()).abs();
+        let delta = (self.target_processing_ratio() - self.processing_ratio()).abs();
         if delta < MODULATION_HOLD_MIN_RATIO_DELTA {
             return 0;
         }
@@ -2223,7 +2269,10 @@ impl StreamProcessor {
         }
 
         self.decode_output_mid_side(num_channels, min_output_len);
-        self.interleave_to_pending(min_output_len, num_channels)
+        // Route through the pitch resampler like every other emission: with
+        // pitch engaged, the held PV overlap was rendered at the pre-resample
+        // rate, and splicing it in raw is a full-scale pitch discontinuity.
+        self.emit_channel_output_to_pending(min_output_len, num_channels)
     }
 
     /// Creates a streaming processor configured for BPM matching.
@@ -2489,14 +2538,62 @@ impl StreamProcessor {
         self.source_bpm.map(|src| src / self.target_ratio)
     }
 
-    /// Returns the minimum latency in samples.
+    /// Returns the current effective input-buffering latency in frames.
+    ///
+    /// Honest reporting: this is the real gate before output emerges — the
+    /// `fft * 3/2` floor, widened to `fft * 2` when the *target* processing
+    /// ratio (stretch ratio × pitch scale) sits outside `[0.9, 1.1]`, plus
+    /// the engaged sinc pitch resampler's kernel lookahead. Equals
+    /// `fft * 3/2` at construction with an in-band ratio and no pitch.
+    ///
+    /// See [`Self::latency_report`] for the breakdown, including the ~50 ms
+    /// control-glide time constant that governs how fast ratio/pitch changes
+    /// become audible.
     pub fn latency_samples(&self) -> usize {
-        min_latency_frames(self.params.fft_size)
+        self.latency_report().total_frames
     }
 
-    /// Returns the minimum latency in seconds.
+    /// Returns the current effective input-buffering latency in seconds.
     pub fn latency_secs(&self) -> f64 {
-        self.latency_samples() as f64 / self.params.sample_rate as f64
+        self.latency_samples() as f64 / self.params.sample_rate.max(1) as f64
+    }
+
+    /// Returns a breakdown of the processor's current effective latency.
+    ///
+    /// Pure arithmetic over current control targets — allocation-free and
+    /// safe to call from the audio thread.
+    pub fn latency_report(&self) -> StreamLatencyReport {
+        let base_gate_frames = min_latency_frames(self.params.fft_size);
+        let effective_gate_frames =
+            effective_min_frames(self.params.fft_size, self.target_processing_ratio());
+
+        // Pitch lookahead applies once the resampler is (or is about to be)
+        // in the signal path: engaged resamplers stay engaged even at unity
+        // pitch, and a non-unity target engages on the next process call.
+        let pitch_active = self.pitch_resampler_engaged
+            || (self.target_pitch_scale - 1.0).abs() > RATIO_SNAP_THRESHOLD
+            || (self.pitch_scale - 1.0).abs() > RATIO_SNAP_THRESHOLD;
+        let pitch_lookahead_samples = if !pitch_active {
+            0
+        } else {
+            match self.pitch_quality {
+                StreamPitchQuality::Sinc => self
+                    .sinc_pitch_resamplers
+                    .first()
+                    .map(|r| r.current_half_span())
+                    .unwrap_or(0),
+                StreamPitchQuality::Linear => 1,
+            }
+        };
+
+        StreamLatencyReport {
+            base_gate_frames,
+            effective_gate_frames,
+            pitch_lookahead_samples,
+            control_smoothing_secs: RATIO_SMOOTHING_TIME_SECS,
+            sample_rate: self.params.sample_rate,
+            total_frames: effective_gate_frames + pitch_lookahead_samples,
+        }
     }
 
     /// Resets the processor state.
