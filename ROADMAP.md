@@ -38,8 +38,8 @@ The repository is already beyond a toy implementation:
 - Make the RT-safe path the default, obvious path.
 - Reject malformed input instead of silently truncating or falling back.
 - Prefer reference-driven quality gates over self-comparison alone.
-- Preserve the EDM-first focus unless there is a deliberate decision to expand
-  into a broader general-purpose stretcher.
+- Preserve the EDM/DJ-first focus (settled in Stage 9); general-purpose
+  broadening is out of scope until the deck readiness stages are complete.
 
 ## [x] Stage 1: Stabilize Fast Modulation and Transition Quality
 
@@ -363,40 +363,51 @@ needs authoritative, repeatable evidence.
 - Synthetic self-regression is no longer the main quality signal.
 - Listening tests and objective benchmarks point in the same direction.
 
-## [ ] Stage 9: Decide the Product Boundary
+## [x] Stage 9: Decide the Product Boundary
 
 Automation: manual
 
 ### Why
 
-The codebase currently mixes two ambitions: "excellent EDM-focused stretcher"
-and "general-purpose production-grade library". Those are related, but not the
-same target.
+The codebase mixed two ambitions: "excellent EDM-focused stretcher" and
+"general-purpose production-grade library". Those are related, but not the
+same target, and the benchmark corpus, API defaults, and quality gates all
+depend on which one is being built.
 
-### Decision
+### Decision (settled July 2026)
 
-Make an explicit choice:
+**EDM/DJ-first.** The library exists to be the stretch engine inside a
+custom Rust DJ application, with Serato Pitch 'n Time DJ / Elastique as the
+quality bar. General-purpose broadening is explicitly out of scope until the
+DJ Deck Readiness stages are complete; if it happens at all, it happens as a
+deliberate later expansion, not as drift.
 
-- Stay EDM-first and optimize hard for DJ workflows, stereo mixes, and tempo
-  automation.
-- Or broaden into a general-purpose library and retune analysis, presets, and
-  validation around wider material classes.
+### Consequences (binding on later stages)
 
-### Impact
-
-- The right benchmark corpus depends on this choice.
-- The right API defaults depend on this choice.
-- The right quality gates depend on this choice.
-- The DJ Deck Readiness stages below are written assuming the EDM/DJ-first
-  choice; broadening instead would reprioritize them.
+- **Benchmark corpus (Stage 8):** the public CI corpus is DJ material —
+  four-on-the-floor kick patterns, house/techno loops, sustained bass,
+  vocal-over-beat, full EDM mixes. Wider material (orchestral, sparse
+  acoustic, speech) is not gated and regressions there do not block.
+- **Quality gates:** judged at DJ ratios (0.92–1.08 primary, ±20% secondary)
+  on stereo mixes, in the streaming path first — beatmatching happens there.
+  Batch-path quality on non-EDM material is best-effort.
+- **API defaults:** tuned for the DJ case — stereo M/S, DJ-ratio sweet spot,
+  beat-aware behavior on by default where confidence allows. General-purpose
+  callers adjust params; DJ callers get good behavior out of the box.
+- **Analysis tuning (Stages 3-5):** transient/beat heuristics stay tuned for
+  electronic material; adaptive analysis raises robustness *within* that
+  focus (busy mixes, vocals over beats), not toward arbitrary material.
+- **Priority order:** the DJ Deck Readiness stages (10-13) outrank the
+  remaining batch-quality stages (2-5) whenever they conflict for attention.
 
 ## DJ Deck Readiness
 
 The stages below close the gap between "quality streaming stretcher" and
 "engine a real DJ deck can be built on" (the Serato Pitch 'n Time DJ /
-Elastique bar). They assume the EDM/DJ-first outcome of Stage 9. Ordering:
-Stage 10 and Stage 11 are DJ-blocking and should follow Stage 1 directly;
-Stage 12 is the long-tail quality work; Stage 13 is completeness.
+Elastique bar). Stage 9 settled on EDM/DJ-first, so these stages are the
+priority track. Ordering: Stage 10 and Stage 11 are DJ-blocking and should
+follow Stage 1 directly; Stage 12 is the long-tail quality work; Stage 13 is
+completeness.
 
 ## [ ] Stage 10: Make Low-Latency Streaming First-Class
 
