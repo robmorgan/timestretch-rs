@@ -3,12 +3,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use timestretch::{EdmPreset, QualityMode, StreamProcessor, StretchError, StretchParams};
+use timestretch::{StreamProcessor, StretchError, StretchParams};
 
 use crate::audio_engine::RingProducer;
-use crate::state::{
-    AtomicPosition, PresetChoice, SharedStateHandle, StopFlag, StreamProfile, Transport,
-};
+use crate::state::{AtomicPosition, PresetChoice, SharedStateHandle, StopFlag, Transport};
 
 /// Fixed chunk size for desktop stream processing (in frames).
 const CHUNK_FRAMES: usize = 1024;
@@ -172,8 +170,14 @@ fn build_processor(
     let params = desktop_stream_params(&st, sample_rate);
     drop(st);
 
-    let preroll = startup_preroll_target_samples(&params);
     let mut processor = StreamProcessor::new(params);
+    let preroll = startup_preroll_target_samples(&processor);
+
+    // Publish the effective latency for the UI's profile selector.
+    {
+        let mut st = state.lock().unwrap();
+        st.reported_latency_secs = processor.latency_secs();
+    }
     // Anchor the fresh processor to its position in the source so
     // pre-analysis artifact positions stay aligned across seek/preset/EOF
     // rebuilds. Must run before any input is pushed.
@@ -209,34 +213,18 @@ fn desktop_stream_params(st: &crate::state::SharedState, sample_rate: u32) -> St
             st.stretch_ratio
         };
 
-        let mut params = match st.stream_profile {
-            // Lowest-latency profile for responsive live control.
-            StreamProfile::Live => StretchParams::new(base_ratio)
-                .with_sample_rate(sample_rate)
-                .with_channels(CHANNELS)
-                .with_quality_mode(QualityMode::LowLatency)
-                .with_fft_size(1024)
-                .with_hop_size(256)
-                .with_normalize(true),
-            // Balanced default: a 2048 FFT halves Quality's latency while
-            // closing most of the spectral gap to it (measured ~0.9966 vs
-            // 0.9996 mean spectral similarity to the source under a ratio
-            // ride; Live/1024 sits at 0.9904).
-            StreamProfile::Club => StretchParams::new(base_ratio)
-                .with_sample_rate(sample_rate)
-                .with_channels(CHANNELS)
-                .with_quality_mode(QualityMode::Balanced)
-                .with_fft_size(2048)
-                .with_hop_size(512)
-                .with_normalize(true),
-            // Higher-quality realtime profile: larger FFT and full DJ preset
-            // reduce robotic PV character at the cost of more latency/CPU.
-            StreamProfile::Quality => StretchParams::new(base_ratio)
-                .with_sample_rate(sample_rate)
-                .with_channels(CHANNELS)
-                .with_preset(EdmPreset::DjBeatmatch)
-                .with_normalize(true),
-        };
+        // Library streaming profiles: Live 1024/256 (~35 ms), Club 2048/512
+        // (~70 ms), Quality 4096/1024 (~139 ms); all carry the full DJ
+        // bundle. Measured mean spectral similarity to the source (see
+        // qa/profile_quality.rs): at steady ratio Quality 0.9991 / Club
+        // 0.9976 / Live 0.9982; under a 0.92-1.08 ratio ride Live 0.9982 /
+        // Club 0.9969 / Quality 0.9932 — smaller windows track ratio
+        // modulation faster, larger windows win at steady stretch.
+        let mut params = StretchParams::new(base_ratio)
+            .with_sample_rate(sample_rate)
+            .with_channels(CHANNELS)
+            .with_normalize(true)
+            .with_stream_profile(st.stream_profile);
         if detected_bpm.is_finite() && detected_bpm > 0.0 {
             params = params.with_bpm(detected_bpm);
         }
@@ -262,10 +250,12 @@ fn desktop_stream_params(st: &crate::state::SharedState, sample_rate: u32) -> St
     params
 }
 
-fn startup_preroll_target_samples(params: &StretchParams) -> usize {
-    let latency_frames = params.fft_size.saturating_mul(3) / 2;
+fn startup_preroll_target_samples(processor: &StreamProcessor) -> usize {
+    // Use the processor's own effective latency (gate + pitch lookahead)
+    // instead of duplicating the fft*3/2 arithmetic here.
     let callback_cushion_samples = CHUNK_FRAMES * CHANNELS as usize * START_PREROLL_CALLBACKS;
-    latency_frames
+    processor
+        .latency_samples()
         .saturating_mul(CHANNELS as usize)
         .max(callback_cushion_samples)
 }
@@ -341,7 +331,8 @@ fn push_to_ring(producer: &mut RingProducer, data: &[f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::SharedState;
+    use crate::state::{SharedState, StreamProfile};
+    use timestretch::{EdmPreset, QualityMode};
 
     #[test]
     fn desktop_dj_beatmatch_uses_low_latency_stream_profile() {
@@ -357,7 +348,9 @@ mod tests {
         assert_eq!(params.fft_size, 1024);
         assert_eq!(params.hop_size, 256);
         assert!(params.normalize);
-        assert!(params.preset.is_none());
+        // Library profiles carry the full DJ bundle at every latency tier
+        // (Stage 10) — Live no longer drops the preset tuning.
+        assert_eq!(params.preset, Some(EdmPreset::DjBeatmatch));
         assert_eq!(params.bpm, Some(126.0));
         assert!((params.stretch_ratio - (126.0 / 128.0)).abs() < 1e-9);
     }
@@ -376,7 +369,8 @@ mod tests {
         assert_eq!(params.fft_size, 2048);
         assert_eq!(params.hop_size, 512);
         assert!(params.normalize);
-        assert!(params.preset.is_none());
+        // Library profiles carry the full DJ bundle at every latency tier.
+        assert_eq!(params.preset, Some(EdmPreset::DjBeatmatch));
         assert!((params.stretch_ratio - (126.0 / 128.0)).abs() < 1e-9);
     }
 

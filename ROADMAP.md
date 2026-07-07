@@ -28,6 +28,13 @@ The repository is already beyond a toy implementation:
   and the flush-tail splices are fixed. The remaining PV ratio-step seam
   residual (≤4x a tone's natural slew on instant 8% snaps) is documented in
   Stage 1 and deferred to Stage 12.
+- Analyze-on-load pre-analysis (Stage 14, complete): tracks analyzed once
+  produce a persisted artifact consumed authoritatively by every stretch
+  path; streaming has an absolute source-position API for seek alignment.
+- Low-latency streaming is first-class (Stage 10, complete): library
+  `StreamProfile` (Live ~35 ms / Club ~70 ms / Quality ~139 ms, all carrying
+  the full DJ bundle), honest measured latency reporting, and time-based
+  scheduler tuning at small hops.
 - The main gap is not "missing DSP ideas". The main gap is the last 20%:
   tighter routing/decomposition, stricter invariants, and reference-driven
   tuning — then the DJ deck readiness stages.
@@ -409,41 +416,78 @@ priority track. Ordering: Stage 10 and Stage 11 are DJ-blocking and should
 follow Stage 1 directly; Stage 12 is the long-tail quality work; Stage 13 is
 completeness.
 
-## [ ] Stage 10: Make Low-Latency Streaming First-Class
+## [x] Stage 10: Make Low-Latency Streaming First-Class
 
 Automation: auto
 
 ### Why
 
-Default streaming latency is `fft * 3/2` = 6144 samples (~139 ms at 44.1 kHz).
-A DJ nudging against a beat needs roughly 10-40 ms control-to-audio. The
-low-latency constructor (1024 FFT, ~35 ms) exists but trades quality blindly,
-and `QualityMode` barely changes streaming DSP today, so latency and quality
-cannot be traded deliberately.
+Default streaming latency was `fft * 3/2` = 6144 samples (~139 ms at
+44.1 kHz). A DJ nudging against a beat needs roughly 10-40 ms
+control-to-audio. The low-latency constructor (1024 FFT, ~35 ms) existed but
+traded quality blindly (it silently dropped the entire DjBeatmatch tuning
+bundle), and `QualityMode` barely changed streaming DSP, so latency and
+quality could not be traded deliberately.
+
+Correction found during implementation: the original claim that the
+`fft * 2` gate "inflates latency exactly when a DJ is off-unity, which is
+always" was wrong — the wider gate applies only beyond ±10% ratio, so DJ
+ratios (0.92-1.08) always had the `fft * 3/2` floor. The real defects were
+the gate flipping mid-glide (it read the glided ratio, not the target), the
+dishonest reporting, and the untuned 1024 configuration.
 
 ### Primary Files
 
 - `src/stream/processor.rs`
+- `src/stream/transient_scheduler.rs`
 - `src/core/types.rs`
 - `desktop/src/processor.rs`
 
-### Work
+### Shipped
 
-- Make `QualityMode` meaningfully reconfigure the streaming path (FFT/hop,
-  lookahead, enabled DSP features) instead of only sizing buffers.
-- Tune the transient scheduler and the sinc pitch stage for the 1024-FFT
-  low-latency profile so it is a supported mode, not a degraded one.
-- Revisit the `effective_min_frames` gating (`fft * 2` off-unity) that
-  inflates latency exactly when a DJ is off-unity, which is always.
-- Measure and document actual control-to-audio latency per mode (ratio
-  change, pitch change, first-sample-out), not just buffer arithmetic.
+- **`StreamProfile` (Live/Club/Quality)** replaces the QualityMode idea from
+  the original stage text: profiles are the streaming latency/quality knob
+  (1024/256 ~35 ms, 2048/512 ~70 ms, 4096/1024 ~139 ms), every tier carries
+  the full DJ bundle, and `try_from_tempo_low_latency` delegates to Live.
+- **Gate correctness + honest reporting**: the buffering gate reads the
+  *target* processing ratio (no mid-glide flips at the ±10% boundary);
+  `latency_samples()`/`latency_report()` report the real gate including the
+  ratio band and sinc pitch lookahead.
+- **Time-based scheduler tuning**: cooldown (~46 ms), statistics EMA
+  (~104 ms), and the modulation-hold budget (~371 ms) derive from absolute
+  time, identical at the reference 4096/1024 configuration and correctly
+  scaled at 1024/256. Warmup stays a 3-frame statistical bootstrap.
+- **Measured latency**: `tests/streaming_latency.rs` verifies first-sample-
+  out equals the reported gate exactly (delta 0 at all profiles, in and out
+  of band) and bounds control-to-audio for ratio (gate + 50 ms glide) and
+  pitch (near-instant; resampler is post-PV). README carries the table.
+- **Latent flush bug fixed**: vocoder tails bypassed the engaged pitch
+  resampler at flush, splicing pre-resample-rate samples in (a full-scale
+  click at most stream lengths); the pitch-sweep guard now runs at four
+  lengths.
+- Desktop uses the library profiles and shows the reported latency next to
+  the profile selector; preroll derives from `latency_samples()`.
 
 ### Exit Criteria
 
-- A supported low-latency mode at or under ~40 ms with acceptable quality on
-  DJ material at typical ratios (0.92-1.08).
-- Quality modes are audibly and measurably distinct in streaming.
-- A published latency table covers each mode and control path.
+- Live profile at ~35 ms in-band with the full DJ bundle; click-free under
+  nudge/ride/snap torture and zero-alloc in steady state. ✓
+- Profiles measurably distinct (`qa/profile_quality.rs`): steady-ratio
+  similarity Quality 0.9991 / Club 0.9976 / Live 0.9982; under a 0.92-1.08
+  ride Live 0.9982 / Club 0.9969 / Quality 0.9932 (small windows track
+  modulation better — Live is the control profile by measurement, not just
+  by latency). ✓
+- Published latency table (README) with measured first-sample-out and
+  control-path behavior. ✓
+
+### Deferred Follow-Ups
+
+- Sub-bass cutoff at 1024 FFT: raising 180 → 250 Hz measured only +0.0008
+  low-band similarity on synthetic bass — not adopted; revisit with real
+  material in Stage 8's corpus.
+- Gate hysteresis at the ±10% boundary if target-toggling across it ever
+  shows audible stalls (target-based gating removed the known oscillation
+  source).
 
 ## [ ] Stage 11: Warm-Start Seek, Cue, and Loop Support
 

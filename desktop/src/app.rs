@@ -531,6 +531,18 @@ impl TimeStretchApp {
                         st.stream_profile = self.stream_profile;
                         st.preset_changed = true;
                     }
+                    // Effective latency reported by the active processor
+                    // (published by the processing thread at every build).
+                    let latency_secs = self.state.lock().unwrap().reported_latency_secs;
+                    if latency_secs > 0.0 {
+                        ui.label(
+                            egui::RichText::new(format!("~{:.0} ms", latency_secs * 1000.0)).weak(),
+                        )
+                        .on_hover_text(
+                            "Effective control-to-audio buffering latency for the \
+                             selected playback profile",
+                        );
+                    }
                 });
                 ui.end_row();
 

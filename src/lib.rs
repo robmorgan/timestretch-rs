@@ -64,7 +64,7 @@ pub use core::preanalysis::{
 };
 pub use core::types::{
     AudioBuffer, Channels, CrossfadeMode, EdmPreset, EnvelopePreset, FrameIter, QualityMode,
-    Sample, StretchParams, TransientThresholdPolicy,
+    Sample, StreamProfile, StretchParams, TransientThresholdPolicy,
 };
 pub use core::window::WindowType;
 pub use error::StretchError;

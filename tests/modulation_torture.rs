@@ -129,6 +129,15 @@ fn torture_params(channels: u32) -> StretchParams {
         .with_hop_size(256)
 }
 
+/// The supported low-latency profile: same 1024/256 configuration plus the
+/// full DJ tuning bundle (Stage 10).
+fn live_profile_params(channels: u32) -> StretchParams {
+    StretchParams::new(1.0)
+        .with_sample_rate(SAMPLE_RATE)
+        .with_channels(channels)
+        .with_stream_profile(timestretch::StreamProfile::Live)
+}
+
 /// Streams `input` while driving `set_stretch_ratio` per callback from the
 /// gesture. Returns (full output including flush, pre-flush length,
 /// per-callback expected output accumulator).
@@ -156,11 +165,15 @@ fn stream_with_gesture(
 /// Tonal torture: gesture-modulated 220 Hz sine must stay click-free over
 /// the full output, INCLUDING the flush region.
 fn assert_tonal_torture(gesture: Gesture) {
+    assert_tonal_torture_with(gesture, torture_params(1));
+}
+
+fn assert_tonal_torture_with(gesture: Gesture, params: StretchParams) {
     let freq = 220.0f32;
     let amp = 0.5f32;
     let input = sine(freq, SAMPLE_RATE as usize * 8, amp);
 
-    let mut processor = StreamProcessor::new(torture_params(1));
+    let mut processor = StreamProcessor::new(params);
     let (output, pre_flush_len, expected) = stream_with_gesture(&mut processor, &input, 1, gesture);
 
     let scan = &output[WARMUP_SAMPLES..];
@@ -235,6 +248,21 @@ fn torture_ride_tonal_no_clicks() {
 #[test]
 fn torture_snap_tonal_no_clicks() {
     assert_tonal_torture(Gesture::Snap);
+}
+
+#[test]
+fn torture_nudge_tonal_no_clicks_live_profile() {
+    assert_tonal_torture_with(Gesture::Nudge, live_profile_params(1));
+}
+
+#[test]
+fn torture_ride_tonal_no_clicks_live_profile() {
+    assert_tonal_torture_with(Gesture::Ride, live_profile_params(1));
+}
+
+#[test]
+fn torture_snap_tonal_no_clicks_live_profile() {
+    assert_tonal_torture_with(Gesture::Snap, live_profile_params(1));
 }
 
 /// Reset-budget torture: ratio modulation must not materially change how

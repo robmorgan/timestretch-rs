@@ -82,29 +82,47 @@ fn first_sample_out_matches_reported_in_band() {
     let input = noise(SR as usize * 2);
 
     for (fft, preset) in cases {
-        let mut processor = StreamProcessor::new(config(fft, preset, 1.05));
-        let reported = processor.latency_samples();
-        let hop = processor.params().hop_size;
-        let measured = measure_first_sample_out(&mut processor, &input)
-            .unwrap_or_else(|| panic!("fft={}: no output produced", fft));
-        eprintln!(
-            "fft={} hop={} reported={} measured={} delta={}",
-            fft,
-            hop,
-            reported,
-            measured,
-            measured as isize - reported as isize
-        );
-        let tolerance = CHUNK + hop;
-        assert!(
-            measured.abs_diff(reported) <= tolerance,
-            "fft={}: measured first-sample-out {} vs reported {} exceeds tolerance {}",
-            fft,
-            measured,
-            reported,
-            tolerance
-        );
+        let processor = StreamProcessor::new(config(fft, preset, 1.05));
+        assert_first_sample_out_honest(processor, &input, &format!("fft={}", fft));
     }
+}
+
+#[test]
+fn first_sample_out_matches_reported_per_profile() {
+    let input = noise(SR as usize * 2);
+    for &profile in timestretch::StreamProfile::ALL {
+        let processor = StreamProcessor::new(
+            StretchParams::new(1.05)
+                .with_sample_rate(SR)
+                .with_channels(1)
+                .with_stream_profile(profile),
+        );
+        assert_first_sample_out_honest(processor, &input, profile.label());
+    }
+}
+
+fn assert_first_sample_out_honest(mut processor: StreamProcessor, input: &[f32], label: &str) {
+    let reported = processor.latency_samples();
+    let hop = processor.params().hop_size;
+    let measured = measure_first_sample_out(&mut processor, input)
+        .unwrap_or_else(|| panic!("{}: no output produced", label));
+    eprintln!(
+        "{} hop={} reported={} measured={} delta={}",
+        label,
+        hop,
+        reported,
+        measured,
+        measured as isize - reported as isize
+    );
+    let tolerance = CHUNK + hop;
+    assert!(
+        measured.abs_diff(reported) <= tolerance,
+        "{}: measured first-sample-out {} vs reported {} exceeds tolerance {}",
+        label,
+        measured,
+        reported,
+        tolerance
+    );
 }
 
 #[test]

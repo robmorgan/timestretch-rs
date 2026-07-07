@@ -171,15 +171,44 @@ println!(
 );
 ```
 
-### Low-Latency Tempo Constructor
+### Streaming Profiles & Latency
+
+Streaming latency and quality are selected together through
+`StreamProfile`. Every profile carries the full DJ tuning bundle; they
+differ only in the FFT/hop configuration that sets the buffering latency.
 
 ```rust
-use timestretch::StreamProcessor;
+use timestretch::{StreamProcessor, StreamProfile};
 
-let mut processor = StreamProcessor::try_from_tempo_low_latency(126.0, 128.0, 44100, 2)
-    .expect("valid BPM inputs");
+let mut processor =
+    StreamProcessor::try_from_tempo_with_profile(126.0, 128.0, 44100, 2, StreamProfile::Live)
+        .expect("valid BPM inputs");
 assert!(processor.latency_secs() * 1000.0 < 40.0);
+
+// Or via params: StretchParams::new(ratio).with_stream_profile(StreamProfile::Club)
+// `try_from_tempo_low_latency` is shorthand for the Live profile.
 ```
+
+Measured figures at 44.1 kHz (`tests/streaming_latency.rs` verifies that the
+first output sample appears exactly at the reported gate; `latency_samples()`
+/ `latency_report()` report the real current gate, not a formula):
+
+| Profile | FFT/hop | Buffering gate (ratio in `[0.9, 1.1]`) | Gate beyond ±10% | Steady-ratio similarity | Ratio-ride similarity |
+|---------|-----------|--------------------|--------------------|------|------|
+| Live    | 1024/256  | 1536 fr = 34.8 ms  | 2048 fr = 46.4 ms  | 0.9982 | 0.9982 |
+| Club    | 2048/512  | 3072 fr = 69.7 ms  | 4096 fr = 92.9 ms  | 0.9976 | 0.9969 |
+| Quality | 4096/1024 | 6144 fr = 139.3 ms | 8192 fr = 185.8 ms | 0.9991 | 0.9932 |
+
+Similarity = mean spectral similarity to the source on synthetic EDM material
+(`qa/profile_quality.rs`). At steady stretch the larger windows win; under a
+0.92–1.08 ratio ride the smaller windows track the modulation better — which
+is exactly why `Live` is the DJ control profile.
+
+Control-to-audio behavior (all profiles): ratio and pitch controls glide with
+a ~50 ms time constant. Pitch changes reach the output almost immediately
+(the pitch resampler sits after the vocoder, so only the glide applies, plus
+16–80 samples of sinc kernel lookahead); ratio changes take roughly the
+buffering gate plus the glide.
 
 ### Realtime Pitch Control
 

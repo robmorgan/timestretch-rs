@@ -1308,6 +1308,56 @@ pub enum QualityMode {
     MaxQuality,
 }
 
+/// First-class streaming latency/quality profile for DJ-style realtime use.
+///
+/// Each profile carries the full DJ tuning bundle (the `DjBeatmatch` preset)
+/// and selects the FFT/hop configuration that sets the streaming latency
+/// floor (`fft * 3/2` input frames at ratios within `[0.9, 1.1]`). Apply
+/// with [`StretchParams::with_stream_profile`] or construct directly via
+/// `StreamProcessor::try_from_tempo_with_profile`.
+///
+/// | Profile | FFT/hop | Latency @ 44.1 kHz (in-band) |
+/// |---------|---------|------------------------------|
+/// | Live    | 1024/256  | ~35 ms |
+/// | Club    | 2048/512  | ~70 ms |
+/// | Quality | 4096/1024 | ~139 ms |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamProfile {
+    /// Lowest latency (~35 ms at 44.1 kHz): tightest nudge feel for live
+    /// control, with the most phase-vocoder coloration on tonal material.
+    Live,
+    /// Balanced default (~70 ms): closes most of the spectral-quality gap
+    /// to `Quality` at half its latency.
+    Club,
+    /// Highest quality (~139 ms): full DJ preset at its native FFT size;
+    /// laggy controls.
+    Quality,
+}
+
+impl StreamProfile {
+    /// All profiles, ordered lowest to highest latency.
+    pub const ALL: &'static [StreamProfile] = &[
+        StreamProfile::Live,
+        StreamProfile::Club,
+        StreamProfile::Quality,
+    ];
+
+    /// Short human-readable name.
+    pub fn label(&self) -> &'static str {
+        match self {
+            StreamProfile::Live => "Live",
+            StreamProfile::Club => "Club",
+            StreamProfile::Quality => "Quality",
+        }
+    }
+}
+
+impl std::fmt::Display for StreamProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 /// Formant/envelope preservation profile for pitch and timbre-sensitive material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvelopePreset {
@@ -1833,6 +1883,36 @@ impl StretchParams {
             }
         }
         self
+    }
+
+    /// Applies a streaming latency/quality profile.
+    ///
+    /// Every profile starts from the full `DjBeatmatch` tuning bundle (via
+    /// [`Self::with_preset`]) and then selects the FFT/hop configuration and
+    /// streaming quality mode that set the latency floor:
+    ///
+    /// - [`StreamProfile::Live`]: 1024/256, [`QualityMode::LowLatency`]
+    /// - [`StreamProfile::Club`]: 2048/512, [`QualityMode::Balanced`]
+    /// - [`StreamProfile::Quality`]: 4096/1024 (preset native), Balanced
+    ///
+    /// Call this **after** other builder methods that touch FFT size, hop
+    /// size, preset, or quality mode — it overrides them (calling
+    /// `with_preset` afterwards would revert the FFT size). It does not
+    /// touch ratio, sample rate, channels, BPM, pre-analysis, or
+    /// normalization.
+    pub fn with_stream_profile(self, profile: StreamProfile) -> Self {
+        let with_bundle = self.with_preset(EdmPreset::DjBeatmatch);
+        match profile {
+            StreamProfile::Live => with_bundle
+                .with_fft_size(1024)
+                .with_hop_size(256)
+                .with_quality_mode(QualityMode::LowLatency),
+            StreamProfile::Club => with_bundle
+                .with_fft_size(2048)
+                .with_hop_size(512)
+                .with_quality_mode(QualityMode::Balanced),
+            StreamProfile::Quality => with_bundle.with_quality_mode(QualityMode::Balanced),
+        }
     }
 
     /// Sets the EDM preset, overriding FFT size, hop size, transient sensitivity,

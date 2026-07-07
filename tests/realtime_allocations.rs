@@ -422,3 +422,55 @@ fn process_into_with_preanalysis_artifact_no_heap_growth_after_warmup() {
         realloc_bytes
     );
 }
+
+#[test]
+fn process_into_live_profile_no_heap_growth_after_warmup() {
+    let _guard = ALLOC_TEST_MUTEX
+        .lock()
+        .expect("allocation test mutex poisoned");
+    const SAMPLE_RATE: u32 = 44_100;
+    const CHUNK_FRAMES: usize = 256;
+    const WARMUP_ITERS: usize = 64;
+    const MEASURE_ITERS: usize = 96;
+
+    let params = StretchParams::new(1.05)
+        .with_sample_rate(SAMPLE_RATE)
+        .with_channels(2)
+        .with_stream_profile(timestretch::StreamProfile::Live);
+    let mut processor = StreamProcessor::new(params);
+    processor.set_hybrid_mode(false);
+
+    let chunk = test_chunk_stereo(CHUNK_FRAMES, SAMPLE_RATE as f32);
+    let max_samples = chunk.len() * (WARMUP_ITERS + MEASURE_ITERS) * 8;
+    let mut output = Vec::with_capacity(max_samples);
+
+    for _ in 0..WARMUP_ITERS {
+        processor
+            .process_into(&chunk, &mut output)
+            .expect("warmup process_into should succeed");
+    }
+    output.clear();
+
+    begin_alloc_tracking();
+    for i in 0..MEASURE_ITERS {
+        if i == MEASURE_ITERS / 2 {
+            processor
+                .set_stretch_ratio(1.08)
+                .expect("ratio change should be accepted");
+        }
+        processor
+            .process_into(&chunk, &mut output)
+            .expect("steady-state process_into should succeed");
+    }
+    let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
+
+    assert_eq!(
+        alloc_calls + realloc_calls,
+        0,
+        "Live-profile steady-state process_into allocated: alloc_calls={}, realloc_calls={}, alloc_bytes={}, realloc_bytes={}",
+        alloc_calls,
+        realloc_calls,
+        alloc_bytes,
+        realloc_bytes
+    );
+}

@@ -7,8 +7,7 @@ use crate::analysis::transient::{detect_transients_with_options, TransientDetect
 use crate::core::preanalysis::PreAnalysisArtifact;
 use crate::core::resample::{SincInterpTable, StreamingSincResampler};
 use crate::core::ring_buffer::RingBuffer;
-use crate::core::types::{QualityMode, StretchParams};
-use crate::core::window::WindowType;
+use crate::core::types::{QualityMode, StreamProfile, StretchParams};
 use crate::error::StretchError;
 use crate::stream::transient_scheduler::{TransientEventScheduler, TransientSchedulerStats};
 use crate::stretch::hybrid::HybridStretcher;
@@ -27,11 +26,6 @@ const RATIO_SMOOTHING_TIME_SECS: f64 = 0.050;
 const LATENCY_FFT_NUMERATOR: usize = 3;
 /// Denominator for the FFT-size latency fraction.
 const LATENCY_FFT_DENOMINATOR: usize = 2;
-/// FFT size used by the low-latency tempo constructor.
-const LOW_LATENCY_TEMPO_FFT_SIZE: usize = 1024;
-/// Hop size used by the low-latency tempo constructor.
-const LOW_LATENCY_TEMPO_HOP_SIZE: usize = LOW_LATENCY_TEMPO_FFT_SIZE / 4;
-
 /// Callback size assumptions for real-time capacity planning.
 const MAX_CALLBACK_FRAMES: usize = 1024;
 const MIN_CALLBACK_FRAMES: usize = 64;
@@ -2324,19 +2318,39 @@ impl StreamProcessor {
     }
 
     /// Creates a low-latency BPM-matching stream processor.
+    ///
+    /// Equivalent to [`Self::try_from_tempo_with_profile`] with
+    /// [`StreamProfile::Live`] (~35 ms at 44.1 kHz). Unlike earlier
+    /// versions, this now carries the full `DjBeatmatch` tuning bundle
+    /// instead of silently dropping it.
     pub fn try_from_tempo_low_latency(
         source_bpm: f64,
         target_bpm: f64,
         sample_rate: u32,
         channels: u32,
     ) -> Result<Self, StretchError> {
+        Self::try_from_tempo_with_profile(
+            source_bpm,
+            target_bpm,
+            sample_rate,
+            channels,
+            StreamProfile::Live,
+        )
+    }
+
+    /// Creates a BPM-matching stream processor with an explicit streaming
+    /// latency/quality profile (see [`StreamProfile`]).
+    pub fn try_from_tempo_with_profile(
+        source_bpm: f64,
+        target_bpm: f64,
+        sample_rate: u32,
+        channels: u32,
+        profile: StreamProfile,
+    ) -> Result<Self, StretchError> {
         let base = StretchParams::new(1.0)
             .with_sample_rate(sample_rate)
             .with_channels(channels)
-            .with_quality_mode(QualityMode::LowLatency)
-            .with_window_type(WindowType::Hann)
-            .with_fft_size(LOW_LATENCY_TEMPO_FFT_SIZE)
-            .with_hop_size(LOW_LATENCY_TEMPO_HOP_SIZE);
+            .with_stream_profile(profile);
         Self::try_from_tempo_with_params(source_bpm, target_bpm, base)
     }
 
@@ -3661,7 +3675,7 @@ mod tests {
     fn test_stream_processor_try_from_tempo_low_latency() {
         let proc = StreamProcessor::try_from_tempo_low_latency(126.0, 128.0, 44100, 2).unwrap();
         assert_eq!(proc.params().quality_mode, QualityMode::LowLatency);
-        assert_eq!(proc.params().fft_size, LOW_LATENCY_TEMPO_FFT_SIZE);
+        assert_eq!(proc.params().fft_size, 1024);
         assert!(
             proc.latency_secs() * 1000.0 < 40.0,
             "Expected low-latency constructor under 40ms, got {:.2}ms",
