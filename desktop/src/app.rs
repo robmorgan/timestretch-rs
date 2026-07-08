@@ -154,6 +154,8 @@ impl TimeStretchApp {
                     st.preset = self.preset;
                     st.stream_profile = self.stream_profile;
                     st.pre_analysis = None;
+                    st.loop_region = None;
+                    st.loop_in = None;
                     st.analysis_generation += 1;
                     st.analysis_generation
                 };
@@ -420,6 +422,86 @@ impl TimeStretchApp {
                 Self::format_time(pos_secs),
                 Self::format_time(duration_secs)
             ));
+        });
+
+        self.loop_and_jump_panel(ui);
+    }
+
+    /// Beat-jump buttons and loop in/out/exit controls. Jumps and loop wraps
+    /// go through the processing thread's warm-start machinery.
+    fn loop_and_jump_panel(&mut self, ui: &mut egui::Ui) {
+        let has_audio = self.source_audio.is_some();
+        let (pos_frames, total_frames, bpm, sample_rate, loop_region, loop_in) = {
+            let st = self.state.lock().unwrap();
+            (
+                st.position_frames,
+                st.total_frames,
+                st.detected_bpm,
+                st.sample_rate,
+                st.loop_region,
+                st.loop_in,
+            )
+        };
+
+        ui.horizontal(|ui| {
+            // Beat jumps: relative seeks by whole beats using the detected
+            // grid. Disabled until a tempo is known.
+            let beat_frames = if bpm > 0.0 {
+                (sample_rate as f64 * 60.0 / bpm).round() as i64
+            } else {
+                0
+            };
+            let can_jump = has_audio && beat_frames > 0 && total_frames > 0;
+            ui.label("Jump:");
+            for beats in [-16i64, -4, 4, 16] {
+                let label = if beats > 0 {
+                    format!("+{beats}")
+                } else {
+                    format!("{beats}")
+                };
+                if ui.add_enabled(can_jump, egui::Button::new(label)).clicked() {
+                    let delta = beats * beat_frames;
+                    let target =
+                        (pos_frames as i64 + delta).clamp(0, total_frames as i64 - 1) as usize;
+                    self.state.lock().unwrap().seek_request = Some(target);
+                }
+            }
+
+            ui.separator();
+
+            // Loop: set in point, then out point to arm; exit to clear.
+            ui.label("Loop:");
+            if ui.add_enabled(has_audio, egui::Button::new("In")).clicked() {
+                self.state.lock().unwrap().loop_in = Some(pos_frames);
+            }
+            let can_close = has_audio && loop_in.is_some_and(|i| pos_frames > i);
+            if ui
+                .add_enabled(can_close, egui::Button::new("Out"))
+                .clicked()
+            {
+                if let Some(start) = loop_in {
+                    let mut st = self.state.lock().unwrap();
+                    st.loop_region = Some((start, pos_frames));
+                    st.loop_in = None;
+                }
+            }
+            if ui
+                .add_enabled(loop_region.is_some(), egui::Button::new("Exit"))
+                .clicked()
+            {
+                self.state.lock().unwrap().loop_region = None;
+            }
+
+            match loop_region {
+                Some((s, e)) => {
+                    let secs = (e - s) as f64 / sample_rate.max(1) as f64;
+                    ui.monospace(format!("looping {secs:.2}s"));
+                }
+                None if loop_in.is_some() => {
+                    ui.monospace("in set…");
+                }
+                None => {}
+            }
         });
     }
 

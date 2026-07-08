@@ -45,17 +45,18 @@ pub fn start_processing_thread(
                 break;
             }
 
-            let (transport, stretch_ratio, seek_req, preset_changed, pitch_semi) = {
+            let (transport, stretch_ratio, seek_req, preset_changed, pitch_semi, loop_region) = {
                 let mut st = state.lock().unwrap();
                 let t = st.transport;
                 let r = st.stretch_ratio;
                 let s = st.seek_request.take();
                 let prc = st.preset_changed;
                 let ps = st.pitch_semitones;
+                let lr = st.loop_region;
                 if prc {
                     st.preset_changed = false;
                 }
-                (t, r, s, prc, ps)
+                (t, r, s, prc, ps, lr)
             };
 
             if preset_changed {
@@ -84,11 +85,19 @@ pub fn start_processing_thread(
             }
 
             if let Some(seek_frame) = seek_req {
-                src_pos = (seek_frame * CHANNELS as usize).min(source_audio.len());
-                (processor, preroll_target_samples) =
-                    build_processor(&state, sample_rate, src_pos / CHANNELS as usize);
-                last_ratio = f64::NAN;
-                last_pitch_semi = f32::NAN;
+                let total_frames = source_audio.len() / CHANNELS as usize;
+                let target_frame = seek_frame.min(total_frames);
+                src_pos = target_frame * CHANNELS as usize;
+                // Warm-start from the audio preceding the target so playback
+                // resumes converged (no cold buffering gap, no PV warm-up),
+                // preserving ratio/pitch control state. Fall back to a full
+                // rebuild only if priming errors.
+                if !warm_start_seek(&mut processor, &source_audio, target_frame) {
+                    (processor, preroll_target_samples) =
+                        build_processor(&state, sample_rate, target_frame);
+                    last_ratio = f64::NAN;
+                    last_pitch_semi = f32::NAN;
+                }
                 flush_ring.store(true, Ordering::Release);
                 stream_active.store(false, Ordering::Relaxed);
                 stream_started = false;
@@ -133,7 +142,22 @@ pub fn start_processing_thread(
                 continue;
             }
 
-            let end = (src_pos + chunk_samples).min(source_audio.len());
+            // Active loop: feed only up to the loop end this iteration, then
+            // splice the feed back to the loop start. `notify_source_jump`
+            // re-anchors the source timeline while the processor keeps
+            // rendering, so the wrap is gapless (no ring flush, no rebuild).
+            let loop_wrap = loop_region.and_then(|(start, end_frame)| {
+                let loop_end = end_frame * CHANNELS as usize;
+                if src_pos < loop_end && src_pos + chunk_samples >= loop_end {
+                    Some((start, loop_end))
+                } else {
+                    None
+                }
+            });
+            let end = match loop_wrap {
+                Some((_, loop_end)) => loop_end,
+                None => (src_pos + chunk_samples).min(source_audio.len()),
+            };
             let chunk = &source_audio[src_pos..end];
             src_pos = end;
 
@@ -153,10 +177,36 @@ pub fn start_processing_thread(
                 }
                 Err(e) => log::error!("Stream processing error: {e}"),
             }
+
+            if let Some((loop_start, _)) = loop_wrap {
+                src_pos = loop_start * CHANNELS as usize;
+                processor.notify_source_jump(loop_start);
+                position.store(loop_start);
+            }
         }
 
         stream_active.store(false, Ordering::Relaxed);
     })
+}
+
+/// Warm-starts `processor` at `target_frame` from the preceding source
+/// audio. Returns `false` if priming errored (caller should rebuild).
+fn warm_start_seek(
+    processor: &mut StreamProcessor,
+    source_audio: &[f32],
+    target_frame: usize,
+) -> bool {
+    let ch = CHANNELS as usize;
+    let preroll_frames = processor.warm_start_preroll_frames().min(target_frame);
+    let start = target_frame - preroll_frames;
+    let preroll = &source_audio[start * ch..target_frame * ch];
+    match processor.warm_start_seek(target_frame, preroll) {
+        Ok(()) => true,
+        Err(err) => {
+            log::warn!("warm-start seek to frame {target_frame} failed: {err}; rebuilding");
+            false
+        }
+    }
 }
 
 fn build_processor(

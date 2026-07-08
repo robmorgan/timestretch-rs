@@ -95,6 +95,14 @@ pub struct SharedState {
     /// Bumped on every file load; a background analysis result is discarded
     /// unless its generation still matches (guards rapid successive loads).
     pub analysis_generation: u64,
+
+    /// Active loop region in source frames, if looping is engaged. When set,
+    /// the processing thread wraps `[start, end)` gaplessly via the library's
+    /// warm-start machinery.
+    pub loop_region: Option<(usize, usize)>,
+    /// Loop-in point staged by the UI (source frame) before the loop-out is
+    /// set to complete a region.
+    pub loop_in: Option<usize>,
 }
 
 impl SharedState {
@@ -116,6 +124,8 @@ impl SharedState {
             reported_latency_secs: 0.0,
             pre_analysis: None,
             analysis_generation: 0,
+            loop_region: None,
+            loop_in: None,
         }
     }
 
