@@ -114,6 +114,17 @@ pub fn start_processing_thread(
                 continue;
             }
 
+            // Active loop: wrap back to the loop start once playback reaches
+            // the loop end. Checked before the EOF handler so a loop whose
+            // out point sits at the track end still wraps instead of
+            // stopping. `notify_source_jump` re-anchors the source timeline
+            // while the processor keeps rendering — gapless, no rebuild.
+            if let Some(loop_start) = loop_wrap_target(src_pos, loop_region) {
+                src_pos = loop_start * CHANNELS as usize;
+                processor.notify_source_jump(loop_start);
+                position.store(loop_start);
+            }
+
             if src_pos >= source_audio.len() {
                 let mut flushed = Vec::new();
                 reserve_flush_output_capacity(&processor, &mut flushed);
@@ -142,22 +153,10 @@ pub fn start_processing_thread(
                 continue;
             }
 
-            // Active loop: feed only up to the loop end this iteration, then
-            // splice the feed back to the loop start. `notify_source_jump`
-            // re-anchors the source timeline while the processor keeps
-            // rendering, so the wrap is gapless (no ring flush, no rebuild).
-            let loop_wrap = loop_region.and_then(|(start, end_frame)| {
-                let loop_end = end_frame * CHANNELS as usize;
-                if src_pos < loop_end && src_pos + chunk_samples >= loop_end {
-                    Some((start, loop_end))
-                } else {
-                    None
-                }
-            });
-            let end = match loop_wrap {
-                Some((_, loop_end)) => loop_end,
-                None => (src_pos + chunk_samples).min(source_audio.len()),
-            };
+            // Feed the next chunk, clamping so it never overshoots the loop
+            // end (the wrap above then fires on the following iteration).
+            let end =
+                loop_clamped_feed_end(src_pos, chunk_samples, source_audio.len(), loop_region);
             let chunk = &source_audio[src_pos..end];
             src_pos = end;
 
@@ -177,16 +176,43 @@ pub fn start_processing_thread(
                 }
                 Err(e) => log::error!("Stream processing error: {e}"),
             }
-
-            if let Some((loop_start, _)) = loop_wrap {
-                src_pos = loop_start * CHANNELS as usize;
-                processor.notify_source_jump(loop_start);
-                position.store(loop_start);
-            }
         }
 
         stream_active.store(false, Ordering::Relaxed);
     })
+}
+
+/// If an active loop's end has been reached, returns the loop-start frame to
+/// wrap to. `src_pos` is the interleaved read offset; `loop_region` is in
+/// frames. Wraps as soon as `src_pos` reaches the loop end (not only when a
+/// chunk would cross it), so a loop whose out point is set at — or behind —
+/// the current playhead still triggers.
+fn loop_wrap_target(src_pos: usize, loop_region: Option<(usize, usize)>) -> Option<usize> {
+    let (loop_start, loop_end_frame) = loop_region?;
+    if src_pos >= loop_end_frame * CHANNELS as usize {
+        Some(loop_start)
+    } else {
+        None
+    }
+}
+
+/// End (interleaved offset) of the next chunk to feed, clamped to the source
+/// length and — inside an active loop — to the loop end so the feed never
+/// overshoots.
+fn loop_clamped_feed_end(
+    src_pos: usize,
+    chunk_samples: usize,
+    source_len: usize,
+    loop_region: Option<(usize, usize)>,
+) -> usize {
+    let mut end = (src_pos + chunk_samples).min(source_len);
+    if let Some((_, loop_end_frame)) = loop_region {
+        let loop_end = loop_end_frame * CHANNELS as usize;
+        if src_pos < loop_end {
+            end = end.min(loop_end);
+        }
+    }
+    end
 }
 
 /// Warm-starts `processor` at `target_frame` from the preceding source
@@ -383,6 +409,65 @@ mod tests {
     use super::*;
     use crate::state::{SharedState, StreamProfile};
     use timestretch::{EdmPreset, QualityMode};
+
+    const CH: usize = CHANNELS as usize;
+
+    #[test]
+    fn loop_wrap_fires_when_out_set_at_playhead() {
+        // The classic bug: hitting "Out" at the current playhead means the
+        // read position already sits at the loop end, so a "crossing" test
+        // never fires. Wrapping on `>=` must still trigger.
+        let region = Some((1000usize, 2000usize));
+        assert_eq!(loop_wrap_target(2000 * CH, region), Some(1000));
+        assert_eq!(loop_wrap_target(2001 * CH, region), Some(1000)); // read-ahead past out
+        assert_eq!(loop_wrap_target(1500 * CH, region), None); // mid-loop
+        assert_eq!(loop_wrap_target(2000 * CH, None), None); // no loop
+    }
+
+    #[test]
+    fn loop_feed_end_clamps_to_loop_out() {
+        let region = Some((1000usize, 2000usize));
+        let source_len = 10_000 * CH;
+        let chunk = 512 * CH;
+        // Approaching the out point: clamp so we stop exactly at it.
+        assert_eq!(
+            loop_clamped_feed_end(1900 * CH, chunk, source_len, region),
+            2000 * CH
+        );
+        // Well inside the loop: a full chunk fits.
+        assert_eq!(
+            loop_clamped_feed_end(1000 * CH, chunk, source_len, region),
+            1512 * CH
+        );
+        // No loop: clamp only to the source length.
+        assert_eq!(
+            loop_clamped_feed_end(9800 * CH, chunk, source_len, None),
+            source_len
+        );
+    }
+
+    #[test]
+    fn loop_wrap_then_feed_cycles_the_region() {
+        // Simulate the transport: from the out point it wraps to in, then
+        // feeds chunk-by-chunk back up to out and wraps again.
+        let region = Some((1000usize, 1600usize));
+        let source_len = 10_000 * CH;
+        let chunk = 256 * CH;
+
+        let mut src = 1600 * CH; // at the out point
+        let mut wraps = 0;
+        for _ in 0..40 {
+            if let Some(start) = loop_wrap_target(src, region) {
+                src = start * CH;
+                wraps += 1;
+            }
+            let end = loop_clamped_feed_end(src, chunk, source_len, region);
+            assert!(end <= 1600 * CH, "fed past loop out: {end}");
+            assert!(end > src, "no progress");
+            src = end;
+        }
+        assert!(wraps >= 5, "loop did not cycle: {wraps} wraps");
+    }
 
     #[test]
     fn desktop_dj_beatmatch_uses_low_latency_stream_profile() {
