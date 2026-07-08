@@ -17,6 +17,8 @@ const MIN_STRETCH_RATIO: f64 = 0.25;
 const MAX_STRETCH_RATIO: f64 = 10.0;
 /// Tempo fader reaches double the track BPM (+100%).
 const MAX_TEMPO_FACTOR: f64 = 2.0;
+/// Tempo fader width in points (3x egui's ~100pt default) for fine control.
+const TEMPO_SLIDER_WIDTH: f32 = 300.0;
 
 pub struct TimeStretchApp {
     state: SharedStateHandle,
@@ -551,6 +553,9 @@ impl TimeStretchApp {
                         let min_bpm = detected / MAX_STRETCH_RATIO;
                         let max_bpm = detected * MAX_TEMPO_FACTOR;
                         let old_bpm = self.target_bpm;
+                        // Widen the fader (3x the default) so 0.1-BPM steps
+                        // are easy to hit by drag.
+                        ui.spacing_mut().slider_width = TEMPO_SLIDER_WIDTH;
                         ui.add(
                             egui::Slider::new(&mut self.target_bpm, min_bpm..=max_bpm)
                                 .step_by(0.1)
