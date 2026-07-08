@@ -27,6 +27,9 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
+      # Regression tests read fixtures from test_audio/ (gitignored, *.wav).
+      # The generator is deterministic, so regenerate them before testing.
+      - run: cargo run --example generate_test_audio
       - run: cargo test --all-targets
 
   quality-gates:
