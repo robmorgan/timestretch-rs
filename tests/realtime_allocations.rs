@@ -474,3 +474,65 @@ fn process_into_live_profile_no_heap_growth_after_warmup() {
         realloc_bytes
     );
 }
+
+#[test]
+fn warm_start_seek_no_heap_growth_after_warmup() {
+    let _guard = ALLOC_TEST_MUTEX
+        .lock()
+        .expect("allocation test mutex poisoned");
+    const SAMPLE_RATE: u32 = 44_100;
+    const CHANNELS: u32 = 2;
+    const CHUNK_FRAMES: usize = 256;
+
+    let params = StretchParams::new(1.05)
+        .with_sample_rate(SAMPLE_RATE)
+        .with_channels(CHANNELS)
+        .with_stream_profile(timestretch::StreamProfile::Live);
+    let mut processor = StreamProcessor::new(params);
+    processor.set_hybrid_mode(false);
+
+    let chunk = test_chunk_stereo(CHUNK_FRAMES, SAMPLE_RATE as f32);
+    let mut output = Vec::with_capacity(chunk.len() * 512);
+
+    // A cue point ~1 s in, with a full preroll of preceding audio.
+    let preroll_frames = processor.warm_start_preroll_frames();
+    let cue = SAMPLE_RATE as usize;
+    let preroll = test_chunk_stereo(cue, SAMPLE_RATE as f32);
+    let preroll_slice = &preroll[(cue - preroll_frames) * CHANNELS as usize..];
+
+    // Warm up the processor and every buffer the seek touches (one seek plus
+    // steady processing) so capacities are grown before measuring.
+    for _ in 0..64 {
+        processor
+            .process_into(&chunk, &mut output)
+            .expect("warmup process");
+    }
+    processor
+        .warm_start_seek(cue, preroll_slice)
+        .expect("warmup seek");
+    for _ in 0..64 {
+        processor
+            .process_into(&chunk, &mut output)
+            .expect("warmup process");
+    }
+    output.clear();
+
+    // The seek itself must not allocate in the deterministic engine.
+    begin_alloc_tracking();
+    for _ in 0..32 {
+        processor
+            .warm_start_seek(cue, preroll_slice)
+            .expect("steady-state warm_start_seek should succeed");
+    }
+    let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
+
+    assert_eq!(
+        alloc_calls + realloc_calls,
+        0,
+        "warm_start_seek allocated: alloc_calls={}, realloc_calls={}, alloc_bytes={}, realloc_bytes={}",
+        alloc_calls,
+        realloc_calls,
+        alloc_bytes,
+        realloc_bytes
+    );
+}

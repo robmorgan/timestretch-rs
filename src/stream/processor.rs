@@ -63,6 +63,11 @@ const MODULATION_HOLD_MAX_SECS: f64 = 0.371;
 /// Hard ceiling for the derived modulation-hold window cap.
 const MODULATION_HOLD_MAX_WINDOWS_CEILING: usize = 16;
 
+/// Declick fade-in applied to the first output samples after a warm-start
+/// seek (interleaved samples; ~3 ms stereo at 44.1 kHz). The caller cut the
+/// previous stream mid-waveform, so the resumed stream ramps in briefly.
+const WARM_START_FADE_SAMPLES: usize = 256;
+
 /// Minimum artifact onset strength for a low-band (100-500 Hz) phase reset.
 const ARTIFACT_LOW_BAND_RESET_STRENGTH: f32 = 0.45;
 /// Minimum artifact onset strength for a sub-bass (<100 Hz) phase reset.
@@ -519,6 +524,8 @@ pub struct StreamProcessor {
     /// Artifact onsets merged with beat anchors (absolute source frames),
     /// precomputed for the legacy hybrid re-render engine.
     artifact_merged_anchors: (Vec<usize>, Vec<f32>),
+    /// Remaining interleaved samples of the post-warm-start declick fade.
+    warm_start_fade_remaining: usize,
     /// Expected total output samples across the current stream.
     ///
     /// Accumulated from input samples and the effective interpolated ratio,
@@ -672,6 +679,7 @@ impl StreamProcessor {
             artifact_events_scheduled_total: 0,
             artifact_reset_band_counts_total: [0; 4],
             artifact_merged_anchors: (Vec::new(), Vec::new()),
+            warm_start_fade_remaining: 0,
             expected_total_output_samples: 0.0,
             total_output_emitted_samples: 0,
             pitch_scale: 1.0,
@@ -807,7 +815,23 @@ impl StreamProcessor {
                     available,
                 });
             }
-            output.extend_from_slice(input);
+            if self.warm_start_fade_remaining > 0 {
+                // Declick ramp after a unity warm-start seek; degrades the
+                // bit-exact guarantee only for the first few ms post-seek.
+                let total = WARM_START_FADE_SAMPLES as f32;
+                for &sample in input {
+                    let scaled = if self.warm_start_fade_remaining > 0 {
+                        let progress = 1.0 - self.warm_start_fade_remaining as f32 / total;
+                        self.warm_start_fade_remaining -= 1;
+                        sample * progress
+                    } else {
+                        sample
+                    };
+                    output.push(scaled);
+                }
+            } else {
+                output.extend_from_slice(input);
+            }
             self.passthrough_frames_total = self
                 .passthrough_frames_total
                 .saturating_add(input.len() / self.params.channels.count().max(1));
@@ -1968,6 +1992,20 @@ impl StreamProcessor {
                     "pending-output drain made zero progress",
                 ));
             }
+            // Declick ramp on the first output after a warm-start seek: the
+            // caller cut the old stream mid-waveform (that is what a cue
+            // jump is), so the resumed stream fades in over a few ms.
+            if self.warm_start_fade_remaining > 0 {
+                let total = WARM_START_FADE_SAMPLES as f32;
+                for sample in chunk[..n].iter_mut() {
+                    if self.warm_start_fade_remaining == 0 {
+                        break;
+                    }
+                    let progress = 1.0 - self.warm_start_fade_remaining as f32 / total;
+                    *sample *= progress;
+                    self.warm_start_fade_remaining -= 1;
+                }
+            }
             output.extend_from_slice(&chunk[..n]);
             written += n;
         }
@@ -2651,6 +2689,7 @@ impl StreamProcessor {
         self.passthrough_frames_total = 0;
         self.artifact_events_scheduled_total = 0;
         self.artifact_reset_band_counts_total = [0; 4];
+        self.warm_start_fade_remaining = 0;
         self.reposition_artifact_cursor();
 
         self.vocoders = Self::create_vocoders(&self.params, self.params.stretch_ratio);
@@ -2922,6 +2961,165 @@ impl StreamProcessor {
     /// Returns the absolute source frame of the next frame to be consumed.
     pub fn source_position(&self) -> usize {
         self.ring_start_abs()
+    }
+
+    /// Declares a gapless jump in the SOURCE timeline (a loop wrap or
+    /// beat-jump) without touching any DSP state.
+    ///
+    /// Use this when the caller splices its input feed — e.g. after pushing
+    /// audio up to a loop end, subsequent pushes come from the loop start.
+    /// The processor keeps rendering continuously (output stays as seamless
+    /// as the source splice itself); this call only re-anchors the absolute
+    /// source position so pre-analysis artifact onsets keep firing at the
+    /// right places. Frames already buffered from before the jump keep
+    /// their old positions until consumed.
+    ///
+    /// For jumps where the output pipeline is flushed (cue jumps, scrub
+    /// seeks), use [`Self::warm_start_seek`] instead.
+    pub fn notify_source_jump(&mut self, next_frame: usize) {
+        // Frames still buffered belong to pre-jump material; position the
+        // timeline so the NEXT pushed frame maps to `next_frame`.
+        let num_channels = self.params.channels.count().max(1);
+        let in_flight = self.input_ring.len() / num_channels;
+        let already_counted = self
+            .passthrough_frames_total
+            .saturating_add(self.input_frames_consumed_total)
+            .saturating_add(in_flight);
+        self.source_start_frames = next_frame.saturating_sub(already_counted);
+        self.reposition_artifact_cursor();
+    }
+
+    /// Frames of preceding audio [`Self::warm_start_seek`] wants as preroll.
+    ///
+    /// Enough to clear the input-buffering gate plus one extra FFT window
+    /// of convergence margin for the phase vocoder's overlap and the pitch
+    /// resampler's history. Bounded, so rapid cue jumps stay cheap.
+    pub fn warm_start_preroll_frames(&self) -> usize {
+        effective_min_frames(self.params.fft_size, self.target_processing_ratio())
+            .saturating_add(self.params.fft_size)
+    }
+
+    /// Re-primes the processor at a new source position from the audio
+    /// immediately preceding it, so playback resumes converged: no cold
+    /// input-buffering gate refill from silence, no phase-vocoder warm-up
+    /// transient. This is the seek/cue/loop path — commercial decks re-prime
+    /// from surrounding audio the same way.
+    ///
+    /// `target_frame` is the absolute source frame playback resumes from.
+    /// `preroll` is interleaved audio ending exactly at the target (its
+    /// last frame is source frame `target_frame - 1`). Pass
+    /// [`Self::warm_start_preroll_frames`] frames; longer prerolls are
+    /// trimmed from the front, shorter ones degrade gracefully toward a
+    /// cold start (an empty preroll is equivalent to a state clear plus
+    /// [`Self::set_source_position`]).
+    ///
+    /// Stretch-ratio and pitch control state — targets **and** in-flight
+    /// glides — is preserved; there is no re-glide from unity. Allocation-
+    /// free in the deterministic engine (the legacy hybrid re-render engine
+    /// rebuilds its rolling state, which allocates; that engine is not
+    /// RT-safe anyway). CPU cost is bounded by the preroll length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `preroll` is not whole frames, or if an internal
+    /// buffer overflows while priming. After an error the processor state
+    /// is cleared but unprimed; callers should fall back to [`Self::reset`].
+    pub fn warm_start_seek(
+        &mut self,
+        target_frame: usize,
+        preroll: &[f32],
+    ) -> Result<(), StretchError> {
+        let num_channels = self.params.channels.count().max(1);
+        if preroll.len() % num_channels != 0 {
+            return Err(StretchError::InvalidState(
+                "warm-start preroll must contain whole frames",
+            ));
+        }
+
+        // Bound CPU: keep only the most recent preroll frames, and never
+        // more than actually precede the target.
+        let max_frames = self.warm_start_preroll_frames().min(target_frame);
+        let preroll_frames = (preroll.len() / num_channels).min(max_frames);
+        let preroll = &preroll[preroll.len() - preroll_frames * num_channels..];
+        let preroll_start = target_frame - preroll_frames;
+
+        // Clear per-stream DSP state without deallocating. Energy/gain EMAs
+        // and their filter states are deliberately preserved: a seek stays
+        // within the same track, so the levels they track remain valid and
+        // the preroll refines them exactly as a continuous stream would.
+        self.input_ring.clear();
+        self.pending_output.clear();
+        for buf in &mut self.channel_input_buffers {
+            buf.clear();
+        }
+        for buf in &mut self.channel_output_buffers {
+            buf.clear();
+        }
+        for vocoder in &mut self.vocoders {
+            vocoder.reset_streaming_state();
+        }
+        self.transient_scheduler.reset();
+        self.reset_pitch_resamplers();
+        self.wsola_overlay_remaining = 0;
+        self.wsola_overlay_total = 0;
+        self.wsola_overlay_pos = 0;
+        for buf in &mut self.wsola_overlay_buffers {
+            buf.clear();
+        }
+        if self.use_hybrid {
+            // The rolling re-render window cannot survive a jump; rebuilding
+            // it allocates, which the legacy hybrid engine already does per
+            // render (documented non-RT).
+            self.hybrid_state.reset(
+                &self.params,
+                self.current_ratio,
+                self.capacity_frames_per_channel,
+            );
+            self.hybrid_pending_rebase = false;
+        }
+
+        // Timeline and accounting: the stream resumes at the preroll start;
+        // the preroll's rendered output is discarded below, and post-target
+        // output begins a fresh accounting window. The first audible output
+        // fades in briefly — the caller cut the old stream mid-waveform.
+        self.input_frames_consumed_total = 0;
+        self.passthrough_frames_total = 0;
+        self.source_start_frames = preroll_start;
+        self.reposition_artifact_cursor();
+        self.expected_total_output_samples = 0.0;
+        self.total_output_emitted_samples = 0;
+        self.initialized = true;
+        self.warm_start_fade_remaining = WARM_START_FADE_SAMPLES;
+
+        // Unity fast path: with no stretch or pitch in play, the bit-exact
+        // passthrough resumes instantly and needs no priming.
+        let unity = (self.target_ratio - 1.0).abs() < RATIO_SNAP_THRESHOLD
+            && (self.current_ratio - 1.0).abs() < RATIO_SNAP_THRESHOLD
+            && (self.pitch_scale - 1.0).abs() < RATIO_SNAP_THRESHOLD
+            && (self.target_pitch_scale - 1.0).abs() < RATIO_SNAP_THRESHOLD;
+        if unity || preroll_frames == 0 {
+            self.dsp_engaged = false;
+            self.source_start_frames = target_frame;
+            self.reposition_artifact_cursor();
+            return Ok(());
+        }
+
+        // Prime: run the preroll through the full DSP path — phase vocoder,
+        // schedulers, pitch resamplers, gain tracking — discarding the
+        // rendered output. Control glides do NOT advance: the jump is
+        // instantaneous, so no wall-clock time passes.
+        self.dsp_engaged = true;
+        let chunk_samples = MAX_CALLBACK_FRAMES * num_channels;
+        for chunk in preroll.chunks(chunk_samples) {
+            self.push_input_samples(chunk)?;
+            self.process_available_to_pending(true)?;
+            self.pending_output.clear();
+        }
+        self.pending_output.clear();
+        self.expected_total_output_samples = 0.0;
+        self.total_output_emitted_samples = 0;
+
+        Ok(())
     }
 
     /// Attaches or clears an offline pre-analysis artifact.
