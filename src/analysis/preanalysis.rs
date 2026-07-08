@@ -1,6 +1,6 @@
 //! Offline pre-analysis pipeline for DJ beat/onset alignment.
 
-use crate::analysis::beat::detect_beats;
+use crate::analysis::beat::detect_beats_from_transients;
 use crate::analysis::transient::detect_transients;
 use crate::core::preanalysis::{hash_samples, PreAnalysisArtifact, PREANALYSIS_VERSION};
 
@@ -64,7 +64,9 @@ pub fn analyze_for_dj_with_report(
     sample_rate: u32,
 ) -> (PreAnalysisArtifact, AnalysisReport) {
     let started = std::time::Instant::now();
-    let beats = detect_beats(samples, sample_rate);
+    // One detection pass drives both the onset artifact and beat tracking.
+    // Beat detection uses the same 2048/512/0.4 configuration, so a separate
+    // pass would recompute exactly this map.
     let transients = detect_transients(
         samples,
         sample_rate,
@@ -72,6 +74,7 @@ pub fn analyze_for_dj_with_report(
         PREANALYSIS_HOP_SIZE,
         PREANALYSIS_SENSITIVITY,
     );
+    let beats = detect_beats_from_transients(&transients, sample_rate);
 
     let bpm = if beats.bpm.is_finite() && beats.bpm > 0.0 {
         beats.bpm
