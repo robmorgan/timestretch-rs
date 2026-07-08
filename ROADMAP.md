@@ -35,6 +35,14 @@ The repository is already beyond a toy implementation:
   `StreamProfile` (Live ~35 ms / Club ~70 ms / Quality ~139 ms, all carrying
   the full DJ bundle), honest measured latency reporting, and time-based
   scheduler tuning at small hops.
+- Warm-start seek/cue/loop (Stage 11, complete): `warm_start_seek` re-primes
+  from preceding audio (no cold gap, no PV warm-up, control state preserved)
+  and `notify_source_jump` wraps loops gaplessly; desktop seek, beat-jump
+  buttons, and loop in/out are wired to them.
+- Analysis robustness (Stage 3, partial): a loudness-robust onset front end
+  (log-compressed flux, median+MAD threshold, energy gate) so dense mastered
+  tracks analyze correctly; tempogram beat tracking and rolling adaptive
+  analysis remain open.
 - The main gap is not "missing DSP ideas". The main gap is the last 20%:
   tighter routing/decomposition, stricter invariants, and reference-driven
   tuning — then the DJ deck readiness stages.
@@ -521,39 +529,59 @@ dishonest reporting, and the untuned 1024 configuration.
   shows audible stalls (target-based gating removed the known oscillation
   source).
 
-## [ ] Stage 11: Warm-Start Seek, Cue, and Loop Support
+## [x] Stage 11: Warm-Start Seek, Cue, and Loop Support
 
 Automation: auto
 
 ### Why
 
-DJ decks jump constantly: cue points, loops, beat jumps. Today every jump
-means `reset()` plus a cold 1.5x-FFT prebuffer and PV warm-up transient — the
-desktop app rebuilds the whole processor per seek. Commercial engines re-prime
-from surrounding audio so a jump is seamless.
+DJ decks jump constantly: cue points, loops, beat jumps. Every jump used to
+mean `reset()` (which reallocates the vocoders) plus a cold `fft*3/2`
+prebuffer refilled from silence and a PV warm-up transient — the desktop
+rebuilt the whole processor per seek. Commercial engines re-prime from
+surrounding audio so a jump is seamless.
 
 ### Primary Files
 
 - `src/stream/processor.rs`
 - `src/stretch/phase_vocoder.rs`
-- `desktop/src/processor.rs`
+- `desktop/src/processor.rs`, `desktop/src/app.rs`, `desktop/src/state.rs`
 
-### Work
+### Shipped
 
-- Add a warm-start API: prime processor state from audio preceding the seek
-  target so the first emitted frame is already converged.
-- Bound the CPU cost of a jump so rapid cue drumming stays realtime-safe.
-- Keep the warm-start path allocation-free (extend
-  `tests/realtime_allocations.rs`).
-- Preserve pitch/ratio control state across jumps (no re-glide from unity).
-- Convert the desktop app's seek handling from rebuild-processor to
-  warm-start as the reference integration.
+- `StreamProcessor::warm_start_seek(target, preroll)` re-primes at a new
+  source position by running the preceding audio through the full DSP path
+  and discarding its rendered output, so the first emitted frame is already
+  converged. Ratio/pitch control state — targets *and* in-flight glides —
+  is preserved (no re-glide from unity). A short declick fade covers the
+  mid-waveform cut.
+- `StreamProcessor::notify_source_jump(next_frame)` handles gapless loop
+  wraps (input-feed splice, timeline re-anchor only, no state reset).
+- `PhaseVocoder::reset_streaming_state` clears all per-stream state without
+  deallocating — the allocation-free equivalent of a rebuild.
+- CPU bounded by `warm_start_preroll_frames()` (gate + one FFT window);
+  the deterministic engine's warm start is allocation-free
+  (`tests/realtime_allocations.rs`). The legacy hybrid engine rebuilds its
+  rolling window (already non-RT) and is documented as such.
+- Desktop: click-to-seek and beat-jump buttons (±4/±16 beats off the
+  detected grid) use warm-start; loop in/out/exit wraps the region gaplessly
+  via `notify_source_jump`.
 
 ### Exit Criteria
 
-- Cue jumps and loop wraps produce no audible warm-up transient or gap.
-- A beat-jump/loop torture test passes clean at DJ ratios.
-- Desktop seek no longer rebuilds the processor.
+- Cue jumps and loop wraps produce no audible warm-up transient or gap. ✓
+  (`tests/warm_start.rs`: post-seek level at steady state immediately, output
+  within normal cadence, no gap.)
+- A beat-jump/loop torture test passes clean at DJ ratios. ✓ (loop-wrap seams
+  and cue-drumming click-free across ratios/profiles; click bound 6× ideal
+  slew vs the PV's measured ~4.7× ripple and a cold-restart ~40× splice.)
+- Desktop seek no longer rebuilds the processor. ✓ (warm-start, with a
+  rebuild only as an error fallback.)
+
+### Deferred Follow-Up
+
+- Allocation-free warm start in the legacy hybrid re-render engine (it
+  rebuilds its rolling window today; that engine is non-RT regardless).
 
 ## [ ] Stage 12: Port Hybrid Quality Into the Deterministic Stream Engine
 

@@ -29,6 +29,10 @@ external DSP dependency is [`rustfft`](https://crates.io/crates/rustfft).
   robust `median + k·MAD` threshold and an energy-channel gate, so dense
   mastered material yields usable onsets/BPM (where a plateau-and-multiply
   detector reads zero) while sustained tones correctly report no beat
+- **Warm-start seek/cue/loop** — `warm_start_seek` re-primes the streaming
+  processor from the audio preceding a jump so playback resumes converged
+  (no cold buffering gap, no phase-vocoder warm-up, ratio/pitch state
+  preserved); `notify_source_jump` wraps loops gaplessly
 - **Stereo coherence hardening** — shared onset/timing map and deterministic
   channel length agreement in mid/side mode
 - **Sub-bass phase locking** — locks phase below 120 Hz to prevent bass smearing
