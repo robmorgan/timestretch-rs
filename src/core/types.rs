@@ -1379,11 +1379,21 @@ pub struct TransientThresholdPolicy {
     ///
     /// Even values are rounded up to the next odd value to keep the median centered.
     pub median_window_frames: usize,
+    /// Sliding window (frames) for the median absolute deviation estimate.
+    ///
+    /// Wider than the median window for a stable dispersion estimate; even
+    /// values round up, and values below `median_window_frames` are raised
+    /// to it.
+    pub mad_window_frames: usize,
     /// Additive threshold floor to suppress near-silence false positives.
     pub threshold_floor: f32,
-    /// Sensitivity-to-threshold slope used in:
-    /// `multiplier = 1 + (1 - sensitivity) * threshold_sensitivity_slope`.
-    pub threshold_sensitivity_slope: f32,
+    /// Base deviation multiplier in the robust threshold:
+    /// `threshold = median + k * MAD + floor` with
+    /// `k = threshold_k_base + (1 - sensitivity) * threshold_k_slope`.
+    pub threshold_k_base: f32,
+    /// Sensitivity-to-k slope (see [`Self::threshold_k_base`]). Higher
+    /// sensitivity lowers k and admits more onsets.
+    pub threshold_k_slope: f32,
     /// Minimum onset spacing in frames for normal sensitivity settings.
     pub min_gap_frames: usize,
     /// Minimum onset spacing in frames when sensitivity is above
@@ -1401,10 +1411,16 @@ impl TransientThresholdPolicy {
         if window % 2 == 0 {
             window = window.saturating_add(1).min(63);
         }
+        let mut mad_window = self.mad_window_frames.clamp(window, 63);
+        if mad_window % 2 == 0 {
+            mad_window = mad_window.saturating_add(1).min(63);
+        }
         Self {
             median_window_frames: window,
+            mad_window_frames: mad_window,
             threshold_floor: self.threshold_floor.max(0.0),
-            threshold_sensitivity_slope: self.threshold_sensitivity_slope.max(0.0),
+            threshold_k_base: self.threshold_k_base.max(0.0),
+            threshold_k_slope: self.threshold_k_slope.max(0.0),
             min_gap_frames: self.min_gap_frames.clamp(1, 32),
             high_sensitivity_min_gap_frames: self.high_sensitivity_min_gap_frames.clamp(1, 32),
             high_sensitivity_split: self.high_sensitivity_split.clamp(0.0, 1.0),
@@ -1426,8 +1442,10 @@ impl Default for TransientThresholdPolicy {
     fn default() -> Self {
         Self {
             median_window_frames: DEFAULT_TRANSIENT_MEDIAN_WINDOW_FRAMES,
+            mad_window_frames: DEFAULT_TRANSIENT_MAD_WINDOW_FRAMES,
             threshold_floor: DEFAULT_TRANSIENT_THRESHOLD_FLOOR,
-            threshold_sensitivity_slope: DEFAULT_TRANSIENT_THRESHOLD_SENSITIVITY_SLOPE,
+            threshold_k_base: DEFAULT_TRANSIENT_THRESHOLD_K_BASE,
+            threshold_k_slope: DEFAULT_TRANSIENT_THRESHOLD_K_SLOPE,
             min_gap_frames: DEFAULT_TRANSIENT_MIN_GAP_FRAMES,
             high_sensitivity_min_gap_frames: DEFAULT_TRANSIENT_HIGH_SENS_MIN_GAP_FRAMES,
             high_sensitivity_split: DEFAULT_TRANSIENT_HIGH_SENS_SPLIT,
@@ -1686,12 +1704,19 @@ const DEFAULT_TRANSIENT_LOOKAHEAD_PEAK_RETAIN_RATIO: f32 = 0.30;
 const DEFAULT_TRANSIENT_STRONG_SPIKE_BYPASS_MULTIPLIER: f32 = 3.0;
 /// Default transient median window size in frames.
 const DEFAULT_TRANSIENT_MEDIAN_WINDOW_FRAMES: usize = 11;
+/// Default MAD window (wider than the median window for a stable
+/// dispersion estimate on busy material).
+const DEFAULT_TRANSIENT_MAD_WINDOW_FRAMES: usize = 21;
 /// Default transient threshold floor.
 const DEFAULT_TRANSIENT_THRESHOLD_FLOOR: f32 = 0.01;
-/// Default slope in sensitivity->threshold multiplier mapping.
-const DEFAULT_TRANSIENT_THRESHOLD_SENSITIVITY_SLOPE: f32 = 3.5;
-/// Default minimum onset gap for normal sensitivity.
-const DEFAULT_TRANSIENT_MIN_GAP_FRAMES: usize = 4;
+/// Default base deviation multiplier in `threshold = median + k*MAD + floor`.
+const DEFAULT_TRANSIENT_THRESHOLD_K_BASE: f32 = 1.5;
+/// Default sensitivity-to-k slope: `k = base + (1 - sensitivity) * slope`.
+const DEFAULT_TRANSIENT_THRESHOLD_K_SLOPE: f32 = 4.5;
+/// Default minimum onset gap for normal sensitivity (~70 ms at the 512-hop
+/// analysis rate — two detections closer than this are one physical event,
+/// e.g. a kick attack followed by its pitch-sweep hump).
+const DEFAULT_TRANSIENT_MIN_GAP_FRAMES: usize = 6;
 /// Default minimum onset gap for high sensitivity.
 const DEFAULT_TRANSIENT_HIGH_SENS_MIN_GAP_FRAMES: usize = 2;
 /// Default sensitivity split used for high-sensitivity gap mode.
@@ -2046,9 +2071,25 @@ impl StretchParams {
         self
     }
 
-    /// Sets the sensitivity-to-threshold slope.
-    pub fn with_transient_threshold_sensitivity_slope(mut self, slope: f32) -> Self {
-        self.transient_threshold_policy.threshold_sensitivity_slope = slope.max(0.0);
+    /// Sets the sensitivity-to-k slope in the robust transient threshold
+    /// `median + k * MAD + floor` (see [`TransientThresholdPolicy`]).
+    pub fn with_transient_threshold_k_slope(mut self, slope: f32) -> Self {
+        self.transient_threshold_policy.threshold_k_slope = slope.max(0.0);
+        self
+    }
+
+    /// Sets the base deviation multiplier in the robust transient threshold.
+    pub fn with_transient_threshold_k_base(mut self, base: f32) -> Self {
+        self.transient_threshold_policy.threshold_k_base = base.max(0.0);
+        self
+    }
+
+    /// Sets the transient detector MAD window size in analysis frames.
+    ///
+    /// Even values round up; values below the median window are raised to it.
+    pub fn with_transient_mad_window_frames(mut self, frames: usize) -> Self {
+        self.transient_threshold_policy.mad_window_frames = frames;
+        self.transient_threshold_policy = self.transient_threshold_policy.sanitized();
         self
     }
 
@@ -2511,7 +2552,8 @@ mod tests {
             .with_transient_strong_spike_bypass_multiplier(0.5)
             .with_transient_median_window_frames(12)
             .with_transient_threshold_floor(-1.0)
-            .with_transient_threshold_sensitivity_slope(-4.0)
+            .with_transient_threshold_k_slope(-4.0)
+            .with_transient_threshold_k_base(-2.0)
             .with_transient_min_gap_frames(0, 0)
             .with_transient_high_sensitivity_split(1.2);
 
@@ -2521,12 +2563,8 @@ mod tests {
         assert!((params.transient_strong_spike_bypass_multiplier - 1.0).abs() < 1e-6);
         assert_eq!(params.transient_threshold_policy.median_window_frames, 13);
         assert_eq!(params.transient_threshold_policy.threshold_floor, 0.0);
-        assert_eq!(
-            params
-                .transient_threshold_policy
-                .threshold_sensitivity_slope,
-            0.0
-        );
+        assert_eq!(params.transient_threshold_policy.threshold_k_slope, 0.0);
+        assert_eq!(params.transient_threshold_policy.threshold_k_base, 0.0);
         assert_eq!(params.transient_threshold_policy.min_gap_frames, 1);
         assert_eq!(
             params
@@ -2555,8 +2593,10 @@ mod tests {
     fn test_with_transient_threshold_policy_sanitizes() {
         let policy = TransientThresholdPolicy {
             median_window_frames: 0,
+            mad_window_frames: 0,
             threshold_floor: -0.5,
-            threshold_sensitivity_slope: -1.0,
+            threshold_k_base: -1.0,
+            threshold_k_slope: -1.0,
             min_gap_frames: 0,
             high_sensitivity_min_gap_frames: 99,
             high_sensitivity_split: -1.0,
@@ -2564,12 +2604,10 @@ mod tests {
         let params = StretchParams::new(1.0).with_transient_threshold_policy(policy);
         assert_eq!(params.transient_threshold_policy.median_window_frames, 1);
         assert_eq!(params.transient_threshold_policy.threshold_floor, 0.0);
-        assert_eq!(
-            params
-                .transient_threshold_policy
-                .threshold_sensitivity_slope,
-            0.0
-        );
+        assert_eq!(params.transient_threshold_policy.threshold_k_slope, 0.0);
+        assert_eq!(params.transient_threshold_policy.threshold_k_base, 0.0);
+        // mad window is raised to at least the median window (1 here).
+        assert_eq!(params.transient_threshold_policy.mad_window_frames, 1);
         assert_eq!(params.transient_threshold_policy.min_gap_frames, 1);
         assert_eq!(
             params

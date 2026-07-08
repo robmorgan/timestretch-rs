@@ -26,6 +26,28 @@ pub fn downmix_to_mid(interleaved: &[f32], channels: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Diagnostic telemetry from an offline analysis run.
+///
+/// Produced by [`analyze_for_dj_with_report`] alongside the artifact and
+/// never serialized — it exists so analysis mistakes can be inspected
+/// during tuning (onset detection function statistics, onset rate, timing).
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct AnalysisReport {
+    /// Median of the combined onset detection function (ODF).
+    pub odf_median: f32,
+    /// Median absolute deviation of the ODF around its median.
+    pub odf_mad: f32,
+    /// Maximum of the ODF.
+    pub odf_max: f32,
+    /// Number of detected transient onsets.
+    pub onset_count: usize,
+    /// Detected onsets per second of source audio.
+    pub onset_rate_per_sec: f64,
+    /// Wall-clock analysis time in seconds.
+    pub analysis_elapsed_secs: f64,
+}
+
 /// Produces a reusable beat/onset analysis artifact for runtime snapping.
 ///
 /// `samples` must be the mono analysis signal (see [`downmix_to_mid`]).
@@ -33,6 +55,15 @@ pub fn downmix_to_mid(interleaved: &[f32], channels: usize) -> Vec<f32> {
 /// artifacts can be rejected via
 /// [`PreAnalysisArtifact::matches_source`].
 pub fn analyze_for_dj(samples: &[f32], sample_rate: u32) -> PreAnalysisArtifact {
+    analyze_for_dj_with_report(samples, sample_rate).0
+}
+
+/// [`analyze_for_dj`] plus an [`AnalysisReport`] for tuning/diagnostics.
+pub fn analyze_for_dj_with_report(
+    samples: &[f32],
+    sample_rate: u32,
+) -> (PreAnalysisArtifact, AnalysisReport) {
+    let started = std::time::Instant::now();
     let beats = detect_beats(samples, sample_rate);
     let transients = detect_transients(
         samples,
@@ -76,7 +107,17 @@ pub fn analyze_for_dj(samples: &[f32], sample_rate: u32) -> PreAnalysisArtifact 
         })
         .collect();
 
-    PreAnalysisArtifact {
+    let report = AnalysisReport {
+        odf_median: median_of(&transients.flux),
+        odf_mad: mad_of(&transients.flux),
+        odf_max: transients.flux.iter().copied().fold(0.0f32, f32::max),
+        onset_count: transients.onsets.len(),
+        onset_rate_per_sec: transients.onsets.len() as f64
+            / (samples.len() as f64 / sample_rate.max(1) as f64).max(1e-9),
+        analysis_elapsed_secs: started.elapsed().as_secs_f64(),
+    };
+
+    let artifact = PreAnalysisArtifact {
         version: PREANALYSIS_VERSION,
         sample_rate,
         bpm,
@@ -89,7 +130,29 @@ pub fn analyze_for_dj(samples: &[f32], sample_rate: u32) -> PreAnalysisArtifact 
         analysis_hop_size: hop,
         source_len_samples: samples.len(),
         content_hash: hash_samples(samples),
+    };
+
+    (artifact, report)
+}
+
+/// Median of a slice (0.0 when empty).
+fn median_of(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
     }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    sorted[sorted.len() / 2]
+}
+
+/// Median absolute deviation around the median (0.0 when empty).
+fn mad_of(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let median = median_of(values);
+    let deviations: Vec<f32> = values.iter().map(|&v| (v - median).abs()).collect();
+    median_of(&deviations)
 }
 
 /// Estimates confidence from beat regularity and onset support.

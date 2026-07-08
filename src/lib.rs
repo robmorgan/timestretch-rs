@@ -57,7 +57,9 @@ pub mod stream;
 pub mod stretch;
 
 pub use analysis::beat::BeatGrid;
-pub use analysis::preanalysis::{analyze_for_dj, downmix_to_mid};
+pub use analysis::preanalysis::{
+    analyze_for_dj, analyze_for_dj_with_report, downmix_to_mid, AnalysisReport,
+};
 pub use core::preanalysis::{
     hash_samples, read_preanalysis_json, write_preanalysis_json, PreAnalysisArtifact,
     PREANALYSIS_VERSION,

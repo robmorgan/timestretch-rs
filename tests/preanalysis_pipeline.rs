@@ -183,8 +183,8 @@ fn test_batch_artifact_transient_parity_with_online_detection() {
 
     let beat_interval = 60.0 * sample_rate as f64 / bpm;
     let min_distance = (beat_interval * ratio * 0.5) as usize;
-    let peaks_online = detect_peaks(&out_online, 0.3, min_distance);
-    let peaks_artifact = detect_peaks(&out_artifact, 0.3, min_distance);
+    let peaks_online = detect_peaks(&out_online, 0.2, min_distance);
+    let peaks_artifact = detect_peaks(&out_artifact, 0.2, min_distance);
     // The artifact path must preserve at least as many transients as online
     // detection (in practice it preserves more: offline analysis is
     // non-causal, so onsets that online detection misses survive).

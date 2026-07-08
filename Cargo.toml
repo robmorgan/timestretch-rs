@@ -73,6 +73,11 @@ path = "qa/profile_quality.rs"
 required-features = ["qa-harnesses"]
 
 [[test]]
+name = "track_analysis_qa"
+path = "qa/track_analysis_qa.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
 name = "quality_gates"
 path = "tests/quality_gates.rs"
 required-features = ["qa-harnesses"]

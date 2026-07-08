@@ -395,12 +395,13 @@ fn main() {
 /// (default: a `.tsanalysis.json` sidecar next to the input file).
 fn run_analyze(args: &[String]) {
     if args.len() < 3 {
-        eprintln!("Usage: timestretch-cli analyze <input.wav> [-o <artifact.json>]");
+        eprintln!("Usage: timestretch-cli analyze <input.wav> [-o <artifact.json>] [--verbose]");
         std::process::exit(1);
     }
     let input_path = &args[2];
 
     let mut output_path: Option<String> = None;
+    let mut verbose = false;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -412,6 +413,7 @@ fn run_analyze(args: &[String]) {
                 }
                 output_path = Some(args[i].clone());
             }
+            "--verbose" | "-v" => verbose = true,
             other => {
                 eprintln!("ERROR: Unknown analyze option '{}'", other);
                 std::process::exit(1);
@@ -437,10 +439,9 @@ fn run_analyze(args: &[String]) {
         buffer.duration_secs()
     );
 
-    let start = std::time::Instant::now();
     let analysis_signal = timestretch::downmix_to_mid(&buffer.data, buffer.channels.count());
-    let artifact = timestretch::analyze_for_dj(&analysis_signal, buffer.sample_rate);
-    let elapsed = start.elapsed();
+    let (artifact, report) =
+        timestretch::analyze_for_dj_with_report(&analysis_signal, buffer.sample_rate);
 
     eprintln!(
         "Analysis: {:.1} BPM, confidence {:.2}, {} beats, {} onsets ({:.3}s)",
@@ -448,8 +449,22 @@ fn run_analyze(args: &[String]) {
         artifact.confidence,
         artifact.beat_positions.len(),
         artifact.transient_onsets.len(),
-        elapsed.as_secs_f64()
+        report.analysis_elapsed_secs
     );
+
+    if verbose {
+        println!("METRIC odf_median={:.6}", report.odf_median);
+        println!("METRIC odf_mad={:.6}", report.odf_mad);
+        println!("METRIC odf_max={:.6}", report.odf_max);
+        println!("METRIC onset_count={}", report.onset_count);
+        println!("METRIC onset_rate_per_sec={:.3}", report.onset_rate_per_sec);
+        println!(
+            "METRIC analysis_realtime_factor={:.1}",
+            buffer.duration_secs() / report.analysis_elapsed_secs.max(1e-9)
+        );
+        println!("METRIC bpm={:.2}", artifact.bpm);
+        println!("METRIC confidence={:.3}", artifact.confidence);
+    }
 
     if let Err(e) = timestretch::write_preanalysis_json(Path::new(&output_path), &artifact) {
         eprintln!("ERROR: Failed to write {}: {}", output_path, e);
