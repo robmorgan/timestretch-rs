@@ -63,6 +63,13 @@ const MODULATION_HOLD_MAX_SECS: f64 = 0.371;
 /// Hard ceiling for the derived modulation-hold window cap.
 const MODULATION_HOLD_MAX_WINDOWS_CEILING: usize = 16;
 
+/// Multiplier on the per-channel input capacity used to size the streaming
+/// output buffers. A single render over the retained input window emits up
+/// to ~`stretch_ratio` times its frame count, so this factor sets the
+/// largest ratio that will not overflow the PV output buffer (8x keeps
+/// ratios up to ~10x, i.e. down to quarter-... tenth-speed, safe).
+const OUTPUT_CAPACITY_MULTIPLIER: usize = 8;
+
 /// Declick fade-in applied to the first output samples after a warm-start
 /// seek (interleaved samples; ~3 ms stereo at 44.1 kHz). The caller cut the
 /// previous stream mid-waveform, so the resumed stream ramps in briefly.
@@ -630,8 +637,13 @@ impl StreamProcessor {
 
         let capacity_frames_per_channel = stream_capacity_frames(&params);
         let capacity_samples = capacity_frames_per_channel.saturating_mul(num_channels);
+        // Output headroom is sized for the widest supported stretch (a render
+        // over the retained input emits up to ~ratio times as many frames).
+        // The multiplier bounds the maximum usable stretch ratio: 8x the
+        // input-capacity window keeps ratios up to ~10x from overflowing the
+        // per-render PV output buffer (see `OUTPUT_CAPACITY_MULTIPLIER`).
         let output_capacity_frames = capacity_frames_per_channel
-            .saturating_mul(4)
+            .saturating_mul(OUTPUT_CAPACITY_MULTIPLIER)
             .saturating_add(params.fft_size);
         let output_capacity_samples = output_capacity_frames.saturating_mul(num_channels);
         let pitch_output_capacity_frames = output_capacity_frames.saturating_mul(2);

@@ -11,7 +11,12 @@ use crate::state::*;
 use crate::waveform::{self, WaveformPeaks};
 
 const MIN_STRETCH_RATIO: f64 = 0.25;
-const MAX_STRETCH_RATIO: f64 = 4.0;
+/// Slowest playback the streaming engine sustains cleanly on every profile
+/// (Live handles ~12x; 10x leaves margin). Sets the tempo fader's floor at
+/// `detected_bpm / 10` (~-90%, near-stop).
+const MAX_STRETCH_RATIO: f64 = 10.0;
+/// Tempo fader reaches double the track BPM (+100%).
+const MAX_TEMPO_FACTOR: f64 = 2.0;
 
 pub struct TimeStretchApp {
     state: SharedStateHandle,
@@ -38,6 +43,9 @@ pub struct TimeStretchApp {
 
     // UI state
     stretch_ratio: f64,
+    /// Target playback BPM the tempo fader binds to (0.0 until a BPM is
+    /// detected). Derived view of `stretch_ratio`, kept in sync.
+    target_bpm: f64,
     pitch_semitones: f32,
     volume: f32,
     preset: PresetChoice,
@@ -52,6 +60,21 @@ impl TimeStretchApp {
     #[inline]
     fn clamp_stretch_ratio(ratio: f64) -> f64 {
         ratio.clamp(MIN_STRETCH_RATIO, MAX_STRETCH_RATIO)
+    }
+
+    /// Sets the playback tempo to `target_bpm` (for a track at `detected_bpm`)
+    /// and syncs every derived view — stretch ratio, the fader's `target_bpm`,
+    /// and the BPM text box — to the value that actually plays after the
+    /// engine's ratio clamp. Single write point for the tempo control.
+    fn apply_target_bpm(&mut self, detected_bpm: f64, target_bpm: f64) {
+        let ratio = Self::clamp_stretch_ratio(detected_bpm / target_bpm.max(1e-6));
+        let effective_bpm = detected_bpm / ratio;
+        self.stretch_ratio = ratio;
+        self.target_bpm = effective_bpm;
+        self.target_bpm_text = format!("{effective_bpm:.1}");
+        let mut st = self.state.lock().unwrap();
+        st.stretch_ratio = ratio;
+        st.target_bpm = effective_bpm;
     }
 
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
@@ -88,6 +111,7 @@ impl TimeStretchApp {
             file_path: None,
             waveform_peaks: None,
             stretch_ratio: 1.0,
+            target_bpm: 0.0,
             pitch_semitones: 0.0,
             volume: 0.8,
             preset: PresetChoice::DjBeatmatch,
@@ -136,6 +160,10 @@ impl TimeStretchApp {
                 } else {
                     String::new()
                 };
+                // A fresh track starts at its own tempo (fader centered) and
+                // unity ratio, regardless of any prior track's settings.
+                self.stretch_ratio = 1.0;
+                self.target_bpm = bpm.max(0.0);
                 let num_channels = bpm_buffer.channels.count();
                 let samples = Arc::new(bpm_buffer.into_data());
 
@@ -510,35 +538,49 @@ impl TimeStretchApp {
             .num_columns(2)
             .spacing([16.0, 8.0])
             .show(ui, |ui| {
-                // Stretch ratio
-                ui.label("Stretch Ratio:");
+                // Tempo control. With a detected BPM it is a CDJ-style tempo
+                // fader in BPM (0.1-BPM steps, centered on the track tempo);
+                // otherwise it falls back to a raw stretch-ratio slider.
+                let detected = self.state.lock().unwrap().detected_bpm;
+                ui.label("Tempo:");
                 ui.horizontal(|ui| {
-                    let old_ratio = self.stretch_ratio;
-                    ui.add(
-                        egui::Slider::new(
-                            &mut self.stretch_ratio,
-                            MIN_STRETCH_RATIO..=MAX_STRETCH_RATIO,
-                        )
-                        .text("x")
-                        .fixed_decimals(2),
-                    );
-                    if (self.stretch_ratio - old_ratio).abs() > 0.001 {
-                        let mut st = self.state.lock().unwrap();
-                        st.stretch_ratio = self.stretch_ratio;
-                        // Update target BPM text if we have detected BPM
-                        if st.detected_bpm > 0.0 {
-                            let target = st.detected_bpm / self.stretch_ratio;
-                            self.target_bpm_text = format!("{target:.1}");
-                            st.target_bpm = target;
+                    if detected > 0.0 {
+                        if self.target_bpm <= 0.0 {
+                            self.target_bpm = detected;
                         }
-                    }
-                    if ui.button("Reset").clicked() {
-                        self.stretch_ratio = 1.0;
-                        let mut st = self.state.lock().unwrap();
-                        st.stretch_ratio = 1.0;
-                        if st.detected_bpm > 0.0 {
-                            self.target_bpm_text = format!("{:.1}", st.detected_bpm);
-                            st.target_bpm = st.detected_bpm;
+                        let min_bpm = detected / MAX_STRETCH_RATIO;
+                        let max_bpm = detected * MAX_TEMPO_FACTOR;
+                        let old_bpm = self.target_bpm;
+                        ui.add(
+                            egui::Slider::new(&mut self.target_bpm, min_bpm..=max_bpm)
+                                .step_by(0.1)
+                                .fixed_decimals(1)
+                                .suffix(" BPM"),
+                        );
+                        if (self.target_bpm - old_bpm).abs() > 0.001 {
+                            self.apply_target_bpm(detected, self.target_bpm);
+                        }
+                        let pct = (1.0 / self.stretch_ratio - 1.0) * 100.0;
+                        ui.label(egui::RichText::new(format!("{pct:+.1}%")).weak());
+                        if ui.button("Reset").clicked() {
+                            self.apply_target_bpm(detected, detected);
+                        }
+                    } else {
+                        let old_ratio = self.stretch_ratio;
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.stretch_ratio,
+                                MIN_STRETCH_RATIO..=MAX_STRETCH_RATIO,
+                            )
+                            .text("x")
+                            .fixed_decimals(2),
+                        );
+                        if (self.stretch_ratio - old_ratio).abs() > 0.001 {
+                            self.state.lock().unwrap().stretch_ratio = self.stretch_ratio;
+                        }
+                        if ui.button("Reset").clicked() {
+                            self.stretch_ratio = 1.0;
+                            self.state.lock().unwrap().stretch_ratio = 1.0;
                         }
                     }
                 });
@@ -558,14 +600,10 @@ impl TimeStretchApp {
                         );
                         if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             if let Ok(target) = self.target_bpm_text.parse::<f64>() {
-                                if target > 0.0 && detected_bpm > 0.0 {
-                                    self.stretch_ratio =
-                                        Self::clamp_stretch_ratio(detected_bpm / target);
-                                    let effective_target = detected_bpm / self.stretch_ratio;
-                                    self.target_bpm_text = format!("{effective_target:.1}");
-                                    let mut st = self.state.lock().unwrap();
-                                    st.stretch_ratio = self.stretch_ratio;
-                                    st.target_bpm = effective_target;
+                                if target > 0.0 {
+                                    // Route through the shared sync point so the
+                                    // tempo fader tracks a typed BPM too.
+                                    self.apply_target_bpm(detected_bpm, target);
                                 }
                             }
                         }
