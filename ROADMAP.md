@@ -144,9 +144,17 @@ mixed-content regions need softer treatment.
 - Exact-length output is achieved without heavy dependence on hard truncation or
   last-sample padding.
 
-## [ ] Stage 3: Upgrade Analysis from Fixed EDM Heuristics to Rolling Adaptive Analysis
+## [~] Stage 3: Upgrade Analysis from Fixed EDM Heuristics to Rolling Adaptive Analysis
 
 Automation: auto
+
+Status: **partially complete** — the loudness-robustness slice landed after
+a real track ("dense mastered club mashup") produced an empty analysis
+artifact (0 onsets, BPM 0, confidence 0), which the analyze-on-load feature
+(Stage 14) then silently no-opped on. Root cause: linear-magnitude spectral
+flux plateaued on continuously loud material and the multiplicative
+`median * 3.1` threshold sat at the signal ceiling, so no frame stood out.
+Every prior test used clicks-over-silence and never exercised that regime.
 
 ### Why
 
@@ -161,16 +169,40 @@ confidence estimates.
 - `src/analysis/adaptive_snapshot.rs`
 - `src/analysis/beat.rs`
 
-### Work
+### Shipped (loudness-robustness slice)
 
-- Replace single-resolution assumptions with rolling multi-resolution analysis.
-- Revisit fixed spectral weights and band boundaries used for transient
-  detection.
-- Make tonal, transient, and noise confidence evolve over time instead of being
-  estimated from only a narrow view of the signal.
-- Improve beat confidence so beat-aware behavior is useful outside ideal EDM
-  material.
-- Expose enough telemetry to inspect analysis mistakes during tuning.
+- Log-magnitude compression `ln(1 + gamma*mag)` in the flux/energy/phase
+  channels so onsets stay separable on dense mastered material.
+- Robust additive threshold `median + k(sensitivity)*MAD + floor` over
+  trailing windows (replacing the multiplicative threshold), with a global
+  relative floor, a MAD floor, local-peak/masking gates, and startup-frame
+  suppression.
+- Energy-channel gate: sustained tonal material (held note, pure tone) emits
+  no onsets, killing the spectral-leakage false positives that smeared pure
+  tones in the stretcher.
+- Telemetry: `AnalysisReport` (ODF median/MAD/max, onset count/rate, timing)
+  via `analyze_for_dj_with_report`, surfaced by CLI `analyze -v` and the new
+  `qa/track_analysis_qa.rs` real-track harness (scans
+  `TIMESTRETCH_TRACK_QA_DIR`, filename `<n>bpm` tag accuracy, usability gate).
+- Fixture `test_audio/dense_mastered_128bpm.wav` + `tests/dense_material_
+  regression.rs` reproduce and lock in the fix.
+- Result: the real failing track now analyzes to 123 BPM / confidence 0.90 /
+  2.9 onsets/sec; the kick fixture no longer octave-doubles.
+
+### Still Open
+
+- **Rolling multi-resolution analysis** and **time-evolving tonal/noise
+  confidence** (the original core of this stage) are untouched.
+- **Beat-tracker redesign** (tempogram over the ODF, EDM-weighted octave
+  disambiguation, widen the 100-160 BPM fold to ~70-180, tempo-salience
+  confidence). Deferred deliberately: the failing track already resolves to
+  the correct BPM with the current median-interval tracker, so this becomes
+  valuable mainly for material outside 100-160 (DnB, hip-hop). A residual
+  edge case (a 60 Hz sub-sine reporting false confidence) waits on this.
+- **Streaming scheduler parity**: `src/stream/transient_scheduler.rs` is a
+  separate incremental detector with its own `mean + 2.5*sigma` threshold and
+  a bounded version of the same dense-material blindness — not yet aligned
+  with the offline front end.
 
 ### Exit Criteria
 

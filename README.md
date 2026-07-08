@@ -25,6 +25,10 @@ external DSP dependency is [`rustfft`](https://crates.io/crates/rustfft).
   with strengths, content hash), and every stretch path — batch and both
   streaming engines — consumes it in place of online detection, with
   `set_source_position` keeping onsets aligned across seeks
+- **Loudness-robust onset detection** — log-compressed spectral flux with a
+  robust `median + k·MAD` threshold and an energy-channel gate, so dense
+  mastered material yields usable onsets/BPM (where a plateau-and-multiply
+  detector reads zero) while sustained tones correctly report no beat
 - **Stereo coherence hardening** — shared onset/timing map and deterministic
   channel length agreement in mid/side mode
 - **Sub-bass phase locking** — locks phase below 120 Hz to prevent bass smearing

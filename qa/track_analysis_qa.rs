@@ -117,17 +117,44 @@ fn track_analysis_qa() {
             duration / report.analysis_elapsed_secs.max(1e-9),
         );
 
-        // Skeleton-stage assertions: report fields must be finite. The
-        // musical assertions (onset rate band, BPM range, filename-tag
-        // accuracy, is_usable) arrive with the detection-front-end fix.
+        // Every file: report fields must be finite, and the onset rate must
+        // be sane — not the zero-onset bug, not hi-hat spam.
         assert!(report.odf_median.is_finite(), "{}: odf_median", name);
         assert!(report.odf_mad.is_finite(), "{}: odf_mad", name);
         assert!(report.odf_max.is_finite(), "{}: odf_max", name);
         assert!(artifact.bpm.is_finite(), "{}: bpm", name);
         assert!(artifact.confidence.is_finite(), "{}: confidence", name);
+        assert!(
+            (0.0..=25.0).contains(&report.onset_rate_per_sec),
+            "{}: implausible onset rate {:.2}/s",
+            name,
+            report.onset_rate_per_sec
+        );
 
+        // Files whose name carries a `<n>bpm` tag are known danceable
+        // material, so they must clear the runtime usability gate (the
+        // literal "analyze-on-load must not silently no-op" criterion) and
+        // detect a tempo within +/-2% of the tag or its half/double octave.
         if let Some(tagged) = bpm_from_filename(&name) {
             println!("METRIC track=\"{}\" filename_bpm={:.0}", name, tagged);
+            assert!(
+                artifact.is_usable(buffer.sample_rate, 0.35),
+                "{}: tagged {:.0} BPM but artifact not usable (confidence {:.2}, {} beats, {} onsets)",
+                name,
+                tagged,
+                artifact.confidence,
+                artifact.beat_positions.len(),
+                artifact.transient_onsets.len()
+            );
+            let bpm = artifact.bpm;
+            let near = |t: f64| t > 0.0 && (bpm - t).abs() / t < 0.02;
+            assert!(
+                near(tagged) || near(tagged / 2.0) || near(tagged * 2.0),
+                "{}: detected {:.1} BPM not within 2% of tagged {:.0} or an octave",
+                name,
+                bpm,
+                tagged
+            );
         }
     }
 }
