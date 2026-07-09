@@ -580,8 +580,8 @@ surrounding audio so a jump is seamless.
 
 ### Deferred Follow-Up
 
-- Allocation-free warm start in the legacy hybrid re-render engine (it
-  rebuilds its rolling window today; that engine is non-RT regardless).
+- ~~Allocation-free warm start in the legacy hybrid re-render engine.~~
+  Obsolete: the legacy hybrid streaming engine has been removed.
 
 ## [ ] Stage 12: Port Hybrid Quality Into the Deterministic Stream Engine
 
@@ -709,9 +709,9 @@ or persisted it in real workflows.
 
 ### Deferred Follow-Ups
 
-- Thread a sparse per-band transient map through `process_with_onsets` so
-  the artifact path keeps per-band resets in the legacy hybrid engine
-  (currently full four-band resets, matching prior streaming behavior).
+- ~~Thread a sparse per-band transient map through `process_with_onsets` so
+  the artifact path keeps per-band resets in the legacy hybrid engine.~~
+  Obsolete: the legacy hybrid streaming engine has been removed.
 - Tempo curve (per-region BPM) in the artifact for drifting material.
 - Warm-start seek (Stage 11) builds on this stage's position bookkeeping.
 

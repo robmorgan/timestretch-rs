@@ -14,16 +14,14 @@ external DSP dependency is [`rustfft`](https://crates.io/crates/rustfft).
   crossfade compensation keep output duration locked to target tempo
 - **EDM presets** — tuned parameter sets for DJ beatmatching, house loops,
   halftime effects, ambient stretches, and vocal chops
-- **Persistent hybrid streaming** — optional high-quality stream mode that keeps
-  rolling state across calls instead of re-instantiating per chunk
 - **Stateful streaming PV core** — phase state and overlap tails persist across
   stream chunks for smoother continuity
 - **Streaming API** — process audio in chunks for real-time use with dynamic
   stretch ratio and tempo changes
 - **Analyze-on-load pre-analysis** — analyze a track once (CLI `analyze` or
   `analyze_for_dj`), persist the artifact (BPM, beat grid, transient onsets
-  with strengths, content hash), and every stretch path — batch and both
-  streaming engines — consumes it in place of online detection, with
+  with strengths, content hash), and every stretch path — batch and
+  streaming — consumes it in place of online detection, with
   `set_source_position` keeping onsets aligned across seeks
 - **Loudness-robust onset detection** — log-compressed spectral flux with a
   robust `median + k·MAD` threshold and an energy-channel gate, so dense
@@ -390,8 +388,8 @@ sub-bass cutoff, ~20ms WSOLA segments, ~10ms search range.
 
 ## Performance
 
-Performance depends heavily on preset, ratio, and mode (PV-only streaming vs
-hybrid streaming vs offline batch).
+Performance depends heavily on preset, ratio, and mode (streaming vs offline
+batch).
 
 Run opt-in QA harnesses:
 
