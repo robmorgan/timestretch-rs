@@ -243,10 +243,19 @@ fn build_processor(
     let st = state.lock().unwrap();
     let ratio = st.stretch_ratio;
     let pitch_semi = st.pitch_semitones;
+    let engine = st.streaming_engine;
     let params = desktop_stream_params(&st, sample_rate);
     drop(st);
 
     let mut processor = StreamProcessor::new(params);
+    // Engine selection is a build-time operation (it re-sizes buffers for
+    // the engine's gate), so this is the one place it happens. The
+    // multi-resolution engine needs the Club profile or larger; on Live the
+    // library rejects it and the build keeps the deterministic engine (the
+    // UI disables the option there, so this fallback only covers races).
+    if let Err(err) = processor.set_streaming_engine(engine) {
+        log::warn!("streaming engine {engine:?} unavailable, using deterministic: {err}");
+    }
     let preroll = startup_preroll_target_samples(&processor);
 
     // Publish the effective latency for the UI's profile selector.
@@ -507,6 +516,41 @@ mod tests {
         // Library profiles carry the full DJ bundle at every latency tier.
         assert_eq!(params.preset, Some(EdmPreset::DjBeatmatch));
         assert!((params.stretch_ratio - (126.0 / 128.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn desktop_multi_res_engine_applies_at_club_and_falls_back_on_live() {
+        use crate::state::StreamingEngine;
+        use std::sync::{Arc, Mutex};
+
+        let mut st = SharedState::new();
+        st.preset = PresetChoice::DjBeatmatch;
+        st.stream_profile = StreamProfile::Club;
+        st.streaming_engine = StreamingEngine::MultiResolution;
+        st.detected_bpm = 126.0;
+        st.target_bpm = 128.0;
+        let state: SharedStateHandle = Arc::new(Mutex::new(st));
+
+        let (processor, _preroll) = build_processor(&state, 44_100, 0);
+        assert_eq!(
+            processor.streaming_engine(),
+            StreamingEngine::MultiResolution
+        );
+        // Club multi-res gate: 1.5x the 8192 sub-bass FFT, published to the
+        // UI's latency chip via reported_latency_secs.
+        assert_eq!(processor.latency_samples(), 12_288);
+        let reported = state.lock().unwrap().reported_latency_secs;
+        assert!((reported - 12_288.0 / 44_100.0).abs() < 1e-9);
+
+        // Live rejects multi-res; the build must fall back to deterministic
+        // instead of failing, and report the deterministic gate.
+        {
+            let mut st = state.lock().unwrap();
+            st.stream_profile = StreamProfile::Live;
+        }
+        let (processor, _preroll) = build_processor(&state, 44_100, 0);
+        assert_eq!(processor.streaming_engine(), StreamingEngine::Deterministic);
+        assert_eq!(processor.latency_samples(), 1024 * 3 / 2);
     }
 
     #[test]

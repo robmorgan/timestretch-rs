@@ -52,6 +52,7 @@ pub struct TimeStretchApp {
     volume: f32,
     preset: PresetChoice,
     stream_profile: StreamProfile,
+    streaming_engine: StreamingEngine,
     target_bpm_text: String,
 
     // Error messages
@@ -118,6 +119,7 @@ impl TimeStretchApp {
             volume: 0.8,
             preset: PresetChoice::DjBeatmatch,
             stream_profile: StreamProfile::Live,
+            streaming_engine: StreamingEngine::Deterministic,
             target_bpm_text: String::new(),
             error_message: None,
         }
@@ -183,6 +185,7 @@ impl TimeStretchApp {
                     st.volume = self.volume;
                     st.preset = self.preset;
                     st.stream_profile = self.stream_profile;
+                    st.streaming_engine = self.streaming_engine;
                     st.pre_analysis = None;
                     st.loop_region = None;
                     st.loop_in = None;
@@ -665,8 +668,58 @@ impl TimeStretchApp {
                         )
                         .on_hover_text(
                             "Effective control-to-audio buffering latency for the \
-                             selected playback profile",
+                             selected playback profile and engine",
                         );
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Engine:");
+                ui.horizontal(|ui| {
+                    // The multi-res engine's buffering gate is set by its
+                    // sub-bass FFT, which needs the Club profile or larger;
+                    // the library rejects it on Live.
+                    let multi_res_available = self.stream_profile != StreamProfile::Live;
+                    let old_engine = self.streaming_engine;
+                    ui.add_enabled_ui(multi_res_available, |ui| {
+                        egui::ComboBox::from_id_salt("streaming_engine_combo")
+                            .selected_text(engine_label(self.streaming_engine))
+                            .show_ui(ui, |ui| {
+                                for engine in [
+                                    StreamingEngine::Deterministic,
+                                    StreamingEngine::MultiResolution,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.streaming_engine,
+                                        engine,
+                                        engine_label(engine),
+                                    );
+                                }
+                            });
+                    })
+                    .response
+                    .on_disabled_hover_text(
+                        "Multi-resolution needs the Club or Quality playback \
+                         profile; Live stays on the standard engine",
+                    );
+                    if !multi_res_available
+                        && self.streaming_engine == StreamingEngine::MultiResolution
+                    {
+                        // Profile dropped to Live while multi-res was selected:
+                        // revert the control so the UI matches what plays.
+                        self.streaming_engine = StreamingEngine::Deterministic;
+                    }
+                    if self.streaming_engine != old_engine {
+                        let mut st = self.state.lock().unwrap();
+                        st.streaming_engine = self.streaming_engine;
+                        st.preset_changed = true;
+                    }
+                    if self.streaming_engine == StreamingEngine::MultiResolution {
+                        ui.label(egui::RichText::new("3-band").weak())
+                            .on_hover_text(
+                                "Three-band filterbank: tighter sub-bass phase \
+                             coherence, higher buffering latency",
+                            );
                     }
                 });
                 ui.end_row();
@@ -708,6 +761,14 @@ impl TimeStretchApp {
                 });
                 ui.end_row();
             });
+    }
+}
+
+/// UI label for a stream-mode rendering engine.
+fn engine_label(engine: StreamingEngine) -> &'static str {
+    match engine {
+        StreamingEngine::Deterministic => "Standard",
+        StreamingEngine::MultiResolution => "Multi-resolution",
     }
 }
 

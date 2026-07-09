@@ -55,6 +55,9 @@ impl PresetChoice {
 // The streaming latency/quality profile is now a first-class library
 // concept; the desktop app re-exports it for its UI.
 pub use timestretch::StreamProfile;
+// Stream-mode rendering engine (deterministic single-PV vs multi-resolution
+// filterbank), likewise a library concept re-exported for the UI.
+pub use timestretch::StreamingEngine;
 
 /// State shared between UI, processing, and audio threads.
 pub struct SharedState {
@@ -64,6 +67,11 @@ pub struct SharedState {
     pub volume: f32,
     pub preset: PresetChoice,
     pub stream_profile: StreamProfile,
+    /// Preferred stream-mode rendering engine. Applied at every processor
+    /// build; the multi-resolution engine needs the Club profile or larger,
+    /// so on the Live profile the build falls back to deterministic (the
+    /// preference is kept and re-applies when the profile allows it).
+    pub streaming_engine: StreamingEngine,
 
     /// Current playback position in source frames.
     pub position_frames: usize,
@@ -114,6 +122,7 @@ impl SharedState {
             volume: 0.8,
             preset: PresetChoice::DjBeatmatch,
             stream_profile: StreamProfile::Club,
+            streaming_engine: StreamingEngine::Deterministic,
             position_frames: 0,
             total_frames: 0,
             sample_rate: 44100,
