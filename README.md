@@ -16,6 +16,10 @@ external DSP dependency is [`rustfft`](https://crates.io/crates/rustfft).
   halftime effects, ambient stretches, and vocal chops
 - **Stateful streaming PV core** — phase state and overlap tails persist across
   stream chunks for smoother continuity
+- **Multi-resolution streaming engine** — optional three-band Linkwitz-Riley
+  filterbank with per-band phase vocoders (16384-point sub-bass FFT at the
+  Quality profile) for tighter low-end phase coherence, at a higher
+  buffering latency
 - **Streaming API** — process audio in chunks for real-time use with dynamic
   stretch ratio and tempo changes
 - **Analyze-on-load pre-analysis** — analyze a track once (CLI `analyze` or
@@ -209,6 +213,50 @@ Similarity = mean spectral similarity to the source on synthetic EDM material
 (`qa/profile_quality.rs`). At steady stretch the larger windows win; under a
 0.92–1.08 ratio ride the smaller windows track the modulation better — which
 is exactly why `Live` is the DJ control profile.
+
+### Streaming Engines
+
+`StreamProcessor` renders with one of two engines, selected via
+`set_streaming_engine` (at build time, not from the audio callback —
+switching starts a fresh stream):
+
+- `StreamingEngine::Deterministic` (default) — single persistent phase
+  vocoder per channel with scheduled per-band transient phase resets.
+  All figures in the profile table above are this engine.
+- `StreamingEngine::MultiResolution` — three-band Linkwitz-Riley filterbank
+  (sub-bass/mid/high at 200 Hz / 4 kHz) with a per-band phase vocoder whose
+  FFT is tuned to its range: sub-bass `mid × 4`, high `mid / 4`. The
+  buffering gate is set by the sub-bass FFT, so it needs the Club profile
+  or larger — selecting it on Live returns an error.
+
+```rust
+use timestretch::{StreamProcessor, StreamProfile, StreamingEngine, StretchParams};
+
+let params = StretchParams::new(1.05)
+    .with_sample_rate(44100)
+    .with_channels(2)
+    .with_stream_profile(StreamProfile::Club);
+let mut processor = StreamProcessor::new(params);
+processor
+    .set_streaming_engine(StreamingEngine::MultiResolution)
+    .expect("Club/Quality profiles support multi-resolution");
+```
+
+Measured multi-resolution figures at 44.1 kHz (`tests/streaming_latency.rs`
+verifies the first output sample lands exactly at the reported gate):
+
+| Profile | Band FFTs (sub/mid/high) | Buffering gate (ratio in `[0.9, 1.1]`) | Steady-ratio similarity | Ratio-ride similarity |
+|---------|--------------------------|--------------------|------|------|
+| Club    | 8192/2048/512   | 12288 fr = 278.6 ms | 0.9898 | 0.9876 |
+| Quality | 16384/4096/1024 | 24576 fr = 557.3 ms | 0.9898 | 0.9928 |
+
+Trade-off profile on the same synthetic EDM material: the multi-res engine
+ties the single-PV engine at the sub-bass band's similarity ceiling and wins
+the mid band (0.9982 vs 0.9964 at Quality), but gives some broadband
+similarity back in the bands containing the 200 Hz / 4 kHz crossover seams,
+where the independently-stretched bands overlap. Reach for it on
+sub-bass-critical material where low-end phase coherence matters more than
+control latency; keep the deterministic engine for beatmatching feel.
 
 Control-to-audio behavior (all profiles): ratio and pitch controls glide with
 a ~50 ms time constant. Pitch changes reach the output almost immediately

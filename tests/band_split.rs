@@ -435,3 +435,57 @@ fn test_band_split_pitch_shift() {
         "Pitch shift output contains NaN/Inf"
     );
 }
+
+/// The Linkwitz-Riley crossover is stateful IIR: splitting a signal in
+/// small chunks (streaming) must produce exactly the same band signals as
+/// splitting the whole buffer in one call.
+#[test]
+fn test_three_band_splitter_chunked_matches_whole() {
+    use timestretch::core::crossover::ThreeBandSplitter;
+
+    let sample_rate = 44100u32;
+    let input = edm_like_signal(sample_rate, 2.0);
+    let len = input.len();
+
+    let mut whole = ThreeBandSplitter::new(200.0, 4000.0, sample_rate);
+    let mut whole_sub = vec![0.0f32; len];
+    let mut whole_mid = vec![0.0f32; len];
+    let mut whole_high = vec![0.0f32; len];
+    whole.process(&input, &mut whole_sub, &mut whole_mid, &mut whole_high);
+
+    let mut chunked = ThreeBandSplitter::new(200.0, 4000.0, sample_rate);
+    let mut chunk_sub = vec![0.0f32; len];
+    let mut chunk_mid = vec![0.0f32; len];
+    let mut chunk_high = vec![0.0f32; len];
+    let mut pos = 0usize;
+    // Irregular chunk sizes to catch any per-call state assumptions.
+    for &chunk_len in [1usize, 7, 64, 250, 512, 1000, 4096].iter().cycle() {
+        if pos >= len {
+            break;
+        }
+        let end = (pos + chunk_len).min(len);
+        chunked.process(
+            &input[pos..end],
+            &mut chunk_sub[pos..end],
+            &mut chunk_mid[pos..end],
+            &mut chunk_high[pos..end],
+        );
+        pos = end;
+    }
+
+    for (name, whole_band, chunk_band) in [
+        ("sub", &whole_sub, &chunk_sub),
+        ("mid", &whole_mid, &chunk_mid),
+        ("high", &whole_high, &chunk_high),
+    ] {
+        let max_diff = whole_band
+            .iter()
+            .zip(chunk_band.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-6,
+            "{name} band: chunked split diverged from whole-buffer split by {max_diff}"
+        );
+    }
+}

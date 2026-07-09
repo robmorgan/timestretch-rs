@@ -8,6 +8,7 @@ use crate::core::ring_buffer::RingBuffer;
 use crate::core::types::{QualityMode, StreamProfile, StretchParams};
 use crate::error::StretchError;
 use crate::stream::transient_scheduler::{TransientEventScheduler, TransientSchedulerStats};
+use crate::stretch::multi_resolution::MultiResolutionStretcher;
 use crate::stretch::phase_vocoder::PhaseVocoder;
 use crate::stretch::stereo::StereoMode;
 use crate::stretch::wsola::Wsola;
@@ -67,6 +68,30 @@ const OUTPUT_CAPACITY_MULTIPLIER: usize = 8;
 /// previous stream mid-waveform, so the resumed stream ramps in briefly.
 const WARM_START_FADE_SAMPLES: usize = 256;
 
+/// Smallest mid-band FFT the multi-resolution streaming engine supports.
+///
+/// The engine's buffering gate is set by the sub-bass band (`mid * 4`), so
+/// at the Live profile's 1024-point FFT the gate would still be ~139 ms —
+/// the whole point of Live is defeated. Selecting
+/// [`StreamingEngine::MultiResolution`] below this mid FFT is an error.
+const MULTI_RES_MIN_MID_FFT: usize = 2048;
+/// Ceiling on the multi-resolution engine's derived sub-bass FFT
+/// (`mid * 4`, so Club/2048 lands on 8192 and Quality/4096 on the offline
+/// default of 16384; larger custom mid FFTs are capped here).
+const MULTI_RES_SUB_BASS_FFT_CAP: usize = 16384;
+
+/// Sub-bass FFT size the multi-resolution streaming engine derives from a
+/// mid-band FFT size (used for gate/capacity math before construction).
+#[inline]
+const fn multi_res_sub_bass_fft(mid_fft: usize) -> usize {
+    let derived = mid_fft * 4;
+    if derived > MULTI_RES_SUB_BASS_FFT_CAP {
+        MULTI_RES_SUB_BASS_FFT_CAP
+    } else {
+        derived
+    }
+}
+
 /// Minimum artifact onset strength for a low-band (100-500 Hz) phase reset.
 const ARTIFACT_LOW_BAND_RESET_STRENGTH: f32 = 0.45;
 /// Minimum artifact onset strength for a sub-bass (<100 Hz) phase reset.
@@ -115,13 +140,25 @@ fn analysis_lookahead_frames(fft_size: usize, quality_mode: QualityMode) -> usiz
     }
 }
 
+/// FFT size the active engine's buffering gate and capacities are keyed to:
+/// the configured FFT for the deterministic engine, the derived sub-bass
+/// FFT (the largest band) for the multi-resolution engine.
 #[inline]
-fn stream_capacity_frames(params: &StretchParams) -> usize {
+fn effective_stream_fft(params: &StretchParams, engine: StreamingEngine) -> usize {
+    match engine {
+        StreamingEngine::Deterministic => params.fft_size,
+        StreamingEngine::MultiResolution => multi_res_sub_bass_fft(params.fft_size),
+    }
+}
+
+#[inline]
+fn stream_capacity_frames(params: &StretchParams, engine: StreamingEngine) -> usize {
     let _ = MIN_CALLBACK_FRAMES;
     let _ = COMMON_CALLBACK_FRAMES;
-    analysis_lookahead_frames(params.fft_size, params.quality_mode)
+    let fft = effective_stream_fft(params, engine);
+    analysis_lookahead_frames(fft, params.quality_mode)
         .saturating_add(MAX_CALLBACK_FRAMES)
-        .saturating_add(params.fft_size)
+        .saturating_add(fft)
 }
 
 /// Stateful linear resampler used for realtime pitch control in stream mode.
@@ -227,6 +264,16 @@ pub enum StreamingEngine {
     /// per-band transient phase resets, and never re-renders historical
     /// context in callback paths.
     Deterministic,
+    /// Multi-resolution filterbank engine: a three-band Linkwitz-Riley
+    /// split (sub-bass/mid/high) with a per-band phase vocoder whose FFT
+    /// size is tuned to its frequency range (sub-bass `mid * 4`, high
+    /// `mid / 4`).
+    ///
+    /// Trades latency for low-end quality: the buffering gate is set by the
+    /// sub-bass FFT, so this engine needs the Club profile or larger
+    /// (`fft_size >= 2048`); selecting it on the Live profile returns an
+    /// error from [`StreamProcessor::set_streaming_engine`].
+    MultiResolution,
 }
 
 /// Quality of the realtime pitch resampler used when `pitch_scale != 1.0`.
@@ -314,8 +361,14 @@ pub struct StreamProcessor {
     vocoder_ratio: f64,
     /// Whether the processor has been initialized.
     initialized: bool,
-    /// Persistent PhaseVocoder instances, one per channel.
+    /// Active stream-mode rendering engine.
+    engine: StreamingEngine,
+    /// Persistent PhaseVocoder instances, one per channel (deterministic
+    /// engine; empty when the multi-resolution engine is active).
     vocoders: Vec<PhaseVocoder>,
+    /// Persistent multi-resolution stretchers, one per channel
+    /// (multi-resolution engine; empty for the deterministic engine).
+    multi_res: Vec<MultiResolutionStretcher>,
     /// Reusable per-channel deinterleave buffers.
     channel_input_buffers: Vec<Vec<f32>>,
     /// Reusable per-channel stretched output buffers.
@@ -443,8 +496,17 @@ impl std::fmt::Debug for StreamProcessor {
 }
 
 impl StreamProcessor {
-    /// Creates a new streaming processor.
+    /// Creates a new streaming processor (deterministic engine).
     pub fn new(params: StretchParams) -> Self {
+        Self::new_with_engine(params, StreamingEngine::Deterministic)
+    }
+
+    /// Creates a new streaming processor for a specific engine.
+    ///
+    /// Callers must have validated engine availability first (see
+    /// [`Self::set_streaming_engine`]); buffer capacities and gates are
+    /// sized for the engine's effective FFT.
+    fn new_with_engine(params: StretchParams, engine: StreamingEngine) -> Self {
         let ratio = params.stretch_ratio;
         let num_channels = params.channels.count();
         let source_bpm = params.bpm;
@@ -452,7 +514,7 @@ impl StreamProcessor {
         let wsola_seg_size = params.wsola_segment_size;
         let wsola_search = params.wsola_search_range;
 
-        let capacity_frames_per_channel = stream_capacity_frames(&params);
+        let capacity_frames_per_channel = stream_capacity_frames(&params, engine);
         let capacity_samples = capacity_frames_per_channel.saturating_mul(num_channels);
         // Output headroom is sized for the widest supported stretch (a render
         // over the retained input emits up to ~ratio times as many frames).
@@ -461,11 +523,20 @@ impl StreamProcessor {
         // per-render PV output buffer (see `OUTPUT_CAPACITY_MULTIPLIER`).
         let output_capacity_frames = capacity_frames_per_channel
             .saturating_mul(OUTPUT_CAPACITY_MULTIPLIER)
-            .saturating_add(params.fft_size);
+            .saturating_add(effective_stream_fft(&params, engine));
         let output_capacity_samples = output_capacity_frames.saturating_mul(num_channels);
         let pitch_output_capacity_frames = output_capacity_frames.saturating_mul(2);
 
-        let vocoders = Self::create_vocoders(&params, ratio);
+        let vocoders = match engine {
+            StreamingEngine::Deterministic => Self::create_vocoders(&params, ratio),
+            StreamingEngine::MultiResolution => Vec::new(),
+        };
+        let multi_res = match engine {
+            StreamingEngine::Deterministic => Vec::new(),
+            StreamingEngine::MultiResolution => {
+                Self::create_multi_res(&params, ratio, capacity_frames_per_channel)
+            }
+        };
         let channel_input_buffers = (0..num_channels)
             .map(|_| Vec::with_capacity(capacity_frames_per_channel))
             .collect();
@@ -488,7 +559,9 @@ impl StreamProcessor {
             target_ratio: ratio,
             vocoder_ratio: ratio,
             initialized: false,
+            engine,
             vocoders,
+            multi_res,
             channel_input_buffers,
             channel_output_buffers,
             interleaved_scratch: vec![0.0; capacity_samples],
@@ -589,6 +662,36 @@ impl StreamProcessor {
                 pv.set_envelope_strength(params.envelope_strength);
                 pv.set_adaptive_envelope_order(params.adaptive_envelope_order);
                 pv
+            })
+            .collect()
+    }
+
+    /// Creates per-channel multi-resolution stretchers for streaming.
+    fn create_multi_res(
+        params: &StretchParams,
+        ratio: f64,
+        capacity_frames_per_channel: usize,
+    ) -> Vec<MultiResolutionStretcher> {
+        (0..params.channels.count())
+            .map(|_| {
+                // Match the deterministic engine's streaming tuning: wider
+                // sub-bass rigid phase locking and no adaptive mode flips.
+                let streaming_sub_bass_cutoff = params.sub_bass_cutoff.max(180.0);
+                let mut stretcher = MultiResolutionStretcher::with_sub_bass_fft_cap(
+                    params.fft_size,
+                    ratio,
+                    params.sample_rate,
+                    streaming_sub_bass_cutoff,
+                    MULTI_RES_SUB_BASS_FFT_CAP,
+                );
+                stretcher.set_adaptive_phase_locking(false);
+                stretcher.set_envelope_strength(params.envelope_strength);
+                stretcher.set_adaptive_envelope_order(params.adaptive_envelope_order);
+                stretcher.reserve_streaming_capacity(
+                    capacity_frames_per_channel,
+                    OUTPUT_CAPACITY_MULTIPLIER as f64,
+                );
+                stretcher
             })
             .collect()
     }
@@ -728,7 +831,7 @@ impl StreamProcessor {
         self.interpolate_ratio_for_frames(COMMON_CALLBACK_FRAMES);
 
         if !self.input_ring.is_empty() {
-            let min_samples = self.params.fft_size.saturating_mul(num_channels);
+            let min_samples = self.effective_fft().saturating_mul(num_channels);
             if self.input_ring.len() < min_samples {
                 let missing = min_samples - self.input_ring.len();
                 if missing > self.input_ring.available() {
@@ -877,13 +980,13 @@ impl StreamProcessor {
         let num_channels = self.params.channels.count();
         let total_frames = self.input_ring.len() / num_channels;
 
-        if total_frames < self.params.fft_size {
+        if total_frames < self.effective_fft() {
             return Ok(());
         }
 
         if require_min_latency {
             let min_frames =
-                effective_min_frames(self.params.fft_size, self.target_processing_ratio());
+                effective_min_frames(self.effective_fft(), self.target_processing_ratio());
             if total_frames < min_frames {
                 return Ok(());
             }
@@ -1502,10 +1605,20 @@ impl StreamProcessor {
         let mut min_output_len = usize::MAX;
 
         for ch in 0..num_channels {
-            self.vocoders[ch].process_streaming_into(
-                &self.channel_input_buffers[ch],
-                &mut self.channel_output_buffers[ch],
-            )?;
+            match self.engine {
+                StreamingEngine::Deterministic => {
+                    self.vocoders[ch].process_streaming_into(
+                        &self.channel_input_buffers[ch],
+                        &mut self.channel_output_buffers[ch],
+                    )?;
+                }
+                StreamingEngine::MultiResolution => {
+                    self.multi_res[ch].process_streaming_into(
+                        &self.channel_input_buffers[ch],
+                        &mut self.channel_output_buffers[ch],
+                    )?;
+                }
+            }
             min_output_len = min_output_len.min(self.channel_output_buffers[ch].len());
         }
 
@@ -1516,17 +1629,33 @@ impl StreamProcessor {
         })
     }
 
+    /// FFT size the active engine's gate and consumption math are keyed to.
+    #[inline]
+    fn effective_fft(&self) -> usize {
+        effective_stream_fft(&self.params, self.engine)
+    }
+
     /// Per-channel frames a render pass over `total_frames` will consume.
     ///
     /// Shared between `consume_processed_input` and artifact reset span math
-    /// so the two cannot drift.
+    /// so the two cannot drift. Engine-aware: the multi-resolution engine's
+    /// cadence is keyed to its sub-bass band.
     #[inline]
     fn frames_consumed_for(&self, total_frames: usize) -> usize {
-        let hop = self.params.hop_size;
-        if hop == 0 || total_frames < self.params.fft_size {
-            return 0;
+        match self.engine {
+            StreamingEngine::Deterministic => {
+                let hop = self.params.hop_size;
+                if hop == 0 || total_frames < self.params.fft_size {
+                    return 0;
+                }
+                ((total_frames - self.params.fft_size) / hop + 1) * hop
+            }
+            StreamingEngine::MultiResolution => self
+                .multi_res
+                .first()
+                .map(|m| m.streaming_frames_consumed(total_frames))
+                .unwrap_or(0),
         }
-        ((total_frames - self.params.fft_size) / hop + 1) * hop
     }
 
     fn consume_processed_input(&mut self, total_frames: usize, num_channels: usize) -> usize {
@@ -1802,7 +1931,15 @@ impl StreamProcessor {
     fn flush_vocoder_tails_to_pending(&mut self, num_channels: usize) -> Result<(), StretchError> {
         let mut min_output_len = usize::MAX;
         for ch in 0..num_channels {
-            self.vocoders[ch].flush_streaming_into(&mut self.channel_output_buffers[ch])?;
+            match self.engine {
+                StreamingEngine::Deterministic => {
+                    self.vocoders[ch].flush_streaming_into(&mut self.channel_output_buffers[ch])?;
+                }
+                StreamingEngine::MultiResolution => {
+                    self.multi_res[ch]
+                        .flush_streaming_into(&mut self.channel_output_buffers[ch])?;
+                }
+            }
             min_output_len = min_output_len.min(self.channel_output_buffers[ch].len());
         }
 
@@ -1997,18 +2134,47 @@ impl StreamProcessor {
 
     /// Selects the stream-mode rendering engine.
     ///
-    /// [`StreamingEngine::Deterministic`] is currently the only engine, so
-    /// this is a no-op; it exists so callers can select engines added in
-    /// future releases without an API change.
-    pub fn set_streaming_engine(&mut self, engine: StreamingEngine) {
-        match engine {
-            StreamingEngine::Deterministic => {}
+    /// Not RT-safe: switching engines re-sizes buffers for the new engine's
+    /// buffering gate and starts a fresh stream (buffered input/output is
+    /// dropped; ratio/pitch targets, resampler quality, tempo state, and
+    /// the pre-analysis artifact carry over). Select the engine at
+    /// build/rebuild time, before streaming — never from an audio callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StretchError::InvalidFormat`] when
+    /// [`StreamingEngine::MultiResolution`] is selected with a mid-band FFT
+    /// below 2048 (e.g. the Live profile): the engine's sub-bass band would
+    /// still gate at ~139 ms, defeating the profile's latency budget. Use
+    /// the Club or Quality profile instead.
+    pub fn set_streaming_engine(&mut self, engine: StreamingEngine) -> Result<(), StretchError> {
+        if engine == self.engine {
+            return Ok(());
         }
+        if engine == StreamingEngine::MultiResolution
+            && self.params.fft_size < MULTI_RES_MIN_MID_FFT
+        {
+            return Err(StretchError::InvalidFormat(format!(
+                "multi-resolution streaming needs fft_size >= {} (Club/Quality profiles), got {}",
+                MULTI_RES_MIN_MID_FFT, self.params.fft_size
+            )));
+        }
+
+        // Rebuild at the current control targets so engine, buffers, and
+        // stretcher ratios all agree from the first render.
+        let params = self.params.clone().with_stretch_ratio(self.target_ratio);
+        let mut rebuilt = Self::new_with_engine(params, engine);
+        rebuilt.source_bpm = self.source_bpm;
+        rebuilt.target_pitch_scale = self.target_pitch_scale;
+        rebuilt.pitch_scale = self.target_pitch_scale;
+        rebuilt.pitch_quality = self.pitch_quality;
+        *self = rebuilt;
+        Ok(())
     }
 
     /// Returns the active stream-mode rendering engine.
     pub fn streaming_engine(&self) -> StreamingEngine {
-        StreamingEngine::Deterministic
+        self.engine
     }
 
     /// Returns the source BPM if available.
@@ -2071,9 +2237,9 @@ impl StreamProcessor {
     /// Pure arithmetic over current control targets — allocation-free and
     /// safe to call from the audio thread.
     pub fn latency_report(&self) -> StreamLatencyReport {
-        let base_gate_frames = min_latency_frames(self.params.fft_size);
+        let base_gate_frames = min_latency_frames(self.effective_fft());
         let effective_gate_frames =
-            effective_min_frames(self.params.fft_size, self.target_processing_ratio());
+            effective_min_frames(self.effective_fft(), self.target_processing_ratio());
 
         // Pitch lookahead applies once the resampler is (or is about to be)
         // in the signal path: engaged resamplers stay engaged even at unity
@@ -2130,7 +2296,17 @@ impl StreamProcessor {
         self.warm_start_fade_remaining = 0;
         self.reposition_artifact_cursor();
 
-        self.vocoders = Self::create_vocoders(&self.params, self.params.stretch_ratio);
+        match self.engine {
+            StreamingEngine::Deterministic => {
+                self.vocoders = Self::create_vocoders(&self.params, self.params.stretch_ratio);
+            }
+            StreamingEngine::MultiResolution => {
+                for stretcher in &mut self.multi_res {
+                    stretcher.reset_streaming_state();
+                    stretcher.set_stretch_ratio(self.params.stretch_ratio);
+                }
+            }
+        }
         self.expected_total_output_samples = 0.0;
         self.total_output_emitted_samples = 0;
         self.pitch_scale = 1.0;
@@ -2156,6 +2332,9 @@ impl StreamProcessor {
             for voc in &mut self.vocoders {
                 voc.set_stretch_ratio(processing_ratio);
             }
+            for stretcher in &mut self.multi_res {
+                stretcher.set_stretch_ratio(processing_ratio);
+            }
             self.vocoder_ratio = processing_ratio;
         }
     }
@@ -2166,13 +2345,29 @@ impl StreamProcessor {
     /// preserve attack shape; steady-state frames get less to let the PV's
     /// tonal quality dominate.
     fn compute_flux_blend_factor(&self) -> f32 {
-        // Use channel 0's vocoder flux (mid channel for stereo M/S).
-        let flux = match self.vocoders.first().and_then(|v| v.last_frame_flux()) {
+        // Use channel 0's flux (mid channel for stereo M/S). For the
+        // multi-resolution engine this is the combined three-band report,
+        // normalized against the summed band spectra.
+        let (flux, num_bins) = match self.engine {
+            StreamingEngine::Deterministic => (
+                self.vocoders
+                    .first()
+                    .and_then(|v| v.last_frame_flux().copied()),
+                self.params.fft_size / 2 + 1,
+            ),
+            StreamingEngine::MultiResolution => (
+                self.multi_res.first().and_then(|m| m.last_frame_flux()),
+                self.multi_res
+                    .first()
+                    .map(|m| m.total_spectral_bins())
+                    .unwrap_or(0),
+            ),
+        };
+        let flux = match flux {
             Some(f) => f,
             None => return 1.0,
         };
 
-        let num_bins = self.params.fft_size / 2 + 1;
         if num_bins == 0 {
             return 1.0;
         }
@@ -2192,7 +2387,7 @@ impl StreamProcessor {
     }
 
     fn apply_transient_scheduled_phase_reset(&mut self, total_frames: usize, num_channels: usize) {
-        if total_frames < self.params.fft_size {
+        if total_frames < self.effective_fft() {
             return;
         }
 
@@ -2236,20 +2431,47 @@ impl StreamProcessor {
             return;
         };
 
-        if num_channels == 2
-            && self.params.stereo_mode == StereoMode::MidSide
-            && self.vocoders.len() == 2
-        {
-            let (mid_mask, side_mask) = stereo_channel_reset_masks(reset_mask);
-            self.vocoders[0].reset_phase_state_bands(mid_mask, self.params.sample_rate);
-            if side_mask.iter().any(|&b| b) {
-                self.vocoders[1].reset_phase_state_bands(side_mask, self.params.sample_rate);
-            }
-            return;
-        }
+        self.apply_reset_mask_to_engine(reset_mask, num_channels);
+    }
 
-        for vocoder in &mut self.vocoders {
-            vocoder.reset_phase_state_bands(reset_mask, self.params.sample_rate);
+    /// Routes a scheduler reset mask to the active engine's per-channel
+    /// stretchers, applying the Mid/Side split policy when applicable.
+    ///
+    /// The multi-resolution path forwards the mask through
+    /// [`MultiResolutionStretcher::reset_phase_state_bands`], which applies
+    /// it to every band vocoder by absolute bin frequency — the same
+    /// 100/500/4000 Hz band edges the scheduler routes by, independent of
+    /// the filterbank's 200/4000 Hz crossover points.
+    fn apply_reset_mask_to_engine(&mut self, reset_mask: [bool; 4], num_channels: usize) {
+        let sample_rate = self.params.sample_rate;
+        let mid_side = num_channels == 2 && self.params.stereo_mode == StereoMode::MidSide;
+        match self.engine {
+            StreamingEngine::Deterministic => {
+                if mid_side && self.vocoders.len() == 2 {
+                    let (mid_mask, side_mask) = stereo_channel_reset_masks(reset_mask);
+                    self.vocoders[0].reset_phase_state_bands(mid_mask, sample_rate);
+                    if side_mask.iter().any(|&b| b) {
+                        self.vocoders[1].reset_phase_state_bands(side_mask, sample_rate);
+                    }
+                    return;
+                }
+                for vocoder in &mut self.vocoders {
+                    vocoder.reset_phase_state_bands(reset_mask, sample_rate);
+                }
+            }
+            StreamingEngine::MultiResolution => {
+                if mid_side && self.multi_res.len() == 2 {
+                    let (mid_mask, side_mask) = stereo_channel_reset_masks(reset_mask);
+                    self.multi_res[0].reset_phase_state_bands(mid_mask, sample_rate);
+                    if side_mask.iter().any(|&b| b) {
+                        self.multi_res[1].reset_phase_state_bands(side_mask, sample_rate);
+                    }
+                    return;
+                }
+                for stretcher in &mut self.multi_res {
+                    stretcher.reset_phase_state_bands(reset_mask, sample_rate);
+                }
+            }
         }
     }
 
@@ -2263,7 +2485,7 @@ impl StreamProcessor {
     /// Reset granularity matches the online scheduler: one combined mask per
     /// render pass, applied at the current render rather than sample-timed.
     fn apply_artifact_scheduled_phase_reset(&mut self, total_frames: usize, num_channels: usize) {
-        if total_frames < self.params.fft_size {
+        if total_frames < self.effective_fft() {
             return;
         }
         // Mirror the deterministic reset path's channel-count support.
@@ -2329,21 +2551,7 @@ impl StreamProcessor {
             }
         }
 
-        if num_channels == 2
-            && self.params.stereo_mode == StereoMode::MidSide
-            && self.vocoders.len() == 2
-        {
-            let (mid_mask, side_mask) = stereo_channel_reset_masks(mask);
-            self.vocoders[0].reset_phase_state_bands(mid_mask, self.params.sample_rate);
-            if side_mask.iter().any(|&b| b) {
-                self.vocoders[1].reset_phase_state_bands(side_mask, self.params.sample_rate);
-            }
-            return;
-        }
-
-        for vocoder in &mut self.vocoders {
-            vocoder.reset_phase_state_bands(mask, self.params.sample_rate);
-        }
+        self.apply_reset_mask_to_engine(mask, num_channels);
     }
 
     /// Returns the BPM stored in the params, if any.
@@ -2427,8 +2635,8 @@ impl StreamProcessor {
     /// of convergence margin for the phase vocoder's overlap and the pitch
     /// resampler's history. Bounded, so rapid cue jumps stay cheap.
     pub fn warm_start_preroll_frames(&self) -> usize {
-        effective_min_frames(self.params.fft_size, self.target_processing_ratio())
-            .saturating_add(self.params.fft_size)
+        effective_min_frames(self.effective_fft(), self.target_processing_ratio())
+            .saturating_add(self.effective_fft())
     }
 
     /// Re-primes the processor at a new source position from the audio
@@ -2487,6 +2695,9 @@ impl StreamProcessor {
         }
         for vocoder in &mut self.vocoders {
             vocoder.reset_streaming_state();
+        }
+        for stretcher in &mut self.multi_res {
+            stretcher.reset_streaming_state();
         }
         self.transient_scheduler.reset();
         self.reset_pitch_resamplers();
@@ -3051,8 +3262,78 @@ mod tests {
 
         let mut proc = StreamProcessor::new(params);
         assert_eq!(proc.streaming_engine(), StreamingEngine::Deterministic);
-        proc.set_streaming_engine(StreamingEngine::Deterministic);
+        proc.set_streaming_engine(StreamingEngine::Deterministic)
+            .expect("selecting the active engine is a no-op");
         assert_eq!(proc.streaming_engine(), StreamingEngine::Deterministic);
+
+        proc.set_streaming_engine(StreamingEngine::MultiResolution)
+            .expect("default 4096 FFT supports multi-resolution");
+        assert_eq!(proc.streaming_engine(), StreamingEngine::MultiResolution);
+        proc.set_streaming_engine(StreamingEngine::Deterministic)
+            .expect("switch back");
+        assert_eq!(proc.streaming_engine(), StreamingEngine::Deterministic);
+    }
+
+    #[test]
+    fn test_streaming_engine_multi_res_rejected_at_live_profile() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(2)
+            .with_stream_profile(crate::core::types::StreamProfile::Live);
+
+        let mut proc = StreamProcessor::new(params);
+        let err = proc
+            .set_streaming_engine(StreamingEngine::MultiResolution)
+            .expect_err("Live profile (1024 FFT) must reject multi-resolution");
+        assert!(matches!(err, StretchError::InvalidFormat(_)));
+        // The failed selection must leave the active engine untouched.
+        assert_eq!(proc.streaming_engine(), StreamingEngine::Deterministic);
+    }
+
+    #[test]
+    fn test_stream_processor_multi_res_basic() {
+        let params = StretchParams::new(1.2)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_stream_profile(crate::core::types::StreamProfile::Club);
+
+        let mut proc = StreamProcessor::new(params);
+        proc.set_streaming_engine(StreamingEngine::MultiResolution)
+            .expect("Club profile supports multi-resolution");
+
+        // Long enough to clear the sub-bass gate several times over.
+        let total = 44100 * 4;
+        let signal: Vec<f32> = (0..total)
+            .map(|i| {
+                let t = i as f32 / 44100.0;
+                0.4 * (2.0 * PI * 55.0 * t).sin() + 0.3 * (2.0 * PI * 880.0 * t).sin()
+            })
+            .collect();
+
+        let mut output = Vec::new();
+        for chunk in signal.chunks(1024) {
+            let rendered = proc.process(chunk).expect("multi-res stream chunk");
+            output.extend_from_slice(&rendered);
+        }
+        let tail = proc.flush().expect("multi-res flush");
+        output.extend_from_slice(&tail);
+
+        let expected = (total as f64 * 1.2) as usize;
+        assert!(
+            output.len().abs_diff(expected) < expected / 10,
+            "multi-res output length {} too far from expected {}",
+            output.len(),
+            expected
+        );
+        assert!(
+            output.iter().all(|s| s.is_finite()),
+            "multi-res output contains non-finite samples"
+        );
+        let peak = output.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            (0.1..4.0).contains(&peak),
+            "multi-res output peak {peak} outside sane range"
+        );
     }
 
     #[test]

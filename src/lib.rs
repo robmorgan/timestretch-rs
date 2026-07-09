@@ -70,7 +70,9 @@ pub use core::types::{
 };
 pub use core::window::WindowType;
 pub use error::StretchError;
-pub use stream::{StreamLatencyReport, StreamPitchQuality, StreamProcessor, TransientResetStats};
+pub use stream::{
+    StreamLatencyReport, StreamPitchQuality, StreamProcessor, StreamingEngine, TransientResetStats,
+};
 pub use stretch::phase_locking::PhaseLockingMode;
 pub use stretch::stereo::StereoMode;
 

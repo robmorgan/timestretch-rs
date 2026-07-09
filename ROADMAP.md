@@ -605,8 +605,17 @@ streaming-side counterpart of Stages 2-5.
 
 ### Work
 
-- Design a bounded-latency multi-band PV for streaming (larger FFT for
+- [x] Design a bounded-latency multi-band PV for streaming (larger FFT for
   sub-bass phase coherence, smaller FFT for transient-sharp highs).
+  Landed as `StreamingEngine::MultiResolution`: streaming support on
+  `MultiResolutionStretcher` (incremental LR8 split, per-band PVs, aligned
+  band summation, combined flux report) wired into `StreamProcessor` with
+  per-profile sub-bass FFT sizing (Club 8192 / Quality 16384; Live rejects
+  the engine). Allocation-free steady state; measured gates: Club 12288
+  frames (~279 ms), Quality 24576 frames (~557 ms) at 44.1 kHz.
+  Known limit: similarity dips in the bands containing the 200 Hz / 4 kHz
+  crossover seams (inherited from the offline multi-res band summation);
+  sub-band similarity ties the single-PV ceiling, mid band wins.
 - Evaluate an incremental/causal HPSS variant for the streaming path, gated
   behind `QualityMode`.
 - As structural quality lands, retire corrective heuristics instead of

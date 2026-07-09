@@ -240,3 +240,158 @@ fn live_profile_sub_bass_cutoff_experiment() {
         raised_sim, raised_bands.sub_bass, raised_bands.low
     );
 }
+
+/// Streams `input` at a fixed off-unity ratio with a selected engine.
+fn stream_steady_with_engine(
+    input: &[f32],
+    params: StretchParams,
+    ratio: f64,
+    engine: timestretch::StreamingEngine,
+) -> Vec<f32> {
+    let mut processor = StreamProcessor::new(params.with_stretch_ratio(ratio));
+    processor
+        .set_streaming_engine(engine)
+        .expect("profile supports the requested engine");
+    let mut output = Vec::with_capacity(input.len() * 2);
+    for chunk in input.chunks(CHUNK) {
+        let rendered = processor.process(chunk).expect("stream chunk");
+        output.extend_from_slice(&rendered);
+    }
+    let tail = processor.flush().expect("flush");
+    output.extend_from_slice(&tail);
+    output
+}
+
+/// Streams `input` under the DJ ratio ride with a selected engine.
+fn stream_ride_with_engine(
+    input: &[f32],
+    params: StretchParams,
+    engine: timestretch::StreamingEngine,
+) -> Vec<f32> {
+    let mut processor = StreamProcessor::new(params);
+    processor
+        .set_streaming_engine(engine)
+        .expect("profile supports the requested engine");
+    let mut output = Vec::with_capacity(input.len() * 2);
+    for (ci, chunk) in input.chunks(CHUNK).enumerate() {
+        let t = (ci * CHUNK) as f64 / SAMPLE_RATE as f64;
+        let ratio = 1.0 + 0.08 * (TWO_PI as f64 * t / 2.0).sin();
+        processor.set_stretch_ratio(ratio).expect("valid ratio");
+        let rendered = processor.process(chunk).expect("stream chunk");
+        output.extend_from_slice(&rendered);
+    }
+    let tail = processor.flush().expect("flush");
+    output.extend_from_slice(&tail);
+    output
+}
+
+/// Multi-resolution engine measurement rows (Club and Quality; Live rejects
+/// the engine), plus the gate that motivates the engine: on sub-bass-heavy
+/// EDM material at the Quality profile, the multi-res filterbank must not
+/// fall below the single-PV deterministic engine in sub-band similarity.
+///
+/// Measured seam context (2026-07): the multi-res engine ties single-PV at
+/// the sub-band metric ceiling and wins the mid band, but loses similarity
+/// in the bands containing the 200 Hz / 4 kHz crossover seams — a property
+/// inherited from the offline `MultiResolutionStretcher` (independent band
+/// PVs de-phase where LR8 skirts overlap), not from the streaming port.
+#[test]
+fn multi_res_engine_quality_rows() {
+    use timestretch::StreamingEngine;
+
+    let edm = generate_edm_signal(6.0);
+    let bass = generate_bass_signal(6.0);
+    let ratio = 1.05;
+
+    // Ratio-ride rows: no profile/engine may click under a plain ride.
+    for profile in [StreamProfile::Club, StreamProfile::Quality] {
+        let output = stream_ride_with_engine(
+            &edm,
+            profile_params(profile),
+            StreamingEngine::MultiResolution,
+        );
+        let similarity = similarity_to_source(&edm, &output);
+        let clicks = click_count(&output[8192..], 0.5);
+        println!(
+            "METRIC ride_similarity_{}_multi_res={:.4} clicks={}",
+            profile.label().to_lowercase(),
+            similarity,
+            clicks
+        );
+        assert_eq!(clicks, 0, "{profile} multi-res clicked under ratio ride");
+    }
+
+    for profile in [StreamProfile::Club, StreamProfile::Quality] {
+        let single = stream_steady_with_engine(
+            &edm,
+            profile_params(profile),
+            ratio,
+            StreamingEngine::Deterministic,
+        );
+        let multi = stream_steady_with_engine(
+            &edm,
+            profile_params(profile),
+            ratio,
+            StreamingEngine::MultiResolution,
+        );
+        let single_sim = similarity_to_source(&edm, &single);
+        let multi_sim = similarity_to_source(&edm, &multi);
+        let single_bands =
+            comparison::mean_band_spectral_similarity(&edm, &single, 2048, 512, SAMPLE_RATE);
+        let multi_bands =
+            comparison::mean_band_spectral_similarity(&edm, &multi, 2048, 512, SAMPLE_RATE);
+        let multi_clicks = click_count(&multi[8192..], 0.5);
+        println!(
+            "METRIC steady_similarity_{}_single_pv={:.4} multi_res={:.4} multi_clicks={}",
+            profile.label().to_lowercase(),
+            single_sim,
+            multi_sim,
+            multi_clicks
+        );
+        println!(
+            "METRIC steady_bands_{} single sub={:.4} low={:.4} mid={:.4} high={:.4} | multi sub={:.4} low={:.4} mid={:.4} high={:.4}",
+            profile.label().to_lowercase(),
+            single_bands.sub_bass,
+            single_bands.low,
+            single_bands.mid,
+            single_bands.high,
+            multi_bands.sub_bass,
+            multi_bands.low,
+            multi_bands.mid,
+            multi_bands.high
+        );
+        assert_eq!(
+            multi_clicks, 0,
+            "{profile} multi-res clicked at steady ratio"
+        );
+    }
+
+    // Sub-bass gate on bass-heavy material at the Quality profile.
+    let single = stream_steady_with_engine(
+        &bass,
+        profile_params(StreamProfile::Quality),
+        ratio,
+        StreamingEngine::Deterministic,
+    );
+    let multi = stream_steady_with_engine(
+        &bass,
+        profile_params(StreamProfile::Quality),
+        ratio,
+        StreamingEngine::MultiResolution,
+    );
+    let single_bands =
+        comparison::mean_band_spectral_similarity(&bass, &single, 2048, 512, SAMPLE_RATE);
+    let multi_bands =
+        comparison::mean_band_spectral_similarity(&bass, &multi, 2048, 512, SAMPLE_RATE);
+    println!(
+        "METRIC quality_bass_sub single_pv={:.4} multi_res={:.4} low single_pv={:.4} multi_res={:.4}",
+        single_bands.sub_bass, multi_bands.sub_bass, single_bands.low, multi_bands.low
+    );
+    let epsilon = 0.002;
+    assert!(
+        multi_bands.sub_bass + epsilon >= single_bands.sub_bass,
+        "multi-res Quality sub-band similarity ({:.4}) fell below single-PV ({:.4})",
+        multi_bands.sub_bass,
+        single_bands.sub_bass
+    );
+}

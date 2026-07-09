@@ -133,6 +133,67 @@ fn process_into_steady_state_no_heap_growth_after_warmup() {
 }
 
 #[test]
+fn process_into_multi_res_steady_state_no_heap_growth_after_warmup() {
+    let _guard = ALLOC_TEST_MUTEX
+        .lock()
+        .expect("allocation test mutex poisoned");
+    const SAMPLE_RATE: u32 = 44_100;
+    const CHUNK_FRAMES: usize = 256;
+    // The multi-res Club gate is 12288 frames (1.5x the 8192 sub-bass FFT);
+    // warm up well past it so every band buffer reaches steady-state size.
+    const WARMUP_ITERS: usize = 192;
+    const MEASURE_ITERS: usize = 96;
+
+    let params = StretchParams::new(1.05)
+        .with_sample_rate(SAMPLE_RATE)
+        .with_channels(2)
+        .with_stream_profile(timestretch::StreamProfile::Club);
+    let mut processor = StreamProcessor::new(params);
+    processor
+        .set_streaming_engine(timestretch::StreamingEngine::MultiResolution)
+        .expect("Club profile supports the multi-resolution engine");
+
+    let chunk = test_chunk_stereo(CHUNK_FRAMES, SAMPLE_RATE as f32);
+    let max_samples = chunk.len() * (WARMUP_ITERS + MEASURE_ITERS) * 8;
+    let mut output = Vec::with_capacity(max_samples);
+
+    for _ in 0..WARMUP_ITERS {
+        processor
+            .process_into(&chunk, &mut output)
+            .expect("warmup process_into should succeed");
+    }
+    assert!(
+        !output.is_empty(),
+        "warmup must clear the multi-res buffering gate"
+    );
+    output.clear();
+
+    begin_alloc_tracking();
+    for i in 0..MEASURE_ITERS {
+        // A mid-measure ratio nudge keeps the DJ modulation path covered.
+        if i == MEASURE_ITERS / 2 {
+            processor
+                .set_stretch_ratio(1.08)
+                .expect("ratio change should be accepted");
+        }
+        processor
+            .process_into(&chunk, &mut output)
+            .expect("steady-state multi-res process_into should succeed");
+    }
+    let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
+
+    assert_eq!(
+        alloc_calls + realloc_calls,
+        0,
+        "multi-res steady-state process_into allocated: alloc_calls={}, realloc_calls={}, alloc_bytes={}, realloc_bytes={}",
+        alloc_calls,
+        realloc_calls,
+        alloc_bytes,
+        realloc_bytes
+    );
+}
+
+#[test]
 fn process_into_pitch_scaled_steady_state_no_heap_growth_after_warmup() {
     let _guard = ALLOC_TEST_MUTEX
         .lock()

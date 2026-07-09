@@ -101,6 +101,67 @@ fn first_sample_out_matches_reported_per_profile() {
     }
 }
 
+#[test]
+fn first_sample_out_matches_reported_multi_res() {
+    use timestretch::StreamingEngine;
+
+    // Multi-resolution needs a longer runway: the sub-bass gate is 1.5x the
+    // derived sub-bass FFT (Club 8192 -> 12288 frames, Quality 16384 ->
+    // 24576 frames).
+    let input = noise(SR as usize * 2);
+    for profile in [
+        timestretch::StreamProfile::Club,
+        timestretch::StreamProfile::Quality,
+    ] {
+        let mut processor = StreamProcessor::new(
+            StretchParams::new(1.05)
+                .with_sample_rate(SR)
+                .with_channels(1)
+                .with_stream_profile(profile),
+        );
+        processor
+            .set_streaming_engine(StreamingEngine::MultiResolution)
+            .expect("Club/Quality profiles support multi-resolution");
+        let mid_fft = processor.params().fft_size;
+        let expected_gate = (mid_fft * 4).min(16384) * 3 / 2;
+        assert_eq!(
+            processor.latency_samples(),
+            expected_gate,
+            "{}: multi-res gate must be keyed to the sub-bass FFT",
+            profile.label()
+        );
+        assert_first_sample_out_honest(
+            processor,
+            &input,
+            &format!("multi-res {}", profile.label()),
+        );
+    }
+}
+
+#[test]
+fn multi_res_rejected_at_live_profile_keeps_deterministic_gate() {
+    use timestretch::StreamingEngine;
+
+    let mut processor = StreamProcessor::new(
+        StretchParams::new(1.05)
+            .with_sample_rate(SR)
+            .with_channels(1)
+            .with_stream_profile(timestretch::StreamProfile::Live),
+    );
+    let gate_before = processor.latency_samples();
+    assert!(
+        processor
+            .set_streaming_engine(StreamingEngine::MultiResolution)
+            .is_err(),
+        "Live profile must reject the multi-resolution engine"
+    );
+    assert_eq!(
+        processor.latency_samples(),
+        gate_before,
+        "failed engine selection must not change the reported gate"
+    );
+}
+
 fn assert_first_sample_out_honest(mut processor: StreamProcessor, input: &[f32], label: &str) {
     let reported = processor.latency_samples();
     let hop = processor.params().hop_size;
