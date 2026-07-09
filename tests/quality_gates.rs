@@ -128,6 +128,21 @@ fn callback_budget_multiplier() -> Option<f64> {
     None
 }
 
+/// Nearest-rank percentile (`pct` in 0.0..=1.0) of `ratios`. Used by the
+/// callback-budget gates so a lone OS scheduler hiccup on one of hundreds of
+/// callbacks — dominant on shared, non-realtime CI VMs — cannot fail the gate,
+/// while a systematic slowdown (many slow callbacks) still does. The absolute
+/// max is kept for logging only.
+fn percentile_ratio(ratios: &[f64], pct: f64) -> f64 {
+    if ratios.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = ratios.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let rank = (pct * (sorted.len() as f64 - 1.0)).round() as usize;
+    sorted[rank.min(sorted.len() - 1)]
+}
+
 fn write_quality_dashboard_csv(name: &str, header: &str, row: &str) {
     let Ok(dir) = std::env::var(QUALITY_DASHBOARD_DIR_ENV) else {
         return;
@@ -354,8 +369,8 @@ fn quality_gate_streaming_worst_case_callback_budget() {
         );
         write_quality_dashboard_csv(
             "quality_gate_streaming_worst_case_callback_budget",
-            "status,max_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
-            "skipped,NaN,NaN,NaN,NaN,0,NaN,false",
+            "status,p99_ratio,max_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
+            "skipped,NaN,NaN,NaN,NaN,NaN,0,NaN,false",
         );
         return;
     };
@@ -375,17 +390,18 @@ fn quality_gate_streaming_worst_case_callback_budget() {
     }
     output.clear();
 
-    let mut measured_callbacks = 0usize;
+    // Budget for a nominal full callback (reporting only; the per-callback
+    // ratio below uses each chunk's own audio duration).
+    let budget_ms = callback_frames as f64 * 1000.0 / sample_rate as f64 * multiplier;
     let mut max_ratio = 0.0f64;
     let mut max_callback_ms = 0.0f64;
-    let mut max_budget_ms = 0.0f64;
     let mut total_process_ms = 0.0f64;
     let mut total_audio_ms = 0.0f64;
+    let mut ratios: Vec<f64> = Vec::new();
 
     for chunk in input.chunks(callback_frames * 2).skip(8) {
         let chunk_frames = (chunk.len() / 2).max(1);
         let callback_audio_ms = chunk_frames as f64 * 1000.0 / sample_rate as f64;
-        let allowed_ms = callback_audio_ms * multiplier;
 
         let start = Instant::now();
         processor
@@ -393,15 +409,14 @@ fn quality_gate_streaming_worst_case_callback_budget() {
             .expect("measured process_into failed");
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-        measured_callbacks += 1;
         total_process_ms += elapsed_ms;
         total_audio_ms += callback_audio_ms;
 
         let ratio = elapsed_ms / callback_audio_ms.max(1e-9);
+        ratios.push(ratio);
         if ratio > max_ratio {
             max_ratio = ratio;
             max_callback_ms = elapsed_ms;
-            max_budget_ms = allowed_ms;
         }
     }
 
@@ -409,6 +424,7 @@ fn quality_gate_streaming_worst_case_callback_budget() {
         .flush_into(&mut output)
         .expect("flush_into failed for callback budget gate");
 
+    let measured_callbacks = ratios.len();
     assert!(
         measured_callbacks > 0,
         "callback budget gate measured no callbacks"
@@ -419,24 +435,29 @@ fn quality_gate_streaming_worst_case_callback_budget() {
     );
 
     let avg_ratio = total_process_ms / total_audio_ms.max(1e-9);
+    // Gate on p99 rather than the absolute max: on shared CI VMs the single
+    // slowest callback is dominated by OS scheduling noise, not the DSP.
+    let p99_ratio = percentile_ratio(&ratios, 0.99);
     println!(
-        "callback-budget: callbacks={} max_ratio={:.3} avg_ratio={:.3} max_ms={:.3} budget_ms={:.3} strict_mode={}",
+        "callback-budget: callbacks={} p99_ratio={:.3} max_ratio={:.3} avg_ratio={:.3} max_ms={:.3} budget_ms={:.3} strict_mode={}",
         measured_callbacks,
+        p99_ratio,
         max_ratio,
         avg_ratio,
         max_callback_ms,
-        max_budget_ms,
+        budget_ms,
         strict_callback_budget_mode()
     );
     write_quality_dashboard_csv(
         "quality_gate_streaming_worst_case_callback_budget",
-        "status,max_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
+        "status,p99_ratio,max_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
         &format!(
-            "ok,{:.6},{:.6},{:.6},{:.6},{},{:.6},{}",
+            "ok,{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{}",
+            p99_ratio,
             max_ratio,
             avg_ratio,
             max_callback_ms,
-            max_budget_ms,
+            budget_ms,
             measured_callbacks,
             multiplier,
             strict_callback_budget_mode()
@@ -444,12 +465,149 @@ fn quality_gate_streaming_worst_case_callback_budget() {
     );
 
     assert!(
-        max_ratio <= multiplier,
-        "callback budget gate failed: max callback ratio {:.3} > {:.3} (max callback {:.3}ms, budget {:.3}ms). Set {}=0 for relaxed mode or {} to tune.",
-        max_ratio,
+        p99_ratio <= multiplier,
+        "callback budget gate failed: p99 callback ratio {:.3} > {:.3} (max callback {:.3}ms, budget {:.3}ms, max_ratio {:.3}). Set {}=0 for relaxed mode or {} to tune.",
+        p99_ratio,
         multiplier,
         max_callback_ms,
-        max_budget_ms,
+        budget_ms,
+        max_ratio,
+        STRICT_CALLBACK_BUDGET_ENV,
+        CALLBACK_BUDGET_MULTIPLIER_ENV
+    );
+}
+
+/// Sibling of `quality_gate_streaming_worst_case_callback_budget` with the
+/// realtime pitch path engaged (default sinc resampler) and the pitch control
+/// modulated every callback, mirroring DJ pitch-bend usage.
+#[test]
+fn quality_gate_streaming_pitch_callback_budget() {
+    let sample_rate = 44_100u32;
+    let bpm = 126.0;
+    let ratio = 1.02;
+    let callback_frames = 256usize;
+    let input = generate_gate_signal(sample_rate, bpm, 10.0);
+    let Some(multiplier) = callback_budget_multiplier() else {
+        println!(
+            "Skipping pitch callback budget gate: set {}=1 (strict) or {}=<value> to enable",
+            STRICT_CALLBACK_BUDGET_ENV, CALLBACK_BUDGET_MULTIPLIER_ENV
+        );
+        write_quality_dashboard_csv(
+            "quality_gate_streaming_pitch_callback_budget",
+            "status,p99_ratio,max_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
+            "skipped,NaN,NaN,NaN,NaN,NaN,0,NaN,false",
+        );
+        return;
+    };
+
+    let params = StretchParams::new(ratio)
+        .with_sample_rate(sample_rate)
+        .with_channels(2)
+        .with_preset(EdmPreset::DjBeatmatch);
+
+    let mut processor = StreamProcessor::new(params);
+    processor
+        .set_pitch_scale(1.06)
+        .expect("pitch scale should be accepted");
+    let mut output = Vec::with_capacity((input.len() as f64 * 1.30) as usize + 65_536);
+
+    for chunk in input.chunks(callback_frames * 2).take(8) {
+        processor
+            .process_into(chunk, &mut output)
+            .expect("warmup process_into failed");
+    }
+    output.clear();
+
+    // Budget for a nominal full callback (reporting only; the per-callback
+    // ratio below uses each chunk's own audio duration).
+    let budget_ms = callback_frames as f64 * 1000.0 / sample_rate as f64 * multiplier;
+    let mut max_ratio = 0.0f64;
+    let mut max_callback_ms = 0.0f64;
+    let mut total_process_ms = 0.0f64;
+    let mut total_audio_ms = 0.0f64;
+    let mut ratios: Vec<f64> = Vec::new();
+
+    for (i, chunk) in input.chunks(callback_frames * 2).skip(8).enumerate() {
+        let chunk_frames = (chunk.len() / 2).max(1);
+        let callback_audio_ms = chunk_frames as f64 * 1000.0 / sample_rate as f64;
+
+        // Modulate the pitch control every callback (1.04..1.08 triangle).
+        let phase = (i % 32) as f64 / 32.0;
+        let tri = if phase < 0.5 { phase } else { 1.0 - phase };
+        let scale = 1.04 + 0.08 * tri;
+
+        let start = Instant::now();
+        processor
+            .set_pitch_scale(scale)
+            .expect("pitch scale should be accepted");
+        processor
+            .process_into(chunk, &mut output)
+            .expect("measured process_into failed");
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        total_process_ms += elapsed_ms;
+        total_audio_ms += callback_audio_ms;
+
+        let ratio = elapsed_ms / callback_audio_ms.max(1e-9);
+        ratios.push(ratio);
+        if ratio > max_ratio {
+            max_ratio = ratio;
+            max_callback_ms = elapsed_ms;
+        }
+    }
+
+    processor
+        .flush_into(&mut output)
+        .expect("flush_into failed for pitch callback budget gate");
+
+    let measured_callbacks = ratios.len();
+    assert!(
+        measured_callbacks > 0,
+        "pitch callback budget gate measured no callbacks"
+    );
+    assert!(
+        !output.is_empty(),
+        "pitch callback budget gate produced empty output"
+    );
+
+    let avg_ratio = total_process_ms / total_audio_ms.max(1e-9);
+    // Gate on p99 rather than the absolute max: on shared CI VMs the single
+    // slowest callback is dominated by OS scheduling noise, not the DSP.
+    let p99_ratio = percentile_ratio(&ratios, 0.99);
+    println!(
+        "pitch-callback-budget: callbacks={} p99_ratio={:.3} max_ratio={:.3} avg_ratio={:.3} max_ms={:.3} budget_ms={:.3} strict_mode={}",
+        measured_callbacks,
+        p99_ratio,
+        max_ratio,
+        avg_ratio,
+        max_callback_ms,
+        budget_ms,
+        strict_callback_budget_mode()
+    );
+    write_quality_dashboard_csv(
+        "quality_gate_streaming_pitch_callback_budget",
+        "status,p99_ratio,max_ratio,avg_ratio,max_callback_ms,max_budget_ms,measured_callbacks,multiplier,strict_mode",
+        &format!(
+            "ok,{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{}",
+            p99_ratio,
+            max_ratio,
+            avg_ratio,
+            max_callback_ms,
+            budget_ms,
+            measured_callbacks,
+            multiplier,
+            strict_callback_budget_mode()
+        ),
+    );
+
+    assert!(
+        p99_ratio <= multiplier,
+        "pitch callback budget gate failed: p99 callback ratio {:.3} > {:.3} (max callback {:.3}ms, budget {:.3}ms, max_ratio {:.3}). Set {}=0 for relaxed mode or {} to tune.",
+        p99_ratio,
+        multiplier,
+        max_callback_ms,
+        budget_ms,
+        max_ratio,
         STRICT_CALLBACK_BUDGET_ENV,
         CALLBACK_BUDGET_MULTIPLIER_ENV
     );

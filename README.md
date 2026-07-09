@@ -20,8 +20,19 @@ external DSP dependency is [`rustfft`](https://crates.io/crates/rustfft).
   stream chunks for smoother continuity
 - **Streaming API** — process audio in chunks for real-time use with dynamic
   stretch ratio and tempo changes
-- **Offline pre-analysis pipeline** — optional reusable artifact (BPM, phase,
-  confidence, transient map) for safer beat/onset alignment at runtime
+- **Analyze-on-load pre-analysis** — analyze a track once (CLI `analyze` or
+  `analyze_for_dj`), persist the artifact (BPM, beat grid, transient onsets
+  with strengths, content hash), and every stretch path — batch and both
+  streaming engines — consumes it in place of online detection, with
+  `set_source_position` keeping onsets aligned across seeks
+- **Loudness-robust onset detection** — log-compressed spectral flux with a
+  robust `median + k·MAD` threshold and an energy-channel gate, so dense
+  mastered material yields usable onsets/BPM (where a plateau-and-multiply
+  detector reads zero) while sustained tones correctly report no beat
+- **Warm-start seek/cue/loop** — `warm_start_seek` re-primes the streaming
+  processor from the audio preceding a jump so playback resumes converged
+  (no cold buffering gap, no phase-vocoder warm-up, ratio/pitch state
+  preserved); `notify_source_jump` wraps loops gaplessly
 - **Stereo coherence hardening** — shared onset/timing map and deterministic
   channel length agreement in mid/side mode
 - **Sub-bass phase locking** — locks phase below 120 Hz to prevent bass smearing
@@ -168,15 +179,44 @@ println!(
 );
 ```
 
-### Low-Latency Tempo Constructor
+### Streaming Profiles & Latency
+
+Streaming latency and quality are selected together through
+`StreamProfile`. Every profile carries the full DJ tuning bundle; they
+differ only in the FFT/hop configuration that sets the buffering latency.
 
 ```rust
-use timestretch::StreamProcessor;
+use timestretch::{StreamProcessor, StreamProfile};
 
-let mut processor = StreamProcessor::try_from_tempo_low_latency(126.0, 128.0, 44100, 2)
-    .expect("valid BPM inputs");
+let mut processor =
+    StreamProcessor::try_from_tempo_with_profile(126.0, 128.0, 44100, 2, StreamProfile::Live)
+        .expect("valid BPM inputs");
 assert!(processor.latency_secs() * 1000.0 < 40.0);
+
+// Or via params: StretchParams::new(ratio).with_stream_profile(StreamProfile::Club)
+// `try_from_tempo_low_latency` is shorthand for the Live profile.
 ```
+
+Measured figures at 44.1 kHz (`tests/streaming_latency.rs` verifies that the
+first output sample appears exactly at the reported gate; `latency_samples()`
+/ `latency_report()` report the real current gate, not a formula):
+
+| Profile | FFT/hop | Buffering gate (ratio in `[0.9, 1.1]`) | Gate beyond ±10% | Steady-ratio similarity | Ratio-ride similarity |
+|---------|-----------|--------------------|--------------------|------|------|
+| Live    | 1024/256  | 1536 fr = 34.8 ms  | 2048 fr = 46.4 ms  | 0.9982 | 0.9982 |
+| Club    | 2048/512  | 3072 fr = 69.7 ms  | 4096 fr = 92.9 ms  | 0.9976 | 0.9969 |
+| Quality | 4096/1024 | 6144 fr = 139.3 ms | 8192 fr = 185.8 ms | 0.9991 | 0.9932 |
+
+Similarity = mean spectral similarity to the source on synthetic EDM material
+(`qa/profile_quality.rs`). At steady stretch the larger windows win; under a
+0.92–1.08 ratio ride the smaller windows track the modulation better — which
+is exactly why `Live` is the DJ control profile.
+
+Control-to-audio behavior (all profiles): ratio and pitch controls glide with
+a ~50 ms time constant. Pitch changes reach the output almost immediately
+(the pitch resampler sits after the vocoder, so only the glide applies, plus
+16–80 samples of sinc kernel lookahead); ratio changes take roughly the
+buffering gate plus the glide.
 
 ### Realtime Pitch Control
 

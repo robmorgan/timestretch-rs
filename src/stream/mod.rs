@@ -3,4 +3,6 @@
 pub mod processor;
 mod transient_scheduler;
 
-pub use processor::{StreamProcessor, TransientResetStats};
+pub use processor::{
+    StreamLatencyReport, StreamPitchQuality, StreamProcessor, TransientResetStats,
+};

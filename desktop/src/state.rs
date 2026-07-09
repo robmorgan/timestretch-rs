@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use timestretch::EdmPreset;
+use timestretch::{EdmPreset, PreAnalysisArtifact};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Transport {
@@ -52,22 +52,9 @@ impl PresetChoice {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum StreamProfile {
-    Live,
-    Quality,
-}
-
-impl StreamProfile {
-    pub const ALL: &'static [StreamProfile] = &[StreamProfile::Live, StreamProfile::Quality];
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            StreamProfile::Live => "Live",
-            StreamProfile::Quality => "Quality",
-        }
-    }
-}
+// The streaming latency/quality profile is now a first-class library
+// concept; the desktop app re-exports it for its UI.
+pub use timestretch::StreamProfile;
 
 /// State shared between UI, processing, and audio threads.
 pub struct SharedState {
@@ -91,12 +78,31 @@ pub struct SharedState {
 
     /// Set by UI to request a seek.
     pub seek_request: Option<usize>,
-    /// Set by UI when pitch changes (requires re-processing).
-    pub pitch_changed: bool,
     /// Set by UI when preset changes (requires rebuilding processor).
     pub preset_changed: bool,
-    /// Set by processing thread when it finishes loading pitch-shifted audio.
-    pub pitch_processing: bool,
+
+    /// Effective streaming latency reported by the active processor, in
+    /// seconds. Published by the processing thread at every build; read by
+    /// the UI next to the profile selector.
+    pub reported_latency_secs: f64,
+
+    /// Offline pre-analysis of the loaded track (beat grid, onsets).
+    ///
+    /// Arrives asynchronously from the analysis thread after load and is
+    /// consumed at the next processor rebuild (seek/preset/EOF); running
+    /// processors are never hot-swapped.
+    pub pre_analysis: Option<Arc<PreAnalysisArtifact>>,
+    /// Bumped on every file load; a background analysis result is discarded
+    /// unless its generation still matches (guards rapid successive loads).
+    pub analysis_generation: u64,
+
+    /// Active loop region in source frames, if looping is engaged. When set,
+    /// the processing thread wraps `[start, end)` gaplessly via the library's
+    /// warm-start machinery.
+    pub loop_region: Option<(usize, usize)>,
+    /// Loop-in point staged by the UI (source frame) before the loop-out is
+    /// set to complete a region.
+    pub loop_in: Option<usize>,
 }
 
 impl SharedState {
@@ -107,16 +113,19 @@ impl SharedState {
             pitch_semitones: 0.0,
             volume: 0.8,
             preset: PresetChoice::DjBeatmatch,
-            stream_profile: StreamProfile::Live,
+            stream_profile: StreamProfile::Club,
             position_frames: 0,
             total_frames: 0,
             sample_rate: 44100,
             detected_bpm: 0.0,
             target_bpm: 0.0,
             seek_request: None,
-            pitch_changed: false,
             preset_changed: false,
-            pitch_processing: false,
+            reported_latency_secs: 0.0,
+            pre_analysis: None,
+            analysis_generation: 0,
+            loop_region: None,
+            loop_in: None,
         }
     }
 

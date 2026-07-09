@@ -4,7 +4,7 @@
 //! estimation, allowing the grid to self-correct over time and eliminate
 //! systematic offset from the first detected onset.
 
-use crate::analysis::transient::detect_transients;
+use crate::analysis::transient::{detect_transients, TransientMap};
 
 /// FFT size for beat detection (balances frequency resolution and speed).
 const BEAT_FFT_SIZE: usize = 2048;
@@ -103,7 +103,18 @@ pub fn detect_beats(samples: &[f32], sample_rate: u32) -> BeatGrid {
         BEAT_HOP_SIZE,
         BEAT_SENSITIVITY,
     );
+    detect_beats_from_transients(&transients, sample_rate)
+}
 
+/// Beat-grid estimation from an already-computed transient map.
+///
+/// The map must come from a detection pass at [`BEAT_HOP_SIZE`] so onset
+/// sample positions line up with the grid. `analyze_for_dj` reuses its
+/// single pre-analysis detection here instead of running detection twice.
+pub(crate) fn detect_beats_from_transients(
+    transients: &TransientMap,
+    sample_rate: u32,
+) -> BeatGrid {
     if transients.onsets.len() < 2 {
         let beats_fractional = transients.onsets_fractional.to_vec();
         let beats_int = if beats_fractional.is_empty() {

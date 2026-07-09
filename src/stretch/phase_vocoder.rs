@@ -689,6 +689,27 @@ impl PhaseVocoder {
         self.ratio_change_phase_from = self.stretch_ratio;
     }
 
+    /// Clears ALL per-stream state — phase history, the held streaming
+    /// overlap tail, synthesis position, and flux tracking — without
+    /// deallocating any buffer.
+    ///
+    /// After this call the vocoder behaves like a freshly constructed one
+    /// for streaming purposes, which makes it the allocation-free
+    /// equivalent of dropping and rebuilding the instance. Used by
+    /// warm-start seek to re-prime from new material.
+    pub fn reset_streaming_state(&mut self) {
+        self.reset_phase_state();
+        self.streaming_tail.clear();
+        self.streaming_tail_window_sum.clear();
+        self.streaming_tail_ratio = self.stretch_ratio;
+        self.streaming_tail_phase_ratio = self.stretch_ratio;
+        self.synthesis_pos = 0.0;
+        self.synthesis_emitted = 0;
+        self.flux_prev_magnitudes.fill(0.0);
+        self.flux_has_prev = false;
+        self.last_frame_flux = None;
+    }
+
     /// Enables or disables confidence-driven adaptive phase-lock switching.
     #[inline]
     pub fn set_adaptive_phase_locking(&mut self, enabled: bool) {

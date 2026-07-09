@@ -57,15 +57,20 @@ pub mod stream;
 pub mod stretch;
 
 pub use analysis::beat::BeatGrid;
-pub use analysis::preanalysis::analyze_for_dj;
-pub use core::preanalysis::{read_preanalysis_json, write_preanalysis_json, PreAnalysisArtifact};
+pub use analysis::preanalysis::{
+    analyze_for_dj, analyze_for_dj_with_report, downmix_to_mid, AnalysisReport,
+};
+pub use core::preanalysis::{
+    hash_samples, read_preanalysis_json, write_preanalysis_json, PreAnalysisArtifact,
+    PREANALYSIS_VERSION,
+};
 pub use core::types::{
     AudioBuffer, Channels, CrossfadeMode, EdmPreset, EnvelopePreset, FrameIter, QualityMode,
-    Sample, StretchParams, TransientThresholdPolicy,
+    Sample, StreamProfile, StretchParams, TransientThresholdPolicy,
 };
 pub use core::window::WindowType;
 pub use error::StretchError;
-pub use stream::{StreamProcessor, TransientResetStats};
+pub use stream::{StreamLatencyReport, StreamPitchQuality, StreamProcessor, TransientResetStats};
 pub use stretch::phase_locking::PhaseLockingMode;
 pub use stretch::stereo::StereoMode;
 

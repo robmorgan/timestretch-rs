@@ -11,8 +11,18 @@ const BAND_SUB_END_HZ: f64 = 100.0;
 const BAND_LOW_END_HZ: f64 = 500.0;
 /// Mid/high split (Hz) used for reset-mask routing.
 const BAND_MID_END_HZ: f64 = 4000.0;
-/// EMA coefficient for adaptive spectral-flux statistics.
-const FLUX_EMA_ALPHA: f64 = 0.2;
+/// Reference configuration the frame-count tunings below were calibrated at:
+/// 4096 FFT / 1024 hop / 44.1 kHz. Time-based derivations reproduce the
+/// legacy per-frame values exactly at this configuration and scale them to
+/// equivalent absolute time elsewhere (e.g. 1024/256 low-latency streaming).
+const REFERENCE_FFT_SIZE: f64 = 4096.0;
+
+/// Adaptation time constant for the spectral-flux statistics EMA.
+///
+/// Chosen so the per-frame alpha `1 - exp(-frame_secs / T)` equals the
+/// legacy `FLUX_EMA_ALPHA = 0.2` at the reference hop (1024 / 44.1 kHz,
+/// `T = frame_secs / ln(1.25)`).
+const FLUX_STAT_TIME_SECS: f64 = 0.104058;
 /// Sigma multiplier for adaptive spectral-flux threshold.
 const FLUX_THRESHOLD_SIGMA: f64 = 2.5;
 /// Required jump versus previous frame flux to classify a transient.
@@ -36,11 +46,22 @@ const FLUX_MODULATION_MIN_UPPER_THRESHOLD_SHARE: f64 = 0.35;
 /// mode turns a seam-side event into a fresh upper-band reset.
 const FLUX_MODULATION_MIN_UPPER_DOMINANCE: f64 = 1.25;
 /// Number of flux frames to observe before trigger checks.
+///
+/// Deliberately a frame count, not time-derived: warmup bootstraps the flux
+/// mean/variance statistics, which need a minimum number of observations
+/// regardless of hop duration. Keeping it small also bounds how much audio
+/// after a stream start or seek rebuild goes without transient resets
+/// (~17 ms at 256 hop, ~70 ms at the reference 1024 hop).
 const FLUX_WARMUP_FRAMES: usize = 3;
 /// Maximum analysis frames scanned per scheduler pass.
 const FLUX_MAX_SCAN_FRAMES: usize = 8;
-/// Minimum cooldown frames after an event to avoid duplicate resets.
-const FLUX_RESET_COOLDOWN_FRAMES: usize = 2;
+/// Minimum cooldown time after an event to avoid duplicate resets.
+///
+/// 2 frames at the reference hop (~46 ms); scales to 8 frames at 256 hop so
+/// the cooldown still covers a kick's decay at low-latency configurations.
+const FLUX_RESET_COOLDOWN_SECS: f64 = 0.0464;
+/// Floor for the derived minimum cooldown frame count.
+const FLUX_RESET_COOLDOWN_MIN_FRAMES: usize = 2;
 /// Base overlap windows used by tests when verifying modulation cooldown scaling.
 #[cfg(test)]
 const MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS: usize = 2;
@@ -81,6 +102,19 @@ pub(crate) struct TransientEventScheduler {
     cooldown_frames: usize,
     last_processed_frame_start: Option<usize>,
     stats: TransientSchedulerStats,
+    /// Initial warmup frame count ([`FLUX_WARMUP_FRAMES`]).
+    warmup_frames_initial: usize,
+    /// Derived minimum cooldown frames ([`FLUX_RESET_COOLDOWN_SECS`]).
+    min_cooldown_frames: usize,
+    /// Derived per-frame statistics EMA alpha ([`FLUX_STAT_TIME_SECS`]).
+    flux_ema_alpha: f64,
+    /// Modulation-hold per-window threshold step, scaled by
+    /// `fft_size / 4096` so the desensitization ceiling stays constant when
+    /// the processor's time-based window cap grows at smaller FFT sizes.
+    modulation_threshold_scale_step: f64,
+    /// Modulation-hold per-window spike-ratio step, scaled like
+    /// [`Self::modulation_threshold_scale_step`].
+    modulation_spike_ratio_step: f64,
 }
 
 impl TransientEventScheduler {
@@ -100,6 +134,20 @@ impl TransientEventScheduler {
             ((BAND_LOW_END_HZ / bin_hz).floor() as usize).min(num_bins.saturating_sub(1));
         let mid_end_bin =
             ((BAND_MID_END_HZ / bin_hz).floor() as usize).min(num_bins.saturating_sub(1));
+
+        // Derive temporal tunings (cooldown, statistics adaptation) from
+        // absolute time so the scheduler behaves the same across hop sizes.
+        // At the reference 4096/1024/44.1kHz configuration these reproduce
+        // the legacy constants exactly (min cooldown 2, alpha 0.2). Warmup
+        // stays a frame count — it bootstraps statistics, not a time span.
+        let frame_secs = hop_size.max(1) as f64 / sample_rate.max(1) as f64;
+        let warmup_frames_initial = FLUX_WARMUP_FRAMES;
+        let min_cooldown_frames = ((FLUX_RESET_COOLDOWN_SECS / frame_secs).ceil() as usize)
+            .max(FLUX_RESET_COOLDOWN_MIN_FRAMES);
+        let flux_ema_alpha = 1.0 - (-frame_secs / FLUX_STAT_TIME_SECS).exp();
+        let fft_scale = fft_size as f64 / REFERENCE_FFT_SIZE;
+        let modulation_threshold_scale_step = FLUX_MODULATION_THRESHOLD_SCALE_STEP * fft_scale;
+        let modulation_spike_ratio_step = FLUX_MODULATION_SPIKE_RATIO_STEP * fft_scale;
 
         Self {
             fft_size,
@@ -121,10 +169,15 @@ impl TransientEventScheduler {
             mean_flux: 0.0,
             var_flux: 0.0,
             prev_flux: 0.0,
-            warmup_frames: FLUX_WARMUP_FRAMES,
+            warmup_frames: warmup_frames_initial,
             cooldown_frames: 0,
             last_processed_frame_start: None,
             stats: TransientSchedulerStats::default(),
+            warmup_frames_initial,
+            min_cooldown_frames,
+            flux_ema_alpha,
+            modulation_threshold_scale_step,
+            modulation_spike_ratio_step,
         }
     }
 
@@ -133,7 +186,7 @@ impl TransientEventScheduler {
         self.mean_flux = 0.0;
         self.var_flux = 0.0;
         self.prev_flux = 0.0;
-        self.warmup_frames = FLUX_WARMUP_FRAMES;
+        self.warmup_frames = self.warmup_frames_initial;
         self.cooldown_frames = 0;
         self.left_buffer.clear();
         self.right_buffer.clear();
@@ -144,14 +197,14 @@ impl TransientEventScheduler {
     #[inline]
     fn reset_cooldown_frames(&self, modulation_overlap_windows: usize) -> usize {
         if self.hop_size == 0 {
-            return FLUX_RESET_COOLDOWN_FRAMES;
+            return self.min_cooldown_frames;
         }
 
         // Hold the scheduler through the full overlapping-window footprint of
         // a detected event so the same click is not reclassified as a fresh
         // transient on the next few callback snapshots.
         let overlap_frames = self.fft_size.div_ceil(self.hop_size).saturating_sub(1);
-        let mut cooldown_frames = FLUX_RESET_COOLDOWN_FRAMES.max(overlap_frames);
+        let mut cooldown_frames = self.min_cooldown_frames.max(overlap_frames);
 
         if modulation_overlap_windows > 0 {
             // Cross-unity/near-unity modulation already keeps low bands phase
@@ -196,9 +249,9 @@ impl TransientEventScheduler {
         }
 
         let overlap_windows = modulation_overlap_windows as f64;
-        let threshold_scale = 1.0 + FLUX_MODULATION_THRESHOLD_SCALE_STEP * overlap_windows;
+        let threshold_scale = 1.0 + self.modulation_threshold_scale_step * overlap_windows;
         let spike_ratio =
-            FLUX_SPIKE_RATIO * (1.0 + FLUX_MODULATION_SPIKE_RATIO_STEP * overlap_windows);
+            FLUX_SPIKE_RATIO * (1.0 + self.modulation_spike_ratio_step * overlap_windows);
 
         (threshold_scale, spike_ratio)
     }
@@ -268,6 +321,75 @@ impl TransientEventScheduler {
             self.right_buffer.push(frame[1]);
         }
 
+        self.scan_frames(
+            frames,
+            absolute_frame_origin,
+            true,
+            suppress_low_bands,
+            modulation_overlap_windows,
+        )
+    }
+
+    /// Detects a transient event from a mono input snapshot and returns a
+    /// per-band reset mask when detected.
+    ///
+    /// Mirrors [`Self::detect_stereo_reset_mask`]; all flux statistics,
+    /// cooldowns, and mask routing are shared, only the per-frame magnitude
+    /// source differs (single channel instead of an L/R average).
+    pub(crate) fn detect_mono_reset_mask(
+        &mut self,
+        mono: &[f32],
+        frame_origin: usize,
+        suppress_low_bands: bool,
+        modulation_overlap_windows: usize,
+    ) -> Option<[bool; 4]> {
+        if self.hop_size == 0 || mono.len() < self.fft_size {
+            return None;
+        }
+
+        let mut frames = mono.len();
+        if frames < self.fft_size.saturating_add(self.hop_size) {
+            return None;
+        }
+
+        let mut start_sample = 0usize;
+        let mut absolute_frame_origin = frame_origin;
+        if frames > self.max_frames {
+            let drop_frames = frames - self.max_frames;
+            start_sample = drop_frames;
+            frames = self.max_frames;
+            absolute_frame_origin = absolute_frame_origin.saturating_add(drop_frames);
+        }
+
+        if self.left_buffer.capacity() < frames {
+            return None;
+        }
+        self.left_buffer.clear();
+        self.left_buffer
+            .extend_from_slice(&mono[start_sample..start_sample + frames]);
+
+        self.scan_frames(
+            frames,
+            absolute_frame_origin,
+            false,
+            suppress_low_bands,
+            modulation_overlap_windows,
+        )
+    }
+
+    /// Shared per-frame flux scan over the prepared channel buffers.
+    ///
+    /// Reads `left_buffer` (and `right_buffer` when `stereo`) and runs the
+    /// incremental spectral-flux transient detection, returning the combined
+    /// reset mask for the first accepted event, if any.
+    fn scan_frames(
+        &mut self,
+        frames: usize,
+        absolute_frame_origin: usize,
+        stereo: bool,
+        suppress_low_bands: bool,
+        modulation_overlap_windows: usize,
+    ) -> Option<[bool; 4]> {
         let num_frames = (frames - self.fft_size) / self.hop_size + 1;
         if num_frames < 2 {
             return None;
@@ -292,7 +414,6 @@ impl TransientEventScheduler {
             }
 
             let left_frame = &self.left_buffer[start..start + self.fft_size];
-            let right_frame = &self.right_buffer[start..start + self.fft_size];
 
             for (dst, (&sample, &window)) in self
                 .fft_buffer
@@ -304,19 +425,22 @@ impl TransientEventScheduler {
             self.fft_forward
                 .process_with_scratch(&mut self.fft_buffer, &mut self.fft_scratch);
 
-            for bin in 1..self.num_bins {
-                self.left_magnitudes[bin] = self.fft_buffer[bin].norm();
-            }
+            if stereo {
+                for bin in 1..self.num_bins {
+                    self.left_magnitudes[bin] = self.fft_buffer[bin].norm();
+                }
 
-            for (dst, (&sample, &window)) in self
-                .fft_buffer
-                .iter_mut()
-                .zip(right_frame.iter().zip(self.window.iter()))
-            {
-                *dst = Complex::new(sample * window, 0.0);
+                let right_frame = &self.right_buffer[start..start + self.fft_size];
+                for (dst, (&sample, &window)) in self
+                    .fft_buffer
+                    .iter_mut()
+                    .zip(right_frame.iter().zip(self.window.iter()))
+                {
+                    *dst = Complex::new(sample * window, 0.0);
+                }
+                self.fft_forward
+                    .process_with_scratch(&mut self.fft_buffer, &mut self.fft_scratch);
             }
-            self.fft_forward
-                .process_with_scratch(&mut self.fft_buffer, &mut self.fft_scratch);
 
             let mut sub_flux = 0.0f64;
             let mut low_flux = 0.0f64;
@@ -324,10 +448,13 @@ impl TransientEventScheduler {
             let mut high_flux = 0.0f64;
 
             for bin in 1..self.num_bins {
-                // Average per-channel magnitudes. This avoids mid-channel
-                // cancellation for anti-phase/wide stereo transients.
-                let right_mag = self.fft_buffer[bin].norm();
-                let mag = (self.left_magnitudes[bin] + right_mag) * 0.5;
+                let mag = if stereo {
+                    // Average per-channel magnitudes. This avoids mid-channel
+                    // cancellation for anti-phase/wide stereo transients.
+                    (self.left_magnitudes[bin] + self.fft_buffer[bin].norm()) * 0.5
+                } else {
+                    self.fft_buffer[bin].norm()
+                };
                 let diff = (mag - self.prev_magnitudes[bin]).max(0.0) as f64;
                 if bin <= self.sub_end_bin {
                     sub_flux += diff;
@@ -412,8 +539,8 @@ impl TransientEventScheduler {
     #[inline]
     fn update_flux_stats(&mut self, flux: f64) {
         let delta = flux - self.mean_flux;
-        self.mean_flux += FLUX_EMA_ALPHA * delta;
-        self.var_flux += FLUX_EMA_ALPHA * (delta * delta - self.var_flux);
+        self.mean_flux += self.flux_ema_alpha * delta;
+        self.var_flux += self.flux_ema_alpha * (delta * delta - self.var_flux);
     }
 
     /// Builds a per-band phase-reset mask from detected band fluxes.
@@ -473,11 +600,61 @@ mod tests {
     use super::{
         TransientEventScheduler, FLUX_MODULATION_MIN_UPPER_DOMINANCE,
         FLUX_MODULATION_MIN_UPPER_SHARE, FLUX_MODULATION_MIN_UPPER_THRESHOLD_SHARE,
-        FLUX_MODULATION_SPIKE_RATIO_STEP, FLUX_MODULATION_THRESHOLD_SCALE_STEP,
-        FLUX_RESET_COOLDOWN_FRAMES, FLUX_SPIKE_RATIO,
-        MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS,
+        FLUX_MODULATION_SPIKE_RATIO_STEP, FLUX_MODULATION_THRESHOLD_SCALE_STEP, FLUX_SPIKE_RATIO,
+        FLUX_WARMUP_FRAMES, MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS,
     };
     use std::f32::consts::PI;
+
+    #[test]
+    fn derived_tunings_match_legacy_constants_at_reference_config() {
+        // 4096/1024 @ 44.1 kHz is the configuration the frame-count tunings
+        // were calibrated at; the time-based derivation must reproduce the
+        // legacy constants exactly there.
+        let scheduler = TransientEventScheduler::new(4096, 1024, 44_100, 16384);
+        assert_eq!(scheduler.warmup_frames_initial, FLUX_WARMUP_FRAMES);
+        assert_eq!(scheduler.min_cooldown_frames, 2);
+        assert!(
+            (scheduler.flux_ema_alpha - 0.2).abs() < 1e-4,
+            "reference EMA alpha drifted: {}",
+            scheduler.flux_ema_alpha
+        );
+        assert_eq!(
+            scheduler.modulation_threshold_scale_step,
+            FLUX_MODULATION_THRESHOLD_SCALE_STEP
+        );
+        assert_eq!(
+            scheduler.modulation_spike_ratio_step,
+            FLUX_MODULATION_SPIKE_RATIO_STEP
+        );
+    }
+
+    #[test]
+    fn derived_tunings_scale_to_absolute_time_at_low_latency_config() {
+        // 1024/256 @ 44.1 kHz: 4x the frame rate, so temporal frame counts
+        // scale ~4x (same absolute time) and the EMA alpha shrinks to keep
+        // the same adaptation time constant. Warmup stays a fixed
+        // observation count.
+        let scheduler = TransientEventScheduler::new(1024, 256, 44_100, 4096);
+        assert_eq!(scheduler.warmup_frames_initial, FLUX_WARMUP_FRAMES);
+        assert_eq!(scheduler.min_cooldown_frames, 8);
+        assert!(
+            (scheduler.flux_ema_alpha - 0.0543).abs() < 5e-4,
+            "low-latency EMA alpha off: {}",
+            scheduler.flux_ema_alpha
+        );
+        // Desensitization steps shrink by fft/4096 so the ceiling stays
+        // constant when the processor's window cap grows at small FFT sizes.
+        assert_eq!(
+            scheduler.modulation_threshold_scale_step,
+            FLUX_MODULATION_THRESHOLD_SCALE_STEP * 0.25
+        );
+        assert_eq!(
+            scheduler.modulation_spike_ratio_step,
+            FLUX_MODULATION_SPIKE_RATIO_STEP * 0.25
+        );
+        // Warmup and reset() agree.
+        assert_eq!(scheduler.warmup_frames, scheduler.warmup_frames_initial);
+    }
 
     #[test]
     fn scheduler_detects_click_transient() {
@@ -575,6 +752,74 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_detects_mono_click_transient() {
+        let sr = 44_100u32;
+        let fft = 1024usize;
+        let hop = 256usize;
+        let frames = 4096usize;
+        let mut mono = vec![0.0f32; frames];
+        for (i, sample) in mono.iter_mut().enumerate() {
+            let t = i as f32 / sr as f32;
+            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
+            let click = if (3400..3420).contains(&i) { 2.0 } else { 0.0 };
+            *sample = base + click;
+        }
+
+        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
+        let mask = scheduler.detect_mono_reset_mask(&mono, 0, false, 0);
+        assert!(mask.is_some(), "expected mono transient reset mask");
+        let mask = mask.unwrap();
+        assert!(
+            mask[2] || mask[3],
+            "expected at least mid/high reset for mono click transient, got {:?}",
+            mask
+        );
+    }
+
+    #[test]
+    fn scheduler_mono_skips_duplicate_frames_for_same_origin() {
+        let sr = 44_100u32;
+        let fft = 1024usize;
+        let hop = 256usize;
+        let frames = 4096usize;
+        let mut mono = vec![0.0f32; frames];
+        for (i, sample) in mono.iter_mut().enumerate() {
+            let t = i as f32 / sr as f32;
+            let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
+            let click = if (3400..3420).contains(&i) { 2.0 } else { 0.0 };
+            *sample = base + click;
+        }
+
+        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
+        let first = scheduler.detect_mono_reset_mask(&mono, 0, false, 0);
+        let second = scheduler.detect_mono_reset_mask(&mono, 0, false, 0);
+        assert!(first.is_some(), "first mono pass should observe transient");
+        assert!(
+            second.is_none(),
+            "second mono pass with same origin should not reprocess duplicate frames"
+        );
+    }
+
+    #[test]
+    fn scheduler_mono_ignores_steady_tone() {
+        let sr = 44_100u32;
+        let fft = 1024usize;
+        let hop = 256usize;
+        let frames = 4096usize;
+        let mono: Vec<f32> = (0..frames)
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / sr as f32).sin() * 0.3)
+            .collect();
+
+        let mut scheduler = TransientEventScheduler::new(fft, hop, sr, frames);
+        let mask = scheduler.detect_mono_reset_mask(&mono, 0, false, 0);
+        assert!(
+            mask.is_none(),
+            "steady mono tone should not trigger phase resets, got {:?}",
+            mask
+        );
+    }
+
+    #[test]
     fn scheduler_select_reset_mask_always_sets_mid_and_high() {
         let mut scheduler = TransientEventScheduler::new(1024, 256, 44_100, 4096);
         scheduler.warmup_frames = 0;
@@ -627,8 +872,8 @@ mod tests {
 
         assert_eq!(
             base,
-            FLUX_RESET_COOLDOWN_FRAMES.max(overlap_frames),
-            "base cooldown should continue to cover one overlap footprint"
+            scheduler.min_cooldown_frames.max(overlap_frames),
+            "base cooldown should cover the time-derived minimum or one overlap footprint"
         );
         assert_eq!(
             modulation,
@@ -704,7 +949,7 @@ mod tests {
         assert_eq!(
             threshold_scale,
             1.0
-                + FLUX_MODULATION_THRESHOLD_SCALE_STEP
+                + scheduler.modulation_threshold_scale_step
                     * MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS as f64,
             "low-band-suppressed modulation should require a proportionally stronger flux threshold"
         );
@@ -712,7 +957,7 @@ mod tests {
             spike_ratio,
             FLUX_SPIKE_RATIO
                 * (1.0
-                    + FLUX_MODULATION_SPIKE_RATIO_STEP
+                    + scheduler.modulation_spike_ratio_step
                         * MODULATION_RESET_COOLDOWN_BASE_OVERLAP_WINDOWS as f64),
             "low-band-suppressed modulation should require a proportionally larger frame-to-frame spike"
         );
@@ -831,7 +1076,9 @@ mod tests {
         assert!(mask.is_some(), "expected tail transient reset mask");
         assert_eq!(
             scheduler.cooldown_frames,
-            FLUX_RESET_COOLDOWN_FRAMES.max(fft.div_ceil(hop).saturating_sub(1)),
+            scheduler
+                .min_cooldown_frames
+                .max(fft.div_ceil(hop).saturating_sub(1)),
             "detected events should keep the full configured cooldown for subsequent analysis frames"
         );
     }
@@ -1019,18 +1266,19 @@ mod tests {
         let hop = 256usize;
         let callback_frames = 4096usize;
         let quarter_hop = hop / 4;
-        let total_frames = callback_frames + hop * 5;
+        let total_frames = callback_frames + hop * 10;
         let mut stereo = vec![0.0f32; total_frames * 2];
         for i in 0..total_frames {
             let t = i as f32 / sr as f32;
             let base = (2.0 * PI * 220.0 * t).sin() * 0.2;
             // The first click is late enough to trigger near the end of the
             // initial callback without being visible in the prior analysis
-            // frame. The second begins just after the last pre-cooldown
-            // window so it should fire on the first post-cooldown mixed
-            // callback that clears the full-hop gate.
+            // frame. The second first becomes visible in the frame scanned
+            // right after the time-based cooldown (8 frames at 256 hop,
+            // ~46 ms) expires, so it should fire exactly once on the first
+            // post-cooldown mixed callback that clears the full-hop gate.
             let click_a = if (3328..3348).contains(&i) { 2.0 } else { 0.0 };
-            let click_b = if (4416..4496).contains(&i) { 4.0 } else { 0.0 };
+            let click_b = if (6200..6280).contains(&i) { 4.0 } else { 0.0 };
             let sample = base + click_a + click_b;
             stereo[i * 2] = sample;
             stereo[i * 2 + 1] = sample * 0.9;
@@ -1038,36 +1286,32 @@ mod tests {
 
         let mut scheduler = TransientEventScheduler::new(fft, hop, sr, callback_frames);
         let mut triggered_origins = Vec::new();
-        for origin in [
-            0usize,
-            quarter_hop,
-            hop / 2,
-            hop - quarter_hop,
-            hop,
-            hop + quarter_hop,
-            hop + hop / 2,
-            hop + hop - quarter_hop,
-            hop * 2,
-            hop * 2 + quarter_hop,
-            hop * 2 + hop / 2,
-            hop * 2 + hop - quarter_hop,
-            hop * 3,
-            hop * 3 + quarter_hop,
-            hop * 3 + hop / 2,
-            hop * 3 + hop - quarter_hop,
-        ] {
-            let start = origin * 2;
-            let end = start + callback_frames * 2;
-            let mask = scheduler.detect_stereo_reset_mask(&stereo[start..end], origin, false, 0);
-            if mask.is_some() {
-                triggered_origins.push(origin);
+        // Ten full-hop groups, each visited at four sub-hop offsets.
+        for group in 0..10usize {
+            for offset in [0, quarter_hop, hop / 2, hop - quarter_hop] {
+                let origin = group * hop + offset;
+                let start = origin * 2;
+                let end = start + callback_frames * 2;
+                let mask =
+                    scheduler.detect_stereo_reset_mask(&stereo[start..end], origin, false, 0);
+                if mask.is_some() {
+                    triggered_origins.push(origin);
+                }
             }
         }
 
         assert_eq!(
-            triggered_origins,
-            vec![0, hop * 2 + quarter_hop],
-            "mixed sub-hop overlap should keep suppressing the first transient while still scheduling the next distinct transient exactly once"
+            triggered_origins.len(),
+            2,
+            "expected exactly two scheduled events, got {:?}",
+            triggered_origins
+        );
+        assert_eq!(triggered_origins[0], 0, "first click should fire at once");
+        assert!(
+            (hop * 9..hop * 10).contains(&triggered_origins[1]),
+            "second click should fire exactly once in the first post-cooldown \
+             full-hop group, got {:?}",
+            triggered_origins
         );
         assert_eq!(
             scheduler.stats().events_detected_total,

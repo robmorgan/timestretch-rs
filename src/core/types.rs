@@ -1308,6 +1308,56 @@ pub enum QualityMode {
     MaxQuality,
 }
 
+/// First-class streaming latency/quality profile for DJ-style realtime use.
+///
+/// Each profile carries the full DJ tuning bundle (the `DjBeatmatch` preset)
+/// and selects the FFT/hop configuration that sets the streaming latency
+/// floor (`fft * 3/2` input frames at ratios within `[0.9, 1.1]`). Apply
+/// with [`StretchParams::with_stream_profile`] or construct directly via
+/// `StreamProcessor::try_from_tempo_with_profile`.
+///
+/// | Profile | FFT/hop | Latency @ 44.1 kHz (in-band) |
+/// |---------|---------|------------------------------|
+/// | Live    | 1024/256  | ~35 ms |
+/// | Club    | 2048/512  | ~70 ms |
+/// | Quality | 4096/1024 | ~139 ms |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamProfile {
+    /// Lowest latency (~35 ms at 44.1 kHz): tightest nudge feel for live
+    /// control, with the most phase-vocoder coloration on tonal material.
+    Live,
+    /// Balanced default (~70 ms): closes most of the spectral-quality gap
+    /// to `Quality` at half its latency.
+    Club,
+    /// Highest quality (~139 ms): full DJ preset at its native FFT size;
+    /// laggy controls.
+    Quality,
+}
+
+impl StreamProfile {
+    /// All profiles, ordered lowest to highest latency.
+    pub const ALL: &'static [StreamProfile] = &[
+        StreamProfile::Live,
+        StreamProfile::Club,
+        StreamProfile::Quality,
+    ];
+
+    /// Short human-readable name.
+    pub fn label(&self) -> &'static str {
+        match self {
+            StreamProfile::Live => "Live",
+            StreamProfile::Club => "Club",
+            StreamProfile::Quality => "Quality",
+        }
+    }
+}
+
+impl std::fmt::Display for StreamProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 /// Formant/envelope preservation profile for pitch and timbre-sensitive material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvelopePreset {
@@ -1329,11 +1379,21 @@ pub struct TransientThresholdPolicy {
     ///
     /// Even values are rounded up to the next odd value to keep the median centered.
     pub median_window_frames: usize,
+    /// Sliding window (frames) for the median absolute deviation estimate.
+    ///
+    /// Wider than the median window for a stable dispersion estimate; even
+    /// values round up, and values below `median_window_frames` are raised
+    /// to it.
+    pub mad_window_frames: usize,
     /// Additive threshold floor to suppress near-silence false positives.
     pub threshold_floor: f32,
-    /// Sensitivity-to-threshold slope used in:
-    /// `multiplier = 1 + (1 - sensitivity) * threshold_sensitivity_slope`.
-    pub threshold_sensitivity_slope: f32,
+    /// Base deviation multiplier in the robust threshold:
+    /// `threshold = median + k * MAD + floor` with
+    /// `k = threshold_k_base + (1 - sensitivity) * threshold_k_slope`.
+    pub threshold_k_base: f32,
+    /// Sensitivity-to-k slope (see [`Self::threshold_k_base`]). Higher
+    /// sensitivity lowers k and admits more onsets.
+    pub threshold_k_slope: f32,
     /// Minimum onset spacing in frames for normal sensitivity settings.
     pub min_gap_frames: usize,
     /// Minimum onset spacing in frames when sensitivity is above
@@ -1351,10 +1411,16 @@ impl TransientThresholdPolicy {
         if window % 2 == 0 {
             window = window.saturating_add(1).min(63);
         }
+        let mut mad_window = self.mad_window_frames.clamp(window, 63);
+        if mad_window % 2 == 0 {
+            mad_window = mad_window.saturating_add(1).min(63);
+        }
         Self {
             median_window_frames: window,
+            mad_window_frames: mad_window,
             threshold_floor: self.threshold_floor.max(0.0),
-            threshold_sensitivity_slope: self.threshold_sensitivity_slope.max(0.0),
+            threshold_k_base: self.threshold_k_base.max(0.0),
+            threshold_k_slope: self.threshold_k_slope.max(0.0),
             min_gap_frames: self.min_gap_frames.clamp(1, 32),
             high_sensitivity_min_gap_frames: self.high_sensitivity_min_gap_frames.clamp(1, 32),
             high_sensitivity_split: self.high_sensitivity_split.clamp(0.0, 1.0),
@@ -1376,8 +1442,10 @@ impl Default for TransientThresholdPolicy {
     fn default() -> Self {
         Self {
             median_window_frames: DEFAULT_TRANSIENT_MEDIAN_WINDOW_FRAMES,
+            mad_window_frames: DEFAULT_TRANSIENT_MAD_WINDOW_FRAMES,
             threshold_floor: DEFAULT_TRANSIENT_THRESHOLD_FLOOR,
-            threshold_sensitivity_slope: DEFAULT_TRANSIENT_THRESHOLD_SENSITIVITY_SLOPE,
+            threshold_k_base: DEFAULT_TRANSIENT_THRESHOLD_K_BASE,
+            threshold_k_slope: DEFAULT_TRANSIENT_THRESHOLD_K_SLOPE,
             min_gap_frames: DEFAULT_TRANSIENT_MIN_GAP_FRAMES,
             high_sensitivity_min_gap_frames: DEFAULT_TRANSIENT_HIGH_SENS_MIN_GAP_FRAMES,
             high_sensitivity_split: DEFAULT_TRANSIENT_HIGH_SENS_SPLIT,
@@ -1636,12 +1704,19 @@ const DEFAULT_TRANSIENT_LOOKAHEAD_PEAK_RETAIN_RATIO: f32 = 0.30;
 const DEFAULT_TRANSIENT_STRONG_SPIKE_BYPASS_MULTIPLIER: f32 = 3.0;
 /// Default transient median window size in frames.
 const DEFAULT_TRANSIENT_MEDIAN_WINDOW_FRAMES: usize = 11;
+/// Default MAD window (wider than the median window for a stable
+/// dispersion estimate on busy material).
+const DEFAULT_TRANSIENT_MAD_WINDOW_FRAMES: usize = 21;
 /// Default transient threshold floor.
 const DEFAULT_TRANSIENT_THRESHOLD_FLOOR: f32 = 0.01;
-/// Default slope in sensitivity->threshold multiplier mapping.
-const DEFAULT_TRANSIENT_THRESHOLD_SENSITIVITY_SLOPE: f32 = 3.5;
-/// Default minimum onset gap for normal sensitivity.
-const DEFAULT_TRANSIENT_MIN_GAP_FRAMES: usize = 4;
+/// Default base deviation multiplier in `threshold = median + k*MAD + floor`.
+const DEFAULT_TRANSIENT_THRESHOLD_K_BASE: f32 = 1.5;
+/// Default sensitivity-to-k slope: `k = base + (1 - sensitivity) * slope`.
+const DEFAULT_TRANSIENT_THRESHOLD_K_SLOPE: f32 = 4.5;
+/// Default minimum onset gap for normal sensitivity (~70 ms at the 512-hop
+/// analysis rate — two detections closer than this are one physical event,
+/// e.g. a kick attack followed by its pitch-sweep hump).
+const DEFAULT_TRANSIENT_MIN_GAP_FRAMES: usize = 6;
 /// Default minimum onset gap for high sensitivity.
 const DEFAULT_TRANSIENT_HIGH_SENS_MIN_GAP_FRAMES: usize = 2;
 /// Default sensitivity split used for high-sensitivity gap mode.
@@ -1835,6 +1910,36 @@ impl StretchParams {
         self
     }
 
+    /// Applies a streaming latency/quality profile.
+    ///
+    /// Every profile starts from the full `DjBeatmatch` tuning bundle (via
+    /// [`Self::with_preset`]) and then selects the FFT/hop configuration and
+    /// streaming quality mode that set the latency floor:
+    ///
+    /// - [`StreamProfile::Live`]: 1024/256, [`QualityMode::LowLatency`]
+    /// - [`StreamProfile::Club`]: 2048/512, [`QualityMode::Balanced`]
+    /// - [`StreamProfile::Quality`]: 4096/1024 (preset native), Balanced
+    ///
+    /// Call this **after** other builder methods that touch FFT size, hop
+    /// size, preset, or quality mode — it overrides them (calling
+    /// `with_preset` afterwards would revert the FFT size). It does not
+    /// touch ratio, sample rate, channels, BPM, pre-analysis, or
+    /// normalization.
+    pub fn with_stream_profile(self, profile: StreamProfile) -> Self {
+        let with_bundle = self.with_preset(EdmPreset::DjBeatmatch);
+        match profile {
+            StreamProfile::Live => with_bundle
+                .with_fft_size(1024)
+                .with_hop_size(256)
+                .with_quality_mode(QualityMode::LowLatency),
+            StreamProfile::Club => with_bundle
+                .with_fft_size(2048)
+                .with_hop_size(512)
+                .with_quality_mode(QualityMode::Balanced),
+            StreamProfile::Quality => with_bundle.with_quality_mode(QualityMode::Balanced),
+        }
+    }
+
     /// Sets the EDM preset, overriding FFT size, hop size, transient sensitivity,
     /// WSOLA params, and transient region size. Call this before other builder
     /// methods if you want to customize individual parameters after applying a preset.
@@ -1966,9 +2071,25 @@ impl StretchParams {
         self
     }
 
-    /// Sets the sensitivity-to-threshold slope.
-    pub fn with_transient_threshold_sensitivity_slope(mut self, slope: f32) -> Self {
-        self.transient_threshold_policy.threshold_sensitivity_slope = slope.max(0.0);
+    /// Sets the sensitivity-to-k slope in the robust transient threshold
+    /// `median + k * MAD + floor` (see [`TransientThresholdPolicy`]).
+    pub fn with_transient_threshold_k_slope(mut self, slope: f32) -> Self {
+        self.transient_threshold_policy.threshold_k_slope = slope.max(0.0);
+        self
+    }
+
+    /// Sets the base deviation multiplier in the robust transient threshold.
+    pub fn with_transient_threshold_k_base(mut self, base: f32) -> Self {
+        self.transient_threshold_policy.threshold_k_base = base.max(0.0);
+        self
+    }
+
+    /// Sets the transient detector MAD window size in analysis frames.
+    ///
+    /// Even values round up; values below the median window are raised to it.
+    pub fn with_transient_mad_window_frames(mut self, frames: usize) -> Self {
+        self.transient_threshold_policy.mad_window_frames = frames;
+        self.transient_threshold_policy = self.transient_threshold_policy.sanitized();
         self
     }
 
@@ -2194,7 +2315,15 @@ impl StretchParams {
         self
     }
 
-    /// Attaches an offline pre-analysis artifact for runtime beat snapping.
+    /// Attaches an offline pre-analysis artifact.
+    ///
+    /// When the artifact is usable (sample-rate match, confident, non-empty),
+    /// it is authoritative: online transient detection is skipped in favor of
+    /// its onset/beat data. Positions are absolute source frames, so batch
+    /// input must be the entire analyzed file starting at source frame 0;
+    /// positions past the end of the input are ignored. Streaming consumers
+    /// use `StreamProcessor::set_source_position` to stay aligned after
+    /// seeks.
     pub fn with_pre_analysis(mut self, artifact: PreAnalysisArtifact) -> Self {
         self.pre_analysis = Some(artifact);
         self
@@ -2423,7 +2552,8 @@ mod tests {
             .with_transient_strong_spike_bypass_multiplier(0.5)
             .with_transient_median_window_frames(12)
             .with_transient_threshold_floor(-1.0)
-            .with_transient_threshold_sensitivity_slope(-4.0)
+            .with_transient_threshold_k_slope(-4.0)
+            .with_transient_threshold_k_base(-2.0)
             .with_transient_min_gap_frames(0, 0)
             .with_transient_high_sensitivity_split(1.2);
 
@@ -2433,12 +2563,8 @@ mod tests {
         assert!((params.transient_strong_spike_bypass_multiplier - 1.0).abs() < 1e-6);
         assert_eq!(params.transient_threshold_policy.median_window_frames, 13);
         assert_eq!(params.transient_threshold_policy.threshold_floor, 0.0);
-        assert_eq!(
-            params
-                .transient_threshold_policy
-                .threshold_sensitivity_slope,
-            0.0
-        );
+        assert_eq!(params.transient_threshold_policy.threshold_k_slope, 0.0);
+        assert_eq!(params.transient_threshold_policy.threshold_k_base, 0.0);
         assert_eq!(params.transient_threshold_policy.min_gap_frames, 1);
         assert_eq!(
             params
@@ -2467,8 +2593,10 @@ mod tests {
     fn test_with_transient_threshold_policy_sanitizes() {
         let policy = TransientThresholdPolicy {
             median_window_frames: 0,
+            mad_window_frames: 0,
             threshold_floor: -0.5,
-            threshold_sensitivity_slope: -1.0,
+            threshold_k_base: -1.0,
+            threshold_k_slope: -1.0,
             min_gap_frames: 0,
             high_sensitivity_min_gap_frames: 99,
             high_sensitivity_split: -1.0,
@@ -2476,12 +2604,10 @@ mod tests {
         let params = StretchParams::new(1.0).with_transient_threshold_policy(policy);
         assert_eq!(params.transient_threshold_policy.median_window_frames, 1);
         assert_eq!(params.transient_threshold_policy.threshold_floor, 0.0);
-        assert_eq!(
-            params
-                .transient_threshold_policy
-                .threshold_sensitivity_slope,
-            0.0
-        );
+        assert_eq!(params.transient_threshold_policy.threshold_k_slope, 0.0);
+        assert_eq!(params.transient_threshold_policy.threshold_k_base, 0.0);
+        // mad window is raised to at least the median window (1 here).
+        assert_eq!(params.transient_threshold_policy.mad_window_frames, 1);
         assert_eq!(params.transient_threshold_policy.min_gap_frames, 1);
         assert_eq!(
             params
@@ -3973,6 +4099,7 @@ mod tests {
             confidence: 0.8,
             beat_positions: vec![0, 22050],
             transient_onsets: vec![0, 22050],
+            ..Default::default()
         };
         let params = StretchParams::new(1.0).with_pre_analysis(artifact.clone());
         let stored = params.pre_analysis.expect("artifact should be present");

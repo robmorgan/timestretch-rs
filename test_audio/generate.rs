@@ -11,6 +11,9 @@
 //! - `white_noise.wav` — 2s white noise
 //! - `sweep_20_20k.wav` — 4s logarithmic frequency sweep 20Hz–20kHz
 //! - `edm_mix.wav` — 4s layered kick + bass + hihat pattern
+//! - `dense_mastered_128bpm.wav` — 12s mastered-style dense club mix
+//!   (continuous broadband floor + limiter; crest matches real mastered
+//!   tracks, peak ~0.90 / RMS ~0.28)
 
 use std::f32::consts::PI;
 
@@ -27,6 +30,7 @@ fn main() {
         ("white_noise", white_noise(2.0), 1),
         ("sweep_20_20k", freq_sweep(20.0, 20000.0, 4.0), 1),
         ("edm_mix", edm_mix(128.0, 4.0), 1),
+        ("dense_mastered_128bpm", dense_mastered_edm(128.0, 12.0), 1),
     ];
 
     for (name, data, channels) in &signals {
@@ -176,6 +180,106 @@ fn edm_mix(bpm: f32, duration: f32) -> Vec<f32> {
     }
 
     data
+}
+
+/// Dense, mastered-style club mix: four-on-the-floor kicks over a
+/// *continuous* broadband floor (sub line, two sustained saw pads, noise
+/// bed), then pushed through a saturating limiter so the crest factor
+/// matches real mastered tracks (target peak ~0.90, RMS ~0.28 — measured
+/// from a real club mashup). Unlike `edm_mix`, there is no quiet background
+/// anywhere: this is the regime where onset detectors tuned on
+/// clicks-over-silence go blind.
+fn dense_mastered_edm(bpm: f32, duration: f32) -> Vec<f32> {
+    let n = (SAMPLE_RATE as f32 * duration) as usize;
+    let samples_per_beat = (SAMPLE_RATE as f32 * 60.0 / bpm) as usize;
+    let samples_per_8th = samples_per_beat / 2;
+
+    let mut data = vec![0.0f32; n];
+    let mut seed: u64 = 7;
+
+    for (i, sample) in data.iter_mut().enumerate() {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        let beat_pos = i % samples_per_beat;
+        let eighth_pos = i % samples_per_8th;
+
+        // Kick: every beat (classic 808 pitch-decay).
+        if beat_pos < (SAMPLE_RATE as f32 * 0.05) as usize {
+            let kt = beat_pos as f32 / SAMPLE_RATE as f32;
+            let freq = 150.0 * (-kt * 40.0).exp() + 50.0;
+            let env = (-kt * 30.0).exp();
+            *sample += env * (TWO_PI * freq * kt).sin() * 0.9;
+        }
+
+        // Continuous sub line: 55 Hz, always on.
+        *sample += (TWO_PI * 55.0 * t).sin() * 0.30;
+
+        // Two sustained saw-ish pads (6 harmonics, 1/n rolloff): the
+        // continuous mid/high broadband floor.
+        for &fundamental in &[220.0f32, 277.18] {
+            let mut pad = 0.0f32;
+            for h in 1..=6u32 {
+                pad += (TWO_PI * fundamental * h as f32 * t).sin() / h as f32;
+            }
+            *sample += pad * 0.10;
+        }
+
+        // Off-beat hats.
+        if eighth_pos < (SAMPLE_RATE as f32 * 0.012) as usize && beat_pos >= samples_per_8th {
+            let ht = eighth_pos as f32 / SAMPLE_RATE as f32;
+            let env = (-ht * 400.0).exp();
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let noise = ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0;
+            *sample += env * noise * 0.25;
+        }
+
+        // Mastering-limiter noise floor (~-26 dBFS).
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let bed = ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0;
+        *sample += bed * 0.05;
+    }
+
+    masterize(&mut data, 0.90, 0.28);
+    data
+}
+
+/// Saturating "mastering limiter": drives the mix through tanh until the
+/// RMS lands near `target_rms`, then rescales to `target_peak`. Picks the
+/// smallest drive whose resulting RMS is within 5% of target (or the
+/// closest candidate otherwise) so the fixture's crest factor matches real
+/// mastered material deterministically.
+fn masterize(data: &mut [f32], target_peak: f32, target_rms: f32) {
+    let peak = data.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+    if peak <= 0.0 {
+        return;
+    }
+    for s in data.iter_mut() {
+        *s /= peak;
+    }
+
+    let mut best_drive = 1.0f32;
+    let mut best_err = f32::INFINITY;
+    for step in 0..40 {
+        let drive = 0.5 + step as f32 * 0.25;
+        let norm = drive.tanh();
+        let sum_sq: f64 = data
+            .iter()
+            .map(|&s| {
+                let y = ((s * drive).tanh() / norm * target_peak) as f64;
+                y * y
+            })
+            .sum();
+        let rms = (sum_sq / data.len() as f64).sqrt() as f32;
+        let err = (rms - target_rms).abs();
+        if err < best_err {
+            best_err = err;
+            best_drive = drive;
+        }
+    }
+
+    let norm = best_drive.tanh();
+    for s in data.iter_mut() {
+        *s = (*s * best_drive).tanh() / norm * target_peak;
+    }
 }
 
 // ── WAV writer (minimal, self-contained) ─────────────────────────────────────

@@ -1,10 +1,15 @@
-//! Spectral-flux transient detection with adaptive thresholding.
+//! Spectral-flux transient detection with robust adaptive thresholding.
 //!
-//! Combines spectral flux (frequency-domain onset measure) with an energy
-//! envelope detector (time-domain onset measure) and phase deviation analysis
-//! for more robust transient detection. Uses mean + stddev adaptive
-//! thresholding instead of sliding median for better handling of varying
-//! signal dynamics.
+//! Combines log-compressed spectral flux (frequency-domain onset measure) with
+//! an energy-envelope detector (time-domain onset measure) and phase deviation
+//! analysis. Log-magnitude compression keeps onsets separable on dense,
+//! continuously loud mastered material, where a linear-magnitude detection
+//! function plateaus. Candidates are thresholded against a trailing-window
+//! `median + k * MAD` (robust to a chronically elevated baseline), with a
+//! global relative floor, a MAD floor, and local-peak/masking gates. The
+//! energy channel also acts as a gate: sustained tonal material (a held note,
+//! a pure tone) has no time-domain onset, so its flux — pure windowing/leakage
+//! ripple — is not detected as transients.
 //!
 //! Phase deviation detection computes the expected phase advance for each FFT
 //! bin based on the hop size and compares it to the actual phase, providing
@@ -28,6 +33,43 @@ const PHASE_DEVIATION_ONSET_WEIGHT: f32 = 0.4;
 /// Smoothing coefficient for the onset energy envelope (one-pole lowpass).
 /// Higher values = slower response. 0.9 gives ~10-frame smoothing.
 const ENERGY_SMOOTH_ALPHA: f32 = 0.9;
+
+/// Log-compression drive for spectral magnitudes: `ln(1 + GAMMA_FLUX * mag)`
+/// (Boeck/Klapuri logarithmic spectral flux).
+///
+/// Linear-magnitude flux on dense mastered material is dominated by the
+/// continuously loud broadband floor: the detection function plateaus and no
+/// frame stands out from its local median. Compression shrinks a loud
+/// stationary layer's absolute frame-to-frame fluctuation far more than a
+/// genuine onset's large relative jump, restoring separation regardless of
+/// mastering level. Near-silence is unaffected (`ln(1+x) ~ x` for small x).
+const GAMMA_FLUX: f32 = 40.0;
+/// Log-compression drive for the frame-RMS onset energy envelope.
+const GAMMA_ENERGY: f32 = 20.0;
+
+/// Post-transient masking: a candidate within the masking window after a
+/// larger peak must reach at least this fraction of that peak. Rejects the
+/// secondary ODF hump of a single physical transient (e.g. a kick's pitch
+/// sweep re-exciting flux a few frames after its attack) while letting
+/// similar-sized genuine neighbors (rapid equal hits) through.
+const ONSET_MASK_RATIO: f32 = 0.6;
+
+/// Global relative floor: a candidate must reach at least this fraction of
+/// the loudest onset in the whole signal. The trailing-window baseline can
+/// fall to near zero over a sustained tonal passage, so a tiny fluctuation
+/// there would otherwise clear the local threshold; requiring a meaningful
+/// fraction of the global peak rejects such noise-floor "onsets" (standard
+/// relative peak-picking) without affecting genuinely strong transients.
+const GLOBAL_ONSET_FLOOR_RATIO: f32 = 0.12;
+
+/// Minimum effective deviation as a fraction of the local median, flooring
+/// the MAD term. On a very regular sustained signal (a held tonal note) the
+/// ODF plateau ripples so little that MAD collapses toward zero, leaving a
+/// razor-thin margin that a slow swell can cross — a false onset. Requiring
+/// a candidate to exceed the local level by at least this relative amount
+/// keeps the threshold meaningful on regular plateaus without weakening it
+/// where the background genuinely varies (real onsets clear it easily).
+const MAD_FLOOR_MEDIAN_RATIO: f32 = 0.06;
 
 /// Result of transient detection: sample positions of detected onsets.
 #[derive(Debug, Clone)]
@@ -138,7 +180,9 @@ fn compute_spectral_flux(
             .zip(bin_weights[..num_bins].iter())
             .enumerate()
         {
-            let mag = c.norm();
+            // Log-compressed magnitude: keeps onsets separable from a
+            // continuously loud broadband floor (see GAMMA_FLUX).
+            let mag = (1.0 + GAMMA_FLUX * c.norm()).ln();
             let diff = mag - *prev;
             if diff > 0.0 {
                 flux += diff * weight;
@@ -162,6 +206,17 @@ fn compute_spectral_flux(
         band_flux_values.push(band_flux);
     }
 
+    // Frame 0 has no prior spectrum (it differences against a zero history),
+    // so its flux is the whole signal appearing at once — a startup artifact,
+    // not an onset. Zeroing it also keeps this artifact from dominating the
+    // global-max normalization and compressing real onsets.
+    if let Some(first) = flux_values.first_mut() {
+        *first = 0.0;
+    }
+    if let Some(first) = band_flux_values.first_mut() {
+        *first = [0.0; 4];
+    }
+
     (flux_values, band_flux_values)
 }
 
@@ -176,12 +231,12 @@ fn compute_onset_energy(samples: &[f32], fft_size: usize, hop_size: usize) -> Ve
     let mut energies = Vec::with_capacity(num_frames);
     let inv_fft = 1.0 / fft_size as f32;
 
-    // Compute RMS energy per frame
+    // Compute log-compressed RMS energy per frame (see GAMMA_ENERGY).
     for frame_idx in 0..num_frames {
         let start = frame_idx * hop_size;
         let end = start + fft_size;
         let rms: f32 = samples[start..end].iter().map(|&s| s * s).sum::<f32>() * inv_fft;
-        energies.push(rms.sqrt());
+        energies.push((1.0 + GAMMA_ENERGY * rms.sqrt()).ln());
     }
 
     // Half-wave rectified first difference + smoothing
@@ -189,10 +244,13 @@ fn compute_onset_energy(samples: &[f32], fft_size: usize, hop_size: usize) -> Ve
     let mut smoothed = 0.0f32;
 
     for i in 0..num_frames {
+        // Frame 0 has no predecessor: treat its rise as zero rather than its
+        // absolute energy (which would read a loud steady signal's first
+        // frame as an onset).
         let diff = if i > 0 {
             (energies[i] - energies[i - 1]).max(0.0)
         } else {
-            energies[0]
+            0.0
         };
         smoothed = ENERGY_SMOOTH_ALPHA * smoothed + (1.0 - ENERGY_SMOOTH_ALPHA) * diff;
         envelope.push(smoothed);
@@ -272,7 +330,9 @@ fn compute_phase_deviation(
             .zip(bin_weights[..num_bins].iter())
             .enumerate()
         {
-            let mag = c.norm();
+            // Log-compressed magnitude weighting, matching the flux channel
+            // so neither is loudness-dominated on dense material.
+            let mag = (1.0 + GAMMA_FLUX * c.norm()).ln();
             let current_phase = c.arg();
             let expected = *prev + phase_advance[bin];
             let deviation = wrap_phase(current_phase - expected).abs();
@@ -296,6 +356,12 @@ fn compute_phase_deviation(
             strongest_bin: max_deviation_bin,
             phase_diff: max_deviation_phase_diff,
         });
+    }
+
+    // Frame 0 differences phase against a zero history — a startup artifact,
+    // not a real deviation (see the flux channel).
+    if let Some(first) = deviation_values.first_mut() {
+        *first = 0.0;
     }
 
     (deviation_values, deviation_info)
@@ -369,7 +435,16 @@ const ENERGY_GATE_THRESHOLD: f32 = 0.01;
 /// first they are mixed using `SPECTRAL_FLUX_ONSET_WEIGHT` and
 /// `PHASE_DEVIATION_ONSET_WEIGHT`, then the result is blended with the energy
 /// envelope using `FLUX_WEIGHT` and `ENERGY_WEIGHT`.
-fn combine_detection_functions(flux: &[f32], energy: &[f32], phase_deviation: &[f32]) -> Vec<f32> {
+///
+/// Returns the combined detection function and whether the energy channel was
+/// active (its peak cleared [`ENERGY_GATE_THRESHOLD`]). An inactive energy
+/// channel means the signal has no meaningful time-domain onset — sustained
+/// tonal material — which callers use to suppress flux-only leakage onsets.
+fn combine_detection_functions(
+    flux: &[f32],
+    energy: &[f32],
+    phase_deviation: &[f32],
+) -> (Vec<f32>, bool) {
     let max_flux = flux.iter().copied().fold(0.0f32, f32::max);
     let max_energy = energy.iter().copied().fold(0.0f32, f32::max);
     let max_phase = phase_deviation.iter().copied().fold(0.0f32, f32::max);
@@ -383,7 +458,7 @@ fn combine_detection_functions(flux: &[f32], energy: &[f32], phase_deviation: &[
     let energy_norm = if use_energy { max_energy } else { 1.0 };
 
     let n = flux.len();
-    (0..n)
+    let combined: Vec<f32> = (0..n)
         .map(|i| {
             let f = flux[i] / flux_norm;
             let pd = if i < phase_deviation.len() {
@@ -404,7 +479,9 @@ fn combine_detection_functions(flux: &[f32], energy: &[f32], phase_deviation: &[
 
             FLUX_WEIGHT * spectral_combined + e_contrib
         })
-        .collect()
+        .collect();
+
+    (combined, use_energy)
 }
 
 /// Detects transients in a mono audio signal using combined spectral flux,
@@ -460,14 +537,23 @@ pub fn detect_transients_with_options(
     let energy_envelope = compute_onset_energy(samples, fft_size, hop_size);
     let (phase_deviation, deviation_info) =
         compute_phase_deviation(samples, sample_rate, fft_size, hop_size);
-    let combined = combine_detection_functions(&flux_values, &energy_envelope, &phase_deviation);
+    let (combined, energy_active) =
+        combine_detection_functions(&flux_values, &energy_envelope, &phase_deviation);
 
-    // Use policy-configured sensitivity-aware gap to detect rapid patterns.
-    let min_gap = options
-        .threshold_policy
-        .sanitized()
-        .min_gap_for_sensitivity(sensitivity);
-    let onsets = adaptive_threshold_with_gap(&combined, sensitivity, hop_size, min_gap, options);
+    // Sustained tonal material (a held note, a pure tone) has no time-domain
+    // energy onset, so the energy channel gates off. Its spectral flux is
+    // pure windowing/leakage ripple, not real transients — detecting onsets
+    // there produces false positives that smear the signal in the stretcher.
+    // Real percussive/broadband onsets always carry an energy rise.
+    let onsets = if energy_active {
+        let min_gap = options
+            .threshold_policy
+            .sanitized()
+            .min_gap_for_sensitivity(sensitivity);
+        adaptive_threshold_with_gap(&combined, sensitivity, hop_size, min_gap, options)
+    } else {
+        Vec::new()
+    };
 
     // Compute onset strengths from detection function values
     let strengths = compute_onset_strengths(&combined, &onsets, hop_size);
@@ -556,15 +642,23 @@ fn adaptive_threshold_with_gap(
     }
 
     let threshold_policy = options.threshold_policy.sanitized();
-    let half_window = threshold_policy.median_window_frames / 2;
-    // Higher sensitivity = lower threshold = more detections
-    let threshold_multiplier =
-        1.0 + (1.0 - sensitivity).max(0.0) * threshold_policy.threshold_sensitivity_slope.max(0.0);
+    // Robust additive threshold: `median + k*MAD + floor`. Unlike a
+    // multiplicative threshold, k*MAD does not scale with a chronically
+    // elevated baseline, so onsets on dense mastered material still stand
+    // out while quiet backgrounds behave as before (MAD collapses to ~0 and
+    // the floor dominates). Higher sensitivity = lower k = more detections.
+    let k = threshold_policy.threshold_k_base
+        + (1.0 - sensitivity).max(0.0) * threshold_policy.threshold_k_slope;
+
+    // Global relative floor: reject candidates below a fraction of the
+    // loudest onset (see GLOBAL_ONSET_FLOOR_RATIO).
+    let global_floor = GLOBAL_ONSET_FLOOR_RATIO * flux.iter().copied().fold(0.0f32, f32::max);
 
     let mut onsets = Vec::new();
     let mut last_onset: Option<usize> = None;
-    // Reusable sort buffer to avoid per-frame allocation
+    // Reusable scratch buffers to avoid per-frame allocation.
     let mut local = Vec::with_capacity(threshold_policy.median_window_frames);
+    let mut mad_local = Vec::with_capacity(threshold_policy.mad_window_frames);
 
     let lookahead_frames = options.lookahead_confirm_frames;
     let threshold_relax = options.lookahead_threshold_relax.clamp(0.0, 1.0);
@@ -572,17 +666,55 @@ fn adaptive_threshold_with_gap(
     let strong_bypass_multiplier = options.strong_spike_bypass_multiplier.max(1.0);
 
     for (i, &flux_val) in flux.iter().enumerate() {
-        // Compute local median
-        let start = i.saturating_sub(half_window);
-        let end = (i + half_window + 1).min(flux.len());
+        // Baseline statistics come from TRAILING windows (frames before the
+        // candidate, excluding it): a centered window would include the
+        // onset's own peak and decay tail, inflating median and MAD until
+        // the onset fails its own threshold. The trailing window estimates
+        // the background the candidate must stand out from.
+        let start = i.saturating_sub(threshold_policy.median_window_frames);
         local.clear();
-        local.extend_from_slice(&flux[start..end]);
-        local.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = local[local.len() / 2];
+        local.extend_from_slice(&flux[start..i]);
+        let median = if local.is_empty() {
+            0.0
+        } else {
+            local.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            local[local.len() / 2]
+        };
 
-        let threshold = median * threshold_multiplier + threshold_policy.threshold_floor;
+        // Median absolute deviation around that median, over a wider
+        // trailing window for a stable dispersion estimate on busy material.
+        let mad_start = i.saturating_sub(threshold_policy.mad_window_frames);
+        mad_local.clear();
+        mad_local.extend(flux[mad_start..i].iter().map(|&v| (v - median).abs()));
+        let mad = if mad_local.is_empty() {
+            0.0
+        } else {
+            let mid = mad_local.len() / 2;
+            let (_, mad, _) = mad_local.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+            *mad
+        };
+        // Floor the dispersion so an ultra-regular plateau still demands a
+        // meaningful relative rise (see MAD_FLOOR_MEDIAN_RATIO).
+        let mad = mad.max(MAD_FLOOR_MEDIAN_RATIO * median);
 
-        if flux_val > threshold {
+        let threshold = (median + k * mad + threshold_policy.threshold_floor).max(global_floor);
+
+        // Peak-picking: a candidate must be a local maximum of the ODF.
+        // With trailing baseline windows, an onset's decay tail can also sit
+        // above the threshold for several frames; tail frames are strictly
+        // decreasing, so requiring a local peak rejects them without extra
+        // cooldown state.
+        let is_local_peak =
+            (i == 0 || flux_val >= flux[i - 1]) && (i + 1 >= flux.len() || flux_val >= flux[i + 1]);
+
+        // Post-transient masking (see ONSET_MASK_RATIO): compare against the
+        // largest ODF value in the recent past beyond the immediate
+        // neighbors the local-peak test already covers.
+        let mask_start = i.saturating_sub(min_gap_frames.saturating_mul(2));
+        let recent_max = flux[mask_start..i].iter().copied().fold(0.0f32, f32::max);
+        let masked = flux_val < recent_max * ONSET_MASK_RATIO;
+
+        if flux_val > threshold && is_local_peak && !masked {
             let strong_spike = flux_val > threshold * strong_bypass_multiplier;
             if !strong_spike && lookahead_frames > 0 && i + 1 < flux.len() {
                 let lookahead_end = i.saturating_add(lookahead_frames).min(flux.len() - 1);
@@ -1010,7 +1142,8 @@ mod tests {
 
     #[test]
     fn test_spectral_flux_constant_tone_after_onset() {
-        // A constant tone: flux should be high at onset (first frame), then low
+        // A constant tone: the frame-0 window-fill artifact is suppressed, and
+        // steady-state flux stays low.
         let sample_rate = 44100u32;
         let num_samples = sample_rate as usize;
         let input: Vec<f32> = (0..num_samples)
@@ -1020,20 +1153,19 @@ mod tests {
         let (flux, _band_flux) = compute_spectral_flux(&input, sample_rate, 2048, 512);
         assert!(flux.len() > 2);
 
-        // First frame has high flux (transition from zeros in prev_magnitude)
-        assert!(
-            flux[0] > 0.0,
-            "First frame flux should be > 0 (onset from silence)"
-        );
+        // Frame 0 is deliberately zeroed: it differences against a zero
+        // history (window fill), which is a startup artifact, not an onset.
+        assert_eq!(flux[0], 0.0, "First frame flux should be suppressed");
 
-        // Later frames should have much lower flux (steady state)
+        // Steady-state flux stays low for a constant tone.
+        let peak = flux.iter().copied().fold(0.0f32, f32::max);
         let late_flux_avg: f32 =
             flux[flux.len() / 2..].iter().sum::<f32>() / (flux.len() / 2) as f32;
         assert!(
-            late_flux_avg < flux[0] * 0.5,
-            "Late flux avg {} should be much lower than onset flux {}",
+            late_flux_avg < peak * 0.5 + 1e-6,
+            "Late flux avg {} should stay low vs peak {}",
             late_flux_avg,
-            flux[0]
+            peak
         );
     }
 

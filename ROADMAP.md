@@ -4,7 +4,10 @@
 
 Make `timestretch-rs` competitive with production-grade realtime stretchers by
 closing the remaining gaps in audible quality, modulation stability, realtime
-contract quality, external quality evidence, and API strictness.
+contract quality, external quality evidence, and API strictness — and then
+close the deck-integration gaps (latency, seek/cue behavior, transport
+completeness) that separate a quality stretcher from an engine a real DJ deck
+can be built on.
 
 ## Current Status
 
@@ -13,13 +16,36 @@ The repository is already beyond a toy implementation:
 - The core hybrid design is real: phase vocoder, WSOLA, HPSS, multi-resolution,
   stereo handling, streaming, and a deterministic RT path all exist.
 - CI, quality gates, regression tests, and allocation tests are already in
-  place.
+  place, including callback-budget and zero-allocation gates for the realtime
+  pitch path.
+- The realtime pitch stage is production-grade (Stage 6, complete): an
+  anti-aliased Kaiser-sinc resampler with a click-free ~50 ms control glide,
+  with the old linear resampler kept as an explicit fallback. Mono streams get
+  the same transient-driven phase resets as stereo.
+- Fast-modulation stability (Stage 1, complete): per-callback jog-wheel
+  gestures (nudge/ride/snap) are click-free under hard CI bounds
+  (`tests/modulation_torture.rs`), the scheduler's modulation-hold is wired,
+  and the flush-tail splices are fixed. The remaining PV ratio-step seam
+  residual (≤4x a tone's natural slew on instant 8% snaps) is documented in
+  Stage 1 and deferred to Stage 12.
+- Analyze-on-load pre-analysis (Stage 14, complete): tracks analyzed once
+  produce a persisted artifact consumed authoritatively by every stretch
+  path; streaming has an absolute source-position API for seek alignment.
+- Low-latency streaming is first-class (Stage 10, complete): library
+  `StreamProfile` (Live ~35 ms / Club ~70 ms / Quality ~139 ms, all carrying
+  the full DJ bundle), honest measured latency reporting, and time-based
+  scheduler tuning at small hops.
+- Warm-start seek/cue/loop (Stage 11, complete): `warm_start_seek` re-primes
+  from preceding audio (no cold gap, no PV warm-up, control state preserved)
+  and `notify_source_jump` wraps loops gaplessly; desktop seek, beat-jump
+  buttons, and loop in/out are wired to them.
+- Analysis robustness (Stage 3, partial): a loudness-robust onset front end
+  (log-compressed flux, median+MAD threshold, energy gate) so dense mastered
+  tracks analyze correctly; tempogram beat tracking and rolling adaptive
+  analysis remain open.
 - The main gap is not "missing DSP ideas". The main gap is the last 20%:
-  stronger continuity under modulation, tighter routing/decomposition, stricter
-  invariants, and reference-driven tuning.
-
-The current branch should be treated as not yet production-grade until the
-fast-modulation artifact regression is fixed.
+  tighter routing/decomposition, stricter invariants, and reference-driven
+  tuning — then the DJ deck readiness stages.
 
 ## Principles
 
@@ -27,10 +53,10 @@ fast-modulation artifact regression is fixed.
 - Make the RT-safe path the default, obvious path.
 - Reject malformed input instead of silently truncating or falling back.
 - Prefer reference-driven quality gates over self-comparison alone.
-- Preserve the EDM-first focus unless there is a deliberate decision to expand
-  into a broader general-purpose stretcher.
+- Preserve the EDM/DJ-first focus (settled in Stage 9); general-purpose
+  broadening is out of scope until the deck readiness stages are complete.
 
-## [~] Stage 1: Stabilize Fast Modulation and Transition Quality
+## [x] Stage 1: Stabilize Fast Modulation and Transition Quality
 
 Automation: auto
 
@@ -49,19 +75,48 @@ artifacts, improvements elsewhere will not matter.
 
 ### Work
 
-- Fix ratio-transition continuity in the streaming path.
-- Tighten transient reset scheduling so fast modulation does not over-trigger
-  phase resets.
+- [x] Fix ratio-transition continuity in the streaming path. Three click
+  sources found and fixed via the torture test: (1) the WSOLA overlay armed
+  on PV-side flux (which spikes on every ratio step) and spliced in at 0.90
+  weight instantly — now gated on input-domain onsets during slews and
+  ramped in over ~3 ms; (2) the bit-exact unity passthrough re-engaged
+  mid-stream when a nudge settled back to 1.0, hard-switching between raw
+  input and the PV stream (a full-scale splice) — the DSP path now stays
+  engaged for the life of the stream once used (`dsp_engaged`); (3) flush
+  discontinuities (below).
+- [x] Tighten transient reset scheduling so fast modulation does not
+  over-trigger phase resets: the modulation-hold machinery is now wired —
+  `modulation_hold_overlap_windows()` maps the in-flight ratio+pitch slew to
+  scheduler hold windows, activating low-band suppression and trigger
+  tightening that previously existed only as dead code.
 - Review how phase state is preserved or reseeded during rapid ratio changes.
-- Add focused tests around short-interval modulation and callback boundaries.
+  **Remaining (deferred)**: the PV ratio-step seam — `hop_synthesis` jumps
+  immediately while phase slews over ~3 frames. Measured residual after all
+  fixes: 4.0x a pure tone's natural slew on instant 8% snaps (was 39x),
+  1.8-2.8x on nudges/rides. Inaudible-to-marginal; revisit with Stage 12.
+- [x] Add focused tests around short-interval modulation and callback
+  boundaries (`tests/modulation_torture.rs`).
+- [x] Add a jog-wheel-style torture test: continuous per-callback ratio
+  modulation (nudge, ride, snap back) with hard click/slew/length bounds
+  over the full output including flush, plus reset over/under-trigger
+  budgets on percussive material.
+- [x] Fix the end-of-stream flush splice click: fractional-period,
+  gain-matched, crossfaded tonal-tail splice (was integer-period,
+  amplitude-floored hard rewrite); faded input padding instead of a hard cut
+  to zeros; fade-out after truncation. The pitch-sweep zipper test now scans
+  the flush region instead of excluding it.
 
 ### Exit Criteria
 
-- `cargo test --features qa-harnesses --release --test streaming_quality -- --nocapture`
-  passes with margin, not barely.
-- Release-mode modulation no longer produces obvious clicks, roughness, or
-  discontinuities on synthetic DJ-like material.
-- Fixes do not regress steady-state streaming quality.
+- [x] `cargo test --features qa-harnesses --release --test streaming_quality -- --nocapture`
+  passes with margin, including the new `streaming_modulation_quality_benchmark`
+  (clicks=0, max slew 2.75x theoretical vs a 12x soft gate).
+- [x] Release-mode modulation no longer produces obvious clicks, roughness,
+  or discontinuities on synthetic DJ-like material: worst-case gesture click
+  reduced from 1.03 (full scale) to 0.063 (residual seam) on a 0.5-amplitude
+  tone.
+- [x] Fixes do not regress steady-state streaming quality: full suite,
+  strict callback-budget gates, and existing METRIC scores unchanged.
 
 ## [ ] Stage 2: Replace Binary Segment Routing with Confidence-Based Blending
 
@@ -97,9 +152,17 @@ mixed-content regions need softer treatment.
 - Exact-length output is achieved without heavy dependence on hard truncation or
   last-sample padding.
 
-## [ ] Stage 3: Upgrade Analysis from Fixed EDM Heuristics to Rolling Adaptive Analysis
+## [~] Stage 3: Upgrade Analysis from Fixed EDM Heuristics to Rolling Adaptive Analysis
 
 Automation: auto
+
+Status: **partially complete** — the loudness-robustness slice landed after
+a real track ("dense mastered club mashup") produced an empty analysis
+artifact (0 onsets, BPM 0, confidence 0), which the analyze-on-load feature
+(Stage 14) then silently no-opped on. Root cause: linear-magnitude spectral
+flux plateaued on continuously loud material and the multiplicative
+`median * 3.1` threshold sat at the signal ceiling, so no frame stood out.
+Every prior test used clicks-over-silence and never exercised that regime.
 
 ### Why
 
@@ -114,16 +177,40 @@ confidence estimates.
 - `src/analysis/adaptive_snapshot.rs`
 - `src/analysis/beat.rs`
 
-### Work
+### Shipped (loudness-robustness slice)
 
-- Replace single-resolution assumptions with rolling multi-resolution analysis.
-- Revisit fixed spectral weights and band boundaries used for transient
-  detection.
-- Make tonal, transient, and noise confidence evolve over time instead of being
-  estimated from only a narrow view of the signal.
-- Improve beat confidence so beat-aware behavior is useful outside ideal EDM
-  material.
-- Expose enough telemetry to inspect analysis mistakes during tuning.
+- Log-magnitude compression `ln(1 + gamma*mag)` in the flux/energy/phase
+  channels so onsets stay separable on dense mastered material.
+- Robust additive threshold `median + k(sensitivity)*MAD + floor` over
+  trailing windows (replacing the multiplicative threshold), with a global
+  relative floor, a MAD floor, local-peak/masking gates, and startup-frame
+  suppression.
+- Energy-channel gate: sustained tonal material (held note, pure tone) emits
+  no onsets, killing the spectral-leakage false positives that smeared pure
+  tones in the stretcher.
+- Telemetry: `AnalysisReport` (ODF median/MAD/max, onset count/rate, timing)
+  via `analyze_for_dj_with_report`, surfaced by CLI `analyze -v` and the new
+  `qa/track_analysis_qa.rs` real-track harness (scans
+  `TIMESTRETCH_TRACK_QA_DIR`, filename `<n>bpm` tag accuracy, usability gate).
+- Fixture `test_audio/dense_mastered_128bpm.wav` + `tests/dense_material_
+  regression.rs` reproduce and lock in the fix.
+- Result: the real failing track now analyzes to 123 BPM / confidence 0.90 /
+  2.9 onsets/sec; the kick fixture no longer octave-doubles.
+
+### Still Open
+
+- **Rolling multi-resolution analysis** and **time-evolving tonal/noise
+  confidence** (the original core of this stage) are untouched.
+- **Beat-tracker redesign** (tempogram over the ODF, EDM-weighted octave
+  disambiguation, widen the 100-160 BPM fold to ~70-180, tempo-salience
+  confidence). Deferred deliberately: the failing track already resolves to
+  the correct BPM with the current median-interval tracker, so this becomes
+  valuable mainly for material outside 100-160 (DnB, hip-hop). A residual
+  edge case (a 60 Hz sub-sine reporting false confidence) waits on this.
+- **Streaming scheduler parity**: `src/stream/transient_scheduler.rs` is a
+  separate incremental detector with its own `mean + 2.5*sigma` threshold and
+  a bounded version of the same dense-material blindness — not yet aligned
+  with the offline front end.
 
 ### Exit Criteria
 
@@ -203,13 +290,13 @@ too coarse for production-grade event handling.
 - Transient preservation improves on mixed and non-EDM material.
 - WSOLA mismatch and repetition artifacts become less obvious on event tails.
 
-## [ ] Stage 6: Raise Streaming Pitch Quality
+## [x] Stage 6: Raise Streaming Pitch Quality
 
 Automation: auto
 
 ### Why
 
-Realtime pitch currently depends on a linear resampler. That is acceptable as a
+Realtime pitch previously depended on a linear resampler — acceptable as a
 control mechanism, but not as a production-quality pitch stage for bright
 material.
 
@@ -220,19 +307,32 @@ material.
 
 ### Work
 
-- Replace linear realtime pitch resampling with a bounded-latency higher-quality
-  resampler.
-- Keep the current linear path only as an explicit low-quality or emergency
-  fallback.
-- Measure CPU cost and callback safety after the new resampler is introduced.
-- Add quality checks for hats, vocals, and sustained bright tones under stream
-  pitch modulation.
+- [x] Replace linear realtime pitch resampling with a bounded-latency
+  higher-quality resampler (`StreamingSincResampler`: interpolated
+  Kaiser-windowed sinc, 16 half-taps, ratio-adaptive anti-aliasing cutoff,
+  default via `StreamPitchQuality::Sinc`).
+- [x] Keep the current linear path only as an explicit low-quality or emergency
+  fallback (`StreamPitchQuality::Linear` via `set_pitch_resampler_quality`).
+- [x] Measure CPU cost and callback safety after the new resampler is
+  introduced (`quality_gate_streaming_pitch_callback_budget`: avg callback
+  ratio 0.032 vs 0.034 baseline; pitch-path zero-alloc tests in
+  `tests/realtime_allocations.rs`).
+- [x] Add quality checks for hats, vocals, and sustained bright tones under
+  stream pitch modulation (`streaming_pitch_quality_benchmark` in
+  `qa/streaming_quality.rs`).
+- [x] (Bonus) `set_pitch_scale` now glides over ~50 ms instead of hard-resetting
+  the resampler, removing clicks/zipper on DJ pitch nudges and sweeps.
 
 ### Exit Criteria
 
-- High-frequency roughness drops when `pitch_scale != 1.0`.
-- Pitch modulation sounds materially cleaner on hats, cymbals, and vocals.
-- Callback-safe behavior is preserved.
+- [x] High-frequency roughness drops when `pitch_scale != 1.0`: spurious
+  (alias/image) energy on a bright tone stack is ~265x lower than linear at
+  pitch 1.06 and ~460x lower at 1.30.
+- [x] Pitch modulation sounds materially cleaner on hats, cymbals, and vocals:
+  in-band interpolation images (e.g. 13.1 kHz -> 11.2 kHz at 1.06) are
+  suppressed below the PV noise floor; sweeps are click-free.
+- [x] Callback-safe behavior is preserved: zero allocations in the pitch path
+  (steady and swept) and callback budget unchanged within noise.
 
 ## [ ] Stage 7: Harden API Contracts and Make Silent Failure Impossible
 
@@ -283,18 +383,25 @@ needs authoritative, repeatable evidence.
 - `qa/reference_quality.rs`
 - `qa/rubberband_comparison.rs`
 - `qa/quality_benchmark.rs`
+- `scripts/compare_rubberband.sh`
 - `benchmarks/manifest.toml`
 - `benchmarks/README.md`
 - `.github/workflows/ci.yml`
 
 ### Work
 
+- Investigate the harmonic-track anomaly in the RubberBand comparison first:
+  `scripts/compare_rubberband.sh` reports ~-24 LUFS difference and ~0.15
+  spectral similarity on the harmonic sweep, which smells like a harness or
+  fixture bug rather than a real audio gap. Benchmarks cannot be trusted or
+  tightened until this is explained.
 - Define a small redistributable public corpus that can run in CI.
 - Keep the larger private corpus for deeper local tuning, but stop relying on it
   as the only meaningful reference test.
 - Promote at least one external-reference comparison from optional to required.
-- Tighten streaming-vs-batch and batch-vs-reference tolerances so they reflect
-  audible defects, not just rough parity.
+- Tighten batch-vs-reference tolerances so they reflect audible defects, not
+  just rough parity. (Streaming-vs-batch tightening is driven by Stage 12,
+  which changes the streaming engine itself.)
 - Produce machine-readable reports that make regressions obvious in PRs.
 
 ### Exit Criteria
@@ -303,37 +410,329 @@ needs authoritative, repeatable evidence.
 - Synthetic self-regression is no longer the main quality signal.
 - Listening tests and objective benchmarks point in the same direction.
 
-## [ ] Stage 9: Decide the Product Boundary
+## [x] Stage 9: Decide the Product Boundary
 
 Automation: manual
 
 ### Why
 
-The codebase currently mixes two ambitions: "excellent EDM-focused stretcher"
-and "general-purpose production-grade library". Those are related, but not the
-same target.
+The codebase mixed two ambitions: "excellent EDM-focused stretcher" and
+"general-purpose production-grade library". Those are related, but not the
+same target, and the benchmark corpus, API defaults, and quality gates all
+depend on which one is being built.
 
-### Decision
+### Decision (settled July 2026)
 
-Make an explicit choice:
+**EDM/DJ-first.** The library exists to be the stretch engine inside a
+custom Rust DJ application, with Serato Pitch 'n Time DJ / Elastique as the
+quality bar. General-purpose broadening is explicitly out of scope until the
+DJ Deck Readiness stages are complete; if it happens at all, it happens as a
+deliberate later expansion, not as drift.
 
-- Stay EDM-first and optimize hard for DJ workflows, stereo mixes, and tempo
-  automation.
-- Or broaden into a general-purpose library and retune analysis, presets, and
-  validation around wider material classes.
+### Consequences (binding on later stages)
 
-### Impact
+- **Benchmark corpus (Stage 8):** the public CI corpus is DJ material —
+  four-on-the-floor kick patterns, house/techno loops, sustained bass,
+  vocal-over-beat, full EDM mixes. Wider material (orchestral, sparse
+  acoustic, speech) is not gated and regressions there do not block.
+- **Quality gates:** judged at DJ ratios (0.92–1.08 primary, ±20% secondary)
+  on stereo mixes, in the streaming path first — beatmatching happens there.
+  Batch-path quality on non-EDM material is best-effort.
+- **API defaults:** tuned for the DJ case — stereo M/S, DJ-ratio sweet spot,
+  beat-aware behavior on by default where confidence allows. General-purpose
+  callers adjust params; DJ callers get good behavior out of the box.
+- **Analysis tuning (Stages 3-5):** transient/beat heuristics stay tuned for
+  electronic material; adaptive analysis raises robustness *within* that
+  focus (busy mixes, vocals over beats), not toward arbitrary material.
+- **Priority order:** the DJ Deck Readiness stages (10-13) outrank the
+  remaining batch-quality stages (2-5) whenever they conflict for attention.
 
-- The right benchmark corpus depends on this choice.
-- The right API defaults depend on this choice.
-- The right quality gates depend on this choice.
+## DJ Deck Readiness
+
+The stages below close the gap between "quality streaming stretcher" and
+"engine a real DJ deck can be built on" (the Serato Pitch 'n Time DJ /
+Elastique bar). Stage 9 settled on EDM/DJ-first, so these stages are the
+priority track. Ordering: Stage 10 and Stage 11 are DJ-blocking and should
+follow Stage 1 directly; Stage 12 is the long-tail quality work; Stage 13 is
+completeness.
+
+## [x] Stage 10: Make Low-Latency Streaming First-Class
+
+Automation: auto
+
+### Why
+
+Default streaming latency was `fft * 3/2` = 6144 samples (~139 ms at
+44.1 kHz). A DJ nudging against a beat needs roughly 10-40 ms
+control-to-audio. The low-latency constructor (1024 FFT, ~35 ms) existed but
+traded quality blindly (it silently dropped the entire DjBeatmatch tuning
+bundle), and `QualityMode` barely changed streaming DSP, so latency and
+quality could not be traded deliberately.
+
+Correction found during implementation: the original claim that the
+`fft * 2` gate "inflates latency exactly when a DJ is off-unity, which is
+always" was wrong — the wider gate applies only beyond ±10% ratio, so DJ
+ratios (0.92-1.08) always had the `fft * 3/2` floor. The real defects were
+the gate flipping mid-glide (it read the glided ratio, not the target), the
+dishonest reporting, and the untuned 1024 configuration.
+
+### Primary Files
+
+- `src/stream/processor.rs`
+- `src/stream/transient_scheduler.rs`
+- `src/core/types.rs`
+- `desktop/src/processor.rs`
+
+### Shipped
+
+- **`StreamProfile` (Live/Club/Quality)** replaces the QualityMode idea from
+  the original stage text: profiles are the streaming latency/quality knob
+  (1024/256 ~35 ms, 2048/512 ~70 ms, 4096/1024 ~139 ms), every tier carries
+  the full DJ bundle, and `try_from_tempo_low_latency` delegates to Live.
+- **Gate correctness + honest reporting**: the buffering gate reads the
+  *target* processing ratio (no mid-glide flips at the ±10% boundary);
+  `latency_samples()`/`latency_report()` report the real gate including the
+  ratio band and sinc pitch lookahead.
+- **Time-based scheduler tuning**: cooldown (~46 ms), statistics EMA
+  (~104 ms), and the modulation-hold budget (~371 ms) derive from absolute
+  time, identical at the reference 4096/1024 configuration and correctly
+  scaled at 1024/256. Warmup stays a 3-frame statistical bootstrap.
+- **Measured latency**: `tests/streaming_latency.rs` verifies first-sample-
+  out equals the reported gate exactly (delta 0 at all profiles, in and out
+  of band) and bounds control-to-audio for ratio (gate + 50 ms glide) and
+  pitch (near-instant; resampler is post-PV). README carries the table.
+- **Latent flush bug fixed**: vocoder tails bypassed the engaged pitch
+  resampler at flush, splicing pre-resample-rate samples in (a full-scale
+  click at most stream lengths); the pitch-sweep guard now runs at four
+  lengths.
+- Desktop uses the library profiles and shows the reported latency next to
+  the profile selector; preroll derives from `latency_samples()`.
+
+### Exit Criteria
+
+- Live profile at ~35 ms in-band with the full DJ bundle; click-free under
+  nudge/ride/snap torture and zero-alloc in steady state. ✓
+- Profiles measurably distinct (`qa/profile_quality.rs`): steady-ratio
+  similarity Quality 0.9991 / Club 0.9976 / Live 0.9982; under a 0.92-1.08
+  ride Live 0.9982 / Club 0.9969 / Quality 0.9932 (small windows track
+  modulation better — Live is the control profile by measurement, not just
+  by latency). ✓
+- Published latency table (README) with measured first-sample-out and
+  control-path behavior. ✓
+
+### Deferred Follow-Ups
+
+- Sub-bass cutoff at 1024 FFT: raising 180 → 250 Hz measured only +0.0008
+  low-band similarity on synthetic bass — not adopted; revisit with real
+  material in Stage 8's corpus.
+- Gate hysteresis at the ±10% boundary if target-toggling across it ever
+  shows audible stalls (target-based gating removed the known oscillation
+  source).
+
+## [x] Stage 11: Warm-Start Seek, Cue, and Loop Support
+
+Automation: auto
+
+### Why
+
+DJ decks jump constantly: cue points, loops, beat jumps. Every jump used to
+mean `reset()` (which reallocates the vocoders) plus a cold `fft*3/2`
+prebuffer refilled from silence and a PV warm-up transient — the desktop
+rebuilt the whole processor per seek. Commercial engines re-prime from
+surrounding audio so a jump is seamless.
+
+### Primary Files
+
+- `src/stream/processor.rs`
+- `src/stretch/phase_vocoder.rs`
+- `desktop/src/processor.rs`, `desktop/src/app.rs`, `desktop/src/state.rs`
+
+### Shipped
+
+- `StreamProcessor::warm_start_seek(target, preroll)` re-primes at a new
+  source position by running the preceding audio through the full DSP path
+  and discarding its rendered output, so the first emitted frame is already
+  converged. Ratio/pitch control state — targets *and* in-flight glides —
+  is preserved (no re-glide from unity). A short declick fade covers the
+  mid-waveform cut.
+- `StreamProcessor::notify_source_jump(next_frame)` handles gapless loop
+  wraps (input-feed splice, timeline re-anchor only, no state reset).
+- `PhaseVocoder::reset_streaming_state` clears all per-stream state without
+  deallocating — the allocation-free equivalent of a rebuild.
+- CPU bounded by `warm_start_preroll_frames()` (gate + one FFT window);
+  the deterministic engine's warm start is allocation-free
+  (`tests/realtime_allocations.rs`). The legacy hybrid engine rebuilds its
+  rolling window (already non-RT) and is documented as such.
+- Desktop: click-to-seek and beat-jump buttons (±4/±16 beats off the
+  detected grid) use warm-start; loop in/out/exit wraps the region gaplessly
+  via `notify_source_jump`.
+
+### Exit Criteria
+
+- Cue jumps and loop wraps produce no audible warm-up transient or gap. ✓
+  (`tests/warm_start.rs`: post-seek level at steady state immediately, output
+  within normal cadence, no gap.)
+- A beat-jump/loop torture test passes clean at DJ ratios. ✓ (loop-wrap seams
+  and cue-drumming click-free across ratios/profiles; click bound 6× ideal
+  slew vs the PV's measured ~4.7× ripple and a cold-restart ~40× splice.)
+- Desktop seek no longer rebuilds the processor. ✓ (warm-start, with a
+  rebuild only as an error fallback.)
+
+### Deferred Follow-Up
+
+- Allocation-free warm start in the legacy hybrid re-render engine (it
+  rebuilds its rolling window today; that engine is non-RT regardless).
+
+## [ ] Stage 12: Port Hybrid Quality Into the Deterministic Stream Engine
+
+Automation: auto
+
+### Why
+
+Offline rendering gets multi-resolution FFT, HPSS, and segmented transient
+WSOLA; the streaming path approximates all of that with a single-FFT PV plus
+a stack of corrective heuristics (EMA gain matching, spectral shelving, dry
+blend, WSOLA overlay). Kick and hat sharpness under +/-8% stretch is judged in
+the streaming path, because that is where beatmatching happens. This is the
+streaming-side counterpart of Stages 2-5.
+
+### Primary Files
+
+- `src/stream/processor.rs`
+- `src/stretch/multi_resolution.rs`
+- `src/analysis/hpss.rs`
+- `src/stream/transient_scheduler.rs`
+
+### Work
+
+- Design a bounded-latency multi-band PV for streaming (larger FFT for
+  sub-bass phase coherence, smaller FFT for transient-sharp highs).
+- Evaluate an incremental/causal HPSS variant for the streaming path, gated
+  behind `QualityMode`.
+- As structural quality lands, retire corrective heuristics instead of
+  stacking more (each heuristic removed is a win in itself).
+- Keep per-callback cost bounded and allocation-free; extend the callback
+  budget gates to the new configuration.
+
+### Exit Criteria
+
+- Streaming-vs-batch tolerances in `tests/streaming_batch_parity.rs` and
+  `tests/stretch_quality_regressions.rs` tighten measurably.
+- Kick/hat transient sharpness in streaming is comparable to batch at DJ
+  ratios.
+- The corrective heuristic stack shrinks rather than grows.
+
+## [ ] Stage 13: Deck Control Completeness
+
+Automation: manual
+
+### Why
+
+Real decks are more than play-at-a-ratio: keylock has defined behavior at
+extreme rates, playback can reverse, scratching hands control to plain
+resampling, and pitch faders have hardware-grade resolution. These behaviors
+need definitions and tests even where the answer is "the host does it".
+
+### Primary Files
+
+- `src/stream/processor.rs`
+- `src/lib.rs` (docs)
+- `desktop/src/processor.rs`
+
+### Work
+
+- Define keylock behavior beyond roughly +/-50%: blend to plain resampling
+  (like commercial decks) rather than letting PV quality collapse; specify
+  the crossover and make the transition inaudible.
+- Define and test reverse playback: what the engine supports natively versus
+  what the host feeds it.
+- Document the scratch story: scratching is host-side variable-rate
+  resampling; specify how the engine re-enters cleanly after a scratch
+  (ties into Stage 11 warm-start).
+- Verify 48 kHz and 96 kHz end-to-end (all tuned constants are Hz-based;
+  confirm none assume 44.1 kHz).
+- Verify CDJ-grade pitch resolution: 0.02% fader steps must ride the 50 ms
+  control glide without artifacts or drift.
+
+### Exit Criteria
+
+- Documented, tested behavior for every transport control across its range.
+- Keylock degrades gracefully (blend), never catastrophically.
+- 48/96 kHz produce equivalent quality metrics to 44.1 kHz.
+
+## [x] Stage 14: Analyze-on-Load Pre-Analysis Everywhere
+
+Automation: auto
+
+### Why
+
+Commercial DJ products analyze tracks once on import and let the engine
+consume the stored beatgrid/onset map; offline analysis is non-causal and
+strictly better than per-chunk online detection, and it frees realtime CPU.
+The `PreAnalysisArtifact` existed but was only consumed by batch mono beat
+snapping — no stretch path used its transient onsets, and nothing produced
+or persisted it in real workflows.
+
+### Primary Files
+
+- `src/core/preanalysis.rs`
+- `src/analysis/preanalysis.rs`
+- `src/analysis/adaptive_snapshot.rs`
+- `src/stretch/stereo.rs`
+- `src/stream/processor.rs`
+- `src/cli.rs`
+- `desktop/src/app.rs`, `desktop/src/processor.rs`
+
+### Work
+
+- Artifact schema v2: version, content binding (source length + FNV-1a
+  hash), per-onset strengths and band flux, analysis hop size; v1 JSON
+  stays readable. Gates: `is_usable` (runtime) and `matches_source`
+  (load boundary).
+- All four stretch paths consume a usable artifact authoritatively
+  (online detection skipped): batch mono, batch stereo M/S, deterministic
+  RT engine (artifact-scheduled per-band phase resets, allocation-free
+  cursor, strength-based band thresholds, modulation-hold suppression),
+  legacy hybrid re-render engine (absolute window-base tracking maps
+  artifact anchors into the rolling window; mono skips per-render
+  adaptive analysis).
+- `StreamProcessor::set_source_position` + `source_position`: absolute
+  source-frame timeline (including unity passthrough) so artifact
+  positions survive seek-rebuild flows. `set_pre_analysis` for rebuild
+  wiring; artifact telemetry in `TransientResetStats`.
+- Producers: `timestretch-cli analyze` writes a `.tsanalysis.json`
+  sidecar; `--pre-analysis` validates and warn-falls-back when stale.
+  Desktop analyzes on load in a background thread (generation-guarded),
+  caches the sidecar, threads the artifact into every processor rebuild,
+  and anchors rebuilds at the correct source position (fixing preset
+  changes mid-track implicitly rebuilding at frame 0).
+
+### Deferred Follow-Ups
+
+- Thread a sparse per-band transient map through `process_with_onsets` so
+  the artifact path keeps per-band resets in the legacy hybrid engine
+  (currently full four-band resets, matching prior streaming behavior).
+- Tempo curve (per-region BPM) in the artifact for drifting material.
+- Warm-start seek (Stage 11) builds on this stage's position bookkeeping.
+
+### Exit Criteria
+
+- All four paths consume artifacts with parity-or-better transient
+  preservation vs online detection (`tests/preanalysis_pipeline.rs`,
+  `tests/streaming_preanalysis.rs`). ✓
+- Zero-alloc steady state with a large artifact attached
+  (`tests/realtime_allocations.rs`). ✓
+- Seek-offset streaming schedules exactly the onsets past the seek point. ✓
+- CLI and desktop produce/persist/validate artifacts end-to-end. ✓
+- Version 1 artifact JSON remains readable. ✓
 
 ## Not a Priority Yet
 
 These should stay secondary until the quality roadmap above is complete:
 
 - SIMD and architecture-specific acceleration
-- Desktop and web tooling polish
+- Desktop and web tooling polish (the desktop app does serve as the reference
+  integration for Stages 10-13, but its UI/UX polish stays secondary)
 - Additional presets
 - Wider API surface
 - New convenience wrappers
@@ -350,3 +749,5 @@ are true:
 - The public API rejects malformed input instead of silently degrading.
 - At least one external-reference benchmark is mandatory in CI.
 - Realtime-safe usage is clearly separated from non-RT or legacy behavior.
+- A deck built on the engine feels like hardware: low-latency nudges, seamless
+  cue jumps, click-free pitch rides, and graceful keylock at extremes.

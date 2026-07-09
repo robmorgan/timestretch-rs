@@ -11,7 +11,14 @@ use crate::state::*;
 use crate::waveform::{self, WaveformPeaks};
 
 const MIN_STRETCH_RATIO: f64 = 0.25;
-const MAX_STRETCH_RATIO: f64 = 4.0;
+/// Slowest playback the streaming engine sustains cleanly on every profile
+/// (Live handles ~12x; 10x leaves margin). Sets the tempo fader's floor at
+/// `detected_bpm / 10` (~-90%, near-stop).
+const MAX_STRETCH_RATIO: f64 = 10.0;
+/// Tempo fader reaches double the track BPM (+100%).
+const MAX_TEMPO_FACTOR: f64 = 2.0;
+/// Tempo fader width in points (3x egui's ~100pt default) for fine control.
+const TEMPO_SLIDER_WIDTH: f32 = 300.0;
 
 pub struct TimeStretchApp {
     state: SharedStateHandle,
@@ -38,6 +45,9 @@ pub struct TimeStretchApp {
 
     // UI state
     stretch_ratio: f64,
+    /// Target playback BPM the tempo fader binds to (0.0 until a BPM is
+    /// detected). Derived view of `stretch_ratio`, kept in sync.
+    target_bpm: f64,
     pitch_semitones: f32,
     volume: f32,
     preset: PresetChoice,
@@ -52,6 +62,21 @@ impl TimeStretchApp {
     #[inline]
     fn clamp_stretch_ratio(ratio: f64) -> f64 {
         ratio.clamp(MIN_STRETCH_RATIO, MAX_STRETCH_RATIO)
+    }
+
+    /// Sets the playback tempo to `target_bpm` (for a track at `detected_bpm`)
+    /// and syncs every derived view — stretch ratio, the fader's `target_bpm`,
+    /// and the BPM text box — to the value that actually plays after the
+    /// engine's ratio clamp. Single write point for the tempo control.
+    fn apply_target_bpm(&mut self, detected_bpm: f64, target_bpm: f64) {
+        let ratio = Self::clamp_stretch_ratio(detected_bpm / target_bpm.max(1e-6));
+        let effective_bpm = detected_bpm / ratio;
+        self.stretch_ratio = ratio;
+        self.target_bpm = effective_bpm;
+        self.target_bpm_text = format!("{effective_bpm:.1}");
+        let mut st = self.state.lock().unwrap();
+        st.stretch_ratio = ratio;
+        st.target_bpm = effective_bpm;
     }
 
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
@@ -88,6 +113,7 @@ impl TimeStretchApp {
             file_path: None,
             waveform_peaks: None,
             stretch_ratio: 1.0,
+            target_bpm: 0.0,
             pitch_semitones: 0.0,
             volume: 0.8,
             preset: PresetChoice::DjBeatmatch,
@@ -136,10 +162,15 @@ impl TimeStretchApp {
                 } else {
                     String::new()
                 };
+                // A fresh track starts at its own tempo (fader centered) and
+                // unity ratio, regardless of any prior track's settings.
+                self.stretch_ratio = 1.0;
+                self.target_bpm = bpm.max(0.0);
+                let num_channels = bpm_buffer.channels.count();
                 let samples = Arc::new(bpm_buffer.into_data());
 
                 // Update shared state
-                {
+                let analysis_generation = {
                     let mut st = self.state.lock().unwrap();
                     st.sample_rate = sample_rate;
                     st.total_frames = num_frames;
@@ -152,7 +183,26 @@ impl TimeStretchApp {
                     st.volume = self.volume;
                     st.preset = self.preset;
                     st.stream_profile = self.stream_profile;
-                }
+                    st.pre_analysis = None;
+                    st.loop_region = None;
+                    st.loop_in = None;
+                    st.analysis_generation += 1;
+                    st.analysis_generation
+                };
+
+                // Analyze-on-load: a matching sidecar is used immediately;
+                // otherwise a background thread analyzes once and caches the
+                // result next to the file. `detect_bpm_buffer` above keeps
+                // the UI BPM instant either way — the artifact upgrades
+                // subsequent processor rebuilds when it lands.
+                spawn_pre_analysis(
+                    self.state.clone(),
+                    samples.clone(),
+                    num_channels,
+                    sample_rate,
+                    sidecar_path(&path),
+                    analysis_generation,
+                );
 
                 self.source_audio = Some(samples);
                 self.file_path = Some(path);
@@ -197,29 +247,11 @@ impl TimeStretchApp {
         };
         self.audio_engine = Some(engine);
 
-        // Prepare working audio (with pitch shift if needed)
-        let working_audio = if self.pitch_semitones.abs() < 0.01 {
-            source.as_ref().clone()
-        } else {
-            let factor = 2.0_f64.powf(self.pitch_semitones as f64 / 12.0);
-            let params = timestretch::StretchParams::new(1.0)
-                .with_sample_rate(sample_rate)
-                .with_channels(2)
-                .with_normalize(true);
-            match timestretch::pitch_shift(&source, &params, factor) {
-                Ok(shifted) => shifted,
-                Err(e) => {
-                    log::error!("Pitch shift failed: {e}");
-                    source.as_ref().clone()
-                }
-            }
-        };
-
-        // Update state
+        // Pitch is applied live by the stream processor; no pre-render pass.
         {
             let mut st = self.state.lock().unwrap();
             st.transport = Transport::Playing;
-            st.total_frames = working_audio.len() / 2;
+            st.total_frames = source.len() / 2;
         }
 
         let stop_flag = Arc::new(StopFlag::new());
@@ -228,7 +260,6 @@ impl TimeStretchApp {
         let handle = processor::start_processing_thread(
             self.state.clone(),
             source,
-            working_audio,
             producer,
             sample_rate,
             self.position.clone(),
@@ -422,6 +453,86 @@ impl TimeStretchApp {
                 Self::format_time(duration_secs)
             ));
         });
+
+        self.loop_and_jump_panel(ui);
+    }
+
+    /// Beat-jump buttons and loop in/out/exit controls. Jumps and loop wraps
+    /// go through the processing thread's warm-start machinery.
+    fn loop_and_jump_panel(&mut self, ui: &mut egui::Ui) {
+        let has_audio = self.source_audio.is_some();
+        let (pos_frames, total_frames, bpm, sample_rate, loop_region, loop_in) = {
+            let st = self.state.lock().unwrap();
+            (
+                st.position_frames,
+                st.total_frames,
+                st.detected_bpm,
+                st.sample_rate,
+                st.loop_region,
+                st.loop_in,
+            )
+        };
+
+        ui.horizontal(|ui| {
+            // Beat jumps: relative seeks by whole beats using the detected
+            // grid. Disabled until a tempo is known.
+            let beat_frames = if bpm > 0.0 {
+                (sample_rate as f64 * 60.0 / bpm).round() as i64
+            } else {
+                0
+            };
+            let can_jump = has_audio && beat_frames > 0 && total_frames > 0;
+            ui.label("Jump:");
+            for beats in [-16i64, -4, 4, 16] {
+                let label = if beats > 0 {
+                    format!("+{beats}")
+                } else {
+                    format!("{beats}")
+                };
+                if ui.add_enabled(can_jump, egui::Button::new(label)).clicked() {
+                    let delta = beats * beat_frames;
+                    let target =
+                        (pos_frames as i64 + delta).clamp(0, total_frames as i64 - 1) as usize;
+                    self.state.lock().unwrap().seek_request = Some(target);
+                }
+            }
+
+            ui.separator();
+
+            // Loop: set in point, then out point to arm; exit to clear.
+            ui.label("Loop:");
+            if ui.add_enabled(has_audio, egui::Button::new("In")).clicked() {
+                self.state.lock().unwrap().loop_in = Some(pos_frames);
+            }
+            let can_close = has_audio && loop_in.is_some_and(|i| pos_frames > i);
+            if ui
+                .add_enabled(can_close, egui::Button::new("Out"))
+                .clicked()
+            {
+                if let Some(start) = loop_in {
+                    let mut st = self.state.lock().unwrap();
+                    st.loop_region = Some((start, pos_frames));
+                    st.loop_in = None;
+                }
+            }
+            if ui
+                .add_enabled(loop_region.is_some(), egui::Button::new("Exit"))
+                .clicked()
+            {
+                self.state.lock().unwrap().loop_region = None;
+            }
+
+            match loop_region {
+                Some((s, e)) => {
+                    let secs = (e - s) as f64 / sample_rate.max(1) as f64;
+                    ui.monospace(format!("looping {secs:.2}s"));
+                }
+                None if loop_in.is_some() => {
+                    ui.monospace("in set…");
+                }
+                None => {}
+            }
+        });
     }
 
     fn controls_panel(&mut self, ui: &mut egui::Ui) {
@@ -429,35 +540,52 @@ impl TimeStretchApp {
             .num_columns(2)
             .spacing([16.0, 8.0])
             .show(ui, |ui| {
-                // Stretch ratio
-                ui.label("Stretch Ratio:");
+                // Tempo control. With a detected BPM it is a CDJ-style tempo
+                // fader in BPM (0.1-BPM steps, centered on the track tempo);
+                // otherwise it falls back to a raw stretch-ratio slider.
+                let detected = self.state.lock().unwrap().detected_bpm;
+                ui.label("Tempo:");
                 ui.horizontal(|ui| {
-                    let old_ratio = self.stretch_ratio;
-                    ui.add(
-                        egui::Slider::new(
-                            &mut self.stretch_ratio,
-                            MIN_STRETCH_RATIO..=MAX_STRETCH_RATIO,
-                        )
+                    if detected > 0.0 {
+                        if self.target_bpm <= 0.0 {
+                            self.target_bpm = detected;
+                        }
+                        let min_bpm = detected / MAX_STRETCH_RATIO;
+                        let max_bpm = detected * MAX_TEMPO_FACTOR;
+                        let old_bpm = self.target_bpm;
+                        // Widen the fader (3x the default) so 0.1-BPM steps
+                        // are easy to hit by drag.
+                        ui.spacing_mut().slider_width = TEMPO_SLIDER_WIDTH;
+                        ui.add(
+                            egui::Slider::new(&mut self.target_bpm, min_bpm..=max_bpm)
+                                .step_by(0.1)
+                                .fixed_decimals(1)
+                                .suffix(" BPM"),
+                        );
+                        if (self.target_bpm - old_bpm).abs() > 0.001 {
+                            self.apply_target_bpm(detected, self.target_bpm);
+                        }
+                        let pct = (1.0 / self.stretch_ratio - 1.0) * 100.0;
+                        ui.label(egui::RichText::new(format!("{pct:+.1}%")).weak());
+                        if ui.button("Reset").clicked() {
+                            self.apply_target_bpm(detected, detected);
+                        }
+                    } else {
+                        let old_ratio = self.stretch_ratio;
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.stretch_ratio,
+                                MIN_STRETCH_RATIO..=MAX_STRETCH_RATIO,
+                            )
                             .text("x")
                             .fixed_decimals(2),
-                    );
-                    if (self.stretch_ratio - old_ratio).abs() > 0.001 {
-                        let mut st = self.state.lock().unwrap();
-                        st.stretch_ratio = self.stretch_ratio;
-                        // Update target BPM text if we have detected BPM
-                        if st.detected_bpm > 0.0 {
-                            let target = st.detected_bpm / self.stretch_ratio;
-                            self.target_bpm_text = format!("{target:.1}");
-                            st.target_bpm = target;
+                        );
+                        if (self.stretch_ratio - old_ratio).abs() > 0.001 {
+                            self.state.lock().unwrap().stretch_ratio = self.stretch_ratio;
                         }
-                    }
-                    if ui.button("Reset").clicked() {
-                        self.stretch_ratio = 1.0;
-                        let mut st = self.state.lock().unwrap();
-                        st.stretch_ratio = 1.0;
-                        if st.detected_bpm > 0.0 {
-                            self.target_bpm_text = format!("{:.1}", st.detected_bpm);
-                            st.target_bpm = st.detected_bpm;
+                        if ui.button("Reset").clicked() {
+                            self.stretch_ratio = 1.0;
+                            self.state.lock().unwrap().stretch_ratio = 1.0;
                         }
                     }
                 });
@@ -477,14 +605,10 @@ impl TimeStretchApp {
                         );
                         if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             if let Ok(target) = self.target_bpm_text.parse::<f64>() {
-                                if target > 0.0 && detected_bpm > 0.0 {
-                                    self.stretch_ratio =
-                                        Self::clamp_stretch_ratio(detected_bpm / target);
-                                    let effective_target = detected_bpm / self.stretch_ratio;
-                                    self.target_bpm_text = format!("{effective_target:.1}");
-                                    let mut st = self.state.lock().unwrap();
-                                    st.stretch_ratio = self.stretch_ratio;
-                                    st.target_bpm = effective_target;
+                                if target > 0.0 {
+                                    // Route through the shared sync point so the
+                                    // tempo fader tracks a typed BPM too.
+                                    self.apply_target_bpm(detected_bpm, target);
                                 }
                             }
                         }
@@ -532,10 +656,22 @@ impl TimeStretchApp {
                         st.stream_profile = self.stream_profile;
                         st.preset_changed = true;
                     }
+                    // Effective latency reported by the active processor
+                    // (published by the processing thread at every build).
+                    let latency_secs = self.state.lock().unwrap().reported_latency_secs;
+                    if latency_secs > 0.0 {
+                        ui.label(
+                            egui::RichText::new(format!("~{:.0} ms", latency_secs * 1000.0)).weak(),
+                        )
+                        .on_hover_text(
+                            "Effective control-to-audio buffering latency for the \
+                             selected playback profile",
+                        );
+                    }
                 });
                 ui.end_row();
 
-                // Pitch shift
+                // Pitch shift (realtime: applied live by the stream processor)
                 ui.label("Pitch Shift:");
                 ui.horizontal(|ui| {
                     let old_pitch = self.pitch_semitones;
@@ -544,28 +680,17 @@ impl TimeStretchApp {
                             .text("st")
                             .fixed_decimals(1),
                     );
-                    if (self.pitch_semitones - old_pitch).abs() > 0.01 {
+                    if (self.pitch_semitones - old_pitch).abs() > 0.001 {
                         let mut st = self.state.lock().unwrap();
                         st.pitch_semitones = self.pitch_semitones;
-                        st.pitch_changed = true;
                     }
-                    if ui.button("Reset").clicked() && self.pitch_semitones.abs() > 0.01 {
+                    if ui.button("Reset").clicked() && self.pitch_semitones.abs() > 0.001 {
                         self.pitch_semitones = 0.0;
                         let mut st = self.state.lock().unwrap();
                         st.pitch_semitones = 0.0;
-                        st.pitch_changed = true;
                     }
                 });
                 ui.end_row();
-
-                // Pitch processing indicator
-                let pitch_processing = self.state.lock().unwrap().pitch_processing;
-                if pitch_processing {
-                    ui.label("");
-                    ui.colored_label(egui::Color32::YELLOW, "Processing pitch shift...");
-                    ui.end_row();
-                    ctx_request_repaint(ui);
-                }
 
                 // Volume
                 ui.label("Volume:");
@@ -586,6 +711,61 @@ impl TimeStretchApp {
     }
 }
 
-fn ctx_request_repaint(ui: &egui::Ui) {
-    ui.ctx().request_repaint();
+/// Sidecar artifact path for a loaded audio file: `<file>.tsanalysis.json`.
+fn sidecar_path(audio_path: &std::path::Path) -> PathBuf {
+    let mut os = audio_path.as_os_str().to_os_string();
+    os.push(".tsanalysis.json");
+    PathBuf::from(os)
+}
+
+/// Loads a matching sidecar artifact or analyzes the track on a background
+/// thread, storing the result in shared state for the next processor rebuild.
+///
+/// The result is discarded if another file was loaded in the meantime
+/// (`generation` mismatch). Sidecar writes are best-effort: a read-only
+/// volume must not break analysis.
+fn spawn_pre_analysis(
+    state: SharedStateHandle,
+    samples: Arc<Vec<f32>>,
+    num_channels: usize,
+    sample_rate: u32,
+    sidecar: PathBuf,
+    generation: u64,
+) {
+    std::thread::spawn(move || {
+        let analysis_signal = timestretch::downmix_to_mid(&samples, num_channels);
+
+        let artifact = match timestretch::read_preanalysis_json(&sidecar) {
+            Ok(cached) if cached.matches_source(&analysis_signal, sample_rate) => {
+                log::info!("Pre-analysis: using cached sidecar {}", sidecar.display());
+                cached
+            }
+            _ => {
+                let start = std::time::Instant::now();
+                let fresh = timestretch::analyze_for_dj(&analysis_signal, sample_rate);
+                log::info!(
+                    "Pre-analysis: {:.1} BPM, confidence {:.2}, {} beats, {} onsets ({:.2}s)",
+                    fresh.bpm,
+                    fresh.confidence,
+                    fresh.beat_positions.len(),
+                    fresh.transient_onsets.len(),
+                    start.elapsed().as_secs_f64()
+                );
+                if let Err(e) = timestretch::write_preanalysis_json(&sidecar, &fresh) {
+                    log::warn!(
+                        "Pre-analysis: could not cache sidecar {}: {e}",
+                        sidecar.display()
+                    );
+                }
+                fresh
+            }
+        };
+
+        let mut st = state.lock().unwrap();
+        if st.analysis_generation == generation {
+            st.pre_analysis = Some(Arc::new(artifact));
+        } else {
+            log::info!("Pre-analysis: discarding stale result (newer file loaded)");
+        }
+    });
 }
