@@ -454,7 +454,10 @@ The stages below close the gap between "quality streaming stretcher" and
 Elastique bar). Stage 9 settled on EDM/DJ-first, so these stages are the
 priority track. Ordering: Stage 10 and Stage 11 are DJ-blocking and should
 follow Stage 1 directly; Stage 12 is the long-tail quality work; Stage 13 is
-completeness.
+completeness. Stage 15 (varispeed-first keylock) and Stage 16 (causal
+low-end quality at small FFTs) together target the élastique feel: instant
+tempo control with Club-grade lows on the Live profile — Stage 15 is the
+bigger win per unit of work and should go first.
 
 ## [x] Stage 10: Make Low-Latency Streaming First-Class
 
@@ -734,6 +737,134 @@ or persisted it in real workflows.
 - Seek-offset streaming schedules exactly the onsets past the seek point. ✓
 - CLI and desktop produce/persist/validate artifacts end-to-end. ✓
 - Version 1 artifact JSON remains readable. ✓
+
+## [ ] Stage 15: Varispeed-First Keylock (Instant Tempo Control)
+
+Automation: auto
+
+### Why
+
+In the current architecture the phase vocoder implements the tempo change,
+so the buffering gate (Live: 1536 frames ≈ 34.8 ms) plus the ~50 ms control
+glide IS the tempo-control latency — a fader nudge takes ~85 ms to fully
+land. Commercial decks (Traktor on élastique 3, Serato on Pitch 'n Time DJ)
+invert this: the tempo fader drives a varispeed resampler (instant,
+sample-accurate response), and the stretcher only pitch-corrects at a
+slowly-varying transposition. The stretcher's buffering then becomes a
+CONSTANT output delay the host compensates in its timeline — perceived
+control latency drops to the soundcard buffer. Same DSP, radically better
+beatmatching feel; no vocoder research required.
+
+### Primary Files
+
+- `src/stream/processor.rs` (control-path restructure)
+- `src/core/resample.rs` (varispeed input stage on the streaming sinc
+  resampler)
+- `desktop/src/processor.rs`, `desktop/src/audio_engine.rs` (timeline/delay
+  compensation, reference integration)
+- `tests/streaming_latency.rs` (new control-to-audio budget)
+
+### Work
+
+- Add a keylock control mode to `StreamProcessor` (e.g.
+  `ControlPath::VarispeedFirst` alongside the current PV-implements-tempo
+  path, which stays for tape-mode/no-keylock use): input passes through a
+  varispeed sinc resampler at the control ratio, then the PV runs at the
+  compensating stretch to restore pitch.
+- Tempo changes retarget the resampler sample-accurately (no 50 ms glide on
+  the tempo axis — the glide survives only on the PV's transposition
+  tracking, where its job is masking phase seams, not delaying tempo).
+- Rework latency reporting: `latency_report()` gains a
+  `control_to_audio_frames` (resampler-only, ~0) versus
+  `pipeline_delay_frames` (PV gate, constant, host-compensated) split.
+  Position/beat-grid bookkeeping (`source_position`, artifact onsets,
+  Stage 14 timeline) must account for the moving resampler ratio ahead of
+  the PV.
+- Ratio-drift audit: the varispeed stage consumes source at a time-varying
+  rate; `expected_total_output_samples` reconciliation and the modulation-
+  hold machinery need to read the effective ratio from the resampler, not
+  the PV.
+- Desktop adopts it as the DJ default with keylock on; the engine-selection
+  UI pattern from the multi-res work is the template.
+- Interacts with Stage 13's extreme-rate keylock blend: beyond the blend
+  threshold the PV correction fades toward plain varispeed — in this
+  architecture that becomes simply fading the corrector out, which is the
+  cleanest possible implementation of that item.
+
+### Exit Criteria
+
+- Measured control-to-audio for a tempo step in varispeed-first mode is
+  bounded by one callback + resampler lookahead (tens of samples, not the
+  PV gate) in `tests/streaming_latency.rs`.
+- Output pipeline delay is constant and reported; beat-grid positions stay
+  sample-aligned through tempo rides (artifact onsets keep firing at the
+  right places).
+- A/B against the current path under the qa ratio ride: no quality
+  regression on the profile similarity rows; pitch wobble during fast
+  tempo rides stays below audibility (define and gate a cents-deviation
+  metric).
+- Allocation-free steady state, both engines (deterministic and
+  multi-resolution) behind the new control path.
+
+## [ ] Stage 16: Causal Low-End Quality at Small FFTs
+
+Automation: auto
+
+### Why
+
+The Live profile's 1024-point window has 43 Hz/bin resolution, which is why
+it leans on a raised (180 Hz) rigid sub-bass locking cutoff and why the
+multi-resolution engine (Club+) exists. But single-frame DFT resolution is
+not a physical limit on a *causal* estimator: phase deltas across multiple
+past hops give near-arbitrary frequency precision for sustained tones, and
+sub-bass is quasi-periodic enough for time-domain period tracking. All of
+the levers below consume only PAST samples — they raise low-end quality at
+1024 with ZERO added output latency. Combined with Stage 15 this gets Live
+toward "instant control AND Club-grade lows", which is the élastique bar.
+
+### Primary Files
+
+- `src/stretch/phase_vocoder.rs` (instantaneous-frequency estimation)
+- `src/stream/processor.rs` (analysis-lookback wiring)
+- `src/stretch/multi_resolution.rs` (shared band machinery where reusable)
+- `qa/profile_quality.rs` (sub/low band rows are the scoreboard)
+
+### Work
+
+- **Multi-hop instantaneous-frequency estimation**: replace single-hop
+  phase differencing with a tracked per-bin (or per-peak) frequency
+  estimate over several past frames (with parabolic magnitude-peak
+  interpolation); use it to drive `phase_accum` advance. Target: sustained
+  bass at 1024 advances phase as accurately as a 4096 window does today.
+- **Analysis-only lookback window**: an optional 4× analysis FFT over the
+  trailing (already-received) samples — window ENDS at the newest sample,
+  so it is causal — refining sub-500 Hz frequency estimates for the small
+  synthesis PV. CPU cost is one extra FFT per hop; gate it behind
+  `QualityMode` if the Live budget needs it.
+- **Time-domain sub-bass option**: below ~150 Hz, evaluate a
+  period-tracking resynthesis path (phase-continuous oscillator bank or
+  period-synchronous splicing) against the PV-with-better-IF approach on
+  the qa bass material; keep whichever wins, don't stack both.
+- **Retire compensations as structure lands** (Stage 12 exit criterion
+  applies here): each improvement must be measured against removing the
+  corrective heuristics it obsoletes — the raised 180 Hz streaming cutoff,
+  the mid-band additive boost, and the ratio-distance spectral shelf are
+  the first candidates.
+- Re-measure the multi-resolution engine after the IF work: better band
+  PVs may shrink its seam losses too (the band vocoders de-phase less when
+  their frequency estimates agree).
+
+### Exit Criteria
+
+- Live-profile sub+low band similarity on the qa bass material reaches the
+  current Club deterministic numbers (sub ≥ 0.999, low ≥ 0.997) with the
+  gate unchanged at 1536 frames.
+- At least one corrective heuristic is removed with no regression in the
+  quality dashboard (shrinking stack, per Stage 12).
+- No new latency: `tests/streaming_latency.rs` figures unchanged; zero
+  allocations in steady state.
+- Modulation-torture and click gates stay green (better IF tracking must
+  not fight the ratio-seam slew machinery).
 
 ## Not a Priority Yet
 
