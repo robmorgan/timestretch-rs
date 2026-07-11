@@ -58,6 +58,9 @@ pub use timestretch::StreamProfile;
 // Stream-mode rendering engine (deterministic single-PV vs multi-resolution
 // filterbank), likewise a library concept re-exported for the UI.
 pub use timestretch::StreamingEngine;
+// Tempo control path (vocoder-implements-tempo vs varispeed-first keylock),
+// likewise a library concept re-exported for the UI.
+pub use timestretch::ControlPath;
 
 /// State shared between UI, processing, and audio threads.
 pub struct SharedState {
@@ -72,6 +75,11 @@ pub struct SharedState {
     /// so on the Live profile the build falls back to deterministic (the
     /// preference is kept and re-applies when the profile allows it).
     pub streaming_engine: StreamingEngine,
+    /// Tempo control path. Varispeed-first (keylock) is the DJ default:
+    /// instant tempo response with the vocoder gate as constant, host-
+    /// compensated pipeline delay. Applied at every processor build; falls
+    /// back to the vocoder path if the ratio is outside the varispeed range.
+    pub control_path: ControlPath,
 
     /// Current playback position in source frames.
     pub position_frames: usize,
@@ -89,10 +97,14 @@ pub struct SharedState {
     /// Set by UI when preset changes (requires rebuilding processor).
     pub preset_changed: bool,
 
-    /// Effective streaming latency reported by the active processor, in
-    /// seconds. Published by the processing thread at every build; read by
-    /// the UI next to the profile selector.
+    /// Constant pipeline (content) delay reported by the active processor,
+    /// in seconds. Published by the processing thread at every build; read
+    /// by the UI next to the profile selector.
     pub reported_latency_secs: f64,
+    /// Tempo control-to-audio latency reported by the active processor, in
+    /// seconds (excludes the callback size). Near-zero on the varispeed-
+    /// first path; equals the pipeline delay on the vocoder path.
+    pub reported_control_latency_secs: f64,
 
     /// Offline pre-analysis of the loaded track (beat grid, onsets).
     ///
@@ -123,6 +135,7 @@ impl SharedState {
             preset: PresetChoice::DjBeatmatch,
             stream_profile: StreamProfile::Club,
             streaming_engine: StreamingEngine::Deterministic,
+            control_path: ControlPath::VarispeedFirst,
             position_frames: 0,
             total_frames: 0,
             sample_rate: 44100,
@@ -131,6 +144,7 @@ impl SharedState {
             seek_request: None,
             preset_changed: false,
             reported_latency_secs: 0.0,
+            reported_control_latency_secs: 0.0,
             pre_analysis: None,
             analysis_generation: 0,
             loop_region: None,

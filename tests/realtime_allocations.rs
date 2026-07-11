@@ -40,6 +40,16 @@ unsafe impl GlobalAlloc for CountingAllocator {
         if TRACK_ALLOCATIONS.load(Ordering::Relaxed) {
             REALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
             REALLOC_BYTES.fetch_add(new_size, Ordering::Relaxed);
+            if std::env::var_os("ALLOC_TRACE").is_some() {
+                TRACK_ALLOCATIONS.store(false, Ordering::SeqCst);
+                eprintln!(
+                    "realloc {} -> {} bytes\n{}",
+                    layout.size(),
+                    new_size,
+                    std::backtrace::Backtrace::force_capture()
+                );
+                TRACK_ALLOCATIONS.store(true, Ordering::SeqCst);
+            }
         }
         out
     }
@@ -491,4 +501,88 @@ fn warm_start_seek_no_heap_growth_after_warmup() {
         alloc_bytes,
         realloc_bytes
     );
+}
+
+#[test]
+fn process_into_varispeed_tempo_ride_no_heap_growth_after_warmup() {
+    // Stage 15 exit criterion: allocation-free steady state on the
+    // varispeed-first control path behind BOTH engines, with the tempo
+    // retargeted every chunk (the DJ ride case the path exists for).
+    let _guard = ALLOC_TEST_MUTEX
+        .lock()
+        .expect("allocation test mutex poisoned");
+    const SAMPLE_RATE: u32 = 44_100;
+    const CHUNK_FRAMES: usize = 256;
+    const MEASURE_ITERS: usize = 96;
+
+    let cases = [
+        // (engine, profile, warmup): the multi-res Club gate is 12288
+        // frames, so it needs the longer runway.
+        (timestretch::StreamingEngine::Deterministic, None, 64usize),
+        (
+            timestretch::StreamingEngine::MultiResolution,
+            Some(timestretch::StreamProfile::Club),
+            192usize,
+        ),
+    ];
+
+    for (engine, profile, warmup_iters) in cases {
+        let mut params = StretchParams::new(1.05)
+            .with_sample_rate(SAMPLE_RATE)
+            .with_channels(2);
+        params = match profile {
+            Some(profile) => params.with_stream_profile(profile),
+            None => params.with_preset(EdmPreset::DjBeatmatch),
+        };
+        let mut processor = StreamProcessor::new(params);
+        processor
+            .set_streaming_engine(engine)
+            .expect("engine selection should succeed");
+        processor
+            .set_control_path(timestretch::ControlPath::VarispeedFirst)
+            .expect("varispeed path should be accepted");
+
+        let chunk = test_chunk_stereo(CHUNK_FRAMES, SAMPLE_RATE as f32);
+        let max_samples = chunk.len() * (warmup_iters + MEASURE_ITERS) * 8;
+        let mut output = Vec::with_capacity(max_samples);
+
+        for _ in 0..warmup_iters {
+            processor
+                .process_into(&chunk, &mut output)
+                .expect("warmup process_into should succeed");
+        }
+        assert!(
+            !output.is_empty(),
+            "warmup must clear the buffering gate ({:?})",
+            engine
+        );
+        output.clear();
+
+        // Retarget the tempo every chunk inside the tracked region: the
+        // varispeed resamplers, ratio map, and transposition tracker must
+        // all be allocation-free under continuous modulation.
+        begin_alloc_tracking();
+        for i in 0..MEASURE_ITERS {
+            let t = i as f64 / MEASURE_ITERS as f64;
+            let ratio = 1.0 + 0.06 * (2.0 * std::f64::consts::PI * t).sin();
+            processor
+                .set_stretch_ratio(ratio)
+                .expect("ride ratio should be accepted");
+            processor
+                .process_into(&chunk, &mut output)
+                .expect("varispeed ride process_into should succeed");
+        }
+        let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
+
+        assert_eq!(
+            alloc_calls + realloc_calls,
+            0,
+            "varispeed ride ({:?}) allocated: alloc_calls={}, realloc_calls={}, alloc_bytes={}, realloc_bytes={}",
+            engine,
+            alloc_calls,
+            realloc_calls,
+            alloc_bytes,
+            realloc_bytes
+        );
+    }
 }

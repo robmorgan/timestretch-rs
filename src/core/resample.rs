@@ -173,7 +173,7 @@ pub const STREAM_SINC_MAX_HALF_TAPS: usize = 80;
 
 /// Maximum step for which the kernel cutoff is dilated. Steps beyond this
 /// (more than +2 octaves of pitch-up) partially alias.
-const STREAM_SINC_MAX_STEP: f64 = 4.0;
+pub(crate) const STREAM_SINC_MAX_STEP: f64 = 4.0;
 
 /// Extra cutoff scaling applied when downsampling so the filter's *stopband
 /// edge* (not its -6 dB point) lands at the fold frequency. Without this,
@@ -260,6 +260,8 @@ pub struct StreamingSincResampler {
     src_pos: f64,
     /// Step at the end of the previous block; ramp anchor for the next one.
     prev_step: f64,
+    /// Total input samples fed since the last reset.
+    fed_total: u64,
     has_started: bool,
 }
 
@@ -271,6 +273,7 @@ impl StreamingSincResampler {
             history: [0.0; STREAM_SINC_HISTORY],
             src_pos: STREAM_SINC_HISTORY as f64,
             prev_step: 1.0,
+            fed_total: 0,
             has_started: false,
         }
     }
@@ -280,7 +283,21 @@ impl StreamingSincResampler {
         self.history.fill(0.0);
         self.src_pos = STREAM_SINC_HISTORY as f64;
         self.prev_step = 1.0;
+        self.fed_total = 0;
         self.has_started = false;
+    }
+
+    /// Fractional source position (in input samples fed since the last
+    /// reset) of the *next* output sample this resampler will emit.
+    ///
+    /// After each block the cursor is rebased so local index
+    /// `STREAM_SINC_HISTORY` is the first not-yet-fed sample; subtracting
+    /// that origin and adding the fed total yields an exact global cursor.
+    /// Starts at 0.0 and advances by exactly `step` per emitted sample,
+    /// making it suitable for driving source-position bookkeeping when the
+    /// resampler sits ahead of downstream processing.
+    pub fn next_output_source_pos(&self) -> f64 {
+        self.fed_total as f64 + self.src_pos - STREAM_SINC_HISTORY as f64
     }
 
     /// Returns whether any input has been consumed since the last reset.
@@ -411,6 +428,7 @@ impl StreamingSincResampler {
         }
         self.src_pos = pos - n as f64;
         self.prev_step = step_end;
+        self.fed_total += n as u64;
         Ok(())
     }
 
@@ -798,6 +816,88 @@ mod tests {
             expected
         );
         assert!(!rs.is_engaged(), "flush must reset engagement");
+    }
+
+    #[test]
+    fn test_streaming_sinc_source_pos_unity_tracks_emission() {
+        // At unity step the cursor advances exactly one source sample per
+        // emitted output, starting from 0.
+        let table = SincInterpTable::new_stream_default();
+        let mut rs = StreamingSincResampler::new(table);
+        assert_eq!(rs.next_output_source_pos(), 0.0);
+
+        let input = sine(440.0, 44100.0, 2048);
+        let out = stream_all(&mut rs, &input, 1.0, 256);
+        assert!(
+            (rs.next_output_source_pos() - out.len() as f64).abs() < 1e-9,
+            "unity source pos {} != emitted {}",
+            rs.next_output_source_pos(),
+            out.len()
+        );
+    }
+
+    #[test]
+    fn test_streaming_sinc_source_pos_constant_step() {
+        // With a constant step from stream start (no ramp), the cursor
+        // advances exactly `step` per emitted sample regardless of chunking.
+        let table = SincInterpTable::new_stream_default();
+        let mut rs = StreamingSincResampler::new(table);
+        let step = 1.25;
+        let input = sine(997.0, 44100.0, 8192);
+        let out = stream_all(&mut rs, &input, step, 300);
+        let expected = out.len() as f64 * step;
+        assert!(
+            (rs.next_output_source_pos() - expected).abs() < 1e-6,
+            "source pos {} != emitted*step {}",
+            rs.next_output_source_pos(),
+            expected
+        );
+        assert!(rs.next_output_source_pos() <= input.len() as f64);
+    }
+
+    #[test]
+    fn test_streaming_sinc_source_pos_step_change_and_reset() {
+        // Across a retarget the cursor stays monotonic, bounded by the fed
+        // total, and equals the per-sample step integral; flush resets to 0.
+        let table = SincInterpTable::new_stream_default();
+        let mut rs = StreamingSincResampler::new(table);
+        let input = sine(440.0, 44100.0, 8192);
+        let mut buf = Vec::with_capacity(16384);
+
+        let mut emitted = 0usize;
+        let mut prev_pos = 0.0f64;
+        let mut integral = 0.0f64;
+        let mut prev_step = 1.0f64;
+        for (bi, block) in input.chunks(512).enumerate() {
+            let step = if bi < 8 { 1.0 } else { 0.8 };
+            rs.process_into(block, step, &mut buf).unwrap();
+            // Integrate the documented per-block linear ramp prev -> step.
+            let begin = if bi == 0 { step } else { prev_step };
+            let pos_now = rs.next_output_source_pos();
+            assert!(pos_now >= prev_pos, "cursor went backwards at block {}", bi);
+            integral += pos_now - prev_pos;
+            // Advance must stay within the block's step range.
+            let (lo, hi) = (begin.min(step), begin.max(step));
+            let advance = pos_now - prev_pos;
+            assert!(
+                advance >= lo * buf.len() as f64 - 1e-6 && advance <= hi * buf.len() as f64 + 1e-6,
+                "block {} advance {} outside [{}, {}] x {} outputs",
+                bi,
+                advance,
+                lo,
+                hi,
+                buf.len()
+            );
+            prev_pos = pos_now;
+            prev_step = step;
+            emitted += buf.len();
+        }
+        assert!(emitted > 0);
+        assert!(integral <= input.len() as f64);
+
+        let mut tail = Vec::with_capacity(256);
+        rs.flush_into(0.8, &mut tail).unwrap();
+        assert_eq!(rs.next_output_source_pos(), 0.0, "flush must reset cursor");
     }
 
     #[test]

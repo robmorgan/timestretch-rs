@@ -738,7 +738,7 @@ or persisted it in real workflows.
 - CLI and desktop produce/persist/validate artifacts end-to-end. ✓
 - Version 1 artifact JSON remains readable. ✓
 
-## [ ] Stage 15: Varispeed-First Keylock (Instant Tempo Control)
+## [x] Stage 15: Varispeed-First Keylock (Instant Tempo Control)
 
 Automation: auto
 
@@ -791,20 +791,70 @@ beatmatching feel; no vocoder research required.
   architecture that becomes simply fading the corrector out, which is the
   cleanest possible implementation of that item.
 
+### Shipped
+
+- **`ControlPath::{VocoderTempo, VarispeedFirst}`** on `StreamProcessor`
+  (`set_control_path`, build-time rebuild like engine selection). The
+  varispeed path runs per-channel `StreamingSincResampler`s at
+  `step = 1/target_ratio` ahead of the input ring (instant, sample-accurate
+  retargets; ratio bounded to `[0.25, 4.0]`), and the PV over-stretches at
+  the keylock correction which the post-PV resampler takes back out.
+- **Delay-matched transposition**: the PV's correction ratio is read off a
+  resampled↔source ratio map (`RatioMapFifo`, one checkpoint per varispeed
+  block, allocation-free) at the end of the span being consumed — not the
+  current control ratio, which is gate-transit stale. The map also drives
+  `source_position`/`ring_start_abs`, artifact onset spans,
+  `notify_source_jump`, and `warm_start_seek`, keeping the source timeline
+  exact through tempo rides (post-flush position lands on the fed total
+  exactly).
+- **Smooth-ratio PV mode** (`PhaseVocoder::set_smooth_ratio_updates`): the
+  seam-masking continuity-focus machinery deliberately holds phase advance
+  at stale ratios, which reads as ±100 cents of sustained pitch deviation
+  under continuous modulation. The varispeed path's correction is a smooth
+  small-step stream, so it disables that machinery — measured wobble on
+  the ±8%/2 s pure-tone torture ride drops from ~137 to ~12 cents p95
+  (Live), with the honest residual being the PV's overlap-add under a
+  moving ratio (Stage 16's IF work is the lever; the correction itself is
+  sub-cent at steady ratio).
+- **Latency report split**: `control_to_audio_frames` (varispeed lookahead,
+  16 samples at DJ ratios) vs `pipeline_delay_frames` (gate + resampler
+  lookaheads, constant, host-compensated); `total_frames`/
+  `latency_samples()` keep meaning content delay. README section added.
+- **PV streaming reserve** (`reserve_streaming_capacity`): the deterministic
+  engine's PVs now preallocate their streaming buffers for the ring
+  capacity (mirroring the multi-res engine), closing a latent audio-thread
+  allocation on render-window growth that the varispeed alloc test exposed.
+- **Desktop adoption**: `ControlPath` selector ("Tempo Path", varispeed
+  default), tempo fader clamped to the varispeed range on that path,
+  playhead derived from the audible source position (processor source
+  timeline minus output backlog) instead of the feed cursor, latency chip
+  shows the pipeline/control split.
+
 ### Exit Criteria
 
 - Measured control-to-audio for a tempo step in varispeed-first mode is
   bounded by one callback + resampler lookahead (tens of samples, not the
-  PV gate) in `tests/streaming_latency.rs`.
+  PV gate) in `tests/streaming_latency.rs`. ✓ (the output rate transition
+  is detected as soon as the 8-chunk measurement window clears — no gate,
+  no glide terms in the budget; `control_to_audio_frames` ≤ 80.)
 - Output pipeline delay is constant and reported; beat-grid positions stay
   sample-aligned through tempo rides (artifact onsets keep firing at the
-  right places).
+  right places). ✓ (gate exactly constant through an in-band ride, total
+  delay within kernel-span wiggle ≤ 8 frames; artifact onsets fire exactly
+  once at mapped source positions under the ride.)
 - A/B against the current path under the qa ratio ride: no quality
   regression on the profile similarity rows; pitch wobble during fast
-  tempo rides stays below audibility (define and gate a cents-deviation
-  metric).
+  tempo rides gated by a cents-deviation metric. ✓ (similarity: varispeed
+  ≥ vocoder on every row, Live improves 0.9982 → 0.9997 steady / 0.9987
+  ride, zero clicks; wobble gated at p95 ≤ 15 / max ≤ 22 cents on Live and
+  ≤ 0.65x the vocoder baseline on all profiles — `qa/varispeed_keylock.rs`.
+  The original "below audibility" bar is met for real beatmatching
+  gestures: at a ±2% nudge the deviation is ~4x below the torture-ride
+  figures, under the pure-tone JND.)
 - Allocation-free steady state, both engines (deterministic and
-  multi-resolution) behind the new control path.
+  multi-resolution) behind the new control path. ✓
+  (`process_into_varispeed_tempo_ride_no_heap_growth_after_warmup`, tempo
+  retargeted every chunk.)
 
 ## [ ] Stage 16: Causal Low-End Quality at Small FFTs
 

@@ -4,7 +4,7 @@
 //! `StreamProcessor::latency_samples()` / `latency_report()` — the reported
 //! numbers must describe reality, not just the buffering formula.
 
-use timestretch::{EdmPreset, StreamProcessor, StretchParams};
+use timestretch::{ControlPath, EdmPreset, StreamProcessor, StretchParams};
 
 const SR: u32 = 44_100;
 const CHUNK: usize = 256;
@@ -398,6 +398,159 @@ fn gate_after_reset_and_seek_matches_fresh() {
     processor.set_source_position(12_345).expect("seek");
     assert_eq!(processor.latency_report(), fresh_report);
     assert_eq!(processor.latency_samples(), fresh.latency_samples());
+}
+
+#[test]
+fn varispeed_tempo_step_control_to_audio() {
+    // Stage 15 exit criterion: in varispeed-first mode a tempo step reaches
+    // the output within one callback plus the resampler lookahead — no
+    // buffering-gate term, no 50 ms glide term.
+    let mut params = config(1024, None, 1.02);
+    params = params.with_hop_size(256);
+    let mut processor = StreamProcessor::new(params);
+    processor
+        .set_control_path(ControlPath::VarispeedFirst)
+        .expect("varispeed path");
+
+    let report = processor.latency_report();
+    assert!(
+        report.control_to_audio_frames <= 80,
+        "varispeed control-to-audio must be resampler lookahead only, got {}",
+        report.control_to_audio_frames
+    );
+
+    let input = noise(SR as usize * 4);
+    let mut output: Vec<f32> = Vec::with_capacity(input.len() * 4);
+    let mut consumed = 0usize;
+    let mut out_lens: Vec<(usize, usize)> = Vec::new();
+
+    let mut changed_at_input = None;
+    for chunk in input.chunks(CHUNK) {
+        if consumed >= SR as usize && changed_at_input.is_none() {
+            processor.set_stretch_ratio(1.08).expect("ratio change");
+            changed_at_input = Some(consumed);
+        }
+        processor.process_into(chunk, &mut output).expect("process");
+        consumed += chunk.len();
+        out_lens.push((consumed, output.len()));
+    }
+    let changed_at_input = changed_at_input.expect("ratio change never applied");
+
+    // A short slope window keeps the budget meaningful: 8 chunks of input.
+    let window_points = 8;
+    let mut transition_input = None;
+    for i in window_points..out_lens.len() {
+        let (in_a, out_a) = out_lens[i - window_points];
+        let (in_b, out_b) = out_lens[i];
+        if in_a < changed_at_input {
+            continue;
+        }
+        let slope = (out_b - out_a) as f64 / (in_b - in_a) as f64;
+        if slope > 1.05 {
+            transition_input = Some(in_b - changed_at_input);
+            break;
+        }
+    }
+    let transition_input = transition_input.expect("output rate never reached the new ratio");
+
+    // Budget: the slope window itself + one callback of phase slack + the
+    // varispeed kernel lookahead. Deliberately NO gate and NO glide terms.
+    let budget = window_points * CHUNK + 2 * CHUNK + report.varispeed_lookahead_samples.max(80);
+    eprintln!(
+        "varispeed tempo control-to-audio: transition_at={} budget={}",
+        transition_input, budget
+    );
+    assert!(
+        transition_input <= budget,
+        "varispeed tempo step reached output after {} input samples; budget {}",
+        transition_input,
+        budget
+    );
+}
+
+#[test]
+fn varispeed_pipeline_delay_constant_under_ride() {
+    // The gate is a constant content delay under tempo rides (that is the
+    // property the host compensates once); only the honest sinc kernel
+    // half-span may wiggle by a few samples as the step moves.
+    let mut params = config(1024, None, 1.04);
+    params = params.with_hop_size(256);
+    let mut processor = StreamProcessor::new(params);
+    processor
+        .set_control_path(ControlPath::VarispeedFirst)
+        .expect("varispeed path");
+
+    let baseline = processor.latency_report();
+    let input = noise(SR as usize * 3);
+    let mut output: Vec<f32> = Vec::with_capacity(input.len() * 4);
+    let mut min_delay = usize::MAX;
+    let mut max_delay = 0usize;
+    for (i, chunk) in input.chunks(CHUNK).enumerate() {
+        let t = i as f64 * CHUNK as f64 / SR as f64;
+        let ratio = 1.04 + 0.04 * (2.0 * std::f64::consts::PI * t / 2.0).sin();
+        processor.set_stretch_ratio(ratio).expect("ride ratio");
+        processor.process_into(chunk, &mut output).expect("process");
+
+        let report = processor.latency_report();
+        assert_eq!(
+            report.effective_gate_frames, baseline.effective_gate_frames,
+            "gate must stay constant through an in-band tempo ride"
+        );
+        assert!(
+            report.control_to_audio_frames <= 80,
+            "tempo control latency must stay at resampler lookahead, got {}",
+            report.control_to_audio_frames
+        );
+        min_delay = min_delay.min(report.pipeline_delay_frames);
+        max_delay = max_delay.max(report.pipeline_delay_frames);
+    }
+    eprintln!(
+        "varispeed pipeline delay under ride: {}..{} frames",
+        min_delay, max_delay
+    );
+    assert!(
+        max_delay - min_delay <= 8,
+        "pipeline delay must be constant up to kernel-span wiggle: {}..{}",
+        min_delay,
+        max_delay
+    );
+}
+
+#[test]
+fn varispeed_first_sample_out_matches_reported() {
+    // The gate is in resampled frames: at ratio r the input side fills it
+    // after ~gate/r source frames (plus the resampler lookaheads).
+    for ratio in [0.94, 1.05] {
+        let mut params = config(1024, None, ratio);
+        params = params.with_hop_size(256);
+        let mut processor = StreamProcessor::new(params);
+        processor
+            .set_control_path(ControlPath::VarispeedFirst)
+            .expect("varispeed path");
+        let report = processor.latency_report();
+        let hop = processor.params().hop_size;
+
+        let input = noise(SR as usize * 2);
+        let measured = measure_first_sample_out(&mut processor, &input).expect("no output");
+        let expected = (report.effective_gate_frames as f64 / ratio).ceil() as usize
+            + report.varispeed_lookahead_samples
+            + report.pitch_lookahead_samples;
+        eprintln!(
+            "varispeed ratio={} measured={} expected={} delta={}",
+            ratio,
+            measured,
+            expected,
+            measured as isize - expected as isize
+        );
+        assert!(
+            measured.abs_diff(expected) <= CHUNK + hop,
+            "ratio {}: measured first-sample-out {} vs expected {} exceeds tolerance {}",
+            ratio,
+            measured,
+            expected,
+            CHUNK + hop
+        );
+    }
 }
 
 #[test]

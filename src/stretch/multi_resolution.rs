@@ -238,6 +238,14 @@ impl MultiResolutionStretcher {
         self.high_pv.set_adaptive_phase_locking(enabled);
     }
 
+    /// Declares smooth small-step ratio updates on all band vocoders (see
+    /// [`PhaseVocoder::set_smooth_ratio_updates`]).
+    pub fn set_smooth_ratio_updates(&mut self, smooth: bool) {
+        self.sub_bass_pv.set_smooth_ratio_updates(smooth);
+        self.mid_pv.set_smooth_ratio_updates(smooth);
+        self.high_pv.set_smooth_ratio_updates(smooth);
+    }
+
     /// Sets envelope correction strength on all band vocoders.
     pub fn set_envelope_strength(&mut self, strength: f32) {
         self.sub_bass_pv.set_envelope_strength(strength);

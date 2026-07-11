@@ -2,7 +2,7 @@
 //! artifact-driven transient handling.
 
 use std::f32::consts::PI;
-use timestretch::{analyze_for_dj, EdmPreset, StreamProcessor, StretchParams};
+use timestretch::{analyze_for_dj, ControlPath, EdmPreset, StreamProcessor, StretchParams};
 
 const SR: u32 = 44_100;
 const CHUNK: usize = 1024;
@@ -271,6 +271,56 @@ fn test_artifact_low_band_resets_suppressed_during_ratio_glide() {
     assert!(
         stats.reset_band_counts_total[2] > 0,
         "upper bands still re-lock during modulation"
+    );
+}
+
+#[test]
+fn test_varispeed_artifact_onsets_fire_once_at_source_positions_under_ride() {
+    let input = click_train(SR, 128.0, 4.0);
+    let artifact = analyze_for_dj(&input, SR);
+    assert!(artifact.transient_onsets.len() >= 6);
+
+    let params = stream_params(1.06)
+        .with_pre_analysis(artifact.clone())
+        .with_beat_snap_confidence_threshold(0.1);
+    let mut processor = StreamProcessor::new(params);
+    processor
+        .set_control_path(ControlPath::VarispeedFirst)
+        .expect("varispeed path");
+
+    // Ride the tempo 1.02..1.10 with sample-accurate retargets every chunk;
+    // onset positions are source frames, so the resampled->source mapping
+    // must keep them firing exactly once each despite the moving ratio.
+    let mut output = Vec::with_capacity(input.len() * 6);
+    for (i, chunk) in input.chunks(CHUNK).enumerate() {
+        let t = i as f64 * CHUNK as f64 / SR as f64;
+        processor
+            .set_stretch_ratio(1.06 + 0.04 * (2.0 * std::f64::consts::PI * t / 2.0).sin())
+            .expect("ride ratio");
+        processor.process_into(chunk, &mut output).expect("process");
+    }
+
+    let stats = processor.transient_reset_stats();
+    assert_eq!(
+        stats.events_detected_total, 0,
+        "online scheduler must stay idle while an artifact drives resets"
+    );
+    // The consumed span in SOURCE frames is the source position; exactly the
+    // onsets inside it must have been scheduled — no doubles, no misses.
+    let consumed_source = processor.source_position();
+    let expected = artifact
+        .transient_onsets
+        .iter()
+        .filter(|&&onset| onset < consumed_source)
+        .count() as u64;
+    assert!(expected >= 4, "ride test too short to consume onsets");
+    assert_eq!(
+        stats.artifact_events_scheduled_total, expected,
+        "artifact onsets must fire exactly once at mapped source positions"
+    );
+    assert!(
+        stats.reset_band_counts_total[2] > 0 && stats.reset_band_counts_total[3] > 0,
+        "artifact events must reset the upper bands"
     );
 }
 

@@ -258,11 +258,51 @@ where the independently-stretched bands overlap. Reach for it on
 sub-bass-critical material where low-end phase coherence matters more than
 control latency; keep the deterministic engine for beatmatching feel.
 
-Control-to-audio behavior (all profiles): ratio and pitch controls glide with
-a ~50 ms time constant. Pitch changes reach the output almost immediately
-(the pitch resampler sits after the vocoder, so only the glide applies, plus
-16–80 samples of sinc kernel lookahead); ratio changes take roughly the
-buffering gate plus the glide.
+Control-to-audio behavior on the default path (all profiles): ratio and
+pitch controls glide with a ~50 ms time constant. Pitch changes reach the
+output almost immediately (the pitch resampler sits after the vocoder, so
+only the glide applies, plus 16–80 samples of sinc kernel lookahead); ratio
+changes take roughly the buffering gate plus the glide.
+
+### Control Paths (Varispeed-First Keylock)
+
+`StreamProcessor` implements tempo through one of two control paths,
+selected via `set_control_path` (at build time, like engine selection):
+
+- `ControlPath::VocoderTempo` (default) — the phase vocoder implements the
+  tempo change, so tempo control latency is the buffering gate plus the
+  ~50 ms glide. The right path for tape-mode/no-keylock use.
+- `ControlPath::VarispeedFirst` — the tempo fader drives a varispeed sinc
+  resampler at the input (instant, sample-accurate retargets, no glide on
+  the tempo axis), and the vocoder only pitch-corrects at a delay-matched
+  transposition. The buffering gate becomes a **constant pipeline delay**
+  the host compensates in its timeline; tempo control-to-audio collapses to
+  the resampler's kernel lookahead (16 samples at DJ ratios) plus the
+  caller's callback size. Tempo ratios are bounded to `[0.25, 4.0]`.
+
+```rust
+use timestretch::{ControlPath, StreamProcessor, StreamProfile, StretchParams};
+
+let params = StretchParams::new(1.05)
+    .with_sample_rate(44100)
+    .with_channels(2)
+    .with_stream_profile(StreamProfile::Live);
+let mut processor = StreamProcessor::new(params);
+processor
+    .set_control_path(ControlPath::VarispeedFirst)
+    .expect("ratio within the varispeed range");
+
+let report = processor.latency_report();
+// Constant content delay to compensate in the deck timeline:
+let _ = report.pipeline_delay_frames;
+// Tempo fader feel — resampler lookahead only:
+assert!(report.control_to_audio_frames <= 80);
+```
+
+`latency_report()` splits the two figures: `pipeline_delay_frames` (constant
+content delay, equals `latency_samples()`) versus `control_to_audio_frames`
+(tempo-change latency, excluding the caller's callback buffering). Works
+behind both streaming engines.
 
 ### Realtime Pitch Control
 

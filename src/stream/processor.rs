@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use crate::core::preanalysis::PreAnalysisArtifact;
-use crate::core::resample::{SincInterpTable, StreamingSincResampler};
+use crate::core::resample::{
+    SincInterpTable, StreamingSincResampler, STREAM_SINC_MAX_HALF_TAPS, STREAM_SINC_MAX_STEP,
+};
 use crate::core::ring_buffer::RingBuffer;
 use crate::core::types::{QualityMode, StreamProfile, StretchParams};
 use crate::error::StretchError;
@@ -92,6 +94,20 @@ const fn multi_res_sub_bass_fft(mid_fft: usize) -> usize {
     }
 }
 
+/// Widest tempo ratio the varispeed-first control path accepts.
+///
+/// The varispeed input stage runs the streaming sinc resampler at
+/// `step = 1 / ratio`; the floor keeps the step within the kernel's
+/// anti-aliased range (`STREAM_SINC_MAX_STEP`), and the ceiling bounds the
+/// preallocated per-callback emission headroom (a 1024-frame callback emits
+/// at most `1024 * VARISPEED_MAX_RATIO` resampled frames).
+const VARISPEED_MAX_RATIO: f64 = VARISPEED_MAX_RATIO_INT as f64;
+/// Integer form of [`VARISPEED_MAX_RATIO`] for const capacity math.
+const VARISPEED_MAX_RATIO_INT: usize = 4;
+/// Narrowest tempo ratio the varispeed-first control path accepts
+/// (`1 / STREAM_SINC_MAX_STEP`).
+const VARISPEED_MIN_RATIO: f64 = 1.0 / STREAM_SINC_MAX_STEP;
+
 /// Minimum artifact onset strength for a low-band (100-500 Hz) phase reset.
 const ARTIFACT_LOW_BAND_RESET_STRENGTH: f32 = 0.45;
 /// Minimum artifact onset strength for a sub-bass (<100 Hz) phase reset.
@@ -125,6 +141,17 @@ fn validate_positive_finite_ratio(value: f64, label: &'static str) -> Result<f64
 }
 
 #[inline]
+fn validate_varispeed_ratio(ratio: f64) -> Result<f64, StretchError> {
+    if !(VARISPEED_MIN_RATIO..=VARISPEED_MAX_RATIO).contains(&ratio) {
+        return Err(StretchError::InvalidRatio(format!(
+            "varispeed-first control path needs a stretch ratio in [{}, {}], got {}",
+            VARISPEED_MIN_RATIO, VARISPEED_MAX_RATIO, ratio
+        )));
+    }
+    Ok(ratio)
+}
+
+#[inline]
 fn ratio_from_tempo(source_bpm: f64, target_bpm: f64) -> Result<f64, StretchError> {
     let source = validate_positive_finite_ratio(source_bpm, "source BPM")?;
     let target = validate_positive_finite_ratio(target_bpm, "target BPM")?;
@@ -152,13 +179,32 @@ fn effective_stream_fft(params: &StretchParams, engine: StreamingEngine) -> usiz
 }
 
 #[inline]
-fn stream_capacity_frames(params: &StretchParams, engine: StreamingEngine) -> usize {
+fn stream_capacity_frames(
+    params: &StretchParams,
+    engine: StreamingEngine,
+    control_path: ControlPath,
+) -> usize {
     let _ = MIN_CALLBACK_FRAMES;
     let _ = COMMON_CALLBACK_FRAMES;
     let fft = effective_stream_fft(params, engine);
+    // The varispeed-first path feeds the input ring through the varispeed
+    // resampler, whose emission per callback expands by up to the maximum
+    // tempo ratio (plus the released kernel lookahead).
+    let callback_headroom = match control_path {
+        ControlPath::VocoderTempo => MAX_CALLBACK_FRAMES,
+        ControlPath::VarispeedFirst => varispeed_output_capacity_frames(),
+    };
     analysis_lookahead_frames(fft, params.quality_mode)
-        .saturating_add(MAX_CALLBACK_FRAMES)
+        .saturating_add(callback_headroom)
         .saturating_add(fft)
+}
+
+/// Per-channel capacity of the varispeed stage's output scratch: the widest
+/// emission a `MAX_CALLBACK_FRAMES` source block can produce at the minimum
+/// step, including the cursor slack and released lookahead an extreme
+/// mid-block retarget can add.
+const fn varispeed_output_capacity_frames() -> usize {
+    (MAX_CALLBACK_FRAMES + STREAM_SINC_MAX_HALF_TAPS + 2) * VARISPEED_MAX_RATIO_INT + 2
 }
 
 /// Stateful linear resampler used for realtime pitch control in stream mode.
@@ -255,6 +301,149 @@ impl LinearResamplerState {
     }
 }
 
+/// One resampled↔source timeline checkpoint recorded per varispeed block.
+#[derive(Debug, Clone, Copy, Default)]
+struct RatioMapEntry {
+    /// Ring-timeline frame count (resampled frames emitted by the varispeed
+    /// stage, resynced to the consumption cursor at engagement).
+    resampled_abs: u64,
+    /// Fractional source frames consumed by the varispeed stage at the
+    /// checkpoint.
+    source_pos: f64,
+    /// Instantaneous tempo ratio in effect AT the checkpoint (the block's
+    /// retarget value — the resampler's ramp lands on it at block end).
+    ratio: f64,
+}
+
+/// Fixed-size FIFO mapping the ring (resampled) timeline back to source
+/// frames on the varispeed-first control path.
+///
+/// The varispeed resampler's step is piecewise-linear per fed block, so one
+/// checkpoint per block plus linear interpolation reconstructs the source
+/// position of any in-flight ring frame to well under a hop of error. The
+/// buffer is preallocated and never grows: pushes beyond capacity merge into
+/// the newest entry (bounded extra interpolation error over one span), and
+/// eviction always retains one anchor at or behind the consumption cursor.
+#[derive(Debug)]
+struct RatioMapFifo {
+    entries: Box<[RatioMapEntry]>,
+    head: usize,
+    len: usize,
+}
+
+impl RatioMapFifo {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: vec![RatioMapEntry::default(); capacity].into_boxed_slice(),
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    #[inline]
+    fn at(&self, i: usize) -> RatioMapEntry {
+        self.entries[(self.head + i) % self.entries.len()]
+    }
+
+    /// Appends a checkpoint, deduping zero-advance blocks and merging into
+    /// the newest entry when full.
+    fn push(&mut self, resampled_abs: u64, source_pos: f64, ratio: f64) {
+        if self.entries.is_empty() {
+            return;
+        }
+        if self.len > 0 {
+            let last_idx = (self.head + self.len - 1) % self.entries.len();
+            let last = self.entries[last_idx];
+            if resampled_abs <= last.resampled_abs || self.len == self.entries.len() {
+                self.entries[last_idx] = RatioMapEntry {
+                    resampled_abs: resampled_abs.max(last.resampled_abs),
+                    source_pos: source_pos.max(last.source_pos),
+                    ratio,
+                };
+                return;
+            }
+        }
+        let idx = (self.head + self.len) % self.entries.len();
+        self.entries[idx] = RatioMapEntry {
+            resampled_abs,
+            source_pos,
+            ratio,
+        };
+        self.len += 1;
+    }
+
+    /// Drops checkpoints strictly behind `consumed`, always retaining one
+    /// anchor entry at or behind it.
+    fn evict_before(&mut self, consumed: u64) {
+        while self.len >= 2 && self.at(1).resampled_abs <= consumed {
+            self.head = (self.head + 1) % self.entries.len();
+            self.len -= 1;
+        }
+    }
+
+    /// Maps a ring-timeline frame count to fractional source frames.
+    ///
+    /// Clamps outside the checkpointed range (behind the anchor, or into
+    /// flush padding beyond the final checkpoint). Returns `None` when no
+    /// checkpoint exists yet.
+    fn map_to_source(&self, resampled: f64) -> Option<f64> {
+        if self.len == 0 {
+            return None;
+        }
+        let first = self.at(0);
+        if resampled <= first.resampled_abs as f64 {
+            return Some(first.source_pos);
+        }
+        for i in 1..self.len {
+            let a = self.at(i - 1);
+            let b = self.at(i);
+            if resampled <= b.resampled_abs as f64 {
+                let span = (b.resampled_abs - a.resampled_abs) as f64;
+                if span <= 0.0 {
+                    return Some(b.source_pos);
+                }
+                let t = (resampled - a.resampled_abs as f64) / span;
+                return Some(a.source_pos + t * (b.source_pos - a.source_pos));
+            }
+        }
+        Some(self.at(self.len - 1).source_pos)
+    }
+
+    /// Instantaneous embedded tempo ratio at a ring-timeline frame count.
+    ///
+    /// Interpolates the per-checkpoint retarget values, matching the
+    /// varispeed resampler's linear intra-block step ramp — unlike a
+    /// position-gradient over a whole block, this resolves the ramp itself.
+    /// Clamps outside the checkpointed range; `None` when empty.
+    fn ratio_at(&self, resampled: f64) -> Option<f64> {
+        if self.len == 0 {
+            return None;
+        }
+        let first = self.at(0);
+        if resampled <= first.resampled_abs as f64 {
+            return Some(first.ratio);
+        }
+        for i in 1..self.len {
+            let a = self.at(i - 1);
+            let b = self.at(i);
+            if resampled <= b.resampled_abs as f64 {
+                let span = (b.resampled_abs - a.resampled_abs) as f64;
+                if span <= 0.0 {
+                    return Some(b.ratio);
+                }
+                let t = (resampled - a.resampled_abs as f64) / span;
+                return Some(a.ratio + t * (b.ratio - a.ratio));
+            }
+        }
+        Some(self.at(self.len - 1).ratio)
+    }
+}
+
 /// Engine used by [`StreamProcessor`] for stream-mode rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamingEngine {
@@ -274,6 +463,29 @@ pub enum StreamingEngine {
     /// (`fft_size >= 2048`); selecting it on the Live profile returns an
     /// error from [`StreamProcessor::set_streaming_engine`].
     MultiResolution,
+}
+
+/// Control-path architecture used by [`StreamProcessor`] to implement tempo
+/// changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlPath {
+    /// The phase vocoder implements the tempo change directly (default).
+    ///
+    /// Tempo control latency is the buffering gate plus the ~50 ms control
+    /// glide. This is the right path for tape-mode/no-keylock use, where the
+    /// caller wants pitch to follow tempo.
+    VocoderTempo,
+    /// A varispeed sinc resampler at the input implements the tempo change
+    /// instantly; the phase vocoder only pitch-corrects at a slowly-varying
+    /// transposition (keylock).
+    ///
+    /// Tempo retargets are sample-accurate at the resampler — control-to-
+    /// audio latency drops to the resampler kernel lookahead plus one
+    /// callback, while the vocoder's buffering gate becomes a constant
+    /// pipeline delay the host can compensate in its timeline (see
+    /// [`StreamProcessor::latency_report`]). Tempo ratios are bounded to
+    /// `[0.25, 4.0]` on this path.
+    VarispeedFirst,
 }
 
 /// Quality of the realtime pitch resampler used when `pitch_scale != 1.0`.
@@ -299,6 +511,20 @@ pub enum StreamPitchQuality {
 /// Produced by [`StreamProcessor::latency_report`]. All figures reflect the
 /// *current control targets*, so a ratio or pitch change updates the report
 /// at the control call, not after the ~50 ms glide.
+///
+/// The two headline figures separate concerns a deck integration must treat
+/// differently:
+///
+/// - [`pipeline_delay_frames`](Self::pipeline_delay_frames) — constant
+///   content delay from input to output. A host compensates it once in its
+///   timeline (playhead offset), like any plugin delay.
+/// - [`control_to_audio_frames`](Self::control_to_audio_frames) — how long a
+///   *tempo change* takes to reach the output. On
+///   [`ControlPath::VocoderTempo`] this is the whole pipeline delay (the PV
+///   implements tempo behind its gate); on
+///   [`ControlPath::VarispeedFirst`] it collapses to the varispeed kernel
+///   lookahead (tens of samples) plus the caller's own callback size, while
+///   the pipeline delay stays constant and host-compensated.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StreamLatencyReport {
     /// Input-buffering floor in frames: `fft_size * 3/2`.
@@ -307,18 +533,32 @@ pub struct StreamLatencyReport {
     /// ratio: equals `base_gate_frames` inside the `[0.9, 1.1]` ratio band,
     /// `fft_size * 2` outside it.
     pub effective_gate_frames: usize,
-    /// Kernel lookahead of the realtime pitch resampler in samples: 0 when
-    /// pitch is inactive; 16 (sinc, unity/pitch-down) up to 80 (sinc,
-    /// pitch-up); 1 for the linear fallback.
+    /// Kernel lookahead of the realtime output (pitch/keylock-correction)
+    /// resampler in samples: 0 when inactive; 16 (sinc, unity/down) up to
+    /// 80 (sinc, up); 1 for the linear fallback.
     pub pitch_lookahead_samples: usize,
-    /// Time constant of the ratio/pitch control glide in seconds (~0.050).
-    /// Control changes become fully audible a few time constants after the
-    /// buffering delay, not instantly.
+    /// Kernel lookahead of the varispeed input resampler in samples: 0 on
+    /// [`ControlPath::VocoderTempo`] and while disengaged; 16–80 otherwise
+    /// (16 at DJ tempo ratios).
+    pub varispeed_lookahead_samples: usize,
+    /// Time constant of the control glide in seconds (~0.050). On
+    /// [`ControlPath::VocoderTempo`] it smooths ratio and pitch alike; on
+    /// [`ControlPath::VarispeedFirst`] only the user-pitch axis — tempo
+    /// retargets sample-accurately and its correction is delay-matched.
     pub control_smoothing_secs: f64,
     /// Sample rate the frame figures are expressed against.
     pub sample_rate: u32,
-    /// Total effective latency in frames:
-    /// `effective_gate_frames + pitch_lookahead_samples`.
+    /// Frames between a tempo-control change and its effect on the output,
+    /// excluding the caller's own callback buffering.
+    pub control_to_audio_frames: usize,
+    /// Constant input-to-output content delay in frames, for host timeline
+    /// compensation:
+    /// `effective_gate_frames + pitch_lookahead_samples + varispeed_lookahead_samples`.
+    pub pipeline_delay_frames: usize,
+    /// Control path the figures describe.
+    pub control_path: ControlPath,
+    /// Total effective content latency in frames; equals
+    /// [`pipeline_delay_frames`](Self::pipeline_delay_frames).
     pub total_frames: usize,
 }
 
@@ -326,6 +566,16 @@ impl StreamLatencyReport {
     /// Total effective latency in seconds.
     pub fn total_secs(&self) -> f64 {
         self.total_frames as f64 / self.sample_rate.max(1) as f64
+    }
+
+    /// [`Self::control_to_audio_frames`] in seconds.
+    pub fn control_to_audio_secs(&self) -> f64 {
+        self.control_to_audio_frames as f64 / self.sample_rate.max(1) as f64
+    }
+
+    /// [`Self::pipeline_delay_frames`] in seconds.
+    pub fn pipeline_delay_secs(&self) -> f64 {
+        self.pipeline_delay_frames as f64 / self.sample_rate.max(1) as f64
     }
 }
 
@@ -346,6 +596,10 @@ pub struct TransientResetStats {
     /// Layout: `[sub_bass, low, mid, high]`.
     pub reset_band_counts_total: [u64; 4],
     /// Absolute per-channel input frames consumed from the stream so far.
+    ///
+    /// On [`ControlPath::VarispeedFirst`] these are resampled (ring
+    /// timeline) frames, not source frames — use
+    /// [`StreamProcessor::source_position`] for the source timeline.
     pub input_frames_consumed_total: usize,
 }
 
@@ -363,6 +617,44 @@ pub struct StreamProcessor {
     initialized: bool,
     /// Active stream-mode rendering engine.
     engine: StreamingEngine,
+    /// Active tempo control path.
+    control_path: ControlPath,
+    /// Per-channel varispeed input resamplers (varispeed-first path only;
+    /// empty on the vocoder-tempo path).
+    varispeed_resamplers: Vec<StreamingSincResampler>,
+    /// Reusable per-channel deinterleave scratch feeding the varispeed stage.
+    varispeed_input_buffers: Vec<Vec<f32>>,
+    /// Reusable per-channel varispeed resampler output buffers.
+    varispeed_output_buffers: Vec<Vec<f32>>,
+    /// Reusable interleave scratch for varispeed output entering the ring.
+    varispeed_interleave_scratch: Vec<f32>,
+    /// True once the varispeed stage has resampled any input this stream.
+    ///
+    /// While engaged, the stage stays in the signal path even at unity ratio
+    /// (a bit-transparent passthrough) so returning to `target_ratio == 1.0`
+    /// never splices its held lookahead out of the stream.
+    varispeed_engaged: bool,
+    /// Cumulative real source frames fed to the varispeed stage (flush drain
+    /// zeros are never counted).
+    varispeed_source_fed_total: usize,
+    /// Ring-timeline frame count of varispeed emissions: resampled frames
+    /// pushed into `input_ring`, resynced to `input_frames_consumed_total`
+    /// at engagement so both share one timeline.
+    varispeed_resampled_emitted_total: u64,
+    /// Source-fed total folded down at each varispeed resampler reset;
+    /// checkpoint source positions are `base + next_output_source_pos()`.
+    varispeed_map_base_source: f64,
+    /// Tempo ratio applied at the previous varispeed block; bounds the next
+    /// block's worst-case emission (the resampler ramps between the two).
+    varispeed_prev_ratio: f64,
+    /// Delay-matched pitch-correction ratio for the varispeed-first path:
+    /// the embedded ratio at the end of the span the PV is about to consume
+    /// (via the ratio map); the post-PV resampler's per-block step ramp
+    /// smooths between consecutive targets. Unused (held at the build
+    /// ratio) on the vocoder-tempo path.
+    transposition: f64,
+    /// Resampled↔source timeline checkpoints for in-flight ring content.
+    ratio_map: RatioMapFifo,
     /// Persistent PhaseVocoder instances, one per channel (deterministic
     /// engine; empty when the multi-resolution engine is active).
     vocoders: Vec<PhaseVocoder>,
@@ -487,6 +779,7 @@ impl std::fmt::Debug for StreamProcessor {
             .field("target_ratio", &self.target_ratio)
             .field("vocoder_ratio", &self.vocoder_ratio)
             .field("pitch_scale", &self.pitch_scale)
+            .field("control_path", &self.control_path)
             .field("initialized", &self.initialized)
             .field("source_bpm", &self.source_bpm)
             .field("input_ring_len", &self.input_ring.len())
@@ -502,11 +795,22 @@ impl StreamProcessor {
     }
 
     /// Creates a new streaming processor for a specific engine.
+    fn new_with_engine(params: StretchParams, engine: StreamingEngine) -> Self {
+        Self::new_with_engine_and_path(params, engine, ControlPath::VocoderTempo)
+    }
+
+    /// Creates a new streaming processor for a specific engine and control
+    /// path.
     ///
     /// Callers must have validated engine availability first (see
     /// [`Self::set_streaming_engine`]); buffer capacities and gates are
-    /// sized for the engine's effective FFT.
-    fn new_with_engine(params: StretchParams, engine: StreamingEngine) -> Self {
+    /// sized for the engine's effective FFT and the control path's
+    /// per-callback emission headroom.
+    fn new_with_engine_and_path(
+        params: StretchParams,
+        engine: StreamingEngine,
+        control_path: ControlPath,
+    ) -> Self {
         let ratio = params.stretch_ratio;
         let num_channels = params.channels.count();
         let source_bpm = params.bpm;
@@ -514,7 +818,7 @@ impl StreamProcessor {
         let wsola_seg_size = params.wsola_segment_size;
         let wsola_search = params.wsola_search_range;
 
-        let capacity_frames_per_channel = stream_capacity_frames(&params, engine);
+        let capacity_frames_per_channel = stream_capacity_frames(&params, engine, control_path);
         let capacity_samples = capacity_frames_per_channel.saturating_mul(num_channels);
         // Output headroom is sized for the widest supported stretch (a render
         // over the retained input emits up to ~ratio times as many frames).
@@ -528,7 +832,9 @@ impl StreamProcessor {
         let pitch_output_capacity_frames = output_capacity_frames.saturating_mul(2);
 
         let vocoders = match engine {
-            StreamingEngine::Deterministic => Self::create_vocoders(&params, ratio),
+            StreamingEngine::Deterministic => {
+                Self::create_vocoders(&params, ratio, capacity_frames_per_channel)
+            }
             StreamingEngine::MultiResolution => Vec::new(),
         };
         let multi_res = match engine {
@@ -551,6 +857,47 @@ impl StreamProcessor {
         );
         let sinc_table = SincInterpTable::new_stream_default();
 
+        // Varispeed stage state exists only on the varispeed-first path so
+        // the default path carries no extra memory.
+        let (
+            varispeed_resamplers,
+            varispeed_input_buffers,
+            varispeed_output_buffers,
+            varispeed_interleave_scratch,
+        ) = match control_path {
+            ControlPath::VocoderTempo => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            ControlPath::VarispeedFirst => (
+                (0..num_channels)
+                    .map(|_| StreamingSincResampler::new(Arc::clone(&sinc_table)))
+                    .collect::<Vec<_>>(),
+                (0..num_channels)
+                    .map(|_| Vec::with_capacity(MAX_CALLBACK_FRAMES))
+                    .collect::<Vec<_>>(),
+                (0..num_channels)
+                    .map(|_| Vec::with_capacity(varispeed_output_capacity_frames()))
+                    .collect::<Vec<_>>(),
+                vec![0.0; varispeed_output_capacity_frames().saturating_mul(num_channels)],
+            ),
+        };
+        let ratio_map = match control_path {
+            ControlPath::VocoderTempo => RatioMapFifo::with_capacity(0),
+            ControlPath::VarispeedFirst => {
+                RatioMapFifo::with_capacity(capacity_frames_per_channel / MIN_CALLBACK_FRAMES + 16)
+            }
+        };
+
+        let (mut vocoders, mut multi_res) = (vocoders, multi_res);
+        if control_path == ControlPath::VarispeedFirst {
+            // The PV ratio on this path is the delay-matched transposition —
+            // a smooth small-step stream, not discrete automation jumps.
+            for pv in &mut vocoders {
+                pv.set_smooth_ratio_updates(true);
+            }
+            for stretcher in &mut multi_res {
+                stretcher.set_smooth_ratio_updates(true);
+            }
+        }
+
         let mut processor = Self {
             params,
             input_ring: RingBuffer::with_capacity(capacity_samples),
@@ -560,6 +907,18 @@ impl StreamProcessor {
             vocoder_ratio: ratio,
             initialized: false,
             engine,
+            control_path,
+            varispeed_resamplers,
+            varispeed_input_buffers,
+            varispeed_output_buffers,
+            varispeed_interleave_scratch,
+            varispeed_engaged: false,
+            varispeed_source_fed_total: 0,
+            varispeed_resampled_emitted_total: 0,
+            varispeed_map_base_source: 0.0,
+            varispeed_prev_ratio: ratio,
+            transposition: ratio,
+            ratio_map,
             vocoders,
             multi_res,
             channel_input_buffers,
@@ -637,8 +996,14 @@ impl StreamProcessor {
         processor
     }
 
-    /// Creates PhaseVocoder instances for each channel.
-    fn create_vocoders(params: &StretchParams, ratio: f64) -> Vec<PhaseVocoder> {
+    /// Creates PhaseVocoder instances for each channel, pre-reserving their
+    /// streaming buffers for the ring capacity so callback-path renders stay
+    /// allocation-free as the ratio and render-window size move.
+    fn create_vocoders(
+        params: &StretchParams,
+        ratio: f64,
+        capacity_frames_per_channel: usize,
+    ) -> Vec<PhaseVocoder> {
         (0..params.channels.count())
             .map(|_| {
                 // Use a wider sub-bass rigid phase locking range for streaming
@@ -661,6 +1026,10 @@ impl StreamProcessor {
                 pv.set_adaptive_phase_locking(false);
                 pv.set_envelope_strength(params.envelope_strength);
                 pv.set_adaptive_envelope_order(params.adaptive_envelope_order);
+                pv.reserve_streaming_capacity(
+                    capacity_frames_per_channel,
+                    OUTPUT_CAPACITY_MULTIPLIER as f64,
+                );
                 pv
             })
             .collect()
@@ -730,6 +1099,7 @@ impl StreamProcessor {
             && (self.pitch_scale - 1.0).abs() < RATIO_SNAP_THRESHOLD
             && (self.target_pitch_scale - 1.0).abs() < RATIO_SNAP_THRESHOLD
             && !self.pitch_resampler_engaged
+            && !self.varispeed_engaged
             && !self.dsp_engaged
         {
             let available = output.capacity().saturating_sub(output.len());
@@ -768,6 +1138,11 @@ impl StreamProcessor {
         }
 
         let num_channels = self.params.channels.count().max(1);
+        if self.control_path == ControlPath::VarispeedFirst && input.len() % num_channels != 0 {
+            return Err(StretchError::InvalidState(
+                "varispeed-first streaming requires whole interleaved frames",
+            ));
+        }
         let mut offset = 0usize;
         let mut iterations = 0usize;
         let max_iterations = input
@@ -781,30 +1156,56 @@ impl StreamProcessor {
                     "process_into iteration bound exceeded",
                 ));
             }
-            if self.input_ring.available() == 0 {
+
+            let remaining = input.len() - offset;
+            let take = match self.control_path {
+                ControlPath::VocoderTempo => remaining.min(self.input_ring.available()),
+                ControlPath::VarispeedFirst => self.varispeed_take_samples(remaining, num_channels),
+            };
+            let take = if take == 0 {
+                // No room for this feed: render buffered input to make some,
+                // advancing the control glide by a callback of wall time.
                 self.interpolate_ratio_for_frames(COMMON_CALLBACK_FRAMES);
                 self.process_available_to_pending(true)?;
-                if self.input_ring.available() == 0 {
+                let retry = match self.control_path {
+                    ControlPath::VocoderTempo => remaining.min(self.input_ring.available()),
+                    ControlPath::VarispeedFirst => {
+                        self.varispeed_take_samples(remaining, num_channels)
+                    }
+                };
+                if retry == 0 {
                     return Err(StretchError::BufferOverflow {
                         buffer: "stream_input_ring",
-                        requested: input.len() - offset,
-                        available: 0,
+                        requested: remaining,
+                        available: self.input_ring.available(),
                     });
                 }
-            }
+                retry
+            } else {
+                take
+            };
 
-            let take = (input.len() - offset).min(self.input_ring.available());
-            if take == 0 {
-                return Err(StretchError::InvalidState(
-                    "process_into made zero progress while input remained",
-                ));
-            }
-            self.push_input_samples(&input[offset..offset + take])?;
+            let samples_pushed = match self.control_path {
+                ControlPath::VocoderTempo => {
+                    self.push_input_samples(&input[offset..offset + take])?;
+                    take
+                }
+                ControlPath::VarispeedFirst => {
+                    self.feed_varispeed_to_ring(&input[offset..offset + take], num_channels)?
+                }
+            };
             offset += take;
 
             let frames = (take / num_channels).max(1);
             self.interpolate_ratio_for_frames(frames);
-            self.expected_total_output_samples += take as f64 * self.current_ratio;
+            // Expected-length accounting: the vocoder path stretches ring
+            // content by the glided ratio; the varispeed path already
+            // resampled to output length (the PV plus post-resample nets
+            // 1:1), so the emission itself is the expectation.
+            self.expected_total_output_samples += match self.control_path {
+                ControlPath::VocoderTempo => samples_pushed as f64 * self.current_ratio,
+                ControlPath::VarispeedFirst => samples_pushed as f64,
+            };
             self.process_available_to_pending(true)?;
             let _ = self.drain_pending_to_output(output)?;
         }
@@ -829,6 +1230,11 @@ impl StreamProcessor {
         }
 
         self.interpolate_ratio_for_frames(COMMON_CALLBACK_FRAMES);
+
+        // Release the varispeed stage's held lookahead into the ring first so
+        // the tail below renders over real content, symmetric to the post-PV
+        // pitch resampler flush at the other end of the chain.
+        self.flush_varispeed_to_ring(num_channels)?;
 
         if !self.input_ring.is_empty() {
             let min_samples = self.effective_fft().saturating_mul(num_channels);
@@ -969,6 +1375,169 @@ impl StreamProcessor {
         Ok(())
     }
 
+    /// Largest interleaved sample count the varispeed stage can accept right
+    /// now: whole frames, bounded by the per-block scratch and by ring
+    /// availability for the block's worst-case emission.
+    fn varispeed_take_samples(&self, remaining: usize, num_channels: usize) -> usize {
+        let avail_frames = self.input_ring.available() / num_channels;
+        let ratio_hint = self.target_ratio.max(self.varispeed_prev_ratio);
+        // Invert the emission bound `frames * ratio + overhead <= avail`,
+        // where the overhead covers cursor slack and lookahead release.
+        let overhead = ((STREAM_SINC_MAX_HALF_TAPS + 2) as f64 * ratio_hint).ceil() as usize + 2;
+        if avail_frames <= overhead {
+            return 0;
+        }
+        let max_feed_frames = ((avail_frames - overhead) as f64 / ratio_hint).floor() as usize;
+        (remaining / num_channels)
+            .min(MAX_CALLBACK_FRAMES)
+            .min(max_feed_frames)
+            .saturating_mul(num_channels)
+    }
+
+    /// Feeds interleaved source samples through the varispeed input stage
+    /// into `input_ring`, recording a resampled↔source checkpoint for the
+    /// block. Returns the number of interleaved resampled samples pushed.
+    ///
+    /// The caller must have bounded `input` via
+    /// [`Self::varispeed_take_samples`] so the worst-case emission fits both
+    /// the scratch buffers and ring availability.
+    fn feed_varispeed_to_ring(
+        &mut self,
+        input: &[f32],
+        num_channels: usize,
+    ) -> Result<usize, StretchError> {
+        let frames = input.len() / num_channels;
+        if frames == 0 {
+            return Ok(0);
+        }
+        if !self.varispeed_engaged {
+            // The ring is empty at engagement: resync the emission timeline
+            // to the consumption cursor (it may have advanced across earlier
+            // streams or flush padding) and drop an anchor checkpoint.
+            self.varispeed_engaged = true;
+            self.varispeed_resampled_emitted_total = self.input_frames_consumed_total as u64;
+            self.ratio_map.push(
+                self.varispeed_resampled_emitted_total,
+                self.varispeed_map_base_source,
+                self.varispeed_prev_ratio,
+            );
+        }
+
+        for ch in 0..num_channels {
+            let buf = &mut self.varispeed_input_buffers[ch];
+            buf.clear();
+            buf.extend(input.iter().skip(ch).step_by(num_channels));
+        }
+
+        // The tempo axis has no control glide: the resampler retargets to
+        // the current target each block (its internal one-block ramp only
+        // suppresses zipper noise).
+        let step = 1.0 / self.target_ratio;
+        let mut emitted = usize::MAX;
+        for ch in 0..num_channels {
+            self.varispeed_resamplers[ch].process_into(
+                &self.varispeed_input_buffers[ch],
+                step,
+                &mut self.varispeed_output_buffers[ch],
+            )?;
+            emitted = emitted.min(self.varispeed_output_buffers[ch].len());
+        }
+        if emitted == usize::MAX {
+            emitted = 0;
+        }
+        debug_assert!(self.varispeed_output_buffers[..num_channels]
+            .iter()
+            .all(|b| b.len() == emitted));
+        self.varispeed_prev_ratio = self.target_ratio;
+        self.varispeed_source_fed_total = self.varispeed_source_fed_total.saturating_add(frames);
+
+        self.push_varispeed_emission(emitted, num_channels)?;
+
+        self.varispeed_resampled_emitted_total += emitted as u64;
+        self.ratio_map
+            .evict_before(self.input_frames_consumed_total as u64);
+        self.ratio_map.push(
+            self.varispeed_resampled_emitted_total,
+            self.varispeed_map_base_source + self.varispeed_resamplers[0].next_output_source_pos(),
+            self.target_ratio,
+        );
+        Ok(emitted * num_channels)
+    }
+
+    /// Interleaves the varispeed output buffers into `input_ring`.
+    fn push_varispeed_emission(
+        &mut self,
+        emitted: usize,
+        num_channels: usize,
+    ) -> Result<(), StretchError> {
+        let pushed_samples = emitted.saturating_mul(num_channels);
+        if pushed_samples == 0 {
+            return Ok(());
+        }
+        if pushed_samples > self.input_ring.available() {
+            return Err(StretchError::BufferOverflow {
+                buffer: "stream_input_ring",
+                requested: pushed_samples,
+                available: self.input_ring.available(),
+            });
+        }
+        for i in 0..emitted {
+            for ch in 0..num_channels {
+                self.varispeed_interleave_scratch[i * num_channels + ch] =
+                    self.varispeed_output_buffers[ch][i];
+            }
+        }
+        let pushed = self
+            .input_ring
+            .push_slice(&self.varispeed_interleave_scratch[..pushed_samples]);
+        if pushed != pushed_samples {
+            return Err(StretchError::BufferOverflow {
+                buffer: "stream_input_ring",
+                requested: pushed_samples,
+                available: pushed,
+            });
+        }
+        Ok(())
+    }
+
+    /// Drains the varispeed stage's held lookahead into the ring as real
+    /// content and drops a final source-exact checkpoint, disengaging the
+    /// stage (the per-resampler flush resets it).
+    fn flush_varispeed_to_ring(&mut self, num_channels: usize) -> Result<(), StretchError> {
+        if !self.varispeed_engaged {
+            return Ok(());
+        }
+        let num_channels = num_channels.max(1);
+        let step = 1.0 / self.target_ratio;
+        let mut emitted = usize::MAX;
+        for ch in 0..num_channels {
+            self.varispeed_resamplers[ch]
+                .flush_into(step, &mut self.varispeed_output_buffers[ch])?;
+            emitted = emitted.min(self.varispeed_output_buffers[ch].len());
+        }
+        if emitted == usize::MAX {
+            emitted = 0;
+        }
+        self.push_varispeed_emission(emitted, num_channels)?;
+        // The drained tail becomes rendered output like any other emission.
+        self.expected_total_output_samples += (emitted * num_channels) as f64;
+
+        self.varispeed_resampled_emitted_total += emitted as u64;
+        // The drain feeds synthetic zeros, so clamp the final checkpoint to
+        // the real source-fed total and fold it into the base the next
+        // stream's checkpoints build on.
+        self.varispeed_map_base_source = self.varispeed_source_fed_total as f64;
+        self.ratio_map
+            .evict_before(self.input_frames_consumed_total as u64);
+        self.ratio_map.push(
+            self.varispeed_resampled_emitted_total,
+            self.varispeed_map_base_source,
+            self.target_ratio,
+        );
+        self.varispeed_engaged = false;
+        Ok(())
+    }
+
     fn process_available_to_pending(
         &mut self,
         require_min_latency: bool,
@@ -995,6 +1564,9 @@ impl StreamProcessor {
         self.collect_channel_inputs(total_frames, num_channels)?;
         self.encode_input_mid_side(num_channels);
 
+        if self.control_path == ControlPath::VarispeedFirst {
+            self.update_varispeed_transposition(total_frames);
+        }
         self.update_vocoder_ratio();
         // Exclusive: artifact-scheduled resets replace the online scheduler
         // when a usable artifact is attached (never both, or transients
@@ -1138,7 +1710,7 @@ impl StreamProcessor {
                 // At extreme stretch ratios, the PV naturally loses high-frequency
                 // energy due to phase modifications. Apply a ratio-dependent
                 // high-shelf boost to counteract centroid shift.
-                let ratio_distance = (self.current_ratio - 1.0).abs();
+                let ratio_distance = self.pv_stretch_distance();
                 // Two-tier shelf: base correction for inherent PV spectral
                 // tilt (always active when gain compensation is active), plus
                 // ratio-dependent boost for centroid shift at extreme ratios.
@@ -1323,7 +1895,7 @@ impl StreamProcessor {
             // detected at extreme ratios, run WSOLA on the input and crossfade
             // its output over the PV output. WSOLA preserves waveform shape
             // for kicks/snares while the PV handles tonal content.
-            let ratio_distance = (self.current_ratio - 1.0).abs();
+            let ratio_distance = self.pv_stretch_distance();
             if ratio_distance > 0.01 {
                 // Arm a new WSOLA overlay on strong onsets.
                 let flux_factor = self.compute_flux_blend_factor();
@@ -1353,7 +1925,14 @@ impl StreamProcessor {
 
                 if should_arm_wsola {
                     // Run WSOLA on channel input buffers and store results.
-                    let ratio = self.current_ratio;
+                    // The overlay is spliced over PV output, so it must run
+                    // at the PV's tempo-axis stretch: the glided tempo on
+                    // the vocoder path, the transposition on the varispeed
+                    // path (ring content is already tempo-resampled there).
+                    let ratio = match self.control_path {
+                        ControlPath::VocoderTempo => self.current_ratio,
+                        ControlPath::VarispeedFirst => self.transposition,
+                    };
                     let mut wsola_min_len = usize::MAX;
                     for ch in 0..num_channels {
                         let in_buf = &self.channel_input_buffers[ch];
@@ -1694,9 +2273,51 @@ impl StreamProcessor {
         Ok(())
     }
 
+    /// Ratio the PV renders at: the glided tempo on the vocoder-tempo path,
+    /// the delay-matched transposition correction on the varispeed-first
+    /// path (the tempo itself lives on the input resampler there), times the
+    /// glided user pitch on both.
     #[inline]
     fn processing_ratio(&self) -> f64 {
-        self.current_ratio * self.pitch_scale
+        match self.control_path {
+            ControlPath::VocoderTempo => self.current_ratio * self.pitch_scale,
+            ControlPath::VarispeedFirst => self.transposition * self.pitch_scale,
+        }
+    }
+
+    /// Distance of the PV's tempo-axis stretch from unity; drives corrective
+    /// heuristics (spectral shelves, blend scaling, overlay sizing) that
+    /// track PV artifact severity.
+    #[inline]
+    fn pv_stretch_distance(&self) -> f64 {
+        match self.control_path {
+            ControlPath::VocoderTempo => (self.current_ratio - 1.0).abs(),
+            ControlPath::VarispeedFirst => (self.transposition - 1.0).abs(),
+        }
+    }
+
+    /// Step of the post-PV output resampler: how many PV output samples are
+    /// consumed per emitted sample.
+    ///
+    /// The vocoder-tempo path resamples away only the pitch over-stretch;
+    /// the varispeed-first path resamples away the PV's entire over-stretch
+    /// (transposition correction times user pitch), restoring the varispeed
+    /// emission's length 1:1.
+    #[inline]
+    fn post_resample_step(&self) -> f64 {
+        match self.control_path {
+            ControlPath::VocoderTempo => self.pitch_scale,
+            ControlPath::VarispeedFirst => self.processing_ratio(),
+        }
+    }
+
+    /// [`Self::post_resample_step`] at the current control targets.
+    #[inline]
+    fn target_post_resample_step(&self) -> f64 {
+        match self.control_path {
+            ControlPath::VocoderTempo => self.target_pitch_scale,
+            ControlPath::VarispeedFirst => self.target_processing_ratio(),
+        }
     }
 
     /// Processing ratio at the current control targets.
@@ -1719,6 +2340,12 @@ impl StreamProcessor {
     /// overlapping analysis footprints the seam disturbance persists. The
     /// control EMA reaches the snap threshold after `tau * ln(delta/snap)`
     /// samples, which this converts to FFT footprints.
+    ///
+    /// On the varispeed-first path the in-flight delta is the gap between
+    /// the delay-matched transposition and its target, which settles after
+    /// the gate transit rather than the 50 ms EMA; the τ-based estimate is
+    /// then an approximation (slightly conservative for a hold heuristic,
+    /// and the delta is re-evaluated on every scheduler pass anyway).
     fn modulation_hold_overlap_windows(&self) -> usize {
         let delta = (self.target_processing_ratio() - self.processing_ratio()).abs();
         if delta < MODULATION_HOLD_MIN_RATIO_DELTA {
@@ -1739,6 +2366,23 @@ impl StreamProcessor {
             self.params.fft_size.max(1) as f64 / self.params.sample_rate.max(1) as f64;
         ((MODULATION_HOLD_MAX_SECS / window_secs).ceil() as usize)
             .clamp(1, MODULATION_HOLD_MAX_WINDOWS_CEILING)
+    }
+
+    /// Clears the varispeed input stage back to disengaged, zeroing its
+    /// timeline bookkeeping (used by seek/reset flows that restart the
+    /// source timeline).
+    fn reset_varispeed_stage(&mut self) {
+        for resampler in &mut self.varispeed_resamplers {
+            resampler.reset();
+        }
+        for buf in &mut self.varispeed_output_buffers {
+            buf.clear();
+        }
+        self.ratio_map.clear();
+        self.varispeed_engaged = false;
+        self.varispeed_source_fed_total = 0;
+        self.varispeed_resampled_emitted_total = 0;
+        self.varispeed_map_base_source = 0.0;
     }
 
     fn reset_pitch_resamplers(&mut self) {
@@ -1763,13 +2407,14 @@ impl StreamProcessor {
             return Ok(());
         }
 
-        // The resampler stays engaged once pitch has been used this stream:
-        // at unity it degenerates to a bit-clean passthrough, which avoids
-        // splicing its held lookahead out of the stream when a pitch sweep
+        // The resampler stays engaged once its step has been off unity this
+        // stream: at unity it degenerates to a bit-clean passthrough, which
+        // avoids splicing its held lookahead out of the stream when the step
         // returns to 1.0.
+        let step = self.post_resample_step();
         let pitch_active = self.pitch_resampler_engaged
-            || (self.pitch_scale - 1.0).abs() >= RATIO_SNAP_THRESHOLD
-            || (self.target_pitch_scale - 1.0).abs() >= RATIO_SNAP_THRESHOLD;
+            || (step - 1.0).abs() >= RATIO_SNAP_THRESHOLD
+            || (self.target_post_resample_step() - 1.0).abs() >= RATIO_SNAP_THRESHOLD;
         if !pitch_active {
             return self.interleave_to_pending(min_output_len, num_channels);
         }
@@ -1785,19 +2430,19 @@ impl StreamProcessor {
 
             match self.pitch_quality {
                 StreamPitchQuality::Sinc => {
-                    // The sinc resampler consumes the source at `pitch_scale`
+                    // The sinc resampler consumes the source at `step`
                     // samples per output sample and ramps toward it from the
                     // previous block's step internally.
                     self.sinc_pitch_resamplers[ch].process_into(
                         &self.channel_output_buffers[ch][..min_output_len],
-                        self.pitch_scale,
+                        step,
                         &mut self.pitch_output_buffers[ch],
                     )?;
                 }
                 StreamPitchQuality::Linear => {
                     self.pitch_resamplers[ch].process_into(
                         &self.channel_output_buffers[ch][..min_output_len],
-                        1.0 / self.pitch_scale,
+                        1.0 / step,
                         &mut self.pitch_output_buffers[ch],
                     )?;
                 }
@@ -1845,16 +2490,17 @@ impl StreamProcessor {
             return Ok(());
         }
 
+        let step = self.post_resample_step();
         let mut min_output_len = usize::MAX;
         for ch in 0..num_channels {
             match self.pitch_quality {
                 StreamPitchQuality::Sinc => {
                     self.sinc_pitch_resamplers[ch]
-                        .flush_into(self.pitch_scale, &mut self.pitch_output_buffers[ch])?;
+                        .flush_into(step, &mut self.pitch_output_buffers[ch])?;
                 }
                 StreamPitchQuality::Linear => {
                     self.pitch_resamplers[ch]
-                        .flush_into(1.0 / self.pitch_scale, &mut self.pitch_output_buffers[ch])?;
+                        .flush_into(1.0 / step, &mut self.pitch_output_buffers[ch])?;
                 }
             }
             min_output_len = min_output_len.min(self.pitch_output_buffers[ch].len());
@@ -2043,8 +2689,14 @@ impl StreamProcessor {
 
     /// Changes the stretch ratio for subsequent processing, returning an error
     /// for invalid values.
+    ///
+    /// On the [`ControlPath::VarispeedFirst`] path the ratio is additionally
+    /// bounded to the varispeed range `[0.25, 4.0]`.
     pub fn try_set_stretch_ratio(&mut self, ratio: f64) -> Result<(), StretchError> {
         let ratio = validate_positive_finite_ratio(ratio, "stretch ratio")?;
+        if self.control_path == ControlPath::VarispeedFirst {
+            validate_varispeed_ratio(ratio)?;
+        }
         self.target_ratio = ratio;
         Ok(())
     }
@@ -2163,7 +2815,7 @@ impl StreamProcessor {
         // Rebuild at the current control targets so engine, buffers, and
         // stretcher ratios all agree from the first render.
         let params = self.params.clone().with_stretch_ratio(self.target_ratio);
-        let mut rebuilt = Self::new_with_engine(params, engine);
+        let mut rebuilt = Self::new_with_engine_and_path(params, engine, self.control_path);
         rebuilt.source_bpm = self.source_bpm;
         rebuilt.target_pitch_scale = self.target_pitch_scale;
         rebuilt.pitch_scale = self.target_pitch_scale;
@@ -2175,6 +2827,44 @@ impl StreamProcessor {
     /// Returns the active stream-mode rendering engine.
     pub fn streaming_engine(&self) -> StreamingEngine {
         self.engine
+    }
+
+    /// Selects the tempo control path.
+    ///
+    /// Not RT-safe: switching paths re-sizes buffers for the new path's
+    /// per-callback emission headroom and starts a fresh stream (buffered
+    /// input/output is dropped; ratio/pitch targets, resampler quality,
+    /// engine, tempo state, and the pre-analysis artifact carry over).
+    /// Select the path at build/rebuild time — never from an audio callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StretchError::InvalidRatio`] when switching to
+    /// [`ControlPath::VarispeedFirst`] while the target stretch ratio is
+    /// outside the varispeed range `[0.25, 4.0]`.
+    pub fn set_control_path(&mut self, control_path: ControlPath) -> Result<(), StretchError> {
+        if control_path == self.control_path {
+            return Ok(());
+        }
+        if control_path == ControlPath::VarispeedFirst {
+            validate_varispeed_ratio(self.target_ratio)?;
+        }
+
+        // Rebuild at the current control targets so path, buffers, and
+        // stretcher ratios all agree from the first render.
+        let params = self.params.clone().with_stretch_ratio(self.target_ratio);
+        let mut rebuilt = Self::new_with_engine_and_path(params, self.engine, control_path);
+        rebuilt.source_bpm = self.source_bpm;
+        rebuilt.target_pitch_scale = self.target_pitch_scale;
+        rebuilt.pitch_scale = self.target_pitch_scale;
+        rebuilt.pitch_quality = self.pitch_quality;
+        *self = rebuilt;
+        Ok(())
+    }
+
+    /// Returns the active tempo control path.
+    pub fn control_path(&self) -> ControlPath {
+        self.control_path
     }
 
     /// Returns the source BPM if available.
@@ -2241,12 +2931,14 @@ impl StreamProcessor {
         let effective_gate_frames =
             effective_min_frames(self.effective_fft(), self.target_processing_ratio());
 
-        // Pitch lookahead applies once the resampler is (or is about to be)
-        // in the signal path: engaged resamplers stay engaged even at unity
-        // pitch, and a non-unity target engages on the next process call.
+        // Output-resampler lookahead applies once the resampler is (or is
+        // about to be) in the signal path: engaged resamplers stay engaged
+        // even at a unity step, and a non-unity target engages on the next
+        // process call. On the varispeed-first path the step is the whole
+        // keylock correction, so any off-unity tempo target engages it.
         let pitch_active = self.pitch_resampler_engaged
-            || (self.target_pitch_scale - 1.0).abs() > RATIO_SNAP_THRESHOLD
-            || (self.pitch_scale - 1.0).abs() > RATIO_SNAP_THRESHOLD;
+            || (self.target_post_resample_step() - 1.0).abs() > RATIO_SNAP_THRESHOLD
+            || (self.post_resample_step() - 1.0).abs() > RATIO_SNAP_THRESHOLD;
         let pitch_lookahead_samples = if !pitch_active {
             0
         } else {
@@ -2260,13 +2952,42 @@ impl StreamProcessor {
             }
         };
 
+        let varispeed_active = self.varispeed_engaged
+            || (self.control_path == ControlPath::VarispeedFirst
+                && ((self.target_ratio - 1.0).abs() > RATIO_SNAP_THRESHOLD
+                    || (self.target_pitch_scale - 1.0).abs() > RATIO_SNAP_THRESHOLD));
+        let varispeed_lookahead_samples = if !varispeed_active {
+            0
+        } else {
+            self.varispeed_resamplers
+                .first()
+                .map(|r| r.current_half_span())
+                .unwrap_or(0)
+        };
+
+        let pipeline_delay_frames =
+            effective_gate_frames + pitch_lookahead_samples + varispeed_lookahead_samples;
+        let control_to_audio_frames = match self.control_path {
+            // The PV implements tempo: a change becomes audible only after
+            // the gate (plus the glide, reported separately).
+            ControlPath::VocoderTempo => pipeline_delay_frames,
+            // The varispeed input stage implements tempo sample-accurately;
+            // only its kernel lookahead (and the caller's callback size,
+            // which the caller owns) stands between control and audio.
+            ControlPath::VarispeedFirst => varispeed_lookahead_samples,
+        };
+
         StreamLatencyReport {
             base_gate_frames,
             effective_gate_frames,
             pitch_lookahead_samples,
+            varispeed_lookahead_samples,
             control_smoothing_secs: RATIO_SMOOTHING_TIME_SECS,
             sample_rate: self.params.sample_rate,
-            total_frames: effective_gate_frames + pitch_lookahead_samples,
+            control_to_audio_frames,
+            pipeline_delay_frames,
+            control_path: self.control_path,
+            total_frames: pipeline_delay_frames,
         }
     }
 
@@ -2284,6 +3005,7 @@ impl StreamProcessor {
         self.current_ratio = self.params.stretch_ratio;
         self.target_ratio = self.params.stretch_ratio;
         self.vocoder_ratio = self.params.stretch_ratio;
+        self.transposition = self.params.stretch_ratio;
         self.initialized = false;
         self.transient_scheduler.reset();
         self.input_frames_consumed_total = 0;
@@ -2298,7 +3020,16 @@ impl StreamProcessor {
 
         match self.engine {
             StreamingEngine::Deterministic => {
-                self.vocoders = Self::create_vocoders(&self.params, self.params.stretch_ratio);
+                self.vocoders = Self::create_vocoders(
+                    &self.params,
+                    self.params.stretch_ratio,
+                    stream_capacity_frames(&self.params, self.engine, self.control_path),
+                );
+                if self.control_path == ControlPath::VarispeedFirst {
+                    for pv in &mut self.vocoders {
+                        pv.set_smooth_ratio_updates(true);
+                    }
+                }
             }
             StreamingEngine::MultiResolution => {
                 for stretcher in &mut self.multi_res {
@@ -2312,6 +3043,8 @@ impl StreamProcessor {
         self.pitch_scale = 1.0;
         self.target_pitch_scale = 1.0;
         self.reset_pitch_resamplers();
+        self.reset_varispeed_stage();
+        self.varispeed_prev_ratio = self.params.stretch_ratio;
         self.dsp_engaged = false;
         self.input_energy_ema = 0.0;
         self.output_energy_ema = 0.0;
@@ -2324,6 +3057,35 @@ impl StreamProcessor {
         for buf in &mut self.wsola_overlay_buffers {
             buf.clear();
         }
+    }
+
+    /// Delay-matched transposition tracking for the varispeed-first path.
+    ///
+    /// The varispeed stage changes pitch instantly at the INPUT, but the PV
+    /// consumes that audio a buffering gate later. Correcting at the current
+    /// control ratio would therefore mis-pitch every render while a tempo
+    /// change transits the gate (audible wobble under fast rides). Instead,
+    /// the correction target is the embedded ratio at the END of the span
+    /// the PV is about to consume, read off the ratio map. The post-PV sinc
+    /// resampler ramps its step from the previous target across each block,
+    /// so consecutive end-of-span targets make the applied correction trace
+    /// the embedded piecewise-linear ratio with no average lag.
+    ///
+    /// Residual wobble under fast rides (~10 cents p95 on a pure tone at
+    /// the qa ±8%/2 s torture ride, versus ~100 on the vocoder path) comes
+    /// from the PV's own overlap-add under a moving ratio, not from this
+    /// estimate — better instantaneous-frequency tracking (ROADMAP Stage
+    /// 16) is the lever for it.
+    fn update_varispeed_transposition(&mut self, total_frames: usize) {
+        let span_len = self.frames_consumed_for(total_frames);
+        if span_len == 0 {
+            return;
+        }
+        let end = self.input_frames_consumed_total as f64 + span_len as f64;
+        let Some(ratio) = self.ratio_map.ratio_at(end) else {
+            return;
+        };
+        self.transposition = ratio.clamp(VARISPEED_MIN_RATIO, VARISPEED_MAX_RATIO);
     }
 
     fn update_vocoder_ratio(&mut self) {
@@ -2501,7 +3263,22 @@ impl StreamProcessor {
             return;
         }
         let span_start = self.ring_start_abs();
-        let span_end = span_start.saturating_add(span_len);
+        // `span_len` is in ring (resampled) frames; onset positions are
+        // source frames, so the span end maps through the varispeed
+        // timeline on the varispeed-first path.
+        let span_end = match self.control_path {
+            ControlPath::VocoderTempo => span_start.saturating_add(span_len),
+            ControlPath::VarispeedFirst => {
+                let end_resampled = (self.input_frames_consumed_total + span_len) as f64;
+                let end_source = self
+                    .ratio_map
+                    .map_to_source(end_resampled)
+                    .unwrap_or(end_resampled);
+                self.source_start_frames
+                    .saturating_add(self.passthrough_frames_total)
+                    .saturating_add(end_source.floor() as usize)
+            }
+        };
 
         let Some(artifact) = self.params.pre_analysis.as_ref() else {
             return;
@@ -2562,12 +3339,28 @@ impl StreamProcessor {
     /// Absolute source frame of the next input frame awaiting consumption.
     ///
     /// This is the timeline pre-analysis artifact positions are compared
-    /// against: `source start + passthrough frames + DSP-consumed frames`.
+    /// against: `source start + passthrough frames + DSP-consumed frames`,
+    /// with the consumption cursor mapped from ring (resampled) frames back
+    /// to source frames when the varispeed stage leads the PV.
     #[inline]
     fn ring_start_abs(&self) -> usize {
         self.source_start_frames
             .saturating_add(self.passthrough_frames_total)
-            .saturating_add(self.input_frames_consumed_total)
+            .saturating_add(self.consumed_source_frames())
+    }
+
+    /// Source frames the DSP path has consumed: the ring consumption cursor,
+    /// mapped through the varispeed timeline on the varispeed-first path.
+    #[inline]
+    fn consumed_source_frames(&self) -> usize {
+        match self.control_path {
+            ControlPath::VocoderTempo => self.input_frames_consumed_total,
+            ControlPath::VarispeedFirst => self
+                .ratio_map
+                .map_to_source(self.input_frames_consumed_total as f64)
+                .unwrap_or(self.input_frames_consumed_total as f64)
+                .floor() as usize,
+        }
     }
 
     /// Tells the processor the absolute source frame of the next pushed
@@ -2618,13 +3411,22 @@ impl StreamProcessor {
     /// seeks), use [`Self::warm_start_seek`] instead.
     pub fn notify_source_jump(&mut self, next_frame: usize) {
         // Frames still buffered belong to pre-jump material; position the
-        // timeline so the NEXT pushed frame maps to `next_frame`.
-        let num_channels = self.params.channels.count().max(1);
-        let in_flight = self.input_ring.len() / num_channels;
-        let already_counted = self
-            .passthrough_frames_total
-            .saturating_add(self.input_frames_consumed_total)
-            .saturating_add(in_flight);
+        // timeline so the NEXT pushed frame maps to `next_frame`. Everything
+        // already accepted must be counted in SOURCE frames: on the
+        // varispeed-first path that is the source-fed total (ring content is
+        // resampled and the resampler holds fractional lookahead).
+        let already_counted = match self.control_path {
+            ControlPath::VocoderTempo => {
+                let num_channels = self.params.channels.count().max(1);
+                let in_flight = self.input_ring.len() / num_channels;
+                self.passthrough_frames_total
+                    .saturating_add(self.input_frames_consumed_total)
+                    .saturating_add(in_flight)
+            }
+            ControlPath::VarispeedFirst => self
+                .passthrough_frames_total
+                .saturating_add(self.varispeed_source_fed_total),
+        };
         self.source_start_frames = next_frame.saturating_sub(already_counted);
         self.reposition_artifact_cursor();
     }
@@ -2635,8 +3437,19 @@ impl StreamProcessor {
     /// of convergence margin for the phase vocoder's overlap and the pitch
     /// resampler's history. Bounded, so rapid cue jumps stay cheap.
     pub fn warm_start_preroll_frames(&self) -> usize {
-        effective_min_frames(self.effective_fft(), self.target_processing_ratio())
-            .saturating_add(self.effective_fft())
+        let ring_frames =
+            effective_min_frames(self.effective_fft(), self.target_processing_ratio())
+                .saturating_add(self.effective_fft());
+        match self.control_path {
+            ControlPath::VocoderTempo => ring_frames,
+            ControlPath::VarispeedFirst => {
+                // The gate is in resampled frames: speeding up (ratio < 1)
+                // needs proportionally more source to fill it, and the
+                // varispeed kernel holds back its lookahead.
+                let scale = (1.0 / self.target_ratio).max(1.0);
+                (ring_frames as f64 * scale).ceil() as usize + STREAM_SINC_MAX_HALF_TAPS
+            }
+        }
     }
 
     /// Re-primes the processor at a new source position from the audio
@@ -2701,6 +3514,7 @@ impl StreamProcessor {
         }
         self.transient_scheduler.reset();
         self.reset_pitch_resamplers();
+        self.reset_varispeed_stage();
         self.wsola_overlay_remaining = 0;
         self.wsola_overlay_total = 0;
         self.wsola_overlay_pos = 0;
@@ -2734,14 +3548,19 @@ impl StreamProcessor {
             return Ok(());
         }
 
-        // Prime: run the preroll through the full DSP path — phase vocoder,
-        // schedulers, pitch resamplers, gain tracking — discarding the
-        // rendered output. Control glides do NOT advance: the jump is
-        // instantaneous, so no wall-clock time passes.
+        // Prime: run the preroll through the full DSP path — varispeed
+        // stage, phase vocoder, schedulers, pitch resamplers, gain tracking
+        // — discarding the rendered output. Control glides do NOT advance:
+        // the jump is instantaneous, so no wall-clock time passes.
         self.dsp_engaged = true;
         let chunk_samples = MAX_CALLBACK_FRAMES * num_channels;
         for chunk in preroll.chunks(chunk_samples) {
-            self.push_input_samples(chunk)?;
+            match self.control_path {
+                ControlPath::VocoderTempo => self.push_input_samples(chunk)?,
+                ControlPath::VarispeedFirst => {
+                    self.feed_varispeed_to_ring(chunk, num_channels)?;
+                }
+            }
             self.process_available_to_pending(true)?;
             self.pending_output.clear();
         }
@@ -2794,13 +3613,24 @@ impl StreamProcessor {
     }
 
     /// Callback-size-agnostic ratio and pitch interpolation.
+    ///
+    /// On the varispeed-first path the tempo axis has no glide: the ratio
+    /// snaps to its target (the input resampler retargets sample-accurately
+    /// and the PV correction is delay-matched separately); only user pitch
+    /// keeps the smoothing.
     fn interpolate_ratio_for_frames(&mut self, frames: usize) {
         let tau_frames = (self.params.sample_rate as f64 * RATIO_SMOOTHING_TIME_SECS).max(1.0);
         let alpha = 1.0 - (-(frames as f64) / tau_frames).exp();
-        self.current_ratio += alpha * (self.target_ratio - self.current_ratio);
-
-        if (self.current_ratio - self.target_ratio).abs() < RATIO_SNAP_THRESHOLD {
-            self.current_ratio = self.target_ratio;
+        match self.control_path {
+            ControlPath::VocoderTempo => {
+                self.current_ratio += alpha * (self.target_ratio - self.current_ratio);
+                if (self.current_ratio - self.target_ratio).abs() < RATIO_SNAP_THRESHOLD {
+                    self.current_ratio = self.target_ratio;
+                }
+            }
+            ControlPath::VarispeedFirst => {
+                self.current_ratio = self.target_ratio;
+            }
         }
 
         self.pitch_scale += alpha * (self.target_pitch_scale - self.pitch_scale);
@@ -4109,6 +4939,297 @@ mod tests {
         assert!(
             !total_output.is_empty(),
             "Expected output with reduced latency"
+        );
+    }
+
+    #[test]
+    fn test_ratio_map_fifo_interpolation_and_eviction() {
+        let mut map = RatioMapFifo::with_capacity(4);
+        assert_eq!(map.map_to_source(10.0), None);
+        assert_eq!(map.ratio_at(10.0), None);
+
+        map.push(0, 0.0, 1.25);
+        map.push(100, 80.0, 1.25); // ratio 1.25 block
+        map.push(200, 180.0, 1.0); // block ramping down to unity
+        assert_eq!(map.map_to_source(0.0), Some(0.0));
+        assert_eq!(map.map_to_source(50.0), Some(40.0));
+        assert_eq!(map.map_to_source(150.0), Some(130.0));
+        // Beyond the final checkpoint clamps (flush padding).
+        assert_eq!(map.map_to_source(500.0), Some(180.0));
+        // Instantaneous ratio interpolates the per-block retarget ramp.
+        assert_eq!(map.ratio_at(50.0), Some(1.25));
+        assert_eq!(map.ratio_at(150.0), Some(1.125));
+        assert_eq!(map.ratio_at(500.0), Some(1.0));
+
+        // Eviction retains one anchor at or behind the cursor.
+        map.evict_before(120);
+        assert_eq!(map.map_to_source(150.0), Some(130.0));
+        assert_eq!(map.map_to_source(0.0), Some(80.0), "behind anchor clamps");
+
+        // Overflow merges into the newest entry instead of growing.
+        let mut small = RatioMapFifo::with_capacity(2);
+        small.push(0, 0.0, 1.0);
+        small.push(100, 100.0, 1.0);
+        small.push(200, 150.0, 1.1);
+        assert_eq!(small.map_to_source(200.0), Some(150.0));
+        assert_eq!(small.ratio_at(200.0), Some(1.1));
+    }
+
+    #[test]
+    fn test_varispeed_control_path_selection_and_ratio_bounds() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params.clone());
+        assert_eq!(proc.control_path(), ControlPath::VocoderTempo);
+
+        proc.set_control_path(ControlPath::VarispeedFirst).unwrap();
+        assert_eq!(proc.control_path(), ControlPath::VarispeedFirst);
+
+        // The varispeed range is enforced on the ratio setter...
+        assert!(proc.set_stretch_ratio(5.0).is_err());
+        assert!(proc.set_stretch_ratio(0.2).is_err());
+        assert!(proc.set_stretch_ratio(1.08).is_ok());
+
+        // ...and on the path switch itself.
+        let mut wide = StreamProcessor::new(params.with_stretch_ratio(6.0));
+        wide.set_stretch_ratio(6.0).unwrap();
+        assert!(wide.set_control_path(ControlPath::VarispeedFirst).is_err());
+        assert_eq!(wide.control_path(), ControlPath::VocoderTempo);
+    }
+
+    #[test]
+    fn test_varispeed_unity_stays_bit_exact_passthrough() {
+        let params = StretchParams::new(1.0)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_control_path(ControlPath::VarispeedFirst).unwrap();
+
+        let input: Vec<f32> = (0..4096)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44100.0).sin() * 0.5)
+            .collect();
+        let mut output = Vec::with_capacity(8192);
+        for chunk in input.chunks(512) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        assert_eq!(output, input, "unity varispeed must stay bit-exact");
+        assert_eq!(proc.source_position(), 4096);
+    }
+
+    #[test]
+    fn test_varispeed_round_trip_length_and_keylock_pitch() {
+        let ratio = 1.25;
+        let params = StretchParams::new(ratio)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_control_path(ControlPath::VarispeedFirst).unwrap();
+
+        let n = 44100usize;
+        let input: Vec<f32> = (0..n)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 44100.0).sin() * 0.5)
+            .collect();
+        let mut output: Vec<f32> = Vec::with_capacity(n * 2 + 65_536);
+        for chunk in input.chunks(512) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        proc.flush_into(&mut output).unwrap();
+
+        let expected = (n as f64 * ratio) as usize;
+        let delta = output.len().abs_diff(expected);
+        assert!(
+            delta <= 128,
+            "round-trip length {} not within 128 of {}",
+            output.len(),
+            expected
+        );
+
+        // Keylock: the varispeed drop (440 -> 352 Hz) must be corrected back.
+        let mid = &output[output.len() / 4..output.len() * 3 / 4];
+        let freq = estimate_freq_zero_crossings(mid, 44100);
+        assert!(
+            (freq - 440.0).abs() < 15.0,
+            "keylock pitch off: {:.1} Hz vs 440 Hz",
+            freq
+        );
+
+        // Post-flush the source timeline lands exactly on the fed total.
+        assert_eq!(proc.source_position(), n);
+    }
+
+    #[test]
+    fn test_varispeed_speedup_round_trip_length() {
+        let ratio = 0.8;
+        let params = StretchParams::new(ratio)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_control_path(ControlPath::VarispeedFirst).unwrap();
+
+        let n = 44100usize;
+        let input: Vec<f32> = (0..n)
+            .map(|i| (2.0 * PI * 330.0 * i as f32 / 44100.0).sin() * 0.5)
+            .collect();
+        let mut output: Vec<f32> = Vec::with_capacity(n * 2 + 65_536);
+        for chunk in input.chunks(512) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        proc.flush_into(&mut output).unwrap();
+
+        let expected = (n as f64 * ratio) as usize;
+        let delta = output.len().abs_diff(expected);
+        assert!(
+            delta <= 128,
+            "speed-up length {} not within 128 of {}",
+            output.len(),
+            expected
+        );
+        let mid = &output[output.len() / 4..output.len() * 3 / 4];
+        let freq = estimate_freq_zero_crossings(mid, 44100);
+        assert!(
+            (freq - 330.0).abs() < 12.0,
+            "keylock pitch off: {:.1} Hz vs 330 Hz",
+            freq
+        );
+    }
+
+    #[test]
+    fn test_varispeed_source_jump_keeps_source_position_aligned() {
+        let params = StretchParams::new(1.05)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_control_path(ControlPath::VarispeedFirst).unwrap();
+
+        let sine = |i: usize| (2.0 * PI * 220.0 * i as f32 / 44100.0).sin() * 0.5;
+        let a: Vec<f32> = (0..8192).map(sine).collect();
+        let b: Vec<f32> = (0..4096).map(sine).collect();
+        let mut output: Vec<f32> = Vec::with_capacity(65_536);
+        for chunk in a.chunks(512) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        proc.notify_source_jump(100_000);
+        for chunk in b.chunks(512) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        proc.flush_into(&mut output).unwrap();
+        assert_eq!(
+            proc.source_position(),
+            100_000 + 4096,
+            "post-jump source position must land on jump target + fed frames"
+        );
+    }
+
+    #[test]
+    fn test_varispeed_transposition_converges_to_tempo_ratio() {
+        let ratio = 1.08;
+        let params = StretchParams::new(ratio)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_control_path(ControlPath::VarispeedFirst).unwrap();
+
+        let input: Vec<f32> = (0..66_150)
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44100.0).sin() * 0.5)
+            .collect();
+        let mut output = Vec::with_capacity(input.len() * 2 + 65_536);
+        for chunk in input.chunks(512) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        assert!(
+            (proc.transposition - ratio).abs() < 0.002,
+            "transposition {} should converge to the tempo ratio {}",
+            proc.transposition,
+            ratio
+        );
+    }
+
+    #[test]
+    fn test_varispeed_modulation_hold_tracks_tempo_step() {
+        let params = StretchParams::new(1.02)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_control_path(ControlPath::VarispeedFirst).unwrap();
+
+        let sine = |i: usize| (2.0 * PI * 220.0 * i as f32 / 44100.0).sin() * 0.5;
+        let warmup: Vec<f32> = (0..44_100).map(sine).collect();
+        let mut output = Vec::with_capacity(warmup.len() * 2 + 65_536);
+        for chunk in warmup.chunks(512) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        assert_eq!(
+            proc.modulation_hold_overlap_windows(),
+            0,
+            "steady state must not hold"
+        );
+
+        // A tempo step engages the hold until the retargeted audio has
+        // transited the gate and the transposition catches up.
+        proc.set_stretch_ratio(1.08).unwrap();
+        assert!(
+            proc.modulation_hold_overlap_windows() >= 1,
+            "tempo step must engage modulation hold on the varispeed path"
+        );
+
+        let settle: Vec<f32> = (0..44_100).map(sine).collect();
+        for chunk in settle.chunks(512) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        assert_eq!(
+            proc.modulation_hold_overlap_windows(),
+            0,
+            "hold must release after the step settles"
+        );
+    }
+
+    #[test]
+    fn test_varispeed_warm_start_seek_resumes_converged() {
+        let params = StretchParams::new(1.05)
+            .with_sample_rate(44100)
+            .with_channels(1)
+            .with_fft_size(1024)
+            .with_hop_size(256);
+        let mut proc = StreamProcessor::new(params);
+        proc.set_control_path(ControlPath::VarispeedFirst).unwrap();
+
+        let sine: Vec<f32> = (0..131_072)
+            .map(|i| (2.0 * PI * 220.0 * i as f32 / 44100.0).sin() * 0.5)
+            .collect();
+        let target = 88_200usize;
+        let preroll_frames = proc.warm_start_preroll_frames().min(target);
+        let preroll = &sine[target - preroll_frames..target];
+        proc.warm_start_seek(target, preroll).unwrap();
+
+        let mut output: Vec<f32> = Vec::with_capacity(65_536);
+        for chunk in sine[target..target + 8192].chunks(512) {
+            proc.process_into(chunk, &mut output).unwrap();
+        }
+        assert!(
+            !output.is_empty(),
+            "warm-started varispeed stream must produce output promptly"
+        );
+        let pos = proc.source_position();
+        assert!(
+            pos >= target - preroll_frames && pos <= target + 8192,
+            "source position {} outside plausible window around target {}",
+            pos,
+            target
         );
     }
 }

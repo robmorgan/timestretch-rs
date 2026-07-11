@@ -81,3 +81,8 @@ required-features = ["qa-harnesses"]
 name = "quality_gates"
 path = "tests/quality_gates.rs"
 required-features = ["qa-harnesses"]
+
+[[test]]
+name = "varispeed_keylock"
+path = "qa/varispeed_keylock.rs"
+required-features = ["qa-harnesses"]

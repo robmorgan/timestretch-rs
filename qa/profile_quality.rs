@@ -395,3 +395,126 @@ fn multi_res_engine_quality_rows() {
         single_bands.sub_bass
     );
 }
+
+/// Streams `input` at a fixed off-unity ratio on a selected control path.
+fn stream_steady_with_path(
+    input: &[f32],
+    params: StretchParams,
+    ratio: f64,
+    path: timestretch::ControlPath,
+) -> Vec<f32> {
+    let mut processor = StreamProcessor::new(params.with_stretch_ratio(ratio));
+    processor
+        .set_control_path(path)
+        .expect("control path accepted");
+    let mut output = Vec::with_capacity(input.len() * 2);
+    for chunk in input.chunks(CHUNK) {
+        let rendered = processor.process(chunk).expect("stream chunk");
+        output.extend_from_slice(&rendered);
+    }
+    let tail = processor.flush().expect("flush");
+    output.extend_from_slice(&tail);
+    output
+}
+
+/// Streams `input` under the DJ ratio ride on a selected control path.
+fn stream_ride_with_path(
+    input: &[f32],
+    params: StretchParams,
+    path: timestretch::ControlPath,
+) -> Vec<f32> {
+    let mut processor = StreamProcessor::new(params);
+    processor
+        .set_control_path(path)
+        .expect("control path accepted");
+    let mut output = Vec::with_capacity(input.len() * 2);
+    for (ci, chunk) in input.chunks(CHUNK).enumerate() {
+        let t = (ci * CHUNK) as f64 / SAMPLE_RATE as f64;
+        let ratio = 1.0 + 0.08 * (TWO_PI as f64 * t / 2.0).sin();
+        processor.set_stretch_ratio(ratio).expect("valid ratio");
+        let rendered = processor.process(chunk).expect("stream chunk");
+        output.extend_from_slice(&rendered);
+    }
+    let tail = processor.flush().expect("flush");
+    output.extend_from_slice(&tail);
+    output
+}
+
+/// Stage 15 A/B gate: the varispeed-first control path must not regress
+/// streaming quality against the vocoder-tempo path on the profile rows —
+/// steady ratio and the DJ ratio ride — and may not click.
+#[test]
+fn control_path_quality_ab_rows() {
+    use timestretch::ControlPath;
+
+    let edm = generate_edm_signal(6.0);
+    let ratio = 1.05;
+    let epsilon = 0.002;
+
+    for &profile in StreamProfile::ALL {
+        let vocoder = stream_steady_with_path(
+            &edm,
+            profile_params(profile),
+            ratio,
+            ControlPath::VocoderTempo,
+        );
+        let varispeed = stream_steady_with_path(
+            &edm,
+            profile_params(profile),
+            ratio,
+            ControlPath::VarispeedFirst,
+        );
+        let vocoder_sim = similarity_to_source(&edm, &vocoder);
+        let varispeed_sim = similarity_to_source(&edm, &varispeed);
+        let varispeed_clicks = click_count(&varispeed[4096..], 0.5);
+        println!(
+            "METRIC steady_similarity_{}_vocoder={:.4} varispeed={:.4} varispeed_clicks={}",
+            profile.label().to_lowercase(),
+            vocoder_sim,
+            varispeed_sim,
+            varispeed_clicks
+        );
+        assert_eq!(
+            varispeed_clicks, 0,
+            "{profile} varispeed clicked at steady ratio"
+        );
+        assert!(
+            varispeed_sim + epsilon >= vocoder_sim,
+            "{profile} varispeed steady similarity ({:.4}) fell below vocoder path ({:.4})",
+            varispeed_sim,
+            vocoder_sim
+        );
+        assert!(
+            varispeed_sim >= 0.985,
+            "{profile} varispeed steady similarity floor violated: {:.4}",
+            varispeed_sim
+        );
+
+        let vocoder_ride =
+            stream_ride_with_path(&edm, profile_params(profile), ControlPath::VocoderTempo);
+        let varispeed_ride =
+            stream_ride_with_path(&edm, profile_params(profile), ControlPath::VarispeedFirst);
+        let vocoder_ride_sim = similarity_to_source(&edm, &vocoder_ride);
+        let varispeed_ride_sim = similarity_to_source(&edm, &varispeed_ride);
+        let ride_clicks = click_count(&varispeed_ride[4096..], 0.5);
+        println!(
+            "METRIC ride_similarity_{}_vocoder={:.4} varispeed={:.4} varispeed_clicks={}",
+            profile.label().to_lowercase(),
+            vocoder_ride_sim,
+            varispeed_ride_sim,
+            ride_clicks
+        );
+        assert_eq!(ride_clicks, 0, "{profile} varispeed clicked under ride");
+        assert!(
+            varispeed_ride_sim + epsilon >= vocoder_ride_sim,
+            "{profile} varispeed ride similarity ({:.4}) fell below vocoder path ({:.4})",
+            varispeed_ride_sim,
+            vocoder_ride_sim
+        );
+        assert!(
+            varispeed_ride_sim >= 0.985,
+            "{profile} varispeed ride similarity floor violated: {:.4}",
+            varispeed_ride_sim
+        );
+    }
+}

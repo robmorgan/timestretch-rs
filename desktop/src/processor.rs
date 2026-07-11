@@ -122,7 +122,9 @@ pub fn start_processing_thread(
             if let Some(loop_start) = loop_wrap_target(src_pos, loop_region) {
                 src_pos = loop_start * CHANNELS as usize;
                 processor.notify_source_jump(loop_start);
-                position.store(loop_start);
+                // The playhead follows via the audible-position tracking
+                // below: buffered pre-wrap audio keeps its old positions
+                // until it has actually played out.
             }
 
             if src_pos >= source_audio.len() {
@@ -160,9 +162,6 @@ pub fn start_processing_thread(
             let chunk = &source_audio[src_pos..end];
             src_pos = end;
 
-            let frame_pos = src_pos / CHANNELS as usize;
-            position.store(frame_pos);
-
             processed_chunk.clear();
             match process_input_chunk(&mut processor, chunk, &mut processed_chunk) {
                 Ok(()) => {
@@ -176,6 +175,18 @@ pub fn start_processing_thread(
                 }
                 Err(e) => log::error!("Stream processing error: {e}"),
             }
+
+            // Playhead: the audible source position, not the feed cursor.
+            // Under the varispeed-first path input frames fed no longer map
+            // linearly to output time, so derive it from the processor's
+            // source timeline minus the not-yet-audible output backlog
+            // (pending output plus the producer ring), mapped back to source
+            // frames at the current ratio.
+            position.store(audible_position_frames(
+                &processor,
+                producer.occupied_len(),
+                stretch_ratio,
+            ));
         }
 
         stream_active.store(false, Ordering::Relaxed);
@@ -244,6 +255,7 @@ fn build_processor(
     let ratio = st.stretch_ratio;
     let pitch_semi = st.pitch_semitones;
     let engine = st.streaming_engine;
+    let control_path = st.control_path;
     let params = desktop_stream_params(&st, sample_rate);
     drop(st);
 
@@ -256,12 +268,11 @@ fn build_processor(
     if let Err(err) = processor.set_streaming_engine(engine) {
         log::warn!("streaming engine {engine:?} unavailable, using deterministic: {err}");
     }
-    let preroll = startup_preroll_target_samples(&processor);
-
-    // Publish the effective latency for the UI's profile selector.
-    {
-        let mut st = state.lock().unwrap();
-        st.reported_latency_secs = processor.latency_secs();
+    // Control-path selection is likewise build-time. Varispeed-first needs
+    // the ratio within [0.25, 4.0]; outside it the build keeps the vocoder
+    // path (the UI keeps ratios well inside, so this only covers races).
+    if let Err(err) = processor.set_control_path(control_path) {
+        log::warn!("control path {control_path:?} unavailable, using vocoder tempo: {err}");
     }
     // Anchor the fresh processor to its position in the source so
     // pre-analysis artifact positions stay aligned across seek/preset/EOF
@@ -275,6 +286,15 @@ fn build_processor(
     let pitch_scale = 2.0_f64.powf(pitch_semi as f64 / 12.0);
     if let Err(err) = processor.set_pitch_scale(pitch_scale) {
         log::warn!("failed to apply initial pitch scale {pitch_scale}: {err}");
+    }
+    // Preroll and the published latency split reflect the applied control
+    // targets (ratio/pitch engagement changes the resampler lookaheads).
+    let preroll = startup_preroll_target_samples(&processor);
+    {
+        let report = processor.latency_report();
+        let mut st = state.lock().unwrap();
+        st.reported_latency_secs = report.pipeline_delay_secs();
+        st.reported_control_latency_secs = report.control_to_audio_secs();
     }
 
     (processor, preroll)
@@ -333,6 +353,22 @@ fn desktop_stream_params(st: &crate::state::SharedState, sample_rate: u32) -> St
         params = params.with_pre_analysis((**artifact).clone());
     }
     params
+}
+
+/// Audible source position in frames: the processor's consumed-source
+/// timeline minus the output-side backlog (processor pending output plus
+/// the playback ring), converted from output frames back to source frames
+/// at the current ratio.
+fn audible_position_frames(
+    processor: &StreamProcessor,
+    ring_occupied_samples: usize,
+    ratio: f64,
+) -> usize {
+    let ch = CHANNELS as usize;
+    let (_, pending_samples, _, _) = processor.capacities();
+    let backlog_frames = (pending_samples + ring_occupied_samples) / ch;
+    let backlog_source = (backlog_frames as f64 / ratio.max(0.01)) as usize;
+    processor.source_position().saturating_sub(backlog_source)
 }
 
 fn startup_preroll_target_samples(processor: &StreamProcessor) -> usize {
@@ -537,10 +573,17 @@ mod tests {
             StreamingEngine::MultiResolution
         );
         // Club multi-res gate: 1.5x the 8192 sub-bass FFT, published to the
-        // UI's latency chip via reported_latency_secs.
-        assert_eq!(processor.latency_samples(), 12_288);
+        // UI's latency chip via reported_latency_secs. On the default
+        // varispeed path the report honestly adds the input resampler's
+        // kernel lookahead on top of the gate.
+        let report = processor.latency_report();
+        assert_eq!(report.effective_gate_frames, 12_288);
+        assert_eq!(
+            processor.latency_samples(),
+            12_288 + report.varispeed_lookahead_samples + report.pitch_lookahead_samples
+        );
         let reported = state.lock().unwrap().reported_latency_secs;
-        assert!((reported - 12_288.0 / 44_100.0).abs() < 1e-9);
+        assert!((reported - processor.latency_samples() as f64 / 44_100.0).abs() < 1e-9);
 
         // Live rejects multi-res; the build must fall back to deterministic
         // instead of failing, and report the deterministic gate.
@@ -550,13 +593,60 @@ mod tests {
         }
         let (processor, _preroll) = build_processor(&state, 44_100, 0);
         assert_eq!(processor.streaming_engine(), StreamingEngine::Deterministic);
-        assert_eq!(processor.latency_samples(), 1024 * 3 / 2);
+        assert_eq!(
+            processor.latency_report().effective_gate_frames,
+            1024 * 3 / 2
+        );
     }
 
     #[test]
     fn desktop_default_profile_is_club() {
         let state = SharedState::new();
         assert_eq!(state.stream_profile, StreamProfile::Club);
+    }
+
+    #[test]
+    fn desktop_default_control_path_is_varispeed_first() {
+        let state = SharedState::new();
+        assert_eq!(
+            state.control_path,
+            crate::state::ControlPath::VarispeedFirst
+        );
+    }
+
+    #[test]
+    fn desktop_build_applies_varispeed_path_and_falls_back_out_of_range() {
+        use crate::state::ControlPath;
+        use std::sync::{Arc, Mutex};
+
+        let mut st = SharedState::new();
+        st.preset = PresetChoice::DjBeatmatch;
+        st.stream_profile = StreamProfile::Live;
+        st.detected_bpm = 126.0;
+        st.target_bpm = 128.0;
+        let state: SharedStateHandle = Arc::new(Mutex::new(st));
+
+        let (processor, _preroll) = build_processor(&state, 44_100, 0);
+        assert_eq!(processor.control_path(), ControlPath::VarispeedFirst);
+        // The latency split is published: tempo control latency collapses to
+        // the resampler lookahead while the pipeline delay stays the gate.
+        let (pipeline, control) = {
+            let st = state.lock().unwrap();
+            (st.reported_latency_secs, st.reported_control_latency_secs)
+        };
+        assert!(pipeline >= (1024.0 * 1.5) / 44_100.0);
+        assert!(control < 0.005, "tempo control latency should be ~0");
+
+        // A ratio outside the varispeed range keeps the vocoder path.
+        {
+            let mut st = state.lock().unwrap();
+            st.preset = PresetChoice::HouseLoop;
+            st.target_bpm = 0.0;
+            st.detected_bpm = 0.0;
+            st.stretch_ratio = 6.0;
+        }
+        let (processor, _preroll) = build_processor(&state, 44_100, 0);
+        assert_eq!(processor.control_path(), ControlPath::VocoderTempo);
     }
 
     #[test]
