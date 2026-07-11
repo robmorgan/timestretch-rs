@@ -11,6 +11,7 @@ benchmarks/
   audio/                 # NOT checked into git
     originals/           # Place original WAV files here
     references/          # Place professionally-stretched WAVs here
+    bpm-corpus/          # Place BPM-accuracy corpus tracks here (wav/mp3/aiff)
     output/              # Library output written during benchmark runs
 ```
 
@@ -39,6 +40,39 @@ benchmarks/
    - `target_bpm` - Target tempo the reference was stretched to
    - `software` - Software used (e.g., "Ableton Live 11")
    - `algorithm` - Algorithm/mode used (e.g., "Complex Pro")
+
+## BPM Accuracy Corpus
+
+The BPM accuracy harness (`qa/bpm_accuracy.rs`) scores tempo detection against
+every manifest track with a `bpm` field. To grow the corpus beyond the
+reference tracks, add `bpm_only = true` entries — these carry no stretched
+references, may be `.wav`, `.mp3`, or `.aiff`, and are ignored by the
+reference quality benchmark:
+
+1. Drop the audio file under `benchmarks/audio/bpm-corpus/`.
+2. Compute its hash: `shasum -a 256 benchmarks/audio/bpm-corpus/<file>`.
+3. Add a manifest entry:
+
+   ```toml
+   [[track]]
+   id = "dark-techno-01"
+   description = "Dark techno, 140 BPM"
+   original = "bpm-corpus/dark_techno_01.mp3"
+   original_sha256 = "<sha256 of audio file>"
+   bpm = 140.0
+   bpm_only = true
+   ```
+
+4. Run the harness:
+
+   ```bash
+   cargo test --features qa-harnesses --release --test bpm_accuracy -- --nocapture
+   ```
+
+Per-track `METRIC` lines and a `SUMMARY` line (acc1 = % within ±2%,
+acc2 = % allowing octave errors) are printed, and a JSON report is written to
+`target/bpm_accuracy_report.json` for diffing between detector changes. See
+`qa/README.md` for the harness's environment variables.
 
 ## Running Benchmarks
 
