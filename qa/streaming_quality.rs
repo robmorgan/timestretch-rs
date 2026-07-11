@@ -142,8 +142,8 @@ fn spectral_centroid(signal: &[f32], sample_rate: u32, fft_size: usize) -> f64 {
             buf[i] = Complex::new(s * w, 0.0);
         }
         fft.process(&mut buf);
-        for bin in 0..num_bins {
-            let mag = buf[bin].norm() as f64;
+        for (bin, value) in buf.iter().enumerate().take(num_bins) {
+            let mag = value.norm() as f64;
             total_weighted += mag * (bin as f64 * bin_freq);
             total_mag += mag;
         }
@@ -322,7 +322,8 @@ fn streaming_quality_benchmark() {
     let harmonic = generate_harmonic_signal(SAMPLE_RATE, 5.0);
     let percussive = generate_percussive_signal(SAMPLE_RATE, 5.0);
 
-    let cases: Vec<(&str, &[f32], f64, EdmPreset, Vec<f32>)> = vec![
+    type Case<'a> = (&'static str, &'a [f32], f64, EdmPreset, Vec<f32>);
+    let cases: Vec<Case> = vec![
         ("edm", &edm, 1.02, EdmPreset::DjBeatmatch, vec![60.0, 300.0]),
         ("edm", &edm, 1.5, EdmPreset::HouseLoop, vec![60.0, 300.0]),
         ("edm", &edm, 2.0, EdmPreset::Halftime, vec![60.0, 300.0]),
@@ -840,7 +841,7 @@ fn streaming_modulation_quality_benchmark() {
         max_slew
     );
     assert!(
-        overtrigger_ratio <= 2.0 && overtrigger_ratio >= 0.4,
+        (0.4..=2.0).contains(&overtrigger_ratio),
         "reset over/under-trigger out of range: {:.3}",
         overtrigger_ratio
     );
