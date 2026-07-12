@@ -170,11 +170,11 @@ audible end-to-end result in the desktop app in the first stage.
 - Tape-mode modulation torture (nudge/ride/snap): clicks = 0.
 - Old-engine CI suites untouched and green.
 
-## [ ] Stage 2: Keylock Chain — Band Split and High-Band Small-FFT PV Corrector
+## [x] Stage 2: Keylock Chain — Band Split and High-Band Small-FFT PV Corrector
 
 Automation: auto
 
-> **Status (2026-07-12):** implementation landed. Chain:
+> **Completed 2026-07-12** (commit `0033214`). Chain:
 > `src/engine/stages/{band_split,delay,pv_corrector,keylock}.rs`, composed
 > as the `Keylock` profile; PV at FFT 512 / hop 128, identity locking,
 > transposition delay-matched via `TimelineMap::rate_at` through the new
@@ -194,16 +194,19 @@ Automation: auto
 > additionally carries the LR8's ~5.5 ms dispersive group delay at DC —
 > filter physics, documented in the gate).
 >
-> **Falsification experiment (metric half):** a pure tone exactly at the
-> 150 Hz seam at rate 1.06 re-sums at −3.0 dB with 39 % envelope beating —
-> the expected power-sum of two copies detuned by the un-keylocked low
-> band; narrow-band by construction (LR8 overlap). Gated as a regression
-> envelope, not a defect. **Listening half pending:** A/B pairs (new
-> two-band keylock vs old full-band keylock) on bass-heavy material at
-> ±8 % and ±20 % are rendered by
-> `cargo test --features qa-harnesses --release --test engine_keylock -- --ignored`
-> into `target/keylock_falsification/` — the audibility verdict and the
-> final cutoff choice are recorded here after the owner listen.
+> **Falsification experiment — result: the bet holds.** Metric half: a
+> pure tone exactly at the 150 Hz seam at rate 1.06 re-sums at −3.0 dB
+> with 39 % envelope beating — the expected power-sum of two copies
+> detuned by the un-keylocked low band; narrow-band by construction (LR8
+> overlap). Gated as a regression envelope, not a defect. Listening half
+> (owner, 2026-07-12, A/B pairs new two-band vs old full-band keylock on
+> bass-heavy material at ±8 % and ±20 %, rendered by the ignored
+> `engine_keylock` test into `target/keylock_falsification/`): **the new
+> keylock sounds better — less bit-crushing / artifact sound** than the
+> old full-band correction; the un-keylocked low band was not the
+> audible problem, the vocoder-processed sub was. The ~150 Hz cutoff is
+> kept (final settlement with corpus evidence stays a Stage 7 item); the
+> period-tracking low-band-corrector fallback is not needed.
 
 ### Why
 
