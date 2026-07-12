@@ -1,5 +1,10 @@
 # timestretch
 
+[![crates.io](https://img.shields.io/crates/v/timestretch.svg)](https://crates.io/crates/timestretch)
+[![docs.rs](https://docs.rs/timestretch/badge.svg)](https://docs.rs/timestretch)
+[![CI](https://github.com/robmorgan/timestretch-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/robmorgan/timestretch-rs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure Rust audio time-stretching library optimized for electronic dance music.
 
 Stretches audio in time without changing its pitch, using a hybrid algorithm that
@@ -49,7 +54,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-timestretch = "0.5.0"
+timestretch = "0.6.0"
 ```
 
 ### One-Shot Stretching
