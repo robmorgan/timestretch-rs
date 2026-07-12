@@ -2,6 +2,7 @@ mod app;
 mod audio_engine;
 mod decoder;
 mod processor;
+mod pull_deck;
 mod state;
 mod waveform;
 

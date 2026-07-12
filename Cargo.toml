@@ -92,3 +92,8 @@ required-features = ["qa-harnesses"]
 name = "varispeed_keylock"
 path = "qa/varispeed_keylock.rs"
 required-features = ["qa-harnesses"]
+
+[[test]]
+name = "engine_ab"
+path = "qa/engine_ab.rs"
+required-features = ["qa-harnesses"]

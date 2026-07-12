@@ -99,6 +99,21 @@ Dependencies form a line: 1 → 2 → 3 → 4 → 5 → 6 → 7 → {8, 9}, with
 
 Automation: auto
 
+> **Status (2026-07-12):** implementation landed. `src/engine/` (stage
+> trait, SPSC mailbox + `EngineController`/`EngineProcessor` split, source
+> ring with underrun policy and `TimelineMap` port of `RatioMapFifo`,
+> varispeed head, Tape profile), desktop pull-native path behind a new
+> "Deck" selector (`desktop/src/pull_deck.rs`, `AudioEngine::new_pull`),
+> and the A/B adapter (`qa/ab/mod.rs`, smoke harness `qa/engine_ab.rs`).
+> Ported gates pass: zero-alloc steady state under per-callback retargets
+> (`tests/engine_realtime_allocations.rs`), first-sample-out == reported
+> latency (0) and control-to-audio ≤ lookahead + one callback
+> (`tests/engine_latency.rs`), tape torture clicks = 0 at 1.5x/1.1x
+> theoretical slew vs the old engine's 6x/1.5x bounds
+> (`tests/engine_modulation_torture.rs`). Old-engine suites untouched and
+> green. **Remaining for exit:** owner listening check — desktop audibly
+> playing a real track through the pull deck at 0.5–2.0x.
+
 ### Why
 
 Everything downstream depends on three structural decisions that must be

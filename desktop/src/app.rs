@@ -7,6 +7,7 @@ use std::thread::JoinHandle;
 use crate::audio_engine::AudioEngine;
 use crate::decoder;
 use crate::processor;
+use crate::pull_deck;
 use crate::state::*;
 use crate::waveform::{self, WaveformPeaks};
 
@@ -57,6 +58,7 @@ pub struct TimeStretchApp {
     stream_profile: StreamProfile,
     streaming_engine: StreamingEngine,
     control_path: ControlPath,
+    deck_engine: DeckEngine,
     target_bpm_text: String,
 
     // Error messages
@@ -67,6 +69,10 @@ impl TimeStretchApp {
     /// Widest stretch ratio the active tempo path supports.
     #[inline]
     fn max_stretch_ratio(&self) -> f64 {
+        if self.deck_engine == DeckEngine::PullTape {
+            // The pull engine's tempo axis is the varispeed resampler.
+            return MAX_VARISPEED_RATIO;
+        }
         match self.control_path {
             ControlPath::VarispeedFirst => MAX_VARISPEED_RATIO,
             ControlPath::VocoderTempo => MAX_STRETCH_RATIO,
@@ -134,6 +140,7 @@ impl TimeStretchApp {
             stream_profile: StreamProfile::Live,
             streaming_engine: StreamingEngine::Deterministic,
             control_path: ControlPath::VarispeedFirst,
+            deck_engine: DeckEngine::Legacy,
             target_bpm_text: String::new(),
             error_message: None,
         }
@@ -247,6 +254,13 @@ impl TimeStretchApp {
             st.sample_rate
         };
 
+        match self.deck_engine {
+            DeckEngine::Legacy => self.start_legacy_playback(source, sample_rate),
+            DeckEngine::PullTape => self.start_pull_playback(source, sample_rate),
+        }
+    }
+
+    fn start_legacy_playback(&mut self, source: Arc<Vec<f32>>, sample_rate: u32) {
         // Create audio engine with ring buffer, matching the source file's sample rate
         // so playback speed is correct regardless of the device's native rate.
         let flush_ring = Arc::new(AtomicBool::new(false));
@@ -283,6 +297,69 @@ impl TimeStretchApp {
             self.stream_active.clone(),
             stop_flag,
             flush_ring,
+        );
+
+        self.processing_handle = Some(handle);
+    }
+
+    /// Pull-native playback on the new engine (ROADMAP new Stage 1): the
+    /// audio callback owns the processor and pulls; the feed thread keeps
+    /// the source ring topped up and forwards tempo control.
+    fn start_pull_playback(&mut self, source: Arc<Vec<f32>>, sample_rate: u32) {
+        let initial_ratio = {
+            let st = self.state.lock().unwrap();
+            st.stretch_ratio
+        };
+        let config = timestretch::engine::EngineConfig {
+            sample_rate,
+            channels: 2,
+            profile: timestretch::engine::EngineProfile::Tape,
+            initial_tempo_rate: 1.0 / initial_ratio.clamp(0.25, MAX_VARISPEED_RATIO),
+            max_block_frames: 2048,
+            source_capacity_frames: 65_536,
+        };
+        let handles = match timestretch::engine::Engine::build(config) {
+            Ok(h) => h,
+            Err(e) => {
+                self.error_message = Some(format!("Engine error: {e}"));
+                return;
+            }
+        };
+
+        let reset_request = Arc::new(AtomicBool::new(false));
+        let engine = match AudioEngine::new_pull(
+            self.state.clone(),
+            self.stream_active.clone(),
+            Some(sample_rate),
+            handles.processor,
+            reset_request.clone(),
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                self.error_message = Some(format!("Audio error: {e}"));
+                return;
+            }
+        };
+        self.audio_engine = Some(engine);
+
+        {
+            let mut st = self.state.lock().unwrap();
+            st.transport = Transport::Playing;
+            st.total_frames = source.len() / 2;
+        }
+
+        let stop_flag = Arc::new(StopFlag::new());
+        self.stop_flag = Some(stop_flag.clone());
+
+        let handle = pull_deck::start_pull_deck_thread(
+            self.state.clone(),
+            source,
+            handles.source,
+            handles.controller,
+            self.position.clone(),
+            self.stream_active.clone(),
+            stop_flag,
+            reset_request,
         );
 
         self.processing_handle = Some(handle);
@@ -655,6 +732,47 @@ impl TimeStretchApp {
                 });
                 ui.end_row();
 
+                // Deck engine: the frozen push pipeline vs the new pull
+                // engine (tape mode). Switching stops playback — the two
+                // pipelines are wired completely differently.
+                ui.label("Deck:");
+                ui.horizontal(|ui| {
+                    let old_deck = self.deck_engine;
+                    egui::ComboBox::from_id_salt("deck_engine_combo")
+                        .selected_text(self.deck_engine.label())
+                        .show_ui(ui, |ui| {
+                            for deck in [DeckEngine::Legacy, DeckEngine::PullTape] {
+                                ui.selectable_value(&mut self.deck_engine, deck, deck.label());
+                            }
+                        });
+                    if self.deck_engine != old_deck {
+                        // The pull engine bounds the tempo ratio to the
+                        // varispeed range; pull the fader back in first.
+                        let clamped = self.clamp_stretch_ratio(self.stretch_ratio);
+                        if (clamped - self.stretch_ratio).abs() > f64::EPSILON {
+                            let detected = self.state.lock().unwrap().detected_bpm;
+                            if detected > 0.0 {
+                                self.apply_target_bpm(detected, detected / clamped);
+                            } else {
+                                self.stretch_ratio = clamped;
+                                self.state.lock().unwrap().stretch_ratio = clamped;
+                            }
+                        }
+                        self.state.lock().unwrap().deck_engine = self.deck_engine;
+                        self.stop_playback();
+                    }
+                    if self.deck_engine == DeckEngine::PullTape {
+                        ui.label(egui::RichText::new("tape: pitch follows tempo").weak())
+                            .on_hover_text(
+                                "New pull-based engine (roadmap Stage 1): zero pipeline \
+                                 delay, sample-accurate tempo, no keylock yet. The \
+                                 Preset, Playback, Engine, Tempo Path, and Pitch \
+                                 controls apply to the legacy deck only.",
+                            );
+                    }
+                });
+                ui.end_row();
+
                 ui.label("Playback:");
                 ui.horizontal(|ui| {
                     let old_profile = self.stream_profile;
@@ -794,25 +912,31 @@ impl TimeStretchApp {
                 });
                 ui.end_row();
 
-                // Pitch shift (realtime: applied live by the stream processor)
+                // Pitch shift (realtime: applied live by the stream
+                // processor). Legacy deck only — in the pull engine's tape
+                // mode pitch follows tempo by design.
                 ui.label("Pitch Shift:");
-                ui.horizontal(|ui| {
-                    let old_pitch = self.pitch_semitones;
-                    ui.add(
-                        egui::Slider::new(&mut self.pitch_semitones, -12.0..=12.0)
-                            .text("st")
-                            .fixed_decimals(1),
-                    );
-                    if (self.pitch_semitones - old_pitch).abs() > 0.001 {
-                        let mut st = self.state.lock().unwrap();
-                        st.pitch_semitones = self.pitch_semitones;
-                    }
-                    if ui.button("Reset").clicked() && self.pitch_semitones.abs() > 0.001 {
-                        self.pitch_semitones = 0.0;
-                        let mut st = self.state.lock().unwrap();
-                        st.pitch_semitones = 0.0;
-                    }
-                });
+                ui.add_enabled_ui(self.deck_engine == DeckEngine::Legacy, |ui| {
+                    ui.horizontal(|ui| {
+                        let old_pitch = self.pitch_semitones;
+                        ui.add(
+                            egui::Slider::new(&mut self.pitch_semitones, -12.0..=12.0)
+                                .text("st")
+                                .fixed_decimals(1),
+                        );
+                        if (self.pitch_semitones - old_pitch).abs() > 0.001 {
+                            let mut st = self.state.lock().unwrap();
+                            st.pitch_semitones = self.pitch_semitones;
+                        }
+                        if ui.button("Reset").clicked() && self.pitch_semitones.abs() > 0.001 {
+                            self.pitch_semitones = 0.0;
+                            let mut st = self.state.lock().unwrap();
+                            st.pitch_semitones = 0.0;
+                        }
+                    });
+                })
+                .response
+                .on_disabled_hover_text("Tape mode: pitch follows tempo");
                 ui.end_row();
 
                 // Volume
