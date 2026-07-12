@@ -5,6 +5,11 @@
 # these, processes the original with each EDM preset, and compares the output
 # against the professional references using spectral and temporal metrics.
 #
+# Every track with a `bpm` field is also scored by the BPM accuracy harness
+# (qa/bpm_accuracy.rs). Tracks marked `bpm_only = true` exist purely for that
+# harness: they carry no stretched references, may be .wav, .mp3, or .aiff,
+# and are ignored by the reference quality benchmark (even in strict mode).
+#
 # Audio files are NOT checked into git (see .gitignore). Place them under
 # benchmarks/audio/ as described in benchmarks/README.md.
 
@@ -31,6 +36,18 @@
 #   software = "Serato DJ Pro"
 #   algorithm = "Default"
 
+# --- Example BPM-corpus entry (BPM accuracy harness only) ---
+#
+# Compute the hash with: shasum -a 256 <file>
+#
+# [[track]]
+# id = "dark-techno-01"
+# description = "Dark techno, 140 BPM"
+# original = "bpm-corpus/dark_techno_01.mp3"
+# original_sha256 = "<sha256 of audio file>"
+# bpm = 140.0
+# bpm_only = true
+
 [[track]]
 id = "music-sounds-better-with-you"
 description = "Music Sounds Better With You (Original Mix), 124 BPM, stereo"
@@ -44,3 +61,4 @@ bpm = 124.0
   target_bpm = 115.0
   software = "Ableton Live 11"
   algorithm = "Complex Pro"
+

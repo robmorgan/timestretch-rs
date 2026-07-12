@@ -134,6 +134,9 @@ pub struct PhaseVocoder {
     ratio_change_phase_total_frames: usize,
     /// Initial seam-hold frames that should stay pinned to `ratio_change_phase_from`.
     ratio_change_phase_hold_frames: usize,
+    /// Ratio updates arrive as a smooth small-step stream; skip the
+    /// continuity-focus seam machinery (see `set_smooth_ratio_updates`).
+    smooth_ratio_updates: bool,
     /// Whether spectral envelope preservation is enabled.
     envelope_preservation: bool,
     /// Envelope correction strength (0 = off, 1 = full, >1 stronger).
@@ -395,6 +398,7 @@ impl PhaseVocoder {
             ratio_change_phase_frames: 0,
             ratio_change_phase_total_frames: 0,
             ratio_change_phase_hold_frames: 0,
+            smooth_ratio_updates: false,
             envelope_preservation,
             envelope_strength: 1.0,
             adaptive_envelope_order: true,
@@ -461,14 +465,42 @@ impl PhaseVocoder {
         self.sub_bass_bin
     }
 
+    /// Declares that runtime ratio updates arrive as a smooth, small-step
+    /// stream (e.g. the varispeed-first control path's delay-matched
+    /// transposition) rather than as discrete automation jumps.
+    ///
+    /// Disables the ratio-change continuity-focus machinery: phase advance
+    /// always follows the current hop ratio instead of slewing from (or
+    /// holding at) a previous ratio to mask a seam. Under continuous
+    /// modulation the seam-masking slew reads as sustained pitch deviation
+    /// on tonal content, which smooth callers must not pay — their per-render
+    /// deltas are too small to produce an audible seam in the first place.
+    #[inline]
+    pub fn set_smooth_ratio_updates(&mut self, smooth: bool) {
+        self.smooth_ratio_updates = smooth;
+        if smooth {
+            self.ratio_change_phase_frames = 0;
+            self.ratio_change_phase_total_frames = 0;
+            self.ratio_change_phase_hold_frames = 0;
+            self.ratio_change_phase_from = self.stretch_ratio;
+        }
+    }
+
     /// Updates the stretch ratio without resetting phase state.
     ///
     /// This recalculates the synthesis hop size from the new ratio while
     /// preserving all accumulated phase information. Meaningful runtime ratio
     /// steps also engage a short continuity-focus window so the first few
-    /// post-change frames prefer tighter phase coherence at the seam.
+    /// post-change frames prefer tighter phase coherence at the seam (unless
+    /// [`Self::set_smooth_ratio_updates`] is active).
     #[inline]
     pub fn set_stretch_ratio(&mut self, stretch_ratio: f64) {
+        if self.smooth_ratio_updates {
+            self.stretch_ratio = stretch_ratio;
+            self.hop_synthesis = (self.hop_analysis as f64 * stretch_ratio).round() as usize;
+            self.ratio_change_phase_from = stretch_ratio;
+            return;
+        }
         let prior_ratio = self.stretch_ratio;
         let ratio_delta = (stretch_ratio - prior_ratio).abs();
         let in_flight_phase_ratio = self.continuity_focus_phase_ratio(prior_ratio);
@@ -936,6 +968,35 @@ impl PhaseVocoder {
             self.stretch_ratio,
         );
         Ok(output)
+    }
+
+    /// Pre-allocates all streaming-path buffers for a maximum input window.
+    ///
+    /// Call once at build time with the caller's rolling-window capacity so
+    /// [`Self::process_streaming_into`] performs no allocations afterwards,
+    /// even as the stretch ratio moves (bounded by `max_ratio`) and the
+    /// render window size varies between calls. Mirrors
+    /// `MultiResolutionStretcher::reserve_streaming_capacity`.
+    pub fn reserve_streaming_capacity(&mut self, max_window_frames: usize, max_ratio: f64) {
+        fn reserve_to(buf: &mut Vec<f32>, capacity: usize) {
+            if buf.capacity() < capacity {
+                buf.reserve(capacity - buf.len());
+            }
+        }
+        let ratio_mult = (max_ratio.max(1.0).ceil() as usize).saturating_add(1);
+        let out_bound = max_window_frames
+            .saturating_mul(ratio_mult)
+            .saturating_add(self.fft_size.saturating_mul(2));
+        reserve_to(&mut self.output_buf, out_bound);
+        reserve_to(&mut self.window_sum_buf, out_bound);
+        reserve_to(&mut self.streaming_accum_output, out_bound);
+        reserve_to(&mut self.streaming_accum_window_sum, out_bound);
+        reserve_to(&mut self.streaming_tail, out_bound);
+        reserve_to(&mut self.streaming_tail_window_sum, out_bound);
+        let num_bins = self.fft_size / 2 + 1;
+        if self.peaks.capacity() < num_bins {
+            self.peaks.reserve(num_bins - self.peaks.len());
+        }
     }
 
     /// Streaming phase-vocoder pass that preserves phase across calls.

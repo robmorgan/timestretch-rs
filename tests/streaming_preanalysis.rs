@@ -2,7 +2,7 @@
 //! artifact-driven transient handling.
 
 use std::f32::consts::PI;
-use timestretch::{analyze_for_dj, EdmPreset, StreamProcessor, StretchParams};
+use timestretch::{analyze_for_dj, ControlPath, EdmPreset, StreamProcessor, StretchParams};
 
 const SR: u32 = 44_100;
 const CHUNK: usize = 1024;
@@ -275,6 +275,56 @@ fn test_artifact_low_band_resets_suppressed_during_ratio_glide() {
 }
 
 #[test]
+fn test_varispeed_artifact_onsets_fire_once_at_source_positions_under_ride() {
+    let input = click_train(SR, 128.0, 4.0);
+    let artifact = analyze_for_dj(&input, SR);
+    assert!(artifact.transient_onsets.len() >= 6);
+
+    let params = stream_params(1.06)
+        .with_pre_analysis(artifact.clone())
+        .with_beat_snap_confidence_threshold(0.1);
+    let mut processor = StreamProcessor::new(params);
+    processor
+        .set_control_path(ControlPath::VarispeedFirst)
+        .expect("varispeed path");
+
+    // Ride the tempo 1.02..1.10 with sample-accurate retargets every chunk;
+    // onset positions are source frames, so the resampled->source mapping
+    // must keep them firing exactly once each despite the moving ratio.
+    let mut output = Vec::with_capacity(input.len() * 6);
+    for (i, chunk) in input.chunks(CHUNK).enumerate() {
+        let t = i as f64 * CHUNK as f64 / SR as f64;
+        processor
+            .set_stretch_ratio(1.06 + 0.04 * (2.0 * std::f64::consts::PI * t / 2.0).sin())
+            .expect("ride ratio");
+        processor.process_into(chunk, &mut output).expect("process");
+    }
+
+    let stats = processor.transient_reset_stats();
+    assert_eq!(
+        stats.events_detected_total, 0,
+        "online scheduler must stay idle while an artifact drives resets"
+    );
+    // The consumed span in SOURCE frames is the source position; exactly the
+    // onsets inside it must have been scheduled — no doubles, no misses.
+    let consumed_source = processor.source_position();
+    let expected = artifact
+        .transient_onsets
+        .iter()
+        .filter(|&&onset| onset < consumed_source)
+        .count() as u64;
+    assert!(expected >= 4, "ride test too short to consume onsets");
+    assert_eq!(
+        stats.artifact_events_scheduled_total, expected,
+        "artifact onsets must fire exactly once at mapped source positions"
+    );
+    assert!(
+        stats.reset_band_counts_total[2] > 0 && stats.reset_band_counts_total[3] > 0,
+        "artifact events must reset the upper bands"
+    );
+}
+
+#[test]
 fn test_artifact_stream_transient_preservation_parity() {
     let bpm = 128.0;
     let input = click_train(SR, bpm, 4.0);
@@ -312,102 +362,5 @@ fn test_artifact_stream_transient_preservation_parity() {
         peaks_artifact.len() >= 4,
         "artifact-driven stream lost transients: {} peaks",
         peaks_artifact.len()
-    );
-}
-
-#[test]
-fn test_hybrid_engine_artifact_transient_parity() {
-    let bpm = 128.0;
-    let input = click_train(SR, bpm, 4.0);
-    let artifact = analyze_for_dj(&input, SR);
-    let ratio = 1.1;
-
-    let run = |params: StretchParams| {
-        let mut processor = StreamProcessor::new(params);
-        processor.set_hybrid_mode(true);
-        let mut output = Vec::with_capacity(input.len() * 4);
-        for chunk in input.chunks(CHUNK) {
-            processor.process_into(chunk, &mut output).expect("process");
-        }
-        let mut tail = Vec::with_capacity(input.len() * 2);
-        processor.flush_into(&mut tail).expect("flush");
-        output.extend_from_slice(&tail);
-        output
-    };
-
-    let out_online = run(stream_params(ratio));
-    let out_artifact = run(stream_params(ratio)
-        .with_pre_analysis(artifact)
-        .with_beat_snap_confidence_threshold(0.1));
-
-    let beat_interval = 60.0 * SR as f64 / bpm;
-    let min_distance = (beat_interval * ratio * 0.5) as usize;
-    assert_eq!(
-        out_online.len(),
-        out_artifact.len(),
-        "hybrid engine output length must not depend on the anchor source"
-    );
-    // The legacy re-render engine's chunk-boundary crossfades smear strong
-    // peaks regardless of anchor source (its quality gap is tracked by the
-    // roadmap's deterministic-engine work), so this is a parity gate, not
-    // an absolute one: the artifact path must not lose transients relative
-    // to online detection.
-    let peaks_online = detect_peaks(&out_online, 0.3, min_distance);
-    let peaks_artifact = detect_peaks(&out_artifact, 0.3, min_distance);
-    assert!(
-        peaks_artifact.len() + 1 >= peaks_online.len(),
-        "hybrid artifact stream preserved fewer transients than online: {} vs {}",
-        peaks_artifact.len(),
-        peaks_online.len()
-    );
-    assert!(
-        !peaks_artifact.is_empty(),
-        "hybrid artifact stream lost all transients"
-    );
-}
-
-#[test]
-fn test_hybrid_engine_artifact_seek_alignment() {
-    let bpm = 128.0;
-    let input = click_train(SR, bpm, 6.0);
-    let artifact = analyze_for_dj(&input, SR);
-    let ratio = 1.1;
-    let beat_interval = (60.0 * SR as f64 / bpm) as usize;
-    // Seek to just before a click so the fed slice starts mid-track; an
-    // off-by-one-discard window base would misplace every anchor.
-    let seek = beat_interval * 4 - 1000;
-
-    let run = |pre_analysis: Option<timestretch::PreAnalysisArtifact>| {
-        let mut params = stream_params(ratio).with_beat_snap_confidence_threshold(0.1);
-        if let Some(artifact) = pre_analysis {
-            params = params.with_pre_analysis(artifact);
-        }
-        let mut processor = StreamProcessor::new(params);
-        processor.set_hybrid_mode(true);
-        processor.set_source_position(seek).expect("seek position");
-        let mut output = Vec::with_capacity(input.len() * 4);
-        for chunk in input[seek..].chunks(CHUNK) {
-            processor.process_into(chunk, &mut output).expect("process");
-        }
-        let mut tail = Vec::with_capacity(input.len() * 2);
-        processor.flush_into(&mut tail).expect("flush");
-        output.extend_from_slice(&tail);
-        output
-    };
-
-    let out_artifact = run(Some(artifact));
-
-    // Absolute click preservation over the seeked slice: with a broken window
-    // base the artifact anchors land off-position and clicks smear away, so
-    // requiring most of the fed clicks to survive catches the alignment bug
-    // without depending on the (rolling-window-boundary-noisy) online path.
-    let clicks_in_slice = (input.len() - seek) / beat_interval;
-    let min_distance = (beat_interval as f64 * ratio * 0.5) as usize;
-    let peaks_artifact = detect_peaks(&out_artifact, 0.3, min_distance);
-    assert!(
-        peaks_artifact.len() * 2 >= clicks_in_slice,
-        "seek-offset hybrid artifact stream lost transients: {} peaks for ~{} fed clicks",
-        peaks_artifact.len(),
-        clicks_in_slice
     );
 }

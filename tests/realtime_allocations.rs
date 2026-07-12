@@ -40,6 +40,16 @@ unsafe impl GlobalAlloc for CountingAllocator {
         if TRACK_ALLOCATIONS.load(Ordering::Relaxed) {
             REALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
             REALLOC_BYTES.fetch_add(new_size, Ordering::Relaxed);
+            if std::env::var_os("ALLOC_TRACE").is_some() {
+                TRACK_ALLOCATIONS.store(false, Ordering::SeqCst);
+                eprintln!(
+                    "realloc {} -> {} bytes\n{}",
+                    layout.size(),
+                    new_size,
+                    std::backtrace::Backtrace::force_capture()
+                );
+                TRACK_ALLOCATIONS.store(true, Ordering::SeqCst);
+            }
         }
         out
     }
@@ -102,9 +112,6 @@ fn process_into_steady_state_no_heap_growth_after_warmup() {
         .with_preset(EdmPreset::DjBeatmatch);
     let mut processor = StreamProcessor::new(params);
 
-    // This test exercises the default low-latency streaming path.
-    processor.set_hybrid_mode(false);
-
     let chunk = test_chunk_stereo(CHUNK_FRAMES, SAMPLE_RATE as f32);
     let max_samples = chunk.len() * (WARMUP_ITERS + MEASURE_ITERS) * 8;
     let mut output = Vec::with_capacity(max_samples);
@@ -136,71 +143,25 @@ fn process_into_steady_state_no_heap_growth_after_warmup() {
 }
 
 #[test]
-fn process_into_hybrid_mode_allocation_telemetry_present() {
+fn process_into_multi_res_steady_state_no_heap_growth_after_warmup() {
     let _guard = ALLOC_TEST_MUTEX
         .lock()
         .expect("allocation test mutex poisoned");
     const SAMPLE_RATE: u32 = 44_100;
-    const CHANNELS: u32 = 2;
     const CHUNK_FRAMES: usize = 256;
-    const WARMUP_ITERS: usize = 16;
-    const MEASURE_ITERS: usize = 24;
-
-    let params = StretchParams::new(1.05)
-        .with_sample_rate(SAMPLE_RATE)
-        .with_channels(CHANNELS)
-        .with_preset(EdmPreset::DjBeatmatch);
-    let mut processor = StreamProcessor::new(params);
-    processor.set_hybrid_mode(true);
-
-    let chunk = test_chunk_stereo(CHUNK_FRAMES, SAMPLE_RATE as f32);
-    let max_samples = chunk.len() * (WARMUP_ITERS + MEASURE_ITERS) * 8;
-    let mut output = Vec::with_capacity(max_samples);
-
-    for _ in 0..WARMUP_ITERS {
-        processor
-            .process_into(&chunk, &mut output)
-            .expect("warmup process_into should succeed");
-    }
-    output.clear();
-
-    begin_alloc_tracking();
-    for _ in 0..MEASURE_ITERS {
-        processor
-            .process_into(&chunk, &mut output)
-            .expect("measured process_into should succeed");
-    }
-    let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
-    let total_calls = alloc_calls + realloc_calls;
-
-    assert!(
-        total_calls > 0,
-        "expected non-zero allocation telemetry in hybrid mode; if this is now zero, update this test to enforce strict no-allocation behavior"
-    );
-    println!(
-        "hybrid allocation telemetry: alloc_calls={} realloc_calls={} alloc_bytes={} realloc_bytes={}",
-        alloc_calls, realloc_calls, alloc_bytes, realloc_bytes
-    );
-}
-
-#[test]
-fn process_into_hybrid_realtime_strict_no_heap_growth_after_warmup() {
-    let _guard = ALLOC_TEST_MUTEX
-        .lock()
-        .expect("allocation test mutex poisoned");
-    const SAMPLE_RATE: u32 = 44_100;
-    const CHANNELS: u32 = 2;
-    const CHUNK_FRAMES: usize = 256;
-    const WARMUP_ITERS: usize = 64;
+    // The multi-res Club gate is 12288 frames (1.5x the 8192 sub-bass FFT);
+    // warm up well past it so every band buffer reaches steady-state size.
+    const WARMUP_ITERS: usize = 192;
     const MEASURE_ITERS: usize = 96;
 
     let params = StretchParams::new(1.05)
         .with_sample_rate(SAMPLE_RATE)
-        .with_channels(CHANNELS)
-        .with_preset(EdmPreset::DjBeatmatch);
+        .with_channels(2)
+        .with_stream_profile(timestretch::StreamProfile::Club);
     let mut processor = StreamProcessor::new(params);
-    processor.set_hybrid_mode(true);
-    processor.set_hybrid_realtime_strict(true);
+    processor
+        .set_streaming_engine(timestretch::StreamingEngine::MultiResolution)
+        .expect("Club profile supports the multi-resolution engine");
 
     let chunk = test_chunk_stereo(CHUNK_FRAMES, SAMPLE_RATE as f32);
     let max_samples = chunk.len() * (WARMUP_ITERS + MEASURE_ITERS) * 8;
@@ -211,20 +172,30 @@ fn process_into_hybrid_realtime_strict_no_heap_growth_after_warmup() {
             .process_into(&chunk, &mut output)
             .expect("warmup process_into should succeed");
     }
+    assert!(
+        !output.is_empty(),
+        "warmup must clear the multi-res buffering gate"
+    );
     output.clear();
 
     begin_alloc_tracking();
-    for _ in 0..MEASURE_ITERS {
+    for i in 0..MEASURE_ITERS {
+        // A mid-measure ratio nudge keeps the DJ modulation path covered.
+        if i == MEASURE_ITERS / 2 {
+            processor
+                .set_stretch_ratio(1.08)
+                .expect("ratio change should be accepted");
+        }
         processor
             .process_into(&chunk, &mut output)
-            .expect("strict hybrid process_into should succeed");
+            .expect("steady-state multi-res process_into should succeed");
     }
     let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
 
     assert_eq!(
         alloc_calls + realloc_calls,
         0,
-        "strict hybrid process_into allocated: alloc_calls={}, realloc_calls={}, alloc_bytes={}, realloc_bytes={}",
+        "multi-res steady-state process_into allocated: alloc_calls={}, realloc_calls={}, alloc_bytes={}, realloc_bytes={}",
         alloc_calls,
         realloc_calls,
         alloc_bytes,
@@ -248,7 +219,6 @@ fn process_into_pitch_scaled_steady_state_no_heap_growth_after_warmup() {
         .with_channels(CHANNELS)
         .with_preset(EdmPreset::DjBeatmatch);
     let mut processor = StreamProcessor::new(params);
-    processor.set_hybrid_mode(false);
     // Engage the (default sinc) pitch resampler path before warmup.
     processor
         .set_pitch_scale(1.06)
@@ -300,7 +270,6 @@ fn process_into_pitch_sweep_no_heap_growth_after_warmup() {
         .with_channels(CHANNELS)
         .with_preset(EdmPreset::DjBeatmatch);
     let mut processor = StreamProcessor::new(params);
-    processor.set_hybrid_mode(false);
     processor
         .set_pitch_scale(1.02)
         .expect("pitch scale should be accepted");
@@ -380,7 +349,6 @@ fn process_into_with_preanalysis_artifact_no_heap_growth_after_warmup() {
         .with_pre_analysis(artifact)
         .with_beat_snap_confidence_threshold(0.1);
     let mut processor = StreamProcessor::new(params);
-    processor.set_hybrid_mode(false);
 
     let chunk = test_chunk_stereo(CHUNK_FRAMES, SAMPLE_RATE as f32);
     let max_samples = chunk.len() * (WARMUP_ITERS + MEASURE_ITERS) * 8;
@@ -438,7 +406,6 @@ fn process_into_live_profile_no_heap_growth_after_warmup() {
         .with_channels(2)
         .with_stream_profile(timestretch::StreamProfile::Live);
     let mut processor = StreamProcessor::new(params);
-    processor.set_hybrid_mode(false);
 
     let chunk = test_chunk_stereo(CHUNK_FRAMES, SAMPLE_RATE as f32);
     let max_samples = chunk.len() * (WARMUP_ITERS + MEASURE_ITERS) * 8;
@@ -489,7 +456,6 @@ fn warm_start_seek_no_heap_growth_after_warmup() {
         .with_channels(CHANNELS)
         .with_stream_profile(timestretch::StreamProfile::Live);
     let mut processor = StreamProcessor::new(params);
-    processor.set_hybrid_mode(false);
 
     let chunk = test_chunk_stereo(CHUNK_FRAMES, SAMPLE_RATE as f32);
     let mut output = Vec::with_capacity(chunk.len() * 512);
@@ -535,4 +501,88 @@ fn warm_start_seek_no_heap_growth_after_warmup() {
         alloc_bytes,
         realloc_bytes
     );
+}
+
+#[test]
+fn process_into_varispeed_tempo_ride_no_heap_growth_after_warmup() {
+    // Stage 15 exit criterion: allocation-free steady state on the
+    // varispeed-first control path behind BOTH engines, with the tempo
+    // retargeted every chunk (the DJ ride case the path exists for).
+    let _guard = ALLOC_TEST_MUTEX
+        .lock()
+        .expect("allocation test mutex poisoned");
+    const SAMPLE_RATE: u32 = 44_100;
+    const CHUNK_FRAMES: usize = 256;
+    const MEASURE_ITERS: usize = 96;
+
+    let cases = [
+        // (engine, profile, warmup): the multi-res Club gate is 12288
+        // frames, so it needs the longer runway.
+        (timestretch::StreamingEngine::Deterministic, None, 64usize),
+        (
+            timestretch::StreamingEngine::MultiResolution,
+            Some(timestretch::StreamProfile::Club),
+            192usize,
+        ),
+    ];
+
+    for (engine, profile, warmup_iters) in cases {
+        let mut params = StretchParams::new(1.05)
+            .with_sample_rate(SAMPLE_RATE)
+            .with_channels(2);
+        params = match profile {
+            Some(profile) => params.with_stream_profile(profile),
+            None => params.with_preset(EdmPreset::DjBeatmatch),
+        };
+        let mut processor = StreamProcessor::new(params);
+        processor
+            .set_streaming_engine(engine)
+            .expect("engine selection should succeed");
+        processor
+            .set_control_path(timestretch::ControlPath::VarispeedFirst)
+            .expect("varispeed path should be accepted");
+
+        let chunk = test_chunk_stereo(CHUNK_FRAMES, SAMPLE_RATE as f32);
+        let max_samples = chunk.len() * (warmup_iters + MEASURE_ITERS) * 8;
+        let mut output = Vec::with_capacity(max_samples);
+
+        for _ in 0..warmup_iters {
+            processor
+                .process_into(&chunk, &mut output)
+                .expect("warmup process_into should succeed");
+        }
+        assert!(
+            !output.is_empty(),
+            "warmup must clear the buffering gate ({:?})",
+            engine
+        );
+        output.clear();
+
+        // Retarget the tempo every chunk inside the tracked region: the
+        // varispeed resamplers, ratio map, and transposition tracker must
+        // all be allocation-free under continuous modulation.
+        begin_alloc_tracking();
+        for i in 0..MEASURE_ITERS {
+            let t = i as f64 / MEASURE_ITERS as f64;
+            let ratio = 1.0 + 0.06 * (2.0 * std::f64::consts::PI * t).sin();
+            processor
+                .set_stretch_ratio(ratio)
+                .expect("ride ratio should be accepted");
+            processor
+                .process_into(&chunk, &mut output)
+                .expect("varispeed ride process_into should succeed");
+        }
+        let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
+
+        assert_eq!(
+            alloc_calls + realloc_calls,
+            0,
+            "varispeed ride ({:?}) allocated: alloc_calls={}, realloc_calls={}, alloc_bytes={}, realloc_bytes={}",
+            engine,
+            alloc_calls,
+            realloc_calls,
+            alloc_bytes,
+            realloc_bytes
+        );
+    }
 }

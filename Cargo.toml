@@ -34,6 +34,7 @@ qa-harnesses = []
 toml = "0.8"
 sha2 = "0.10"
 hound = "3"
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aiff", "pcm"] }
 
 [profile.release]
 opt-level = 3
@@ -80,4 +81,14 @@ required-features = ["qa-harnesses"]
 [[test]]
 name = "quality_gates"
 path = "tests/quality_gates.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
+name = "bpm_accuracy"
+path = "qa/bpm_accuracy.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
+name = "varispeed_keylock"
+path = "qa/varispeed_keylock.rs"
 required-features = ["qa-harnesses"]

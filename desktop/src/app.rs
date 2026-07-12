@@ -15,6 +15,9 @@ const MIN_STRETCH_RATIO: f64 = 0.25;
 /// (Live handles ~12x; 10x leaves margin). Sets the tempo fader's floor at
 /// `detected_bpm / 10` (~-90%, near-stop).
 const MAX_STRETCH_RATIO: f64 = 10.0;
+/// Ratio ceiling on the varispeed-first tempo path (the library bounds the
+/// varispeed resampler's step range to `[0.25, 4.0]`).
+const MAX_VARISPEED_RATIO: f64 = 4.0;
 /// Tempo fader reaches double the track BPM (+100%).
 const MAX_TEMPO_FACTOR: f64 = 2.0;
 /// Tempo fader width in points (3x egui's ~100pt default) for fine control.
@@ -52,6 +55,8 @@ pub struct TimeStretchApp {
     volume: f32,
     preset: PresetChoice,
     stream_profile: StreamProfile,
+    streaming_engine: StreamingEngine,
+    control_path: ControlPath,
     target_bpm_text: String,
 
     // Error messages
@@ -59,9 +64,18 @@ pub struct TimeStretchApp {
 }
 
 impl TimeStretchApp {
+    /// Widest stretch ratio the active tempo path supports.
     #[inline]
-    fn clamp_stretch_ratio(ratio: f64) -> f64 {
-        ratio.clamp(MIN_STRETCH_RATIO, MAX_STRETCH_RATIO)
+    fn max_stretch_ratio(&self) -> f64 {
+        match self.control_path {
+            ControlPath::VarispeedFirst => MAX_VARISPEED_RATIO,
+            ControlPath::VocoderTempo => MAX_STRETCH_RATIO,
+        }
+    }
+
+    #[inline]
+    fn clamp_stretch_ratio(&self, ratio: f64) -> f64 {
+        ratio.clamp(MIN_STRETCH_RATIO, self.max_stretch_ratio())
     }
 
     /// Sets the playback tempo to `target_bpm` (for a track at `detected_bpm`)
@@ -69,7 +83,7 @@ impl TimeStretchApp {
     /// and the BPM text box — to the value that actually plays after the
     /// engine's ratio clamp. Single write point for the tempo control.
     fn apply_target_bpm(&mut self, detected_bpm: f64, target_bpm: f64) {
-        let ratio = Self::clamp_stretch_ratio(detected_bpm / target_bpm.max(1e-6));
+        let ratio = self.clamp_stretch_ratio(detected_bpm / target_bpm.max(1e-6));
         let effective_bpm = detected_bpm / ratio;
         self.stretch_ratio = ratio;
         self.target_bpm = effective_bpm;
@@ -118,6 +132,8 @@ impl TimeStretchApp {
             volume: 0.8,
             preset: PresetChoice::DjBeatmatch,
             stream_profile: StreamProfile::Live,
+            streaming_engine: StreamingEngine::Deterministic,
+            control_path: ControlPath::VarispeedFirst,
             target_bpm_text: String::new(),
             error_message: None,
         }
@@ -183,6 +199,7 @@ impl TimeStretchApp {
                     st.volume = self.volume;
                     st.preset = self.preset;
                     st.stream_profile = self.stream_profile;
+                    st.streaming_engine = self.streaming_engine;
                     st.pre_analysis = None;
                     st.loop_region = None;
                     st.loop_in = None;
@@ -550,7 +567,7 @@ impl TimeStretchApp {
                         if self.target_bpm <= 0.0 {
                             self.target_bpm = detected;
                         }
-                        let min_bpm = detected / MAX_STRETCH_RATIO;
+                        let min_bpm = detected / self.max_stretch_ratio();
                         let max_bpm = detected * MAX_TEMPO_FACTOR;
                         let old_bpm = self.target_bpm;
                         // Widen the fader (3x the default) so 0.1-BPM steps
@@ -572,10 +589,11 @@ impl TimeStretchApp {
                         }
                     } else {
                         let old_ratio = self.stretch_ratio;
+                        let max_ratio = self.max_stretch_ratio();
                         ui.add(
                             egui::Slider::new(
                                 &mut self.stretch_ratio,
-                                MIN_STRETCH_RATIO..=MAX_STRETCH_RATIO,
+                                MIN_STRETCH_RATIO..=max_ratio,
                             )
                             .text("x")
                             .fixed_decimals(2),
@@ -656,17 +674,122 @@ impl TimeStretchApp {
                         st.stream_profile = self.stream_profile;
                         st.preset_changed = true;
                     }
-                    // Effective latency reported by the active processor
-                    // (published by the processing thread at every build).
-                    let latency_secs = self.state.lock().unwrap().reported_latency_secs;
+                    // Effective latency split reported by the active
+                    // processor (published by the processing thread at
+                    // every build): constant pipeline delay vs tempo
+                    // control-to-audio.
+                    let (latency_secs, control_secs) = {
+                        let st = self.state.lock().unwrap();
+                        (st.reported_latency_secs, st.reported_control_latency_secs)
+                    };
                     if latency_secs > 0.0 {
-                        ui.label(
-                            egui::RichText::new(format!("~{:.0} ms", latency_secs * 1000.0)).weak(),
-                        )
-                        .on_hover_text(
-                            "Effective control-to-audio buffering latency for the \
-                             selected playback profile",
+                        let text = if control_secs + 0.0005 < latency_secs {
+                            format!(
+                                "~{:.0} ms delay · tempo ~{:.1} ms",
+                                latency_secs * 1000.0,
+                                control_secs * 1000.0
+                            )
+                        } else {
+                            format!("~{:.0} ms", latency_secs * 1000.0)
+                        };
+                        ui.label(egui::RichText::new(text).weak()).on_hover_text(
+                            "Constant pipeline (content) delay for the selected \
+                             profile/engine, and how quickly a tempo change \
+                             reaches the output on the selected tempo path",
                         );
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Engine:");
+                ui.horizontal(|ui| {
+                    // The multi-res engine's buffering gate is set by its
+                    // sub-bass FFT, which needs the Club profile or larger;
+                    // the library rejects it on Live.
+                    let multi_res_available = self.stream_profile != StreamProfile::Live;
+                    let old_engine = self.streaming_engine;
+                    ui.add_enabled_ui(multi_res_available, |ui| {
+                        egui::ComboBox::from_id_salt("streaming_engine_combo")
+                            .selected_text(engine_label(self.streaming_engine))
+                            .show_ui(ui, |ui| {
+                                for engine in [
+                                    StreamingEngine::Deterministic,
+                                    StreamingEngine::MultiResolution,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.streaming_engine,
+                                        engine,
+                                        engine_label(engine),
+                                    );
+                                }
+                            });
+                    })
+                    .response
+                    .on_disabled_hover_text(
+                        "Multi-resolution needs the Club or Quality playback \
+                         profile; Live stays on the standard engine",
+                    );
+                    if !multi_res_available
+                        && self.streaming_engine == StreamingEngine::MultiResolution
+                    {
+                        // Profile dropped to Live while multi-res was selected:
+                        // revert the control so the UI matches what plays.
+                        self.streaming_engine = StreamingEngine::Deterministic;
+                    }
+                    if self.streaming_engine != old_engine {
+                        let mut st = self.state.lock().unwrap();
+                        st.streaming_engine = self.streaming_engine;
+                        st.preset_changed = true;
+                    }
+                    if self.streaming_engine == StreamingEngine::MultiResolution {
+                        ui.label(egui::RichText::new("3-band").weak())
+                            .on_hover_text(
+                                "Three-band filterbank: tighter sub-bass phase \
+                             coherence, higher buffering latency",
+                            );
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Tempo Path:");
+                ui.horizontal(|ui| {
+                    let old_path = self.control_path;
+                    egui::ComboBox::from_id_salt("control_path_combo")
+                        .selected_text(control_path_label(self.control_path))
+                        .show_ui(ui, |ui| {
+                            for path in [ControlPath::VarispeedFirst, ControlPath::VocoderTempo] {
+                                ui.selectable_value(
+                                    &mut self.control_path,
+                                    path,
+                                    control_path_label(path),
+                                );
+                            }
+                        });
+                    if self.control_path != old_path {
+                        // The varispeed path bounds the tempo ratio; pull the
+                        // fader back into range before the rebuild applies it.
+                        let clamped = self.clamp_stretch_ratio(self.stretch_ratio);
+                        if (clamped - self.stretch_ratio).abs() > f64::EPSILON {
+                            let detected = self.state.lock().unwrap().detected_bpm;
+                            if detected > 0.0 {
+                                self.apply_target_bpm(detected, detected / clamped);
+                            } else {
+                                self.stretch_ratio = clamped;
+                                self.state.lock().unwrap().stretch_ratio = clamped;
+                            }
+                        }
+                        let mut st = self.state.lock().unwrap();
+                        st.control_path = self.control_path;
+                        st.preset_changed = true;
+                    }
+                    if self.control_path == ControlPath::VarispeedFirst {
+                        ui.label(egui::RichText::new("instant tempo").weak())
+                            .on_hover_text(
+                                "Varispeed-first keylock: the tempo fader drives \
+                                 an input resampler sample-accurately; the \
+                                 vocoder's buffering becomes a constant delay \
+                                 instead of tempo control latency",
+                            );
                     }
                 });
                 ui.end_row();
@@ -708,6 +831,22 @@ impl TimeStretchApp {
                 });
                 ui.end_row();
             });
+    }
+}
+
+/// UI label for a stream-mode rendering engine.
+fn engine_label(engine: StreamingEngine) -> &'static str {
+    match engine {
+        StreamingEngine::Deterministic => "Standard",
+        StreamingEngine::MultiResolution => "Multi-resolution",
+    }
+}
+
+/// UI label for a tempo control path.
+fn control_path_label(path: ControlPath) -> &'static str {
+    match path {
+        ControlPath::VarispeedFirst => "Varispeed (instant)",
+        ControlPath::VocoderTempo => "Vocoder (glide)",
     }
 }
 

@@ -188,9 +188,8 @@ fn write_quality_dashboard_csv(name: &str, header: &str, row: &str) {
     }
 }
 
-fn stream_hybrid(input: &[f32], params: StretchParams, chunk_size: usize) -> Vec<f32> {
+fn stream_deterministic(input: &[f32], params: StretchParams, chunk_size: usize) -> Vec<f32> {
     let mut processor = StreamProcessor::new(params);
-    processor.set_hybrid_mode(true);
     let mut out = Vec::new();
     for chunk in input.chunks(chunk_size) {
         let rendered = processor.process(chunk).expect("stream process failed");
@@ -202,7 +201,7 @@ fn stream_hybrid(input: &[f32], params: StretchParams, chunk_size: usize) -> Vec
 }
 
 #[test]
-fn quality_gate_batch_vs_stream_hybrid_subset() {
+fn quality_gate_batch_vs_stream_deterministic_subset() {
     let sample_rate = 44_100u32;
     let bpm = 126.0;
     let target_bpm = 128.0;
@@ -216,7 +215,7 @@ fn quality_gate_batch_vs_stream_hybrid_subset() {
         .with_bpm(bpm);
 
     let reference = timestretch::stretch(&input, &params).expect("batch stretch failed");
-    let candidate = stream_hybrid(&input, params.clone(), 4096);
+    let candidate = stream_deterministic(&input, params.clone(), 4096);
 
     assert!(!reference.is_empty());
     assert!(!candidate.is_empty());
@@ -241,8 +240,8 @@ fn quality_gate_batch_vs_stream_hybrid_subset() {
         len_diff_pct, transient.match_rate
     );
     // Keep logging the transient matcher for visibility, but do not gate on it:
-    // after the streaming overhaul it no longer tracks the current hybrid path
-    // reliably, while correlation, loudness, spectral, and boundary metrics do.
+    // after the streaming overhaul it no longer tracks the deterministic stream
+    // path reliably, while correlation, loudness, spectral, and boundary metrics do.
     let xcorr = comparison::cross_correlation(reference, candidate);
     println!("quality-gates: xcorr_peak={:.3}", xcorr.peak_value);
 
@@ -284,7 +283,7 @@ fn quality_gate_batch_vs_stream_hybrid_subset() {
         candidate_boundary.evaluated_boundaries
     );
     write_quality_dashboard_csv(
-        "quality_gate_batch_vs_stream_hybrid_subset",
+        "quality_gate_batch_vs_stream_deterministic_subset",
         "len_diff_pct,transient_match_rate,cross_correlation_peak,loudness_diff_db,sub_bass_similarity,low_similarity,mid_similarity,high_similarity,boundary_max_ratio_ref,boundary_mean_ratio_ref,boundary_max_ratio_cand,boundary_mean_ratio_cand,boundary_count_ref,boundary_count_cand",
         &format!(
             "{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{}",
@@ -304,10 +303,35 @@ fn quality_gate_batch_vs_stream_hybrid_subset() {
             candidate_boundary.evaluated_boundaries
         ),
     );
+    // Re-baselined for the deterministic engine (measured 0.319): the 0.35
+    // floor was calibrated against the removed hybrid streaming engine,
+    // which re-rendered with the same algorithm as the batch reference and
+    // tracked its waveform closely. The deterministic PV stream is
+    // phase-divergent from the batch render by design, so waveform-level
+    // correlation is a coarse signal here; the band-similarity floors below
+    // carry the spectral quality gate.
     assert!(
-        xcorr.peak_value >= 0.35,
-        "cross-correlation gate failed: peak {:.3} < 0.35",
+        xcorr.peak_value >= 0.25,
+        "cross-correlation gate failed: peak {:.3} < 0.25",
         xcorr.peak_value
+    );
+    // Band-similarity floors (measured: sub=0.971 low=0.972 mid=0.934
+    // high=0.819 for the deterministic engine).
+    assert!(
+        band.sub_bass >= 0.90 && band.low >= 0.90,
+        "low-end band similarity gate failed: sub={:.3} low={:.3} (floor 0.90)",
+        band.sub_bass,
+        band.low
+    );
+    assert!(
+        band.mid >= 0.85,
+        "mid band similarity gate failed: {:.3} < 0.85",
+        band.mid
+    );
+    assert!(
+        band.high >= 0.70,
+        "high band similarity gate failed: {:.3} < 0.70",
+        band.high
     );
     assert!(
         loudness_diff <= 2.5,

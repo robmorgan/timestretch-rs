@@ -53,6 +53,8 @@ struct Track {
     original_sha256: Option<String>,
     bpm: f64,
     #[serde(default)]
+    bpm_only: bool,
+    #[serde(default)]
     reference: Vec<Reference>,
 }
 
@@ -237,6 +239,12 @@ fn reference_quality_benchmark() {
     println!();
 
     for track in &manifest.track {
+        // BPM-corpus entries belong to qa/bpm_accuracy.rs; they intentionally
+        // have no stretched references and may not even be WAV files.
+        if track.bpm_only {
+            continue;
+        }
+
         if track.reference.is_empty() {
             if strict {
                 panic!(

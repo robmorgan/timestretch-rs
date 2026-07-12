@@ -12,7 +12,7 @@
 
 use crate::core::crossover::ThreeBandSplitter;
 use crate::error::StretchError;
-use crate::stretch::phase_vocoder::PhaseVocoder;
+use crate::stretch::phase_vocoder::{PerFrameFlux, PhaseVocoder};
 
 /// Default crossover frequency between sub-bass and mid bands (Hz).
 const DEFAULT_LOW_CROSSOVER: f64 = 200.0;
@@ -73,6 +73,25 @@ pub struct MultiResolutionStretcher {
     mid_buf: Vec<f32>,
     /// Pre-allocated buffer for high band input.
     high_buf: Vec<f32>,
+    /// Band-domain mirrors of the caller's retained streaming window,
+    /// one per band, kept in lockstep with the caller's rolling input.
+    stream_band_bufs: [Vec<f32>; 3],
+    /// Frames of the caller's window already split through the crossover.
+    ///
+    /// The stateful IIR splitter must see each input sample exactly once, so
+    /// only `input[stream_retained_frames..]` is split on each streaming call.
+    stream_retained_frames: usize,
+    /// Per-band emitted-but-not-yet-summed output queues.
+    ///
+    /// Band PVs release resolved samples at different rates (the sub-bass
+    /// PV holds the largest unresolved overlap tail), so emissions queue
+    /// here until every band has produced a sample for the same synthesis
+    /// position; only the aligned minimum is summed into the caller output.
+    stream_pending: [Vec<f32>; 3],
+    /// Scratch buffer for a single band PV's per-call emission.
+    stream_band_out: Vec<f32>,
+    /// Combined per-frame flux from the most recent streaming call.
+    stream_last_flux: Option<PerFrameFlux>,
 }
 
 impl MultiResolutionStretcher {
@@ -138,7 +157,46 @@ impl MultiResolutionStretcher {
             sub_bass_buf: Vec::new(),
             mid_buf: Vec::new(),
             high_buf: Vec::new(),
+            stream_band_bufs: [Vec::new(), Vec::new(), Vec::new()],
+            stream_retained_frames: 0,
+            stream_pending: [Vec::new(), Vec::new(), Vec::new()],
+            stream_band_out: Vec::new(),
+            stream_last_flux: None,
         }
+    }
+
+    /// Creates a multi-resolution stretcher with a cap on the sub-bass FFT.
+    ///
+    /// Identical to [`Self::new`] except that the derived sub-bass FFT size
+    /// (`mid_fft_size * 4`) is clamped to `sub_bass_fft_cap`. Used by the
+    /// streaming path, where a 16384-sample sub-bass window may exceed the
+    /// latency budget of the selected stream profile.
+    pub fn with_sub_bass_fft_cap(
+        mid_fft_size: usize,
+        stretch_ratio: f64,
+        sample_rate: u32,
+        sub_bass_cutoff: f32,
+        sub_bass_fft_cap: usize,
+    ) -> Self {
+        let mut s = Self::new(mid_fft_size, stretch_ratio, sample_rate, sub_bass_cutoff);
+        // The streaming consumption cadence is keyed to the sub-bass hop, so
+        // the sub-bass FFT must stay a power-of-two multiple of the mid FFT
+        // (>= mid) for all band hops to stay mutually aligned.
+        let capped = s
+            .sub_bass_fft_size
+            .min(sub_bass_fft_cap.max(MIN_FFT_SIZE))
+            .max(mid_fft_size);
+        if capped != s.sub_bass_fft_size {
+            s.sub_bass_fft_size = capped;
+            s.sub_bass_pv = PhaseVocoder::new(
+                capped,
+                capped / 4,
+                stretch_ratio,
+                sample_rate,
+                sub_bass_cutoff,
+            );
+        }
+        s
     }
 
     /// Creates a new multi-resolution stretcher with custom crossover frequencies.
@@ -178,6 +236,14 @@ impl MultiResolutionStretcher {
         self.sub_bass_pv.set_adaptive_phase_locking(enabled);
         self.mid_pv.set_adaptive_phase_locking(enabled);
         self.high_pv.set_adaptive_phase_locking(enabled);
+    }
+
+    /// Declares smooth small-step ratio updates on all band vocoders (see
+    /// [`PhaseVocoder::set_smooth_ratio_updates`]).
+    pub fn set_smooth_ratio_updates(&mut self, smooth: bool) {
+        self.sub_bass_pv.set_smooth_ratio_updates(smooth);
+        self.mid_pv.set_smooth_ratio_updates(smooth);
+        self.high_pv.set_smooth_ratio_updates(smooth);
     }
 
     /// Sets envelope correction strength on all band vocoders.
@@ -298,6 +364,289 @@ impl MultiResolutionStretcher {
         }
 
         Ok(output)
+    }
+
+    /// Per-band hop of the streaming consumption driver (the sub-bass PV).
+    #[inline]
+    fn sub_bass_hop(&self) -> usize {
+        self.sub_bass_fft_size / 4
+    }
+
+    /// Frames a streaming call over a `window_frames`-long window consumes.
+    ///
+    /// Mirrors the phase-vocoder streaming contract: the caller passes its
+    /// full retained rolling window to [`Self::process_streaming_into`] and
+    /// discards exactly this many frames from the front afterwards. The
+    /// cadence is keyed to the sub-bass PV (largest FFT); its hop is a
+    /// multiple of the mid and high hops, so one consumption figure keeps
+    /// all three band vocoders frame-aligned across calls.
+    #[inline]
+    pub fn streaming_frames_consumed(&self, window_frames: usize) -> usize {
+        let fft = self.sub_bass_fft_size;
+        let hop = self.sub_bass_hop();
+        if hop == 0 || window_frames < fft {
+            return 0;
+        }
+        ((window_frames - fft) / hop + 1) * hop
+    }
+
+    /// Pre-allocates all streaming buffers for a maximum window size.
+    ///
+    /// Call once at build time with the caller's rolling-window capacity so
+    /// [`Self::process_streaming_into`] performs no allocations afterwards.
+    /// `max_ratio` bounds the output-side buffers the same way the caller's
+    /// output buffers are bounded.
+    pub fn reserve_streaming_capacity(&mut self, max_window_frames: usize, max_ratio: f64) {
+        let out_bound = Self::stream_out_bound(max_window_frames, max_ratio)
+            .saturating_add(self.sub_bass_fft_size.saturating_mul(2));
+        for buf in &mut self.stream_band_bufs {
+            reserve_to(buf, max_window_frames);
+        }
+        for buf in &mut self.stream_pending {
+            reserve_to(buf, out_bound);
+        }
+        reserve_to(&mut self.stream_band_out, out_bound);
+    }
+
+    /// Output-side capacity bound for a render consuming `frames` frames.
+    #[inline]
+    fn stream_out_bound(frames: usize, ratio: f64) -> usize {
+        let ratio_mult = (ratio.max(1.0).ceil() as usize).saturating_add(1);
+        frames.saturating_mul(ratio_mult)
+    }
+
+    /// Streaming multi-resolution pass writing directly into `output`.
+    ///
+    /// Contract parity with [`PhaseVocoder::process_streaming_into`]:
+    ///
+    /// - `input` is the caller's full retained rolling window (analysis
+    ///   overlap included). After the call the caller discards
+    ///   [`Self::streaming_frames_consumed`]`(input.len())` frames from the
+    ///   front and appends new audio before the next call.
+    /// - `output` is overwritten with the samples that are final for this
+    ///   call; an insufficient `output` capacity is a
+    ///   [`StretchError::BufferOverflow`], never a reallocation.
+    /// - Windows shorter than the sub-bass FFT emit nothing (empty output,
+    ///   `Ok`), matching the PV's short-input behavior.
+    ///
+    /// Internally the Linkwitz-Riley crossover runs incrementally (stateful
+    /// IIR biquads persist across calls; only the new tail of the window is
+    /// split), each band feeds its own phase vocoder in streaming mode, and
+    /// band outputs are queued and summed once every band has resolved the
+    /// same synthesis position. Allocation-free after
+    /// [`Self::reserve_streaming_capacity`] (or after first-call warmup).
+    pub fn process_streaming_into(
+        &mut self,
+        input: &[f32],
+        output: &mut Vec<f32>,
+    ) -> Result<(), StretchError> {
+        output.clear();
+
+        // Split only the samples this call appended to the caller's window;
+        // the retained prefix was split (and buffered per band) previously.
+        if input.len() < self.stream_retained_frames {
+            return Err(StretchError::InvalidState(
+                "multi-resolution streaming window shrank without reset",
+            ));
+        }
+        let new_samples = &input[self.stream_retained_frames..];
+        if !new_samples.is_empty() {
+            for band_buf in &mut self.stream_band_bufs {
+                let old_len = band_buf.len();
+                band_buf.resize(old_len + new_samples.len(), 0.0);
+            }
+            let [sub, mid, high] = &mut self.stream_band_bufs;
+            let start = sub.len() - new_samples.len();
+            self.splitter.process(
+                new_samples,
+                &mut sub[start..],
+                &mut mid[start..],
+                &mut high[start..],
+            );
+        }
+        self.stream_retained_frames = input.len();
+
+        let window = input.len();
+        let consumed = self.streaming_frames_consumed(window);
+        if consumed == 0 {
+            return self.emit_aligned_pending(output);
+        }
+
+        // The band PVs error on insufficient output capacity rather than
+        // reallocating, so keep the shared band scratch ahead of this call's
+        // worst-case emission (grow-only; a no-op in the steady state).
+        let out_bound = Self::stream_out_bound(consumed, self.stretch_ratio)
+            .saturating_add(self.sub_bass_fft_size.saturating_mul(2));
+        reserve_to(&mut self.stream_band_out, out_bound);
+
+        // Feed each band PV a prefix of its band window sized so that every
+        // band consumes exactly `consumed` frames this call: a PV over a
+        // window of `fft + consumed - hop` frames analyzes `consumed / hop`
+        // hop-aligned frames, keeping all three PVs on one shared timeline.
+        let sub_len = window;
+        let mid_len = self.mid_fft_size + consumed - self.mid_fft_size / 4;
+        let high_len = self.high_fft_size + consumed - self.high_fft_size / 4;
+
+        let mut flux = PerFrameFlux::default();
+        let mut flux_seen = false;
+        for (band, band_len) in [(0usize, sub_len), (1, mid_len), (2, high_len)] {
+            let pv = match band {
+                0 => &mut self.sub_bass_pv,
+                1 => &mut self.mid_pv,
+                _ => &mut self.high_pv,
+            };
+            let band_input = &self.stream_band_bufs[band][..band_len];
+            self.stream_band_out.clear();
+            pv.process_streaming_into(band_input, &mut self.stream_band_out)?;
+            self.stream_pending[band].extend_from_slice(&self.stream_band_out);
+            if let Some(f) = pv.last_frame_flux() {
+                flux_seen = true;
+                flux.sub_bass += f.sub_bass;
+                flux.low += f.low;
+                flux.mid += f.mid;
+                flux.high += f.high;
+                flux.transient_bin_count = flux
+                    .transient_bin_count
+                    .saturating_add(f.transient_bin_count);
+                flux.total_bins_rising = flux.total_bins_rising.saturating_add(f.total_bins_rising);
+            }
+        }
+        self.stream_last_flux = if flux_seen { Some(flux) } else { None };
+
+        // Drop the consumed prefix from each band mirror.
+        for band_buf in &mut self.stream_band_bufs {
+            band_buf.copy_within(consumed.., 0);
+            band_buf.truncate(band_buf.len() - consumed);
+        }
+        self.stream_retained_frames -= consumed;
+
+        self.emit_aligned_pending(output)
+    }
+
+    /// Sums the aligned front of the per-band pending queues into `output`.
+    fn emit_aligned_pending(&mut self, output: &mut Vec<f32>) -> Result<(), StretchError> {
+        let emit = self.stream_pending.iter().map(Vec::len).min().unwrap_or(0);
+        if emit == 0 {
+            return Ok(());
+        }
+        if output.capacity() < emit {
+            return Err(StretchError::BufferOverflow {
+                buffer: "multi_resolution_stream_output",
+                requested: emit,
+                available: output.capacity(),
+            });
+        }
+        output.resize(emit, 0.0);
+        let [sub, mid, high] = &self.stream_pending;
+        for i in 0..emit {
+            output[i] = sub[i] + mid[i] + high[i];
+        }
+        for pending in &mut self.stream_pending {
+            pending.copy_within(emit.., 0);
+            pending.truncate(pending.len() - emit);
+        }
+        Ok(())
+    }
+
+    /// Flushes each band vocoder's remaining overlap tail into `output`.
+    ///
+    /// End-of-stream counterpart of [`Self::process_streaming_into`]:
+    /// remaining band tails are summed with zero-padding to the longest
+    /// band (mirroring the offline `process` summation) and all streaming
+    /// state is reset for a fresh stream.
+    pub fn flush_streaming_into(&mut self, output: &mut Vec<f32>) -> Result<(), StretchError> {
+        for (band, pv) in [
+            (0usize, &mut self.sub_bass_pv),
+            (1, &mut self.mid_pv),
+            (2, &mut self.high_pv),
+        ] {
+            self.stream_band_out.clear();
+            pv.flush_streaming_into(&mut self.stream_band_out)?;
+            self.stream_pending[band].extend_from_slice(&self.stream_band_out);
+        }
+
+        let total = self.stream_pending.iter().map(Vec::len).max().unwrap_or(0);
+        output.clear();
+        if output.capacity() < total {
+            return Err(StretchError::BufferOverflow {
+                buffer: "multi_resolution_flush_output",
+                requested: total,
+                available: output.capacity(),
+            });
+        }
+        output.resize(total, 0.0);
+        for pending in &self.stream_pending {
+            for (out, &s) in output.iter_mut().zip(pending.iter()) {
+                *out += s;
+            }
+        }
+
+        self.reset_streaming_state();
+        Ok(())
+    }
+
+    /// Clears all streaming state — band mirrors, pending queues, crossover
+    /// IIR state, and each band PV's per-stream state — without deallocating.
+    pub fn reset_streaming_state(&mut self) {
+        for buf in &mut self.stream_band_bufs {
+            buf.clear();
+        }
+        for buf in &mut self.stream_pending {
+            buf.clear();
+        }
+        self.stream_retained_frames = 0;
+        self.stream_last_flux = None;
+        self.splitter.reset();
+        self.sub_bass_pv.reset_streaming_state();
+        self.mid_pv.reset_streaming_state();
+        self.high_pv.reset_streaming_state();
+    }
+
+    /// Combined per-frame spectral flux from the most recent streaming call.
+    ///
+    /// Field-wise sum of the three band vocoders' [`PerFrameFlux`] reports.
+    /// Each band PV computes flux against absolute bin frequencies over its
+    /// own band-limited spectrum, so the sum lands in the scheduler's
+    /// existing `[sub_bass, low, mid, high]` layout without a new mapping:
+    ///
+    /// - filterbank sub-bass band (< 200 Hz) contributes to the `sub_bass`
+    ///   (< 100 Hz) and `low` (100–500 Hz) fields,
+    /// - filterbank mid band (200–4000 Hz) contributes to `low` and `mid`,
+    /// - filterbank high band (> 4000 Hz) contributes to `high`.
+    ///
+    /// `transient_bin_count` / `total_bins_rising` are saturating sums over
+    /// all three spectra; normalize against [`Self::total_spectral_bins`].
+    pub fn last_frame_flux(&self) -> Option<PerFrameFlux> {
+        self.stream_last_flux
+    }
+
+    /// Total spectral bin count across the three band vocoders.
+    ///
+    /// The denominator for bin-fraction heuristics over the combined
+    /// [`Self::last_frame_flux`] report.
+    pub fn total_spectral_bins(&self) -> usize {
+        (self.sub_bass_fft_size / 2 + 1)
+            + (self.mid_fft_size / 2 + 1)
+            + (self.high_fft_size / 2 + 1)
+    }
+
+    /// Streaming buffering gate in samples (mono frames).
+    ///
+    /// The maximum over the band PVs' buffering gates — `fft * 3/2` per the
+    /// stream-processor convention, dominated by the sub-bass FFT. The
+    /// Linkwitz-Riley crossovers are IIR and add no buffering; their group
+    /// delay near the crossover points is a few milliseconds of phase lag,
+    /// not gated latency.
+    pub fn latency_samples(&self) -> usize {
+        self.sub_bass_fft_size * 3 / 2
+    }
+}
+
+/// Grows `buf`'s capacity to at least `capacity` (never shrinks).
+#[inline]
+fn reserve_to(buf: &mut Vec<f32>, capacity: usize) {
+    if buf.capacity() < capacity {
+        buf.reserve(capacity - buf.len());
     }
 }
 
@@ -526,5 +875,138 @@ mod tests {
         // With mid_fft_size = 512, high would be 128 but MIN_FFT_SIZE = 256
         let stretcher = MultiResolutionStretcher::new(512, 1.0, 44100, 120.0);
         assert_eq!(stretcher.high_fft_size(), 256);
+    }
+
+    /// EDM-flavored test signal: sub sine, mid lead, hats.
+    fn streaming_test_signal(len: usize, sample_rate: u32) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                0.4 * (2.0 * std::f32::consts::PI * 55.0 * t).sin()
+                    + 0.3 * (2.0 * std::f32::consts::PI * 880.0 * t).sin()
+                    + 0.1 * (2.0 * std::f32::consts::PI * 9000.0 * t).sin()
+            })
+            .collect()
+    }
+
+    /// Drives the streaming API with the rolling-window caller contract.
+    fn stream_in_chunks(
+        stretcher: &mut MultiResolutionStretcher,
+        input: &[f32],
+        chunk_size: usize,
+    ) -> Vec<f32> {
+        let mut window: Vec<f32> = Vec::new();
+        let mut out = Vec::new();
+        let mut call_out = Vec::with_capacity(input.len() * 4 + 262_144);
+        for chunk in input.chunks(chunk_size) {
+            window.extend_from_slice(chunk);
+            let consumed = stretcher.streaming_frames_consumed(window.len());
+            stretcher
+                .process_streaming_into(&window, &mut call_out)
+                .expect("streaming call");
+            out.extend_from_slice(&call_out);
+            window.drain(..consumed);
+        }
+        call_out.clear();
+        stretcher
+            .flush_streaming_into(&mut call_out)
+            .expect("streaming flush");
+        out.extend_from_slice(&call_out);
+        out
+    }
+
+    /// Chunked and whole-buffer streaming invocations must match: the same
+    /// hop-aligned analysis frames are processed either way, so the emitted
+    /// stream may differ only by per-block normalization noise.
+    #[test]
+    fn test_multi_res_streaming_chunked_vs_whole_parity() {
+        let sample_rate = 44100;
+        let input = streaming_test_signal(sample_rate as usize * 3, sample_rate);
+
+        let mut chunked_stretcher = MultiResolutionStretcher::new(1024, 1.25, sample_rate, 120.0);
+        let chunked = stream_in_chunks(&mut chunked_stretcher, &input, 1024);
+
+        let mut whole_stretcher = MultiResolutionStretcher::new(1024, 1.25, sample_rate, 120.0);
+        let whole = stream_in_chunks(&mut whole_stretcher, &input, input.len());
+
+        assert!(!chunked.is_empty(), "chunked run produced no output");
+        let common = chunked.len().min(whole.len());
+        assert!(
+            chunked.len().abs_diff(whole.len()) <= common / 10,
+            "chunked ({}) and whole ({}) lengths diverged",
+            chunked.len(),
+            whole.len()
+        );
+        // Skip the stream head: the PV normalizes each emitted block against
+        // that block's own window-sum peak, so while the overlap-add window
+        // sum is still ramping from zero the same samples land in blocks of
+        // different spans (one giant block vs many small ones) and get
+        // different normalization floors. Identical analysis frames make the
+        // steady-state body match almost exactly.
+        let skip = (whole_stretcher.latency_samples() as f64 * 1.25 * 2.0) as usize;
+        assert!(common > skip * 2, "not enough output to compare");
+        let mut max_diff = 0.0f32;
+        let mut max_idx = 0usize;
+        for i in skip..common {
+            let d = (chunked[i] - whole[i]).abs();
+            if d > max_diff {
+                max_diff = d;
+                max_idx = i;
+            }
+        }
+        assert!(
+            max_diff < 1e-3,
+            "chunked vs whole max sample diff {max_diff} at {max_idx}/{common} exceeds tolerance"
+        );
+    }
+
+    /// Streaming consumption cadence: multiples of the sub-bass hop, zero
+    /// below the sub-bass FFT gate.
+    #[test]
+    fn test_multi_res_streaming_consumption_math() {
+        let stretcher = MultiResolutionStretcher::new(1024, 1.0, 44100, 120.0);
+        let sub_fft = stretcher.sub_bass_fft_size();
+        let sub_hop = sub_fft / 4;
+        assert_eq!(stretcher.streaming_frames_consumed(sub_fft - 1), 0);
+        assert_eq!(stretcher.streaming_frames_consumed(sub_fft), sub_hop);
+        assert_eq!(
+            stretcher.streaming_frames_consumed(sub_fft + sub_hop * 2),
+            sub_hop * 3
+        );
+    }
+
+    /// The combined flux report appears once streaming processing runs.
+    #[test]
+    fn test_multi_res_streaming_flux_report() {
+        let sample_rate = 44100;
+        let mut stretcher = MultiResolutionStretcher::new(1024, 1.1, sample_rate, 120.0);
+        assert!(stretcher.last_frame_flux().is_none());
+
+        let input = streaming_test_signal(stretcher.sub_bass_fft_size() * 2, sample_rate);
+        let mut out = Vec::with_capacity(input.len() * 4);
+        stretcher
+            .process_streaming_into(&input, &mut out)
+            .expect("streaming call");
+        let flux = stretcher
+            .last_frame_flux()
+            .expect("flux after a processed streaming call");
+        assert!(
+            flux.sub_bass >= 0.0 && flux.low >= 0.0 && flux.mid >= 0.0 && flux.high >= 0.0,
+            "flux fields must be non-negative"
+        );
+        assert!(stretcher.total_spectral_bins() > 0);
+    }
+
+    /// The sub-bass FFT cap clamps the derived size but never below mid.
+    #[test]
+    fn test_multi_res_sub_bass_fft_cap() {
+        let capped = MultiResolutionStretcher::with_sub_bass_fft_cap(2048, 1.0, 44100, 120.0, 8192);
+        assert_eq!(capped.sub_bass_fft_size(), 8192);
+        let clamped =
+            MultiResolutionStretcher::with_sub_bass_fft_cap(4096, 1.0, 44100, 120.0, 8192);
+        assert_eq!(clamped.sub_bass_fft_size(), 8192);
+        let floor = MultiResolutionStretcher::with_sub_bass_fft_cap(4096, 1.0, 44100, 120.0, 256);
+        assert_eq!(floor.sub_bass_fft_size(), 4096);
+        assert_eq!(capped.latency_samples(), 8192 * 3 / 2);
     }
 }
