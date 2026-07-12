@@ -95,24 +95,23 @@ The target architecture is settled. These are decisions, not open questions:
 
 Dependencies form a line: 1 → 2 → 3 → 4 → 5 → 6 → 7 → {8, 9}, with 8 → 9.
 
-## [ ] Stage 1: Walking Skeleton — Pull-Based Engine Core with Varispeed Tape Mode
+## [x] Stage 1: Walking Skeleton — Pull-Based Engine Core with Varispeed Tape Mode
 
 Automation: auto
 
-> **Status (2026-07-12):** implementation landed. `src/engine/` (stage
-> trait, SPSC mailbox + `EngineController`/`EngineProcessor` split, source
-> ring with underrun policy and `TimelineMap` port of `RatioMapFifo`,
-> varispeed head, Tape profile), desktop pull-native path behind a new
-> "Deck" selector (`desktop/src/pull_deck.rs`, `AudioEngine::new_pull`),
-> and the A/B adapter (`qa/ab/mod.rs`, smoke harness `qa/engine_ab.rs`).
+> **Completed 2026-07-12** (commit `8a1d214`). `src/engine/` (stage trait,
+> SPSC mailbox + `EngineController`/`EngineProcessor` split, source ring
+> with underrun policy and `TimelineMap` port of `RatioMapFifo`, varispeed
+> head, Tape profile), desktop pull-native path behind a new "Deck"
+> selector (`desktop/src/pull_deck.rs`, `AudioEngine::new_pull`), and the
+> A/B adapter (`qa/ab/mod.rs`, smoke harness `qa/engine_ab.rs`).
 > Ported gates pass: zero-alloc steady state under per-callback retargets
 > (`tests/engine_realtime_allocations.rs`), first-sample-out == reported
 > latency (0) and control-to-audio ≤ lookahead + one callback
 > (`tests/engine_latency.rs`), tape torture clicks = 0 at 1.5x/1.1x
 > theoretical slew vs the old engine's 6x/1.5x bounds
 > (`tests/engine_modulation_torture.rs`). Old-engine suites untouched and
-> green. **Remaining for exit:** owner listening check — desktop audibly
-> playing a real track through the pull deck at 0.5–2.0x.
+> green. Owner listening check on the desktop pull deck: passed.
 
 ### Why
 
@@ -174,6 +173,37 @@ audible end-to-end result in the desktop app in the first stage.
 ## [ ] Stage 2: Keylock Chain — Band Split and High-Band Small-FFT PV Corrector
 
 Automation: auto
+
+> **Status (2026-07-12):** implementation landed. Chain:
+> `src/engine/stages/{band_split,delay,pv_corrector,keylock}.rs`, composed
+> as the `Keylock` profile; PV at FFT 512 / hop 128, identity locking,
+> transposition delay-matched via `TimelineMap::rate_at` through the new
+> `StageCtx`; constant pipeline delay 560 frames = **12.7 ms** at 44.1 kHz
+> (≤ 15 ms budget). Desktop gains a "Pull — Keylock" deck.
+> Measured gates (all green, `qa/engine_keylock.rs` +
+> `tests/engine_{latency,modulation_torture,realtime_allocations}.rs`):
+> cents wobble on the ±8%/2 s ride **p95 5.1 / max 5.2** vs old Live
+> baseline 12.2 / 27.9 (and vs gates ≤ 15 / ≤ 22); steady-ratio residual
+> 0.05 cents; unity band re-summation +0.00 dB / 0.0 % envelope after
+> fixing a real defect found by the seam fixture — the legacy
+> `LR8Crossover` cascades four Q=0.707 sections and notches −6 dB at the
+> crossover; the new chain uses the corrected `LinkwitzRiley8` (proper LR
+> Qs 0.5412/1.3066, true allpass re-sum) while the frozen multi-res engine
+> keeps the old filter and its baselines. Keylock torture clicks = 0;
+> zero-alloc steady state holds; control-to-audio unchanged (the low band
+> additionally carries the LR8's ~5.5 ms dispersive group delay at DC —
+> filter physics, documented in the gate).
+>
+> **Falsification experiment (metric half):** a pure tone exactly at the
+> 150 Hz seam at rate 1.06 re-sums at −3.0 dB with 39 % envelope beating —
+> the expected power-sum of two copies detuned by the un-keylocked low
+> band; narrow-band by construction (LR8 overlap). Gated as a regression
+> envelope, not a defect. **Listening half pending:** A/B pairs (new
+> two-band keylock vs old full-band keylock) on bass-heavy material at
+> ±8 % and ±20 % are rendered by
+> `cargo test --features qa-harnesses --release --test engine_keylock -- --ignored`
+> into `target/keylock_falsification/` — the audibility verdict and the
+> final cutoff choice are recorded here after the owner listen.
 
 ### Why
 

@@ -17,10 +17,14 @@ use timestretch::{ControlPath, StreamProcessor, StreamProfile, StretchParams};
 /// Which engine renders the fixture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arm {
-    /// Frozen push engine on the varispeed-first control path.
+    /// Frozen push engine on the varispeed-first control path (full-band
+    /// keylock: the PV corrects everything, sub-bass included).
     OldVarispeed(StreamProfile),
     /// New pull engine, tape profile (pitch follows tempo).
     NewTape,
+    /// New pull engine, keylock profile (two-band: low band follows tempo,
+    /// high band corrected).
+    NewKeylock,
 }
 
 /// Output and bookkeeping from one A/B render.
@@ -58,7 +62,22 @@ pub fn render_with_rate_schedule(
             callback_frames,
             rate_at,
         ),
-        Arm::NewTape => render_new(input, channels, sample_rate, callback_frames, rate_at),
+        Arm::NewTape => render_new(
+            EngineProfile::Tape,
+            input,
+            channels,
+            sample_rate,
+            callback_frames,
+            rate_at,
+        ),
+        Arm::NewKeylock => render_new(
+            EngineProfile::Keylock,
+            input,
+            channels,
+            sample_rate,
+            callback_frames,
+            rate_at,
+        ),
     }
 }
 
@@ -97,6 +116,7 @@ fn render_old(
 }
 
 fn render_new(
+    profile: EngineProfile,
     input: &[f32],
     channels: usize,
     sample_rate: u32,
@@ -106,7 +126,7 @@ fn render_new(
     let handles = Engine::build(EngineConfig {
         sample_rate,
         channels,
-        profile: EngineProfile::Tape,
+        profile,
         initial_tempo_rate: rate_at(0.0),
         max_block_frames: callback_frames.clamp(64, 8192),
         source_capacity_frames: (callback_frames * 16).max(32_768),

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::core::ring_buffer::RingBuffer;
 use crate::engine::control::{clamp_tempo_rate, EngineShared, Param};
 use crate::engine::source::{SourceRing, TimelineMap};
-use crate::engine::stage::{BlockBuf, Stage, BLOCK_FRAMES};
+use crate::engine::stage::{BlockBuf, Stage, StageCtx, BLOCK_FRAMES};
 use crate::engine::stages::varispeed::{VarispeedHead, FEED_CHUNK_FRAMES, MAX_OUT_PER_FEED};
 
 /// Audio-thread half of the engine.
@@ -32,6 +32,8 @@ pub struct EngineProcessor {
     timeline: TimelineMap,
     /// Varispeed output frames emitted into the pipeline.
     emitted_frames: u64,
+    /// Varispeed output frames consumed by the stage chain (block-aligned).
+    stage_in_frames: u64,
     /// Frames delivered to the caller (includes underrun silence).
     delivered_frames: u64,
     /// Silence frames delivered due to source underrun.
@@ -82,6 +84,7 @@ impl EngineProcessor {
             out_fifo: RingBuffer::with_capacity(out_fifo_frames * channels),
             timeline: TimelineMap::with_capacity(out_fifo_frames / (FEED_CHUNK_FRAMES / 4) + 16),
             emitted_frames: 0,
+            stage_in_frames: 0,
             delivered_frames: 0,
             underrun_total: 0,
             channels,
@@ -167,6 +170,7 @@ impl EngineProcessor {
         self.out_fifo.clear();
         self.timeline.clear();
         self.emitted_frames = 0;
+        self.stage_in_frames = 0;
         self.delivered_frames = 0;
         self.underrun_total = 0;
         // Bounded drain (allocation-free): a concurrently pushing producer
@@ -287,8 +291,18 @@ impl EngineProcessor {
             debug_assert_eq!(popped, block_samples);
             self.block
                 .fill_deinterleaved(&self.block_scratch[..block_samples], BLOCK_FRAMES);
+            self.stage_in_frames += BLOCK_FRAMES as u64;
+            // Delay-matched control: the rate embedded at the END of this
+            // block's span on the varispeed timeline, so corrections track
+            // the audio being consumed rather than the control target.
+            let ctx = StageCtx {
+                embedded_rate: self
+                    .timeline
+                    .rate_at(self.stage_in_frames as f64)
+                    .unwrap_or(self.rate),
+            };
             for stage in &mut self.stages {
-                stage.process(&mut self.block);
+                stage.process(&mut self.block, &ctx);
             }
             self.block
                 .write_interleaved(&mut self.block_scratch[..block_samples], BLOCK_FRAMES);
@@ -450,7 +464,8 @@ mod tests {
     /// A stage that inverts polarity — validates the fixed-block path.
     struct Invert;
     impl Stage for Invert {
-        fn process(&mut self, block: &mut BlockBuf) {
+        fn process(&mut self, block: &mut BlockBuf, ctx: &StageCtx) {
+            assert!(ctx.embedded_rate > 0.0, "ctx must carry a usable rate");
             for ch in 0..block.channels() {
                 for s in block.channel_mut(ch) {
                     *s = -*s;
@@ -487,6 +502,116 @@ mod tests {
                 "sample {i}: got {got}, want inverted {want}"
             );
         }
+    }
+
+    /// Zero-crossing frequency estimate over a window.
+    fn measure_freq(window: &[f32], sample_rate: f64) -> f64 {
+        let (mut first, mut last, mut count) = (None, None, 0usize);
+        for i in 1..window.len() {
+            let (a, b) = (window[i - 1] as f64, window[i] as f64);
+            if a <= 0.0 && b > 0.0 {
+                let t = (i - 1) as f64 + a / (a - b);
+                if first.is_none() {
+                    first = Some(t);
+                }
+                last = Some(t);
+                count += 1;
+            }
+        }
+        match (first, last) {
+            (Some(f), Some(l)) if count >= 2 => (count - 1) as f64 * sample_rate / (l - f),
+            _ => 0.0,
+        }
+    }
+
+    fn run_profile_at_rate(
+        profile: EngineProfile,
+        freq: f32,
+        rate: f64,
+        seconds: usize,
+    ) -> Vec<f32> {
+        let handles = Engine::build(EngineConfig {
+            channels: 1,
+            profile,
+            initial_tempo_rate: rate,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let (mut processor, mut source) = (handles.processor, handles.source);
+        let input = sine(freq, 44_100.0, 44_100 * (seconds + 1));
+        let mut feed = 0usize;
+        let mut out = vec![0.0f32; 256];
+        let mut collected = Vec::new();
+        for _ in 0..(44_100 * seconds / 256) {
+            while feed < input.len() && source.occupied_frames() < 8_192 {
+                let end = (feed + 8_192).min(input.len());
+                feed += source.push(&input[feed..end]);
+            }
+            processor.process(&mut out);
+            collected.extend_from_slice(&out);
+        }
+        collected
+    }
+
+    #[test]
+    fn keylock_profile_holds_pitch_while_tape_follows_tempo() {
+        let rate = 1.06;
+        let tape = run_profile_at_rate(EngineProfile::Tape, 440.0, rate, 3);
+        let keylock = run_profile_at_rate(EngineProfile::Keylock, 440.0, rate, 3);
+
+        let scan = 44_100..88_200;
+        let tape_freq = measure_freq(&tape[scan.clone()], 44_100.0);
+        let keylock_freq = measure_freq(&keylock[scan], 44_100.0);
+
+        // Tape mode: pitch follows tempo (440 * 1.06 = 466.4 Hz).
+        assert!(
+            (tape_freq - 440.0 * rate).abs() < 2.0,
+            "tape pitch {tape_freq:.1} Hz should follow tempo"
+        );
+        // Keylock: pitch corrected back to the source (440 Hz), cents-level.
+        let cents = 1200.0 * (keylock_freq / 440.0).log2();
+        assert!(
+            cents.abs() < 10.0,
+            "keylock pitch off by {cents:.1} cents ({keylock_freq:.2} Hz)"
+        );
+    }
+
+    #[test]
+    fn keylock_pipeline_latency_within_budget_and_reported_exactly() {
+        let handles = Engine::build(EngineConfig {
+            channels: 1,
+            profile: EngineProfile::Keylock,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let (mut processor, mut source) = (handles.processor, handles.source);
+
+        let latency = processor.pipeline_latency_frames();
+        // ≤ 15 ms at 44.1 kHz (ROADMAP Stage 2 budget).
+        assert!(
+            latency as f64 / 44_100.0 <= 0.015,
+            "keylock pipeline latency {latency} frames exceeds 15 ms"
+        );
+
+        // A silence-then-tone onset must first appear exactly at the
+        // reported latency (within one internal block of smear tolerance).
+        let mut input = vec![0.0f32; 32_768];
+        for (i, s) in input.iter_mut().enumerate().skip(4_096) {
+            *s = 0.6 * (2.0 * std::f32::consts::PI * 900.0 * (i - 4_096) as f32 / 44_100.0).sin();
+        }
+        source.push(&input);
+        let mut out = vec![0.0f32; 16_384];
+        processor.process(&mut out);
+
+        let onset = out
+            .iter()
+            .position(|s| s.abs() > 1e-3)
+            .expect("onset must appear");
+        let expected = 4_096 + latency;
+        assert!(
+            (onset as i64 - expected as i64).abs() <= BLOCK_FRAMES as i64,
+            "onset at {onset}, expected {expected} (reported latency {latency})"
+        );
     }
 
     #[test]

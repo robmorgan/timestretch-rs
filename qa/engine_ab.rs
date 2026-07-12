@@ -9,6 +9,9 @@
 //! with tempo, so spectral comparisons start in Stage 2 when the keylock
 //! chain exists.
 
+// Each harness compiles the shared adapter separately, so arms another
+// harness uses read as dead code here.
+#[allow(dead_code)]
 #[path = "ab/mod.rs"]
 mod ab;
 

@@ -104,13 +104,18 @@ impl Gesture {
     }
 }
 
-/// Streams `input` through a tape-mode engine, driving the tempo rate from
-/// the gesture on every callback. Returns the collected output.
-fn stream_with_gesture(input: &[f32], channels: usize, gesture: Gesture) -> Vec<f32> {
+/// Streams `input` through the engine, driving the tempo rate from the
+/// gesture on every callback. Returns the collected output.
+fn stream_profile_with_gesture(
+    profile: EngineProfile,
+    input: &[f32],
+    channels: usize,
+    gesture: Gesture,
+) -> Vec<f32> {
     let handles = Engine::build(EngineConfig {
         sample_rate: SAMPLE_RATE,
         channels,
-        profile: EngineProfile::Tape,
+        profile,
         ..EngineConfig::default()
     })
     .unwrap();
@@ -161,7 +166,7 @@ fn assert_tonal_torture(gesture: Gesture) {
     let freq = 220.0f32;
     let amp = 0.5f32;
     let input = sine(freq, SAMPLE_RATE as usize * 8, amp);
-    let output = stream_with_gesture(&input, 1, gesture);
+    let output = stream_profile_with_gesture(EngineProfile::Tape, &input, 1, gesture);
 
     let theoretical = sine_max_slew(freq, amp, gesture.max_rate());
     // The varispeed path is structurally click-free: no PV ratio-step seam,
@@ -216,6 +221,88 @@ fn engine_torture_snap_tonal_no_clicks() {
     assert_tonal_torture(Gesture::Snap);
 }
 
+/// Keylock torture: the corrected high band must stay click-free under the
+/// same gestures (ROADMAP new Stage 2 exit criterion: clicks = 0 with
+/// keylock engaged). The tone stays at its source pitch, so the slew bound
+/// carries no rate factor; the margin covers the PV's overlap-add under a
+/// moving transposition.
+fn assert_keylock_torture(gesture: Gesture) {
+    let freq = 220.0f32; // above the 150 Hz crossover: fully corrected
+    let amp = 0.5f32;
+    let input = sine(freq, SAMPLE_RATE as usize * 8, amp);
+    let output = stream_profile_with_gesture(EngineProfile::Keylock, &input, 1, gesture);
+
+    // Skip the pipeline-delay prefix of silence.
+    let scan = &output[16_384..];
+    let theoretical = sine_max_slew(freq, amp, 1.0);
+    let hard_bound = theoretical * 3.0;
+    let p95_bound = theoretical * 1.3;
+
+    let (max_idx, max_diff) = max_adjacent_diff(scan);
+    let p95 = p95_adjacent_diff(scan);
+    println!(
+        "keylock-torture[{}]: len={} max_diff={:.5}@{} p95={:.5} bounds={:.5}/{:.5}",
+        gesture.label(),
+        output.len(),
+        max_diff,
+        max_idx,
+        p95,
+        hard_bound,
+        p95_bound,
+    );
+    assert!(
+        max_diff <= hard_bound,
+        "keylock torture[{}]: click at {}: {:.5} > {:.5}",
+        gesture.label(),
+        max_idx,
+        max_diff,
+        hard_bound
+    );
+    assert!(
+        p95 <= p95_bound,
+        "keylock torture[{}]: p95 {:.5} > {:.5}",
+        gesture.label(),
+        p95,
+        p95_bound
+    );
+}
+
+#[test]
+fn engine_keylock_torture_nudge_no_clicks() {
+    assert_keylock_torture(Gesture::Nudge);
+}
+
+#[test]
+fn engine_keylock_torture_ride_no_clicks() {
+    assert_keylock_torture(Gesture::Ride);
+}
+
+#[test]
+fn engine_keylock_torture_snap_no_clicks() {
+    assert_keylock_torture(Gesture::Snap);
+}
+
+#[test]
+fn engine_keylock_torture_low_band_no_clicks() {
+    // A 60 Hz tone rides the UN-corrected low band: tape behavior inside
+    // the keylock chain. Pitch follows tempo, so the bound carries the
+    // gesture's max rate; the band split and delay must add no clicks.
+    let freq = 60.0f32;
+    let amp = 0.6f32;
+    let input = sine(freq, SAMPLE_RATE as usize * 8, amp);
+    let output = stream_profile_with_gesture(EngineProfile::Keylock, &input, 1, Gesture::Ride);
+
+    let scan = &output[16_384..];
+    let theoretical = sine_max_slew(freq, amp, Gesture::Ride.max_rate());
+    let (max_idx, max_diff) = max_adjacent_diff(scan);
+    println!("keylock low-band torture: max_diff={max_diff:.5}@{max_idx}");
+    assert!(
+        max_diff <= theoretical * 1.5,
+        "low-band click at {max_idx}: {max_diff:.5} > {:.5}",
+        theoretical * 1.5
+    );
+}
+
 #[test]
 fn engine_torture_snap_stereo_stays_click_free_and_aligned() {
     let freq = 220.0f32;
@@ -223,7 +310,7 @@ fn engine_torture_snap_stereo_stays_click_free_and_aligned() {
     let mono = sine(freq, SAMPLE_RATE as usize * 6, amp);
     let input: Vec<f32> = mono.iter().flat_map(|&s| [s, s * 0.9]).collect();
 
-    let output = stream_with_gesture(&input, 2, Gesture::Snap);
+    let output = stream_profile_with_gesture(EngineProfile::Tape, &input, 2, Gesture::Snap);
 
     let left: Vec<f32> = output.iter().step_by(2).copied().collect();
     let right: Vec<f32> = output.iter().skip(1).step_by(2).copied().collect();

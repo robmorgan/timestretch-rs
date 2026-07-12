@@ -69,7 +69,7 @@ impl TimeStretchApp {
     /// Widest stretch ratio the active tempo path supports.
     #[inline]
     fn max_stretch_ratio(&self) -> f64 {
-        if self.deck_engine == DeckEngine::PullTape {
+        if self.deck_engine.is_pull() {
             // The pull engine's tempo axis is the varispeed resampler.
             return MAX_VARISPEED_RATIO;
         }
@@ -256,7 +256,9 @@ impl TimeStretchApp {
 
         match self.deck_engine {
             DeckEngine::Legacy => self.start_legacy_playback(source, sample_rate),
-            DeckEngine::PullTape => self.start_pull_playback(source, sample_rate),
+            DeckEngine::PullTape | DeckEngine::PullKeylock => {
+                self.start_pull_playback(source, sample_rate)
+            }
         }
     }
 
@@ -310,10 +312,14 @@ impl TimeStretchApp {
             let st = self.state.lock().unwrap();
             st.stretch_ratio
         };
+        let profile = match self.deck_engine {
+            DeckEngine::PullKeylock => timestretch::engine::EngineProfile::Keylock,
+            _ => timestretch::engine::EngineProfile::Tape,
+        };
         let config = timestretch::engine::EngineConfig {
             sample_rate,
             channels: 2,
-            profile: timestretch::engine::EngineProfile::Tape,
+            profile,
             initial_tempo_rate: 1.0 / initial_ratio.clamp(0.25, MAX_VARISPEED_RATIO),
             max_block_frames: 2048,
             source_capacity_frames: 65_536,
@@ -325,6 +331,8 @@ impl TimeStretchApp {
                 return;
             }
         };
+        let pipeline_latency_secs =
+            handles.processor.pipeline_latency_frames() as f64 / sample_rate as f64;
 
         let reset_request = Arc::new(AtomicBool::new(false));
         let engine = match AudioEngine::new_pull(
@@ -360,6 +368,7 @@ impl TimeStretchApp {
             self.stream_active.clone(),
             stop_flag,
             reset_request,
+            pipeline_latency_secs,
         );
 
         self.processing_handle = Some(handle);
@@ -741,7 +750,7 @@ impl TimeStretchApp {
                     egui::ComboBox::from_id_salt("deck_engine_combo")
                         .selected_text(self.deck_engine.label())
                         .show_ui(ui, |ui| {
-                            for deck in [DeckEngine::Legacy, DeckEngine::PullTape] {
+                            for &deck in DeckEngine::ALL {
                                 ui.selectable_value(&mut self.deck_engine, deck, deck.label());
                             }
                         });
@@ -761,14 +770,28 @@ impl TimeStretchApp {
                         self.state.lock().unwrap().deck_engine = self.deck_engine;
                         self.stop_playback();
                     }
-                    if self.deck_engine == DeckEngine::PullTape {
-                        ui.label(egui::RichText::new("tape: pitch follows tempo").weak())
-                            .on_hover_text(
-                                "New pull-based engine (roadmap Stage 1): zero pipeline \
-                                 delay, sample-accurate tempo, no keylock yet. The \
-                                 Preset, Playback, Engine, Tempo Path, and Pitch \
-                                 controls apply to the legacy deck only.",
-                            );
+                    match self.deck_engine {
+                        DeckEngine::PullTape => {
+                            ui.label(egui::RichText::new("tape: pitch follows tempo").weak())
+                                .on_hover_text(
+                                    "New pull-based engine (roadmap Stage 1): zero pipeline \
+                                     delay, sample-accurate tempo, pitch follows the fader. \
+                                     The Preset, Playback, Engine, Tempo Path, and Pitch \
+                                     controls apply to the legacy deck only.",
+                                );
+                        }
+                        DeckEngine::PullKeylock => {
+                            ui.label(egui::RichText::new("keylock: two-band").weak())
+                                .on_hover_text(
+                                    "New pull-based engine (roadmap Stage 2): low band \
+                                     follows tempo, high band pitch-corrected by a small \
+                                     FFT at the delay-matched transposition (~13 ms \
+                                     pipeline delay). The Preset, Playback, Engine, Tempo \
+                                     Path, and Pitch controls apply to the legacy deck \
+                                     only.",
+                                );
+                        }
+                        DeckEngine::Legacy => {}
                     }
                 });
                 ui.end_row();

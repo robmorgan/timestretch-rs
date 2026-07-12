@@ -300,8 +300,7 @@ impl TimelineMap {
     /// Instantaneous embedded tempo rate at an output-timeline frame count,
     /// interpolating the per-checkpoint retarget values (this resolves the
     /// resampler's intra-chunk ramp itself). Clamps outside the range.
-    /// Feeds the delay-matched transposition tracker in Stage 2.
-    #[allow(dead_code)]
+    /// Drives the keylock corrector's delay-matched transposition.
     pub(crate) fn rate_at(&self, output: f64) -> Option<f64> {
         if self.len == 0 {
             return None;

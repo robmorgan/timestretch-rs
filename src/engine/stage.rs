@@ -87,6 +87,20 @@ impl BlockBuf {
     }
 }
 
+/// Per-block context the graph hands every stage.
+///
+/// Carries the control-plane signals a stage may need, computed once per
+/// block by the graph. Today that is the delay-matched embedded tempo rate;
+/// artifact cursors join it in Stage 4.
+#[derive(Debug, Clone, Copy)]
+pub struct StageCtx {
+    /// Tempo rate embedded in the audio at the END of this block, read off
+    /// the varispeed timeline map (the old engine's delay-matched
+    /// transposition mechanism). The audio's pitch is scaled by this rate;
+    /// a keylock corrector cancels it by transposing at its reciprocal.
+    pub embedded_rate: f64,
+}
+
 /// One DSP stage in the engine graph.
 ///
 /// Stages are small, single-purpose processors composed into fixed
@@ -102,7 +116,7 @@ impl BlockBuf {
 ///   the stage, discarding output, so a jump resumes converged.
 pub trait Stage: Send {
     /// Processes one fixed block in place.
-    fn process(&mut self, block: &mut BlockBuf);
+    fn process(&mut self, block: &mut BlockBuf, ctx: &StageCtx);
 
     /// Constant pipeline delay this stage introduces, in frames.
     fn latency_frames(&self) -> usize;

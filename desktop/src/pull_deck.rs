@@ -90,6 +90,7 @@ pub fn start_pull_deck_thread(
     stream_active: Arc<AtomicBool>,
     stop_flag: Arc<StopFlag>,
     reset_request: Arc<AtomicBool>,
+    pipeline_latency_secs: f64,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let total_frames = source_audio.len() / CHANNELS;
@@ -103,11 +104,12 @@ pub fn start_pull_deck_thread(
         let mut prerolled = false;
         let mut last_underruns = 0u64;
 
-        // The pull chain has zero pipeline delay and resampler-lookahead
-        // control latency; publish once for the UI latency chip.
+        // Publish the chain's constant pipeline delay (0 for tape, the
+        // corrector's constant for keylock) for the UI latency chip;
+        // control-to-audio stays at resampler lookahead either way.
         {
             let mut st = state.lock().unwrap();
-            st.reported_latency_secs = 0.0;
+            st.reported_latency_secs = pipeline_latency_secs;
             st.reported_control_latency_secs = 0.0;
         }
 

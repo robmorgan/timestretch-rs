@@ -56,7 +56,7 @@ pub use control::{EngineController, MAX_TEMPO_RATE, MIN_TEMPO_RATE};
 pub use graph::EngineProcessor;
 pub use profiles::EngineProfile;
 pub use source::SourceProducer;
-pub use stage::{BlockBuf, Stage, BLOCK_FRAMES};
+pub use stage::{BlockBuf, Stage, StageCtx, BLOCK_FRAMES};
 
 use crate::engine::control::EngineShared;
 use crate::engine::source::SourceRing;
@@ -151,7 +151,7 @@ pub struct Engine;
 impl Engine {
     /// Builds an engine with the profile's fixed stage chain.
     pub fn build(config: EngineConfig) -> Result<EngineHandles, StretchError> {
-        let stages = profiles::build_stages(config.profile);
+        let stages = profiles::build_stages(config.profile, config.sample_rate, config.channels);
         Self::build_with_stages(config, stages)
     }
 

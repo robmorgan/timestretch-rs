@@ -62,14 +62,26 @@ impl PresetChoice {
 pub enum DeckEngine {
     Legacy,
     PullTape,
+    PullKeylock,
 }
 
 impl DeckEngine {
+    pub const ALL: &'static [DeckEngine] = &[
+        DeckEngine::Legacy,
+        DeckEngine::PullTape,
+        DeckEngine::PullKeylock,
+    ];
+
     pub fn label(&self) -> &'static str {
         match self {
             DeckEngine::Legacy => "Legacy (push)",
             DeckEngine::PullTape => "Pull — Tape",
+            DeckEngine::PullKeylock => "Pull — Keylock",
         }
+    }
+
+    pub fn is_pull(&self) -> bool {
+        !matches!(self, DeckEngine::Legacy)
     }
 }
 
