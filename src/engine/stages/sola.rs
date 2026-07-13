@@ -31,15 +31,40 @@ const DRIFT_TRIGGER: f64 = 192.0;
 const HARD_TRIGGER: f64 = 320.0;
 /// Correlation search half-range around the nominal jump, in frames.
 const SEARCH_RANGE: isize = 160;
-/// Correlation window length, in frames.
-const CORR_WINDOW: usize = 96;
-/// Splice crossfade length, in frames (equal-power).
+/// Correlation window length, in frames. Sized to cover 2+ periods at the
+/// band's bottom edge (~150 Hz): a shorter window aligns splices only to
+/// the dominant mid/high period grid and repeatedly chops seam-region
+/// content mid-period — audible as bass thinning against the un-corrected
+/// low band during tempo gestures.
+const CORR_WINDOW: usize = 320;
+/// Splice crossfade length, in frames (~2.2 ms). Longer fades measurably
+/// worsen ride pitch stability (each fade interpolates between copies at
+/// a sub-period offset, and more estimation windows straddle a fade), so
+/// seam-content preservation leans on the correlation window instead.
 const XFADE_FRAMES: usize = 96;
 /// Sinc half-width plus slack the read cursor keeps behind the write head.
 const MIN_READ_MARGIN: f64 = (STREAM_SINC_HALF_TAPS + 4) as f64;
 /// Candidate-region energy above this multiple of the rolling average reads
 /// as a transient: postpone the splice until [`HARD_TRIGGER`].
 const TRANSIENT_POSTPONE_RATIO: f64 = 3.0;
+/// Below this transposition deviation the corrector is effectively at rest
+/// and actively bleeds elastic drift back to zero (see `process_block`):
+/// parked drift keeps the high band time-shifted against the low band's
+/// fixed delay, comb-filtering the crossover overlap indefinitely.
+const REST_DEV: f64 = 0.003;
+/// Blocks the deviation must stay below [`REST_DEV`] before rest actions
+/// engage (~150 ms): a fast ride sweeps through unity in tens of
+/// milliseconds, and firing rest splices/trim there costs measurable
+/// pitch stability exactly where the ride should be purest.
+const REST_DWELL_BLOCKS: u32 = 206;
+/// At-rest drift beyond this recenters via a clean splice immediately.
+const REST_SPLICE_DRIFT: f64 = 48.0;
+/// Maximum read-rate trim used to bleed small at-rest drift. Kept under
+/// the pure-tone pitch JND (~1.4 cents): a tempo ride sweeps through
+/// unity — engaging the trim — exactly when pitch should be purest, so
+/// this must stay inaudible. The rest splice above removes bulk drift;
+/// the trim only polishes the sub-[`REST_SPLICE_DRIFT`] residue.
+const REST_TRIM_MAX: f64 = 0.0008;
 
 /// One channel's ring state.
 #[derive(Debug)]
@@ -68,6 +93,8 @@ pub(crate) struct SolaCorrector {
     splice_count: u64,
     /// A recentering splice is pending (keylock release handoff prep).
     recenter_requested: bool,
+    /// Consecutive blocks with the transposition inside [`REST_DEV`].
+    rest_blocks: u32,
 }
 
 impl SolaCorrector {
@@ -96,6 +123,7 @@ impl SolaCorrector {
             energy_avg: 0.0,
             splice_count: 0,
             recenter_requested: false,
+            rest_blocks: 0,
         }
     }
 
@@ -159,6 +187,7 @@ impl SolaCorrector {
         self.energy_avg = 0.0;
         self.splice_count = 0;
         self.recenter_requested = false;
+        self.rest_blocks = 0;
     }
 
     /// Processes one fixed block for every channel in lockstep: writes the
@@ -180,7 +209,18 @@ impl SolaCorrector {
         self.energy_avg = 0.98 * self.energy_avg + 0.02 * block_rms;
 
         // 2) Splice management (block-granular: drift accrues < 2 frames
-        //    per block at the clamp bounds).
+        //    per block at the clamp bounds). `lag_error_frames` here — after
+        //    ingest, before synthesis — reads one block high; the SETTLED
+        //    drift (what actually parks between blocks) subtracts it.
+        let deviation = (self.transposition - 1.0).abs();
+        let settled_drift = self.lag_error_frames() - BLOCK_FRAMES as f64;
+        let at_rest = if deviation < REST_DEV {
+            self.rest_blocks = self.rest_blocks.saturating_add(1);
+            self.rest_blocks >= REST_DWELL_BLOCKS
+        } else {
+            self.rest_blocks = 0;
+            false
+        };
         if self.xfade_remaining == 0 {
             let drift = self.lag_error_frames();
             if self.recenter_requested {
@@ -191,11 +231,24 @@ impl SolaCorrector {
                 }
             } else if drift.abs() > DRIFT_TRIGGER {
                 self.try_splice(drift);
+            } else if at_rest && settled_drift.abs() > REST_SPLICE_DRIFT {
+                // At sustained rest a parked drift comb-filters the
+                // crossover overlap against the low band's fixed delay;
+                // recenter cleanly.
+                self.try_splice(drift);
             }
         }
 
-        // 3) Synthesis.
-        let t = self.transposition;
+        // 3) Synthesis. At sustained rest, a small read-rate trim bleeds
+        // residual drift to zero (kept under the pitch JND).
+        // d(drift)/dframe = −trim: positive parked drift needs a faster
+        // read (positive trim) to converge.
+        let trim = if at_rest {
+            (settled_drift * 0.001).clamp(-REST_TRIM_MAX, REST_TRIM_MAX)
+        } else {
+            0.0
+        };
+        let t = self.transposition + trim;
         for i in 0..BLOCK_FRAMES {
             if self.xfade_remaining > 0 {
                 // Raised-cosine amplitude-complementary crossfade between
@@ -259,7 +312,12 @@ impl SolaCorrector {
             if !self.readable_span(candidate, CORR_WINDOW + XFADE_FRAMES) {
                 continue;
             }
-            let score = self.mix_correlation(base, candidate, CORR_WINDOW);
+            // Mild distance penalty: periodic content scores every
+            // period-grid candidate identically, and un-penalized ties
+            // resolve to the search edge — parking the elastic drift ~a
+            // full search range off nominal instead of converging to it.
+            let distance = (jump as f64 - nominal_jump).abs() / SEARCH_RANGE as f64;
+            let score = self.mix_correlation(base, candidate, CORR_WINDOW) - 0.02 * distance;
             if score > best_score {
                 best_score = score;
                 best_jump = jump as f64;

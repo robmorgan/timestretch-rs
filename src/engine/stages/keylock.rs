@@ -306,6 +306,79 @@ mod tests {
     }
 
     #[test]
+    fn seam_level_recovers_after_a_nudge() {
+        // A platter nudge drifts SOLA's elastic cursor; if that drift PARKS
+        // after the nudge, the high band stays time-shifted against the low
+        // band's fixed delay and the crossover overlap region cancels —
+        // audible as "filtered / lost bass" at rest. Seam-region level must
+        // return to its pre-nudge baseline shortly after the gesture.
+        // Dominant high content (880 Hz) over a quieter seam tone (170 Hz):
+        // splice correlation aligns to the dominant period grid, so any
+        // parked drift leaves the seam tone at an arbitrary inter-band
+        // phase — the realistic case (a pure seam tone self-aligns and
+        // cannot reproduce the bug).
+        let mut stage = KeylockStage::new(SR, 1);
+        let seam_hz = 170.0;
+        let mut phase_seam = 0.0f64;
+        let mut phase_hi = 0.0f64;
+        let mut block = BlockBuf::new(1);
+        let mut collected = Vec::new();
+        let total_secs = 8.0;
+        let total_blocks = (total_secs * SR as f64 / BLOCK_FRAMES as f64) as usize;
+        for bi in 0..total_blocks {
+            let t = (bi * BLOCK_FRAMES) as f64 / SR as f64;
+            // Rest 2 s, nudge to +4% over 0.2 s, hold 0.1 s, back over
+            // 0.2 s, rest for the remainder.
+            let rate = if t < 2.0 {
+                1.0
+            } else if t < 2.2 {
+                1.0 + 0.04 * (t - 2.0) / 0.2
+            } else if t < 2.3 {
+                1.04
+            } else if t < 2.5 {
+                1.04 - 0.04 * (t - 2.3) / 0.2
+            } else {
+                1.0
+            };
+            for s in block.channel_mut(0).iter_mut() {
+                phase_seam += 2.0 * std::f64::consts::PI * seam_hz * rate / SR as f64;
+                phase_hi += 2.0 * std::f64::consts::PI * 880.0 * rate / SR as f64;
+                *s = 0.15 * phase_seam.sin() as f32 + 0.5 * phase_hi.sin() as f32;
+            }
+            let ctx = StageCtx {
+                embedded_rate: rate,
+            };
+            stage.process(&mut block, &ctx);
+            collected.extend_from_slice(block.channel(0));
+        }
+
+        // Goertzel power at the seam frequency, before vs well after.
+        let goertzel = |lo: usize, hi: usize| -> f64 {
+            let w = 2.0 * std::f64::consts::PI * seam_hz / SR as f64;
+            let coeff = 2.0 * w.cos();
+            let (mut s1, mut s2) = (0.0f64, 0.0f64);
+            for &x in &collected[lo..hi] {
+                let s0 = x as f64 + coeff * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            (s1 * s1 + s2 * s2 - coeff * s1 * s2) / ((hi - lo) as f64 / 2.0).powi(2)
+        };
+        let sr = SR as usize;
+        let baseline = goertzel(sr, 2 * sr); // settled, pre-nudge
+        let after = goertzel(6 * sr, 8 * sr); // 3.5 s past the gesture
+        let loss_db = 10.0 * (after / baseline).log10();
+        println!(
+            "seam 170 Hz power: baseline {baseline:.5}, after nudge {after:.5} ({loss_db:+.2} dB)"
+        );
+        assert!(
+            loss_db > -1.5,
+            "seam level did not recover after the nudge: {loss_db:+.2} dB \
+             (parked SOLA drift de-phasing the bands)"
+        );
+    }
+
+    #[test]
     fn selects_sola_inside_threshold_and_pv_outside() {
         let mut stage = KeylockStage::new(SR, 1);
         // 600 blocks: dwell (344) + alignment wait (bounded by one phase

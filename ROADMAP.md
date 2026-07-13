@@ -281,6 +281,20 @@ Automation: auto
 > second, a pathological selection gesture — measures p95 12.9 / max 16.5
 > vs old 12.2 / 27.9 (absolute gates 15 / 22 still clear; threshold and
 > hysteresis tuning is a named Stage 7 experiment).
+> **Post-landing fix (2026-07-13, owner-reported):** tempo nudges on the
+> keylock deck thinned the bass. Cause: SOLA's elastic drift parks after a
+> gesture, leaving the high band time-shifted against the low band's fixed
+> delay — the crossover overlap (~100–300 Hz: kick body, bass harmonics)
+> comb-filters indefinitely (reproduced at −6.7 dB on a seam tone under a
+> dominant mid tone; a pure seam tone self-aligns and hides it). Fixed:
+> splice correlation window widened to 2+ periods at the band edge (320)
+> so splices align seam content too; distance-penalized tie-breaking
+> (periodic content otherwise parks drift at the search edge); and
+> sustained-rest drift bleed — a clean recenter splice for parked drift
+> > 48 frames plus a sub-JND read-rate trim, gated on ~150 ms of rest so
+> unity crossings mid-ride stay pure. Seam recovery after a nudge:
+> **+0.00 dB** (was −6.7); all cents/torture/sharpness gates green.
+>
 > **Known issue found and pinned during gating:** the streaming PV sags
 > up to −3 dB for ~1 s after fast unity-crossing transposition rides
 > (envelope-gated in `pv_corrector` unit tests; the old engine measures
