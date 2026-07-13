@@ -111,6 +111,13 @@ pub struct StageCtx<'a> {
     /// transposition mechanism). The audio's pitch is scaled by this rate;
     /// a keylock corrector cancels it by transposing at its reciprocal.
     pub embedded_rate: f64,
+    /// Local slope of the embedded rate, in rate per stage frame (read off
+    /// the timeline over the trailing few hundred frames; 0.0 when the
+    /// history is too short). An elastic corrector reading `d` frames away
+    /// from its nominal lag is consuming audio embedded at approximately
+    /// `embedded_rate - slope * d`; tracking that keeps ride pitch exact
+    /// even while drift is parked.
+    pub embedded_rate_slope: f64,
     /// Artifact events near this block (behind by up to ~1k frames, ahead
     /// by up to ~2k), in stage-timeline coordinates. Empty when no
     /// artifact is attached — stages fall back to online heuristics.

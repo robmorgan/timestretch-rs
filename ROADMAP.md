@@ -570,6 +570,27 @@ Automation: manual
 > octave at 1.08 (−1.7 vs −0.8 dB, splice-phase scatter), envelope under
 > ±11% crossing (11.8 vs 10.4 dB — both dominated by the pinned PV sag).
 >
+> **2026-07 campaign closed all three losing rows — the matrix is now 9/9
+> for the new engine.** (1) Ride cents: root cause was the StageCtx
+> embedded rate being read at the ring ingest position instead of the
+> pipeline-latency-matched consumption position — a ride led the
+> corrector by 560 frames (≈ latency × slope ≈ 2.8 cents at ±4% max
+> slope). Delay-matching the read (plus a slope-tracked SOLA
+> transposition that compensates the elastic drift term, and the rate
+> history the timeline must now retain) took ride4 to **0.23 vs old
+> 1.86** and ride8 to **0.57 vs old 12.19**. (2) Top octave: two causes —
+> the 32-tap SOLA read kernel drooped ~1.5 dB in the top octave (now a
+> dedicated 64-tap Kaiser table, flat past 0.9× Nyquist), and integer
+> splice quantization scattered HF phase at every splice (now a
+> sub-sample fine search over the fade window, sinc-interpolated at 1/8
+> grid + parabolic vertex). hf_retention at 1.08: **−0.41 vs old
+> −0.79 dB**. (3) Envelope under crossing rides: the PV's accumulated
+> unity-crossing sag is now flushed (`flush_streaming_pipeline`,
+> artifact bookkeeping preserved) whenever the ride settles near unity
+> while SOLA alone is audible, with a release-handoff cooldown while the
+> PV re-primes. env_swing at ±11%: **0.65 vs old 10.36 dB** — the sag no
+> longer reaches the output at all on this fixture.
+>
 > Remaining (manual): settle the three tuning constants with listening +
 > the matrix, define the public corpus, promote an external-reference
 > comparison to required CI, and the owner listening sign-off.

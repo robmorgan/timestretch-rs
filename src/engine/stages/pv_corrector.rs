@@ -328,7 +328,17 @@ impl PvCorrector {
         PV_CORRECTOR_LATENCY_FRAMES
     }
 
-    pub(crate) fn reset(&mut self) {
+    /// Flushes the audio pipeline — PV phase/window state, resampler and
+    /// output FIFO (re-primed with the latency prime of silence) — while
+    /// PRESERVING the artifact bookkeeping (`ingested`, `last_onset_fired`,
+    /// fallback state) and the current transposition: onset resets fire
+    /// once per event across a flush, exactly as without one.
+    ///
+    /// Only call while this corrector is inaudible (keylock mix fully on
+    /// SOLA): the output restarts as silence for one latency. The keylock
+    /// stage uses it to shed the PV's accumulated unity-crossing envelope
+    /// sag whenever a ride settles near unity.
+    pub(crate) fn flush_streaming_pipeline(&mut self) {
         for ch in &mut self.channels {
             ch.pv.reset_streaming_state();
             ch.window.clear();
@@ -340,6 +350,10 @@ impl PvCorrector {
                 ch.out_fifo.push(0.0);
             }
         }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.flush_streaming_pipeline();
         self.transposition = 1.0;
         for ch in &mut self.channels {
             ch.pv.set_stretch_ratio(1.0);

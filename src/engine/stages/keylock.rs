@@ -69,6 +69,19 @@ const CORRECTION_FADE_START_DEV: f64 = 0.12;
 /// instead of pushing the PV past its quality range (old Stage 13
 /// semantics, trivial in this architecture).
 const CORRECTION_FADE_END_DEV: f64 = 0.22;
+/// With SOLA fully carrying the output and the ride settled this close to
+/// unity (rate space), the PV's streaming pipeline is flushed once: the PV
+/// accumulates an envelope sag riding through unity (known inherited
+/// defect — see ROADMAP Stage 3 notes), and shedding that state while the
+/// PV is inaudible means a later engage starts clean.
+const PV_FLUSH_DEV: f64 = 0.02;
+/// The flush re-arms once the ride moves back out beyond this.
+const PV_FLUSH_REARM_DEV: f64 = 0.04;
+/// Blocks after a flush during which a release handoff must not start:
+/// the PV is re-priming its latency of silence, and the alignment gate
+/// reads silence as aligned (a fade would swap in a silent corrector).
+/// Covers the prime (560 frames) plus one render hop, in blocks.
+const PV_FLUSH_COOLDOWN_BLOCKS: u32 = 24;
 
 /// Two-band keylock stage with corrector selection.
 #[derive(Debug)]
@@ -97,6 +110,10 @@ pub(crate) struct KeylockStage {
     handoff_wait_blocks: u32,
     /// True once the pending engage has hard-recentered SOLA.
     engage_recentered: bool,
+    /// Near-unity PV flush is armed (one-shot, re-armed away from unity).
+    pv_flush_armed: bool,
+    /// Blocks remaining in the post-flush handoff cooldown.
+    pv_flush_cooldown: u32,
     /// Rolling channel-mix history of each corrector's output.
     sola_history: [f32; ALIGN_WINDOW],
     pv_history: [f32; ALIGN_WINDOW],
@@ -126,6 +143,8 @@ impl KeylockStage {
             blocks_since_flip: 0,
             handoff_wait_blocks: 0,
             engage_recentered: false,
+            pv_flush_armed: true,
+            pv_flush_cooldown: 0,
             sola_history: [0.0; ALIGN_WINDOW],
             pv_history: [0.0; ALIGN_WINDOW],
             last_alignment: 0.0,
@@ -187,7 +206,9 @@ impl KeylockStage {
             }
             // Fade only at a phase-aligned instant (or on force timeout).
             self.handoff_wait_blocks = self.handoff_wait_blocks.saturating_add(1);
-            let ready = self.sola.is_recentered() && self.last_alignment >= HANDOFF_ALIGNMENT_MIN;
+            let ready = self.sola.is_recentered()
+                && self.last_alignment >= HANDOFF_ALIGNMENT_MIN
+                && (start == 0.0 || self.pv_flush_cooldown == 0);
             if !ready && self.handoff_wait_blocks < HANDOFF_FORCE_BLOCKS {
                 return (start, start);
             }
@@ -246,6 +267,10 @@ impl Stage for KeylockStage {
         };
         self.pv.set_transposition(transposition);
         self.sola.set_transposition(transposition);
+        // SOLA reads elastically off the nominal lag; give it the local
+        // rate slope so its synthesis rate tracks the audio actually under
+        // its cursor (the PV reads at a constant lag and needs no slope).
+        self.sola.set_rate_slope(ctx.embedded_rate_slope);
         // Artifact events for this block: PV schedules per-band phase
         // resets; SOLA steers splice timing around the same events.
         self.pv
@@ -255,6 +280,21 @@ impl Stage for KeylockStage {
         // cursor BEFORE this block is synthesized, so a starting fade mixes
         // post-recenter audio from its very first sample.
         let (mix_start, mix_end) = self.update_selection(transposition);
+
+        // Near-unity PV flush: one-shot while SOLA alone is audible.
+        let rate_deviation = (ctx.embedded_rate - 1.0).abs();
+        self.pv_flush_cooldown = self.pv_flush_cooldown.saturating_sub(1);
+        if mix_start == 1.0
+            && mix_end == 1.0
+            && self.pv_flush_armed
+            && rate_deviation < PV_FLUSH_DEV
+        {
+            self.pv.flush_streaming_pipeline();
+            self.pv_flush_armed = false;
+            self.pv_flush_cooldown = PV_FLUSH_COOLDOWN_BLOCKS;
+        } else if !self.pv_flush_armed && rate_deviation > PV_FLUSH_REARM_DEV {
+            self.pv_flush_armed = true;
+        }
 
         // Split every channel, keep the delayed low band, and fan the high
         // band out to BOTH correctors (both stay warm so a handoff never
@@ -312,6 +352,8 @@ impl Stage for KeylockStage {
         self.blocks_since_flip = 0;
         self.handoff_wait_blocks = 0;
         self.engage_recentered = false;
+        self.pv_flush_armed = true;
+        self.pv_flush_cooldown = 0;
         self.sola_history.fill(0.0);
         self.pv_history.fill(0.0);
         self.last_alignment = 0.0;
@@ -328,6 +370,7 @@ mod tests {
         let mut block = BlockBuf::new(1);
         let ctx = StageCtx {
             embedded_rate: rate,
+            embedded_rate_slope: 0.0,
             onsets: &[],
             modulation_hold: false,
             has_artifact: false,
@@ -389,6 +432,7 @@ mod tests {
             }
             let ctx = StageCtx {
                 embedded_rate: rate,
+                embedded_rate_slope: 0.0,
                 onsets: &[],
                 modulation_hold: false,
                 has_artifact: false,

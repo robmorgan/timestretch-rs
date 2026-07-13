@@ -16,10 +16,79 @@
 //! Splice decisions are made once per block on the channel mix and applied
 //! to every channel identically, keeping the stereo image intact.
 
-use std::sync::Arc;
-
-use crate::core::resample::{SincInterpTable, STREAM_SINC_HALF_TAPS};
 use crate::engine::stage::{OnsetEvent, BLOCK_FRAMES};
+
+/// Half-width of the SOLA read kernel in zero-crossings (64-tap kernel).
+///
+/// Twice the shared streaming prototype's 16: the corrector's random-access
+/// reads sit at arbitrary fractional offsets for minutes at a time, so
+/// passband flatness matters more than for the varispeed's forward
+/// resampler — 16 half-taps droop ~1.5 dB in the top octave (measured as
+/// the keylock chain's HF loss vs the old engine), 32 half-taps are flat
+/// past 0.9× Nyquist. Integer offsets remain an exact delta, preserving
+/// bit-exact unity passthrough.
+const READ_HALF_TAPS: usize = 32;
+/// Table oversampling (entries per zero-crossing, linearly interpolated).
+const READ_PHASES: usize = 512;
+/// Kaiser beta (~−90 dB stopband, same family as the shared prototype).
+const READ_KAISER_BETA: f64 = 9.0;
+
+/// Windowed-sinc interpolation table for the SOLA reader.
+#[derive(Debug)]
+struct ReadInterpTable {
+    taps: Vec<f32>,
+}
+
+impl ReadInterpTable {
+    fn new() -> Self {
+        fn bessel_i0(x: f64) -> f64 {
+            let mut sum = 1.0f64;
+            let mut term = 1.0f64;
+            let half_x = x * 0.5;
+            for k in 1..=25 {
+                term *= (half_x / k as f64) * (half_x / k as f64);
+                sum += term;
+                if term < sum * 1e-16 {
+                    break;
+                }
+            }
+            sum
+        }
+        let entries = READ_HALF_TAPS * READ_PHASES;
+        let mut taps = vec![0.0f32; entries + 2];
+        let bessel_beta = bessel_i0(READ_KAISER_BETA);
+        for (i, tap) in taps.iter_mut().enumerate().take(entries + 1) {
+            let u = i as f64 / READ_PHASES as f64;
+            let sinc_val = if u < 1e-12 {
+                1.0
+            } else {
+                let pi_u = std::f64::consts::PI * u;
+                pi_u.sin() / pi_u
+            };
+            let t = u / READ_HALF_TAPS as f64;
+            let window = if t <= 1.0 {
+                bessel_i0(READ_KAISER_BETA * (1.0 - t * t).max(0.0).sqrt()) / bessel_beta
+            } else {
+                0.0
+            };
+            *tap = (sinc_val * window) as f32;
+        }
+        Self { taps }
+    }
+
+    #[inline]
+    fn weight(&self, u_abs: f64) -> f32 {
+        if u_abs >= READ_HALF_TAPS as f64 {
+            return 0.0;
+        }
+        let x = u_abs * READ_PHASES as f64;
+        let i = x as usize;
+        let frac = (x - i as f64) as f32;
+        let a = self.taps[i];
+        let b = self.taps[i + 1];
+        a + (b - a) * frac
+    }
+}
 
 /// Ring capacity per channel (power of two), in frames.
 const RING_LEN: usize = 4_096;
@@ -43,7 +112,13 @@ const CORR_WINDOW: usize = 320;
 /// seam-content preservation leans on the correlation window instead.
 const XFADE_FRAMES: usize = 96;
 /// Sinc half-width plus slack the read cursor keeps behind the write head.
-const MIN_READ_MARGIN: f64 = (STREAM_SINC_HALF_TAPS + 4) as f64;
+const MIN_READ_MARGIN: f64 = (READ_HALF_TAPS + 4) as f64;
+/// Sub-sample splice refinement half-range, in frames: after the integer
+/// correlation search, the landing is refined on a fractional grid within
+/// this radius (see `plan_splice`).
+const FINE_SEARCH_RADIUS: f64 = 0.5;
+/// Fractional steps per frame in the sub-sample refinement grid.
+const FINE_SEARCH_STEPS: isize = 4;
 /// Candidate-region energy above this multiple of the rolling average reads
 /// as a transient: postpone the splice until [`HARD_TRIGGER`]. Online
 /// fallback — artifact onsets take precedence when present.
@@ -88,7 +163,7 @@ struct SolaChannel {
 #[derive(Debug)]
 pub(crate) struct SolaCorrector {
     channels: Vec<SolaChannel>,
-    table: Arc<SincInterpTable>,
+    table: ReadInterpTable,
     /// Frames written since reset (shared across channels).
     write_abs: u64,
     /// Absolute fractional read cursor (shared: channels are lockstep).
@@ -98,6 +173,11 @@ pub(crate) struct SolaCorrector {
     /// Remaining crossfade frames (0 = not fading).
     xfade_remaining: usize,
     transposition: f64,
+    /// Local slope of the embedded rate (rate per stage frame): the read
+    /// cursor sits `settled_drift` frames off nominal, consuming audio
+    /// embedded at `rate - slope * drift`, and the synthesis rate tracks
+    /// that instead of the nominal transposition (ride pitch accuracy).
+    rate_slope: f64,
     nominal_lag: f64,
     /// Rolling average of block RMS on the channel mix (transient gate).
     energy_avg: f64,
@@ -122,7 +202,7 @@ impl SolaCorrector {
                     ring: vec![0.0; RING_LEN],
                 })
                 .collect(),
-            table: SincInterpTable::new_stream_default(),
+            table: ReadInterpTable::new(),
             write_abs: 0,
             // Starting the cursor a full lag behind zero realizes the
             // constant delay exactly: the first `nominal_lag` reads land on
@@ -131,6 +211,7 @@ impl SolaCorrector {
             xfade_from: 0.0,
             xfade_remaining: 0,
             transposition: 1.0,
+            rate_slope: 0.0,
             nominal_lag: nominal_lag_frames as f64,
             energy_avg: 0.0,
             splice_count: 0,
@@ -145,6 +226,10 @@ impl SolaCorrector {
         } else {
             1.0
         };
+    }
+
+    pub(crate) fn set_rate_slope(&mut self, slope: f64) {
+        self.rate_slope = if slope.is_finite() { slope } else { 0.0 };
     }
 
     pub(crate) fn latency_frames(&self) -> usize {
@@ -200,15 +285,18 @@ impl SolaCorrector {
         self.splice_count = 0;
         self.recenter_requested = false;
         self.rest_blocks = 0;
+        self.rate_slope = 0.0;
     }
 
     /// Whether a fade read-span starting at `start` overlaps any artifact
     /// onset's protection window (positions share the write/stage axis).
     fn span_hits_onset(&self, onsets: &[OnsetEvent], start: f64) -> bool {
+        // Padded by the sub-sample refinement radius: the fine search may
+        // move a vetted candidate by up to half a frame either way.
         let span = XFADE_FRAMES as f64 * self.transposition.max(1.0);
         onsets.iter().any(|event| {
-            start < event.stage_frame + ONSET_PROTECT_POST
-                && start + span > event.stage_frame - ONSET_PROTECT_PRE
+            start - FINE_SEARCH_RADIUS < event.stage_frame + ONSET_PROTECT_POST
+                && start + span + FINE_SEARCH_RADIUS > event.stage_frame - ONSET_PROTECT_PRE
         })
     }
 
@@ -288,7 +376,22 @@ impl SolaCorrector {
         } else {
             0.0
         };
-        let t = self.transposition + trim;
+        // Slope-tracked transposition: the cursor reads `settled_drift`
+        // frames off the nominal lag, where the embedded rate differs by
+        // `slope * drift` — invert THAT rate, or a ride detunes by up to a
+        // couple of cents whenever drift is parked. Zero slope (constant
+        // rate) leaves the nominal transposition bit-exact.
+        let t = if self.rate_slope != 0.0 {
+            let rate_at_cursor =
+                1.0 / self.transposition - (self.rate_slope * settled_drift).clamp(-0.02, 0.02);
+            if rate_at_cursor > 0.5 {
+                (1.0 / rate_at_cursor).clamp(0.75, 1.35) + trim
+            } else {
+                self.transposition + trim
+            }
+        } else {
+            self.transposition + trim
+        };
         for i in 0..BLOCK_FRAMES {
             if self.xfade_remaining > 0 {
                 // Raised-cosine amplitude-complementary crossfade between
@@ -316,8 +419,13 @@ impl SolaCorrector {
                 self.read_pos += t;
             }
         }
+        let newest_read = if self.xfade_remaining > 0 {
+            self.read_pos.max(self.xfade_from)
+        } else {
+            self.read_pos
+        };
         debug_assert!(
-            self.write_abs as f64 - self.read_pos.max(self.xfade_from) >= MIN_READ_MARGIN - 1.0,
+            self.write_abs as f64 - newest_read >= MIN_READ_MARGIN - 1.0,
             "SOLA read overtook the write head"
         );
     }
@@ -373,6 +481,44 @@ impl SolaCorrector {
         }
         if best_score == f64::MIN {
             return false; // every candidate excluded; retried next block
+        }
+        // Sub-sample refinement: the integer grid misses the correlation
+        // peak by up to half a sample — at the band's top octave that is
+        // most of a period, and the residual phase error at each splice
+        // scrambles HF coherence (measured as steady top-octave loss at
+        // sustained rates). Only sub-sample structure distinguishes the
+        // fractional candidates, so a short window (the fade span, where
+        // the two copies actually interfere) suffices; the read cursor is
+        // fractional anyway, so the refined jump costs nothing downstream.
+        if self.readable_span(base + best_jump - 1.0, CORR_WINDOW + XFADE_FRAMES)
+            && self.readable_span(base + best_jump + 1.0, CORR_WINDOW + XFADE_FRAMES)
+        {
+            const GRID: usize = 2 * FINE_SEARCH_STEPS as usize + 1;
+            let step = FINE_SEARCH_RADIUS / FINE_SEARCH_STEPS as f64;
+            let mut cs = [0.0f64; GRID];
+            let (mut best_k, mut best_c) = (0usize, f64::MIN);
+            for (k, c) in cs.iter_mut().enumerate() {
+                let frac = (k as f64 - FINE_SEARCH_STEPS as f64) * step;
+                *c = self.mix_correlation_frac(base, base + best_jump + frac, XFADE_FRAMES);
+                if *c > best_c {
+                    best_c = *c;
+                    best_k = k;
+                }
+            }
+            let mut best_frac = (best_k as f64 - FINE_SEARCH_STEPS as f64) * step;
+            // The grid steps sample the correlation ripple ~20x denser than
+            // even top-octave content, so a parabolic vertex through the
+            // peak's neighbours is well-conditioned: residual sub-sample
+            // error drops another order of magnitude (each splice's fade
+            // spreads that error as a pitch wobble — ride cents accuracy).
+            if best_k > 0 && best_k + 1 < GRID {
+                let (cm, c0, cp) = (cs[best_k - 1], cs[best_k], cs[best_k + 1]);
+                let denom = cm - 2.0 * c0 + cp;
+                if denom < -1e-12 {
+                    best_frac += step * (0.5 * (cm - cp) / denom).clamp(-0.5, 0.5);
+                }
+            }
+            best_jump += best_frac;
         }
         let target = base + best_jump;
         if !self.readable_span(target, CORR_WINDOW + XFADE_FRAMES) {
@@ -430,6 +576,30 @@ impl SolaCorrector {
         }
     }
 
+    /// Like [`Self::mix_correlation`], but `b_pos` is honoured at fractional
+    /// precision (sinc-interpolated reads) so sub-sample offsets rank
+    /// correctly. `a_pos` stays on the integer grid like the coarse search.
+    fn mix_correlation_frac(&self, a_pos: f64, b_pos: f64, len: usize) -> f64 {
+        let a0 = a_pos.floor() as usize;
+        let (mut dot, mut a_sq, mut b_sq) = (0.0f64, 0.0f64, 0.0f64);
+        for i in 0..len {
+            let (mut a, mut b) = (0.0f64, 0.0f64);
+            for ch in &self.channels {
+                a += ch.ring[(a0 + i) & RING_MASK] as f64;
+                b += sinc_read(&ch.ring, b_pos + i as f64, &self.table) as f64;
+            }
+            dot += a * b;
+            a_sq += a * a;
+            b_sq += b * b;
+        }
+        let norm = (a_sq * b_sq).sqrt();
+        if norm < 1e-12 {
+            0.0
+        } else {
+            dot / norm
+        }
+    }
+
     /// RMS of the channel mix over `len` frames starting at `pos`.
     fn region_rms(&self, pos: f64, len: usize) -> f64 {
         let p0 = pos.floor() as usize;
@@ -449,11 +619,11 @@ impl SolaCorrector {
 /// Windowed-sinc random-access read from a ring at a fractional position.
 /// Exact passthrough at integer positions (the kernel is a delta there).
 #[inline]
-fn sinc_read(ring: &[f32], pos: f64, table: &SincInterpTable) -> f32 {
+fn sinc_read(ring: &[f32], pos: f64, table: &ReadInterpTable) -> f32 {
     let center = pos.floor();
     let frac = pos - center;
     let center = center as isize;
-    let half = STREAM_SINC_HALF_TAPS as isize;
+    let half = READ_HALF_TAPS as isize;
     let mut acc = 0.0f64;
     let mut wsum = 0.0f64;
     for j in (1 - half)..=half {

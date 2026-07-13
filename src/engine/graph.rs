@@ -36,6 +36,10 @@ const PRIME_BUDGET_MAX_FRAMES: u64 = 2_048;
 const DECLICK_FRAMES: u32 = 64;
 /// Maximum timestamped retargets held in flight.
 const MAX_PENDING_RETARGETS: usize = 8;
+/// Extra output frames of rate history retained behind the stages'
+/// consumption position (the SLOPE_WINDOW of the StageCtx build, rounded
+/// up), so the delay-matched rate and its slope never fall off the map.
+const RATE_HISTORY_MARGIN: usize = 256;
 
 /// Audio-thread half of the engine.
 ///
@@ -118,7 +122,15 @@ impl EngineProcessor {
         artifact: Option<Arc<PreAnalysisArtifact>>,
     ) -> Self {
         let out_fifo_frames = max_block_frames + 2 * MAX_OUT_PER_FEED + BLOCK_FRAMES;
-        let pipeline_latency_frames = stages.iter().map(|s| s.latency_frames()).sum();
+        let pipeline_latency_frames: usize = stages.iter().map(|s| s.latency_frames()).sum();
+        // The timeline must answer rate_at() a full pipeline latency (plus
+        // the slope window) behind the newest delivered frame — see the
+        // delay-matched StageCtx build and the matching evict_before().
+        // Checkpoints land once per feed chunk, as close together as
+        // FEED_CHUNK / MAX_TEMPO_RATE output frames at the fastest rate.
+        let timeline_capacity = (out_fifo_frames + pipeline_latency_frames + RATE_HISTORY_MARGIN)
+            / (FEED_CHUNK_FRAMES / 4)
+            + 16;
         Self {
             shared,
             ring,
@@ -126,7 +138,7 @@ impl EngineProcessor {
             block: BlockBuf::new(channels),
             stage_fifo: RingBuffer::with_capacity((BLOCK_FRAMES + 2 * MAX_OUT_PER_FEED) * channels),
             out_fifo: RingBuffer::with_capacity(out_fifo_frames * channels),
-            timeline: TimelineMap::with_capacity(out_fifo_frames / (FEED_CHUNK_FRAMES / 4) + 16),
+            timeline: TimelineMap::with_capacity(timeline_capacity),
             emitted_frames: 0,
             stage_in_frames: 0,
             delivered_frames: 0,
@@ -186,7 +198,13 @@ impl EngineProcessor {
         }
         out[whole..].fill(0.0);
 
-        self.timeline.evict_before(self.media_delivered_frames());
+        // Retain rate history back to the stages' consumption horizon:
+        // the delay-matched StageCtx reads `pipeline_latency + slope
+        // window` behind the ingest position every block.
+        self.timeline.evict_before(
+            self.media_delivered_frames()
+                .saturating_sub((self.pipeline_latency_frames + RATE_HISTORY_MARGIN) as u64),
+        );
         let position = self
             .timeline
             .map_to_source(self.position_query_frame())
@@ -529,14 +547,27 @@ impl EngineProcessor {
             if self.modulation_hold_blocks > 0 {
                 self.modulation_hold_blocks -= 1;
             }
-            // Delay-matched control: the rate embedded at the END of this
-            // block's span on the varispeed timeline, so corrections track
-            // the audio being consumed rather than the control target.
+            // Delay-matched control: the rate embedded in the audio the
+            // stages are CONSUMING — the pipeline latency behind this
+            // block's ingest position on the varispeed timeline — not the
+            // control target. Evaluating at the ingest position instead
+            // leads a ride by the full latency and detunes a corrector by
+            // `latency * rate_slope` (measured ~2.8 cents p95 on a ±4%
+            // ride before the offset was matched).
+            let consumed_pos = self.stage_in_frames as f64 - self.pipeline_latency_frames as f64;
+            let embedded_rate = self.timeline.rate_at(consumed_pos).unwrap_or(self.rate);
+            // Rate slope over the trailing window (matches the elastic
+            // corrector's drift scale): lets stages compensate for reading
+            // away from the nominal lag during a ride.
+            const SLOPE_WINDOW: f64 = RATE_HISTORY_MARGIN as f64;
+            let embedded_rate_slope = self
+                .timeline
+                .rate_at(consumed_pos - SLOPE_WINDOW)
+                .map(|earlier| (embedded_rate - earlier) / SLOPE_WINDOW)
+                .unwrap_or(0.0);
             let ctx = StageCtx {
-                embedded_rate: self
-                    .timeline
-                    .rate_at(self.stage_in_frames as f64)
-                    .unwrap_or(self.rate),
+                embedded_rate,
+                embedded_rate_slope,
                 onsets: &events[..event_count],
                 modulation_hold: self.modulation_hold_blocks > 0,
                 has_artifact: self.transient.is_some(),
@@ -1014,8 +1045,10 @@ mod tests {
         let mut out = vec![0.0f32; 256];
         let mut collected = Vec::new();
         let mut rate_integral = 0.0f64;
+        let mut last_rate = 1.0f64;
         for cb in 0..(44_100 * 4 / 256) {
             let rate = 1.0 + 0.0002 * ((cb % 400) as f64 - 200.0).abs() / 200.0 * 100.0;
+            last_rate = rate;
             controller.set_tempo_rate(rate);
             while feed < input.len() && source.occupied_frames() < 8_192 {
                 let end = (feed + 8_192).min(input.len());
@@ -1036,8 +1069,10 @@ mod tests {
             );
         }
         // Drift-free: consumed source within one feed chunk + retarget
-        // granularity of the rate integral.
-        let expected = rate_integral;
+        // granularity of the rate integral. The published position is
+        // delay-matched (the source frame that is audible NOW, a pipeline
+        // latency behind delivery), so shift the integral accordingly.
+        let expected = rate_integral - processor.pipeline_latency_frames() as f64 * last_rate;
         let got = controller.source_position();
         assert!(
             (got - expected).abs() < 320.0,
