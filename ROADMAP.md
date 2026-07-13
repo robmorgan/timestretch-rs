@@ -281,6 +281,20 @@ Automation: auto
 > second, a pathological selection gesture — measures p95 12.9 / max 16.5
 > vs old 12.2 / 27.9 (absolute gates 15 / 22 still clear; threshold and
 > hysteresis tuning is a named Stage 7 experiment).
+> **Threshold settled early (2026-07-13, owner-reported):** beyond the 5%
+> corrector threshold the deck sounded muffled — measured: the PV at FFT
+> 512 loses ~2–4 dB in the top octave (multitone probe, 12–16 kHz, −3.8 dB
+> at rate 1.10) while SOLA measures flat (−0.2 dB). The SOLA/PV threshold
+> is raised from 5% to **9% rate deviation** (engage 8.5% / release 9.5%,
+> now measured in rate space — transposition space is asymmetric), so the
+> time-domain path covers the full DJ range (±8% with margin) and the PV
+> serves only extreme rates, where Stage 5's corrector fade-out will apply
+> anyway. Ripple effect: the ±8% cents torture ride is now all-SOLA and
+> improved from p95 12.9 / max 16.5 to **p95 6.0 / max 6.3** (old engine
+> 12.2 / 27.9). Final corpus settlement stays a Stage 7 item; improving
+> the PV's top-octave fidelity (window/locking tuning) is on the Stage 7
+> list too.
+>
 > **Post-landing fix (2026-07-13, owner-reported):** tempo nudges on the
 > keylock deck thinned the bass. Cause: SOLA's elastic drift parks after a
 > gesture, leaving the high band time-shifted against the low band's fixed

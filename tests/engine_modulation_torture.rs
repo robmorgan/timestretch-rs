@@ -56,10 +56,10 @@ enum Gesture {
     Ride,
     /// Sync snaps: instant jumps 1.08 / 0.92 / 1.0 within each second.
     Snap,
-    /// Threshold ride: 1.0 + 0.075 * sin(2*pi*0.25*t) — sweeps the
-    /// transposition deviation through the SOLA/PV selection boundary
-    /// (engage 4.5% / release 5.5%) twice per 4 s cycle, forcing repeated
-    /// corrector handoffs mid-gesture.
+    /// Threshold ride: 1.0 + 0.11 * sin(2*pi*0.25*t) — sweeps the rate
+    /// deviation through the SOLA/PV selection boundary (engage 8.5% /
+    /// release 9.5%) twice per 4 s cycle, forcing repeated corrector
+    /// handoffs mid-gesture.
     ThresholdRide,
 }
 
@@ -80,7 +80,7 @@ impl Gesture {
             }
             Gesture::Ride => 1.0 + 0.06 * (2.0 * std::f64::consts::PI * 0.25 * t_secs).sin(),
             Gesture::ThresholdRide => {
-                1.0 + 0.075 * (2.0 * std::f64::consts::PI * 0.25 * t_secs).sin()
+                1.0 + 0.11 * (2.0 * std::f64::consts::PI * 0.25 * t_secs).sin()
             }
             Gesture::Snap => {
                 let phase = t_secs.fract();
@@ -100,7 +100,7 @@ impl Gesture {
             Gesture::Nudge => 1.04,
             Gesture::Ride => 1.06,
             Gesture::Snap => 1.08,
-            Gesture::ThresholdRide => 1.075,
+            Gesture::ThresholdRide => 1.11,
         }
     }
 
@@ -348,15 +348,18 @@ fn engine_keylock_torture_threshold_crossing_no_clicks() {
     }
     let swing_db = 20.0 * (max_rms / min_rms).log10();
     println!("threshold-crossing envelope swing: {swing_db:.2} dB");
-    // Measured 2026-07: 2.7 dB, dominated NOT by the handoffs but by the
-    // PV's known level sag after fast unity-crossing transposition rides
-    // (pinned in `pv_corrector` unit tests; the old engine measures
-    // 12.7 dB on this identical fixture). Gate at a regression envelope
-    // above the measured value; tighten when the PV sag is fixed.
+    // Measured 2026-07 at the ±11% ride: 11.6 dB, dominated NOT by the
+    // handoffs (clicks/p95 above stay clean) but by the PV's known level
+    // sag after fast unity-crossing transposition rides — this gesture's
+    // extremes sit deep in PV territory (pinned in `pv_corrector` unit
+    // tests; the old engine measures 12.7 dB at just ±7.5% on this
+    // fixture). Gate at a regression envelope above the measured value;
+    // tighten substantially when the PV sag is fixed (Stage 4 phase
+    // resets are the lever).
     assert!(
-        swing_db <= 4.0,
+        swing_db <= 13.0,
         "envelope swings {swing_db:.2} dB across the threshold ride \
-         (known envelope 2.7 dB, old engine 12.7 dB)"
+         (known envelope 11.6 dB from the pinned PV sag)"
     );
 }
 
