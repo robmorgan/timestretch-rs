@@ -350,9 +350,15 @@ fn test_beat_grid_snap_empty_grid() {
 #[test]
 fn test_beat_grid_interval_samples() {
     let grid = timestretch::BeatGrid {
-        beats: vec![0, 22050],
-        beats_fractional: vec![0.0, 22050.0],
+        beats: vec![0.0, 22050.0],
+        downbeats: vec![0],
+        segments: vec![timestretch::TempoSegment {
+            start_beat: 0,
+            bpm: 120.0,
+        }],
         bpm: 120.0,
+        confidence: 1.0,
+        downbeat_confidence: 1.0,
         sample_rate: 44100,
     };
     let interval = grid.beat_interval_samples();

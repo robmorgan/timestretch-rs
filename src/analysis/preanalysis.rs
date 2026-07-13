@@ -1,12 +1,18 @@
 //! Offline pre-analysis pipeline for DJ beat/onset alignment.
 
-use crate::analysis::beat::detect_beats_from_transients;
+use crate::analysis::beat::detect_beats_from_transients_with_options;
+use crate::analysis::tempogram::TempoTrackingOptions;
 use crate::analysis::transient::detect_transients;
 use crate::core::preanalysis::{hash_samples, PreAnalysisArtifact, PREANALYSIS_VERSION};
 
 const PREANALYSIS_FFT_SIZE: usize = 2048;
 const PREANALYSIS_HOP_SIZE: usize = 512;
 const PREANALYSIS_SENSITIVITY: f32 = 0.4;
+
+/// Soft tempo hint for the DJ analysis path: candidates in the classic EDM
+/// range get a small salience bonus. A hint, not a fold — a 90 BPM hip-hop
+/// track still comes back as 90.
+const DJ_TEMPO_HINT_RANGE: (f64, f64) = (100.0, 160.0);
 
 /// Downmixes interleaved audio to the mono analysis signal expected by
 /// [`analyze_for_dj`]: the input itself for mono, or the mid channel
@@ -74,22 +80,32 @@ pub fn analyze_for_dj_with_report(
         PREANALYSIS_HOP_SIZE,
         PREANALYSIS_SENSITIVITY,
     );
-    let beats = detect_beats_from_transients(&transients, sample_rate);
+    let grid = detect_beats_from_transients_with_options(
+        &transients,
+        sample_rate,
+        &TempoTrackingOptions {
+            hint_range: Some(DJ_TEMPO_HINT_RANGE),
+            ..TempoTrackingOptions::default()
+        },
+    );
 
-    let bpm = if beats.bpm.is_finite() && beats.bpm > 0.0 {
-        beats.bpm
+    let bpm = if grid.bpm.is_finite() && grid.bpm > 0.0 {
+        grid.bpm
     } else {
         0.0
     };
 
-    let downbeat_offset_samples = if bpm > 0.0 && !beats.beats.is_empty() {
+    let beat_positions = grid.beats_rounded();
+
+    let downbeat_offset_samples = if bpm > 0.0 && !grid.beats.is_empty() {
         let beat_interval = 60.0 * sample_rate as f64 / bpm;
-        (beats.beats[0] as f64).rem_euclid(beat_interval).round() as usize
+        grid.beats[0].rem_euclid(beat_interval).round() as usize
     } else {
         0
     };
 
-    let confidence = estimate_confidence(&beats.beats, &transients.onsets, sample_rate);
+    let confidence =
+        estimate_confidence(&beat_positions, &transients.onsets, sample_rate).max(grid.confidence);
 
     let transient_strengths = if transients.strengths.len() == transients.onsets.len() {
         transients.strengths.clone()
@@ -126,7 +142,10 @@ pub fn analyze_for_dj_with_report(
         bpm,
         downbeat_offset_samples,
         confidence,
-        beat_positions: beats.beats,
+        beat_positions,
+        beat_positions_fractional: grid.beats,
+        downbeat_beat_indices: grid.downbeats,
+        tempo_segments: grid.segments,
         transient_onsets: transients.onsets,
         transient_strengths,
         onset_band_flux,

@@ -52,11 +52,29 @@ impl WaveformPeaks {
     }
 }
 
-/// Paint a waveform display with playback cursor and click-to-seek.
+/// A beat marker for the waveform overlay: horizontal position as a
+/// fraction of the track (0..1) and whether it is a downbeat (bar start).
+#[derive(Debug, Clone, Copy)]
+pub struct BeatMark {
+    /// Position as a fraction of the total track length.
+    pub frac: f32,
+    /// True for downbeats (drawn emphasized).
+    pub is_downbeat: bool,
+}
+
+/// Minimum pixel spacing between adjacent grid lines before a marker tier
+/// (beats, then downbeats) is drawn at all.
+const MIN_GRID_SPACING_PX: f32 = 6.0;
+
+/// Paint a waveform display with playback cursor, beat-grid overlay, and
+/// click-to-seek. `beat_marks` must be sorted by position; the overlay is
+/// density-adaptive — all beats when they have room, downbeats only when
+/// beats would smear, nothing when even bars are too dense.
 pub fn paint_waveform(
     ui: &mut egui::Ui,
     peaks: &WaveformPeaks,
     progress: f32,
+    beat_marks: &[BeatMark],
 ) -> (egui::Response, Option<f32>) {
     let desired_size = egui::vec2(ui.available_width(), 120.0);
     let (response, painter) = ui.allocate_painter(desired_size, egui::Sense::click());
@@ -104,6 +122,47 @@ pub fn paint_waveform(
             0.0,
             color,
         );
+    }
+
+    // Beat-grid overlay: density-adaptive. Spacing is estimated from the
+    // marker counts (marks are evenly spread in musical time, so the mean
+    // is representative); each tier draws only when it has room.
+    if beat_marks.len() >= 2 {
+        let beat_spacing_px = rect.width() / beat_marks.len() as f32;
+        let downbeat_count = beat_marks.iter().filter(|m| m.is_downbeat).count();
+        let downbeat_spacing_px = if downbeat_count > 0 {
+            rect.width() / downbeat_count as f32
+        } else {
+            0.0
+        };
+
+        let draw_beats = beat_spacing_px >= MIN_GRID_SPACING_PX;
+        let draw_downbeats = downbeat_spacing_px >= MIN_GRID_SPACING_PX;
+
+        let beat_stroke = egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 42),
+        );
+        let downbeat_stroke = egui::Stroke::new(
+            2.0,
+            egui::Color32::from_rgba_unmultiplied(255, 220, 130, 120),
+        );
+
+        for mark in beat_marks {
+            let (draw, stroke) = if mark.is_downbeat {
+                (draw_downbeats, downbeat_stroke)
+            } else {
+                (draw_beats, beat_stroke)
+            };
+            if !draw {
+                continue;
+            }
+            let x = rect.left() + mark.frac.clamp(0.0, 1.0) * rect.width();
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                stroke,
+            );
+        }
     }
 
     // Draw cursor line

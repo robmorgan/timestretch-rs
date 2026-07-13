@@ -9,7 +9,7 @@ use crate::decoder;
 use crate::processor;
 use crate::pull_deck;
 use crate::state::*;
-use crate::waveform::{self, WaveformPeaks};
+use crate::waveform::{self, BeatMark, WaveformPeaks};
 
 const MIN_STRETCH_RATIO: f64 = 0.25;
 /// Slowest playback the streaming engine sustains cleanly on every profile
@@ -46,6 +46,12 @@ pub struct TimeStretchApp {
 
     // Waveform
     waveform_peaks: Option<WaveformPeaks>,
+
+    /// Beat grid detected on load; drives the waveform overlay and
+    /// grid-accurate beat jumps.
+    beat_grid: Option<timestretch::BeatGrid>,
+    /// Beat positions normalized to track length, cached for the overlay.
+    beat_marks: Vec<BeatMark>,
 
     // UI state
     stretch_ratio: f64,
@@ -132,6 +138,8 @@ impl TimeStretchApp {
             file_name: String::new(),
             file_path: None,
             waveform_peaks: None,
+            beat_grid: None,
+            beat_marks: Vec::new(),
             stretch_ratio: 1.0,
             target_bpm: 0.0,
             pitch_semitones: 0.0,
@@ -177,9 +185,19 @@ impl TimeStretchApp {
                 // Compute waveform peaks
                 self.waveform_peaks = Some(WaveformPeaks::compute(&bpm_buffer.data, 2, 800));
 
-                // Detect BPM from channel-aware buffer (stereo-safe).
-                let bpm = timestretch::detect_bpm_buffer(&bpm_buffer);
-                log::info!("Detected BPM: {bpm:.1}");
+                // Detect the beat grid from the channel-aware buffer
+                // (stereo-safe): BPM for the tempo fader plus beat and
+                // downbeat positions for the overlay and beat jumps.
+                let grid = timestretch::detect_beat_grid_buffer(&bpm_buffer);
+                let bpm = grid.bpm;
+                log::info!(
+                    "Detected BPM: {bpm:.1} ({} beats, {} segments, confidence {:.2})",
+                    grid.beats.len(),
+                    grid.segments.len(),
+                    grid.confidence
+                );
+                self.beat_marks = beat_marks_for_overlay(&grid, num_frames);
+                self.beat_grid = Some(grid);
                 self.target_bpm_text = if bpm > 0.0 {
                     format!("{bpm:.1}")
                 } else {
@@ -516,7 +534,8 @@ impl TimeStretchApp {
             neg: vec![],
         };
         let peaks = self.waveform_peaks.as_ref().unwrap_or(&empty_peaks);
-        let (_response, seek_pos) = waveform::paint_waveform(ui, peaks, progress);
+        let (_response, seek_pos) =
+            waveform::paint_waveform(ui, peaks, progress, &self.beat_marks);
 
         // Handle click-to-seek
         if let Some(frac) = seek_pos {
@@ -584,14 +603,22 @@ impl TimeStretchApp {
         };
 
         ui.horizontal(|ui| {
-            // Beat jumps: relative seeks by whole beats using the detected
-            // grid. Disabled until a tempo is known.
+            // Beat jumps: relative seeks by whole beats on the detected
+            // grid (tracked positions, not computed intervals, so jumps
+            // stay on the beat through tempo drift). Falls back to fixed
+            // 60/BPM intervals when only a tempo is known. Disabled until
+            // a tempo is detected.
+            let grid = self
+                .beat_grid
+                .as_ref()
+                .filter(|g| g.beats.len() >= 2 && g.bpm > 0.0);
             let beat_frames = if bpm > 0.0 {
                 (sample_rate as f64 * 60.0 / bpm).round() as i64
             } else {
                 0
             };
-            let can_jump = has_audio && beat_frames > 0 && total_frames > 0;
+            let can_jump =
+                has_audio && total_frames > 0 && (grid.is_some() || beat_frames > 0);
             ui.label("Jump:");
             for beats in [-16i64, -4, 4, 16] {
                 let label = if beats > 0 {
@@ -600,9 +627,21 @@ impl TimeStretchApp {
                     format!("{beats}")
                 };
                 if ui.add_enabled(can_jump, egui::Button::new(label)).clicked() {
-                    let delta = beats * beat_frames;
-                    let target =
-                        (pos_frames as i64 + delta).clamp(0, total_frames as i64 - 1) as usize;
+                    let target = match grid {
+                        Some(g) => {
+                            let here = g
+                                .nearest_beat_index(pos_frames as f64)
+                                .unwrap_or(0) as i64;
+                            let idx =
+                                (here + beats).clamp(0, g.beats.len() as i64 - 1) as usize;
+                            g.beats[idx].round().max(0.0) as usize
+                        }
+                        None => {
+                            let delta = beats * beat_frames;
+                            (pos_frames as i64 + delta).max(0) as usize
+                        }
+                    }
+                    .min(total_frames.saturating_sub(1));
                     self.state.lock().unwrap().seek_request = Some(target);
                 }
             }
@@ -1005,6 +1044,29 @@ fn control_path_label(path: ControlPath) -> &'static str {
 }
 
 /// Sidecar artifact path for a loaded audio file: `<file>.tsanalysis.json`.
+/// Precomputes normalized overlay marks from a beat grid: beat positions
+/// as track fractions with downbeats flagged, ready for the painter.
+fn beat_marks_for_overlay(grid: &timestretch::BeatGrid, total_frames: usize) -> Vec<BeatMark> {
+    if total_frames == 0 || grid.beats.is_empty() {
+        return Vec::new();
+    }
+    let inv_total = 1.0 / total_frames as f64;
+    let mut downbeat_flags = vec![false; grid.beats.len()];
+    for &idx in &grid.downbeats {
+        if let Some(flag) = downbeat_flags.get_mut(idx) {
+            *flag = true;
+        }
+    }
+    grid.beats
+        .iter()
+        .zip(downbeat_flags.iter())
+        .map(|(&pos, &is_downbeat)| BeatMark {
+            frac: (pos * inv_total) as f32,
+            is_downbeat,
+        })
+        .collect()
+}
+
 fn sidecar_path(audio_path: &std::path::Path) -> PathBuf {
     let mut os = audio_path.as_os_str().to_os_string();
     os.push(".tsanalysis.json");

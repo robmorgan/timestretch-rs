@@ -5,10 +5,23 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Current schema version written by [`crate::analyze_for_dj`].
-pub const PREANALYSIS_VERSION: u32 = 2;
+pub const PREANALYSIS_VERSION: u32 = 3;
 
 fn default_artifact_version() -> u32 {
     1
+}
+
+/// A stretch of consecutive beats at (locally) constant tempo.
+///
+/// Serialized in the artifact (schema v3+) and used as the tempo model of
+/// [`crate::BeatGrid`]: `start_beat` indexes the grid's beat sequence, and
+/// the segment runs until the next segment's `start_beat`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TempoSegment {
+    /// Index of the first beat of this segment in the beat sequence.
+    pub start_beat: usize,
+    /// Tempo within the segment in BPM.
+    pub bpm: f64,
 }
 
 /// Serializable beat/onset analysis artifact produced offline and reused at runtime.
@@ -36,6 +49,19 @@ pub struct PreAnalysisArtifact {
     /// Beat positions in samples.
     #[serde(default)]
     pub beat_positions: Vec<usize>,
+    /// Fractional-sample beat positions, parallel to `beat_positions`.
+    /// Empty for artifacts older than schema v3.
+    #[serde(default)]
+    pub beat_positions_fractional: Vec<f64>,
+    /// Indices into `beat_positions` marking downbeats (bar starts).
+    /// Empty for artifacts older than schema v3.
+    #[serde(default)]
+    pub downbeat_beat_indices: Vec<usize>,
+    /// Piecewise-constant tempo segments over the beat sequence.
+    /// Empty for artifacts older than schema v3 (treat as one segment at
+    /// [`bpm`](Self::bpm)).
+    #[serde(default)]
+    pub tempo_segments: Vec<TempoSegment>,
     /// Detected transient onset positions in samples.
     #[serde(default)]
     pub transient_onsets: Vec<usize>,
@@ -157,6 +183,12 @@ mod tests {
             downbeat_offset_samples: 100,
             confidence: 0.8,
             beat_positions: vec![0, 22050],
+            beat_positions_fractional: vec![0.0, 22050.0],
+            downbeat_beat_indices: vec![0],
+            tempo_segments: vec![TempoSegment {
+                start_beat: 0,
+                bpm: 128.0,
+            }],
             transient_onsets: vec![0, 22050],
             transient_strengths: vec![1.0, 0.5],
             onset_band_flux: vec![[1.0, 0.5, 0.2, 0.1], [0.2, 0.3, 0.4, 0.5]],

@@ -285,6 +285,7 @@ fn engine_keylock_with_large_artifact_no_heap_activity() {
         analysis_hop_size: 512,
         source_len_samples: 0,
         content_hash: 0,
+        ..Default::default()
     };
 
     let handles = Engine::build(EngineConfig {

@@ -340,6 +340,7 @@ fn process_into_with_preanalysis_artifact_no_heap_growth_after_warmup() {
         analysis_hop_size: 512,
         source_len_samples: 0,
         content_hash: 0,
+        ..Default::default()
     };
 
     let params = StretchParams::new(1.05)
