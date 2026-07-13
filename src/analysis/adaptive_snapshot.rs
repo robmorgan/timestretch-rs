@@ -89,15 +89,15 @@ pub(crate) fn analyze_adaptive_snapshot_mono(
         let use_live_beats =
             confident_pre.is_some() || should_use_live_beat_aware_anchors(&strengths);
         if use_live_beats {
-            let beats = if let Some(artifact) = confident_pre {
-                artifact.beat_positions.as_slice()
+            let beats: Vec<usize> = if let Some(artifact) = confident_pre {
+                artifact.beat_positions.clone()
             } else {
                 let grid = detected_beat_grid
                     .get_or_insert_with(|| detect_beats(input, params.sample_rate));
-                grid.beats.as_slice()
+                grid.beats_rounded()
             };
             let (merged_onsets, merged_strengths) =
-                merge_onsets_and_beats(&onsets, &strengths, beats, input.len());
+                merge_onsets_and_beats(&onsets, &strengths, &beats, input.len());
             onsets = merged_onsets;
             strengths = merged_strengths;
         }

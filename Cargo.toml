@@ -92,3 +92,28 @@ required-features = ["qa-harnesses"]
 name = "varispeed_keylock"
 path = "qa/varispeed_keylock.rs"
 required-features = ["qa-harnesses"]
+
+[[test]]
+name = "engine_ab"
+path = "qa/engine_ab.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
+name = "engine_keylock"
+path = "qa/engine_keylock.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
+name = "engine_transients"
+path = "qa/engine_transients.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
+name = "engine_wcet"
+path = "qa/engine_wcet.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
+name = "engine_ab_matrix"
+path = "qa/engine_ab_matrix.rs"
+required-features = ["qa-harnesses"]

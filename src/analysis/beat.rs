@@ -1,101 +1,201 @@
-//! Beat detection and grid snapping for 4/4 EDM patterns.
+//! General-purpose beat tracking, BPM detection, and grid snapping.
 //!
-//! Uses a phase-locked loop (PLL) to refine the beat grid after initial
-//! estimation, allowing the grid to self-correct over time and eliminate
-//! systematic offset from the first detected onset.
+//! The tracker follows a time-varying tempo: an autocorrelation tempogram
+//! with a Viterbi tempo path ([`crate::analysis::tempogram`]) estimates a
+//! per-frame beat period, and a dynamic-programming beat tracker
+//! (Ellis-style) places beats on the onset novelty curve along that path.
+//! Constant-tempo tracks collapse to a single [`TempoSegment`]; live or
+//! drifting material produces a piecewise grid. Downbeats are estimated
+//! from beat-synchronous accent features with a 4/4 prior and an explicit
+//! confidence, never hard-coded.
 
+use crate::analysis::tempogram::{
+    condition_novelty, estimate_tempo_track, TempoTrack, TempoTrackingOptions,
+};
 use crate::analysis::transient::{detect_transients, TransientMap};
+
+pub use crate::core::preanalysis::TempoSegment;
 
 /// FFT size for beat detection (balances frequency resolution and speed).
 const BEAT_FFT_SIZE: usize = 2048;
 /// Hop size for beat detection analysis frames.
 const BEAT_HOP_SIZE: usize = 512;
-/// Transient sensitivity for kick detection (lower = fewer false positives).
+/// Transient sensitivity for the onset pass backing beat detection.
 const BEAT_SENSITIVITY: f32 = 0.4;
-/// Minimum EDM BPM for octave normalization.
-const MIN_EDM_BPM: f64 = 100.0;
-/// Maximum EDM BPM for octave normalization.
-const MAX_EDM_BPM: f64 = 160.0;
-/// Hard bound for octave-normalization loop steps.
-const MAX_BPM_NORMALIZATION_STEPS: usize = 32;
 /// Hard bound for dynamically generated beat/subdivision grid points.
 const MAX_GRID_POINTS: usize = 1_000_000;
 
-/// PLL interval correction gain. Controls how quickly the beat interval
-/// adapts to phase errors from detected onsets. Higher values adapt faster
-/// but may be less stable.
-const PLL_ALPHA: f64 = 0.08;
-/// PLL phase (offset) correction gain. Controls how quickly the grid offset
-/// adjusts to align with detected onsets.
-const PLL_BETA: f64 = 0.03;
+/// DP transition tightness: cost is `TIGHTNESS * ln(interval / period)^2`,
+/// with novelty normalized to a maximum of 1. At 100, a 10% interval
+/// deviation costs about one full-strength onset peak.
+const DP_TIGHTNESS: f32 = 100.0;
 
-/// Beat grid information for a 4/4 track.
+/// Beats-per-bar prior for downbeat estimation. 4/4 is a prior, not a
+/// hard-coded truth: the phase decision carries its own confidence.
+const BEATS_PER_BAR: usize = 4;
+
+/// Minimum number of tracked beats required for downbeat phase estimation.
+const MIN_BEATS_FOR_DOWNBEATS: usize = 8;
+
+/// Relative BPM deviation that opens a new tempo segment.
+const SEGMENT_BPM_DEVIATION: f64 = 0.03;
+/// Consecutive deviating beats required to open a new tempo segment.
+const SEGMENT_DEVIATION_RUN: usize = 4;
+
+/// Weight of low-band flux in the downbeat accent feature (bass emphasis
+/// marks bar starts across most popular genres).
+const DOWNBEAT_LOW_FLUX_WEIGHT: f32 = 0.6;
+/// Weight of overall novelty in the downbeat accent feature.
+const DOWNBEAT_NOVELTY_WEIGHT: f32 = 0.4;
+
+/// Maximum distance, in novelty frames, for snapping a tracked beat to a
+/// detected transient onset (sub-hop precision from the phase-refined
+/// onset positions).
+const BEAT_ONSET_SNAP_FRAMES: f64 = 3.0;
+
+/// Beat grid for a track: tracked beat positions, downbeats, and a
+/// piecewise-constant tempo model.
+///
+/// Positions are fractional sample indices on the analyzed mono signal.
+/// Constant-tempo material yields a single segment; tempo drift or steps
+/// yield several. An empty `beats` with `bpm == 0.0` means no tempo was
+/// detected.
 #[derive(Debug, Clone)]
 pub struct BeatGrid {
-    /// Sample positions of detected beat onsets (integer, for backward
-    /// compatibility with existing code that indexes into sample buffers).
-    pub beats: Vec<usize>,
-    /// Fractional-sample beat positions for sub-sample precision.
-    /// Length matches `beats`; each value is a refinement of the
-    /// corresponding integer beat position.
-    pub beats_fractional: Vec<f64>,
-    /// Estimated BPM.
+    /// Fractional-sample positions of every tracked beat, ascending.
+    pub beats: Vec<f64>,
+    /// Indices into `beats` marking downbeats (bar starts), ascending.
+    pub downbeats: Vec<usize>,
+    /// Piecewise-constant tempo segments covering `beats`, ascending by
+    /// `start_beat`; never empty when `beats` is non-empty.
+    pub segments: Vec<TempoSegment>,
+    /// Representative tempo in BPM (median over all beat intervals);
+    /// 0.0 when undetected.
     pub bpm: f64,
-    /// Sample rate.
+    /// Overall grid confidence in [0, 1]: periodicity clarity, beat-level
+    /// onset support, and interval regularity against the tempo curve.
+    pub confidence: f32,
+    /// Confidence of the downbeat phase decision in [0, 1].
+    pub downbeat_confidence: f32,
+    /// Sample rate the positions refer to.
     pub sample_rate: u32,
 }
 
 impl BeatGrid {
-    /// Returns the interval between beats in samples.
+    /// An empty grid (no tempo detected) at `sample_rate`.
+    pub fn empty(sample_rate: u32) -> Self {
+        BeatGrid {
+            beats: Vec::new(),
+            downbeats: Vec::new(),
+            segments: Vec::new(),
+            bpm: 0.0,
+            confidence: 0.0,
+            downbeat_confidence: 0.0,
+            sample_rate,
+        }
+    }
+
+    /// Returns the representative interval between beats in samples.
     #[inline]
     pub fn beat_interval_samples(&self) -> f64 {
+        if self.bpm <= 0.0 {
+            return 0.0;
+        }
         60.0 * self.sample_rate as f64 / self.bpm
     }
 
-    /// Snaps a sample position to the nearest beat grid position.
-    #[inline]
-    pub fn snap_to_grid(&self, position: usize) -> usize {
-        if self.beats.is_empty() {
-            return position;
+    /// Tempo in BPM at a sample position, from the segment model.
+    /// Returns the representative BPM outside the tracked range and 0.0
+    /// for an empty grid.
+    pub fn bpm_at(&self, position: f64) -> f64 {
+        if self.segments.is_empty() {
+            return self.bpm;
         }
-        let mut closest = self.beats[0];
-        let mut min_dist = (position as i64 - closest as i64).unsigned_abs() as usize;
-        for &beat in &self.beats[1..] {
-            let dist = (position as i64 - beat as i64).unsigned_abs() as usize;
-            if dist < min_dist {
-                min_dist = dist;
-                closest = beat;
-            }
-        }
-        closest
+        let idx = self.index_of_beat_at_or_before(position);
+        let beat_idx = match idx {
+            Some(i) => i,
+            None => return self.segments[0].bpm,
+        };
+        let seg = self
+            .segments
+            .iter()
+            .rev()
+            .find(|s| s.start_beat <= beat_idx)
+            .unwrap_or(&self.segments[0]);
+        seg.bpm
     }
 
-    /// Snaps a sample position to the nearest fractional beat grid position.
-    /// Returns a sub-sample-accurate position.
-    #[inline]
-    pub fn snap_to_grid_fractional(&self, position: f64) -> f64 {
-        if self.beats_fractional.is_empty() {
-            return position;
+    /// Index of the nearest beat to `position`, or `None` for an empty grid.
+    pub fn nearest_beat_index(&self, position: f64) -> Option<usize> {
+        if self.beats.is_empty() {
+            return None;
         }
-        let mut closest = self.beats_fractional[0];
-        let mut min_dist = (position - closest).abs();
-        for &beat in &self.beats_fractional[1..] {
-            let dist = (position - beat).abs();
-            if dist < min_dist {
-                min_dist = dist;
-                closest = beat;
+        let idx = self.beats.partition_point(|&b| b < position);
+        let mut best = idx.min(self.beats.len() - 1);
+        if idx > 0 {
+            let before = idx - 1;
+            if (position - self.beats[before]).abs() <= (self.beats[best] - position).abs() {
+                best = before;
             }
         }
-        closest
+        Some(best)
+    }
+
+    /// Index of the last beat at or before `position`, or `None` when
+    /// `position` precedes the first beat (or the grid is empty).
+    fn index_of_beat_at_or_before(&self, position: f64) -> Option<usize> {
+        let idx = self.beats.partition_point(|&b| b <= position);
+        idx.checked_sub(1)
+    }
+
+    /// Snaps a sample position to the nearest beat.
+    #[inline]
+    pub fn snap_to_grid(&self, position: usize) -> usize {
+        match self.nearest_beat_index(position as f64) {
+            Some(i) => self.beats[i].round().max(0.0) as usize,
+            None => position,
+        }
+    }
+
+    /// Snaps a fractional sample position to the nearest beat.
+    #[inline]
+    pub fn snap_to_grid_fractional(&self, position: f64) -> f64 {
+        match self.nearest_beat_index(position) {
+            Some(i) => self.beats[i],
+            None => position,
+        }
+    }
+
+    /// Beat positions rounded to integer sample indices.
+    pub fn beats_rounded(&self) -> Vec<usize> {
+        self.beats
+            .iter()
+            .map(|&b| b.round().max(0.0) as usize)
+            .collect()
+    }
+
+    /// Fractional-sample positions of the downbeats.
+    pub fn downbeat_positions(&self) -> Vec<f64> {
+        self.downbeats
+            .iter()
+            .filter_map(|&i| self.beats.get(i).copied())
+            .collect()
     }
 }
 
-/// Detects beats in a mono audio signal and estimates BPM.
-///
-/// Optimized for 4/4 EDM (house/techno) with expected BPM range 100-160.
-/// Uses a PLL-based beat grid correction to eliminate systematic offset
-/// from the initial onset detection.
+/// Detects beats in a mono audio signal with general-purpose defaults
+/// (wide 50–220 BPM range, no genre hint).
 pub fn detect_beats(samples: &[f32], sample_rate: u32) -> BeatGrid {
+    detect_beats_with_options(samples, sample_rate, &TempoTrackingOptions::default())
+}
+
+/// Detects beats with explicit tempo-tracking options (range, prior,
+/// genre hint).
+pub fn detect_beats_with_options(
+    samples: &[f32],
+    sample_rate: u32,
+    options: &TempoTrackingOptions,
+) -> BeatGrid {
     let transients = detect_transients(
         samples,
         sample_rate,
@@ -103,227 +203,392 @@ pub fn detect_beats(samples: &[f32], sample_rate: u32) -> BeatGrid {
         BEAT_HOP_SIZE,
         BEAT_SENSITIVITY,
     );
-    detect_beats_from_transients(&transients, sample_rate)
+    detect_beats_from_transients_with_options(&transients, sample_rate, options)
 }
 
-/// Beat-grid estimation from an already-computed transient map.
-///
-/// The map must come from a detection pass at [`BEAT_HOP_SIZE`] so onset
-/// sample positions line up with the grid. `analyze_for_dj` reuses its
-/// single pre-analysis detection here instead of running detection twice.
-pub(crate) fn detect_beats_from_transients(
+/// Beat tracking from an already-computed transient map with explicit
+/// tempo options. The map's detection function drives tracking, so callers
+/// with a detection pass in hand (`analyze_for_dj`) don't run a second one.
+pub(crate) fn detect_beats_from_transients_with_options(
     transients: &TransientMap,
     sample_rate: u32,
+    options: &TempoTrackingOptions,
 ) -> BeatGrid {
+    let hop = transients.hop_size.max(1);
+    let frame_rate = sample_rate as f64 / hop as f64;
+    if transients.flux.is_empty() || frame_rate <= 0.0 {
+        return BeatGrid::empty(sample_rate);
+    }
+    // No (or a single) detected onset means the energy gate classified the
+    // material as sustained/tonal — the residual detection function is
+    // windowing ripple, and normalizing it would hallucinate a tempo (a DC
+    // or pure-tone input must report no beats).
     if transients.onsets.len() < 2 {
-        let beats_fractional = transients.onsets_fractional.to_vec();
-        let beats_int = if beats_fractional.is_empty() {
-            transients.onsets.clone()
-        } else {
-            beats_fractional
-                .iter()
-                .map(|&f| f.round() as usize)
-                .collect()
-        };
-        return BeatGrid {
-            beats: beats_int,
-            beats_fractional,
-            bpm: 0.0,
-            sample_rate,
-        };
+        return BeatGrid::empty(sample_rate);
     }
 
-    // Use fractional onsets for better precision when available
-    let onset_positions_f64: Vec<f64> =
-        if transients.onsets_fractional.len() == transients.onsets.len() {
-            transients.onsets_fractional.clone()
-        } else {
-            transients.onsets.iter().map(|&o| o as f64).collect()
-        };
+    let track = match estimate_tempo_track(&transients.flux, frame_rate, options) {
+        Some(track) => track,
+        None => return BeatGrid::empty(sample_rate),
+    };
+    let novelty = condition_novelty(&transients.flux, frame_rate);
 
-    // Compute inter-onset intervals from fractional positions
-    let intervals_f64: Vec<f64> = onset_positions_f64
-        .windows(2)
-        .map(|w| w[1] - w[0])
-        .collect();
+    let beat_frames = track_beats_dp(&novelty, &track);
+    if beat_frames.len() < 2 {
+        return BeatGrid::empty(sample_rate);
+    }
 
-    // Also compute integer intervals for BPM estimation (backward compatible)
-    let intervals: Vec<usize> = transients.onsets.windows(2).map(|w| w[1] - w[0]).collect();
+    let beats = refine_beat_positions(&beat_frames, &novelty, transients, hop);
 
-    // Estimate BPM from median interval (robust to outliers)
-    let bpm = estimate_bpm_from_intervals(&intervals, sample_rate);
+    let segments = segment_tempo(&beats, sample_rate);
+    let bpm = median_bpm(&beats, sample_rate);
 
-    // Initial beat interval estimate
-    let initial_interval = 60.0 * sample_rate as f64 / bpm;
+    let (downbeats, downbeat_confidence) =
+        estimate_downbeats(&beat_frames, &novelty, transients, hop);
 
-    // Build beat grid using PLL-corrected quantization
-    let beats_fractional =
-        quantize_to_grid_pll(&onset_positions_f64, &intervals_f64, initial_interval);
-
-    // Derive integer positions from fractional
-    let beats: Vec<usize> = beats_fractional
-        .iter()
-        .map(|&f| f.round() as usize)
-        .collect();
+    let confidence = grid_confidence(&beat_frames, &novelty, &track);
 
     BeatGrid {
         beats,
-        beats_fractional,
+        downbeats,
+        segments,
         bpm,
+        confidence,
+        downbeat_confidence,
         sample_rate,
     }
 }
 
-/// Estimates BPM from inter-onset intervals.
-fn estimate_bpm_from_intervals(intervals: &[usize], sample_rate: u32) -> f64 {
-    if intervals.is_empty() {
-        return 0.0;
+/// Dynamic-programming beat tracking (Ellis-style) along a time-varying
+/// tempo curve. Returns beat positions as novelty frame indices, ascending.
+fn track_beats_dp(novelty: &[f32], track: &TempoTrack) -> Vec<usize> {
+    let n = novelty.len();
+    if n == 0 {
+        return Vec::new();
     }
 
-    let mut sorted = intervals.to_vec();
-    sorted.sort();
-    let median_interval = sorted[sorted.len() / 2];
+    let mut score = vec![0.0f32; n];
+    let mut backlink = vec![usize::MAX; n];
 
-    if median_interval == 0 {
-        return 0.0;
-    }
-    let raw_bpm = 60.0 * sample_rate as f64 / median_interval as f64;
-    if !raw_bpm.is_finite() || raw_bpm <= 0.0 {
-        return 0.0;
+    for i in 0..n {
+        let period = track.period_at(i) as f64;
+        if period <= 1.0 {
+            score[i] = novelty[i];
+            continue;
+        }
+        let lo = (i as f64 - 2.0 * period).max(0.0) as usize;
+        let hi_excl = (i as f64 - 0.5 * period).ceil().max(0.0) as usize;
+
+        let mut best = 0.0f32;
+        let mut best_j = usize::MAX;
+        let window = lo..hi_excl.min(i);
+        for (j, &prev_score) in score[window.clone()].iter().enumerate() {
+            let j = j + window.start;
+            let interval = (i - j) as f64;
+            let dev = (interval / period).ln() as f32;
+            let cand = prev_score - DP_TIGHTNESS * dev * dev;
+            if cand > best {
+                best = cand;
+                best_j = j;
+            }
+        }
+        // `best` floors at 0: a chain may start anywhere without inheriting
+        // the (negative) cost of a nonexistent predecessor.
+        score[i] = novelty[i] + best;
+        backlink[i] = best_j;
     }
 
-    // Snap to reasonable EDM BPM range
-    let mut bpm = raw_bpm;
-    for _ in 0..MAX_BPM_NORMALIZATION_STEPS {
-        if bpm <= MAX_EDM_BPM {
+    // Choose the endpoint: the best cumulative score within the last two
+    // periods (so trailing silence doesn't orphan the chain).
+    let tail_period = track.period_at(n.saturating_sub(1)) as f64;
+    let tail_start = (n as f64 - 2.0 * tail_period).max(0.0) as usize;
+    let mut end = tail_start;
+    for (i, &s) in score.iter().enumerate().skip(tail_start) {
+        if s > score[end] {
+            end = i;
+        }
+    }
+    if score[end] <= 0.0 {
+        return Vec::new();
+    }
+
+    let mut beats = Vec::new();
+    let mut cursor = end;
+    loop {
+        beats.push(cursor);
+        let prev = backlink[cursor];
+        if prev == usize::MAX {
             break;
         }
-        bpm /= 2.0;
+        cursor = prev;
     }
-    for _ in 0..MAX_BPM_NORMALIZATION_STEPS {
-        if !(bpm < MIN_EDM_BPM && bpm > 0.0) {
-            break;
-        }
-        bpm *= 2.0;
-    }
-
-    bpm
+    beats.reverse();
+    beats
 }
 
-/// Quantizes onset positions to a regular grid (simple, backward-compatible).
-///
-/// Kept for test backward compatibility and as a reference implementation.
-/// For PLL-corrected grids, use [`quantize_to_grid_pll`].
-#[cfg(test)]
-fn quantize_to_grid(onsets: &[usize], beat_interval: usize) -> Vec<usize> {
-    if onsets.is_empty() || beat_interval == 0 {
-        return onsets.to_vec();
-    }
+/// Converts beat frames to fractional sample positions: parabolic
+/// interpolation on the novelty peak, then snapping to a phase-refined
+/// transient onset when one is close (see [`BEAT_ONSET_SNAP_FRAMES`]).
+fn refine_beat_positions(
+    beat_frames: &[usize],
+    novelty: &[f32],
+    transients: &TransientMap,
+    hop: usize,
+) -> Vec<f64> {
+    let snap_tolerance_samples = BEAT_ONSET_SNAP_FRAMES * hop as f64;
+    beat_frames
+        .iter()
+        .map(|&frame| {
+            let mut pos = frame as f64;
+            if frame > 0 && frame + 1 < novelty.len() {
+                let (a, b, c) = (
+                    novelty[frame - 1] as f64,
+                    novelty[frame] as f64,
+                    novelty[frame + 1] as f64,
+                );
+                let denom = a - 2.0 * b + c;
+                if denom.abs() > 1e-12 {
+                    pos += (0.5 * (a - c) / denom).clamp(-0.5, 0.5);
+                }
+            }
+            let sample_pos = pos * hop as f64;
 
-    let first = onsets[0];
-    let last = *onsets.last().unwrap_or(&first);
-
-    let max_points = last
-        .saturating_sub(first)
-        .saturating_div(beat_interval)
-        .saturating_add(2)
-        .min(MAX_GRID_POINTS);
-    let mut grid = Vec::new();
-    let mut pos = first;
-    for _ in 0..max_points {
-        if pos > last + beat_interval / 2 {
-            break;
-        }
-        grid.push(pos);
-        pos += beat_interval;
-    }
-
-    grid
+            // Prefer the sub-hop position of a coincident detected onset.
+            let onsets = &transients.onsets_fractional;
+            if !onsets.is_empty() {
+                let idx = onsets.partition_point(|&o| o < sample_pos);
+                let mut best: Option<f64> = None;
+                for cand in [idx.checked_sub(1), Some(idx)].into_iter().flatten() {
+                    if let Some(&o) = onsets.get(cand) {
+                        let dist = (o - sample_pos).abs();
+                        if dist <= snap_tolerance_samples
+                            && best.is_none_or(|b: f64| dist < (b - sample_pos).abs())
+                        {
+                            best = Some(o);
+                        }
+                    }
+                }
+                if let Some(o) = best {
+                    return o.max(0.0);
+                }
+            }
+            sample_pos.max(0.0)
+        })
+        .collect()
 }
 
-/// Quantizes onset positions to a regular grid using a phase-locked loop (PLL)
-/// for self-correcting beat alignment.
+/// Median BPM over all beat intervals (0.0 with fewer than two beats).
+fn median_bpm(beats: &[f64], sample_rate: u32) -> f64 {
+    if beats.len() < 2 {
+        return 0.0;
+    }
+    let mut intervals: Vec<f64> = beats.windows(2).map(|w| w[1] - w[0]).collect();
+    intervals.sort_by(|a, b| a.total_cmp(b));
+    let median = intervals[intervals.len() / 2];
+    if median <= 0.0 {
+        return 0.0;
+    }
+    60.0 * sample_rate as f64 / median
+}
+
+/// Splits the beat sequence into piecewise-constant tempo segments.
 ///
-/// The PLL iterates through detected onsets and adjusts both the beat interval
-/// and grid phase (offset) based on the phase error between each detected onset
-/// and its nearest grid position. This allows the grid to:
-/// - Recover from an inaccurate first onset position
-/// - Track gradual tempo drift within a track
-/// - Converge to the true beat positions over multiple beats
-///
-/// # Parameters
-/// - `onsets`: Fractional-sample onset positions from transient detection
-/// - `_intervals`: Fractional inter-onset intervals (reserved for future use)
-/// - `initial_interval`: Initial beat interval estimate from BPM detection
-///
-/// # Returns
-/// Fractional-sample beat grid positions.
-fn quantize_to_grid_pll(onsets: &[f64], _intervals: &[f64], initial_interval: f64) -> Vec<f64> {
-    if onsets.is_empty() || initial_interval <= 0.0 || !initial_interval.is_finite() {
-        return onsets.to_vec();
+/// A new segment opens when [`SEGMENT_DEVIATION_RUN`] consecutive beat
+/// intervals deviate from the current segment's median interval by more
+/// than [`SEGMENT_BPM_DEVIATION`]. Constant-tempo tracks yield one segment.
+fn segment_tempo(beats: &[f64], sample_rate: u32) -> Vec<TempoSegment> {
+    if beats.len() < 2 {
+        return Vec::new();
     }
+    let intervals: Vec<f64> = beats.windows(2).map(|w| w[1] - w[0]).collect();
 
-    let first = onsets[0];
-    let last = *onsets.last().unwrap_or(&first);
-
-    // Phase 1: Run PLL to refine interval and offset
-    let mut beat_interval = initial_interval;
-    let mut grid_offset: f64 = 0.0; // cumulative phase correction
-
-    // Iterate through detected onsets and compute corrections
-    for &onset in onsets.iter().skip(1) {
-        // Find nearest grid position for this onset
-        let relative = onset - first - grid_offset;
-        if beat_interval <= 0.0 || !beat_interval.is_finite() {
-            break;
+    let segment_bpm = |range: std::ops::Range<usize>| -> f64 {
+        let mut slice: Vec<f64> = intervals[range].to_vec();
+        slice.sort_by(|a, b| a.total_cmp(b));
+        let median = slice[slice.len() / 2];
+        if median <= 0.0 {
+            0.0
+        } else {
+            60.0 * sample_rate as f64 / median
         }
-        let nearest_grid_idx = (relative / beat_interval).round();
-        let nearest_grid_pos = first + grid_offset + nearest_grid_idx * beat_interval;
+    };
 
-        // Phase error: how far is the detected onset from the nearest grid position
-        let phase_error = onset - nearest_grid_pos;
+    let mut segments = Vec::new();
+    let mut seg_start = 0usize; // interval index
+    let mut deviation_run = 0usize;
 
-        // Apply PLL corrections
-        beat_interval += PLL_ALPHA * phase_error / nearest_grid_idx.abs().max(1.0);
-        grid_offset += PLL_BETA * phase_error;
-
-        // Ensure interval stays positive and reasonable (within 50% of initial)
-        beat_interval = beat_interval.clamp(initial_interval * 0.5, initial_interval * 1.5);
-    }
-
-    // Phase 2: Generate corrected grid using refined interval and offset
-    let mut grid = Vec::new();
-    let mut pos = first + grid_offset;
-
-    // Ensure grid starts at or before the first onset
-    let max_back_steps = onsets.len().saturating_mul(8).max(64);
-    for _ in 0..max_back_steps {
-        if pos <= first + beat_interval * 0.5 {
-            break;
+    for i in 0..intervals.len() {
+        // Median of the segment so far, updated lazily: use a running
+        // reference from the segment's first few intervals, refreshed on
+        // each split. Cheap and robust for segmentation purposes.
+        let ref_end = (seg_start + 8).min(i + 1).max(seg_start + 1);
+        let mut reference: Vec<f64> = intervals[seg_start..ref_end].to_vec();
+        reference.sort_by(|a, b| a.total_cmp(b));
+        let ref_interval = reference[reference.len() / 2];
+        if ref_interval <= 0.0 {
+            continue;
         }
-        pos -= beat_interval;
-    }
-    if pos > first + beat_interval * 0.5 {
-        pos = first;
-    }
-    // Don't start before sample 0
-    if pos < 0.0 {
-        pos += beat_interval * (((-pos) / beat_interval).ceil());
-    }
 
-    let end = last + beat_interval * 0.5;
-    let max_grid_points = (((end - pos) / beat_interval).max(0.0).ceil() as usize)
-        .saturating_add(2)
-        .min(MAX_GRID_POINTS);
-    for _ in 0..max_grid_points {
-        if pos > end {
-            break;
+        let deviation = (intervals[i] / ref_interval - 1.0).abs();
+        if deviation > SEGMENT_BPM_DEVIATION {
+            deviation_run += 1;
+            if deviation_run >= SEGMENT_DEVIATION_RUN {
+                let split = i + 1 - deviation_run;
+                if split > seg_start {
+                    segments.push(TempoSegment {
+                        start_beat: seg_start,
+                        bpm: segment_bpm(seg_start..split),
+                    });
+                    seg_start = split;
+                }
+                deviation_run = 0;
+            }
+        } else {
+            deviation_run = 0;
         }
-        grid.push(pos);
-        pos += beat_interval;
+    }
+    segments.push(TempoSegment {
+        start_beat: seg_start,
+        bpm: segment_bpm(seg_start..intervals.len()),
+    });
+
+    // Merge adjacent segments whose tempo agrees: a transient deviation run
+    // (a breakdown, a dropped beat) splits the sequence, but if the tempo
+    // on both sides is the same there was no tempo change to model.
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(segments.len());
+    for (i, seg) in segments.iter().enumerate() {
+        let end = segments
+            .get(i + 1)
+            .map(|s| s.start_beat)
+            .unwrap_or(intervals.len());
+        match spans.last_mut() {
+            Some((start, span_end)) => {
+                let span_bpm = segment_bpm(*start..*span_end);
+                if span_bpm > 0.0
+                    && seg.bpm > 0.0
+                    && (seg.bpm / span_bpm - 1.0).abs() <= SEGMENT_BPM_DEVIATION
+                {
+                    *span_end = end;
+                } else {
+                    spans.push((seg.start_beat, end));
+                }
+            }
+            None => spans.push((seg.start_beat, end)),
+        }
+    }
+    spans
+        .into_iter()
+        .map(|(start, end)| TempoSegment {
+            start_beat: start,
+            bpm: segment_bpm(start..end),
+        })
+        .collect()
+}
+
+/// Estimates the downbeat phase from beat-synchronous accent features:
+/// low-band flux (bass emphasis) plus overall novelty, scored across the
+/// [`BEATS_PER_BAR`] phase hypotheses. Returns downbeat indices into the
+/// beat sequence and the decision confidence.
+fn estimate_downbeats(
+    beat_frames: &[usize],
+    novelty: &[f32],
+    transients: &TransientMap,
+    _hop: usize,
+) -> (Vec<usize>, f32) {
+    if beat_frames.len() < MIN_BEATS_FOR_DOWNBEATS {
+        let downbeats = (0..beat_frames.len()).step_by(BEATS_PER_BAR).collect();
+        return (downbeats, 0.0);
     }
 
-    grid
+    // Per-beat accent: novelty + low-band flux at the beat frame.
+    let low_flux: Vec<f32> = beat_frames
+        .iter()
+        .map(|&frame| {
+            transients
+                .per_frame_band_flux
+                .get(frame)
+                .map(|bands| bands[0] + bands[1])
+                .unwrap_or(0.0)
+        })
+        .collect();
+    let max_low = low_flux.iter().copied().fold(0.0f32, f32::max);
+    let low_norm = if max_low > 1e-12 { max_low } else { 1.0 };
+
+    let accents: Vec<f32> = beat_frames
+        .iter()
+        .zip(low_flux.iter())
+        .map(|(&frame, &low)| {
+            let nov = novelty.get(frame).copied().unwrap_or(0.0);
+            DOWNBEAT_NOVELTY_WEIGHT * nov + DOWNBEAT_LOW_FLUX_WEIGHT * (low / low_norm)
+        })
+        .collect();
+
+    let mut phase_scores = [0.0f64; BEATS_PER_BAR];
+    let mut phase_counts = [0usize; BEATS_PER_BAR];
+    for (k, &a) in accents.iter().enumerate() {
+        phase_scores[k % BEATS_PER_BAR] += a as f64;
+        phase_counts[k % BEATS_PER_BAR] += 1;
+    }
+    for (score, &count) in phase_scores.iter_mut().zip(phase_counts.iter()) {
+        if count > 0 {
+            *score /= count as f64;
+        }
+    }
+
+    let best_phase = (0..BEATS_PER_BAR)
+        .max_by(|&a, &b| phase_scores[a].total_cmp(&phase_scores[b]))
+        .unwrap_or(0);
+    let best = phase_scores[best_phase];
+    let second = (0..BEATS_PER_BAR)
+        .filter(|&p| p != best_phase)
+        .map(|p| phase_scores[p])
+        .fold(f64::NEG_INFINITY, f64::max);
+    let confidence = if best > 1e-12 {
+        (((best - second) / best).clamp(0.0, 1.0)) as f32
+    } else {
+        0.0
+    };
+
+    let downbeats = (best_phase..beat_frames.len())
+        .step_by(BEATS_PER_BAR)
+        .collect();
+    (downbeats, confidence)
+}
+
+/// Grid confidence: tempogram path clarity, beat-level onset support, and
+/// interval regularity against the tracked tempo curve.
+fn grid_confidence(beat_frames: &[usize], novelty: &[f32], track: &TempoTrack) -> f32 {
+    if beat_frames.len() < 2 || novelty.is_empty() {
+        return 0.0;
+    }
+
+    // Beat support: mean novelty at beats relative to the global peak (1.0
+    // after conditioning). Strong grids have beats on strong onsets.
+    let support = beat_frames
+        .iter()
+        .map(|&f| novelty.get(f).copied().unwrap_or(0.0))
+        .sum::<f32>()
+        / beat_frames.len() as f32;
+
+    // Regularity: mean absolute log deviation of intervals from the local
+    // tempo period, mapped so 0 deviation -> 1 and 10% -> ~0.
+    let mut dev_sum = 0.0f64;
+    let mut dev_count = 0usize;
+    for w in beat_frames.windows(2) {
+        let period = track.period_at(w[0]) as f64;
+        if period > 1.0 {
+            let interval = (w[1] - w[0]) as f64;
+            dev_sum += (interval / period).ln().abs();
+            dev_count += 1;
+        }
+    }
+    let regularity = if dev_count > 0 {
+        (1.0 - (dev_sum / dev_count as f64) / 0.1).clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    };
+
+    (0.4 * track.path_salience + 0.3 * support + 0.3 * regularity).clamp(0.0, 1.0)
 }
 
 /// Generate a grid of beat subdivision positions (e.g., 1/16th notes) from BPM.
@@ -446,270 +711,221 @@ pub fn default_subdivision_for_preset(preset: Option<crate::core::types::EdmPres
 mod tests {
     use super::*;
 
-    /// Helper to create a BeatGrid with matching fractional positions.
-    fn make_grid(beats: Vec<usize>, bpm: f64, sample_rate: u32) -> BeatGrid {
-        let beats_fractional = beats.iter().map(|&b| b as f64).collect();
+    /// Helper: a grid with evenly spaced beats for snap tests.
+    fn make_grid(beats: Vec<f64>, bpm: f64, sample_rate: u32) -> BeatGrid {
+        let n = beats.len();
         BeatGrid {
             beats,
-            beats_fractional,
+            downbeats: (0..n).step_by(BEATS_PER_BAR).collect(),
+            segments: vec![TempoSegment { start_beat: 0, bpm }],
             bpm,
+            confidence: 1.0,
+            downbeat_confidence: 1.0,
             sample_rate,
         }
     }
 
+    /// Click train at `bpm` with a stronger accent every `accent_every`
+    /// beats (0 = no accents).
+    fn click_train(
+        sample_rate: u32,
+        bpm: f64,
+        seconds: f64,
+        accent_every: usize,
+        phase_offset_samples: usize,
+    ) -> Vec<f32> {
+        let len = (sample_rate as f64 * seconds) as usize;
+        let mut samples = vec![0.0f32; len];
+        let interval = 60.0 * sample_rate as f64 / bpm;
+        let mut pos = phase_offset_samples as f64;
+        let mut k = 0usize;
+        while (pos as usize) + 24 < len {
+            let base = pos as usize;
+            let amp = if accent_every > 0 && k % accent_every == 0 {
+                1.0
+            } else {
+                0.55
+            };
+            for j in 0..20 {
+                // A short decaying burst with some low-frequency content.
+                let t = j as f32 / 20.0;
+                samples[base + j] = amp * (1.0 - t) * if j % 2 == 0 { 1.0 } else { -0.7 };
+            }
+            pos += interval;
+            k += 1;
+        }
+        samples
+    }
+
+    #[test]
+    fn detect_beats_120_click_train() {
+        let sample_rate = 44100u32;
+        let grid = detect_beats(&click_train(sample_rate, 120.0, 12.0, 0, 0), sample_rate);
+        assert!(
+            (grid.bpm - 120.0).abs() < 2.0,
+            "expected ~120 BPM, got {:.2}",
+            grid.bpm
+        );
+        assert!(
+            grid.beats.len() > 15,
+            "expected beats, got {}",
+            grid.beats.len()
+        );
+        assert_eq!(grid.segments.len(), 1, "constant tempo => one segment");
+        assert!((grid.segments[0].bpm - 120.0).abs() < 2.0);
+        assert!(grid.confidence > 0.4, "confidence {}", grid.confidence);
+
+        // Beats should land near click positions (multiples of the interval).
+        let interval = 60.0 * sample_rate as f64 / 120.0;
+        for &b in &grid.beats[1..grid.beats.len() - 1] {
+            let nearest = (b / interval).round() * interval;
+            assert!(
+                (b - nearest).abs() < interval * 0.1,
+                "beat at {:.1} too far from click at {:.1}",
+                b,
+                nearest
+            );
+        }
+    }
+
+    #[test]
+    fn detect_beats_90_not_octave_folded() {
+        let sample_rate = 44100u32;
+        let grid = detect_beats(&click_train(sample_rate, 90.0, 12.0, 0, 0), sample_rate);
+        assert!(
+            (grid.bpm - 90.0).abs() < 2.0,
+            "90 BPM must not fold into the EDM range, got {:.2}",
+            grid.bpm
+        );
+    }
+
+    #[test]
+    fn detect_beats_silence_is_empty() {
+        let grid = detect_beats(&vec![0.0f32; 44100 * 4], 44100);
+        assert_eq!(grid.bpm, 0.0);
+        assert!(grid.beats.is_empty());
+        assert!(grid.segments.is_empty());
+        assert_eq!(grid.confidence, 0.0);
+    }
+
+    #[test]
+    fn detect_beats_too_short_is_empty() {
+        let grid = detect_beats(&[0.0f32; 100], 44100);
+        assert_eq!(grid.bpm, 0.0);
+        assert!(grid.beats.is_empty());
+    }
+
+    #[test]
+    fn downbeats_follow_accents() {
+        let sample_rate = 44100u32;
+        // Accent every 4 beats, starting on beat 0.
+        let grid = detect_beats(&click_train(sample_rate, 120.0, 16.0, 4, 0), sample_rate);
+        assert!(grid.beats.len() >= MIN_BEATS_FOR_DOWNBEATS);
+        assert!(
+            !grid.downbeats.is_empty(),
+            "accented pattern should produce downbeats"
+        );
+        assert!(
+            grid.downbeat_confidence > 0.05,
+            "accented pattern should give a confident phase, got {}",
+            grid.downbeat_confidence
+        );
+        // Downbeats should be 4 beats apart.
+        for w in grid.downbeats.windows(2) {
+            assert_eq!(w[1] - w[0], BEATS_PER_BAR);
+        }
+        // The downbeat should fall on the accented (stronger) clicks: check
+        // the first downbeat is within a beat interval of a multiple of the
+        // bar length.
+        let bar = 4.0 * 60.0 * sample_rate as f64 / 120.0;
+        let first_downbeat = grid.beats[grid.downbeats[0]];
+        let nearest_bar = (first_downbeat / bar).round() * bar;
+        assert!(
+            (first_downbeat - nearest_bar).abs() < bar * 0.1,
+            "first downbeat {:.0} not on an accent (nearest bar {:.0})",
+            first_downbeat,
+            nearest_bar
+        );
+    }
+
+    #[test]
+    fn tempo_ramp_produces_multiple_segments() {
+        let sample_rate = 44100u32;
+        // Two constant halves: 120 BPM then 132 BPM.
+        let mut samples = click_train(sample_rate, 120.0, 10.0, 0, 0);
+        samples.extend(click_train(sample_rate, 132.0, 10.0, 0, 0));
+        let grid = detect_beats(&samples, sample_rate);
+        assert!(
+            grid.segments.len() >= 2,
+            "tempo step should split segments, got {:?}",
+            grid.segments
+        );
+        let first = grid.segments.first().unwrap().bpm;
+        let last = grid.segments.last().unwrap().bpm;
+        assert!(
+            (first - 120.0).abs() < 3.0,
+            "first segment should be ~120, got {:.2}",
+            first
+        );
+        assert!(
+            (last - 132.0).abs() < 3.0,
+            "last segment should be ~132, got {:.2}",
+            last
+        );
+    }
+
+    // --- BeatGrid helpers ---
+
     #[test]
     fn test_beat_grid_snap() {
-        let grid = make_grid(vec![0, 22050, 44100, 66150], 120.0, 44100);
+        let grid = make_grid(vec![0.0, 22050.0, 44100.0, 66150.0], 120.0, 44100);
         assert_eq!(grid.snap_to_grid(100), 0);
         assert_eq!(grid.snap_to_grid(22000), 22050);
         assert_eq!(grid.snap_to_grid(33000), 22050);
     }
 
     #[test]
-    fn test_estimate_bpm() {
-        // 120 BPM at 44100 Hz = 22050 samples per beat
-        let intervals = vec![22050, 22050, 22050, 22050];
-        let bpm = estimate_bpm_from_intervals(&intervals, 44100);
-        assert!((bpm - 120.0).abs() < 1.0, "Expected ~120 BPM, got {}", bpm);
-    }
-
-    #[test]
-    fn test_estimate_bpm_empty() {
-        assert_eq!(estimate_bpm_from_intervals(&[], 44100), 0.0);
-    }
-
-    #[test]
-    fn test_quantize_grid() {
-        let onsets = vec![0, 22000, 44200];
-        let grid = quantize_to_grid(&onsets, 22050);
-        assert_eq!(grid.len(), 3);
-        assert_eq!(grid[0], 0);
-        assert_eq!(grid[1], 22050);
-        assert_eq!(grid[2], 44100);
-    }
-
-    // --- beat_interval_samples ---
-
-    #[test]
     fn test_beat_interval_samples_120bpm() {
-        let grid = make_grid(vec![0], 120.0, 44100);
-        // 60 * 44100 / 120 = 22050
+        let grid = make_grid(vec![0.0], 120.0, 44100);
         assert!((grid.beat_interval_samples() - 22050.0).abs() < 1.0);
     }
 
     #[test]
     fn test_beat_interval_samples_128bpm_48khz() {
-        let grid = make_grid(vec![0], 128.0, 48000);
-        // 60 * 48000 / 128 = 22500
+        let grid = make_grid(vec![0.0], 128.0, 48000);
         assert!((grid.beat_interval_samples() - 22500.0).abs() < 1.0);
     }
 
-    // --- snap_to_grid edge cases ---
-
     #[test]
     fn test_snap_to_grid_empty_beats() {
-        let grid = make_grid(vec![], 120.0, 44100);
-        // Empty grid -> return position unchanged
+        let grid = BeatGrid::empty(44100);
         assert_eq!(grid.snap_to_grid(1000), 1000);
     }
 
     #[test]
     fn test_snap_to_grid_before_first_beat() {
-        let grid = make_grid(vec![1000, 2000, 3000], 120.0, 44100);
-        // Position before any beat -> snaps to first beat
+        let grid = make_grid(vec![1000.0, 2000.0, 3000.0], 120.0, 44100);
         assert_eq!(grid.snap_to_grid(500), 1000);
     }
 
     #[test]
     fn test_snap_to_grid_after_last_beat() {
-        let grid = make_grid(vec![1000, 2000, 3000], 120.0, 44100);
-        // Position after all beats -> snaps to last beat
+        let grid = make_grid(vec![1000.0, 2000.0, 3000.0], 120.0, 44100);
         assert_eq!(grid.snap_to_grid(10000), 3000);
     }
 
     #[test]
-    fn test_snap_to_grid_equidistant() {
-        let grid = make_grid(vec![0, 100, 200], 120.0, 44100);
-        // Position exactly between beats 0 and 100 -> snaps to first one found
-        // (50 is equidistant from 0 and 100; algorithm picks first as min_dist tie)
-        let result = grid.snap_to_grid(50);
-        assert!(
-            result == 0 || result == 100,
-            "Should snap to 0 or 100, got {}",
-            result
-        );
-    }
-
-    #[test]
     fn test_snap_to_grid_exact_beat() {
-        let grid = make_grid(vec![0, 22050, 44100], 120.0, 44100);
+        let grid = make_grid(vec![0.0, 22050.0, 44100.0], 120.0, 44100);
         assert_eq!(grid.snap_to_grid(22050), 22050);
     }
 
-    // --- estimate_bpm_from_intervals ---
-
-    #[test]
-    fn test_estimate_bpm_halving_high_bpm() {
-        // Raw BPM 320 -> should halve to 160 (within MAX_EDM_BPM)
-        // 320 BPM at 44100 Hz = 60*44100/320 = 8268.75 samples
-        let intervals = vec![8269, 8269, 8269];
-        let bpm = estimate_bpm_from_intervals(&intervals, 44100);
-        assert!(
-            (bpm - 160.0).abs() < 2.0,
-            "320 BPM should halve to ~160, got {}",
-            bpm
-        );
-    }
-
-    #[test]
-    fn test_estimate_bpm_doubling_low_bpm() {
-        // Raw BPM 50 -> should double to 100 (at MIN_EDM_BPM)
-        // 50 BPM at 44100 Hz = 60*44100/50 = 52920 samples
-        let intervals = vec![52920, 52920, 52920];
-        let bpm = estimate_bpm_from_intervals(&intervals, 44100);
-        assert!(
-            (bpm - 100.0).abs() < 2.0,
-            "50 BPM should double to ~100, got {}",
-            bpm
-        );
-    }
-
-    #[test]
-    fn test_estimate_bpm_already_in_range() {
-        // 128 BPM should stay as-is (within 100-160 range)
-        let interval = (60.0 * 44100.0 / 128.0) as usize;
-        let intervals = vec![interval, interval, interval];
-        let bpm = estimate_bpm_from_intervals(&intervals, 44100);
-        assert!(
-            (bpm - 128.0).abs() < 2.0,
-            "128 BPM should stay ~128, got {}",
-            bpm
-        );
-    }
-
-    #[test]
-    fn test_estimate_bpm_outlier_robustness() {
-        // Median should be robust to one outlier
-        // 4 intervals at 120 BPM, 1 outlier
-        let normal = (60.0 * 44100.0 / 120.0) as usize; // 22050
-        let outlier = normal / 3; // very short interval
-        let intervals = vec![normal, normal, outlier, normal, normal];
-        let bpm = estimate_bpm_from_intervals(&intervals, 44100);
-        // Median of sorted = [outlier, 22050, 22050, 22050, 22050] -> median = 22050
-        assert!(
-            (bpm - 120.0).abs() < 2.0,
-            "BPM should be robust to outlier, got {}",
-            bpm
-        );
-    }
-
-    // --- quantize_to_grid edge cases ---
-
-    #[test]
-    fn test_quantize_to_grid_empty_onsets() {
-        let result = quantize_to_grid(&[], 22050);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_quantize_to_grid_zero_interval() {
-        // beat_interval == 0 -> return onsets as-is
-        let onsets = vec![100, 200, 300];
-        let result = quantize_to_grid(&onsets, 0);
-        assert_eq!(result, onsets);
-    }
-
-    #[test]
-    fn test_quantize_to_grid_single_onset() {
-        let result = quantize_to_grid(&[5000], 22050);
-        // Grid starts at 5000, extends by beat_interval
-        assert_eq!(result, vec![5000]);
-    }
-
-    #[test]
-    fn test_quantize_to_grid_extension() {
-        // Grid should extend up to last + interval/2
-        let onsets = vec![0, 44100];
-        let result = quantize_to_grid(&onsets, 22050);
-        // Grid: 0, 22050, 44100 (44100 <= 44100 + 22050/2 = 55125)
-        assert_eq!(result, vec![0, 22050, 44100]);
-    }
-
-    // --- PLL quantization tests ---
-
-    #[test]
-    fn test_pll_grid_perfect_onsets() {
-        // Perfect onsets at exact beat positions -> grid should match closely
-        let interval = 22050.0; // 120 BPM at 44100 Hz
-        let onsets: Vec<f64> = (0..8).map(|i| i as f64 * interval).collect();
-        let intervals: Vec<f64> = onsets.windows(2).map(|w| w[1] - w[0]).collect();
-        let grid = quantize_to_grid_pll(&onsets, &intervals, interval);
-
-        assert_eq!(grid.len(), 8, "PLL grid should have 8 beats");
-        for (i, &pos) in grid.iter().enumerate() {
-            let expected = i as f64 * interval;
-            assert!(
-                (pos - expected).abs() < interval * 0.1,
-                "Beat {} at {:.1} should be near {:.1}",
-                i,
-                pos,
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn test_pll_grid_offset_first_onset() {
-        // First onset is 200 samples late, subsequent onsets are correct
-        let interval = 22050.0;
-        let offset = 200.0;
-        let mut onsets: Vec<f64> = (0..8).map(|i| i as f64 * interval).collect();
-        onsets[0] += offset; // shift first onset
-
-        let intervals: Vec<f64> = onsets.windows(2).map(|w| w[1] - w[0]).collect();
-        let grid = quantize_to_grid_pll(&onsets, &intervals, interval);
-
-        // PLL should correct; later beats should be closer to true positions
-        // than the initial offset would suggest
-        assert!(
-            grid.len() >= 7,
-            "PLL grid should produce reasonable number of beats"
-        );
-    }
-
-    #[test]
-    fn test_pll_grid_empty() {
-        let result = quantize_to_grid_pll(&[], &[], 22050.0);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_pll_grid_zero_interval() {
-        let onsets = vec![100.0, 200.0, 300.0];
-        let result = quantize_to_grid_pll(&onsets, &[], 0.0);
-        assert_eq!(result, onsets);
-    }
-
-    #[test]
-    fn test_pll_grid_single_onset() {
-        let result = quantize_to_grid_pll(&[5000.0], &[], 22050.0);
-        assert_eq!(result.len(), 1);
-        assert!((result[0] - 5000.0).abs() < 1.0);
-    }
-
-    // --- snap_to_grid_fractional ---
-
     #[test]
     fn test_snap_to_grid_fractional_basic() {
-        let grid = BeatGrid {
-            beats: vec![0, 22050, 44100],
-            beats_fractional: vec![0.0, 22050.5, 44100.25],
-            bpm: 120.0,
-            sample_rate: 44100,
-        };
+        let grid = make_grid(vec![0.0, 22050.5, 44100.25], 120.0, 44100);
         let snapped = grid.snap_to_grid_fractional(22000.0);
         assert!(
-            (snapped - 22050.5).abs() < 1.0,
+            (snapped - 22050.5).abs() < 1e-9,
             "Should snap to 22050.5, got {}",
             snapped
         );
@@ -717,49 +933,61 @@ mod tests {
 
     #[test]
     fn test_snap_to_grid_fractional_empty() {
-        let grid = BeatGrid {
-            beats: vec![],
-            beats_fractional: vec![],
-            bpm: 120.0,
-            sample_rate: 44100,
-        };
+        let grid = BeatGrid::empty(44100);
         let snapped = grid.snap_to_grid_fractional(1000.0);
         assert!((snapped - 1000.0).abs() < 1e-10);
     }
 
-    // --- beats_fractional populated by detect_beats ---
+    #[test]
+    fn test_nearest_beat_index() {
+        let grid = make_grid(vec![0.0, 1000.0, 2000.0], 120.0, 44100);
+        assert_eq!(grid.nearest_beat_index(-50.0), Some(0));
+        assert_eq!(grid.nearest_beat_index(400.0), Some(0));
+        assert_eq!(grid.nearest_beat_index(600.0), Some(1));
+        assert_eq!(grid.nearest_beat_index(2600.0), Some(2));
+        assert_eq!(BeatGrid::empty(44100).nearest_beat_index(100.0), None);
+    }
 
     #[test]
-    fn test_detect_beats_has_fractional() {
-        // Generate a click train
-        let sample_rate = 44100u32;
-        let num_samples = sample_rate as usize * 4;
-        let mut samples = vec![0.0f32; num_samples];
-        let click_interval = (60.0 * sample_rate as f64 / 120.0) as usize; // 120 BPM
-        for i in (0..num_samples).step_by(click_interval) {
-            for j in 0..10.min(num_samples - i) {
-                samples[i + j] = if j < 5 { 1.0 } else { -0.5 };
-            }
-        }
+    fn test_bpm_at_segments() {
+        let grid = BeatGrid {
+            beats: vec![0.0, 22050.0, 44100.0, 64150.0, 84200.0],
+            downbeats: vec![0, 4],
+            segments: vec![
+                TempoSegment {
+                    start_beat: 0,
+                    bpm: 120.0,
+                },
+                TempoSegment {
+                    start_beat: 2,
+                    bpm: 132.0,
+                },
+            ],
+            bpm: 126.0,
+            confidence: 1.0,
+            downbeat_confidence: 1.0,
+            sample_rate: 44100,
+        };
+        assert!((grid.bpm_at(10000.0) - 120.0).abs() < 1e-9);
+        assert!((grid.bpm_at(70000.0) - 132.0).abs() < 1e-9);
+        // Before the first beat: first segment's tempo.
+        assert!((grid.bpm_at(-10.0) - 120.0).abs() < 1e-9);
+        // Empty grid: representative bpm (0.0).
+        assert_eq!(BeatGrid::empty(44100).bpm_at(0.0), 0.0);
+    }
 
-        let grid = detect_beats(&samples, sample_rate);
-        assert_eq!(
-            grid.beats.len(),
-            grid.beats_fractional.len(),
-            "beats and beats_fractional should have same length"
-        );
+    #[test]
+    fn test_beats_rounded_and_downbeat_positions() {
+        let grid = make_grid(vec![0.4, 1000.6, 2000.0, 3000.0, 4000.0], 120.0, 44100);
+        assert_eq!(grid.beats_rounded(), vec![0, 1001, 2000, 3000, 4000]);
+        assert_eq!(grid.downbeat_positions(), vec![0.4, 4000.0]);
     }
 
     // --- generate_subdivision_grid ---
 
     #[test]
     fn test_generate_subdivision_grid_120bpm_1sec() {
-        // 120 BPM = 2 beats/sec, 16 subdivisions per beat = 32 per second
         let grid = generate_subdivision_grid(120.0, 44100, 44100, 16);
-        // sub_interval = 22050/16 = 1378.125 samples
-        // positions: 0, 1378.125, 2756.25, ... up to < 44100
-        // 32 * 1378.125 = 44100.0 which is NOT < 44100 (strictly less)
-        // So positions 0..31 = 32 entries
         assert_eq!(
             grid.len(),
             32,
@@ -767,8 +995,7 @@ mod tests {
             grid.len()
         );
         assert!((grid[0] - 0.0).abs() < 1e-10, "First position should be 0");
-        // Check spacing is consistent
-        let expected_interval = 60.0 * 44100.0 / 120.0 / 16.0; // 1378.125
+        let expected_interval = 60.0 * 44100.0 / 120.0 / 16.0;
         for i in 1..grid.len() {
             let interval = grid[i] - grid[i - 1];
             assert!(
@@ -784,28 +1011,22 @@ mod tests {
 
     #[test]
     fn test_generate_subdivision_grid_zero_bpm() {
-        let grid = generate_subdivision_grid(0.0, 44100, 44100, 16);
-        assert!(grid.is_empty());
+        assert!(generate_subdivision_grid(0.0, 44100, 44100, 16).is_empty());
     }
 
     #[test]
     fn test_generate_subdivision_grid_zero_subdivision() {
-        let grid = generate_subdivision_grid(120.0, 44100, 44100, 0);
-        assert!(grid.is_empty());
+        assert!(generate_subdivision_grid(120.0, 44100, 44100, 0).is_empty());
     }
 
     #[test]
     fn test_generate_subdivision_grid_zero_samples() {
-        let grid = generate_subdivision_grid(120.0, 44100, 0, 16);
-        assert!(grid.is_empty());
+        assert!(generate_subdivision_grid(120.0, 44100, 0, 16).is_empty());
     }
 
     #[test]
     fn test_generate_subdivision_grid_quarter_notes() {
-        // 128 BPM, 48000 Hz, 2 seconds, quarter notes (subdivision=1)
         let grid = generate_subdivision_grid(128.0, 48000, 96000, 1);
-        // beat interval = 60*48000/128 = 22500 samples
-        // positions: 0, 22500, 45000, 67500, 90000 (all < 96000)
         assert_eq!(
             grid.len(),
             5,
@@ -819,65 +1040,44 @@ mod tests {
     #[test]
     fn test_snap_to_subdivision_exact_on_grid() {
         let grid = vec![0.0, 1000.0, 2000.0, 3000.0];
-        let result = snap_to_subdivision(1000.0, &grid, 220.0);
-        assert_eq!(result, Some(1000.0));
+        assert_eq!(snap_to_subdivision(1000.0, &grid, 220.0), Some(1000.0));
     }
 
     #[test]
     fn test_snap_to_subdivision_within_tolerance() {
-        // 3ms at 44100 Hz ~= 132 samples
         let grid = vec![0.0, 1000.0, 2000.0, 3000.0];
-        let tolerance = 44100.0 * 0.005; // 5ms = 220.5 samples
-        let result = snap_to_subdivision(1132.0, &grid, tolerance);
-        assert_eq!(
-            result,
-            Some(1000.0),
-            "Should snap to 1000 (132 samples away, within 220 tolerance)"
-        );
+        let tolerance = 44100.0 * 0.005;
+        assert_eq!(snap_to_subdivision(1132.0, &grid, tolerance), Some(1000.0));
     }
 
     #[test]
     fn test_snap_to_subdivision_outside_tolerance() {
-        // 10ms at 44100 Hz = 441 samples
         let grid = vec![0.0, 1000.0, 2000.0, 3000.0];
-        let tolerance = 44100.0 * 0.005; // 5ms = 220.5 samples
-        let result = snap_to_subdivision(1441.0, &grid, tolerance);
-        assert_eq!(
-            result, None,
-            "Should suppress (441 samples away, outside 220 tolerance)"
-        );
+        let tolerance = 44100.0 * 0.005;
+        assert_eq!(snap_to_subdivision(1441.0, &grid, tolerance), None);
     }
 
     #[test]
     fn test_snap_to_subdivision_empty_grid() {
-        let result = snap_to_subdivision(1000.0, &[], 220.0);
-        assert_eq!(result, None);
+        assert_eq!(snap_to_subdivision(1000.0, &[], 220.0), None);
     }
 
     #[test]
     fn test_snap_to_subdivision_snaps_to_nearest() {
-        // Position closer to second grid point than first
         let grid = vec![0.0, 1000.0, 2000.0];
-        let result = snap_to_subdivision(1800.0, &grid, 250.0);
-        assert_eq!(
-            result,
-            Some(2000.0),
-            "Should snap to 2000 (200 away), not 1000 (800 away)"
-        );
+        assert_eq!(snap_to_subdivision(1800.0, &grid, 250.0), Some(2000.0));
     }
 
     #[test]
     fn test_snap_to_subdivision_first_position() {
         let grid = vec![0.0, 1000.0, 2000.0];
-        let result = snap_to_subdivision(50.0, &grid, 100.0);
-        assert_eq!(result, Some(0.0));
+        assert_eq!(snap_to_subdivision(50.0, &grid, 100.0), Some(0.0));
     }
 
     #[test]
     fn test_snap_to_subdivision_last_position() {
         let grid = vec![0.0, 1000.0, 2000.0];
-        let result = snap_to_subdivision(1990.0, &grid, 100.0);
-        assert_eq!(result, Some(2000.0));
+        assert_eq!(snap_to_subdivision(1990.0, &grid, 100.0), Some(2000.0));
     }
 
     // --- default_subdivision_for_preset ---
@@ -902,15 +1102,14 @@ mod tests {
         );
     }
 
-    // --- Integration test: beat-grid snapping end-to-end ---
+    // --- Integration: snapping transients to a beat grid ---
 
     #[test]
     fn test_snap_transients_to_beat_grid_integration() {
-        // Generate a 128 BPM kick pattern: clicks exactly on every beat
         let sample_rate = 44100u32;
         let bpm = 128.0;
-        let num_samples = sample_rate as usize * 2; // 2 seconds
-        let beat_interval = (60.0 * sample_rate as f64 / bpm) as usize; // ~20671 samples
+        let num_samples = sample_rate as usize * 2;
+        let beat_interval = (60.0 * sample_rate as f64 / bpm) as usize;
 
         let mut samples = vec![0.0f32; num_samples];
         let mut true_beat_positions = Vec::new();
@@ -920,19 +1119,16 @@ mod tests {
                 break;
             }
             true_beat_positions.push(pos);
-            // Strong click at beat position
             for j in 0..20.min(num_samples - pos) {
                 samples[pos + j] = if j < 5 { 1.0 } else { -0.5 };
             }
         }
 
-        // Detect transients
         let transients =
             crate::analysis::transient::detect_transients(&samples, sample_rate, 2048, 512, 0.4);
 
-        // Generate subdivision grid and snap
         let grid = generate_subdivision_grid(bpm, sample_rate, num_samples, 16);
-        let tolerance = sample_rate as f64 * 0.005; // 5ms
+        let tolerance = sample_rate as f64 * 0.005;
 
         let snapped: Vec<usize> = transients
             .onsets
@@ -942,12 +1138,10 @@ mod tests {
             })
             .collect();
 
-        // Every snapped position should be within 2ms of a true beat position
         let tolerance_2ms = (sample_rate as f64 * 0.002) as usize;
         for &snapped_pos in &snapped {
             let near_beat = true_beat_positions.iter().any(|&beat| {
                 snapped_pos.abs_diff(beat) <= tolerance_2ms || {
-                    // Also check if it's near a subdivision of a beat
                     let sub_interval = beat_interval as f64 / 16.0;
                     let nearest_sub = (snapped_pos as f64 / sub_interval).round() * sub_interval;
                     (snapped_pos as f64 - nearest_sub).abs() <= tolerance_2ms as f64
@@ -959,27 +1153,5 @@ mod tests {
                 snapped_pos
             );
         }
-    }
-
-    #[test]
-    fn test_snap_preserves_dedup() {
-        // Multiple transients snapping to the same subdivision should deduplicate
-        let grid = vec![0.0, 1000.0, 2000.0, 3000.0];
-        let tolerance = 300.0;
-        let transients = [990, 1010]; // Both near grid point 1000
-
-        let mut snapped: Vec<usize> = transients
-            .iter()
-            .filter_map(|&onset| {
-                snap_to_subdivision(onset as f64, &grid, tolerance).map(|s| s.round() as usize)
-            })
-            .collect();
-        snapped.dedup();
-        assert_eq!(
-            snapped.len(),
-            1,
-            "Duplicate snapped positions should be deduplicated"
-        );
-        assert_eq!(snapped[0], 1000);
     }
 }

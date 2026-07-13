@@ -12,6 +12,13 @@ const RATIO_ENV: &str = "TIMESTRETCH_RUBBERBAND_RATIO";
 const SOURCE_BPM_ENV: &str = "TIMESTRETCH_RUBBERBAND_SOURCE_BPM";
 const TARGET_BPM_ENV: &str = "TIMESTRETCH_RUBBERBAND_TARGET_BPM";
 const MAX_SECONDS_ENV: &str = "TIMESTRETCH_RUBBERBAND_MAX_SECONDS";
+/// `old` (default) renders through the frozen batch `stretch()`; `new`
+/// renders through the pull engine's keylock chain at constant rate.
+/// The new arm is only meaningful at DJ ratios (0.92–1.08, ±20%
+/// secondary): beyond ~±10% rate deviation the keylock deliberately fades
+/// toward plain varispeed and no longer preserves pitch, while RubberBand
+/// always does.
+const ENGINE_ENV: &str = "TIMESTRETCH_RUBBERBAND_ENGINE";
 const FFT_SIZE: usize = 2048;
 const HOP_SIZE: usize = 512;
 const DEFAULT_MAX_SECONDS: f64 = 20.0;
@@ -53,6 +60,54 @@ fn resolve_ratio(original: &AudioBuffer, reference: &AudioBuffer) -> Option<f64>
         return Some(reference.num_frames() as f64 / original.num_frames() as f64);
     }
     None
+}
+
+/// Renders through the new pull engine's keylock chain at constant rate
+/// `1 / ratio`, trimming the pipeline-latency prefix so the output aligns
+/// with the source timeline like the batch render does.
+fn render_new_engine(input: &[f32], sample_rate: u32, ratio: f64) -> Vec<f32> {
+    use timestretch::engine::{Engine, EngineConfig, EngineProfile};
+    let rate = 1.0 / ratio;
+    let handles = Engine::build(EngineConfig {
+        sample_rate,
+        channels: 1,
+        profile: EngineProfile::Keylock,
+        initial_tempo_rate: rate,
+        ..EngineConfig::default()
+    })
+    .expect("engine builds");
+    let (controller, mut processor, mut source) =
+        (handles.controller, handles.processor, handles.source);
+    source.set_track_position(0);
+    let latency = processor.pipeline_latency_frames();
+
+    let mut feed = 0usize;
+    let mut finished = false;
+    let mut out = vec![0.0f32; 256];
+    let mut collected: Vec<f32> = Vec::with_capacity((input.len() as f64 * ratio) as usize + 4096);
+    loop {
+        while feed < input.len() && source.occupied_frames() < 8_192 {
+            let end = (feed + 8_192).min(input.len());
+            feed += source.push(&input[feed..end]);
+        }
+        if feed >= input.len() && !finished {
+            finished = source.finish();
+        }
+        let underruns_before = controller.underrun_frames();
+        processor.process(&mut out);
+        if controller.underrun_frames() > underruns_before {
+            let shortfall = (controller.underrun_frames() - underruns_before) as usize;
+            collected.extend_from_slice(&out[..out.len() - shortfall.min(out.len())]);
+            break;
+        }
+        collected.extend_from_slice(&out);
+        if collected.len() > input.len() * 6 + 100_000 {
+            panic!("new-engine render did not terminate");
+        }
+    }
+    // Drop the constant pipeline-latency prefix (silence + fill).
+    collected.drain(..latency.min(collected.len()));
+    collected
 }
 
 #[test]
@@ -111,12 +166,16 @@ fn benchmark_against_external_rubberband_render() {
         trim_to_seconds(&reference, max_seconds * ratio.max(0.01)).mix_to_mono();
     let original_mono = original.mix_to_mono();
 
-    let params = StretchParams::new(ratio)
-        .with_sample_rate(original_mono.sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::DjBeatmatch);
-
-    let stretched = timestretch::stretch(&original_mono.data, &params).expect("stretch failed");
+    let engine = std::env::var(ENGINE_ENV).unwrap_or_else(|_| "old".to_string());
+    let stretched = if engine.trim().eq_ignore_ascii_case("new") {
+        render_new_engine(&original_mono.data, original_mono.sample_rate, ratio)
+    } else {
+        let params = StretchParams::new(ratio)
+            .with_sample_rate(original_mono.sample_rate)
+            .with_channels(1)
+            .with_preset(EdmPreset::DjBeatmatch);
+        timestretch::stretch(&original_mono.data, &params).expect("stretch failed")
+    };
     assert!(!stretched.is_empty(), "stretched output must not be empty");
 
     let compare_len = stretched.len().min(reference_mono.data.len());

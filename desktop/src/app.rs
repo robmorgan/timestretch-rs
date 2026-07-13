@@ -7,8 +7,9 @@ use std::thread::JoinHandle;
 use crate::audio_engine::AudioEngine;
 use crate::decoder;
 use crate::processor;
+use crate::pull_deck;
 use crate::state::*;
-use crate::waveform::{self, WaveformPeaks};
+use crate::waveform::{self, BeatMark, WaveformPeaks};
 
 const MIN_STRETCH_RATIO: f64 = 0.25;
 /// Slowest playback the streaming engine sustains cleanly on every profile
@@ -46,6 +47,12 @@ pub struct TimeStretchApp {
     // Waveform
     waveform_peaks: Option<WaveformPeaks>,
 
+    /// Beat grid detected on load; drives the waveform overlay and
+    /// grid-accurate beat jumps.
+    beat_grid: Option<timestretch::BeatGrid>,
+    /// Beat positions normalized to track length, cached for the overlay.
+    beat_marks: Vec<BeatMark>,
+
     // UI state
     stretch_ratio: f64,
     /// Target playback BPM the tempo fader binds to (0.0 until a BPM is
@@ -57,6 +64,7 @@ pub struct TimeStretchApp {
     stream_profile: StreamProfile,
     streaming_engine: StreamingEngine,
     control_path: ControlPath,
+    deck_engine: DeckEngine,
     target_bpm_text: String,
 
     // Error messages
@@ -67,6 +75,10 @@ impl TimeStretchApp {
     /// Widest stretch ratio the active tempo path supports.
     #[inline]
     fn max_stretch_ratio(&self) -> f64 {
+        if self.deck_engine.is_pull() {
+            // The pull engine's tempo axis is the varispeed resampler.
+            return MAX_VARISPEED_RATIO;
+        }
         match self.control_path {
             ControlPath::VarispeedFirst => MAX_VARISPEED_RATIO,
             ControlPath::VocoderTempo => MAX_STRETCH_RATIO,
@@ -126,6 +138,8 @@ impl TimeStretchApp {
             file_name: String::new(),
             file_path: None,
             waveform_peaks: None,
+            beat_grid: None,
+            beat_marks: Vec::new(),
             stretch_ratio: 1.0,
             target_bpm: 0.0,
             pitch_semitones: 0.0,
@@ -134,6 +148,7 @@ impl TimeStretchApp {
             stream_profile: StreamProfile::Live,
             streaming_engine: StreamingEngine::Deterministic,
             control_path: ControlPath::VarispeedFirst,
+            deck_engine: DeckEngine::PullKeylock,
             target_bpm_text: String::new(),
             error_message: None,
         }
@@ -170,9 +185,19 @@ impl TimeStretchApp {
                 // Compute waveform peaks
                 self.waveform_peaks = Some(WaveformPeaks::compute(&bpm_buffer.data, 2, 800));
 
-                // Detect BPM from channel-aware buffer (stereo-safe).
-                let bpm = timestretch::detect_bpm_buffer(&bpm_buffer);
-                log::info!("Detected BPM: {bpm:.1}");
+                // Detect the beat grid from the channel-aware buffer
+                // (stereo-safe): BPM for the tempo fader plus beat and
+                // downbeat positions for the overlay and beat jumps.
+                let grid = timestretch::detect_beat_grid_buffer(&bpm_buffer);
+                let bpm = grid.bpm;
+                log::info!(
+                    "Detected BPM: {bpm:.1} ({} beats, {} segments, confidence {:.2})",
+                    grid.beats.len(),
+                    grid.segments.len(),
+                    grid.confidence
+                );
+                self.beat_marks = beat_marks_for_overlay(&grid, num_frames);
+                self.beat_grid = Some(grid);
                 self.target_bpm_text = if bpm > 0.0 {
                     format!("{bpm:.1}")
                 } else {
@@ -247,6 +272,15 @@ impl TimeStretchApp {
             st.sample_rate
         };
 
+        match self.deck_engine {
+            DeckEngine::Legacy => self.start_legacy_playback(source, sample_rate),
+            DeckEngine::PullTape | DeckEngine::PullKeylock => {
+                self.start_pull_playback(source, sample_rate)
+            }
+        }
+    }
+
+    fn start_legacy_playback(&mut self, source: Arc<Vec<f32>>, sample_rate: u32) {
         // Create audio engine with ring buffer, matching the source file's sample rate
         // so playback speed is correct regardless of the device's native rate.
         let flush_ring = Arc::new(AtomicBool::new(false));
@@ -283,6 +317,83 @@ impl TimeStretchApp {
             self.stream_active.clone(),
             stop_flag,
             flush_ring,
+        );
+
+        self.processing_handle = Some(handle);
+    }
+
+    /// Pull-native playback on the new engine (ROADMAP new Stage 1): the
+    /// audio callback owns the processor and pulls; the feed thread keeps
+    /// the source ring topped up and forwards tempo control.
+    fn start_pull_playback(&mut self, source: Arc<Vec<f32>>, sample_rate: u32) {
+        let initial_ratio = {
+            let st = self.state.lock().unwrap();
+            st.stretch_ratio
+        };
+        let profile = match self.deck_engine {
+            DeckEngine::PullKeylock => timestretch::engine::EngineProfile::Keylock,
+            _ => timestretch::engine::EngineProfile::Tape,
+        };
+        // Analyze-on-load artifact: the engine's primary transient control
+        // signal (splice guidance + PV phase resets). Arc-shared with the
+        // analysis thread's result.
+        let pre_analysis = self.state.lock().unwrap().pre_analysis.clone();
+        let config = timestretch::engine::EngineConfig {
+            sample_rate,
+            channels: 2,
+            profile,
+            initial_tempo_rate: 1.0 / initial_ratio.clamp(0.25, MAX_VARISPEED_RATIO),
+            max_block_frames: 2048,
+            source_capacity_frames: 65_536,
+            pre_analysis,
+        };
+        let handles = match timestretch::engine::Engine::build(config) {
+            Ok(h) => h,
+            Err(e) => {
+                self.error_message = Some(format!("Engine error: {e}"));
+                return;
+            }
+        };
+        let pipeline_latency_secs =
+            handles.processor.pipeline_latency_frames() as f64 / sample_rate as f64;
+        let warm_start_preroll = handles.processor.warm_start_preroll_frames();
+
+        let reset_request = Arc::new(AtomicBool::new(false));
+        let engine = match AudioEngine::new_pull(
+            self.state.clone(),
+            self.stream_active.clone(),
+            Some(sample_rate),
+            handles.processor,
+            reset_request.clone(),
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                self.error_message = Some(format!("Audio error: {e}"));
+                return;
+            }
+        };
+        self.audio_engine = Some(engine);
+
+        {
+            let mut st = self.state.lock().unwrap();
+            st.transport = Transport::Playing;
+            st.total_frames = source.len() / 2;
+        }
+
+        let stop_flag = Arc::new(StopFlag::new());
+        self.stop_flag = Some(stop_flag.clone());
+
+        let handle = pull_deck::start_pull_deck_thread(
+            self.state.clone(),
+            source,
+            handles.source,
+            handles.controller,
+            self.position.clone(),
+            self.stream_active.clone(),
+            stop_flag,
+            reset_request,
+            pipeline_latency_secs,
+            warm_start_preroll,
         );
 
         self.processing_handle = Some(handle);
@@ -423,7 +534,7 @@ impl TimeStretchApp {
             neg: vec![],
         };
         let peaks = self.waveform_peaks.as_ref().unwrap_or(&empty_peaks);
-        let (_response, seek_pos) = waveform::paint_waveform(ui, peaks, progress);
+        let (_response, seek_pos) = waveform::paint_waveform(ui, peaks, progress, &self.beat_marks);
 
         // Handle click-to-seek
         if let Some(frac) = seek_pos {
@@ -491,14 +602,21 @@ impl TimeStretchApp {
         };
 
         ui.horizontal(|ui| {
-            // Beat jumps: relative seeks by whole beats using the detected
-            // grid. Disabled until a tempo is known.
+            // Beat jumps: relative seeks by whole beats on the detected
+            // grid (tracked positions, not computed intervals, so jumps
+            // stay on the beat through tempo drift). Falls back to fixed
+            // 60/BPM intervals when only a tempo is known. Disabled until
+            // a tempo is detected.
+            let grid = self
+                .beat_grid
+                .as_ref()
+                .filter(|g| g.beats.len() >= 2 && g.bpm > 0.0);
             let beat_frames = if bpm > 0.0 {
                 (sample_rate as f64 * 60.0 / bpm).round() as i64
             } else {
                 0
             };
-            let can_jump = has_audio && beat_frames > 0 && total_frames > 0;
+            let can_jump = has_audio && total_frames > 0 && (grid.is_some() || beat_frames > 0);
             ui.label("Jump:");
             for beats in [-16i64, -4, 4, 16] {
                 let label = if beats > 0 {
@@ -507,9 +625,18 @@ impl TimeStretchApp {
                     format!("{beats}")
                 };
                 if ui.add_enabled(can_jump, egui::Button::new(label)).clicked() {
-                    let delta = beats * beat_frames;
-                    let target =
-                        (pos_frames as i64 + delta).clamp(0, total_frames as i64 - 1) as usize;
+                    let target = match grid {
+                        Some(g) => {
+                            let here = g.nearest_beat_index(pos_frames as f64).unwrap_or(0) as i64;
+                            let idx = (here + beats).clamp(0, g.beats.len() as i64 - 1) as usize;
+                            g.beats[idx].round().max(0.0) as usize
+                        }
+                        None => {
+                            let delta = beats * beat_frames;
+                            (pos_frames as i64 + delta).max(0) as usize
+                        }
+                    }
+                    .min(total_frames.saturating_sub(1));
                     self.state.lock().unwrap().seek_request = Some(target);
                 }
             }
@@ -655,6 +782,61 @@ impl TimeStretchApp {
                 });
                 ui.end_row();
 
+                // Deck engine: the frozen push pipeline vs the new pull
+                // engine (tape mode). Switching stops playback — the two
+                // pipelines are wired completely differently.
+                ui.label("Deck:");
+                ui.horizontal(|ui| {
+                    let old_deck = self.deck_engine;
+                    egui::ComboBox::from_id_salt("deck_engine_combo")
+                        .selected_text(self.deck_engine.label())
+                        .show_ui(ui, |ui| {
+                            for &deck in DeckEngine::ALL {
+                                ui.selectable_value(&mut self.deck_engine, deck, deck.label());
+                            }
+                        });
+                    if self.deck_engine != old_deck {
+                        // The pull engine bounds the tempo ratio to the
+                        // varispeed range; pull the fader back in first.
+                        let clamped = self.clamp_stretch_ratio(self.stretch_ratio);
+                        if (clamped - self.stretch_ratio).abs() > f64::EPSILON {
+                            let detected = self.state.lock().unwrap().detected_bpm;
+                            if detected > 0.0 {
+                                self.apply_target_bpm(detected, detected / clamped);
+                            } else {
+                                self.stretch_ratio = clamped;
+                                self.state.lock().unwrap().stretch_ratio = clamped;
+                            }
+                        }
+                        self.state.lock().unwrap().deck_engine = self.deck_engine;
+                        self.stop_playback();
+                    }
+                    match self.deck_engine {
+                        DeckEngine::PullTape => {
+                            ui.label(egui::RichText::new("tape: pitch follows tempo").weak())
+                                .on_hover_text(
+                                    "New pull-based engine (roadmap Stage 1): zero pipeline \
+                                     delay, sample-accurate tempo, pitch follows the fader. \
+                                     The Preset, Playback, Engine, Tempo Path, and Pitch \
+                                     controls apply to the legacy deck only.",
+                                );
+                        }
+                        DeckEngine::PullKeylock => {
+                            ui.label(egui::RichText::new("keylock: two-band").weak())
+                                .on_hover_text(
+                                    "New pull-based engine (roadmap Stage 2): low band \
+                                     follows tempo, high band pitch-corrected by a small \
+                                     FFT at the delay-matched transposition (~13 ms \
+                                     pipeline delay). The Preset, Playback, Engine, Tempo \
+                                     Path, and Pitch controls apply to the legacy deck \
+                                     only.",
+                                );
+                        }
+                        DeckEngine::Legacy => {}
+                    }
+                });
+                ui.end_row();
+
                 ui.label("Playback:");
                 ui.horizontal(|ui| {
                     let old_profile = self.stream_profile;
@@ -794,25 +976,31 @@ impl TimeStretchApp {
                 });
                 ui.end_row();
 
-                // Pitch shift (realtime: applied live by the stream processor)
+                // Pitch shift (realtime: applied live by the stream
+                // processor). Legacy deck only — in the pull engine's tape
+                // mode pitch follows tempo by design.
                 ui.label("Pitch Shift:");
-                ui.horizontal(|ui| {
-                    let old_pitch = self.pitch_semitones;
-                    ui.add(
-                        egui::Slider::new(&mut self.pitch_semitones, -12.0..=12.0)
-                            .text("st")
-                            .fixed_decimals(1),
-                    );
-                    if (self.pitch_semitones - old_pitch).abs() > 0.001 {
-                        let mut st = self.state.lock().unwrap();
-                        st.pitch_semitones = self.pitch_semitones;
-                    }
-                    if ui.button("Reset").clicked() && self.pitch_semitones.abs() > 0.001 {
-                        self.pitch_semitones = 0.0;
-                        let mut st = self.state.lock().unwrap();
-                        st.pitch_semitones = 0.0;
-                    }
-                });
+                ui.add_enabled_ui(self.deck_engine == DeckEngine::Legacy, |ui| {
+                    ui.horizontal(|ui| {
+                        let old_pitch = self.pitch_semitones;
+                        ui.add(
+                            egui::Slider::new(&mut self.pitch_semitones, -12.0..=12.0)
+                                .text("st")
+                                .fixed_decimals(1),
+                        );
+                        if (self.pitch_semitones - old_pitch).abs() > 0.001 {
+                            let mut st = self.state.lock().unwrap();
+                            st.pitch_semitones = self.pitch_semitones;
+                        }
+                        if ui.button("Reset").clicked() && self.pitch_semitones.abs() > 0.001 {
+                            self.pitch_semitones = 0.0;
+                            let mut st = self.state.lock().unwrap();
+                            st.pitch_semitones = 0.0;
+                        }
+                    });
+                })
+                .response
+                .on_disabled_hover_text("Tape mode: pitch follows tempo");
                 ui.end_row();
 
                 // Volume
@@ -851,6 +1039,29 @@ fn control_path_label(path: ControlPath) -> &'static str {
 }
 
 /// Sidecar artifact path for a loaded audio file: `<file>.tsanalysis.json`.
+/// Precomputes normalized overlay marks from a beat grid: beat positions
+/// as track fractions with downbeats flagged, ready for the painter.
+fn beat_marks_for_overlay(grid: &timestretch::BeatGrid, total_frames: usize) -> Vec<BeatMark> {
+    if total_frames == 0 || grid.beats.is_empty() {
+        return Vec::new();
+    }
+    let inv_total = 1.0 / total_frames as f64;
+    let mut downbeat_flags = vec![false; grid.beats.len()];
+    for &idx in &grid.downbeats {
+        if let Some(flag) = downbeat_flags.get_mut(idx) {
+            *flag = true;
+        }
+    }
+    grid.beats
+        .iter()
+        .zip(downbeat_flags.iter())
+        .map(|(&pos, &is_downbeat)| BeatMark {
+            frac: (pos * inv_total) as f32,
+            is_downbeat,
+        })
+        .collect()
+}
+
 fn sidecar_path(audio_path: &std::path::Path) -> PathBuf {
     let mut os = audio_path.as_os_str().to_os_string();
     os.push(".tsanalysis.json");

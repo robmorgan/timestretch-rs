@@ -51,15 +51,17 @@ use rustfft::{num_complex::Complex, FftPlanner};
 
 pub mod analysis;
 pub mod core;
+pub mod engine;
 pub mod error;
 pub mod io;
 pub mod stream;
 pub mod stretch;
 
-pub use analysis::beat::BeatGrid;
+pub use analysis::beat::{BeatGrid, TempoSegment};
 pub use analysis::preanalysis::{
     analyze_for_dj, analyze_for_dj_with_report, downmix_to_mid, AnalysisReport,
 };
+pub use analysis::tempogram::TempoTrackingOptions;
 pub use core::preanalysis::{
     hash_samples, read_preanalysis_json, write_preanalysis_json, PreAnalysisArtifact,
     PREANALYSIS_VERSION,
@@ -1064,9 +1066,13 @@ pub fn pitch_shift_buffer(
 
 /// Detects the BPM of a mono audio signal.
 ///
-/// Uses transient detection and inter-onset interval analysis optimized
-/// for 4/4 EDM (house/techno) with expected BPM range 100-160. Returns
-/// the estimated BPM, or 0.0 if no tempo can be detected.
+/// General-purpose tempo estimation: an autocorrelation tempogram over the
+/// onset novelty curve with a wide 50–220 BPM search range and a soft
+/// log-normal prior for octave decisions (no hard folding — a 90 BPM
+/// hip-hop track reports 90, a 174 BPM DnB track is not forced into an EDM
+/// range). Returns the representative (median) BPM over the tracked beat
+/// sequence, or 0.0 if no tempo can be detected. Use
+/// [`detect_beat_grid_with_options`] to narrow the range or hint a genre.
 ///
 /// For stereo audio, extract the left channel first (or mix to mono).
 ///
@@ -1076,7 +1082,7 @@ pub fn pitch_shift_buffer(
 /// // Generate a click train at ~120 BPM
 /// let sample_rate = 44100u32;
 /// let beat_interval = (60.0 * sample_rate as f64 / 120.0) as usize;
-/// let mut audio = vec![0.0f32; sample_rate as usize * 4];
+/// let mut audio = vec![0.0f32; sample_rate as usize * 8];
 /// for pos in (0..audio.len()).step_by(beat_interval) {
 ///     for j in 0..10.min(audio.len() - pos) {
 ///         audio[pos + j] = if j < 5 { 0.9 } else { -0.4 };
@@ -1084,27 +1090,45 @@ pub fn pitch_shift_buffer(
 /// }
 ///
 /// let bpm = timestretch::detect_bpm(&audio, sample_rate);
-/// // BPM detection may or may not succeed on synthetic clicks
-/// // For real EDM audio with kicks, this is very reliable
+/// assert!((bpm - 120.0).abs() < 3.0, "got {bpm}");
 /// ```
 pub fn detect_bpm(samples: &[f32], sample_rate: u32) -> f64 {
     analysis::beat::detect_beats(samples, sample_rate).bpm
 }
 
-/// Detects beats and returns a [`BeatGrid`] with BPM and beat positions.
+/// Detects beats and returns a [`BeatGrid`]: tracked beat positions,
+/// downbeats, and a piecewise-constant tempo model.
 ///
-/// This provides more detail than [`detect_bpm`], including the sample
-/// positions of detected beats and a grid-snapping utility.
+/// This provides more detail than [`detect_bpm`]: fractional-sample beat
+/// positions (following tempo drift on live or unquantized material),
+/// downbeat indices with a confidence, per-segment BPM, and snapping
+/// helpers.
 ///
 /// # Example
 ///
 /// ```
 /// let audio = vec![0.0f32; 44100 * 4];
 /// let grid = timestretch::detect_beat_grid(&audio, 44100);
-/// println!("BPM: {}, beats: {}", grid.bpm, grid.beats.len());
+/// println!(
+///     "BPM: {}, beats: {}, segments: {}",
+///     grid.bpm,
+///     grid.beats.len(),
+///     grid.segments.len()
+/// );
 /// ```
 pub fn detect_beat_grid(samples: &[f32], sample_rate: u32) -> BeatGrid {
     analysis::beat::detect_beats(samples, sample_rate)
+}
+
+/// [`detect_beat_grid`] with explicit [`TempoTrackingOptions`] — narrow the
+/// BPM search range, move the octave prior, or add a soft genre hint (the
+/// DJ analysis path uses a 100–160 hint).
+pub fn detect_beat_grid_with_options(
+    samples: &[f32],
+    sample_rate: u32,
+    options: &TempoTrackingOptions,
+) -> BeatGrid {
+    analysis::beat::detect_beats_with_options(samples, sample_rate, options)
 }
 
 /// Detects the BPM of an [`AudioBuffer`].

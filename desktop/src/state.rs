@@ -52,6 +52,39 @@ impl PresetChoice {
     }
 }
 
+/// Which engine architecture drives the deck (ROADMAP new Stage 1).
+///
+/// `Legacy` is the frozen push-based `StreamProcessor` pipeline; `PullTape`
+/// is the new pull-based engine in tape mode (pitch follows tempo, zero
+/// pipeline delay). The desktop is the new engine's reference integration
+/// and drives it pull-native — no push-compat shim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeckEngine {
+    Legacy,
+    PullTape,
+    PullKeylock,
+}
+
+impl DeckEngine {
+    pub const ALL: &'static [DeckEngine] = &[
+        DeckEngine::Legacy,
+        DeckEngine::PullTape,
+        DeckEngine::PullKeylock,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            DeckEngine::Legacy => "Legacy (push)",
+            DeckEngine::PullTape => "Pull — Tape",
+            DeckEngine::PullKeylock => "Pull — Keylock",
+        }
+    }
+
+    pub fn is_pull(&self) -> bool {
+        !matches!(self, DeckEngine::Legacy)
+    }
+}
+
 // The streaming latency/quality profile is now a first-class library
 // concept; the desktop app re-exports it for its UI.
 pub use timestretch::StreamProfile;
@@ -80,6 +113,9 @@ pub struct SharedState {
     /// compensated pipeline delay. Applied at every processor build; falls
     /// back to the vocoder path if the ratio is outside the varispeed range.
     pub control_path: ControlPath,
+    /// Deck engine architecture. Takes effect at the next playback start
+    /// (the two pipelines are wired completely differently).
+    pub deck_engine: DeckEngine,
 
     /// Current playback position in source frames.
     pub position_frames: usize,
@@ -136,6 +172,7 @@ impl SharedState {
             stream_profile: StreamProfile::Club,
             streaming_engine: StreamingEngine::Deterministic,
             control_path: ControlPath::VarispeedFirst,
+            deck_engine: DeckEngine::PullKeylock,
             position_frames: 0,
             total_frames: 0,
             sample_rate: 44100,

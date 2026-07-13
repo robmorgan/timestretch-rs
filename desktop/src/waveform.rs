@@ -52,11 +52,59 @@ impl WaveformPeaks {
     }
 }
 
-/// Paint a waveform display with playback cursor and click-to-seek.
+/// A beat marker for the waveform overlay: horizontal position as a
+/// fraction of the track (0..1) and whether it is a downbeat (bar start).
+#[derive(Debug, Clone, Copy)]
+pub struct BeatMark {
+    /// Position as a fraction of the total track length.
+    pub frac: f32,
+    /// True for downbeats (drawn emphasized).
+    pub is_downbeat: bool,
+}
+
+/// Minimum pixel spacing between adjacent grid lines before a marker tier
+/// is drawn at full density.
+const MIN_GRID_SPACING_PX: f32 = 6.0;
+
+/// How the overlay adapts the grid to the available width: whether
+/// individual beats fit, and how many bars each drawn downbeat line spans
+/// (1 = every downbeat; 2/4/8… = phrase markers when bars are too dense).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayPlan {
+    draw_beats: bool,
+    downbeat_stride: usize,
+}
+
+/// Chooses the densest tier that keeps adjacent lines at least
+/// [`MIN_GRID_SPACING_PX`] apart. Downbeats never disappear entirely —
+/// they thin to every 2^k bars instead, so a full-length track still shows
+/// its phrase structure.
+fn overlay_plan(width_px: f32, beat_count: usize, downbeat_count: usize) -> OverlayPlan {
+    let draw_beats = beat_count >= 2 && width_px / beat_count as f32 >= MIN_GRID_SPACING_PX;
+    let mut downbeat_stride = 1usize;
+    if downbeat_count > 0 {
+        let mut spacing = width_px / downbeat_count as f32;
+        while spacing < MIN_GRID_SPACING_PX && downbeat_stride < (1 << 16) {
+            downbeat_stride *= 2;
+            spacing *= 2.0;
+        }
+    }
+    OverlayPlan {
+        draw_beats,
+        downbeat_stride,
+    }
+}
+
+/// Paint a waveform display with playback cursor, beat-grid overlay, and
+/// click-to-seek. `beat_marks` must be sorted by position; the overlay is
+/// density-adaptive — all beats when they have room, downbeats only when
+/// beats would smear, thinning to every 2^k bars (phrase markers) on
+/// full-length tracks.
 pub fn paint_waveform(
     ui: &mut egui::Ui,
     peaks: &WaveformPeaks,
     progress: f32,
+    beat_marks: &[BeatMark],
 ) -> (egui::Response, Option<f32>) {
     let desired_size = egui::vec2(ui.available_width(), 120.0);
     let (response, painter) = ui.allocate_painter(desired_size, egui::Sense::click());
@@ -106,6 +154,47 @@ pub fn paint_waveform(
         );
     }
 
+    // Beat-grid overlay: density-adaptive (see overlay_plan). Spacing is
+    // estimated from the marker counts — marks are evenly spread in
+    // musical time, so the mean is representative.
+    if beat_marks.len() >= 2 {
+        let downbeat_count = beat_marks.iter().filter(|m| m.is_downbeat).count();
+        let plan = overlay_plan(rect.width(), beat_marks.len(), downbeat_count);
+
+        let beat_stroke = egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 42),
+        );
+        let downbeat_stroke = egui::Stroke::new(
+            2.0,
+            egui::Color32::from_rgba_unmultiplied(255, 220, 130, 120),
+        );
+
+        // Countdown over downbeats: draw one, skip stride - 1.
+        let mut downbeats_until_draw = 0usize;
+        for mark in beat_marks {
+            let (draw, stroke) = if mark.is_downbeat {
+                let draw = downbeats_until_draw == 0;
+                downbeats_until_draw = if draw {
+                    plan.downbeat_stride - 1
+                } else {
+                    downbeats_until_draw - 1
+                };
+                (draw, downbeat_stroke)
+            } else {
+                (plan.draw_beats, beat_stroke)
+            };
+            if !draw {
+                continue;
+            }
+            let x = rect.left() + mark.frac.clamp(0.0, 1.0) * rect.width();
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                stroke,
+            );
+        }
+    }
+
     // Draw cursor line
     if progress > 0.0 && progress < 1.0 {
         painter.line_segment(
@@ -139,4 +228,52 @@ pub fn paint_waveform(
     };
 
     (response, seek_pos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_never_empty_on_long_tracks() {
+        // A 6-minute 123 BPM extended mix in a default-width window: 707
+        // beats, 177 downbeats at ~800 px. Beats and per-bar downbeats are
+        // both too dense (1.1 px / 4.5 px), but phrase markers must remain.
+        let plan = overlay_plan(800.0, 707, 177);
+        assert!(!plan.draw_beats);
+        assert_eq!(plan.downbeat_stride, 2, "expected 2-bar phrase markers");
+        // Drawn lines: ceil(177 / 2) = 89 -> ~9 px apart.
+        assert!(800.0 / (177.0 / plan.downbeat_stride as f32) >= MIN_GRID_SPACING_PX);
+    }
+
+    #[test]
+    fn overlay_full_density_on_short_loops() {
+        // A 16-beat loop at any reasonable width: draw everything.
+        let plan = overlay_plan(800.0, 16, 4);
+        assert!(plan.draw_beats);
+        assert_eq!(plan.downbeat_stride, 1);
+    }
+
+    #[test]
+    fn overlay_downbeats_only_at_medium_density() {
+        // ~200 beats at 800 px: beats smear (4 px), bars fit (16 px).
+        let plan = overlay_plan(800.0, 200, 50);
+        assert!(!plan.draw_beats);
+        assert_eq!(plan.downbeat_stride, 1);
+    }
+
+    #[test]
+    fn overlay_stride_grows_for_very_long_tracks() {
+        // A 2-hour DJ mix: 17k beats, 4.3k downbeats at 800 px needs
+        // 32-bar phrase markers (4300/32 = 134 lines -> ~6 px).
+        let plan = overlay_plan(800.0, 17_000, 4_300);
+        assert!(!plan.draw_beats);
+        assert_eq!(plan.downbeat_stride, 64);
+    }
+
+    #[test]
+    fn overlay_handles_no_downbeats() {
+        let plan = overlay_plan(800.0, 100, 0);
+        assert_eq!(plan.downbeat_stride, 1);
+    }
 }

@@ -13,6 +13,13 @@
 //! octave-folded. A JSON report is written to `target/bpm_accuracy_report.json`
 //! so runs can be diffed while iterating on the detector.
 //!
+//! Tracks may additionally carry a `beats` field pointing at a beat
+//! annotation JSON (relative to `benchmarks/`, schema
+//! `{"beats": [secs...], "downbeats": [secs...]}`; `downbeats` optional).
+//! Annotated tracks are also scored with beat-level metrics: F-measure at
+//! ±70 ms, octave-tolerant continuity (CMLt/AMLt-style), and a downbeat
+//! F-measure when downbeat annotations are present.
+//!
 //! Run with:
 //! `cargo test --features qa-harnesses --release --test bpm_accuracy -- --nocapture`
 //!
@@ -23,6 +30,8 @@
 //!   and skips become failures.
 //! - `TIMESTRETCH_BPM_MIN_ACC1` / `TIMESTRETCH_BPM_MIN_ACC2`: minimum
 //!   accuracy percentages (0-100); the test fails below the floor.
+//! - `TIMESTRETCH_BPM_MIN_BEAT_F`: minimum mean beat F-measure percentage
+//!   over annotated tracks; the test fails below the floor.
 
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -45,7 +54,13 @@ const TOLERANCE_ENV_VAR: &str = "TIMESTRETCH_BPM_TOLERANCE";
 const MAX_SECONDS_ENV_VAR: &str = "TIMESTRETCH_BPM_MAX_SECONDS";
 const MIN_ACC1_ENV_VAR: &str = "TIMESTRETCH_BPM_MIN_ACC1";
 const MIN_ACC2_ENV_VAR: &str = "TIMESTRETCH_BPM_MIN_ACC2";
+const MIN_BEAT_F_ENV_VAR: &str = "TIMESTRETCH_BPM_MIN_BEAT_F";
 const DEFAULT_TOLERANCE: f64 = 0.02;
+/// Standard beat-tracking hit tolerance for F-measure, in seconds.
+const BEAT_TOLERANCE_SECS: f64 = 0.07;
+/// Continuity phase/period tolerance as a fraction of the local
+/// inter-annotation interval (standard CML/AML setting).
+const CONTINUITY_TOLERANCE: f64 = 0.175;
 
 // ---------------------------------------------------------------------------
 // Manifest types (subset of the benchmarks/manifest.toml schema)
@@ -66,6 +81,18 @@ struct Track {
     #[serde(default)]
     original_sha256: Option<String>,
     bpm: f64,
+    /// Optional beat annotation JSON, relative to `benchmarks/`.
+    #[serde(default)]
+    beats: Option<String>,
+}
+
+/// Ground-truth beat annotation: beat (and optionally downbeat) times in
+/// seconds, ascending.
+#[derive(Debug, Deserialize)]
+struct BeatAnnotation {
+    beats: Vec<f64>,
+    #[serde(default)]
+    downbeats: Vec<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +131,15 @@ struct TrackResult {
     confidence: f32,
     duration_secs: f64,
     analysis_secs: f64,
+    /// Beat F-measure at ±70 ms against the annotation (annotated tracks).
+    beat_f: Option<f64>,
+    /// Continuity ratio at the annotated metrical level (CMLt-style).
+    beat_cmlt: Option<f64>,
+    /// Continuity ratio at the best allowed metrical level (AMLt-style:
+    /// annotated level, half at either phase, or double).
+    beat_amlt: Option<f64>,
+    /// Downbeat F-measure at ±70 ms (annotated tracks with downbeats).
+    downbeat_f: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,6 +156,17 @@ struct Summary {
     median_err_pct: Option<f64>,
     mean_err_pct: Option<f64>,
     tolerance: f64,
+    /// Number of tracks scored with beat annotations.
+    beat_annotated: usize,
+    /// Mean beat F-measure over annotated tracks, in percent.
+    mean_beat_f_pct: Option<f64>,
+    /// Mean CMLt-style continuity over annotated tracks, in percent.
+    mean_beat_cmlt_pct: Option<f64>,
+    /// Mean AMLt-style continuity over annotated tracks, in percent.
+    mean_beat_amlt_pct: Option<f64>,
+    /// Mean downbeat F-measure over tracks with downbeat annotations,
+    /// in percent.
+    mean_downbeat_f_pct: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -162,6 +209,130 @@ fn octave_folded_err_pct(detected: f64, expected: f64) -> Option<f64> {
             (detected - target).abs() / target * 100.0
         })
         .min_by(|a, b| a.total_cmp(b))
+}
+
+// ---------------------------------------------------------------------------
+// Beat-level metrics (times in seconds, ascending)
+// ---------------------------------------------------------------------------
+
+/// F-measure of detected beat times against annotated ones at a fixed
+/// tolerance. Each annotation may be matched at most once.
+fn beat_f_measure(detected: &[f64], truth: &[f64], tolerance: f64) -> f64 {
+    if detected.is_empty() || truth.is_empty() {
+        return 0.0;
+    }
+    let mut matched = vec![false; truth.len()];
+    let mut hits = 0usize;
+    for &d in detected {
+        let idx = truth.partition_point(|&t| t < d);
+        let mut best: Option<usize> = None;
+        for cand in [idx.wrapping_sub(1), idx, idx + 1] {
+            if cand < truth.len() && !matched[cand] {
+                let dist = (truth[cand] - d).abs();
+                if dist <= tolerance && best.is_none_or(|b: usize| dist < (truth[b] - d).abs()) {
+                    best = Some(cand);
+                }
+            }
+        }
+        if let Some(b) = best {
+            matched[b] = true;
+            hits += 1;
+        }
+    }
+    let precision = hits as f64 / detected.len() as f64;
+    let recall = hits as f64 / truth.len() as f64;
+    if precision + recall == 0.0 {
+        return 0.0;
+    }
+    2.0 * precision * recall / (precision + recall)
+}
+
+/// Continuity ratio (CML-style): the fraction of annotations hit by a
+/// detection that is phase-accurate (within [`CONTINUITY_TOLERANCE`] of the
+/// local inter-annotation interval) *and* whose preceding detection hit the
+/// preceding annotation — beats only count inside continuous runs.
+fn continuity_ratio(detected: &[f64], truth: &[f64]) -> f64 {
+    if detected.len() < 2 || truth.len() < 2 {
+        return 0.0;
+    }
+    // For each annotation, the closest detection.
+    let closest: Vec<Option<usize>> = truth
+        .iter()
+        .map(|&t| {
+            let idx = detected.partition_point(|&d| d < t);
+            let mut best: Option<usize> = None;
+            for cand in [idx.wrapping_sub(1), idx] {
+                if cand < detected.len()
+                    && best
+                        .is_none_or(|b: usize| (detected[cand] - t).abs() < (detected[b] - t).abs())
+                {
+                    best = Some(cand);
+                }
+            }
+            best
+        })
+        .collect();
+
+    let interval_at = |j: usize| -> f64 {
+        if j + 1 < truth.len() {
+            truth[j + 1] - truth[j]
+        } else {
+            truth[j] - truth[j - 1]
+        }
+    };
+
+    let hit = |j: usize| -> bool {
+        match closest[j] {
+            Some(d) => (detected[d] - truth[j]).abs() <= CONTINUITY_TOLERANCE * interval_at(j),
+            None => false,
+        }
+    };
+
+    let mut correct = 0usize;
+    for j in 0..truth.len() {
+        if !hit(j) {
+            continue;
+        }
+        // Continuity: the previous annotation must also be hit, by the
+        // previous detection (first annotation only needs its own hit).
+        if j == 0 {
+            correct += 1;
+            continue;
+        }
+        let contiguous = hit(j - 1)
+            && match (closest[j], closest[j - 1]) {
+                (Some(a), Some(b)) => a == b + 1,
+                _ => false,
+            };
+        if contiguous {
+            correct += 1;
+        }
+    }
+    correct as f64 / truth.len() as f64
+}
+
+/// Allowed metrical-level variants of an annotation: the annotated level,
+/// half density at both phases, and double density.
+fn metrical_variants(truth: &[f64]) -> Vec<Vec<f64>> {
+    let half_even: Vec<f64> = truth.iter().step_by(2).copied().collect();
+    let half_odd: Vec<f64> = truth.iter().skip(1).step_by(2).copied().collect();
+    let mut double = Vec::with_capacity(truth.len() * 2);
+    for w in truth.windows(2) {
+        double.push(w[0]);
+        double.push((w[0] + w[1]) * 0.5);
+    }
+    if let Some(&last) = truth.last() {
+        double.push(last);
+    }
+    vec![truth.to_vec(), half_even, half_odd, double]
+}
+
+/// AMLt-style continuity: best continuity ratio over the allowed levels.
+fn continuity_ratio_allowed_levels(detected: &[f64], truth: &[f64]) -> f64 {
+    metrical_variants(truth)
+        .iter()
+        .map(|variant| continuity_ratio(detected, variant))
+        .fold(0.0, f64::max)
 }
 
 // ---------------------------------------------------------------------------
@@ -284,12 +455,15 @@ fn decode_with_symphonia(path: &Path) -> Result<DecodedAudio, String> {
 // ---------------------------------------------------------------------------
 
 /// Decodes, downmixes, and analyzes one file, returning its scored result.
+/// When `annotation` is present, the detected grid is additionally scored
+/// with beat-level metrics (annotations past a trim cut are dropped).
 fn score_file(
     id: &str,
     path: &Path,
     expected_bpm: f64,
     tolerance: f64,
     max_seconds: Option<f64>,
+    annotation: Option<&BeatAnnotation>,
 ) -> Result<TrackResult, String> {
     let audio = decode_audio(path)?;
     let data = maybe_trim_interleaved(&audio.data, audio.sample_rate, audio.channels, max_seconds);
@@ -304,6 +478,46 @@ fn score_file(
         BpmClass::Exact | BpmClass::Octave => octave_folded_err_pct(artifact.bpm, expected_bpm),
         BpmClass::Wrong | BpmClass::Failed => None,
     };
+
+    let (beat_f, beat_cmlt, beat_amlt, downbeat_f) = match annotation {
+        Some(ann) => {
+            let secs = 1.0 / audio.sample_rate as f64;
+            let detected: Vec<f64> = artifact
+                .beat_positions_fractional
+                .iter()
+                .map(|&p| p * secs)
+                .collect();
+            let truth: Vec<f64> = ann
+                .beats
+                .iter()
+                .copied()
+                .filter(|&t| t <= duration_secs)
+                .collect();
+            let f = beat_f_measure(&detected, &truth, BEAT_TOLERANCE_SECS);
+            let cmlt = continuity_ratio(&detected, &truth);
+            let amlt = continuity_ratio_allowed_levels(&detected, &truth);
+            let downbeat_f = if ann.downbeats.is_empty() {
+                None
+            } else {
+                let detected_db: Vec<f64> = artifact
+                    .downbeat_beat_indices
+                    .iter()
+                    .filter_map(|&i| artifact.beat_positions_fractional.get(i))
+                    .map(|&p| p * secs)
+                    .collect();
+                let truth_db: Vec<f64> = ann
+                    .downbeats
+                    .iter()
+                    .copied()
+                    .filter(|&t| t <= duration_secs)
+                    .collect();
+                Some(beat_f_measure(&detected_db, &truth_db, BEAT_TOLERANCE_SECS))
+            };
+            (Some(f), Some(cmlt), Some(amlt), downbeat_f)
+        }
+        None => (None, None, None, None),
+    };
+
     Ok(TrackResult {
         id: id.to_string(),
         file: path.display().to_string(),
@@ -314,13 +528,22 @@ fn score_file(
         confidence: artifact.confidence,
         duration_secs,
         analysis_secs: report.analysis_elapsed_secs,
+        beat_f,
+        beat_cmlt,
+        beat_amlt,
+        downbeat_f,
     })
 }
 
 fn print_metric(result: &TrackResult) {
+    let fmt_ratio = |v: Option<f64>| {
+        v.map(|v| format!("{:.3}", v))
+            .unwrap_or_else(|| "n/a".to_string())
+    };
     println!(
         "METRIC track=\"{}\" expected={:.1} detected={:.2} err_pct={} class={} \
-         confidence={:.3} duration_secs={:.1} analysis_realtime_factor={:.1}",
+         confidence={:.3} duration_secs={:.1} analysis_realtime_factor={:.1} \
+         beat_f={} beat_cmlt={} beat_amlt={} downbeat_f={}",
         result.id,
         result.expected_bpm,
         result.detected_bpm,
@@ -332,6 +555,10 @@ fn print_metric(result: &TrackResult) {
         result.confidence,
         result.duration_secs,
         result.duration_secs / result.analysis_secs.max(1e-9),
+        fmt_ratio(result.beat_f),
+        fmt_ratio(result.beat_cmlt),
+        fmt_ratio(result.beat_amlt),
+        fmt_ratio(result.downbeat_f),
     );
 }
 
@@ -363,6 +590,15 @@ fn summarize(results: &[TrackResult], skipped: usize, tolerance: f64) -> Summary
         Some(errs.iter().sum::<f64>() / errs.len() as f64)
     };
 
+    let mean_pct = |values: Vec<f64>| -> Option<f64> {
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.iter().sum::<f64>() / values.len() as f64 * 100.0)
+        }
+    };
+    let beat_annotated = results.iter().filter(|r| r.beat_f.is_some()).count();
+
     Summary {
         tracks: scored + skipped,
         scored,
@@ -376,6 +612,11 @@ fn summarize(results: &[TrackResult], skipped: usize, tolerance: f64) -> Summary
         median_err_pct,
         mean_err_pct,
         tolerance,
+        beat_annotated,
+        mean_beat_f_pct: mean_pct(results.iter().filter_map(|r| r.beat_f).collect()),
+        mean_beat_cmlt_pct: mean_pct(results.iter().filter_map(|r| r.beat_cmlt).collect()),
+        mean_beat_amlt_pct: mean_pct(results.iter().filter_map(|r| r.beat_amlt).collect()),
+        mean_downbeat_f_pct: mean_pct(results.iter().filter_map(|r| r.downbeat_f).collect()),
     }
 }
 
@@ -386,7 +627,8 @@ fn print_summary(summary: &Summary) {
     };
     println!(
         "SUMMARY tracks={} scored={} skipped={} acc1={:.1}% acc2={:.1}% \
-         median_err={}% mean_err={}% exact={} octave={} wrong={} failed={} tolerance={:.1}%",
+         median_err={}% mean_err={}% exact={} octave={} wrong={} failed={} tolerance={:.1}% \
+         beat_annotated={} beat_f={}% beat_cmlt={}% beat_amlt={}% downbeat_f={}%",
         summary.tracks,
         summary.scored,
         summary.skipped,
@@ -399,6 +641,11 @@ fn print_summary(summary: &Summary) {
         summary.wrong,
         summary.failed,
         summary.tolerance * 100.0,
+        summary.beat_annotated,
+        fmt_opt(summary.mean_beat_f_pct),
+        fmt_opt(summary.mean_beat_cmlt_pct),
+        fmt_opt(summary.mean_beat_amlt_pct),
+        fmt_opt(summary.mean_downbeat_f_pct),
     );
 }
 
@@ -472,6 +719,36 @@ fn resolve_audio_path(audio_base: &Path, configured: &str) -> Result<PathBuf, St
     }
 
     Ok(audio_base.join(rel_path))
+}
+
+/// Loads a track's beat annotation JSON (path relative to `benchmarks/`,
+/// no absolute paths or parent traversal). `Ok(None)` when the track has
+/// no annotation configured.
+fn load_annotation(track: &Track) -> Result<Option<BeatAnnotation>, String> {
+    let Some(configured) = track.beats.as_deref() else {
+        return Ok(None);
+    };
+    let rel = Path::new(configured.trim());
+    if rel.as_os_str().is_empty() {
+        return Err("empty beats annotation path".to_string());
+    }
+    if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!(
+            "beats annotation path '{}' must be relative to benchmarks/ without traversal",
+            configured
+        ));
+    }
+    let path = Path::new("benchmarks").join(rel);
+    let json = std::fs::read_to_string(&path)
+        .map_err(|e| format!("unable to read annotation {}: {}", path.display(), e))?;
+    let mut ann: BeatAnnotation = serde_json::from_str(&json)
+        .map_err(|e| format!("invalid annotation {}: {}", path.display(), e))?;
+    if ann.beats.is_empty() {
+        return Err(format!("annotation {} has no beats", path.display()));
+    }
+    ann.beats.sort_by(|a, b| a.total_cmp(b));
+    ann.downbeats.sort_by(|a, b| a.total_cmp(b));
+    Ok(Some(ann))
 }
 
 fn validate_sha256(
@@ -600,7 +877,21 @@ fn bpm_accuracy() {
             // the audio the expected BPM was measured against.
             panic!("{}", msg);
         }
-        match score_file(&track.id, &path, track.bpm, tolerance, max_seconds) {
+        let annotation = match load_annotation(track) {
+            Ok(ann) => ann,
+            Err(msg) => {
+                skip(&track.id, msg, &mut skipped);
+                continue;
+            }
+        };
+        match score_file(
+            &track.id,
+            &path,
+            track.bpm,
+            tolerance,
+            max_seconds,
+            annotation.as_ref(),
+        ) {
             Ok(result) => {
                 print_metric(&result);
                 results.push(result);
@@ -654,6 +945,18 @@ fn bpm_accuracy() {
             min_acc2
         );
     }
+    if let Some(min_beat_f) = env_f64(MIN_BEAT_F_ENV_VAR) {
+        let mean_beat_f = report
+            .summary
+            .mean_beat_f_pct
+            .expect("beat F floor set but no annotated tracks were scored");
+        assert!(
+            mean_beat_f >= min_beat_f,
+            "mean beat F {:.1}% below required minimum {:.1}%",
+            mean_beat_f,
+            min_beat_f
+        );
+    }
 }
 
 /// End-to-end smoke test on checked-in fixtures so the pipeline is exercised
@@ -666,8 +969,23 @@ fn bpm_accuracy_self_test() {
     ] {
         let path = Path::new(file);
         assert!(path.exists(), "checked-in fixture {} missing", file);
-        let result = score_file("self-test", path, expected, DEFAULT_TOLERANCE, None)
-            .unwrap_or_else(|e| panic!("{}: {}", file, e));
+        // Synthetic ground truth: the fixtures are exact 128 BPM grids
+        // from sample 0, so annotate beats every 60/128 s for the first
+        // few seconds and exercise the beat-metric path end to end.
+        let interval = 60.0 / expected;
+        let annotation = BeatAnnotation {
+            beats: (0..8).map(|k| k as f64 * interval).collect(),
+            downbeats: Vec::new(),
+        };
+        let result = score_file(
+            "self-test",
+            path,
+            expected,
+            DEFAULT_TOLERANCE,
+            None,
+            Some(&annotation),
+        )
+        .unwrap_or_else(|e| panic!("{}: {}", file, e));
         print_metric(&result);
         assert_eq!(
             result.class,
@@ -677,6 +995,13 @@ fn bpm_accuracy_self_test() {
             result.detected_bpm,
             expected,
             DEFAULT_TOLERANCE * 100.0
+        );
+        let beat_f = result.beat_f.expect("annotated self-test scores beat F");
+        assert!(
+            beat_f > 0.8,
+            "{}: beat F-measure {:.3} too low against exact grid",
+            file,
+            beat_f
         );
     }
 }
@@ -700,4 +1025,46 @@ fn classification() {
     assert!((err - (0.5 / 64.0 * 100.0)).abs() < 1e-9, "err={}", err);
     assert!(octave_folded_err_pct(128.0, 128.0).unwrap() < 1e-12);
     assert_eq!(octave_folded_err_pct(0.0, 128.0), None);
+}
+
+#[test]
+fn beat_metrics() {
+    let truth: Vec<f64> = (0..16).map(|k| k as f64 * 0.5).collect();
+
+    // Perfect detection: all metrics 1.0.
+    assert!((beat_f_measure(&truth, &truth, BEAT_TOLERANCE_SECS) - 1.0).abs() < 1e-12);
+    assert!((continuity_ratio(&truth, &truth) - 1.0).abs() < 1e-12);
+    assert!((continuity_ratio_allowed_levels(&truth, &truth) - 1.0).abs() < 1e-12);
+
+    // Small constant offset within tolerance: still perfect F.
+    let offset: Vec<f64> = truth.iter().map(|&t| t + 0.03).collect();
+    assert!((beat_f_measure(&offset, &truth, BEAT_TOLERANCE_SECS) - 1.0).abs() < 1e-12);
+
+    // Offset beyond tolerance: F collapses.
+    let far: Vec<f64> = truth.iter().map(|&t| t + 0.2).collect();
+    assert!(beat_f_measure(&far, &truth, BEAT_TOLERANCE_SECS) < 0.2);
+
+    // Half-tempo detection (every other truth beat): CMLt low, AMLt high.
+    let half: Vec<f64> = truth.iter().step_by(2).copied().collect();
+    assert!(continuity_ratio(&half, &truth) < 0.6);
+    assert!(continuity_ratio_allowed_levels(&half, &truth) > 0.9);
+
+    // Offbeat half-tempo (odd phase) is also an allowed level.
+    let half_odd: Vec<f64> = truth.iter().skip(1).step_by(2).copied().collect();
+    assert!(continuity_ratio_allowed_levels(&half_odd, &truth) > 0.9);
+
+    // A gap in the detections breaks continuity for the beat after the gap.
+    let mut gapped = truth.clone();
+    gapped.remove(8);
+    let cont = continuity_ratio(&gapped, &truth);
+    assert!(
+        cont < 0.95 && cont > 0.7,
+        "gap should break continuity locally, got {}",
+        cont
+    );
+
+    // Degenerate inputs.
+    assert_eq!(beat_f_measure(&[], &truth, BEAT_TOLERANCE_SECS), 0.0);
+    assert_eq!(beat_f_measure(&truth, &[], BEAT_TOLERANCE_SECS), 0.0);
+    assert_eq!(continuity_ratio(&[], &truth), 0.0);
 }

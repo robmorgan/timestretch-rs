@@ -208,7 +208,7 @@ fn build_shared_onset_map(mid: &[f32], params: &StretchParams) -> (Vec<usize>, V
     };
     if params.beat_aware && mid.len() >= STEREO_MIN_SAMPLES_FOR_BEAT_DETECTION {
         let beat_grid = detect_beats(mid, params.sample_rate);
-        return merge_onsets_and_beats(&onsets, &strengths, &beat_grid.beats, mid.len());
+        return merge_onsets_and_beats(&onsets, &strengths, &beat_grid.beats_rounded(), mid.len());
     }
 
     (onsets, strengths)

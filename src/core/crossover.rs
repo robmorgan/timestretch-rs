@@ -36,10 +36,15 @@ struct Biquad {
 impl Biquad {
     /// Creates a 2nd-order Butterworth low-pass biquad.
     fn lowpass(freq: f64, sample_rate: u32) -> Self {
+        Self::lowpass_q(freq, sample_rate, BUTTERWORTH_Q)
+    }
+
+    /// Creates a 2nd-order low-pass biquad with an explicit Q.
+    fn lowpass_q(freq: f64, sample_rate: u32, q: f64) -> Self {
         let w0 = 2.0 * PI * freq / sample_rate as f64;
         let cos_w0 = w0.cos();
         let sin_w0 = w0.sin();
-        let alpha = sin_w0 / (2.0 * BUTTERWORTH_Q);
+        let alpha = sin_w0 / (2.0 * q);
 
         let a0 = 1.0 + alpha;
         let b0 = (1.0 - cos_w0) / 2.0 / a0;
@@ -63,10 +68,15 @@ impl Biquad {
 
     /// Creates a 2nd-order Butterworth high-pass biquad.
     fn highpass(freq: f64, sample_rate: u32) -> Self {
+        Self::highpass_q(freq, sample_rate, BUTTERWORTH_Q)
+    }
+
+    /// Creates a 2nd-order high-pass biquad with an explicit Q.
+    fn highpass_q(freq: f64, sample_rate: u32, q: f64) -> Self {
         let w0 = 2.0 * PI * freq / sample_rate as f64;
         let cos_w0 = w0.cos();
         let sin_w0 = w0.sin();
-        let alpha = sin_w0 / (2.0 * BUTTERWORTH_Q);
+        let alpha = sin_w0 / (2.0 * q);
 
         let a0 = 1.0 + alpha;
         let b0 = (1.0 + cos_w0) / 2.0 / a0;
@@ -213,6 +223,7 @@ impl LR4Crossover {
 /// let (low, high) = xover.process_sample(1.0);
 /// // low + high approximately equals the input (with phase shift)
 /// ```
+#[derive(Debug)]
 pub struct LR8Crossover {
     /// Four cascaded 2nd-order Butterworth low-pass filters.
     low_pass: [Biquad; 4],
@@ -261,6 +272,83 @@ impl LR8Crossover {
             high = stage.process_sample(high);
         }
 
+        (low as f32, high as f32)
+    }
+
+    /// Processes a buffer, splitting into low and high bands.
+    ///
+    /// Processes up to the minimum shared length of `input`, `low`, and `high`.
+    pub fn process(&mut self, input: &[f32], low: &mut [f32], high: &mut [f32]) {
+        let len = input.len().min(low.len()).min(high.len());
+        for (i, &sample) in input.iter().take(len).enumerate() {
+            let (l, h) = self.process_sample(sample);
+            low[i] = l;
+            high[i] = h;
+        }
+    }
+
+    /// Resets all filter state to zero.
+    pub fn reset(&mut self) {
+        for bq in &mut self.low_pass {
+            bq.reset();
+        }
+        for bq in &mut self.high_pass {
+            bq.reset();
+        }
+    }
+}
+
+/// Butterworth 4th-order section Qs (poles at ±22.5° and ±67.5°).
+const BW4_Q1: f64 = 0.541_196_100_146_197;
+const BW4_Q2: f64 = 1.306_562_964_876_377;
+
+/// Correct 8th-order Linkwitz-Riley (LR8) crossover: a squared 4th-order
+/// Butterworth (sections at Q = 0.5412 and Q = 1.3066, each applied twice).
+///
+/// Unlike [`LR8Crossover`] — which cascades four Q = 0.707 sections and is
+/// **not** a valid LR topology (each band sits at −12 dB at the crossover,
+/// so the in-phase sum notches −6 dB there) — this splitter's bands are
+/// −6 dB and in phase at the crossover, so `low + high` re-sums to a true
+/// allpass. `LR8Crossover` is kept unchanged because the frozen multi-res
+/// engine's QA baselines encode its behavior; it is deleted with that
+/// engine at cutover (ROADMAP Stage 9).
+#[derive(Debug)]
+pub struct LinkwitzRiley8 {
+    low_pass: [Biquad; 4],
+    high_pass: [Biquad; 4],
+}
+
+impl LinkwitzRiley8 {
+    /// Creates a new LR8 crossover at the specified frequency.
+    pub fn new(crossover_freq: f64, sample_rate: u32) -> Self {
+        Self {
+            low_pass: [
+                Biquad::lowpass_q(crossover_freq, sample_rate, BW4_Q1),
+                Biquad::lowpass_q(crossover_freq, sample_rate, BW4_Q2),
+                Biquad::lowpass_q(crossover_freq, sample_rate, BW4_Q1),
+                Biquad::lowpass_q(crossover_freq, sample_rate, BW4_Q2),
+            ],
+            high_pass: [
+                Biquad::highpass_q(crossover_freq, sample_rate, BW4_Q1),
+                Biquad::highpass_q(crossover_freq, sample_rate, BW4_Q2),
+                Biquad::highpass_q(crossover_freq, sample_rate, BW4_Q1),
+                Biquad::highpass_q(crossover_freq, sample_rate, BW4_Q2),
+            ],
+        }
+    }
+
+    /// Processes a single sample, returning (low, high) band outputs.
+    #[inline]
+    pub fn process_sample(&mut self, input: f32) -> (f32, f32) {
+        let x = input as f64;
+        let mut low = x;
+        for stage in &mut self.low_pass {
+            low = stage.process_sample(low);
+        }
+        let mut high = x;
+        for stage in &mut self.high_pass {
+            high = stage.process_sample(high);
+        }
         (low as f32, high as f32)
     }
 
@@ -639,6 +727,71 @@ mod tests {
         assert!(
             lr8_low_energy < lr4_low_energy * 0.1,
             "LR8 low-pass at 2x crossover should be much lower than LR4: LR8={lr8_low_energy:.6}, LR4={lr4_low_energy:.6}"
+        );
+    }
+
+    /// The corrected LR8 must re-sum to a true allpass: a tone AT the
+    /// crossover comes back at unity amplitude (the legacy `LR8Crossover`
+    /// notches −6 dB here — the defect `LinkwitzRiley8` exists to fix).
+    #[test]
+    fn test_linkwitz_riley8_sums_to_allpass_at_crossover() {
+        let sample_rate = 44_100;
+        let fc = 150.0;
+        let mut xover = LinkwitzRiley8::new(fc, sample_rate);
+        let len = 32_768;
+        let input: Vec<f32> = (0..len)
+            .map(|i| (2.0 * std::f32::consts::PI * fc as f32 * i as f32 / sample_rate as f32).sin())
+            .collect();
+        let mut low = vec![0.0f32; len];
+        let mut high = vec![0.0f32; len];
+        xover.process(&input, &mut low, &mut high);
+
+        let settle = 8_192;
+        let sum_energy: f64 = (settle..len)
+            .map(|i| ((low[i] + high[i]) as f64).powi(2))
+            .sum();
+        let in_energy: f64 = input[settle..].iter().map(|s| (*s as f64).powi(2)).sum();
+        let level_db = 10.0 * (sum_energy / in_energy).log10();
+        assert!(
+            level_db.abs() < 0.1,
+            "LR8 re-sum at crossover: {level_db:+.3} dB (must be allpass)"
+        );
+
+        // And each band sits at −6 dB there (the LR defining property).
+        let low_energy: f64 = low[settle..].iter().map(|s| (*s as f64).powi(2)).sum();
+        let band_db = 10.0 * (low_energy / in_energy).log10();
+        assert!(
+            (band_db + 6.0).abs() < 0.3,
+            "LR8 band level at crossover: {band_db:+.2} dB, expected −6"
+        );
+    }
+
+    /// Corrected LR8 keeps the 48 dB/oct slope of the legacy one.
+    #[test]
+    fn test_linkwitz_riley8_slope_matches_lr8() {
+        let sample_rate = 44_100;
+        let fc = 1_000.0;
+        let mut xover = LinkwitzRiley8::new(fc, sample_rate);
+        let freq = 4_000.0; // two octaves above: expect ~ -96 dB low-band
+        let len = 32_768;
+        let input: Vec<f32> = (0..len)
+            .map(|i| {
+                (2.0 * std::f32::consts::PI * freq as f32 * i as f32 / sample_rate as f32).sin()
+            })
+            .collect();
+        let mut low = vec![0.0f32; len];
+        let mut high = vec![0.0f32; len];
+        xover.process(&input, &mut low, &mut high);
+        let settle = 8_192;
+        let low_energy: f64 = low[settle..].iter().map(|s| (*s as f64).powi(2)).sum();
+        let in_energy: f64 = input[settle..].iter().map(|s| (*s as f64).powi(2)).sum();
+        let db = 10.0 * (low_energy / in_energy).log10();
+        // Theoretical LR8 is −96 dB two octaves up; the f32 signal boundary
+        // floors the measurement near −78 dB. Anything past −70 dB proves
+        // the 48 dB/oct topology (LR4 would sit at −48 dB).
+        assert!(
+            db < -70.0,
+            "LR8 low band only {db:.1} dB down two octaves above fc"
         );
     }
 
