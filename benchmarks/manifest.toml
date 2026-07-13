@@ -101,3 +101,111 @@ original_sha256 = "d3e2129136d1d3ddcf42d778f910e6d808d2c739eaaea7f08ac3d779ae284
 bpm = 116.0 # TODO: confirm tempo (detector reads 115.8; commonly listed 116)
 bpm_only = true
 
+
+# --- Public corpus (redistributable; ROADMAP Stage 7) ---
+#
+# Creative Commons netlabel releases hosted on the Internet Archive.
+# Fetch with: scripts/fetch_public_corpus.sh (pins SHA-256 per file).
+# Every license permits redistribution and derivative works (CC0 /
+# CC-BY / CC-BY-SA), so stretched renders and CI artifacts are safe to
+# publish with attribution.
+#
+# Tempo ground truth: verified 2026-07 with two independent estimators —
+# the repo detector and a coherent onset-envelope Goertzel scan (all
+# scored entries peak at an exact integer BPM, consistent across four
+# 60 s windows; see scripts/fetch_public_corpus.sh). Ear confirmation is
+# still welcome; entries with bpm = 0.0 failed independent verification
+# (rhythmically ambiguous) and are kept as listening material only.
+
+[[track]]
+id = "valya-kan-december"
+description = "Valya Kan - December [YARN020], techno, Berlin/Moscow"
+original = "public-corpus/01-Valya_Kan-December.mp3"
+original_sha256 = "412721bc9404255639c1f929f973b9cb28dd3243dacd68b83613f6c1b98b9ee3"
+bpm = 128.0 # Goertzel 128.000 (64x peak); detector reads 128.13
+bpm_only = true
+license = "CC-BY 4.0"
+source_url = "https://archive.org/details/yarn020"
+
+[[track]]
+id = "valya-kan-memories"
+description = "Valya Kan - Memories [YARN020], techno, Berlin/Moscow"
+original = "public-corpus/02-Valya_Kan-Memories.mp3"
+original_sha256 = "385e2f65d59019a7185f9668f63ae47b32440140428633f1b5a5f2a8882f97d7"
+bpm = 125.0 # Goertzel 125.000 (598x peak); detector reads 125.10
+bpm_only = true
+license = "CC-BY 4.0"
+source_url = "https://archive.org/details/yarn020"
+
+[[track]]
+id = "mehta-stay-like-that"
+description = "Mehta - Stay Like That [YARN021], deep house/techno, 10 min"
+original = "public-corpus/01-Mehta-Stay_Like_That.mp3"
+original_sha256 = "2c5ac35b903c7bd27870d4544e2f84571f7d1f13064fa75703e298908412ae1f"
+bpm = 119.0 # Goertzel 119.000 (84x peak); detector reads 120.04 (+0.9)
+bpm_only = true
+license = "CC-BY 4.0"
+source_url = "https://archive.org/details/yarn021"
+
+[[track]]
+id = "33rd-rate-revs-x"
+description = "33RD RATE REVS - X [SICMON010], acid techno, London"
+original = "public-corpus/33RD_RATE_REVS_-_X_sicmon010.mp3"
+original_sha256 = "e9ffaf3e93107b336023bcdbc8e0be2328378791a7728b041e0ef0b747aee643"
+bpm = 128.0 # Goertzel 128.005 (60x peak); detector reads 128.82
+bpm_only = true
+license = "CC0 1.0"
+source_url = "https://archive.org/details/SICMON010"
+
+[[track]]
+id = "33rd-rate-revs-group-therapy"
+description = "33RD RATE REVS - Group Therapy [SICMON012], fast acid techno"
+original = "public-corpus/33RD_RATE_REVS_-_Group_Therapy_sicmon012.mp3"
+original_sha256 = "50aa9a376fe2e84c050da5a7f2c642792e04b91a30b9d012f9e14ac136ebf0bc"
+bpm = 147.0 # Goertzel 147.005 (149x peak); detector reads 147.66
+bpm_only = true
+license = "CC0 1.0"
+source_url = "https://archive.org/details/SICMON012"
+
+[[track]]
+id = "j-lab-radiophonique"
+description = "J-Lab - Radiophonique [mtrnc002], minimal/microhouse"
+original = "public-corpus/mtrnc002_01_-_J-Lab_-_Radiophonique.mp3"
+original_sha256 = "dd947b758985479d19728f2fb345ec2a9b5f2c9fb9f4251290c7744cd306f984"
+bpm = 128.0 # Goertzel 127.985 (71x peak); detector reads 126.13 (-1.9!)
+bpm_only = true
+license = "CC-BY-SA 3.0"
+source_url = "https://archive.org/details/mtrnc002"
+
+[[track]]
+id = "raymundo-mendoza-wrist-watch"
+description = "Raymundo Mendoza - Wrist Watch [unfound53], tech-house, 48 kHz"
+original = "public-corpus/unfound53_01_-_raymundo_mendoza_-_wrist_watch.mp3"
+original_sha256 = "61de8728f4c780be6ddcd47784cb70894b533795b5a919425abf6d85c0ae52ae"
+bpm = 120.0 # Goertzel 120.000 (58x peak); detector reads 118.35 (-1.4)
+bpm_only = true
+license = "CC-BY 3.0"
+source_url = "https://archive.org/details/unfound53"
+
+# Unscored listening material: independent verification was inconclusive
+# (swung/broken rhythm) — set bpm after ear confirmation.
+
+[[track]]
+id = "interplanetary-criminal-saucers"
+description = "Interplanetary Criminal - Saucers [YARN015], UK garage (swung)"
+original = "public-corpus/01-Interplanetary_Criminal-Saucers.mp3"
+original_sha256 = "cb3a303bd35bc92c27ddfec44db8666c0323913e67e2f8050282f6349651b23a"
+bpm = 0.0 # TODO: ear-verify (detector reads 126.1; envelope scan inconclusive)
+bpm_only = true
+license = "CC-BY 4.0"
+source_url = "https://archive.org/details/yarn015"
+
+[[track]]
+id = "raptom-snig-arf"
+description = "Raptom Snig - Arf [YARN022], broken techno/bass"
+original = "public-corpus/01-Raptom_Snig-Arf.mp3"
+original_sha256 = "65a82156174ec368355da9b95a118878bf200b1128acdbf725674ffa76e1952e"
+bpm = 0.0 # TODO: ear-verify (detector reads 125.1; sections flip to a 156 layer)
+bpm_only = true
+license = "CC-BY 4.0"
+source_url = "https://archive.org/details/yarn022"

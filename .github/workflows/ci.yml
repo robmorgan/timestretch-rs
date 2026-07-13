@@ -63,6 +63,28 @@ jobs:
           path: target/quality_dashboard/
           if-no-files-found: error
 
+  public-corpus:
+    name: Public Corpus (BPM accuracy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The corpus is CC-licensed netlabel audio fetched from the Internet
+      # Archive with pinned SHA-256 (ROADMAP Stage 7). Cached on the fetch
+      # script's hash so CI only downloads when the corpus changes.
+      - uses: actions/cache@v4
+        with:
+          path: benchmarks/audio/public-corpus
+          key: public-corpus-${{ hashFiles('scripts/fetch_public_corpus.sh') }}
+      - run: bash scripts/fetch_public_corpus.sh
+      - run: cargo test --features qa-harnesses --release --test bpm_accuracy -- --nocapture
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bpm-accuracy-report-${{ github.run_id }}
+          path: target/bpm_accuracy_report.json
+          if-no-files-found: error
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

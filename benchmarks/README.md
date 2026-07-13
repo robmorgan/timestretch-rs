@@ -12,6 +12,7 @@ benchmarks/
     originals/           # Place original WAV files here
     references/          # Place professionally-stretched WAVs here
     bpm-corpus/          # Place BPM-accuracy corpus tracks here (wav/mp3/aiff)
+    public-corpus/       # Redistributable CC corpus (scripts/fetch_public_corpus.sh)
     output/              # Library output written during benchmark runs
 ```
 
@@ -183,3 +184,28 @@ Outputs are written to `target/quality_benchmark/`:
 - Audio files are gitignored. Each contributor must supply their own copies.
 - The benchmark uses copyrighted audio that cannot be distributed.
 - Output files are written to `benchmarks/audio/output/` and also gitignored.
+
+## Public Corpus (redistributable)
+
+The public corpus (ROADMAP Stage 7) is a set of Creative Commons netlabel
+club tracks hosted on the Internet Archive — every license permits
+redistribution and derivative works (CC0 / CC-BY / CC-BY-SA), so stretched
+renders and CI artifacts built from it are safe to publish with
+attribution. Fetch it with:
+
+```bash
+scripts/fetch_public_corpus.sh
+```
+
+Every file is verified against a pinned SHA-256. The scored entries carry
+tempo ground truth confirmed by two independent estimators (the repo
+detector and a coherent onset-envelope Goertzel scan; all scored tracks
+peak at an exact integer BPM, consistent across four 60 s windows).
+Entries with `bpm = 0.0` are rhythmically ambiguous (swung UK garage,
+broken techno) and await ear verification — the BPM harness skips them,
+but they remain valuable listening material.
+
+CI fetches this corpus (cached) and runs `qa/bpm_accuracy.rs` against it
+on every push — see the `public-corpus` job in `.github/workflows/ci.yml`.
+The tracks in `bpm-corpus/` are commercial purchases for local runs only
+and are never fetched or redistributed.
