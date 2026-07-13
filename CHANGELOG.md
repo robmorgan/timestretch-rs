@@ -1,5 +1,89 @@
 # Changelog
 
+## 0.7.0
+
+### Breaking changes
+
+- `BeatGrid` rebuilt around a piecewise tempo model instead of a single BPM
+  value:
+  - `beats: Vec<usize>` becomes `beats: Vec<f64>` (fractional-sample
+    positions, following tempo drift); the separate `beats_fractional`
+    field is removed.
+  - New fields: `downbeats: Vec<usize>`, `segments: Vec<TempoSegment>`
+    (piecewise-constant tempo, new type re-exported at the crate root),
+    `confidence: f32`, `downbeat_confidence: f32`.
+  - New `BeatGrid::empty(sample_rate)` and `BeatGrid::bpm_at(position)` for
+    querying the tempo curve at a point.
+- `detect_bpm` / `detect_beat_grid`: tempo estimation moves from an
+  EDM-tuned 100–160 BPM inter-onset detector to a general-purpose
+  autocorrelation tempogram (50–220 BPM, soft log-normal octave prior, no
+  hard range folding) — a 90 BPM hip-hop track now reports 90 instead of
+  being folded into the EDM range. Detected values on existing material may
+  shift; use the new `detect_beat_grid_with_options` (below) to narrow the
+  range or hint a genre. `analyze_for_dj` keeps its 100–160 hint.
+
+### Added
+
+- New `engine` module (`src/engine/`): a pull-based, allocation-free,
+  real-time-first stage-graph engine — the first cutover milestone of the
+  roadmap's varispeed-first architecture. Coexists with the existing
+  `StreamProcessor`/`StreamingEngine` surface (frozen, unaffected) rather
+  than replacing it yet.
+  - `Engine::build(EngineConfig)` returns `EngineHandles { controller,
+    processor, source }`. `EngineProcessor::process(&mut [f32])` fills
+    exactly the requested frames — infallible and lock-free on the audio
+    thread. `EngineController` writes tempo changes through a lock-free,
+    timestamped mailbox (`set_tempo_rate`, `set_tempo_rate_at` for a
+    sample-accurate landing point) and drives allocation-free warm-start
+    priming for seeks and loop wraps (`warm_start`). `SourceProducer` feeds
+    the source ring from the host thread.
+  - `EngineProfile::Tape`: varispeed-only chain (pitch follows tempo), zero
+    pipeline delay.
+  - `EngineProfile::Keylock`: band-split at 150 Hz; the low band stays
+    un-keylocked (pure delay) while the high band is pitch-corrected by a
+    corrector chosen from transposition magnitude — beat-synchronous
+    time-domain SOLA across the full DJ range (rate deviation up to 9%),
+    a small-FFT (512/128) phase vocoder with identity phase locking beyond
+    it, hysteresis on the handoff, and a graceful fade to plain varispeed
+    past 12–22%. Constant pipeline delay of 560 frames (12.7 ms at
+    44.1 kHz).
+  - `EngineConfig.pre_analysis` attaches a `PreAnalysisArtifact` as the
+    engine's primary transient-control signal (splice/phase-reset
+    placement steers around onsets), falling back to online spectral-flux
+    detection when absent.
+  - Measured against the old streaming engine on identical fixtures: kick
+    transient sharpness ~70% sharper (1.21 vs 0.68 at ±4% rate), ±8% cents
+    ride p95 0.23 vs 1.86 (old engine 12.19), top-octave retention -0.41 vs
+    -0.79 dB, envelope swing under unity-crossing rides 0.65 vs 10.36 dB,
+    and click-free modulation torture at 1.5x/1.1x theoretical slew (tape)
+    and 3x/1.3x (keylock) vs the old engine's 6x/1.5x bound. Final A/B
+    matrix run: 9 of 9 parity rows won.
+- `TempoTrackingOptions` (re-exported at the crate root): tune the tempo
+  search range, octave-prior center/width, or add a soft genre hint range.
+- `detect_beat_grid_with_options(samples, sample_rate, &TempoTrackingOptions)`:
+  `detect_beat_grid` with explicit tracking options.
+- `TempoSegment` (re-exported at the crate root): a piecewise-constant
+  tempo stretch (`start_beat`, `bpm`); serialized in the
+  `PreAnalysisArtifact` and used as `BeatGrid`'s tempo model.
+
+### QA
+
+- New engine gate suites: `qa/engine_keylock.rs`, `qa/engine_transients.rs`,
+  `qa/engine_wcet.rs` (per-callback WCET budget gates wired into CI),
+  `qa/engine_ab.rs` and `qa/engine_ab_matrix.rs` (machine-readable
+  old-vs-new parity dashboard), plus `tests/engine_latency.rs`,
+  `tests/engine_modulation_torture.rs`, and
+  `tests/engine_realtime_allocations.rs`.
+- `tests/beat_tracking.rs`: new accuracy suite for the tempogram tracker;
+  `qa/bpm_accuracy.rs` gains the 5-track BPM corpus wired into the
+  manifest.
+- RubberBand comparison anomaly explained: the historic ~-24 LUFS /
+  ~0.15-similarity rows on chirp/sweep content were the frozen offline
+  hybrid driver (`src/stretch/hybrid.rs`) attenuating uniformly ~28 dB
+  whenever a preset was set, independent of the new engine.
+  `qa/rubberband_comparison.rs` gains a `TIMESTRETCH_RUBBERBAND_ENGINE=new`
+  mode that renders through the new keylock chain for comparison.
+
 ## 0.6.0
 
 ### Breaking changes
