@@ -22,6 +22,14 @@ use crate::engine::stages::varispeed::{VarispeedHead, FEED_CHUNK_FRAMES, MAX_OUT
 const MODULATION_HOLD_BLOCKS: u32 = 64;
 /// Per-call rate change that counts as a fast gesture.
 const MODULATION_HOLD_TRIGGER: f64 = 1e-3;
+/// Output frames of warm-start priming performed per `process` call:
+/// bounds the audio-thread work spike (~1 ms of chain CPU) while typical
+/// prerolls complete within one or two callbacks.
+const PRIME_BUDGET_FRAMES: u64 = 2_048;
+/// Declick fade-in length after priming completes, in frames.
+const DECLICK_FRAMES: u32 = 64;
+/// Maximum timestamped retargets held in flight.
+const MAX_PENDING_RETARGETS: usize = 8;
 
 /// Audio-thread half of the engine.
 ///
@@ -67,6 +75,16 @@ pub struct EngineProcessor {
     ring_frames_at_reset: u64,
     /// Remaining blocks of modulation hold.
     modulation_hold_blocks: u32,
+    /// Source frames of warm-start preroll still to prime (0 = not priming).
+    prime_source_frames: f64,
+    /// Output frames discarded so far (priming; a separate axis from
+    /// `delivered_frames`, which stays host-visible time).
+    discarded_frames: u64,
+    /// Remaining declick fade-in frames after priming.
+    declick_remaining: u32,
+    /// Timestamped retargets awaiting their output frame, sorted ascending.
+    pending_retargets: [(u64, f64); MAX_PENDING_RETARGETS],
+    pending_retarget_len: usize,
 }
 
 impl std::fmt::Debug for EngineProcessor {
@@ -120,6 +138,11 @@ impl EngineProcessor {
             anchor: (0, 0),
             ring_frames_at_reset: 0,
             modulation_hold_blocks: 0,
+            prime_source_frames: 0.0,
+            discarded_frames: 0,
+            declick_remaining: 0,
+            pending_retargets: [(0, 1.0); MAX_PENDING_RETARGETS],
+            pending_retarget_len: 0,
         }
     }
 
@@ -133,6 +156,18 @@ impl EngineProcessor {
         debug_assert_eq!(out.len() % self.channels, 0);
         let whole = out.len() / self.channels * self.channels;
         self.apply_pending_control();
+
+        // Warm-start priming: run preroll through the graph with output
+        // discarded, emitting silence until the seek target is reached.
+        if self.prime_source_frames > 0.0 {
+            self.run_priming();
+            if self.prime_source_frames > 0.0 {
+                out.fill(0.0);
+                self.shared
+                    .publish_position(self.priming_position(), self.delivered_frames);
+                return;
+            }
+        }
 
         let max_chunk = self.max_block_frames * self.channels;
         let mut offset = 0;
@@ -201,6 +236,10 @@ impl EngineProcessor {
             cursor.reset();
         }
         self.modulation_hold_blocks = 0;
+        self.prime_source_frames = 0.0;
+        self.discarded_frames = 0;
+        self.declick_remaining = 0;
+        self.pending_retarget_len = 0;
         // Bounded drain (allocation-free): a concurrently pushing producer
         // could otherwise extend this loop indefinitely.
         let max_drains = self.ring.capacity_samples() / self.feed_scratch.len() + 4;
@@ -230,9 +269,71 @@ impl EngineProcessor {
         self.rate
     }
 
+    /// Preroll frames the host should feed ahead of a warm-start target so
+    /// every stage resumes converged: the chain's constant latency plus a
+    /// full analysis window of history (IIR splits and correctors settle
+    /// well within it). Tape chains only need the resampler margin.
+    pub fn warm_start_preroll_frames(&self) -> usize {
+        if self.stages.is_empty() {
+            64
+        } else {
+            self.pipeline_latency_frames + 1_024
+        }
+    }
+
+    /// Runs warm-start priming within the per-callback budget: pull the
+    /// graph as normal but discard output, until the discarded output
+    /// reaches the frame that plays preroll's end (computed through the
+    /// timeline map, so it is exact at any tempo rate).
+    fn run_priming(&mut self) {
+        let mut budget = PRIME_BUDGET_FRAMES;
+        loop {
+            // Output frame at which the preroll's last source frame plays.
+            let done_at = self
+                .timeline
+                .map_to_output(self.prime_source_frames)
+                .map(|out_frame| out_frame.floor().max(0.0) as u64);
+            if let Some(done_at) = done_at {
+                if self.discarded_frames >= done_at {
+                    self.prime_source_frames = 0.0;
+                    self.declick_remaining = DECLICK_FRAMES;
+                    return;
+                }
+            }
+            if budget == 0 {
+                return;
+            }
+            let want = match done_at {
+                Some(done_at) => (done_at - self.discarded_frames)
+                    .min(BLOCK_FRAMES as u64)
+                    .min(budget) as usize,
+                None => BLOCK_FRAMES.min(budget as usize),
+            };
+            let want_samples = want * self.channels;
+            self.fill_out_fifo(want_samples);
+            let popped = self
+                .out_fifo
+                .pop_slice(&mut self.block_scratch[..want_samples]);
+            if popped == 0 {
+                return; // ring dry: wait for the host to push more preroll
+            }
+            let frames = (popped / self.channels) as u64;
+            self.discarded_frames += frames;
+            budget = budget.saturating_sub(frames);
+        }
+    }
+
+    /// Track position to publish while priming (playhead sweeps through
+    /// the preroll; sub-30 ms in practice).
+    fn priming_position(&self) -> f64 {
+        self.timeline
+            .map_to_source(self.discarded_frames as f64)
+            .unwrap_or(0.0)
+    }
+
     /// Frames of real (non-underrun) media delivered so far.
     fn media_delivered_frames(&self) -> u64 {
-        self.delivered_frames - self.underrun_total
+        self.delivered_frames + self.discarded_frames - self.underrun_total
     }
 
     /// Output-timeline frame whose source position is "now": the next frame
@@ -244,22 +345,69 @@ impl EngineProcessor {
     /// Drains the mailbox and applies control at the block boundary.
     /// (Timestamped sample-offset application lands in Stage 5.)
     fn apply_pending_control(&mut self) {
+        let mut saw_asap_tempo = false;
         while let Some(event) = self.shared.pop_event() {
             match event.param {
-                Param::TempoRate => {}
+                Param::TempoRate => {
+                    if event.at_frame == crate::engine::control::APPLY_ASAP {
+                        saw_asap_tempo = true;
+                    } else if self.pending_retarget_len < MAX_PENDING_RETARGETS {
+                        // Insert sorted by frame (stable for equal stamps).
+                        let mut i = self.pending_retarget_len;
+                        while i > 0 && self.pending_retargets[i - 1].0 > event.at_frame {
+                            self.pending_retargets[i] = self.pending_retargets[i - 1];
+                            i -= 1;
+                        }
+                        self.pending_retargets[i] = (event.at_frame, event.value);
+                        self.pending_retarget_len += 1;
+                    } else {
+                        // Queue full: degrade to ASAP rather than lose it.
+                        saw_asap_tempo = true;
+                        self.shared
+                            .store_tempo_latest(clamp_tempo_rate(event.value));
+                    }
+                }
+                Param::WarmStart => {
+                    self.prime_source_frames = event.value.max(0.0);
+                    self.discarded_frames = 0;
+                    self.declick_remaining = 0;
+                }
             }
         }
-        // The latest-value register is authoritative for ASAP semantics and
-        // also covers any events dropped on overflow.
-        let new_rate = clamp_tempo_rate(self.shared.tempo_latest());
-        if (new_rate - self.rate).abs() > MODULATION_HOLD_TRIGGER {
-            self.modulation_hold_blocks = MODULATION_HOLD_BLOCKS;
+        if saw_asap_tempo {
+            // The latest-value register is authoritative for ASAP semantics
+            // and also covers any events dropped on overflow.
+            let new_rate = clamp_tempo_rate(self.shared.tempo_latest());
+            if (new_rate - self.rate).abs() > MODULATION_HOLD_TRIGGER {
+                self.modulation_hold_blocks = MODULATION_HOLD_BLOCKS;
+            }
+            self.rate = new_rate;
         }
-        self.rate = new_rate;
 
         // Refresh the track anchor (kept when a concurrent write tears).
         if let Some(anchor) = self.ring.anchor.load() {
             self.anchor = anchor;
+        }
+    }
+
+    /// Applies retargets that are due and returns the emission cap keeping
+    /// the next feed from crossing the earliest still-pending timestamp.
+    fn due_retargets_and_cap(&mut self) -> usize {
+        while self.pending_retarget_len > 0 && self.pending_retargets[0].0 <= self.emitted_frames {
+            let (_, rate) = self.pending_retargets[0];
+            let rate = clamp_tempo_rate(rate);
+            if (rate - self.rate).abs() > MODULATION_HOLD_TRIGGER {
+                self.modulation_hold_blocks = MODULATION_HOLD_BLOCKS;
+            }
+            self.rate = rate;
+            self.pending_retargets
+                .copy_within(1..self.pending_retarget_len, 0);
+            self.pending_retarget_len -= 1;
+        }
+        if self.pending_retarget_len > 0 {
+            (self.pending_retargets[0].0 - self.emitted_frames) as usize
+        } else {
+            usize::MAX
         }
     }
 
@@ -274,6 +422,20 @@ impl EngineProcessor {
             let missing_frames = ((needed_samples - popped) / self.channels) as u64;
             self.underrun_total += missing_frames;
             self.shared.add_underrun_frames(missing_frames);
+        }
+        // Post-priming declick: a short linear fade-in on the first real
+        // frames after a warm start.
+        if self.declick_remaining > 0 {
+            for frame in 0..needed_samples / self.channels {
+                if self.declick_remaining == 0 {
+                    break;
+                }
+                let gain = 1.0 - self.declick_remaining as f32 / DECLICK_FRAMES as f32;
+                for ch in 0..self.channels {
+                    out[frame * self.channels + ch] *= gain;
+                }
+                self.declick_remaining -= 1;
+            }
         }
         self.delivered_frames += (needed_samples / self.channels) as u64;
     }
@@ -389,12 +551,17 @@ impl EngineProcessor {
     /// now holds `n` output frames (possibly 0 while the kernel lookahead
     /// fills).
     fn feed_varispeed_once(&mut self) -> Option<usize> {
+        // Timestamped retargets: apply any that are due and cap this feed's
+        // emissions so the next one lands exactly on its boundary.
+        let cap = self.due_retargets_and_cap();
         let popped = self.ring.pop_slice(&mut self.feed_scratch);
         if popped == 0 {
             return None;
         }
         debug_assert_eq!(popped % self.channels, 0);
-        let produced = self.varispeed.feed(&self.feed_scratch[..popped], self.rate);
+        let produced = self
+            .varispeed
+            .feed_capped(&self.feed_scratch[..popped], self.rate, cap);
         self.emitted_frames += produced as u64;
         self.timeline
             .push(self.emitted_frames, self.varispeed.source_pos(), self.rate);
@@ -682,6 +849,241 @@ mod tests {
             (onset as i64 - expected as i64).abs() <= BLOCK_FRAMES as i64,
             "onset at {onset}, expected {expected} (reported latency {latency})"
         );
+    }
+
+    #[test]
+    fn warm_start_resumes_at_steady_level_immediately() {
+        // Ported warm-start semantics: after reset + preroll priming, the
+        // FIRST audible output (past the declick fade) is at steady level —
+        // no cold-start silence gap, no converging warble.
+        let handles = Engine::build(EngineConfig {
+            channels: 1,
+            profile: EngineProfile::Keylock,
+            initial_tempo_rate: 1.05,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let (controller, mut processor, mut source) =
+            (handles.controller, handles.processor, handles.source);
+
+        // Play from the top for a while.
+        let track = sine(500.0, 44_100.0, 44_100 * 6);
+        let mut feed = 0usize;
+        let mut out = vec![0.0f32; 256];
+        for _ in 0..64 {
+            while feed < track.len() && source.occupied_frames() < 8_192 {
+                let end = (feed + 8_192).min(track.len());
+                feed += source.push(&track[feed..end]);
+            }
+            processor.process(&mut out);
+        }
+
+        // Seek to 3 s: reset, re-anchor, request priming, feed preroll
+        // then content (the host protocol).
+        processor.reset();
+        let target = 44_100 * 3;
+        let preroll = processor.warm_start_preroll_frames();
+        source.set_track_position((target - preroll) as u64);
+        controller.warm_start(preroll as u32);
+        let mut feed = target - preroll;
+        let mut post_seek: Vec<f32> = Vec::new();
+        for _ in 0..64 {
+            while feed < track.len() && source.occupied_frames() < 8_192 {
+                let end = (feed + 8_192).min(track.len());
+                feed += source.push(&track[feed..end]);
+            }
+            processor.process(&mut out);
+            post_seek.extend_from_slice(&out);
+        }
+
+        // Find the end of the priming silence.
+        let first_sound = post_seek
+            .iter()
+            .position(|s| s.abs() > 1e-4)
+            .expect("audio must resume after priming");
+        assert!(
+            first_sound < 256 * 8,
+            "priming took too long: first sound at {first_sound}"
+        );
+        // Right after the 64-frame declick, the level must already be
+        // steady (converged correctors, primed filters): compare the first
+        // audible 1024 frames' RMS against a later settled span.
+        let early = &post_seek[first_sound + 64..first_sound + 64 + 1_024];
+        let late = &post_seek[first_sound + 8_192..first_sound + 8_192 + 4_096];
+        let rms = |s: &[f32]| {
+            (s.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / s.len() as f64).sqrt()
+        };
+        let ratio = rms(early) / rms(late);
+        assert!(
+            (0.85..1.15).contains(&ratio),
+            "post-seek level not steady immediately: early/late RMS ratio {ratio:.3}"
+        );
+        // And everything past the declick fade is click-free (the fade
+        // region itself carries the fade's own slope on top of the slew).
+        let scan = &post_seek[first_sound + 64..];
+        // The test sine helper is amplitude 1.0.
+        let bound = 2.0 * std::f32::consts::PI * 500.0 * 1.05 / 44_100.0 * 1.5;
+        for (i, w) in scan.windows(2).enumerate() {
+            assert!(
+                (w[1] - w[0]).abs() <= bound,
+                "post-seek click at {i}: {}",
+                (w[1] - w[0]).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn keylock_fades_to_varispeed_at_extreme_rates() {
+        // Old Stage 13 semantics: beyond the fade band the deck behaves as
+        // plain varispeed — pitch follows tempo, no corrector artifacts.
+        let rate = 1.3; // deviation 30% >> fade end (22%)
+        let out = run_profile_at_rate(EngineProfile::Keylock, 440.0, rate, 3);
+        let freq = measure_freq(&out[44_100..88_200], 44_100.0);
+        assert!(
+            (freq - 440.0 * rate).abs() < 3.0,
+            "extreme rate must be uncorrected varispeed: measured {freq:.1} Hz, \
+             expected {:.1}",
+            440.0 * rate
+        );
+    }
+
+    #[test]
+    fn keylock_gates_hold_at_other_sample_rates() {
+        // ROADMAP Stage 5 exit criterion: 48/96 kHz produce equivalent
+        // gated metrics — pitch held to cents-level at a DJ rate.
+        for sample_rate in [48_000u32, 96_000] {
+            let handles = Engine::build(EngineConfig {
+                channels: 1,
+                profile: EngineProfile::Keylock,
+                sample_rate,
+                initial_tempo_rate: 1.06,
+                ..EngineConfig::default()
+            })
+            .unwrap();
+            let (mut processor, mut source) = (handles.processor, handles.source);
+            let sr = sample_rate as f64;
+            // Raw 440 Hz source: the engine's varispeed shifts it, the
+            // keylock chain must bring it back.
+            let track: Vec<f32> = (0..(sr as usize * 4))
+                .map(|i| 0.6 * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / sr).sin() as f32)
+                .collect();
+            let mut feed = 0usize;
+            let mut out = vec![0.0f32; 256];
+            let mut collected = Vec::new();
+            for _ in 0..(sr as usize * 3 / 256) {
+                while feed < track.len() && source.occupied_frames() < 8_192 {
+                    let end = (feed + 8_192).min(track.len());
+                    feed += source.push(&track[feed..end]);
+                }
+                processor.process(&mut out);
+                collected.extend_from_slice(&out);
+            }
+            let scan = &collected[sr as usize..sr as usize * 2];
+            let freq = measure_freq(scan, sr);
+            let cents = 1_200.0 * (freq / 440.0).log2();
+            assert!(
+                cents.abs() < 10.0,
+                "{sample_rate} Hz: keylock pitch off by {cents:.1} cents"
+            );
+        }
+    }
+
+    #[test]
+    fn fine_fader_steps_are_artifact_and_drift_free() {
+        // Old Stage 13: 0.02% pitch-fader steps. Step the rate by 0.0002
+        // every callback for 4 s; output must be click-free and the source
+        // position must track the rate integral (no drift).
+        let handles = Engine::build(EngineConfig {
+            channels: 1,
+            profile: EngineProfile::Keylock,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let (controller, mut processor, mut source) =
+            (handles.controller, handles.processor, handles.source);
+        let input = sine(700.0, 44_100.0, 44_100 * 6);
+        let mut feed = 0usize;
+        let mut out = vec![0.0f32; 256];
+        let mut collected = Vec::new();
+        let mut rate_integral = 0.0f64;
+        for cb in 0..(44_100 * 4 / 256) {
+            let rate = 1.0 + 0.0002 * ((cb % 400) as f64 - 200.0).abs() / 200.0 * 100.0;
+            controller.set_tempo_rate(rate);
+            while feed < input.len() && source.occupied_frames() < 8_192 {
+                let end = (feed + 8_192).min(input.len());
+                feed += source.push(&input[feed..end]);
+            }
+            processor.process(&mut out);
+            collected.extend_from_slice(&out);
+            rate_integral += 256.0 * rate;
+        }
+        assert_eq!(controller.underrun_frames(), 0);
+        // Click-free at the tone's slew (amplitude 1.0 helper).
+        let bound = 2.0 * std::f32::consts::PI * 700.0 * 1.03 / 44_100.0 * 1.5;
+        for (i, w) in collected[16_384..].windows(2).enumerate() {
+            assert!(
+                (w[1] - w[0]).abs() <= bound,
+                "fine-step click at {i}: {}",
+                (w[1] - w[0]).abs()
+            );
+        }
+        // Drift-free: consumed source within one feed chunk + retarget
+        // granularity of the rate integral.
+        let expected = rate_integral;
+        let got = controller.source_position();
+        assert!(
+            (got - expected).abs() < 320.0,
+            "source position drifted: {got:.0} vs integral {expected:.0}"
+        );
+    }
+
+    #[test]
+    fn loop_wrap_is_gapless_across_ratios() {
+        // Deck loop: the host feeds across the wrap (re-anchoring the
+        // track position) with no engine reset. With a loop whose length
+        // is a whole number of periods, the seam must be click-free at
+        // every DJ ratio — the engine adds nothing at the boundary.
+        for rate in [0.92f64, 1.0, 1.08] {
+            let handles = Engine::build(EngineConfig {
+                channels: 1,
+                profile: EngineProfile::Keylock,
+                initial_tempo_rate: rate,
+                ..EngineConfig::default()
+            })
+            .unwrap();
+            let (mut processor, mut source) = (handles.processor, handles.source);
+
+            // 500 Hz sine; loop of exactly 200 periods (17 640 frames).
+            let loop_len = 17_640usize;
+            let track = sine(500.0, 44_100.0, loop_len);
+            let mut cursor = 0usize;
+            let mut out = vec![0.0f32; 256];
+            let mut collected = Vec::new();
+            source.set_track_position(0);
+            for _ in 0..512 {
+                while source.occupied_frames() < 8_192 {
+                    let end = (cursor + 4_096).min(track.len());
+                    cursor += source.push(&track[cursor..end]);
+                    if cursor >= track.len() {
+                        cursor = 0;
+                        source.set_track_position(0);
+                    }
+                }
+                processor.process(&mut out);
+                collected.extend_from_slice(&out);
+            }
+
+            let scan = &collected[16_384..];
+            let bound = 2.0 * std::f32::consts::PI * 500.0 * rate.max(1.0) as f32 / 44_100.0 * 1.5;
+            let mut worst = 0.0f32;
+            for w in scan.windows(2) {
+                worst = worst.max((w[1] - w[0]).abs());
+            }
+            assert!(
+                worst <= bound,
+                "rate {rate}: loop seam click {worst:.5} > {bound:.5}"
+            );
+        }
     }
 
     #[test]

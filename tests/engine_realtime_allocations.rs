@@ -330,6 +330,68 @@ fn engine_keylock_with_large_artifact_no_heap_activity() {
 }
 
 #[test]
+fn engine_warm_start_no_heap_activity() {
+    // ROADMAP Stage 5 exit criterion: allocation-free warm start — the
+    // reset, the priming passes, and the declick all run on the audio
+    // thread with zero heap activity.
+    let _guard = ALLOC_TEST_MUTEX
+        .lock()
+        .expect("allocation test mutex poisoned");
+    const CALLBACK_FRAMES: usize = 256;
+
+    let handles = Engine::build(EngineConfig {
+        profile: EngineProfile::Keylock,
+        ..EngineConfig::default()
+    })
+    .expect("engine builds");
+    let (controller, mut processor, mut source) =
+        (handles.controller, handles.processor, handles.source);
+
+    let feed = test_chunk_stereo(4096, 44_100.0, 0);
+    let mut out = vec![0.0f32; CALLBACK_FRAMES * 2];
+
+    // Warm up ordinary playback plus one full warm-start cycle so every
+    // buffer reaches steady capacity before measuring.
+    source.push(&feed);
+    for _ in 0..64 {
+        if source.occupied_frames() < source.demand_hint(CALLBACK_FRAMES, 1.1) {
+            source.push(&feed);
+        }
+        processor.process(&mut out);
+    }
+    let preroll = processor.warm_start_preroll_frames();
+    processor.reset();
+    source.set_track_position(0);
+    controller.warm_start(preroll as u32);
+    for _ in 0..32 {
+        if source.occupied_frames() < source.demand_hint(CALLBACK_FRAMES, 1.1) {
+            source.push(&feed);
+        }
+        processor.process(&mut out);
+    }
+
+    // The measured warm start.
+    begin_alloc_tracking();
+    processor.reset();
+    source.set_track_position(0);
+    controller.warm_start(preroll as u32);
+    for _ in 0..32 {
+        if source.occupied_frames() < source.demand_hint(CALLBACK_FRAMES, 1.1) {
+            source.push(&feed);
+        }
+        processor.process(&mut out);
+    }
+    let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
+
+    assert_eq!(
+        alloc_calls + realloc_calls,
+        0,
+        "warm start allocated: alloc_calls={alloc_calls}, realloc_calls={realloc_calls}, \
+         alloc_bytes={alloc_bytes}, realloc_bytes={realloc_bytes}"
+    );
+}
+
+#[test]
 fn engine_underrun_and_recovery_no_heap_activity() {
     let _guard = ALLOC_TEST_MUTEX
         .lock()

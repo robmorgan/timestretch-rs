@@ -94,6 +94,9 @@ The target architecture is settled. These are decisions, not open questions:
 ## Stage Sequence
 
 Dependencies form a line: 1 → 2 → 3 → 4 → 5 → 6 → 7 → {8, 9}, with 8 → 9.
+Stage 10 is a parallel analysis/UI track: it touches only the analysis front
+end and the desktop app, has no dependency on Stages 4–9, and can be worked
+at any point alongside the engine line.
 
 ## [x] Stage 1: Walking Skeleton — Pull-Based Engine Core with Varispeed Tape Mode
 
@@ -427,6 +430,26 @@ it.
 
 Automation: auto
 
+> **Status (2026-07-13):** implementation landed; all measured exit
+> criteria green. Warm-start seek: host protocol is reset → re-anchor →
+> `EngineController::warm_start(preroll)` → push preroll + content; the
+> processor primes the whole graph budgeted per callback (~1 ms CPU,
+> exact stop at the mapped preroll boundary) and declick-fades in —
+> post-seek level steady immediately, allocation-free (new gates in
+> `engine_realtime_allocations`/graph tests). Loop wraps stay the Stage 4
+> anchor mechanism: gapless and click-free across ratios (new gate).
+> Timestamped control: `set_tempo_rate_at(rate, output_frame)` lands
+> **exactly** on the requested output sample via capped resampler
+> emission (`process_into_capped`, additive) — gated at a non-aligned
+> frame. Keylock fades to plain varispeed over 12–22% rate deviation
+> (old Stage 13 semantics); 48/96 kHz hold the cents gates; 0.02%
+> fader steps are click- and drift-free. Reverse/scratch: the varispeed
+> range is forward-only [0.25, 4.0] by design — hosts implement reverse
+> by feeding reversed source and scratch re-entry as a warm-start seek
+> (documented). Desktop: seeks warm-start (no more cold mute), and the
+> deck DEFAULTS to Pull — Keylock (old engine one toggle away). Owner
+> listen pending to tick.
+
 ### Why
 
 A DJ deck jumps constantly. The old engine's warm-start seek and gapless loop
@@ -617,13 +640,95 @@ was built to obsolete.
 - Desktop and CLI run exclusively on the new engine.
 - Net LOC substantially down (target: ≥ 8k lines removed).
 
+## [ ] Stage 10: General-Purpose Beat Tracking and BPM Detection (parallel track)
+
+Automation: auto
+
+### Why
+
+The analysis front end's beat detector is EDM-only by construction: kick-tuned
+onset sensitivity, BPM hard-folded into 100–160, and a constant 4/4 grid from
+a single PLL pass. The DJ app needs trustworthy grids on everything a DJ
+loads — hip-hop at 90, DnB at 174, older and live material whose tempo
+drifts — and the deck UI needs to draw the grid on the waveform so a wrong
+grid is visible instead of silently wrong beat jumps. The previous roadmap
+parked a tempogram beat tracker in the backlog; this stage pulls it in as a
+product feature. It touches only the analysis front end (inherited unchanged
+by the engine work) and the desktop app, so it has **no dependency on Stages
+4–9** and can be worked in parallel with the engine line. It does not move
+the EDM/DJ-first *stretch-quality* boundary — non-EDM material must get a
+correct grid, not a quality-gated stretch.
+
+### Primary Files
+
+- Rewritten: `src/analysis/beat.rs` (tempo model + tracker); new
+  `src/analysis/tempogram.rs`
+- Reused in place: `src/analysis/transient.rs` (spectral-flux novelty front
+  end, widened from kick-tuned sensitivity)
+- Schema: `src/core/preanalysis.rs` (beatgrid extended to segments +
+  downbeats, artifact schema bump; coordinate with Stage 4's artifact
+  cursor — whichever lands second adapts)
+- API: `src/lib.rs` (`detect_bpm` / `detect_beat_grid` /
+  `*_buffer` rebased onto the new model; pre-1.0, breaks freely)
+- Desktop: `desktop/src/waveform.rs` (grid overlay),
+  `desktop/src/app.rs` (beat-jump/loop on real grid positions)
+- QA: `qa/bpm_accuracy.rs` (widened corpus + beat-level metrics),
+  `benchmarks/manifest.toml`
+
+### Work
+
+- **Tempo model.** Replace the single-BPM `BeatGrid` with a piecewise model:
+  fractional-sample beat positions, downbeat indices, per-segment BPM, and
+  confidence. Constant-tempo tracks collapse to one segment; snap helpers
+  (`snap_to_grid*`, subdivision grids) carry over on the new type.
+- **Novelty front end.** Multi-band onset novelty built on the existing
+  spectral-flux machinery, sensitivity generalized beyond kicks.
+- **Tempo estimation.** Autocorrelation/Fourier tempogram over the novelty
+  curve; wide prior (~50–220 BPM); explicit octave-decision policy with
+  confidence instead of hard folding. The 100–160 EDM fold survives only as
+  an optional prior/hint for the DJ-app path.
+- **Beat tracking.** Dynamic-programming beat tracker (Ellis-style DP or
+  HMM/Viterbi) over the novelty curve with tempo allowed to vary along the
+  tempogram ridge — this is what makes grids right on live and drifting
+  material. The PLL quantizer is retired unless corpus evidence shows it
+  winning on quantized EDM.
+- **Downbeat estimation.** Bar-phase estimation from beat-synchronous
+  features (energy/spectral pattern); 4/4 prior but confidence-marked, not
+  hard-coded.
+- **Artifact + analyze-on-load.** Artifact beatgrid carries the new model
+  (schema bump + validation-gate update); CLI and desktop analyze-on-load
+  produce it.
+- **Desktop grid overlay.** Beat lines drawn on the waveform, downbeats
+  emphasized, sample-accurate against the peaks buckets. Density-adaptive at
+  the full-track view (bars/downbeats only until beat spacing clears a
+  minimum pixel width). Beat-jump and loop-length math switch from fixed
+  `60/bpm` intervals to real grid lookup.
+- **QA.** Widen the corpus with non-EDM and variable-tempo entries
+  (annotated grids in `benchmarks/manifest.toml`); add beat-level scoring —
+  F-measure (±70 ms) and octave-tolerant continuity (CMLt/AMLt) — alongside
+  acc1/acc2 in `qa/bpm_accuracy.rs`; keep the diffable JSON report.
+
+### Exit Criteria
+
+- acc1/acc2 on the widened corpus ≥ the current detector's scores on the
+  EDM subset (no regression where it already works), with explicit floors on
+  the non-EDM subset (proposed acc2 ≥ 90%).
+- Beat F-measure gate on annotated tracks (proposed ≥ 0.85), including a
+  synthetic tempo-ramp fixture and at least one live-drummer recording
+  tracked within tolerance.
+- Desktop draws the grid aligned on real tracks; beat jumps land on detected
+  beats, not computed intervals; overlay stays responsive (no per-frame
+  allocation churn in the paint path).
+- Full-track analysis stays comfortably offline-budget (proposed ≥ 50×
+  realtime on the CI reference machine).
+
 ## Disposition of the Previous Roadmap's 16 Stages
 
 | Old stage | Status then | Disposition now |
 |---|---|---|
 | 1 Fast modulation stability | Complete | Inherited as gates: the torture-test methodology and click/slew bounds port into new Stages 1–3. The deferred PV ratio-step seam is dissolved — the PV no longer implements tempo. |
 | 2 Confidence-based blending | Open | **Cancelled** (hybrid retired). Event-mask ideas survive only as optional tuning levers in new Stage 4. |
-| 3 Rolling adaptive analysis | Partial | Shipped loudness-robust onset front end inherited unchanged (it feeds artifacts). Rolling multi-res analysis and streaming-scheduler parity **cancelled** (artifact-first makes them fallback-only). Tempogram beat tracker → backlog; pulled in only if Stage 7 corpus evidence demands it. |
+| 3 Rolling adaptive analysis | Partial | Shipped loudness-robust onset front end inherited unchanged (it feeds artifacts). Rolling multi-res analysis and streaming-scheduler parity **cancelled** (artifact-first makes them fallback-only). Tempogram beat tracker → **Stage 10** (general-purpose beat tracking, parallel track). |
 | 4 HPSS / residual paths | Open | **Cancelled** — HPSS is not in the target architecture. |
 | 5 Continuous event shaping | Open | **Cancelled** as hybrid work; per-event descriptors (artifact strengths, band flux) already exist and are consumed in new Stage 4. |
 | 6 Streaming pitch quality | Complete | Inherited: `StreamingSincResampler` is the new engine's varispeed and pitch stage. |
@@ -722,7 +827,8 @@ covered by the per-stage new-engine gates.
   gates exist to measure it against)
 - Desktop UI/UX polish beyond its role as the reference integration
 - Additional presets, wider API surface, convenience wrappers
-- General-purpose (non-EDM) material quality
+- General-purpose (non-EDM) material *stretch* quality (general-purpose
+  analysis — beatgrid/BPM on any material — is Stage 10)
 
 ## Definition of Success
 

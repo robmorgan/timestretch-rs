@@ -91,6 +91,7 @@ pub fn start_pull_deck_thread(
     stop_flag: Arc<StopFlag>,
     reset_request: Arc<AtomicBool>,
     pipeline_latency_secs: f64,
+    warm_start_preroll: usize,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let total_frames = source_audio.len() / CHANNELS;
@@ -141,9 +142,10 @@ pub fn start_pull_deck_thread(
             }
 
             if let Some(seek_frame) = seek_req {
-                // Cold restart at the target (Stage 5 brings warm starts):
-                // mute, have the audio callback reset the engine (which
-                // also discards in-flight source), then refeed from there.
+                // Warm-start seek: mute, have the audio callback reset the
+                // engine (which discards in-flight source), then feed the
+                // preroll PRECEDING the target and request priming — the
+                // graph runs the history through and resumes converged.
                 stream_active.store(false, Ordering::Relaxed);
                 prerolled = false;
                 reset_request.store(true, Ordering::Release);
@@ -153,10 +155,13 @@ pub fn start_pull_deck_thread(
                     spins += 1;
                 }
                 let target = seek_frame.min(total_frames);
-                cursor = target * CHANNELS;
+                let preroll = warm_start_preroll.min(target);
+                let feed_from = target - preroll;
+                cursor = feed_from * CHANNELS;
                 fed_frames = 0.0;
-                jumps = JumpMap::starting_at(target as f64);
-                source.set_track_position(target as u64);
+                jumps = JumpMap::starting_at(feed_from as f64);
+                source.set_track_position(feed_from as u64);
+                controller.warm_start(preroll as u32);
                 finished = false;
             }
 

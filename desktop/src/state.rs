@@ -172,7 +172,7 @@ impl SharedState {
             stream_profile: StreamProfile::Club,
             streaming_engine: StreamingEngine::Deterministic,
             control_path: ControlPath::VarispeedFirst,
-            deck_engine: DeckEngine::Legacy,
+            deck_engine: DeckEngine::PullKeylock,
             position_frames: 0,
             total_frames: 0,
             sample_rate: 44100,

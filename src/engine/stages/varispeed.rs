@@ -57,7 +57,16 @@ impl VarispeedHead {
     /// per output frame. Returns the number of output frames now available
     /// in the per-channel buffers (identical across channels because every
     /// channel sees the same step sequence).
+    #[cfg(test)]
     pub(crate) fn feed(&mut self, interleaved: &[f32], rate: f64) -> usize {
+        self.feed_capped(interleaved, rate, usize::MAX)
+    }
+
+    /// [`feed`](Self::feed) with an emission cap (see
+    /// `StreamingSincResampler::process_into_capped`): lands timestamped
+    /// retargets on an exact emitted frame. Outputs the cap withholds emit
+    /// on the next feed, at that feed's rate.
+    pub(crate) fn feed_capped(&mut self, interleaved: &[f32], rate: f64, max_out: usize) -> usize {
         let frames = interleaved.len() / self.channels;
         debug_assert_eq!(interleaved.len() % self.channels, 0);
         debug_assert!(frames <= FEED_CHUNK_FRAMES);
@@ -74,8 +83,12 @@ impl VarispeedHead {
             }
             // Capacity is construction-guaranteed for the clamped rate
             // range, so overflow is unreachable; debug builds assert it.
-            let result =
-                self.resamplers[ch].process_into(&self.ch_in[..frames], rate, &mut self.ch_out[ch]);
+            let result = self.resamplers[ch].process_into_capped(
+                &self.ch_in[..frames],
+                rate,
+                &mut self.ch_out[ch],
+                max_out,
+            );
             debug_assert!(result.is_ok(), "varispeed scratch overflow: {result:?}");
         }
 

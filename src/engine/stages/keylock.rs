@@ -62,12 +62,22 @@ const ALIGN_WINDOW: usize = 96;
 /// Blocks after which a pending handoff is forced without alignment
 /// (~250 ms; a backstop for noise-like content, not the normal path).
 const HANDOFF_FORCE_BLOCKS: u32 = 344;
+/// Beyond this rate deviation the corrector starts fading out toward
+/// plain varispeed (pitch follows tempo)…
+const CORRECTION_FADE_START_DEV: f64 = 0.12;
+/// …and is fully out here: keylock gracefully releases at extreme rates
+/// instead of pushing the PV past its quality range (old Stage 13
+/// semantics, trivial in this architecture).
+const CORRECTION_FADE_END_DEV: f64 = 0.22;
 
 /// Two-band keylock stage with corrector selection.
 #[derive(Debug)]
 pub(crate) struct KeylockStage {
     split: TwoBandSplit,
     low_delay: FixedDelay,
+    /// Delayed copy of the RAW high band, kept warm for the extreme-rate
+    /// corrector fade-out (aligned with the correctors' constant latency).
+    raw_high_delay: FixedDelay,
     pv: PvCorrector,
     sola: SolaCorrector,
     /// Per-channel low-band scratch.
@@ -76,6 +86,8 @@ pub(crate) struct KeylockStage {
     high_pv: Vec<[f32; BLOCK_FRAMES]>,
     /// Per-channel high band feeding the SOLA corrector (lockstep API).
     high_sola: Vec<[f32; BLOCK_FRAMES]>,
+    /// Per-channel raw (uncorrected) high band, delayed to alignment.
+    high_raw: Vec<[f32; BLOCK_FRAMES]>,
     /// True when the selector wants SOLA (deviation inside the threshold).
     sola_selected: bool,
     /// Corrector mix: 0.0 = all PV, 1.0 = all SOLA. NaN until first block.
@@ -102,11 +114,13 @@ impl KeylockStage {
         Self {
             split: TwoBandSplit::new(KEYLOCK_CROSSOVER_HZ, sample_rate, channels),
             low_delay: FixedDelay::new(pv.latency_frames(), channels),
+            raw_high_delay: FixedDelay::new(pv.latency_frames(), channels),
             sola,
             pv,
             low: vec![[0.0; BLOCK_FRAMES]; channels],
             high_pv: vec![[0.0; BLOCK_FRAMES]; channels],
             high_sola: vec![[0.0; BLOCK_FRAMES]; channels],
+            high_raw: vec![[0.0; BLOCK_FRAMES]; channels],
             sola_selected: true,
             mix: f32::NAN,
             blocks_since_flip: 0,
@@ -249,10 +263,21 @@ impl Stage for KeylockStage {
             let (low, high) = (&mut self.low[ch], &mut self.high_pv[ch]);
             self.split.process_channel(ch, block.channel(ch), low, high);
             self.high_sola[ch].copy_from_slice(high);
+            // Keep an aligned raw copy warm for the extreme-rate fade-out.
+            self.high_raw[ch].copy_from_slice(high);
+            self.raw_high_delay
+                .process_channel(ch, &mut self.high_raw[ch]);
             self.low_delay.process_channel(ch, low);
             self.pv.process_channel(ch, high);
         }
         self.sola.process_block(&mut self.high_sola, ctx.onsets);
+
+        // Extreme-rate correction weight: 1 inside the DJ range, fading to
+        // plain varispeed (pitch follows tempo) beyond it.
+        let deviation = (ctx.embedded_rate - 1.0).abs();
+        let correction = ((CORRECTION_FADE_END_DEV - deviation)
+            / (CORRECTION_FADE_END_DEV - CORRECTION_FADE_START_DEV))
+            .clamp(0.0, 1.0) as f32;
         self.update_alignment();
 
         // Re-sum with a per-sample handoff ramp. Linear (amplitude) mix:
@@ -262,7 +287,8 @@ impl Stage for KeylockStage {
             let out = block.channel_mut(ch);
             for (i, sample) in out.iter_mut().enumerate() {
                 let g = mix_start + (mix_end - mix_start) * (i as f32 / BLOCK_FRAMES as f32);
-                let high = g * self.high_sola[ch][i] + (1.0 - g) * self.high_pv[ch][i];
+                let corrected = g * self.high_sola[ch][i] + (1.0 - g) * self.high_pv[ch][i];
+                let high = correction * corrected + (1.0 - correction) * self.high_raw[ch][i];
                 *sample = self.low[ch][i] + high;
             }
         }
@@ -278,6 +304,7 @@ impl Stage for KeylockStage {
     fn reset(&mut self) {
         self.split.reset();
         self.low_delay.reset();
+        self.raw_high_delay.reset();
         self.pv.reset();
         self.sola.reset();
         self.sola_selected = true;

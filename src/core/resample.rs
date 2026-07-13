@@ -356,6 +356,22 @@ impl StreamingSincResampler {
         step: f64,
         output: &mut Vec<f32>,
     ) -> Result<(), StretchError> {
+        self.process_into_capped(input, step, output, usize::MAX)
+    }
+
+    /// [`process_into`](Self::process_into) with an emission cap: at most
+    /// `max_out` samples are emitted this call; any further outputs the fed
+    /// input covers stay pending (the cursor holds) and emit on the next
+    /// call — at that call's step. This is how the engine lands timestamped
+    /// tempo retargets on an exact output sample even when the boundary
+    /// falls inside one input sample's multiple emissions.
+    pub fn process_into_capped(
+        &mut self,
+        input: &[f32],
+        step: f64,
+        output: &mut Vec<f32>,
+        max_out: usize,
+    ) -> Result<(), StretchError> {
         output.clear();
         if input.is_empty() {
             return Ok(());
@@ -378,7 +394,7 @@ impl StreamingSincResampler {
 
         let mut pos = self.src_pos;
         let start_pos = pos;
-        while pos + half_span_max as f64 + 1.0 <= total as f64 {
+        while pos + half_span_max as f64 + 1.0 <= total as f64 && output.len() < max_out {
             if output.len() == output.capacity() {
                 return Err(StretchError::BufferOverflow {
                     buffer: "stream_pitch_resample_output",

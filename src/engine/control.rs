@@ -31,12 +31,18 @@ pub enum Param {
     /// Playback tempo as a rate multiplier (1.0 = original tempo, 1.02 = 2%
     /// faster). In tape mode pitch follows this rate.
     TempoRate,
+    /// Warm-start priming request: the value is the number of preroll
+    /// source frames at the head of the ring to run through the graph with
+    /// output discarded, so playback resumes converged (no cold-start
+    /// silence-then-warmup at the seek target).
+    WarmStart,
 }
 
 impl Param {
     fn from_code(code: u64) -> Option<Self> {
         match code {
             0 => Some(Param::TempoRate),
+            1 => Some(Param::WarmStart),
             _ => None,
         }
     }
@@ -44,6 +50,7 @@ impl Param {
     fn code(self) -> u64 {
         match self {
             Param::TempoRate => 0,
+            Param::WarmStart => 1,
         }
     }
 }
@@ -149,6 +156,13 @@ impl EngineShared {
         f64::from_bits(self.tempo_latest_bits.load(Ordering::Relaxed))
     }
 
+    /// Processor-side write of the latest-tempo register (used when a full
+    /// pending queue degrades a scheduled retarget to ASAP).
+    pub(crate) fn store_tempo_latest(&self, rate: f64) {
+        self.tempo_latest_bits
+            .store(rate.to_bits(), Ordering::Relaxed);
+    }
+
     pub(crate) fn add_underrun_frames(&self, frames: u64) {
         if frames > 0 {
             self.underrun_frames.fetch_add(frames, Ordering::Relaxed);
@@ -192,8 +206,7 @@ impl EngineController {
         }
     }
 
-    /// Retargets the tempo rate at the next block boundary (sample-accurate
-    /// application at explicit timestamps lands in Stage 5). The rate is
+    /// Retargets the tempo rate at the next block boundary. The rate is
     /// clamped to `[0.25, 4.0]`; in tape mode pitch follows it.
     pub fn set_tempo_rate(&self, rate: f64) {
         let rate = clamp_tempo_rate(rate);
@@ -207,9 +220,41 @@ impl EngineController {
         });
     }
 
+    /// Retargets the tempo rate at an exact output frame (the axis
+    /// [`delivered_frames`](Self::delivered_frames) advances on): the new
+    /// rate's first output sample is exactly `at_output_frame`. Timestamps
+    /// in the past apply immediately; multiple pending retargets apply in
+    /// timestamp order.
+    pub fn set_tempo_rate_at(&self, rate: f64, at_output_frame: u64) {
+        // Scheduled retargets do not touch the latest-value register — it
+        // backs ASAP semantics only.
+        self.shared.push_event(ControlEvent {
+            at_frame: at_output_frame,
+            param: Param::TempoRate,
+            value: clamp_tempo_rate(rate),
+        });
+    }
+
     /// The most recently requested (clamped) tempo rate.
     pub fn tempo_rate_target(&self) -> f64 {
         self.shared.tempo_latest()
+    }
+
+    /// Requests warm-start priming: the next `preroll_frames` source frames
+    /// in the ring are run through the graph with output discarded, so the
+    /// audio that follows plays through fully converged DSP state.
+    ///
+    /// Seek protocol: reset the processor (host-mediated), re-anchor the
+    /// track position, send this, then push `preroll_frames` of the audio
+    /// PRECEDING the target followed by the target's audio. Priming is
+    /// budgeted across a few callbacks (silence during, ~1 ms of work per
+    /// callback) and ends with a declick fade-in.
+    pub fn warm_start(&self, preroll_frames: u32) {
+        self.shared.push_event(ControlEvent {
+            at_frame: APPLY_ASAP,
+            param: Param::WarmStart,
+            value: preroll_frames as f64,
+        });
     }
 
     /// Fractional source position (frames since the first pushed source

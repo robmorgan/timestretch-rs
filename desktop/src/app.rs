@@ -140,7 +140,7 @@ impl TimeStretchApp {
             stream_profile: StreamProfile::Live,
             streaming_engine: StreamingEngine::Deterministic,
             control_path: ControlPath::VarispeedFirst,
-            deck_engine: DeckEngine::Legacy,
+            deck_engine: DeckEngine::PullKeylock,
             target_bpm_text: String::new(),
             error_message: None,
         }
@@ -338,6 +338,7 @@ impl TimeStretchApp {
         };
         let pipeline_latency_secs =
             handles.processor.pipeline_latency_frames() as f64 / sample_rate as f64;
+        let warm_start_preroll = handles.processor.warm_start_preroll_frames();
 
         let reset_request = Arc::new(AtomicBool::new(false));
         let engine = match AudioEngine::new_pull(
@@ -374,6 +375,7 @@ impl TimeStretchApp {
             stop_flag,
             reset_request,
             pipeline_latency_secs,
+            warm_start_preroll,
         );
 
         self.processing_handle = Some(handle);

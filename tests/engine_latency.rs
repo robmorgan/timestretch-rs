@@ -224,6 +224,61 @@ fn keylock_control_to_audio_unchanged_from_tape() {
 }
 
 #[test]
+fn timestamped_retarget_lands_on_exact_output_sample() {
+    // ROADMAP Stage 5 exit criterion: a timestamped tempo step lands on
+    // the requested output sample exactly. The ramp fixture makes the
+    // output's local slope read the rate directly.
+    const CALLBACK_FRAMES: usize = 128;
+    let handles = Engine::build(mono_config()).unwrap();
+    let (controller, mut processor, mut source) =
+        (handles.controller, handles.processor, handles.source);
+
+    let ramp: Vec<f32> = (0..262_144).map(|i| i as f32 * 1e-4).collect();
+    source.push(&ramp[..32_768]);
+    let mut feed_cursor = 32_768usize;
+
+    // Schedule the step at a frame that is NOT block- or callback-aligned.
+    let at_frame = 40 * CALLBACK_FRAMES as u64 + 37;
+    controller.set_tempo_rate_at(1.5, at_frame);
+
+    let mut out = vec![0.0f32; CALLBACK_FRAMES];
+    let mut collected: Vec<f32> = Vec::new();
+    for _ in 0..80 {
+        if source.occupied_frames() < source.demand_hint(CALLBACK_FRAMES, 2.0) {
+            let end = (feed_cursor + 8192).min(ramp.len());
+            source.push(&ramp[feed_cursor..end]);
+            feed_cursor = end;
+        }
+        processor.process(&mut out);
+        collected.extend_from_slice(&out);
+    }
+    assert_eq!(controller.underrun_frames(), 0);
+
+    // Slope must be exactly 1.0 up to (and including the step INTO)
+    // `at_frame - 1`, and start deviating at `at_frame`.
+    for j in 2_048..at_frame as usize - 1 {
+        let slope = (collected[j + 1] - collected[j]) as f64 / 1e-4;
+        assert!(
+            (slope - 1.0).abs() < 0.01,
+            "slope deviated before the timestamp at {j}: {slope}"
+        );
+    }
+    let mut first_change = None;
+    for j in at_frame as usize - 1..collected.len() - 1 {
+        let slope = (collected[j + 1] - collected[j]) as f64 / 1e-4;
+        if (slope - 1.0).abs() > 0.02 {
+            first_change = Some(j);
+            break;
+        }
+    }
+    let first_change = first_change.expect("retarget must apply");
+    assert!(
+        first_change as u64 >= at_frame - 1 && first_change as u64 <= at_frame + 2,
+        "retarget landed at {first_change}, requested {at_frame}"
+    );
+}
+
+#[test]
 fn retarget_before_first_process_applies_from_frame_zero() {
     let handles = Engine::build(mono_config()).unwrap();
     let (controller, mut processor, mut source) =
