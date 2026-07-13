@@ -51,7 +51,7 @@
 [[track]]
 id = "music-sounds-better-with-you"
 description = "Music Sounds Better With You (Original Mix), 124 BPM, stereo"
-original = "12247392_Music Sounds Better With You_(Original Mix)_124bpm.wav"
+original = "bpm-corpus/12247392_Music Sounds Better With You_(Original Mix).wav"
 original_sha256 = "ddcbfee5fb7d6e62d185836020475de828d90d564720a97e4ada81cbb397b9da"
 bpm = 124.0
 
@@ -61,4 +61,43 @@ bpm = 124.0
   target_bpm = 115.0
   software = "Ableton Live 11"
   algorithm = "Complex Pro"
+
+# --- BPM corpus (BPM accuracy harness only) ---
+#
+# bpm = 0.0 is a placeholder: fill in the published/confirmed tempo and the
+# track starts scoring (the harness skips entries with bpm <= 0). The
+# "detector reads" comments are the current tracker's output — for
+# convenience only, verify independently before recording them as truth.
+
+[[track]]
+id = "gimme-gimme-gimme-sgt-slick-recut"
+description = "Gimme! Gimme! Gimme! (Sgt Slick's Melbourne Recut), stereo"
+original = "bpm-corpus/13061141_Gimme! Gimme! Gimme!_(Sgt Slick's Melbourne Recut).wav"
+original_sha256 = "e7b554443b7046f7ea93e890d47b480d1c4830970398d75942986a3838ba9a3d"
+bpm = 123.0 # TODO: confirm tempo (detector reads 123.0)
+bpm_only = true
+
+[[track]]
+id = "hot-stuff-original-mix"
+description = "Hot Stuff (Original Mix), stereo"
+original = "bpm-corpus/14220825_Hot Stuff_(Original Mix).wav"
+original_sha256 = "aaa3a686a73f6793ca59b50cf8f1331a2022bd5d841c5db174fdce1e3543520f"
+bpm = 120.0 # TODO: confirm tempo (detector reads 120.2)
+bpm_only = true
+
+[[track]]
+id = "somebody-to-love-extended-mix"
+description = "Somebody To Love (Extended Mix), stereo"
+original = "bpm-corpus/15650709_Somebody To Love_(Extended Mix).wav"
+original_sha256 = "e15eff5b8b0cbbfd69a0da39789fa9326827d61e39b04f0e63bb7d093edef613"
+bpm = 128.0 # TODO: confirm tempo (detector reads 128.7)
+bpm_only = true
+
+[[track]]
+id = "cold-heart-pnau-extended-mix"
+description = "Cold Heart (PNAU Extended Mix), stereo"
+original = "bpm-corpus/15836669_Cold Heart_(PNAU Extended Mix).wav"
+original_sha256 = "d3e2129136d1d3ddcf42d778f910e6d808d2c739eaaea7f08ac3d779ae2843b3"
+bpm = 116.0 # TODO: confirm tempo (detector reads 115.8; commonly listed 116)
+bpm_only = true
 
