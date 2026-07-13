@@ -285,6 +285,93 @@ mod tests {
         }
     }
 
+    fn pv_ride_level(label: &str, rate_at: impl Fn(f64) -> f64) -> f64 {
+        let mut corrector = PvCorrector::new(SR, 1);
+        let mut phase = 0.0f64;
+        let mut block = [0.0f32; BLOCK];
+        let mut collected = Vec::new();
+        let total_blocks = 16 * SR as usize / BLOCK;
+        for bi in 0..total_blocks {
+            let t = (bi * BLOCK) as f64 / SR as f64;
+            let rate = rate_at(t);
+            corrector.set_transposition(1.0 / rate);
+            for s in block.iter_mut() {
+                phase += 2.0 * std::f64::consts::PI * 880.0 * rate / SR as f64;
+                *s = 0.5 * phase.sin() as f32;
+            }
+            corrector.process_channel(0, &mut block);
+            collected.extend_from_slice(&block);
+        }
+        let baseline = 0.5 / std::f64::consts::SQRT_2;
+        let mut pos = 32_768;
+        let mut worst = (0usize, f64::MAX);
+        let mut dip_blocks = 0usize;
+        while pos + 1_024 <= collected.len() {
+            let rms = (collected[pos..pos + 1_024]
+                .iter()
+                .map(|&s| (s as f64) * (s as f64))
+                .sum::<f64>()
+                / 1_024.0)
+                .sqrt();
+            if rms < worst.1 {
+                worst = (pos, rms);
+            }
+            if rms < baseline * 0.85 {
+                dip_blocks += 1;
+            }
+            pos += 512;
+        }
+        println!(
+            "{label}: min rms {:.3} at t={:.2}s, {} dip windows (baseline {:.3})",
+            worst.1,
+            worst.0 as f64 / SR as f64,
+            dip_blocks,
+            baseline
+        );
+        worst.1
+    }
+
+    #[test]
+    fn pv_level_under_unity_crossing_ride_stays_in_known_envelope() {
+        // KNOWN DEFECT ENVELOPE (2026-07, Stage 3): a fast tempo ride whose
+        // transposition crosses unity in both directions sags the PV's
+        // output level for ~1 s after the crossing (measured min RMS 0.247
+        // of a 0.354 baseline = −3.1 dB; one-sided or slow rides are
+        // clean). The behavior is inherited from the streaming PV — the
+        // old engine measures −10 dB on the identical fixture — and is
+        // tracked for a structural fix (Stage 4 phase resets / Stage 7
+        // tuning). This test pins the envelope so regressions are caught.
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let assert_floor = |label: &str, min_rms: f64, min_floor: f64| {
+            assert!(
+                min_rms >= min_floor,
+                "{label}: PV level sag regressed past the known envelope \
+                 (min rms {min_rms:.3} < {min_floor})"
+            );
+        };
+        assert_floor(
+            "crossing ±7.5%",
+            pv_ride_level("crossing ±7.5%", |t| {
+                1.0 + 0.075 * (two_pi * 0.25 * t).sin()
+            }),
+            0.22,
+        );
+        assert_floor(
+            "no-cross 1.005..1.075",
+            pv_ride_level("no-cross 1.005..1.075", |t| {
+                1.04 + 0.035 * (two_pi * 0.25 * t).sin()
+            }),
+            0.33,
+        );
+        assert_floor(
+            "slow-cross ±7.5% @0.05Hz",
+            pv_ride_level("slow-cross ±7.5% @0.05Hz", |t| {
+                1.0 + 0.075 * (two_pi * 0.05 * t).sin()
+            }),
+            0.31,
+        );
+    }
+
     #[test]
     fn corrector_transparent_across_band_at_unity() {
         // At unity the corrector must be amplitude- and phase-transparent

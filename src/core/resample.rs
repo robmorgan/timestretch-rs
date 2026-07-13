@@ -225,8 +225,10 @@ impl SincInterpTable {
     }
 
     /// Kernel weight at absolute offset `u_abs` (in zero-crossings).
+    /// Crate-visible so random-access interpolators (the SOLA corrector's
+    /// elastic ring reads) can share the prototype.
     #[inline]
-    fn weight(&self, u_abs: f64) -> f32 {
+    pub(crate) fn weight(&self, u_abs: f64) -> f32 {
         if u_abs >= STREAM_SINC_HALF_TAPS as f64 {
             return 0.0;
         }

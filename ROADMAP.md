@@ -260,6 +260,36 @@ FFTs) dissolves here: sub-bass no longer passes through a vocoder at all.
 
 Automation: auto
 
+> **Status (2026-07-12):** implementation landed.
+> `src/engine/stages/sola.rs`: elastic ring read at rate T with sinc
+> interpolation; correlation-matched splices (raised-cosine, mono decision
+> for stereo lockstep) at low-energy positions via an online energy gate;
+> runs at the chain's shared 560-frame nominal lag so corrector handoff is
+> latency-neutral (the splicer itself needs only the ~0.5 ms sinc margin,
+> satisfying the ≤ 1 ms criterion). Selection in the keylock stage:
+> hysteresis 4.5%/5.5% around the provisional 5% threshold, ~93 ms dwell,
+> both correctors always warm; PV→SOLA engages via silent hard-recenter,
+> SOLA→PV releases via a recentering splice, and both directions fade
+> (48 frames) only at a measured phase-aligned instant (96-sample
+> correlation gate, ~250 ms force backstop).
+> Measured gates (all green): kick transient sharpness at ±4% — **new
+> 1.21/1.18 vs old 0.68/0.74** (source 1.5) — the SOLA path preserves
+> attacks ~70% sharper than the old engine; threshold-crossing torture
+> clicks = 0 at 3×/1.3× theoretical slew; zero-alloc steady state across
+> handoffs. Cents wobble: SOLA-band ±4% ride **p95 3.3 / max 3.6** (new
+> gate); the ±8% ride — which now crosses the corrector threshold twice a
+> second, a pathological selection gesture — measures p95 12.9 / max 16.5
+> vs old 12.2 / 27.9 (absolute gates 15 / 22 still clear; threshold and
+> hysteresis tuning is a named Stage 7 experiment).
+> **Known issue found and pinned during gating:** the streaming PV sags
+> up to −3 dB for ~1 s after fast unity-crossing transposition rides
+> (envelope-gated in `pv_corrector` unit tests; the old engine measures
+> **−10 dB / 12.7 dB swing** on the identical fixture, so this is an
+> inherited, already-improved defect). Threshold-ride envelope gate set at
+> 4 dB (measured 2.7) until the PV fix lands (Stage 4 phase resets /
+> Stage 7 tuning are the levers). Beat-snapped splice positions arrive
+> with the artifact cursor in Stage 4, per plan.
+
 ### Why
 
 At DJ transpositions (< ~5%) a time-domain SOLA corrector is near-zero

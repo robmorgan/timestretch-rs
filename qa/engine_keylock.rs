@@ -141,6 +141,29 @@ fn keylock_cents_wobble_under_torture_ride() {
 }
 
 #[test]
+fn keylock_cents_wobble_sola_band_ride() {
+    // A ±4% ride stays inside the SOLA corrector's band (no threshold
+    // crossings): time-domain correction plus correlation-matched splices
+    // must hold pitch tighter than the PV does on the wide ride.
+    let input = sine(REFERENCE_HZ, SAMPLE_RATE as usize * 10, 0.7);
+    let render = render_with_rate_schedule(
+        Arm::NewKeylock,
+        &input,
+        1,
+        SAMPLE_RATE,
+        CALLBACK_FRAMES,
+        &|t| 1.0 + 0.04 * (2.0 * std::f64::consts::PI * t / 2.0).sin(),
+    );
+    let (p95, max) = cents_deviation_track(&render.output);
+    println!("keylock SOLA-band ±4% ride: p95={p95:.2} max={max:.2} cents");
+    assert!(
+        p95 <= 6.0,
+        "SOLA-band ride p95 {p95:.2} cents exceeds the time-domain budget"
+    );
+    assert!(max <= 10.0, "SOLA-band ride max {max:.2} cents");
+}
+
+#[test]
 fn keylock_steady_ratio_is_subcent() {
     // At a steady ratio the delay-matched correction is exact; residual
     // wobble only appears under rides. The old path measured < 1 cent here.

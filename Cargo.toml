@@ -102,3 +102,8 @@ required-features = ["qa-harnesses"]
 name = "engine_keylock"
 path = "qa/engine_keylock.rs"
 required-features = ["qa-harnesses"]
+
+[[test]]
+name = "engine_transients"
+path = "qa/engine_transients.rs"
+required-features = ["qa-harnesses"]

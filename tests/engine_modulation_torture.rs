@@ -56,6 +56,11 @@ enum Gesture {
     Ride,
     /// Sync snaps: instant jumps 1.08 / 0.92 / 1.0 within each second.
     Snap,
+    /// Threshold ride: 1.0 + 0.075 * sin(2*pi*0.25*t) — sweeps the
+    /// transposition deviation through the SOLA/PV selection boundary
+    /// (engage 4.5% / release 5.5%) twice per 4 s cycle, forcing repeated
+    /// corrector handoffs mid-gesture.
+    ThresholdRide,
 }
 
 impl Gesture {
@@ -74,6 +79,9 @@ impl Gesture {
                 }
             }
             Gesture::Ride => 1.0 + 0.06 * (2.0 * std::f64::consts::PI * 0.25 * t_secs).sin(),
+            Gesture::ThresholdRide => {
+                1.0 + 0.075 * (2.0 * std::f64::consts::PI * 0.25 * t_secs).sin()
+            }
             Gesture::Snap => {
                 let phase = t_secs.fract();
                 if phase < 0.4 {
@@ -92,6 +100,7 @@ impl Gesture {
             Gesture::Nudge => 1.04,
             Gesture::Ride => 1.06,
             Gesture::Snap => 1.08,
+            Gesture::ThresholdRide => 1.075,
         }
     }
 
@@ -100,6 +109,7 @@ impl Gesture {
             Gesture::Nudge => "nudge",
             Gesture::Ride => "ride",
             Gesture::Snap => "snap",
+            Gesture::ThresholdRide => "threshold-ride",
         }
     }
 }
@@ -280,6 +290,74 @@ fn engine_keylock_torture_ride_no_clicks() {
 #[test]
 fn engine_keylock_torture_snap_no_clicks() {
     assert_keylock_torture(Gesture::Snap);
+}
+
+#[test]
+fn engine_keylock_torture_threshold_crossing_no_clicks() {
+    // ROADMAP Stage 3 exit criterion: repeated rides through the SOLA/PV
+    // boundary — clicks = 0, no audible mode-switch signature. 16 s covers
+    // four cycles = eight boundary crossings with the ~250 ms dwell.
+    // 880 Hz keeps the tone clear of the 150 Hz seam so the envelope gate
+    // measures the HANDOFF, not band-edge detuning beat (that inherent
+    // seam-adjacent ripple is gated separately in qa/engine_keylock.rs).
+    let freq = 880.0f32;
+    let amp = 0.5f32;
+    let input = sine(freq, SAMPLE_RATE as usize * 16, amp);
+    let output =
+        stream_profile_with_gesture(EngineProfile::Keylock, &input, 1, Gesture::ThresholdRide);
+
+    let scan = &output[16_384..];
+    let theoretical = sine_max_slew(freq, amp, 1.0);
+    let (max_idx, max_diff) = max_adjacent_diff(scan);
+    let p95 = p95_adjacent_diff(scan);
+    println!(
+        "threshold-crossing torture: len={} max_diff={:.5}@{} p95={:.5}",
+        output.len(),
+        max_diff,
+        max_idx,
+        p95
+    );
+    assert!(
+        max_diff <= theoretical * 3.0,
+        "handoff click at {max_idx}: {max_diff:.5} > {:.5}",
+        theoretical * 3.0
+    );
+    assert!(
+        p95 <= theoretical * 1.3,
+        "handoff p95 {p95:.5} > {:.5}",
+        theoretical * 1.3
+    );
+
+    // Mode-switch signature gate: the tone's envelope must stay flat
+    // through every handoff (a corrector swap that dips or doubles the
+    // level reads as an audible switch even without a click).
+    let win = 1_024;
+    let mut min_rms = f64::MAX;
+    let mut max_rms = 0.0f64;
+    let mut pos = 16_384;
+    while pos + win <= output.len() {
+        let rms = (output[pos..pos + win]
+            .iter()
+            .map(|&s| (s as f64) * (s as f64))
+            .sum::<f64>()
+            / win as f64)
+            .sqrt();
+        min_rms = min_rms.min(rms);
+        max_rms = max_rms.max(rms);
+        pos += win / 2;
+    }
+    let swing_db = 20.0 * (max_rms / min_rms).log10();
+    println!("threshold-crossing envelope swing: {swing_db:.2} dB");
+    // Measured 2026-07: 2.7 dB, dominated NOT by the handoffs but by the
+    // PV's known level sag after fast unity-crossing transposition rides
+    // (pinned in `pv_corrector` unit tests; the old engine measures
+    // 12.7 dB on this identical fixture). Gate at a regression envelope
+    // above the measured value; tighten when the PV sag is fixed.
+    assert!(
+        swing_db <= 4.0,
+        "envelope swings {swing_db:.2} dB across the threshold ride \
+         (known envelope 2.7 dB, old engine 12.7 dB)"
+    );
 }
 
 #[test]
