@@ -489,9 +489,27 @@ also absorbs the old Stage 13 completeness items.
   (new test).
 - 48/96 kHz produce equivalent gated metrics to 44.1 kHz.
 
-## [ ] Stage 6: WCET Flattening and Callback Budget Gates
+## [x] Stage 6: WCET Flattening and Callback Budget Gates
 
 Automation: auto
+
+> **Completed 2026-07-13.** Both exit criteria machine-verified:
+> `qa/engine_wcet.rs` (in the CI quality-gates job, strict + 2.0 hardware
+> multiplier) measures per-callback wall/audio ratios across profiles and
+> callback sizes 64–1024 under the full deck workload — threshold-riding
+> gesture, artifact attached, a mid-run warm-start seek so priming
+> callbacks are counted. Local reference measurements: keylock p99.9 ≤
+> **0.20** at 64-frame callbacks (bound 0.5), tape ≤ 0.02; means 0.045 /
+> 0.008. Flattening applied: the PV corrector renders at most ONE
+> analysis+synthesis hop per block by construction (catch-up drains at 4×
+> input rate inside the fixed window capacity), and warm-start priming is
+> budgeted at 2× the callback's own size (clamped 256–2048) so seek
+> priming stays inside the p99.9 bound at every callback size. Hot-path
+> audit: the only non-debug assertion in engine code is a construction-
+> time invariant (`SolaCorrector::new` ring sizing); all hot-path
+> validation is debug-only, loops are const-bounded or guard-protected.
+> No regression on any Stage 2–5 gate (cents, sharpness, seam, torture,
+> latency, allocations re-run green).
 
 ### Why
 

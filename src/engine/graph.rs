@@ -22,10 +22,16 @@ use crate::engine::stages::varispeed::{VarispeedHead, FEED_CHUNK_FRAMES, MAX_OUT
 const MODULATION_HOLD_BLOCKS: u32 = 64;
 /// Per-call rate change that counts as a fast gesture.
 const MODULATION_HOLD_TRIGGER: f64 = 1e-3;
-/// Output frames of warm-start priming performed per `process` call:
-/// bounds the audio-thread work spike (~1 ms of chain CPU) while typical
-/// prerolls complete within one or two callbacks.
-const PRIME_BUDGET_FRAMES: u64 = 2_048;
+/// Warm-start priming work per `process` call, as a multiple of the
+/// callback's own frame count (clamped below): priming costs at most ~2x
+/// a normal callback — keeping priming callbacks well inside the p99.9
+/// WCET bound at every callback size — while typical prerolls still
+/// complete within a handful of callbacks (< 40 ms of muted output).
+const PRIME_BUDGET_CALLBACK_MULTIPLE: u64 = 2;
+/// Priming budget floor (tiny callbacks still make brisk progress).
+const PRIME_BUDGET_MIN_FRAMES: u64 = 256;
+/// Priming budget ceiling.
+const PRIME_BUDGET_MAX_FRAMES: u64 = 2_048;
 /// Declick fade-in length after priming completes, in frames.
 const DECLICK_FRAMES: u32 = 64;
 /// Maximum timestamped retargets held in flight.
@@ -160,7 +166,9 @@ impl EngineProcessor {
         // Warm-start priming: run preroll through the graph with output
         // discarded, emitting silence until the seek target is reached.
         if self.prime_source_frames > 0.0 {
-            self.run_priming();
+            let budget = ((whole / self.channels) as u64 * PRIME_BUDGET_CALLBACK_MULTIPLE)
+                .clamp(PRIME_BUDGET_MIN_FRAMES, PRIME_BUDGET_MAX_FRAMES);
+            self.run_priming(budget);
             if self.prime_source_frames > 0.0 {
                 out.fill(0.0);
                 self.shared
@@ -285,8 +293,8 @@ impl EngineProcessor {
     /// graph as normal but discard output, until the discarded output
     /// reaches the frame that plays preroll's end (computed through the
     /// timeline map, so it is exact at any tempo rate).
-    fn run_priming(&mut self) {
-        let mut budget = PRIME_BUDGET_FRAMES;
+    fn run_priming(&mut self, budget: u64) {
+        let mut budget = budget;
         loop {
             // Output frame at which the preroll's last source frame plays.
             let done_at = self

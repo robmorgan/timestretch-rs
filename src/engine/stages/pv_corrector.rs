@@ -269,13 +269,17 @@ impl PvCorrector {
         debug_assert!(state.window.len() + io.len() <= WINDOW_CAPACITY);
         state.window.extend_from_slice(io);
 
-        // Render every whole hop the window now covers.
+        // Render at most ONE hop per block: per-callback FFT work is
+        // bounded by construction (ROADMAP Stage 6 — one analysis+synthesis
+        // hop per band per callback at 64-frame callbacks). Catch-up after
+        // a hiccup drains at one hop per block, four times the steady input
+        // rate, so backlog clears in a few blocks and the window stays
+        // inside its fixed capacity.
         let mut rendered = false;
         if state.window.len() >= PV_CORRECTOR_FFT {
             rendered = true;
-            let hops = (state.window.len() - PV_CORRECTOR_FFT) / PV_CORRECTOR_HOP;
-            let render_len = PV_CORRECTOR_FFT + hops * PV_CORRECTOR_HOP;
-            let consumed = (hops + 1) * PV_CORRECTOR_HOP;
+            let render_len = PV_CORRECTOR_FFT;
+            let consumed = PV_CORRECTOR_HOP;
 
             let result = state
                 .pv

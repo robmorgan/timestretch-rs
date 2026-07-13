@@ -534,8 +534,7 @@ impl TimeStretchApp {
             neg: vec![],
         };
         let peaks = self.waveform_peaks.as_ref().unwrap_or(&empty_peaks);
-        let (_response, seek_pos) =
-            waveform::paint_waveform(ui, peaks, progress, &self.beat_marks);
+        let (_response, seek_pos) = waveform::paint_waveform(ui, peaks, progress, &self.beat_marks);
 
         // Handle click-to-seek
         if let Some(frac) = seek_pos {
@@ -617,8 +616,7 @@ impl TimeStretchApp {
             } else {
                 0
             };
-            let can_jump =
-                has_audio && total_frames > 0 && (grid.is_some() || beat_frames > 0);
+            let can_jump = has_audio && total_frames > 0 && (grid.is_some() || beat_frames > 0);
             ui.label("Jump:");
             for beats in [-16i64, -4, 4, 16] {
                 let label = if beats > 0 {
@@ -629,11 +627,8 @@ impl TimeStretchApp {
                 if ui.add_enabled(can_jump, egui::Button::new(label)).clicked() {
                     let target = match grid {
                         Some(g) => {
-                            let here = g
-                                .nearest_beat_index(pos_frames as f64)
-                                .unwrap_or(0) as i64;
-                            let idx =
-                                (here + beats).clamp(0, g.beats.len() as i64 - 1) as usize;
+                            let here = g.nearest_beat_index(pos_frames as f64).unwrap_or(0) as i64;
+                            let idx = (here + beats).clamp(0, g.beats.len() as i64 - 1) as usize;
                             g.beats[idx].round().max(0.0) as usize
                         }
                         None => {

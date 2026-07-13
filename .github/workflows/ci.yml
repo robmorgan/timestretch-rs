@@ -49,6 +49,14 @@ jobs:
           # for local runs. A real regression blows past this (avg jumps ~10x).
           TIMESTRETCH_CALLBACK_BUDGET_MULTIPLIER: "2.0"
           TIMESTRETCH_QUALITY_DASHBOARD_DIR: target/quality_dashboard
+      # New-engine WCET gate (ROADMAP Stage 6): p99.9 per-callback ratio
+      # bounded per profile and callback size, priming and threshold-riding
+      # included. Same hardware-headroom multiplier as above (local
+      # measurements sit at p99.9 <= 0.21 vs the 0.5 strict bound).
+      - run: cargo test --features qa-harnesses --release --test engine_wcet -- --nocapture
+        env:
+          TIMESTRETCH_STRICT_CALLBACK_BUDGET: "1"
+          TIMESTRETCH_CALLBACK_BUDGET_MULTIPLIER: "2.0"
       - uses: actions/upload-artifact@v4
         with:
           name: quality-dashboard-${{ github.run_id }}
