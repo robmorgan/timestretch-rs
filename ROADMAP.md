@@ -360,7 +360,7 @@ design is won or lost.
   clicks = 0, no audible mode-switch signature (spectral-discontinuity gate).
 - SOLA path adds ≤ 1 ms latency; selection adds zero allocation.
 
-## [ ] Stage 4: Artifact-First Control — Transient Protection and Splice Guidance
+## [x] Stage 4: Artifact-First Control — Transient Protection and Splice Guidance
 
 Automation: auto
 
@@ -382,8 +382,8 @@ Automation: auto
 > `resets_fired` unit gates); artifact-guided transient sharpness ≥
 > online (1.20 vs 1.13 at rate 0.96; equal at 1.04); no-artifact fallback
 > ≥ old engine online path (1.15/1.13 vs 0.68/0.74); zero-alloc steady
-> state with a 4 000-onset artifact attached. Owner listen pending to
-> tick.
+> state with a 4 000-onset artifact attached. Owner listen passed
+> (2026-07-13).
 
 ### Why
 
@@ -426,7 +426,7 @@ it.
 - No-artifact fallback ≥ the old engine's online path on transient metrics.
 - Zero-alloc steady state with a large artifact attached (ported gate).
 
-## [ ] Stage 5: Deck Semantics — Warm Start, Loops, Timestamped Control, Rate Coverage
+## [x] Stage 5: Deck Semantics — Warm Start, Loops, Timestamped Control, Rate Coverage
 
 Automation: auto
 
@@ -448,7 +448,7 @@ Automation: auto
 > by feeding reversed source and scratch re-entry as a warm-start seek
 > (documented). Desktop: seeks warm-start (no more cold mute), and the
 > deck DEFAULTS to Pull — Keylock (old engine one toggle away). Owner
-> listen pending to tick.
+> listen passed (2026-07-13): seeks resume instantly.
 
 ### Why
 
