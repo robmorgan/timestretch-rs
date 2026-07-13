@@ -11,8 +11,8 @@
 #[path = "ab/mod.rs"]
 mod ab;
 
-use ab::{render_with_rate_schedule, Arm};
-use timestretch::StreamProfile;
+use ab::{render_new_keylock_with_artifact, render_with_rate_schedule, Arm};
+use timestretch::{PreAnalysisArtifact, StreamProfile};
 
 const SAMPLE_RATE: u32 = 44_100;
 const CALLBACK_FRAMES: usize = 256;
@@ -78,6 +78,64 @@ fn median_sharpness(output: &[f32], rate: f64) -> f64 {
     );
     scores.sort_by(|a, b| a.total_cmp(b));
     scores[scores.len() / 2] as f64
+}
+
+/// The fixture's true onset positions as a pre-analysis artifact.
+fn click_train_artifact(num_samples: usize) -> std::sync::Arc<PreAnalysisArtifact> {
+    let onsets: Vec<usize> = (0..)
+        .map(|k| FIRST_CLICK + k * CLICK_PERIOD)
+        .take_while(|&p| p < num_samples)
+        .collect();
+    std::sync::Arc::new(PreAnalysisArtifact {
+        version: timestretch::PREANALYSIS_VERSION,
+        sample_rate: SAMPLE_RATE,
+        bpm: 120.0,
+        confidence: 0.95,
+        transient_strengths: vec![0.9; onsets.len()],
+        transient_onsets: onsets.clone(),
+        beat_positions: onsets,
+        ..Default::default()
+    })
+}
+
+#[test]
+fn keylock_artifact_guidance_preserves_transients_at_least_as_well_as_online() {
+    // ROADMAP Stage 4 exit criterion: artifact-driven transient
+    // preservation >= online detection on the same fixture and metric.
+    let num_samples = SAMPLE_RATE as usize * 10;
+    let input = edm_click_train(num_samples);
+    let artifact = click_train_artifact(num_samples);
+
+    for rate in [1.04f64, 0.96] {
+        let with_artifact = render_new_keylock_with_artifact(
+            artifact.clone(),
+            &input,
+            1,
+            SAMPLE_RATE,
+            CALLBACK_FRAMES,
+            &|_| rate,
+        );
+        let online = render_with_rate_schedule(
+            Arm::NewKeylock,
+            &input,
+            1,
+            SAMPLE_RATE,
+            CALLBACK_FRAMES,
+            &|_| rate,
+        );
+
+        let artifact_sharpness = median_sharpness(&with_artifact.output, rate);
+        let online_sharpness = median_sharpness(&online.output, rate);
+        println!(
+            "artifact guidance @rate {rate}: artifact {artifact_sharpness:.3} | online {online_sharpness:.3}"
+        );
+        assert!(
+            artifact_sharpness >= online_sharpness * 0.95,
+            "rate {rate}: artifact-guided sharpness {artifact_sharpness:.3} \
+             below online {online_sharpness:.3}"
+        );
+        assert_eq!(with_artifact.underrun_frames, 0);
+    }
 }
 
 #[test]

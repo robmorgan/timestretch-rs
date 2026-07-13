@@ -221,7 +221,7 @@ impl KeylockStage {
 }
 
 impl Stage for KeylockStage {
-    fn process(&mut self, block: &mut BlockBuf, ctx: &StageCtx) {
+    fn process(&mut self, block: &mut BlockBuf, ctx: &StageCtx<'_>) {
         // Delay-matched transposition: cancel the pitch shift embedded in
         // THIS audio (the varispeed rate at the block's timeline position),
         // not the control target.
@@ -232,6 +232,10 @@ impl Stage for KeylockStage {
         };
         self.pv.set_transposition(transposition);
         self.sola.set_transposition(transposition);
+        // Artifact events for this block: PV schedules per-band phase
+        // resets; SOLA steers splice timing around the same events.
+        self.pv
+            .begin_block(ctx.onsets, ctx.modulation_hold, ctx.has_artifact);
 
         // Selection first: a recenter (hard or spliced) must move the SOLA
         // cursor BEFORE this block is synthesized, so a starting fade mixes
@@ -248,7 +252,7 @@ impl Stage for KeylockStage {
             self.low_delay.process_channel(ch, low);
             self.pv.process_channel(ch, high);
         }
-        self.sola.process_block(&mut self.high_sola);
+        self.sola.process_block(&mut self.high_sola, ctx.onsets);
         self.update_alignment();
 
         // Re-sum with a per-sample handoff ramp. Linear (amplitude) mix:
@@ -297,6 +301,9 @@ mod tests {
         let mut block = BlockBuf::new(1);
         let ctx = StageCtx {
             embedded_rate: rate,
+            onsets: &[],
+            modulation_hold: false,
+            has_artifact: false,
         };
         let mut out = Vec::with_capacity(input.len());
         for chunk in input.chunks_exact(BLOCK_FRAMES) {
@@ -355,6 +362,9 @@ mod tests {
             }
             let ctx = StageCtx {
                 embedded_rate: rate,
+                onsets: &[],
+                modulation_hold: false,
+                has_artifact: false,
             };
             stage.process(&mut block, &ctx);
             collected.extend_from_slice(block.channel(0));

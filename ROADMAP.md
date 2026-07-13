@@ -256,11 +256,13 @@ FFTs) dissolves here: sub-bass no longer passes through a vocoder at all.
 - Clicks = 0 under modulation torture with keylock engaged; zero-alloc
   steady state holds.
 
-## [ ] Stage 3: Beat-Synchronous SOLA Corrector and Corrector Selection
+## [x] Stage 3: Beat-Synchronous SOLA Corrector and Corrector Selection
 
 Automation: auto
 
-> **Status (2026-07-12):** implementation landed.
+> **Completed 2026-07-13** (commits `e93e5a5`, `db24c87`, `ffd370a`;
+> owner listening passed: sub-threshold "sounds good", nudge bass loss
+> fixed, muffling beyond threshold resolved by the threshold raise).
 > `src/engine/stages/sola.rs`: elastic ring read at rate T with sinc
 > interpolation; correlation-matched splices (raised-cosine, mono decision
 > for stereo lockstep) at low-energy positions via an online energy gate;
@@ -358,6 +360,27 @@ design is won or lost.
 ## [ ] Stage 4: Artifact-First Control — Transient Protection and Splice Guidance
 
 Automation: auto
+
+> **Status (2026-07-13):** implementation landed; all measured exit
+> criteria green. `src/engine/stages/transient.rs`: artifact cursor
+> mapping onsets/beats track → ring (via a producer-side seqlock anchor,
+> `SourceProducer::set_track_position` — seeks and loop wraps re-anchor
+> without engine resets) → stage frames (via the inverted varispeed
+> timeline map, exact under tempo rides; positions re-mapped every block).
+> `StageCtx` carries the events plus a graph-level modulation-hold policy.
+> Consumption: SOLA splice-candidate search excludes fades overlapping an
+> onset protection window and takes pending splices opportunistically in
+> the post-hit masked window; PV fires strength-gated per-band phase
+> resets (inherited 0.45 low-band gate; upper bands always; exactly once
+> per onset under re-mapping) with a flux-based online fallback when no
+> artifact is attached. Desktop pull deck passes the analyze-on-load
+> artifact and anchors start/seek/loop-wrap.
+> Gates: onsets fire exactly once at mapped positions (cursor +
+> `resets_fired` unit gates); artifact-guided transient sharpness ≥
+> online (1.20 vs 1.13 at rate 0.96; equal at 1.04); no-artifact fallback
+> ≥ old engine online path (1.15/1.13 vs 0.68/0.74); zero-alloc steady
+> state with a 4 000-onset artifact attached. Owner listen pending to
+> tick.
 
 ### Why
 

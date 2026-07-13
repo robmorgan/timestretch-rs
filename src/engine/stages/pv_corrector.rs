@@ -25,10 +25,20 @@ use std::sync::Arc;
 use crate::core::resample::{SincInterpTable, StreamingSincResampler};
 use crate::core::ring_buffer::RingBuffer;
 use crate::core::window::WindowType;
+use crate::engine::stage::{OnsetEvent, BLOCK_FRAMES};
 use crate::stretch::phase_locking::PhaseLockingMode;
 use crate::stretch::phase_vocoder::PhaseVocoder;
 
 use super::band_split::KEYLOCK_CROSSOVER_HZ;
+
+/// Artifact onset strength above which the 100–500 Hz band re-locks too
+/// (inherited from the old engine's `ARTIFACT_LOW_BAND_RESET_STRENGTH`);
+/// upper bands always re-lock on a transient. The sub-100 Hz band is not
+/// in this corrector at all (the keylock split removes it).
+const ONSET_LOW_BAND_RESET_STRENGTH: f32 = 0.45;
+/// Online fallback: fraction of bins with transient-grade flux that reads
+/// as an onset (rising-edge gated so sustained content fires once).
+const FALLBACK_FLUX_BIN_FRACTION: f32 = 0.12;
 
 /// PV FFT size. A tuning constant (384/512/768 candidates, settled with
 /// evidence in Stage 7): 512 at 44.1 kHz keeps the corrector's constant
@@ -87,6 +97,19 @@ pub(crate) struct PvCorrector {
     channels: Vec<ChannelState>,
     /// Transposition currently applied to the PV/resampler pair.
     transposition: f64,
+    sample_rate: u32,
+    /// Stage-timeline frames ingested (advanced by the per-block event
+    /// hook; the axis artifact events are scheduled on).
+    ingested: f64,
+    /// Newest onset stage-frame already fired (once-only under re-mapping).
+    last_onset_fired: f64,
+    /// Rising-edge state for the online flux fallback.
+    fallback_armed: bool,
+    /// A fallback-detected transient awaiting application at the next
+    /// block boundary (applied to every channel together).
+    fallback_pending: bool,
+    /// Resets fired since construction (observability for tests/QA).
+    resets_fired: u64,
 }
 
 impl std::fmt::Debug for PvCorrector {
@@ -138,6 +161,82 @@ impl PvCorrector {
         Self {
             channels,
             transposition: 1.0,
+            sample_rate,
+            ingested: 0.0,
+            last_onset_fired: f64::NEG_INFINITY,
+            fallback_armed: true,
+            fallback_pending: false,
+            resets_fired: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resets_fired(&self) -> u64 {
+        self.resets_fired
+    }
+
+    /// Per-block event hook, called once before the channels are processed.
+    ///
+    /// With an artifact: fires strength-gated per-band phase resets for
+    /// onsets whose mapped position entered the ingested span (each fires
+    /// exactly once even as tempo rides re-map positions). Without: applies
+    /// any pending online-fallback detection from the previous block.
+    /// `modulation_hold` keeps the 100–500 Hz band locked during in-flight
+    /// gestures (the old engine's low-band suppression policy).
+    pub(crate) fn begin_block(
+        &mut self,
+        onsets: &[OnsetEvent],
+        modulation_hold: bool,
+        has_artifact: bool,
+    ) {
+        self.ingested += BLOCK_FRAMES as f64;
+
+        let mut mask = [false; 4];
+        let mut fire = false;
+        if has_artifact {
+            for event in onsets.iter().filter(|event| !event.beat) {
+                if event.stage_frame > self.last_onset_fired && event.stage_frame <= self.ingested {
+                    mask[2] = true;
+                    mask[3] = true;
+                    if event.strength >= ONSET_LOW_BAND_RESET_STRENGTH && !modulation_hold {
+                        mask[1] = true;
+                    }
+                    fire = true;
+                    self.last_onset_fired = self.last_onset_fired.max(event.stage_frame);
+                }
+            }
+        } else if self.fallback_pending {
+            self.fallback_pending = false;
+            mask[2] = true;
+            mask[3] = true;
+            fire = true;
+        }
+
+        if fire {
+            for ch in &mut self.channels {
+                ch.pv.reset_phase_state_bands(mask, self.sample_rate);
+            }
+            self.resets_fired += 1;
+        }
+    }
+
+    /// Online-fallback detection from the most recent render's spectral
+    /// flux (channel 0 decides; the reset applies to all channels at the
+    /// next block boundary so they stay lockstep).
+    fn poll_fallback_flux(&mut self, ch: usize) {
+        if ch != 0 {
+            return;
+        }
+        let Some(flux) = self.channels[0].pv.last_frame_flux() else {
+            return;
+        };
+        let num_bins = (PV_CORRECTOR_FFT / 2 + 1) as f32;
+        let transient = flux.transient_bin_count as f32 > num_bins * FALLBACK_FLUX_BIN_FRACTION;
+        if transient && self.fallback_armed {
+            self.fallback_pending = true;
+            self.fallback_armed = false;
+        } else if !transient {
+            self.fallback_armed = true;
         }
     }
 
@@ -171,7 +270,9 @@ impl PvCorrector {
         state.window.extend_from_slice(io);
 
         // Render every whole hop the window now covers.
+        let mut rendered = false;
         if state.window.len() >= PV_CORRECTOR_FFT {
+            rendered = true;
             let hops = (state.window.len() - PV_CORRECTOR_FFT) / PV_CORRECTOR_HOP;
             let render_len = PV_CORRECTOR_FFT + hops * PV_CORRECTOR_HOP;
             let consumed = (hops + 1) * PV_CORRECTOR_HOP;
@@ -213,6 +314,10 @@ impl PvCorrector {
             io[popped..].fill(0.0);
             debug_assert!(false, "corrector FIFO underrun: {popped} < {}", io.len());
         }
+
+        if rendered {
+            self.poll_fallback_flux(ch);
+        }
     }
 
     pub(crate) fn latency_frames(&self) -> usize {
@@ -235,6 +340,10 @@ impl PvCorrector {
         for ch in &mut self.channels {
             ch.pv.set_stretch_ratio(1.0);
         }
+        self.ingested = 0.0;
+        self.last_onset_fired = f64::NEG_INFINITY;
+        self.fallback_armed = true;
+        self.fallback_pending = false;
     }
 }
 
@@ -370,6 +479,43 @@ mod tests {
             }),
             0.31,
         );
+    }
+
+    #[test]
+    fn artifact_onsets_fire_resets_exactly_once() {
+        let mut corrector = PvCorrector::new(SR, 1);
+        let onset = OnsetEvent {
+            stage_frame: 40.0,
+            strength: 0.9,
+            beat: false,
+        };
+        // Block 1 ingests frames 0..32: onset at 40 not yet reached.
+        corrector.begin_block(&[onset], false, true);
+        assert_eq!(corrector.resets_fired(), 0);
+        // Block 2 ingests 32..64: fires once.
+        corrector.begin_block(&[onset], false, true);
+        assert_eq!(corrector.resets_fired(), 1);
+        // Republished (and slightly re-mapped) copies must not refire.
+        let remapped = OnsetEvent {
+            stage_frame: 39.2,
+            ..onset
+        };
+        corrector.begin_block(&[remapped], false, true);
+        assert_eq!(corrector.resets_fired(), 1);
+
+        // Beats never fire resets; a later onset does.
+        let beat = OnsetEvent {
+            stage_frame: 100.0,
+            strength: 1.0,
+            beat: true,
+        };
+        let later = OnsetEvent {
+            stage_frame: 110.0,
+            strength: 0.5,
+            beat: false,
+        };
+        corrector.begin_block(&[beat, later], false, true);
+        assert_eq!(corrector.resets_fired(), 2);
     }
 
     #[test]

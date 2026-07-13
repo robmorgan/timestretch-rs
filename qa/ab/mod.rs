@@ -11,8 +11,12 @@
 //! the new engine's native control). The old arm receives the reciprocal as
 //! its stretch ratio.
 
+use std::sync::Arc;
+
 use timestretch::engine::{Engine, EngineConfig, EngineProfile};
-use timestretch::{ControlPath, StreamProcessor, StreamProfile, StretchParams};
+use timestretch::{
+    ControlPath, PreAnalysisArtifact, StreamProcessor, StreamProfile, StretchParams,
+};
 
 /// Which engine renders the fixture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +29,27 @@ pub enum Arm {
     /// New pull engine, keylock profile (two-band: low band follows tempo,
     /// high band corrected).
     NewKeylock,
+}
+
+/// Renders the new keylock arm with a pre-analysis artifact attached (feed
+/// anchored at track frame 0) — the artifact-first control path.
+pub fn render_new_keylock_with_artifact(
+    artifact: Arc<PreAnalysisArtifact>,
+    input: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    callback_frames: usize,
+    rate_at: &dyn Fn(f64) -> f64,
+) -> AbRender {
+    render_new_inner(
+        EngineProfile::Keylock,
+        Some(artifact),
+        input,
+        channels,
+        sample_rate,
+        callback_frames,
+        rate_at,
+    )
 }
 
 /// Output and bookkeeping from one A/B render.
@@ -123,6 +148,26 @@ fn render_new(
     callback_frames: usize,
     rate_at: &dyn Fn(f64) -> f64,
 ) -> AbRender {
+    render_new_inner(
+        profile,
+        None,
+        input,
+        channels,
+        sample_rate,
+        callback_frames,
+        rate_at,
+    )
+}
+
+fn render_new_inner(
+    profile: EngineProfile,
+    artifact: Option<Arc<PreAnalysisArtifact>>,
+    input: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    callback_frames: usize,
+    rate_at: &dyn Fn(f64) -> f64,
+) -> AbRender {
     let handles = Engine::build(EngineConfig {
         sample_rate,
         channels,
@@ -130,10 +175,12 @@ fn render_new(
         initial_tempo_rate: rate_at(0.0),
         max_block_frames: callback_frames.clamp(64, 8192),
         source_capacity_frames: (callback_frames * 16).max(32_768),
+        pre_analysis: artifact,
     })
     .expect("engine builds");
     let (controller, mut processor, mut source) =
         (handles.controller, handles.processor, handles.source);
+    source.set_track_position(0);
 
     let mut feed_cursor = 0usize;
     let mut finished = false;

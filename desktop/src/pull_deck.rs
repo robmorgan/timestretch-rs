@@ -114,6 +114,8 @@ pub fn start_pull_deck_thread(
         }
 
         stream_active.store(false, Ordering::Relaxed);
+        // Anchor the artifact timeline: the first pushed frame is track 0.
+        source.set_track_position(0);
 
         loop {
             if stop_flag.is_set() {
@@ -154,6 +156,7 @@ pub fn start_pull_deck_thread(
                 cursor = target * CHANNELS;
                 fed_frames = 0.0;
                 jumps = JumpMap::starting_at(target as f64);
+                source.set_track_position(target as u64);
                 finished = false;
             }
 
@@ -169,6 +172,7 @@ pub fn start_pull_deck_thread(
                 if cursor >= loop_end * CHANNELS {
                     cursor = loop_start * CHANNELS;
                     jumps.record(fed_frames, loop_start as f64);
+                    source.set_track_position(loop_start as u64);
                     finished = false;
                 }
             }

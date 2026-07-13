@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use crate::core::resample::{SincInterpTable, STREAM_SINC_HALF_TAPS};
-use crate::engine::stage::BLOCK_FRAMES;
+use crate::engine::stage::{OnsetEvent, BLOCK_FRAMES};
 
 /// Ring capacity per channel (power of two), in frames.
 const RING_LEN: usize = 4_096;
@@ -45,8 +45,20 @@ const XFADE_FRAMES: usize = 96;
 /// Sinc half-width plus slack the read cursor keeps behind the write head.
 const MIN_READ_MARGIN: f64 = (STREAM_SINC_HALF_TAPS + 4) as f64;
 /// Candidate-region energy above this multiple of the rolling average reads
-/// as a transient: postpone the splice until [`HARD_TRIGGER`].
+/// as a transient: postpone the splice until [`HARD_TRIGGER`]. Online
+/// fallback — artifact onsets take precedence when present.
 const TRANSIENT_POSTPONE_RATIO: f64 = 3.0;
+/// Protection window around an artifact onset, in frames: a splice fade
+/// must not overlap `[onset - PRE, onset + POST]` in either the outgoing
+/// or incoming read span (the attack must come from one uncut read).
+const ONSET_PROTECT_PRE: f64 = 96.0;
+const ONSET_PROTECT_POST: f64 = 512.0;
+/// With drift beyond this, a masked window right after an onset/beat is
+/// taken opportunistically even though the trigger has not been reached.
+const OPPORTUNISTIC_DRIFT: f64 = 96.0;
+/// The masked window after an onset where a splice hides best.
+const MASKED_WINDOW_START: f64 = 768.0;
+const MASKED_WINDOW_END: f64 = 2_048.0;
 /// Below this transposition deviation the corrector is effectively at rest
 /// and actively bleeds elastic drift back to zero (see `process_block`):
 /// parked drift keeps the high band time-shifted against the low band's
@@ -190,10 +202,32 @@ impl SolaCorrector {
         self.rest_blocks = 0;
     }
 
+    /// Whether a fade read-span starting at `start` overlaps any artifact
+    /// onset's protection window (positions share the write/stage axis).
+    fn span_hits_onset(&self, onsets: &[OnsetEvent], start: f64) -> bool {
+        let span = XFADE_FRAMES as f64 * self.transposition.max(1.0);
+        onsets.iter().any(|event| {
+            start < event.stage_frame + ONSET_PROTECT_POST
+                && start + span > event.stage_frame - ONSET_PROTECT_PRE
+        })
+    }
+
+    /// Whether the current read position sits in the masked window just
+    /// after an onset/beat — the best hiding place for a splice.
+    fn in_masked_window(&self, onsets: &[OnsetEvent]) -> bool {
+        onsets.iter().any(|event| {
+            let since = self.read_pos - event.stage_frame;
+            (MASKED_WINDOW_START..MASKED_WINDOW_END).contains(&since)
+        })
+    }
+
     /// Processes one fixed block for every channel in lockstep: writes the
     /// inputs into the rings, splices if the elastic lag calls for it, then
-    /// synthesizes the outputs in place.
-    pub(crate) fn process_block(&mut self, io: &mut [[f32; BLOCK_FRAMES]]) {
+    /// synthesizes the outputs in place. `onsets` (stage-timeline artifact
+    /// events; empty when no artifact) steer splice timing: fades never
+    /// overlap an onset's protection window, and pending splices are taken
+    /// opportunistically in the masked window after a hit.
+    pub(crate) fn process_block(&mut self, io: &mut [[f32; BLOCK_FRAMES]], onsets: &[OnsetEvent]) {
         debug_assert_eq!(io.len(), self.channels.len());
 
         // 1) Ingest.
@@ -230,12 +264,18 @@ impl SolaCorrector {
                     self.recenter_requested = false;
                 }
             } else if drift.abs() > DRIFT_TRIGGER {
-                self.try_splice(drift);
+                // Onset protection applies inside the candidate search; the
+                // HARD trigger forces through it eventually.
+                self.try_splice(drift, onsets);
+            } else if drift.abs() > OPPORTUNISTIC_DRIFT && self.in_masked_window(onsets) {
+                // Beat-synchronous placement: a pending correction hides
+                // best right after a hit.
+                self.try_splice(drift, onsets);
             } else if at_rest && settled_drift.abs() > REST_SPLICE_DRIFT {
                 // At sustained rest a parked drift comb-filters the
                 // crossover overlap against the low band's fixed delay;
                 // recenter cleanly.
-                self.try_splice(drift);
+                self.try_splice(drift, onsets);
             }
         }
 
@@ -282,22 +322,27 @@ impl SolaCorrector {
         );
     }
 
-    /// Drift-triggered splice: transient postpone applies until the drift
-    /// is critical.
-    fn try_splice(&mut self, drift: f64) {
+    /// Drift-triggered splice: onset protection and the transient postpone
+    /// apply until the drift is critical.
+    fn try_splice(&mut self, drift: f64, onsets: &[OnsetEvent]) {
         let force = drift.abs() >= HARD_TRIGGER;
-        let _ = self.plan_splice(drift, force);
+        let _ = self.plan_splice(drift, force, onsets);
     }
 
     /// Handoff-requested splice: always forced. Returns whether it ran.
     fn try_splice_forced(&mut self, drift: f64) -> bool {
-        self.plan_splice(drift, true)
+        self.plan_splice(drift, true, &[])
     }
 
     /// Plans and starts a correlation-matched splice toward the nominal
     /// lag; unless `force`, a landing region that reads as a transient
-    /// postpones it.
-    fn plan_splice(&mut self, drift: f64, force: bool) -> bool {
+    /// postpones it, and candidates whose fade would overlap an artifact
+    /// onset's protection window are excluded from the search.
+    fn plan_splice(&mut self, drift: f64, force: bool, onsets: &[OnsetEvent]) -> bool {
+        // Outgoing span: the fade also reads from the current cursor.
+        if !force && self.span_hits_onset(onsets, self.read_pos) {
+            return false;
+        }
         // Jump the read cursor so the lag returns to nominal: with
         // lag' = write − (read + jump), jump = lag − nominal = drift.
         let nominal_jump = drift;
@@ -312,6 +357,9 @@ impl SolaCorrector {
             if !self.readable_span(candidate, CORR_WINDOW + XFADE_FRAMES) {
                 continue;
             }
+            if !force && self.span_hits_onset(onsets, candidate) {
+                continue;
+            }
             // Mild distance penalty: periodic content scores every
             // period-grid candidate identically, and un-penalized ties
             // resolve to the search edge — parking the elastic drift ~a
@@ -322,6 +370,9 @@ impl SolaCorrector {
                 best_score = score;
                 best_jump = jump as f64;
             }
+        }
+        if best_score == f64::MIN {
+            return false; // every candidate excluded; retried next block
         }
         let target = base + best_jump;
         if !self.readable_span(target, CORR_WINDOW + XFADE_FRAMES) {
@@ -439,7 +490,7 @@ mod tests {
         let mut block = [[0.0f32; BLOCK_FRAMES]; 1];
         for chunk in input.chunks_exact(BLOCK_FRAMES) {
             block[0].copy_from_slice(chunk);
-            corrector.process_block(&mut block);
+            corrector.process_block(&mut block, &[]);
             out.extend_from_slice(&block[0]);
         }
         out
@@ -534,6 +585,66 @@ mod tests {
     }
 
     #[test]
+    fn splice_fades_avoid_artifact_onsets() {
+        // Feed a tone with onsets declared every 4410 frames; at T=1.05 the
+        // corrector must splice regularly, and no fade span may overlap an
+        // onset's protection window.
+        let mut corrector = SolaCorrector::new(1, LAG);
+        corrector.set_transposition(1.05);
+        let input = sine(500.0, 44_100 * 8, 0.4);
+        let mut block = [[0.0f32; BLOCK_FRAMES]; 1];
+        let mut fade_spans: Vec<(f64, f64)> = Vec::new();
+        let mut events: Vec<OnsetEvent> = Vec::new();
+        let mut was_fading = false;
+        for (bi, chunk) in input.chunks_exact(BLOCK_FRAMES).enumerate() {
+            let stage_now = (bi * BLOCK_FRAMES) as f64;
+            // Publish onsets near the block, like the graph cursor would.
+            events.clear();
+            let mut onset = ((stage_now - 2_048.0).max(0.0) / 4_410.0).floor() * 4_410.0;
+            while onset <= stage_now + 2_048.0 {
+                if onset > 0.0 {
+                    events.push(OnsetEvent {
+                        stage_frame: onset,
+                        strength: 0.9,
+                        beat: false,
+                    });
+                }
+                onset += 4_410.0;
+            }
+            block[0].copy_from_slice(chunk);
+            corrector.process_block(&mut block, &events);
+            let fading = corrector.xfade_remaining > 0;
+            if fading && !was_fading {
+                // Record the fade's read spans (outgoing + incoming),
+                // rewinding the cursors to the fade's first frame — they
+                // have already advanced within this block.
+                let elapsed = (XFADE_FRAMES - corrector.xfade_remaining) as f64 * 1.05;
+                let span = XFADE_FRAMES as f64 * 1.05;
+                let out_start = corrector.xfade_from - elapsed;
+                let in_start = corrector.read_pos - elapsed;
+                fade_spans.push((out_start, out_start + span));
+                fade_spans.push((in_start, in_start + span));
+            }
+            was_fading = fading;
+        }
+        assert!(
+            corrector.splice_count() > 10,
+            "fixture must splice ({} splices)",
+            corrector.splice_count()
+        );
+        for &(lo, hi) in &fade_spans {
+            let mut onset = 4_410.0;
+            while onset < 44_100.0 * 8.0 {
+                assert!(
+                    hi <= onset - ONSET_PROTECT_PRE || lo >= onset + ONSET_PROTECT_POST,
+                    "fade span [{lo:.0}, {hi:.0}] overlaps onset at {onset:.0}"
+                );
+                onset += 4_410.0;
+            }
+        }
+    }
+
+    #[test]
     fn stereo_channels_splice_in_lockstep() {
         let mut corrector = SolaCorrector::new(2, LAG);
         corrector.set_transposition(1.05);
@@ -546,7 +657,7 @@ mod tests {
                 block[0][i] = s;
                 block[1][i] = -0.8 * s;
             }
-            corrector.process_block(&mut block);
+            corrector.process_block(&mut block, &[]);
             left.extend_from_slice(&block[0]);
             right.extend_from_slice(&block[1]);
         }

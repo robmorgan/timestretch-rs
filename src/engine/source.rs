@@ -24,6 +24,57 @@ use std::sync::Arc;
 
 use crate::core::resample::STREAM_SINC_MAX_HALF_TAPS;
 
+/// Track-position anchor: declares which absolute track frame the source
+/// frame at a given ring position carries. Written by the producer (seek,
+/// loop wrap, stream start), read by the audio thread to map artifact
+/// positions onto its own timeline. Seqlock: `generation` is bumped to odd
+/// before writing the pair and to even after, so a torn read is detected
+/// and the previous coherent value kept.
+#[derive(Debug)]
+pub(crate) struct TrackAnchor {
+    generation: AtomicU64,
+    /// Ring timeline (total frames pushed before this anchor applies).
+    ring_frame: AtomicU64,
+    /// Absolute track frame carried by that ring frame.
+    track_frame: AtomicU64,
+}
+
+impl TrackAnchor {
+    fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            ring_frame: AtomicU64::new(0),
+            track_frame: AtomicU64::new(0),
+        }
+    }
+
+    /// Producer side.
+    pub(crate) fn store(&self, ring_frame: u64, track_frame: u64) {
+        let generation = self.generation.load(Ordering::Relaxed);
+        self.generation.store(generation + 1, Ordering::Release);
+        self.ring_frame.store(ring_frame, Ordering::Relaxed);
+        self.track_frame.store(track_frame, Ordering::Relaxed);
+        self.generation.store(generation + 2, Ordering::Release);
+    }
+
+    /// Consumer side: `None` only during a concurrent write (caller keeps
+    /// its previous value).
+    pub(crate) fn load(&self) -> Option<(u64, u64)> {
+        let g1 = self.generation.load(Ordering::Acquire);
+        if g1 % 2 != 0 {
+            return None;
+        }
+        let ring = self.ring_frame.load(Ordering::Relaxed);
+        let track = self.track_frame.load(Ordering::Relaxed);
+        let g2 = self.generation.load(Ordering::Acquire);
+        if g1 == g2 {
+            Some((ring, track))
+        } else {
+            None
+        }
+    }
+}
+
 /// Lock-free SPSC ring of interleaved f32 samples.
 ///
 /// Samples are stored as `u32` bit patterns so the buffer can be shared
@@ -37,6 +88,8 @@ pub(crate) struct SourceRing {
     /// Producer cursor: total samples pushed.
     tail: AtomicU64,
     channels: usize,
+    /// Where the pushed audio sits on the track timeline.
+    pub(crate) anchor: TrackAnchor,
 }
 
 impl SourceRing {
@@ -48,7 +101,15 @@ impl SourceRing {
             head: AtomicU64::new(0),
             tail: AtomicU64::new(0),
             channels,
+            anchor: TrackAnchor::new(),
         })
+    }
+
+    /// Total frames popped by the consumer since construction (monotonic
+    /// across engine resets — the ring timeline artifact anchors use).
+    #[inline]
+    pub(crate) fn head_frames(&self) -> u64 {
+        self.head.load(Ordering::Relaxed) / self.channels as u64
     }
 
     #[inline]
@@ -170,6 +231,14 @@ impl SourceProducer {
             super::control::MAX_TEMPO_RATE,
         );
         (out_frames as f64 * rate).ceil() as usize + STREAM_SINC_MAX_HALF_TAPS + 2
+    }
+
+    /// Declares that the NEXT pushed frame carries this absolute track
+    /// frame. Call at stream start, after a seek (post-reset), and at a
+    /// loop wrap — it re-anchors the artifact timeline so pre-analysis
+    /// positions stay aligned across jumps without any engine reset.
+    pub fn set_track_position(&mut self, track_frame: u64) {
+        self.ring.anchor.store(self.pushed_frames, track_frame);
     }
 
     /// Signals end of stream by pushing enough silence to flush the
@@ -295,6 +364,37 @@ impl TimelineMap {
             }
         }
         Some(self.at(self.len - 1).source_pos)
+    }
+
+    /// Inverse of [`map_to_source`](Self::map_to_source): maps a fractional
+    /// source position to the output-timeline frame that plays it. Both
+    /// axes are monotonic, so the same checkpoints interpolate either way.
+    /// Positions beyond the newest checkpoint extrapolate at its rate
+    /// (used for scheduling upcoming artifact events); `None` before any
+    /// checkpoint.
+    pub(crate) fn map_to_output(&self, source: f64) -> Option<f64> {
+        if self.len == 0 {
+            return None;
+        }
+        let first = self.at(0);
+        if source <= first.source_pos {
+            return Some(first.output_abs as f64);
+        }
+        for i in 1..self.len {
+            let a = self.at(i - 1);
+            let b = self.at(i);
+            if source <= b.source_pos {
+                let span = b.source_pos - a.source_pos;
+                if span <= 0.0 {
+                    return Some(b.output_abs as f64);
+                }
+                let t = (source - a.source_pos) / span;
+                return Some(a.output_abs as f64 + t * (b.output_abs - a.output_abs) as f64);
+            }
+        }
+        let last = self.at(self.len - 1);
+        let rate = last.rate.max(1e-6);
+        Some(last.output_abs as f64 + (source - last.source_pos) / rate)
     }
 
     /// Instantaneous embedded tempo rate at an output-timeline frame count,

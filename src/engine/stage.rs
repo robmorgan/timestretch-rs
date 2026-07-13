@@ -87,18 +87,43 @@ impl BlockBuf {
     }
 }
 
+/// One artifact event (onset or beat) mapped onto the stage timeline.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OnsetEvent {
+    /// Absolute stage-timeline frame (the axis stage input blocks advance
+    /// on) where the event's audio sits — exact under tempo rides because
+    /// it is re-mapped through the varispeed timeline every block.
+    pub stage_frame: f64,
+    /// Artifact onset strength (beats publish 1.0).
+    pub strength: f32,
+    /// True for beatgrid positions, false for detected onsets.
+    pub beat: bool,
+}
+
 /// Per-block context the graph hands every stage.
 ///
 /// Carries the control-plane signals a stage may need, computed once per
-/// block by the graph. Today that is the delay-matched embedded tempo rate;
-/// artifact cursors join it in Stage 4.
+/// block by the graph.
 #[derive(Debug, Clone, Copy)]
-pub struct StageCtx {
+pub struct StageCtx<'a> {
     /// Tempo rate embedded in the audio at the END of this block, read off
     /// the varispeed timeline map (the old engine's delay-matched
     /// transposition mechanism). The audio's pitch is scaled by this rate;
     /// a keylock corrector cancels it by transposing at its reciprocal.
     pub embedded_rate: f64,
+    /// Artifact events near this block (behind by up to ~1k frames, ahead
+    /// by up to ~2k), in stage-timeline coordinates. Empty when no
+    /// artifact is attached — stages fall back to online heuristics.
+    pub onsets: &'a [OnsetEvent],
+    /// True while a fast control gesture is in flight: stages suppress
+    /// disruptive maintenance (low-band phase resets, discretionary
+    /// splices) until the ride settles — the graph-level re-expression of
+    /// the old engine's modulation-hold latches.
+    pub modulation_hold: bool,
+    /// Whether a pre-analysis artifact is attached at all. Distinguishes
+    /// "no events nearby" from "no artifact" so stages know when to run
+    /// their online-detection fallbacks.
+    pub has_artifact: bool,
 }
 
 /// One DSP stage in the engine graph.
@@ -116,7 +141,7 @@ pub struct StageCtx {
 ///   the stage, discarding output, so a jump resumes converged.
 pub trait Stage: Send {
     /// Processes one fixed block in place.
-    fn process(&mut self, block: &mut BlockBuf, ctx: &StageCtx);
+    fn process(&mut self, block: &mut BlockBuf, ctx: &StageCtx<'_>);
 
     /// Constant pipeline delay this stage introduces, in frames.
     fn latency_frames(&self) -> usize;

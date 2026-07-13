@@ -255,6 +255,81 @@ fn engine_keylock_steady_state_no_heap_activity() {
 }
 
 #[test]
+fn engine_keylock_with_large_artifact_no_heap_activity() {
+    // ROADMAP Stage 4 exit criterion: zero-alloc steady state with a large
+    // artifact attached — thousands of onsets and beats crossing the
+    // cursor, mapped through the varispeed timeline every block, firing
+    // splice guidance and PV resets.
+    let _guard = ALLOC_TEST_MUTEX
+        .lock()
+        .expect("allocation test mutex poisoned");
+    const SAMPLE_RATE: u32 = 44_100;
+    const CALLBACK_FRAMES: usize = 256;
+    const WARMUP_ITERS: usize = 128;
+    const MEASURE_ITERS: usize = 96;
+
+    let onset_spacing = 2_048usize;
+    let transient_onsets: Vec<usize> = (1..4_000).map(|i| i * onset_spacing).collect();
+    let transient_strengths = vec![0.9f32; transient_onsets.len()];
+    let beat_positions: Vec<usize> = (1..2_000).map(|i| i * 20_671).collect();
+    let artifact = timestretch::PreAnalysisArtifact {
+        version: timestretch::PREANALYSIS_VERSION,
+        sample_rate: SAMPLE_RATE,
+        bpm: 128.0,
+        downbeat_offset_samples: 0,
+        confidence: 0.95,
+        beat_positions,
+        transient_onsets,
+        transient_strengths,
+        onset_band_flux: Vec::new(),
+        analysis_hop_size: 512,
+        source_len_samples: 0,
+        content_hash: 0,
+    };
+
+    let handles = Engine::build(EngineConfig {
+        profile: EngineProfile::Keylock,
+        pre_analysis: Some(std::sync::Arc::new(artifact)),
+        ..EngineConfig::default()
+    })
+    .expect("engine builds");
+    let (controller, mut processor, mut source) =
+        (handles.controller, handles.processor, handles.source);
+    source.set_track_position(0);
+
+    let feed = test_chunk_stereo(2048, SAMPLE_RATE as f32, 0);
+    let mut out = vec![0.0f32; CALLBACK_FRAMES * 2];
+
+    source.push(&feed);
+    for i in 0..WARMUP_ITERS {
+        let t = i as f64 / WARMUP_ITERS as f64;
+        controller.set_tempo_rate(1.0 + 0.06 * (2.0 * std::f64::consts::PI * t).sin());
+        if source.occupied_frames() < source.demand_hint(CALLBACK_FRAMES, 1.1) {
+            source.push(&feed);
+        }
+        processor.process(&mut out);
+    }
+
+    begin_alloc_tracking();
+    for i in 0..MEASURE_ITERS {
+        let t = i as f64 / MEASURE_ITERS as f64;
+        controller.set_tempo_rate(1.0 + 0.06 * (2.0 * std::f64::consts::PI * t).sin());
+        if source.occupied_frames() < source.demand_hint(CALLBACK_FRAMES, 1.1) {
+            source.push(&feed);
+        }
+        processor.process(&mut out);
+    }
+    let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
+
+    assert_eq!(
+        alloc_calls + realloc_calls,
+        0,
+        "artifact-driven steady state allocated: alloc_calls={alloc_calls}, \
+         realloc_calls={realloc_calls}, alloc_bytes={alloc_bytes}, realloc_bytes={realloc_bytes}"
+    );
+}
+
+#[test]
 fn engine_underrun_and_recovery_no_heap_activity() {
     let _guard = ALLOC_TEST_MUTEX
         .lock()

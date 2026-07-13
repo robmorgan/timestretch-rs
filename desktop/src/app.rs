@@ -316,6 +316,10 @@ impl TimeStretchApp {
             DeckEngine::PullKeylock => timestretch::engine::EngineProfile::Keylock,
             _ => timestretch::engine::EngineProfile::Tape,
         };
+        // Analyze-on-load artifact: the engine's primary transient control
+        // signal (splice guidance + PV phase resets). Arc-shared with the
+        // analysis thread's result.
+        let pre_analysis = self.state.lock().unwrap().pre_analysis.clone();
         let config = timestretch::engine::EngineConfig {
             sample_rate,
             channels: 2,
@@ -323,6 +327,7 @@ impl TimeStretchApp {
             initial_tempo_rate: 1.0 / initial_ratio.clamp(0.25, MAX_VARISPEED_RATIO),
             max_block_frames: 2048,
             source_capacity_frames: 65_536,
+            pre_analysis,
         };
         let handles = match timestretch::engine::Engine::build(config) {
             Ok(h) => h,

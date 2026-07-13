@@ -82,6 +82,14 @@ pub struct EngineConfig {
     /// Source ring capacity in frames. Must cover at least four maximum
     /// callbacks at the fastest tempo so the host has real scheduling slack.
     pub source_capacity_frames: usize,
+    /// Offline pre-analysis of the track being fed (beatgrid, onsets,
+    /// strengths). When present it is the engine's primary transient
+    /// control signal: SOLA splices steer around onsets and the PV
+    /// schedules per-band phase resets at them. Positions are absolute
+    /// track frames — anchor the feed with
+    /// [`SourceProducer::set_track_position`]. `None` falls back to online
+    /// detection.
+    pub pre_analysis: Option<std::sync::Arc<crate::core::preanalysis::PreAnalysisArtifact>>,
 }
 
 impl Default for EngineConfig {
@@ -93,6 +101,7 @@ impl Default for EngineConfig {
             initial_tempo_rate: 1.0,
             max_block_frames: 1024,
             source_capacity_frames: 32_768,
+            pre_analysis: None,
         }
     }
 }
@@ -175,6 +184,7 @@ impl Engine {
             config.sample_rate,
             initial_rate,
             config.max_block_frames,
+            config.pre_analysis.clone(),
         );
         let source = SourceProducer::new(ring);
         Ok(EngineHandles {

@@ -9,11 +9,19 @@
 
 use std::sync::Arc;
 
+use crate::core::preanalysis::PreAnalysisArtifact;
 use crate::core::ring_buffer::RingBuffer;
 use crate::engine::control::{clamp_tempo_rate, EngineShared, Param};
 use crate::engine::source::{SourceRing, TimelineMap};
-use crate::engine::stage::{BlockBuf, Stage, StageCtx, BLOCK_FRAMES};
+use crate::engine::stage::{BlockBuf, OnsetEvent, Stage, StageCtx, BLOCK_FRAMES};
+use crate::engine::stages::transient::{TransientCursor, MAX_EVENTS};
 use crate::engine::stages::varispeed::{VarispeedHead, FEED_CHUNK_FRAMES, MAX_OUT_PER_FEED};
+
+/// Blocks a fast tempo gesture holds off disruptive stage maintenance
+/// (~46 ms at 44.1 kHz) — the graph-level modulation-hold policy.
+const MODULATION_HOLD_BLOCKS: u32 = 64;
+/// Per-call rate change that counts as a fast gesture.
+const MODULATION_HOLD_TRIGGER: f64 = 1e-3;
 
 /// Audio-thread half of the engine.
 ///
@@ -49,6 +57,16 @@ pub struct EngineProcessor {
     /// Scratch for moving one fixed block through the stage chain.
     block_scratch: Vec<f32>,
     pipeline_latency_frames: usize,
+    /// Artifact cursor (None = artifact-less stream; stages fall back to
+    /// online heuristics).
+    transient: Option<TransientCursor>,
+    /// Last coherent track anchor (ring frame, track frame).
+    anchor: (u64, u64),
+    /// Ring frames already consumed when the engine (re)started; converts
+    /// the ring's monotonic timeline to this run's fed-source coordinates.
+    ring_frames_at_reset: u64,
+    /// Remaining blocks of modulation hold.
+    modulation_hold_blocks: u32,
 }
 
 impl std::fmt::Debug for EngineProcessor {
@@ -64,6 +82,7 @@ impl std::fmt::Debug for EngineProcessor {
 }
 
 impl EngineProcessor {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         shared: Arc<EngineShared>,
         ring: Arc<SourceRing>,
@@ -72,6 +91,7 @@ impl EngineProcessor {
         sample_rate: u32,
         initial_rate: f64,
         max_block_frames: usize,
+        artifact: Option<Arc<PreAnalysisArtifact>>,
     ) -> Self {
         let out_fifo_frames = max_block_frames + 2 * MAX_OUT_PER_FEED + BLOCK_FRAMES;
         let pipeline_latency_frames = stages.iter().map(|s| s.latency_frames()).sum();
@@ -96,6 +116,10 @@ impl EngineProcessor {
             block_scratch: vec![0.0; BLOCK_FRAMES * channels],
             stages,
             pipeline_latency_frames,
+            transient: artifact.map(TransientCursor::new),
+            anchor: (0, 0),
+            ring_frames_at_reset: 0,
+            modulation_hold_blocks: 0,
         }
     }
 
@@ -173,6 +197,10 @@ impl EngineProcessor {
         self.stage_in_frames = 0;
         self.delivered_frames = 0;
         self.underrun_total = 0;
+        if let Some(cursor) = self.transient.as_mut() {
+            cursor.reset();
+        }
+        self.modulation_hold_blocks = 0;
         // Bounded drain (allocation-free): a concurrently pushing producer
         // could otherwise extend this loop indefinitely.
         let max_drains = self.ring.capacity_samples() / self.feed_scratch.len() + 4;
@@ -181,6 +209,9 @@ impl EngineProcessor {
                 break;
             }
         }
+        // This run's fed-source coordinates restart at the ring's current
+        // (monotonic) consumption cursor.
+        self.ring_frames_at_reset = self.ring.head_frames();
         self.shared.publish_position(0.0, 0);
     }
 
@@ -220,7 +251,16 @@ impl EngineProcessor {
         }
         // The latest-value register is authoritative for ASAP semantics and
         // also covers any events dropped on overflow.
-        self.rate = clamp_tempo_rate(self.shared.tempo_latest());
+        let new_rate = clamp_tempo_rate(self.shared.tempo_latest());
+        if (new_rate - self.rate).abs() > MODULATION_HOLD_TRIGGER {
+            self.modulation_hold_blocks = MODULATION_HOLD_BLOCKS;
+        }
+        self.rate = new_rate;
+
+        // Refresh the track anchor (kept when a concurrent write tears).
+        if let Some(anchor) = self.ring.anchor.load() {
+            self.anchor = anchor;
+        }
     }
 
     /// Renders one caller chunk (at most `max_block_frames` frames).
@@ -292,6 +332,33 @@ impl EngineProcessor {
             self.block
                 .fill_deinterleaved(&self.block_scratch[..block_samples], BLOCK_FRAMES);
             self.stage_in_frames += BLOCK_FRAMES as u64;
+
+            // Artifact events near this block, mapped track → ring → stage.
+            let mut events: [OnsetEvent; MAX_EVENTS] = [OnsetEvent::default(); MAX_EVENTS];
+            let mut event_count = 0usize;
+            if let Some(cursor) = self.transient.as_mut() {
+                let (anchor_ring, anchor_track) = self.anchor;
+                let ring_base = self.ring_frames_at_reset;
+                let timeline = &self.timeline;
+                let mapped = cursor.advance(self.stage_in_frames as f64, |track_frame| {
+                    if track_frame < anchor_track {
+                        // Behind the anchored region: permanently passed.
+                        return Some(f64::NEG_INFINITY);
+                    }
+                    let ring_frame = anchor_ring + (track_frame - anchor_track);
+                    if ring_frame < ring_base {
+                        return Some(f64::NEG_INFINITY);
+                    }
+                    let fed_source = (ring_frame - ring_base) as f64;
+                    timeline.map_to_output(fed_source)
+                });
+                event_count = mapped.len();
+                events[..event_count].copy_from_slice(mapped);
+            }
+
+            if self.modulation_hold_blocks > 0 {
+                self.modulation_hold_blocks -= 1;
+            }
             // Delay-matched control: the rate embedded at the END of this
             // block's span on the varispeed timeline, so corrections track
             // the audio being consumed rather than the control target.
@@ -300,6 +367,9 @@ impl EngineProcessor {
                     .timeline
                     .rate_at(self.stage_in_frames as f64)
                     .unwrap_or(self.rate),
+                onsets: &events[..event_count],
+                modulation_hold: self.modulation_hold_blocks > 0,
+                has_artifact: self.transient.is_some(),
             };
             for stage in &mut self.stages {
                 stage.process(&mut self.block, &ctx);
