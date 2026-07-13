@@ -545,6 +545,35 @@ campaign so quality tuning happens under the real compute contract.
 
 Automation: manual
 
+> **Machine-side prep complete (2026-07-13):**
+>
+> **RubberBand anomaly EXPLAINED.** The historic ~−24 LUFS /
+> ~0.15-similarity "harmonic" rows are the old hybrid batch driver
+> (`src/stretch/hybrid.rs`, engaged whenever a preset is set) attenuating
+> chirp content ~28 dB uniformly at any ratio — bisected: independent of
+> HPSS/elastic/beat-aware/envelope/multi-res; `preset = None` with
+> identical fields renders healthily (RMS 0.49 vs 0.02); `normalize=true`
+> masks it. The defect retires with the hybrid at Stage 9. Confirmation:
+> the comparison harness gained `TIMESTRETCH_RUBBERBAND_ENGINE=new`
+> (pull-keylock render, DJ ratios only) — at 1.05×, edm_mix scores
+> spectral **0.972 new vs 0.950 old**, and the sweep **0.954 new vs
+> 0.154 old**. External comparisons are trustworthy for the new engine.
+>
+> **A/B matrix live** (`qa/engine_ab_matrix.rs`): one machine-readable
+> report (`ab_matrix.csv` + parity verdicts) covering cents rides
+> (±8/±4/steady), transient sharpness (±4%), top-octave retention,
+> envelope stability under crossing rides, click ratios, and corpus level
+> integrity, across old-Live / old-Club / new-keylock. First run: new
+> wins 6 of 9 rows (wide-ride cents 6.0 vs 12.2, sharpness 1.15 vs 0.71,
+> clicks 1.0 vs 2.4, steady cents 0.09 vs 0.64…); three tuning targets
+> for the campaign: ±4%-ride cents (3.4 vs 1.9 — both sub-JND), top
+> octave at 1.08 (−1.7 vs −0.8 dB, splice-phase scatter), envelope under
+> ±11% crossing (11.8 vs 10.4 dB — both dominated by the pinned PV sag).
+>
+> Remaining (manual): settle the three tuning constants with listening +
+> the matrix, define the public corpus, promote an external-reference
+> comparison to required CI, and the owner listening sign-off.
+
 ### Why
 
 This is the gate that authorizes deleting the old engine. It settles the open

@@ -6,7 +6,22 @@
 #
 # Usage:
 #   ./scripts/compare_rubberband.sh
-#   ./scripts/compare_rubberband.sh --ratios "0.75 1.5 2.0"
+#   ./scripts/compare_rubberband.sh --ratios "0.95 1.05 1.08"
+#   TIMESTRETCH_RUBBERBAND_ENGINE=new ./scripts/compare_rubberband.sh --ratios "0.95 1.05"
+#
+# Engine selection (TIMESTRETCH_RUBBERBAND_ENGINE, inherited by the test):
+#   old (default) - frozen batch stretch(). KNOWN DEFECT (explained
+#     2026-07, ROADMAP Stage 7): the hybrid batch driver attenuates chirp
+#     content ~28 dB uniformly (the "harmonic"/sweep track's historic
+#     ~-24 LUFS / ~0.15-similarity rows). preset=None renders healthily;
+#     the defect is preset-gated into src/stretch/hybrid.rs and retires
+#     with it at Stage 9.
+#   new - pull-engine keylock chain at constant rate. Only meaningful at
+#     DJ ratios (0.92-1.08, +/-20% secondary): beyond ~+/-10% rate
+#     deviation keylock deliberately fades toward plain varispeed (pitch
+#     follows tempo) while RubberBand always preserves pitch. Reference
+#     scores at 1.05x: edm_mix spectral 0.97 (old 0.95), sweep 0.95
+#     (old 0.15).
 
 set -euo pipefail
 

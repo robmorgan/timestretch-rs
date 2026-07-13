@@ -112,3 +112,8 @@ required-features = ["qa-harnesses"]
 name = "engine_wcet"
 path = "qa/engine_wcet.rs"
 required-features = ["qa-harnesses"]
+
+[[test]]
+name = "engine_ab_matrix"
+path = "qa/engine_ab_matrix.rs"
+required-features = ["qa-harnesses"]
