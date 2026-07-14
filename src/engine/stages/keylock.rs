@@ -31,8 +31,8 @@ use crate::engine::stages::sola::SolaCorrector;
 /// above 5%), 9% → 12% (2026-07-14, PV phasey/robotic at −9.7% on a full
 /// mix), and 12% → 22% (2026-07-14 again: the same artifact reappeared at
 /// −14.1%, i.e. at every boundary the PV was put behind). The threshold
-/// now equals [`CORRECTION_FADE_END_DEV`]: **SOLA owns the entire
-/// corrected range**, and the PV engages only past the fade end, where
+/// now equals `CORRECTION_FADE_END_DEV` (the fade end): **SOLA owns
+/// the entire corrected range**, and the PV engages only past the fade end, where
 /// the correction weight is zero and the handoff is inaudible by
 /// construction. Measured on the adversarial multitone the two tie in
 /// the deep fade region (fade attenuation dominating) and SOLA wins on
