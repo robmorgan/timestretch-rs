@@ -348,16 +348,12 @@ fn engine_keylock_torture_threshold_crossing_no_clicks() {
     }
     let swing_db = 20.0 * (max_rms / min_rms).log10();
     println!("threshold-crossing envelope swing: {swing_db:.2} dB");
-    // Measured 2026-07 at the ±11% ride: 11.6 dB, dominated NOT by the
-    // handoffs (clicks/p95 above stay clean) but by the PV's known level
-    // sag after fast unity-crossing transposition rides — this gesture's
-    // extremes sit deep in PV territory (pinned in `pv_corrector` unit
-    // tests; the old engine measures 12.7 dB at just ±7.5% on this
-    // fixture). Gate at a regression envelope above the measured value;
-    // tighten substantially when the PV sag is fixed (Stage 4 phase
-    // resets are the lever).
+    // Re-derived at Stage 9 (PV corrector deleted; SOLA carries the whole
+    // corrected range): measured 0.03 dB on this ride — the old engine
+    // measured 12.7 dB at just ±7.5%, and the PV-era chain 11.6 dB. Gate
+    // with a wide regression envelope over the measured value.
     assert!(
-        swing_db <= 13.0,
+        swing_db <= 1.0,
         "envelope swings {swing_db:.2} dB across the threshold ride \
          (known envelope 11.6 dB from the pinned PV sag)"
     );

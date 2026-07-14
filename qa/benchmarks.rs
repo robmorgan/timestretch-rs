@@ -221,56 +221,6 @@ fn bench_fft_sizes() {
 }
 
 #[test]
-fn bench_streaming() {
-    println!("\n=== Streaming Benchmarks ===");
-
-    let sample_rate = 44100;
-    let signal = generate_sine(sample_rate, 440.0, 10.0);
-
-    for (label, chunk_size, ratio) in &[
-        ("Stream 256-sample callbacks, 1.02x", 256usize, 1.02),
-        ("Stream 1024-sample chunks, 1.02x", 1024, 1.02),
-        ("Stream 1024-sample chunks, 1.5x", 1024, 1.5),
-        ("Stream 4096-sample chunks, 1.5x", 4096, 1.5),
-    ] {
-        let params = StretchParams::new(*ratio)
-            .with_sample_rate(sample_rate)
-            .with_channels(1);
-
-        let mut processor = timestretch::StreamProcessor::new(params);
-        let mut callback_output = Vec::with_capacity(signal.len().saturating_mul(3));
-
-        let start = Instant::now();
-        let mut total_output = 0usize;
-
-        for chunk in signal.chunks(*chunk_size) {
-            callback_output.clear();
-            processor.process_into(chunk, &mut callback_output).unwrap();
-            total_output += callback_output.len();
-        }
-
-        callback_output.clear();
-        processor.flush_into(&mut callback_output).unwrap();
-        total_output += callback_output.len();
-
-        let elapsed = start.elapsed();
-        let process_ms = elapsed.as_secs_f64() * 1000.0;
-        let input_duration = signal.len() as f64 / sample_rate as f64;
-        let realtime_factor = input_duration / (process_ms / 1000.0);
-
-        println!(
-            "  {:<45} {:>8.1}ms  {:>7} -> {:>7} samples  ({:.1}s audio)  {:.1}x realtime",
-            label,
-            process_ms,
-            signal.len(),
-            total_output,
-            input_duration,
-            realtime_factor,
-        );
-    }
-}
-
-#[test]
 fn bench_signal_lengths() {
     println!("\n=== Signal Length Scaling (mono 1.5x stretch) ===");
 

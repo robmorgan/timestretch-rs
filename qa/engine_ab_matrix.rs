@@ -6,10 +6,10 @@
 //!
 //! Writes `ab_matrix.csv` to `TIMESTRETCH_QUALITY_DASHBOARD_DIR` (or
 //! `target/ab_matrix/`) with one row per (metric, fixture, arm) plus a
-//! parity verdict per metric (new vs old-Live on the same fixture; the
-//! binding definition is new ≥ old on the same fixture and metric).
-//! This harness REPORTS; the Stage 7 sign-off decides which rows become
-//! hard gates and at what thresholds.
+//! absolute gate per metric. Thresholds re-derived at Stage 9 from
+//! new-engine measurements (the old-engine arms and the relative parity
+//! verdicts retired with the old engine; every gate carries the Stage 8
+//! measured value it was derived from).
 
 // Each harness compiles the shared adapter separately, so arms another
 // harness uses read as dead code here.
@@ -22,7 +22,6 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use ab::{render_with_rate_schedule, Arm};
-use timestretch::StreamProfile;
 
 const SAMPLE_RATE: u32 = 44_100;
 const CALLBACK_FRAMES: usize = 256;
@@ -233,16 +232,10 @@ struct Row {
     fixture: &'static str,
     arm: &'static str,
     value: f64,
-    /// Whether larger is better (for the parity verdict).
-    higher_better: bool,
 }
 
-fn arms() -> [(Arm, &'static str); 3] {
-    [
-        (Arm::OldVarispeed(StreamProfile::Live), "old-live"),
-        (Arm::OldVarispeed(StreamProfile::Club), "old-club"),
-        (Arm::NewKeylock, "new-keylock"),
-    ]
+fn arms() -> [(Arm, &'static str); 1] {
+    [(Arm::NewKeylock, "new-keylock")]
 }
 
 fn render(arm: Arm, input: &[f32], rate_at: &dyn Fn(f64) -> f64) -> Vec<f32> {
@@ -263,21 +256,18 @@ fn ab_matrix_report() {
             fixture: "tone440",
             arm: name,
             value: cents_p95(&render(arm, &tone, &wide), 440.0),
-            higher_better: false,
         });
         rows.push(Row {
             metric: "cents_p95_ride4",
             fixture: "tone440",
             arm: name,
             value: cents_p95(&render(arm, &tone, &dj), 440.0),
-            higher_better: false,
         });
         rows.push(Row {
             metric: "cents_p95_steady106",
             fixture: "tone440",
             arm: name,
             value: cents_p95(&render(arm, &tone, &|_| 1.06), 440.0),
-            higher_better: false,
         });
     }
 
@@ -294,7 +284,6 @@ fn ab_matrix_report() {
                 fixture: "clicks",
                 arm: name,
                 value: sharpness(&render(arm, &clicks, &|_| rate), rate),
-                higher_better: true,
             });
         }
     }
@@ -307,7 +296,6 @@ fn ab_matrix_report() {
             fixture: "multitone",
             arm: name,
             value: hf_retention_db(&render(arm, &tones, &|_| 1.08), &tones),
-            higher_better: true,
         });
     }
 
@@ -320,7 +308,6 @@ fn ab_matrix_report() {
             fixture: "tone880",
             arm: name,
             value: envelope_swing_db(&render(arm, &tone_hi, &cross)),
-            higher_better: false,
         });
     }
 
@@ -339,7 +326,6 @@ fn ab_matrix_report() {
                 0.5,
                 1.0,
             ),
-            higher_better: false,
         });
     }
 
@@ -352,7 +338,6 @@ fn ab_matrix_report() {
                 fixture: "edm_mix",
                 arm: name,
                 value: level_db(&render(arm, mix, &|_| 1.06), mix),
-                higher_better: false, // judged as |value|, see verdicts
             });
         }
     } else {
@@ -380,38 +365,49 @@ fn ab_matrix_report() {
         );
     }
 
-    // Parity verdicts: new vs old-live per metric (same fixture).
-    println!("--- parity (new-keylock vs old-live; binding: new >= old) ---");
-    let mut verdicts = String::from("metric,fixture,old_live,new_keylock,new_wins_or_ties\n");
-    let metrics: Vec<(&str, &str, bool)> = rows
-        .iter()
-        .filter(|r| r.arm == "old-live")
-        .map(|r| (r.metric, r.fixture, r.higher_better))
-        .collect();
-    for (metric, fixture, higher_better) in metrics {
-        let get = |arm: &str| {
-            rows.iter()
-                .find(|r| r.metric == metric && r.fixture == fixture && r.arm == arm)
-                .map(|r| r.value)
-                .unwrap_or(f64::NAN)
-        };
-        let old = get("old-live");
-        let new = get("new-keylock");
-        // Level rows judge distance from 0 dB; others by direction.
-        let wins = if metric.starts_with("level_db") {
-            new.abs() <= old.abs() + 0.25
-        } else if higher_better {
-            new >= old * 0.95
+    // Absolute gates, re-derived at Stage 9. Each threshold sits well
+    // above (or below) the Stage 8 measured value in parentheses, wide
+    // enough for runner variance, tight enough that a regression toward
+    // the old engine's numbers (also in parentheses) trips it.
+    let gates: [(&str, f64, bool); 8] = [
+        ("cents_p95_ride8", 1.5, false),      // measured 0.57 (old: 12.19)
+        ("cents_p95_ride4", 0.8, false),      // measured 0.23 (old: 1.86)
+        ("cents_p95_steady106", 1.0, false),  // measured 0.52 (old: 0.63)
+        ("sharpness_rate104", 0.90, true),    // measured 1.16 (old: 0.71)
+        ("sharpness_rate096", 0.90, true),    // measured 1.29 (old: 0.74)
+        ("hf_retention_db_108", -1.0, true),  // measured -0.41 (old: -0.79)
+        ("env_swing_db_cross11", 1.0, false), // measured 0.03 (old: 10.36)
+        ("click_ratio_ride6", 1.3, false),    // measured 1.00 (old: 2.40)
+    ];
+    println!("--- absolute gates (re-derived at Stage 9) ---");
+    for (metric, bound, higher_better) in gates {
+        let value = rows
+            .iter()
+            .find(|r| r.metric == metric)
+            .map(|r| r.value)
+            .unwrap_or(f64::NAN);
+        let ok = if higher_better {
+            value >= bound
         } else {
-            new <= old * 1.05 + 0.25
+            value <= bound
         };
-        println!("parity: {metric:<22} {fixture:<10} old={old:>9.3} new={new:>9.3} ok={wins}");
-        verdicts.push_str(&format!("{metric},{fixture},{old},{new},{wins}\n"));
+        println!("gate: {metric:<22} value={value:>9.3} bound={bound:>7.2} ok={ok}");
         assert!(
-            old.is_finite() && new.is_finite(),
-            "matrix row not finite: {metric}/{fixture}"
+            ok && value.is_finite(),
+            "matrix gate failed: {metric} = {value:.3} vs bound {bound}"
         );
     }
-    fs::write(dir.join("ab_matrix_parity.csv"), verdicts).expect("write parity csv");
+    // Level integrity gate (corpus-dependent row; |dB from unity|).
+    if let Some(level) = rows
+        .iter()
+        .find(|r| r.metric == "level_db_steady106")
+        .map(|r| r.value)
+    {
+        println!(
+            "gate: level_db_steady106     value={level:>9.3} bound=|0.50| ok={}",
+            level.abs() <= 0.5
+        );
+        assert!(level.abs() <= 0.5, "level gate failed: {level:.3} dB"); // measured -0.12 (old: -0.29)
+    }
     println!("ab-matrix: wrote {}", csv_path.display());
 }

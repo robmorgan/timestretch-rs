@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use timestretch::{EdmPreset, PreAnalysisArtifact};
+use timestretch::{PreAnalysisArtifact};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Transport {
@@ -40,79 +40,42 @@ impl PresetChoice {
         }
     }
 
-    pub fn to_edm_preset(self) -> Option<EdmPreset> {
-        match self {
-            PresetChoice::None => None,
-            PresetChoice::DjBeatmatch => Some(EdmPreset::DjBeatmatch),
-            PresetChoice::HouseLoop => Some(EdmPreset::HouseLoop),
-            PresetChoice::Halftime => Some(EdmPreset::Halftime),
-            PresetChoice::Ambient => Some(EdmPreset::Ambient),
-            PresetChoice::VocalChop => Some(EdmPreset::VocalChop),
-        }
-    }
 }
 
 /// Which engine architecture drives the deck (ROADMAP new Stage 1).
 ///
-/// `Legacy` is the frozen push-based `StreamProcessor` pipeline; `PullTape`
+/// `PullTape`
 /// is the new pull-based engine in tape mode (pitch follows tempo, zero
 /// pipeline delay). The desktop is the new engine's reference integration
 /// and drives it pull-native — no push-compat shim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeckEngine {
-    Legacy,
     PullTape,
     PullKeylock,
 }
 
 impl DeckEngine {
     pub const ALL: &'static [DeckEngine] = &[
-        DeckEngine::Legacy,
         DeckEngine::PullTape,
         DeckEngine::PullKeylock,
     ];
 
     pub fn label(&self) -> &'static str {
         match self {
-            DeckEngine::Legacy => "Legacy (push)",
             DeckEngine::PullTape => "Pull — Tape",
             DeckEngine::PullKeylock => "Pull — Keylock",
         }
     }
 
-    pub fn is_pull(&self) -> bool {
-        !matches!(self, DeckEngine::Legacy)
-    }
 }
 
-// The streaming latency/quality profile is now a first-class library
-// concept; the desktop app re-exports it for its UI.
-pub use timestretch::StreamProfile;
-// Stream-mode rendering engine (deterministic single-PV vs multi-resolution
-// filterbank), likewise a library concept re-exported for the UI.
-pub use timestretch::StreamingEngine;
-// Tempo control path (vocoder-implements-tempo vs varispeed-first keylock),
-// likewise a library concept re-exported for the UI.
-pub use timestretch::ControlPath;
 
 /// State shared between UI, processing, and audio threads.
 pub struct SharedState {
     pub transport: Transport,
     pub stretch_ratio: f64,
-    pub pitch_semitones: f32,
     pub volume: f32,
     pub preset: PresetChoice,
-    pub stream_profile: StreamProfile,
-    /// Preferred stream-mode rendering engine. Applied at every processor
-    /// build; the multi-resolution engine needs the Club profile or larger,
-    /// so on the Live profile the build falls back to deterministic (the
-    /// preference is kept and re-applies when the profile allows it).
-    pub streaming_engine: StreamingEngine,
-    /// Tempo control path. Varispeed-first (keylock) is the DJ default:
-    /// instant tempo response with the vocoder gate as constant, host-
-    /// compensated pipeline delay. Applied at every processor build; falls
-    /// back to the vocoder path if the ratio is outside the varispeed range.
-    pub control_path: ControlPath,
     /// Deck engine architecture. Takes effect at the next playback start
     /// (the two pipelines are wired completely differently).
     pub deck_engine: DeckEngine,
@@ -130,8 +93,6 @@ pub struct SharedState {
 
     /// Set by UI to request a seek.
     pub seek_request: Option<usize>,
-    /// Set by UI when preset changes (requires rebuilding processor).
-    pub preset_changed: bool,
 
     /// Constant pipeline (content) delay reported by the active processor,
     /// in seconds. Published by the processing thread at every build; read
@@ -166,12 +127,8 @@ impl SharedState {
         Self {
             transport: Transport::Stopped,
             stretch_ratio: 1.0,
-            pitch_semitones: 0.0,
             volume: 0.8,
             preset: PresetChoice::DjBeatmatch,
-            stream_profile: StreamProfile::Club,
-            streaming_engine: StreamingEngine::Deterministic,
-            control_path: ControlPath::VarispeedFirst,
             deck_engine: DeckEngine::PullKeylock,
             position_frames: 0,
             total_frames: 0,
@@ -179,7 +136,6 @@ impl SharedState {
             detected_bpm: 0.0,
             target_bpm: 0.0,
             seek_request: None,
-            preset_changed: false,
             reported_latency_secs: 0.0,
             reported_control_latency_secs: 0.0,
             pre_analysis: None,

@@ -750,9 +750,25 @@ the old batch-quality ambitions (previous Stages 2–5) are formally closed.
   output without truncation hacks.
 - `timestretch-cli` runs on the new engine end-to-end.
 
-## [ ] Stage 9: Cutover and Deletion
+## [x] Stage 9: Cutover and Deletion
 
 Automation: auto
+
+> **Completed 2026-07-15.** Deleted: `src/stream/` (processor +
+> transient scheduler), `src/stretch/{hybrid,multi_resolution,stereo,
+> wsola}.rs`, `src/analysis/adaptive_snapshot.rs`, the push API surface
+> (`StreamProcessor`, `StreamingEngine`, `StreamProfile`, `ControlPath`,
+> …), the frozen old-surface tests, and the old-engine QA harnesses.
+> The live keylock chain dropped its PV corrector (SOLA carries the
+> whole corrected range; the chain's constant delay is now its own
+> `KEYLOCK_LATENCY_FRAMES`). Desktop runs pull-only (Legacy deck and
+> legacy-only pitch-shift UI removed); CLI is batch-on-engine only.
+> QA re-anchored: the A/B adapter collapsed to new-engine-only, the
+> matrix gates on absolute thresholds derived from measured values, the
+> torture envelope gate re-derived 13 dB → 1 dB (measured 0.03), and
+> the external-reference gate dropped its hybrid-baseline arm. Version
+> 0.8.0 with a breaking-change changelog. `grep` is clean of the
+> removed API; all suites green.
 
 ### Why
 

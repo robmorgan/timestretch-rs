@@ -1,17 +1,13 @@
-//! Time stretching algorithms: phase vocoder, WSOLA, and the hybrid combiner.
+//! Batch time-stretching DSP retained by the engine: the phase vocoder
+//! (the offline wide-ratio path and analysis tooling) and its support
+//! modules. The hybrid combiner, multi-resolution stretcher, WSOLA
+//! driver and stereo mid/side wrapper were deleted with the old engine
+//! at ROADMAP Stage 9.
 
 pub mod envelope;
-pub mod hybrid;
-pub mod multi_resolution;
 pub mod params;
 pub mod phase_locking;
 pub mod phase_vocoder;
-pub mod stereo;
-pub mod wsola;
 
-pub use hybrid::HybridStretcher;
-pub use multi_resolution::MultiResolutionStretcher;
 pub use phase_locking::PhaseLockingMode;
 pub use phase_vocoder::{PerFrameFlux, PhaseVocoder};
-pub use stereo::StereoMode;
-pub use wsola::Wsola;

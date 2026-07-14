@@ -1,11 +1,10 @@
 mod common;
 
 use common::{
-    best_lag_crosscorr, count_positive_zero_crossings, detect_peaks, energy_at_freq,
-    estimate_freq_zero_crossings, gen_click_pad, gen_impulse_train, gen_sine, gen_two_tone,
-    rmse_with_lag, run_streaming_mono, windowed_rms,
+    best_lag_crosscorr, detect_peaks, energy_at_freq, estimate_freq_zero_crossings, gen_click_pad,
+    gen_impulse_train, gen_sine, gen_two_tone, rmse_with_lag, windowed_rms,
 };
-use timestretch::{stretch, EdmPreset, StreamProcessor, StretchParams};
+use timestretch::{stretch, EdmPreset, StretchParams};
 
 const SR: u32 = 44_100;
 const N_IDENTITY: usize = 10_000;
@@ -99,159 +98,6 @@ fn test_sinusoid_2x_offline_preserves_pitch_and_shape() {
         "ratio=2.0 phase-aligned steady RMSE too high: rmse={:.6}, lag={}",
         steady_rmse,
         lag
-    );
-}
-
-#[test]
-fn test_streaming_chunk_sweep_zero_crossings_and_safety() {
-    let ratio = 1.5;
-    let n = 40_000usize;
-    let freq = 441.0;
-    let step = n / 10;
-    let input = gen_sine(freq, SR, n, |i| ((i / step).min(9) as f32 + 1.0) / 10.0);
-
-    for &bs in &[64usize, 128, 256, 512, 1024, 2048] {
-        let output =
-            run_streaming_mono(&input, parity_params(ratio), bs).expect("streaming failed");
-        assert!(
-            !output.is_empty(),
-            "streaming produced no output for chunk_size={}",
-            bs
-        );
-        assert!(
-            output.iter().all(|s| s.is_finite()),
-            "streaming produced NaN/Inf for chunk_size={}",
-            bs
-        );
-        let max_abs = output.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-        assert!(
-            max_abs < 1.5,
-            "streaming spike for chunk_size={}: max_abs={}",
-            bs,
-            max_abs
-        );
-
-        for chunk in 0..20 {
-            let i0 = output.len() * chunk / 20;
-            let i1 = output.len() * (chunk + 1) / 20;
-            if i1 <= i0 + 4 {
-                continue;
-            }
-
-            let actual = count_positive_zero_crossings(&output, i0, i1) as isize;
-            let expected = ((freq as f64 * (i1 - i0) as f64) / SR as f64).round() as isize;
-            let diff = (actual - expected).abs();
-            assert!(
-                diff <= 1,
-                "chunk-size pitch drift: bs={} chunk={} expected_crossings={} actual_crossings={} diff={}",
-                bs,
-                chunk,
-                expected,
-                actual,
-                diff
-            );
-        }
-    }
-}
-
-#[test]
-fn test_streaming_chunk_sweep_amplitude_mapping() {
-    let ratio = 1.5;
-    let n = 40_000usize;
-    let freq = 441.0;
-    let step = n / 10;
-    let input = gen_sine(freq, SR, n, |i| ((i / step).min(9) as f32 + 1.0) / 10.0);
-
-    for &bs in &[64usize, 128, 256, 512, 1024, 2048] {
-        let output =
-            run_streaming_mono(&input, parity_params(ratio), bs).expect("streaming failed");
-        let mut prev = 0.0f64;
-        let mut abs_error_sum = 0.0f64;
-
-        for plateau in 0..10 {
-            let plateau_start = output.len() * plateau / 10;
-            let plateau_end = output.len() * (plateau + 1) / 10;
-            let plateau_len = plateau_end.saturating_sub(plateau_start);
-            let trim = plateau_len / 4;
-            let window_start = (plateau_start + trim).min(plateau_end);
-            let window_len = plateau_len.saturating_sub(trim * 2).max(1);
-            let rms = windowed_rms(&output, window_start, window_len);
-            let expected_amp = (plateau as f64 + 1.0) / 10.0;
-            let expected_rms = expected_amp / 2.0_f64.sqrt();
-            let err = (rms - expected_rms).abs();
-            abs_error_sum += err;
-
-            assert!(
-                rms + 0.05 >= prev,
-                "envelope non-monotonic for chunk_size={}: plateau={} prev_rms={:.6} curr_rms={:.6}",
-                bs,
-                plateau,
-                prev,
-                rms
-            );
-            assert!(
-                err <= 0.10,
-                "envelope mapping error too high for chunk_size={}: plateau={} expected_rms={:.6} got_rms={:.6}",
-                bs,
-                plateau,
-                expected_rms,
-                rms
-            );
-            prev = rms;
-        }
-
-        let mean_abs_error = abs_error_sum / 10.0;
-        assert!(
-            mean_abs_error < 0.05,
-            "mean envelope error too high for chunk_size={}: mae={:.6}",
-            bs,
-            mean_abs_error
-        );
-    }
-}
-
-#[test]
-fn test_streaming_large_block_robustness_80k() {
-    let ratio = 1.8;
-    let params = parity_params(ratio);
-    let input = gen_sine(330.0, SR, 160_000, |_| 0.75);
-
-    let mut processor = StreamProcessor::new(params);
-    let mut output = Vec::new();
-    let mut emitted_after_prime = false;
-
-    for (i, chunk) in input.chunks(80_000).enumerate() {
-        let rendered = processor
-            .process(chunk)
-            .expect("streaming process failed on large block");
-        if i > 0 && !rendered.is_empty() {
-            emitted_after_prime = true;
-        }
-        output.extend_from_slice(&rendered);
-    }
-    output.extend_from_slice(
-        &processor
-            .flush()
-            .expect("streaming flush failed after large blocks"),
-    );
-
-    assert!(
-        emitted_after_prime,
-        "possible stream stall: no output emitted after priming large blocks"
-    );
-    assert!(
-        output.iter().all(|s| s.is_finite()),
-        "large-block streaming produced NaN/Inf samples"
-    );
-
-    let expected = (input.len() as f64 * ratio).round() as isize;
-    let diff = (output.len() as isize - expected).abs();
-    assert!(
-        diff <= 96,
-        "large-block streaming length drift too high: expected={} got={} diff={}",
-        expected,
-        output.len(),
-        diff
     );
 }
 
@@ -443,52 +289,4 @@ fn test_ratio_sweep_click_pad_transient_survival() {
             );
         }
     }
-}
-
-#[test]
-fn test_realtime_pitch_scale_changes_pitch_without_tempo_drift() {
-    let params = StretchParams::new(1.0)
-        .with_sample_rate(44_100)
-        .with_channels(1)
-        .with_fft_size(1024)
-        .with_hop_size(256);
-    let mut processor = StreamProcessor::new(params);
-
-    assert!((processor.pitch_scale() - 1.0).abs() < 1e-9);
-    processor
-        .set_pitch_scale(0.97)
-        .expect("valid pitch scale should be accepted");
-    assert!((processor.pitch_scale() - 0.97).abs() < 1e-9);
-    assert!(processor.set_pitch_scale(0.0).is_err());
-
-    let input = gen_sine(440.0, SR, SR as usize, |_| 0.8);
-    let mut output = Vec::with_capacity(input.len() * 2);
-    for chunk in input.chunks(1024) {
-        processor
-            .process_into(chunk, &mut output)
-            .expect("pitch-scaled stream process failed");
-    }
-    processor
-        .flush_into(&mut output)
-        .expect("pitch-scaled stream flush failed");
-
-    let expected_len = input.len() as isize;
-    let len_diff = (output.len() as isize - expected_len).abs();
-    assert!(
-        len_diff <= 96,
-        "tempo drift too high under pitch scaling: expected={} got={} diff={}",
-        expected_len,
-        output.len(),
-        len_diff
-    );
-
-    let trim = 4096usize.min(output.len() / 4);
-    let start = trim;
-    let end = output.len().saturating_sub(trim).max(start + 2);
-    let measured = estimate_freq_zero_crossings(&output, SR, start, end);
-    assert!(
-        measured < 430.0,
-        "expected pitch-down shift from scale=0.97, got {:.3}Hz",
-        measured
-    );
 }

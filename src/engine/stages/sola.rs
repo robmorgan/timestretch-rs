@@ -7,11 +7,11 @@
 //! correlation-matched jump with an equal-power crossfade, placed at
 //! low-energy moments when possible (onset snapping deepens in Stage 4).
 //!
-//! The nominal lag equals the PV corrector's constant latency, so the two
-//! correctors are interchangeable mid-stream: handoff is latency-neutral
-//! and the low band's matching delay never changes. The SOLA algorithm
-//! itself only needs the sinc margin (~0.5 ms) — the shared lag exists for
-//! the chain, not the splicer.
+//! The nominal lag is the keylock chain's constant latency (see
+//! `KEYLOCK_LATENCY_FRAMES`): the SOLA algorithm itself only needs the
+//! sinc margin (~0.5 ms), but the elastic drift triggers and splice
+//! search need real headroom behind the cursor, and the low band's
+//! matching delay is anchored on the same figure.
 //!
 //! Splice decisions are made once per block on the channel mix and applied
 //! to every channel identically, keeping the stereo image intact.
@@ -183,8 +183,6 @@ pub(crate) struct SolaCorrector {
     energy_avg: f64,
     /// Splices executed since reset (observability for tests/QA).
     splice_count: u64,
-    /// A recentering splice is pending (keylock release handoff prep).
-    recenter_requested: bool,
     /// Consecutive blocks with the transposition inside [`REST_DEV`].
     rest_blocks: u32,
 }
@@ -215,7 +213,6 @@ impl SolaCorrector {
             nominal_lag: nominal_lag_frames as f64,
             energy_avg: 0.0,
             splice_count: 0,
-            recenter_requested: false,
             rest_blocks: 0,
         }
     }
@@ -248,31 +245,6 @@ impl SolaCorrector {
         (self.write_abs as f64 - self.read_pos) - self.nominal_lag
     }
 
-    /// Hard-recenters the read cursor to the exact nominal lag, discarding
-    /// any elastic drift and in-flight crossfade. Audibly discontinuous —
-    /// only call while this corrector's output is faded out (the keylock
-    /// stage uses it to phase-align a PV→SOLA handoff for free).
-    pub(crate) fn recenter_hard(&mut self) {
-        self.read_pos = self.write_abs as f64 - self.nominal_lag;
-        self.xfade_remaining = 0;
-        self.recenter_requested = false;
-    }
-
-    /// Requests an audible-path recentering splice: at the next opportunity
-    /// the corrector splices its elastic drift away (correlation-matched,
-    /// so the jump lands on the dominant content's period grid nearest
-    /// zero — leaving the output phase-aligned with a fixed-latency
-    /// reference like the PV corrector). Keylock release-handoff prep.
-    pub(crate) fn request_recenter_splice(&mut self) {
-        self.recenter_requested = true;
-    }
-
-    /// Whether the cursor is recentered enough to hand off: no pending
-    /// recenter request and no in-flight splice fade.
-    pub(crate) fn is_recentered(&self) -> bool {
-        !self.recenter_requested && self.xfade_remaining == 0
-    }
-
     pub(crate) fn reset(&mut self) {
         for ch in &mut self.channels {
             ch.ring.fill(0.0);
@@ -283,7 +255,6 @@ impl SolaCorrector {
         self.xfade_remaining = 0;
         self.energy_avg = 0.0;
         self.splice_count = 0;
-        self.recenter_requested = false;
         self.rest_blocks = 0;
         self.rate_slope = 0.0;
     }
@@ -345,13 +316,7 @@ impl SolaCorrector {
         };
         if self.xfade_remaining == 0 {
             let drift = self.lag_error_frames();
-            if self.recenter_requested {
-                // Handoff prep: splice the drift away now, bypassing the
-                // transient postpone (a pending handoff outranks it).
-                if drift.abs() < 8.0 || self.try_splice_forced(drift) {
-                    self.recenter_requested = false;
-                }
-            } else if drift.abs() > DRIFT_TRIGGER {
+            if drift.abs() > DRIFT_TRIGGER {
                 // Onset protection applies inside the candidate search; the
                 // HARD trigger forces through it eventually.
                 self.try_splice(drift, onsets);
@@ -435,11 +400,6 @@ impl SolaCorrector {
     fn try_splice(&mut self, drift: f64, onsets: &[OnsetEvent]) {
         let force = drift.abs() >= HARD_TRIGGER;
         let _ = self.plan_splice(drift, force, onsets);
-    }
-
-    /// Handoff-requested splice: always forced. Returns whether it ran.
-    fn try_splice_forced(&mut self, drift: f64) -> bool {
-        self.plan_splice(drift, true, &[])
     }
 
     /// Plans and starts a correlation-matched splice toward the nominal

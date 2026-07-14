@@ -1,7 +1,7 @@
 //! Integration tests for creative audio effects combining new AudioBuffer APIs
 //! with time stretching, demonstrating real-world DJ and production workflows.
 
-use timestretch::{AudioBuffer, EdmPreset, StreamProcessor, StretchParams, WindowType};
+use timestretch::{AudioBuffer, EdmPreset, StretchParams, WindowType};
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -440,50 +440,3 @@ fn dc_removal_in_processing_chain() {
 }
 
 // ─── StreamProcessor with new APIs ────────────────────────────────────
-
-#[test]
-fn streaming_with_tone_factory() {
-    let tone = AudioBuffer::tone(440.0, 44100, 2.0, 0.6);
-
-    let mut proc = StreamProcessor::from_tempo(126.0, 128.0, 44100, 1);
-    let mut output = Vec::new();
-    for chunk in tone.data.chunks(4096) {
-        if let Ok(out) = proc.process(chunk) {
-            output.extend_from_slice(&out);
-        }
-    }
-    if let Ok(out) = proc.flush() {
-        output.extend_from_slice(&out);
-    }
-
-    assert!(
-        !output.is_empty(),
-        "Streaming with tone factory should produce output"
-    );
-    // Check target_bpm getter
-    let target = proc.target_bpm().unwrap();
-    assert!((target - 128.0).abs() < 0.1);
-}
-
-#[test]
-fn streaming_target_ratio_tracks_changes() {
-    let mut proc = StreamProcessor::from_tempo(126.0, 128.0, 44100, 1);
-
-    let initial_target = proc.target_stretch_ratio();
-    assert!((initial_target - 126.0 / 128.0).abs() < 1e-6);
-
-    proc.set_tempo(130.0);
-    let new_target = proc.target_stretch_ratio();
-    assert!(
-        (new_target - 126.0 / 130.0).abs() < 1e-6,
-        "Target ratio should update immediately: expected {}, got {}",
-        126.0 / 130.0,
-        new_target
-    );
-
-    // Current ratio should still be near the old value (not yet interpolated)
-    assert!(
-        (proc.current_stretch_ratio() - initial_target).abs() < 0.1,
-        "Current ratio should lag behind target"
-    );
-}

@@ -1,32 +1,22 @@
-//! Engine-agnostic A/B adapter (ROADMAP new Stage 1).
+//! Fixture-driving adapter for the engine QA harnesses (originally the
+//! old-vs-new A/B adapter from ROADMAP Stage 1; the old push-engine arm
+//! was deleted with the old engine at Stage 9, and every gate is anchored
+//! on absolute thresholds re-derived from new-engine measurements).
 //!
-//! Drives either the frozen push-based [`StreamProcessor`] or the new
-//! pull-based engine over **identical fixtures** — same source samples,
-//! same callback size, same per-callback tempo-rate schedule — so every
-//! later stage can measure new-vs-old directly on the same metric. Parity
-//! is always "new ≥ old on the same fixture and metric", never similarity
-//! to the old engine's output.
-//!
-//! Tempo language: the schedule speaks **rate** (playback speed multiplier,
-//! the new engine's native control). The old arm receives the reciprocal as
-//! its stretch ratio.
+//! Drives the pull engine over deterministic fixtures — source samples,
+//! callback size, and a per-callback tempo-rate schedule.
 
 use std::sync::Arc;
 
 use timestretch::engine::{Engine, EngineConfig, EngineProfile};
-use timestretch::{
-    ControlPath, PreAnalysisArtifact, StreamProcessor, StreamProfile, StretchParams,
-};
+use timestretch::PreAnalysisArtifact;
 
-/// Which engine renders the fixture.
+/// Which profile renders the fixture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arm {
-    /// Frozen push engine on the varispeed-first control path (full-band
-    /// keylock: the PV corrects everything, sub-bass included).
-    OldVarispeed(StreamProfile),
-    /// New pull engine, tape profile (pitch follows tempo).
+    /// Pull engine, tape profile (pitch follows tempo).
     NewTape,
-    /// New pull engine, keylock profile (two-band: low band follows tempo,
+    /// Pull engine, keylock profile (two-band: low band follows tempo,
     /// high band corrected).
     NewKeylock,
 }
@@ -57,10 +47,9 @@ pub fn render_new_keylock_with_artifact(
 pub struct AbRender {
     /// Interleaved output samples.
     pub output: Vec<f32>,
-    /// Mid-stream source underrun frames (new arm only; the push arm cannot
-    /// underrun). Excludes the final callback's expected end-of-stream
-    /// shortfall, which the adapter uses to detect termination and trims
-    /// from the output.
+    /// Mid-stream source underrun frames. Excludes the final callback's
+    /// expected end-of-stream shortfall, which the adapter uses to detect
+    /// termination and trims from the output.
     pub underrun_frames: u64,
 }
 
@@ -79,14 +68,6 @@ pub fn render_with_rate_schedule(
     rate_at: &dyn Fn(f64) -> f64,
 ) -> AbRender {
     match arm {
-        Arm::OldVarispeed(profile) => render_old(
-            profile,
-            input,
-            channels,
-            sample_rate,
-            callback_frames,
-            rate_at,
-        ),
         Arm::NewTape => render_new(
             EngineProfile::Tape,
             input,
@@ -103,40 +84,6 @@ pub fn render_with_rate_schedule(
             callback_frames,
             rate_at,
         ),
-    }
-}
-
-fn render_old(
-    profile: StreamProfile,
-    input: &[f32],
-    channels: usize,
-    sample_rate: u32,
-    callback_frames: usize,
-    rate_at: &dyn Fn(f64) -> f64,
-) -> AbRender {
-    let params = StretchParams::new(1.0)
-        .with_sample_rate(sample_rate)
-        .with_channels(channels as u32)
-        .with_stream_profile(profile);
-    let mut processor = StreamProcessor::new(params);
-    processor
-        .set_control_path(ControlPath::VarispeedFirst)
-        .expect("varispeed control path");
-
-    let chunk = callback_frames * channels;
-    let mut output: Vec<f32> = Vec::with_capacity(input.len() * 4 + 65_536);
-    for (ci, block) in input.chunks(chunk).enumerate() {
-        let t = (ci * callback_frames) as f64 / sample_rate as f64;
-        let rate = rate_at(t).clamp(0.25, 4.0);
-        processor
-            .set_stretch_ratio(1.0 / rate)
-            .expect("ratio in varispeed range");
-        processor.process_into(block, &mut output).expect("process");
-    }
-    processor.flush_into(&mut output).expect("flush");
-    AbRender {
-        output,
-        underrun_frames: 0,
     }
 }
 
