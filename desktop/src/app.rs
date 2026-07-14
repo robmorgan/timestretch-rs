@@ -5,10 +5,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::audio_engine::AudioEngine;
+use crate::deck;
 use crate::decoder;
-use crate::pull_deck;
 use crate::state::*;
-use crate::waveform::{self, BeatMark, WaveformPeaks, WaveformTextures};
+use crate::waveform::{
+    self, BandPeaks, GridMarks, OverviewParams, OverviewTexture, ZoomSpan, ZoomedParams,
+};
 
 const MIN_STRETCH_RATIO: f64 = 0.25;
 /// Ratio ceiling on the varispeed-first tempo path (the library bounds the
@@ -40,16 +42,17 @@ pub struct TimeStretchApp {
     file_path: Option<PathBuf>,
 
     // Waveform
-    waveform_peaks: Option<WaveformPeaks>,
-    /// Pre-rendered waveform textures, built lazily from the peaks (needs
+    band_peaks: Option<BandPeaks>,
+    /// Pre-rendered overview texture, built lazily from the peaks (needs
     /// an egui context) and dropped on track load.
-    waveform_textures: Option<WaveformTextures>,
+    overview_texture: Option<OverviewTexture>,
+    /// Zoomed-view span state (bars/seconds preset).
+    zoom_span: ZoomSpan,
 
-    /// Beat grid detected on load; drives the waveform overlay and
-    /// grid-accurate beat jumps.
+    /// Beat grid detected on load; drives grid-accurate beat jumps.
     beat_grid: Option<timestretch::BeatGrid>,
-    /// Beat positions normalized to track length, cached for the overlay.
-    beat_marks: Vec<BeatMark>,
+    /// Frame-based grid cache for the waveform painters and beat counter.
+    grid_marks: GridMarks,
 
     // UI state
     stretch_ratio: f64,
@@ -63,13 +66,17 @@ pub struct TimeStretchApp {
 
     // Error messages
     error_message: Option<String>,
+
+    /// Dev harness (`TS_SCREENSHOT=<path>.png`): frames rendered so far,
+    /// used to schedule the self-capture.
+    frame_count: u64,
 }
 
 impl TimeStretchApp {
     /// Widest stretch ratio the active tempo path supports.
     #[inline]
     fn max_stretch_ratio(&self) -> f64 {
-        // The pull engine's tempo axis is the varispeed resampler.
+        // The engine's tempo axis is the varispeed resampler.
         MAX_VARISPEED_RATIO
     }
 
@@ -93,28 +100,23 @@ impl TimeStretchApp {
         st.target_bpm = effective_bpm;
     }
 
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
+        // CDJ-style deck: always the dark theme, whatever the system says.
+        cc.egui_ctx.set_theme(egui::Theme::Dark);
+
         let state = Arc::new(Mutex::new(SharedState::new()));
         let stream_active = Arc::new(AtomicBool::new(false));
         let position = Arc::new(AtomicPosition::new());
 
-        // Try to create audio engine to detect default sample rate
-        let dummy_flush = Arc::new(AtomicBool::new(false));
-        let (audio_engine, output_sample_rate) =
-            match AudioEngine::new(state.clone(), stream_active.clone(), None, dummy_flush) {
-                Ok((engine, _producer)) => {
-                    let sr = engine.output_sample_rate;
-                    // We'll create a new engine when loading a file
-                    // since we need the producer for the processing thread
-                    (None, sr)
-                }
-                Err(e) => {
-                    log::error!("Failed to create audio engine: {e}");
-                    (None, 44100)
-                }
-            };
+        // Detect the default output sample rate to size the UI; the real
+        // engine is built when a track starts playing.
+        let output_sample_rate = AudioEngine::default_sample_rate().unwrap_or_else(|| {
+            log::error!("No default audio output device; falling back to 44100 Hz");
+            44100
+        });
+        let audio_engine = None;
 
-        Self {
+        let mut app = Self {
             state,
             position,
             stream_active,
@@ -125,18 +127,24 @@ impl TimeStretchApp {
             stop_flag: None,
             file_name: String::new(),
             file_path: None,
-            waveform_peaks: None,
-            waveform_textures: None,
+            band_peaks: None,
+            overview_texture: None,
+            zoom_span: ZoomSpan::default(),
             beat_grid: None,
-            beat_marks: Vec::new(),
+            grid_marks: GridMarks::empty(),
             stretch_ratio: 1.0,
             target_bpm: 0.0,
             volume: 0.8,
             preset: PresetChoice::DjBeatmatch,
-            deck_engine: DeckEngine::PullKeylock,
+            deck_engine: DeckEngine::Keylock,
             target_bpm_text: String::new(),
             error_message: None,
+            frame_count: 0,
+        };
+        if let Some(path) = initial_file {
+            app.load_file(path);
         }
+        app
     }
 
     fn load_file(&mut self, path: PathBuf) {
@@ -167,9 +175,13 @@ impl TimeStretchApp {
                 let bpm_buffer =
                     timestretch::AudioBuffer::new(decoded.samples, sample_rate, channel_layout);
 
-                // Compute waveform peaks
-                self.waveform_peaks = Some(WaveformPeaks::compute(&bpm_buffer.data, 2, 800));
-                self.waveform_textures = None;
+                // Compute the 3-band waveform peak pyramid
+                self.band_peaks = Some(BandPeaks::compute(
+                    &bpm_buffer.data,
+                    channel_layout.count(),
+                    sample_rate,
+                ));
+                self.overview_texture = None;
 
                 // Detect the beat grid from the channel-aware buffer
                 // (stereo-safe): BPM for the tempo fader plus beat and
@@ -182,7 +194,7 @@ impl TimeStretchApp {
                     grid.segments.len(),
                     grid.confidence
                 );
-                self.beat_marks = beat_marks_for_overlay(&grid, num_frames);
+                self.grid_marks = GridMarks::from_grid(&grid);
                 self.beat_grid = Some(grid);
                 self.target_bpm_text = if bpm > 0.0 {
                     format!("{bpm:.1}")
@@ -241,6 +253,9 @@ impl TimeStretchApp {
         }
     }
 
+    /// Starts playback: the audio callback owns the processor and reads
+    /// from it; the feed thread keeps the source ring topped up and forwards
+    /// tempo control.
     fn start_playback(&mut self) {
         let source = match &self.source_audio {
             Some(s) => s.clone(),
@@ -255,20 +270,13 @@ impl TimeStretchApp {
             st.sample_rate
         };
 
-        self.start_pull_playback(source, sample_rate);
-    }
-
-    /// Pull-native playback on the new engine (ROADMAP new Stage 1): the
-    /// audio callback owns the processor and pulls; the feed thread keeps
-    /// the source ring topped up and forwards tempo control.
-    fn start_pull_playback(&mut self, source: Arc<Vec<f32>>, sample_rate: u32) {
         let initial_ratio = {
             let st = self.state.lock().unwrap();
             st.stretch_ratio
         };
         let profile = match self.deck_engine {
-            DeckEngine::PullKeylock => timestretch::engine::EngineProfile::Keylock,
-            _ => timestretch::engine::EngineProfile::Tape,
+            DeckEngine::Keylock => timestretch::engine::EngineProfile::Keylock,
+            DeckEngine::Tape => timestretch::engine::EngineProfile::Tape,
         };
         // Analyze-on-load artifact: the engine's primary transient control
         // signal (splice guidance + PV phase resets). Arc-shared with the
@@ -295,7 +303,7 @@ impl TimeStretchApp {
         let warm_start_preroll = handles.processor.warm_start_preroll_frames();
 
         let reset_request = Arc::new(AtomicBool::new(false));
-        let engine = match AudioEngine::new_pull(
+        let engine = match AudioEngine::new(
             self.state.clone(),
             self.stream_active.clone(),
             Some(sample_rate),
@@ -319,7 +327,7 @@ impl TimeStretchApp {
         let stop_flag = Arc::new(StopFlag::new());
         self.stop_flag = Some(stop_flag.clone());
 
-        let handle = pull_deck::start_pull_deck_thread(
+        let handle = deck::start_deck_thread(
             self.state.clone(),
             source,
             handles.source,
@@ -373,6 +381,54 @@ impl TimeStretchApp {
         let s = secs % 60.0;
         format!("{mins}:{s:05.2}")
     }
+
+    /// Headless verification hooks, inert unless the env vars are set:
+    /// `TS_AUTOPLAY=1` starts playback once a track is loaded;
+    /// `TS_SCREENSHOT=<path>.ppm` self-captures the window ~3 s in (via
+    /// egui's own framebuffer readback — no OS screen-recording
+    /// permission) and then closes the app.
+    fn dev_harness(&mut self, ctx: &egui::Context) {
+        self.frame_count += 1;
+
+        if self.frame_count == 2
+            && std::env::var_os("TS_AUTOPLAY").is_some()
+            && self.source_audio.is_some()
+        {
+            self.start_playback();
+        }
+
+        let Some(shot_path) = std::env::var_os("TS_SCREENSHOT") else {
+            return;
+        };
+        // With the 30 fps repaint cap, frame 90 is ~3 s of playback.
+        if self.frame_count == 90 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+        }
+        let image = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(image) = image {
+            if let Err(e) = write_ppm(std::path::Path::new(&shot_path), &image) {
+                log::error!("dev screenshot failed: {e}");
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+}
+
+/// Writes an egui image as binary PPM (P6), dropping alpha.
+fn write_ppm(path: &std::path::Path, image: &egui::ColorImage) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let [w, h] = image.size;
+    write!(out, "P6\n{w} {h}\n255\n")?;
+    for px in &image.pixels {
+        out.write_all(&[px.r(), px.g(), px.b()])?;
+    }
+    Ok(())
 }
 
 impl eframe::App for TimeStretchApp {
@@ -383,6 +439,8 @@ impl eframe::App for TimeStretchApp {
             let mut st = self.state.lock().unwrap();
             st.position_frames = pos_frames;
         }
+
+        self.dev_harness(ctx);
 
         // Repaint at ~30 fps while playing — enough for a smooth playhead.
         // An uncapped request_repaint() redraws at full display rate
@@ -406,8 +464,8 @@ impl eframe::App for TimeStretchApp {
             self.file_panel(ui);
             ui.add_space(8.0);
 
-            // Waveform
-            self.waveform_panel(ui);
+            // Deck waveforms
+            self.deck_panel(ui);
             ui.add_space(8.0);
 
             // Transport
@@ -455,38 +513,106 @@ impl TimeStretchApp {
         });
     }
 
-    fn waveform_panel(&mut self, ui: &mut egui::Ui) {
-        let (total_frames, pos_frames) = {
+    /// CDJ-style deck display: zoomed scrolling waveform on top, beat
+    /// counter + zoom controls in a thin row, full-track overview strip
+    /// below.
+    fn deck_panel(&mut self, ui: &mut egui::Ui) {
+        let (total_frames, pos_frames, sample_rate, loop_region, loop_in) = {
             let st = self.state.lock().unwrap();
-            (st.total_frames, st.position_frames)
+            (
+                st.total_frames,
+                st.position_frames,
+                st.sample_rate,
+                st.loop_region,
+                st.loop_in,
+            )
         };
 
+        // Zoomed scrolling view; dragging scrubs relative to the pointer.
+        let scrub = waveform::paint_zoomed(
+            ui,
+            ZoomedParams {
+                peaks: self.band_peaks.as_ref(),
+                marks: &self.grid_marks,
+                position_frames: pos_frames as f64,
+                total_frames,
+                sample_rate,
+                loop_region,
+                loop_in,
+            },
+            &mut self.zoom_span,
+        );
+        if let Some(delta_frames) = scrub {
+            if total_frames > 0 {
+                let target = (pos_frames as f64 + delta_frames)
+                    .clamp(0.0, (total_frames - 1) as f64) as usize;
+                self.request_seek(target);
+            }
+        }
+        ui.add_space(4.0);
+
+        // Counter row: bar.beat readout, beat segments, zoom controls.
+        ui.horizontal(|ui| {
+            waveform::paint_beat_counter(ui, &self.grid_marks, pos_frames as f64);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("+").clicked() {
+                    self.zoom_span.zoom_in();
+                }
+                ui.label(
+                    egui::RichText::new(self.zoom_span.label(self.grid_marks.is_usable()))
+                        .monospace()
+                        .weak(),
+                );
+                if ui.button("−").clicked() {
+                    self.zoom_span.zoom_out();
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        // Overview strip; built lazily on first paint after a track load.
+        if self.overview_texture.is_none() {
+            if let Some(peaks) = &self.band_peaks {
+                self.overview_texture = Some(OverviewTexture::from_peaks(ui.ctx(), peaks));
+            }
+        }
         let progress = if total_frames > 0 {
             pos_frames as f32 / total_frames as f32
         } else {
             0.0
         };
-
-        // Build the textures on first paint after a track load.
-        if self.waveform_textures.is_none() {
-            if let Some(peaks) = &self.waveform_peaks {
-                self.waveform_textures = Some(WaveformTextures::from_peaks(ui.ctx(), peaks));
+        let seek_frac = waveform::paint_overview(
+            ui,
+            OverviewParams {
+                texture: self.overview_texture.as_ref(),
+                marks: &self.grid_marks,
+                progress,
+                total_frames,
+                loop_region,
+                loop_in,
+            },
+        );
+        if let Some(frac) = seek_frac {
+            if total_frames > 0 {
+                self.request_seek((frac as f64 * total_frames as f64) as usize);
             }
         }
-        let (_response, seek_pos) = waveform::paint_waveform(
-            ui,
-            self.waveform_textures.as_ref(),
-            progress,
-            &self.beat_marks,
-        );
+    }
 
-        // Handle click-to-seek
-        if let Some(frac) = seek_pos {
-            if total_frames > 0 {
-                let seek_frame = (frac * total_frames as f32) as usize;
-                let mut st = self.state.lock().unwrap();
-                st.seek_request = Some(seek_frame);
+    /// Routes a seek to the deck thread; while stopped (no deck thread
+    /// running) also moves the visible position directly — the pending
+    /// `seek_request` is consumed when playback next starts.
+    fn request_seek(&mut self, frame: usize) {
+        let stopped = {
+            let mut st = self.state.lock().unwrap();
+            st.seek_request = Some(frame);
+            if st.transport == Transport::Stopped {
+                st.position_frames = frame;
             }
+            st.transport == Transport::Stopped
+        };
+        if stopped {
+            self.position.store(frame);
         }
     }
 
@@ -725,9 +851,9 @@ impl TimeStretchApp {
                 });
                 ui.end_row();
 
-                // Deck engine: the frozen push pipeline vs the new pull
-                // engine (tape mode). Switching stops playback — the two
-                // pipelines are wired completely differently.
+                // Deck engine mode: Tape (pitch follows tempo) vs Keylock
+                // (pitch-preserving). Switching stops playback and rebuilds
+                // the engine with the new profile.
                 ui.label("Deck:");
                 ui.horizontal(|ui| {
                     let old_deck = self.deck_engine;
@@ -739,8 +865,8 @@ impl TimeStretchApp {
                             }
                         });
                     if self.deck_engine != old_deck {
-                        // The pull engine bounds the tempo ratio to the
-                        // varispeed range; pull the fader back in first.
+                        // The engine bounds the tempo ratio to the varispeed
+                        // range; pull the fader back in first.
                         let clamped = self.clamp_stretch_ratio(self.stretch_ratio);
                         if (clamped - self.stretch_ratio).abs() > f64::EPSILON {
                             let detected = self.state.lock().unwrap().detected_bpm;
@@ -755,24 +881,19 @@ impl TimeStretchApp {
                         self.stop_playback();
                     }
                     match self.deck_engine {
-                        DeckEngine::PullTape => {
+                        DeckEngine::Tape => {
                             ui.label(egui::RichText::new("tape: pitch follows tempo").weak())
                                 .on_hover_text(
-                                    "New pull-based engine (roadmap Stage 1): zero pipeline \
-                                     delay, sample-accurate tempo, pitch follows the fader. \
-                                     The Preset, Playback, Engine, Tempo Path, and Pitch \
-                                     controls apply to the legacy deck only.",
+                                    "Tape mode: zero pipeline delay, sample-accurate \
+                                     tempo, pitch follows the fader.",
                                 );
                         }
-                        DeckEngine::PullKeylock => {
+                        DeckEngine::Keylock => {
                             ui.label(egui::RichText::new("keylock: two-band").weak())
                                 .on_hover_text(
-                                    "New pull-based engine (roadmap Stage 2): low band \
-                                     follows tempo, high band pitch-corrected by a small \
-                                     FFT at the delay-matched transposition (~13 ms \
-                                     pipeline delay). The Preset, Playback, Engine, Tempo \
-                                     Path, and Pitch controls apply to the legacy deck \
-                                     only.",
+                                    "Keylock mode: low band follows tempo, high band \
+                                     pitch-corrected by a small FFT at the delay-matched \
+                                     transposition (~13 ms pipeline delay).",
                                 );
                         }
                     }
@@ -799,29 +920,6 @@ impl TimeStretchApp {
 }
 
 /// Sidecar artifact path for a loaded audio file: `<file>.tsanalysis.json`.
-/// Precomputes normalized overlay marks from a beat grid: beat positions
-/// as track fractions with downbeats flagged, ready for the painter.
-fn beat_marks_for_overlay(grid: &timestretch::BeatGrid, total_frames: usize) -> Vec<BeatMark> {
-    if total_frames == 0 || grid.beats.is_empty() {
-        return Vec::new();
-    }
-    let inv_total = 1.0 / total_frames as f64;
-    let mut downbeat_flags = vec![false; grid.beats.len()];
-    for &idx in &grid.downbeats {
-        if let Some(flag) = downbeat_flags.get_mut(idx) {
-            *flag = true;
-        }
-    }
-    grid.beats
-        .iter()
-        .zip(downbeat_flags.iter())
-        .map(|(&pos, &is_downbeat)| BeatMark {
-            frac: (pos * inv_total) as f32,
-            is_downbeat,
-        })
-        .collect()
-}
-
 fn sidecar_path(audio_path: &std::path::Path) -> PathBuf {
     let mut os = audio_path.as_os_str().to_os_string();
     os.push(".tsanalysis.json");

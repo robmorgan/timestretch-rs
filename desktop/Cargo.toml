@@ -17,7 +17,6 @@ eframe = { version = "0.31", default-features = false, features = [
 cpal = "0.15"
 symphonia = { version = "0.5", features = ["mp3", "flac", "ogg", "wav", "pcm", "vorbis"] }
 rfd = "0.15"
-ringbuf = "0.4"
 log = "0.4"
 env_logger = "0.11"
 

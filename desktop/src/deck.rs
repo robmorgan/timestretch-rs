@@ -1,12 +1,11 @@
-//! Feed/control thread for the pull-based deck engine (ROADMAP new Stage 1).
+//! Feed/control thread for the deck engine.
 //!
-//! The pull engine inverts the desktop's data flow: the audio callback owns
-//! the [`EngineProcessor`](timestretch::engine::EngineProcessor) and pulls,
-//! while this thread keeps the engine's source ring topped up, forwards
-//! tempo control, and publishes the playhead. Seeks are cold restarts at
-//! the target position for now (warm-start priming is roadmap Stage 5);
-//! loop wraps feed straight across the seam, exactly like the old path's
-//! `notify_source_jump` timeline re-anchor.
+//! The audio callback owns the
+//! [`EngineProcessor`](timestretch::engine::EngineProcessor) and reads from
+//! it; this thread keeps the engine's source ring topped up, forwards tempo
+//! control, and publishes the playhead. Seeks feed the preroll preceding the
+//! target and request warm-start priming; loop wraps feed straight across the
+//! seam via a timeline re-anchor.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -79,9 +78,9 @@ impl JumpMap {
     }
 }
 
-/// Starts the pull-deck feed thread. Returns its join handle.
+/// Starts the deck feed thread. Returns its join handle.
 #[allow(clippy::too_many_arguments)]
-pub fn start_pull_deck_thread(
+pub fn start_deck_thread(
     state: SharedStateHandle,
     source_audio: Arc<Vec<f32>>,
     mut source: SourceProducer,
@@ -232,7 +231,7 @@ pub fn start_pull_deck_thread(
             let underruns = controller.underrun_frames();
             if underruns > last_underruns && !finished {
                 log::warn!(
-                    "pull deck: {} underrun frames (total {underruns})",
+                    "deck: {} underrun frames (total {underruns})",
                     underruns - last_underruns
                 );
                 last_underruns = underruns;

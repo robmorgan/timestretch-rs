@@ -41,25 +41,23 @@ impl PresetChoice {
     }
 }
 
-/// Which engine architecture drives the deck (ROADMAP new Stage 1).
+/// Which engine mode drives the deck.
 ///
-/// `PullTape`
-/// is the new pull-based engine in tape mode (pitch follows tempo, zero
-/// pipeline delay). The desktop is the new engine's reference integration
-/// and drives it pull-native — no push-compat shim.
+/// `Tape` runs the engine in tape mode (pitch follows tempo, zero pipeline
+/// delay); `Keylock` preserves pitch while the tempo changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeckEngine {
-    PullTape,
-    PullKeylock,
+    Tape,
+    Keylock,
 }
 
 impl DeckEngine {
-    pub const ALL: &'static [DeckEngine] = &[DeckEngine::PullTape, DeckEngine::PullKeylock];
+    pub const ALL: &'static [DeckEngine] = &[DeckEngine::Tape, DeckEngine::Keylock];
 
     pub fn label(&self) -> &'static str {
         match self {
-            DeckEngine::PullTape => "Pull — Tape",
-            DeckEngine::PullKeylock => "Pull — Keylock",
+            DeckEngine::Tape => "Tape",
+            DeckEngine::Keylock => "Keylock",
         }
     }
 }
@@ -123,7 +121,7 @@ impl SharedState {
             stretch_ratio: 1.0,
             volume: 0.8,
             preset: PresetChoice::DjBeatmatch,
-            deck_engine: DeckEngine::PullKeylock,
+            deck_engine: DeckEngine::Keylock,
             position_frames: 0,
             total_frames: 0,
             sample_rate: 44100,

@@ -1,12 +1,15 @@
 mod app;
 mod audio_engine;
+mod deck;
 mod decoder;
-mod pull_deck;
 mod state;
 mod waveform;
 
 fn main() -> eframe::Result<()> {
     env_logger::init();
+
+    // Optional audio file to load on startup (skips the file dialog).
+    let initial_file = std::env::args().nth(1).map(std::path::PathBuf::from);
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -18,6 +21,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Timestretch Desktop",
         options,
-        Box::new(|cc| Ok(Box::new(app::TimeStretchApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(app::TimeStretchApp::new(cc, initial_file)))),
     )
 }
