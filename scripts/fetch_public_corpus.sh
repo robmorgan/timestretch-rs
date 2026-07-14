@@ -45,8 +45,8 @@ fetch 50aa9a376fe2e84c050da5a7f2c642792e04b91a30b9d012f9e14ac136ebf0bc SICMON012
 fetch dd947b758985479d19728f2fb345ec2a9b5f2c9fb9f4251290c7744cd306f984 mtrnc002 "mtrnc002_01_-_J-Lab_-_Radiophonique.mp3"
 fetch 61de8728f4c780be6ddcd47784cb70894b533795b5a919425abf6d85c0ae52ae unfound53 "unfound53_01_-_raymundo_mendoza_-_wrist_watch.mp3"
 
-# Unscored listening material (rhythmically ambiguous — bpm pending ear
-# verification; the BPM harness skips bpm = 0 entries).
+# Rhythmically ambiguous entries (swung UK garage, broken techno):
+# tempos owner-ear-verified 2026-07-14 (126 / 125), scored like the rest.
 fetch cb3a303bd35bc92c27ddfec44db8666c0323913e67e2f8050282f6349651b23a yarn015 "01-Interplanetary_Criminal-Saucers.mp3"
 fetch 65a82156174ec368355da9b95a118878bf200b1128acdbf725674ffa76e1952e yarn022 "01-Raptom_Snig-Arf.mp3"
 
