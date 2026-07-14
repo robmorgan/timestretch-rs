@@ -8,6 +8,56 @@ pub struct WaveformPeaks {
     pub neg: Vec<f32>,
 }
 
+/// Texture height in pixels (2x the 120pt panel for retina crispness).
+const TEX_HEIGHT: usize = 240;
+
+const PLAYED_COLOR: egui::Color32 = egui::Color32::from_rgb(100, 180, 255);
+const UNPLAYED_COLOR: egui::Color32 = egui::Color32::from_rgb(60, 80, 100);
+
+/// The waveform pre-rendered as two textures (played / unplayed bar
+/// colors), built once per loaded track. Per frame the painter draws the
+/// unplayed texture full-width and the played texture UV-clipped to the
+/// playhead — two textured quads instead of one tessellated rect per
+/// bucket, which profiled as the UI's dominant tessellation cost.
+pub struct WaveformTextures {
+    played: egui::TextureHandle,
+    unplayed: egui::TextureHandle,
+}
+
+impl WaveformTextures {
+    pub fn from_peaks(ctx: &egui::Context, peaks: &WaveformPeaks) -> Self {
+        Self {
+            played: ctx.load_texture(
+                "waveform_played",
+                render_peaks(peaks, PLAYED_COLOR),
+                egui::TextureOptions::LINEAR,
+            ),
+            unplayed: ctx.load_texture(
+                "waveform_unplayed",
+                render_peaks(peaks, UNPLAYED_COLOR),
+                egui::TextureOptions::LINEAR,
+            ),
+        }
+    }
+}
+
+/// Rasterizes the peak buckets into a transparent-background image, one
+/// column per bucket, bars spanning [neg, pos] around the vertical center.
+fn render_peaks(peaks: &WaveformPeaks, color: egui::Color32) -> egui::ColorImage {
+    let width = peaks.pos.len().max(1);
+    let mut image = egui::ColorImage::new([width, TEX_HEIGHT], egui::Color32::TRANSPARENT);
+    let center = TEX_HEIGHT as f32 / 2.0;
+    let half_height = TEX_HEIGHT as f32 * 0.45;
+    for (x, (&pos, &neg)) in peaks.pos.iter().zip(peaks.neg.iter()).enumerate() {
+        let top = (center - pos.clamp(0.0, 1.0) * half_height).floor() as usize;
+        let bottom = (center - neg.clamp(-1.0, 0.0) * half_height).ceil() as usize;
+        for y in top..bottom.min(TEX_HEIGHT) {
+            image.pixels[y * width + x] = color;
+        }
+    }
+    image
+}
+
 impl WaveformPeaks {
     /// Compute waveform peaks from interleaved stereo samples.
     /// Mixes to mono for display. `num_buckets` controls resolution.
@@ -102,7 +152,7 @@ fn overlay_plan(width_px: f32, beat_count: usize, downbeat_count: usize) -> Over
 /// full-length tracks.
 pub fn paint_waveform(
     ui: &mut egui::Ui,
-    peaks: &WaveformPeaks,
+    textures: Option<&WaveformTextures>,
     progress: f32,
     beat_marks: &[BeatMark],
 ) -> (egui::Response, Option<f32>) {
@@ -113,7 +163,7 @@ pub fn paint_waveform(
     // Background
     painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(30, 30, 40));
 
-    if peaks.pos.is_empty() {
+    let Some(textures) = textures else {
         // Draw placeholder text
         painter.text(
             rect.center(),
@@ -123,34 +173,25 @@ pub fn paint_waveform(
             egui::Color32::from_rgb(100, 100, 120),
         );
         return (response, None);
-    }
+    };
 
-    let num_buckets = peaks.pos.len();
-    let center_y = rect.center().y;
-    let half_height = rect.height() * 0.45;
-
-    let played_color = egui::Color32::from_rgb(100, 180, 255);
-    let unplayed_color = egui::Color32::from_rgb(60, 80, 100);
-
+    let progress = progress.clamp(0.0, 1.0);
     let cursor_x = rect.left() + rect.width() * progress;
 
-    for i in 0..num_buckets {
-        let x = rect.left() + (i as f32 / num_buckets as f32) * rect.width();
-        let bar_width = (rect.width() / num_buckets as f32).max(1.0);
-
-        let top = center_y - peaks.pos[i] * half_height;
-        let bottom = center_y - peaks.neg[i] * half_height;
-
-        let color = if x < cursor_x {
-            played_color
-        } else {
-            unplayed_color
-        };
-
-        painter.rect_filled(
-            egui::Rect::from_min_max(egui::pos2(x, top), egui::pos2(x + bar_width, bottom)),
-            0.0,
-            color,
+    // Unplayed bars across the full width, then the played texture on top,
+    // UV-clipped to the playhead.
+    painter.image(
+        textures.unplayed.id(),
+        rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+    if progress > 0.0 {
+        painter.image(
+            textures.played.id(),
+            egui::Rect::from_min_max(rect.left_top(), egui::pos2(cursor_x, rect.bottom())),
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(progress, 1.0)),
+            egui::Color32::WHITE,
         );
     }
 
@@ -207,6 +248,7 @@ pub fn paint_waveform(
     }
 
     // Center line
+    let center_y = rect.center().y;
     painter.line_segment(
         [
             egui::pos2(rect.left(), center_y),

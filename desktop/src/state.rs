@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use timestretch::{PreAnalysisArtifact};
+use timestretch::PreAnalysisArtifact;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Transport {
@@ -39,7 +39,6 @@ impl PresetChoice {
             PresetChoice::VocalChop => "Vocal Chop",
         }
     }
-
 }
 
 /// Which engine architecture drives the deck (ROADMAP new Stage 1).
@@ -55,10 +54,7 @@ pub enum DeckEngine {
 }
 
 impl DeckEngine {
-    pub const ALL: &'static [DeckEngine] = &[
-        DeckEngine::PullTape,
-        DeckEngine::PullKeylock,
-    ];
+    pub const ALL: &'static [DeckEngine] = &[DeckEngine::PullTape, DeckEngine::PullKeylock];
 
     pub fn label(&self) -> &'static str {
         match self {
@@ -66,9 +62,7 @@ impl DeckEngine {
             DeckEngine::PullKeylock => "Pull — Keylock",
         }
     }
-
 }
-
 
 /// State shared between UI, processing, and audio threads.
 pub struct SharedState {

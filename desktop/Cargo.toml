@@ -6,7 +6,14 @@ publish = false
 
 [dependencies]
 timestretch = { path = ".." }
-eframe = "0.31"
+# wgpu backend (native Metal on macOS): the default glow backend presents
+# through CGLFlushDrawable / OpenGL-on-Metal, which profiled as the single
+# biggest CPU cost of the app.
+eframe = { version = "0.31", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "wgpu",
+] }
 cpal = "0.15"
 symphonia = { version = "0.5", features = ["mp3", "flac", "ogg", "wav", "pcm", "vorbis"] }
 rfd = "0.15"

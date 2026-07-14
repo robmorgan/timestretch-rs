@@ -8,7 +8,7 @@ use crate::audio_engine::AudioEngine;
 use crate::decoder;
 use crate::pull_deck;
 use crate::state::*;
-use crate::waveform::{self, BeatMark, WaveformPeaks};
+use crate::waveform::{self, BeatMark, WaveformPeaks, WaveformTextures};
 
 const MIN_STRETCH_RATIO: f64 = 0.25;
 /// Ratio ceiling on the varispeed-first tempo path (the library bounds the
@@ -41,6 +41,9 @@ pub struct TimeStretchApp {
 
     // Waveform
     waveform_peaks: Option<WaveformPeaks>,
+    /// Pre-rendered waveform textures, built lazily from the peaks (needs
+    /// an egui context) and dropped on track load.
+    waveform_textures: Option<WaveformTextures>,
 
     /// Beat grid detected on load; drives the waveform overlay and
     /// grid-accurate beat jumps.
@@ -123,6 +126,7 @@ impl TimeStretchApp {
             file_name: String::new(),
             file_path: None,
             waveform_peaks: None,
+            waveform_textures: None,
             beat_grid: None,
             beat_marks: Vec::new(),
             stretch_ratio: 1.0,
@@ -165,6 +169,7 @@ impl TimeStretchApp {
 
                 // Compute waveform peaks
                 self.waveform_peaks = Some(WaveformPeaks::compute(&bpm_buffer.data, 2, 800));
+                self.waveform_textures = None;
 
                 // Detect the beat grid from the channel-aware buffer
                 // (stereo-safe): BPM for the tempo fader plus beat and
@@ -252,7 +257,6 @@ impl TimeStretchApp {
 
         self.start_pull_playback(source, sample_rate);
     }
-
 
     /// Pull-native playback on the new engine (ROADMAP new Stage 1): the
     /// audio callback owns the processor and pulls; the feed thread keeps
@@ -380,10 +384,12 @@ impl eframe::App for TimeStretchApp {
             st.position_frames = pos_frames;
         }
 
-        // Request repaint for continuous UI updates during playback
+        // Repaint at ~30 fps while playing — enough for a smooth playhead.
+        // An uncapped request_repaint() redraws at full display rate
+        // (120 Hz on ProMotion) and profiled as ~90% of the app's CPU.
         let transport = self.state.lock().unwrap().transport;
         if transport == Transport::Playing {
-            ctx.request_repaint();
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -413,7 +419,7 @@ impl eframe::App for TimeStretchApp {
         });
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         self.stop_processing_thread();
     }
 }
@@ -461,12 +467,18 @@ impl TimeStretchApp {
             0.0
         };
 
-        let empty_peaks = WaveformPeaks {
-            pos: vec![],
-            neg: vec![],
-        };
-        let peaks = self.waveform_peaks.as_ref().unwrap_or(&empty_peaks);
-        let (_response, seek_pos) = waveform::paint_waveform(ui, peaks, progress, &self.beat_marks);
+        // Build the textures on first paint after a track load.
+        if self.waveform_textures.is_none() {
+            if let Some(peaks) = &self.waveform_peaks {
+                self.waveform_textures = Some(WaveformTextures::from_peaks(ui.ctx(), peaks));
+            }
+        }
+        let (_response, seek_pos) = waveform::paint_waveform(
+            ui,
+            self.waveform_textures.as_ref(),
+            progress,
+            &self.beat_marks,
+        );
 
         // Handle click-to-seek
         if let Some(frac) = seek_pos {
@@ -767,7 +779,6 @@ impl TimeStretchApp {
                 });
                 ui.end_row();
 
-
                 // Volume
                 ui.label("Volume:");
                 ui.horizontal(|ui| {
@@ -786,8 +797,6 @@ impl TimeStretchApp {
             });
     }
 }
-
-
 
 /// Sidecar artifact path for a loaded audio file: `<file>.tsanalysis.json`.
 /// Precomputes normalized overlay marks from a beat grid: beat positions
