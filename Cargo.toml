@@ -114,6 +114,11 @@ path = "qa/engine_wcet.rs"
 required-features = ["qa-harnesses"]
 
 [[test]]
+name = "rubberband_reference_gate"
+path = "qa/rubberband_reference_gate.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
 name = "engine_ab_matrix"
 path = "qa/engine_ab_matrix.rs"
 required-features = ["qa-harnesses"]

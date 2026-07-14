@@ -591,9 +591,20 @@ Automation: manual
 > PV re-primes. env_swing at ±11%: **0.65 vs old 10.36 dB** — the sag no
 > longer reaches the output at all on this fixture.
 >
+> **Public corpus + external evidence landed (2026-07-14).** The
+> redistributable DJ corpus is defined (9 CC0/CC-BY/CC-BY-SA netlabel
+> club tracks from the Internet Archive, SHA-256-pinned via
+> `scripts/fetch_public_corpus.sh`; 7 scored with independently verified
+> integer tempos, 119–147 BPM) and CI fetches it and runs the BPM
+> harness on every push. The external-reference comparison is REQUIRED
+> in CI: `qa/rubberband_reference_gate.rs` renders a public-corpus track
+> through the keylock chain and gates against a Rubber Band CLI render
+> (125→118 and 125→132 BPM; measured spectral 0.965/0.970 and level
+> within 0.4 LUFS against gates of ≥ 0.85 and ≤ 1.5).
+>
 > Remaining (manual): settle the three tuning constants with listening +
-> the matrix, define the public corpus, promote an external-reference
-> comparison to required CI, and the owner listening sign-off.
+> the matrix, ear-verify the two unscored corpus tempos, and the owner
+> listening sign-off.
 
 ### Why
 

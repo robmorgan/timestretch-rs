@@ -78,7 +78,17 @@ jobs:
           path: benchmarks/audio/public-corpus
           key: public-corpus-${{ hashFiles('scripts/fetch_public_corpus.sh') }}
       - run: bash scripts/fetch_public_corpus.sh
+      # Regression tests read fixtures from test_audio/ (gitignored, *.wav).
+      # The generator is deterministic, so regenerate them before testing.
+      - run: cargo run --example generate_test_audio
       - run: cargo test --features qa-harnesses --release --test bpm_accuracy -- --nocapture
+      # External-reference gate (ROADMAP Stage 7, REQUIRED): the pull
+      # engine's keylock render vs a Rubber Band CLI render of the same
+      # public-corpus track, gated on spectral similarity and level.
+      - run: sudo apt-get update && sudo apt-get install -y rubberband-cli
+      - run: cargo test --features qa-harnesses --release --test rubberband_reference_gate -- --nocapture
+        env:
+          TIMESTRETCH_REQUIRE_RUBBERBAND: "1"
       - uses: actions/upload-artifact@v4
         with:
           name: bpm-accuracy-report-${{ github.run_id }}
