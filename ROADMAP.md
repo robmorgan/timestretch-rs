@@ -541,9 +541,33 @@ campaign so quality tuning happens under the real compute contract.
   reference machine — with p99.9 gated.
 - No latency or quality regression on the Stage 2–5 gates.
 
-## [ ] Stage 7: Parity Campaign — Tuning, External Evidence, Quality Sign-Off
+## [x] Stage 7: Parity Campaign — Tuning, External Evidence, Quality Sign-Off
 
 Automation: manual
+
+> **COMPLETE — owner sign-off recorded 2026-07-14.** Exit criteria:
+>
+> - New engine ≥ old on every gated A/B matrix row: **9/9** (cents rides
+>   0.23/0.57 vs old 1.86/12.19, sharpness 1.16/1.29 vs 0.71/0.74, HF
+>   −0.41 vs −0.79 dB, envelope 0.03 vs 10.36 dB, clicks 1.00 vs 2.40,
+>   level −0.12 vs −0.29 dB).
+> - External-reference comparison REQUIRED in CI and passing
+>   (`qa/rubberband_reference_gate.rs`: spectral 0.965/0.970 vs the
+>   ≥ 0.85 gate against Rubber Band CLI renders of the public corpus).
+> - Owner listening sign-off: structured checklist passed on the pull
+>   keylock deck — kicks, hats, vocals, sub bass, and full mixes across
+>   0.92–1.08 and ±20% (2026-07-14, after the keylock range settlement
+>   below; the ±20% edge carries audible-but-single-pitch splice
+>   granularity, accepted as the specified behavior). Both previously
+>   unscored public-corpus tempos ear-verified (Saucers 126, Arf 125)
+>   and now scored in the BPM harness.
+>
+> Tuning constants settled: low-band cutoff 150 Hz (kept — Stage 2
+> falsification verdict stands), SOLA/PV threshold = the fade end (SOLA
+> owns the entire corrected range; three-step listening history in
+> `src/engine/stages/keylock.rs`), PV FFT 512 (moot in the live path —
+> the PV is never audible and is queued for removal at Stage 8/9).
+> **Stages 8 and 9 are unlocked.**
 
 > **Machine-side prep complete (2026-07-13):**
 >

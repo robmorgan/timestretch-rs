@@ -113,9 +113,9 @@ bpm_only = true
 # Tempo ground truth: verified 2026-07 with two independent estimators —
 # the repo detector and a coherent onset-envelope Goertzel scan (all
 # scored entries peak at an exact integer BPM, consistent across four
-# 60 s windows; see scripts/fetch_public_corpus.sh). Ear confirmation is
-# still welcome; entries with bpm = 0.0 failed independent verification
-# (rhythmically ambiguous) and are kept as listening material only.
+# 60 s windows; see scripts/fetch_public_corpus.sh). The two rhythmically
+# ambiguous entries (swung UK garage, broken techno) were ear-verified by
+# the owner on 2026-07-14 and are scored like the rest.
 
 [[track]]
 id = "valya-kan-december"
@@ -195,7 +195,7 @@ id = "interplanetary-criminal-saucers"
 description = "Interplanetary Criminal - Saucers [YARN015], UK garage (swung)"
 original = "public-corpus/01-Interplanetary_Criminal-Saucers.mp3"
 original_sha256 = "cb3a303bd35bc92c27ddfec44db8666c0323913e67e2f8050282f6349651b23a"
-bpm = 0.0 # TODO: ear-verify (detector reads 126.1; envelope scan inconclusive)
+bpm = 126.0 # owner ear-verified 2026-07-14 (detector reads 126.1; swung UKG)
 bpm_only = true
 license = "CC-BY 4.0"
 source_url = "https://archive.org/details/yarn015"
@@ -205,7 +205,7 @@ id = "raptom-snig-arf"
 description = "Raptom Snig - Arf [YARN022], broken techno/bass"
 original = "public-corpus/01-Raptom_Snig-Arf.mp3"
 original_sha256 = "65a82156174ec368355da9b95a118878bf200b1128acdbf725674ffa76e1952e"
-bpm = 0.0 # TODO: ear-verify (detector reads 125.1; sections flip to a 156 layer)
+bpm = 125.0 # owner ear-verified 2026-07-14 (detector reads 125.1)
 bpm_only = true
 license = "CC-BY 4.0"
 source_url = "https://archive.org/details/yarn022"
