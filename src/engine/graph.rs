@@ -975,7 +975,7 @@ mod tests {
     fn keylock_fades_to_varispeed_at_extreme_rates() {
         // Old Stage 13 semantics: beyond the fade band the deck behaves as
         // plain varispeed — pitch follows tempo, no corrector artifacts.
-        let rate = 1.3; // deviation 30% >> fade end (22%)
+        let rate = 1.42; // deviation 42% >> fade end (35%)
         let out = run_profile_at_rate(EngineProfile::Keylock, 440.0, rate, 3);
         let freq = measure_freq(&out[44_100..88_200], 44_100.0);
         assert!(

@@ -35,18 +35,17 @@ use crate::engine::stages::sola::SolaCorrector;
 /// corrected range**, and the PV engages only past the fade end, where
 /// the correction weight is zero and the handoff is inaudible by
 /// construction. Measured on the adversarial multitone the two tie in
-/// the deep fade region (both ≈ −7 to −10 dB at rates 0.82–0.84, fade
-/// attenuation dominating) and SOLA wins on the up side (−3.9 vs −6.7 dB
-/// at 1.141); on real music SOLA's correlation-matched splices land far
-/// cleaner than the fixture suggests. The PV is now a candidate for
-/// removal from the live chain entirely (it costs the chain's FFT WCET
-/// while never audible) — an architectural cleanup awaiting the Stage 7
-/// corpus settlement.
-pub const SOLA_PV_THRESHOLD: f64 = 0.22;
+/// the deep fade region (fade attenuation dominating) and SOLA wins on
+/// the up side (−3.9 vs −6.7 dB at 1.141); on real music SOLA's
+/// correlation-matched splices land far cleaner than the fixture
+/// suggests. The PV is now a candidate for removal from the live chain
+/// entirely (it costs the chain's FFT WCET while never audible) — an
+/// architectural cleanup awaiting the Stage 7 corpus settlement.
+pub const SOLA_PV_THRESHOLD: f64 = CORRECTION_FADE_END_DEV;
 /// Engage SOLA when the rate deviation falls below this…
-const SOLA_ENGAGE_DEV: f64 = 0.215;
+const SOLA_ENGAGE_DEV: f64 = CORRECTION_FADE_END_DEV - 0.005;
 /// …and release back to the PV when it rises above this.
-const SOLA_RELEASE_DEV: f64 = 0.225;
+const SOLA_RELEASE_DEV: f64 = CORRECTION_FADE_END_DEV + 0.005;
 /// Corrector handoff crossfade length, in frames (~1.1 ms at 44.1 kHz).
 /// Deliberately short: the two correctors emit the same pitch but their
 /// relative timing sweeps at `|1 − T|` samples per frame (the PV's latency
@@ -75,12 +74,20 @@ const ALIGN_WINDOW: usize = 96;
 /// (~250 ms; a backstop for noise-like content, not the normal path).
 const HANDOFF_FORCE_BLOCKS: u32 = 344;
 /// Beyond this rate deviation the corrector starts fading out toward
-/// plain varispeed (pitch follows tempo)…
-const CORRECTION_FADE_START_DEV: f64 = 0.12;
-/// …and is fully out here: keylock gracefully releases at extreme rates
-/// instead of pushing the PV past its quality range (old Stage 13
-/// semantics, trivial in this architecture).
-const CORRECTION_FADE_END_DEV: f64 = 0.22;
+/// plain varispeed (pitch follows tempo). Inside the fade the output
+/// carries BOTH pitches at complementary weights — audibly doubled/
+/// chorused (owner listening 2026-07-14: a full mix "falls apart"
+/// approaching −15% with the fade at 0.12, while −11.5% — pure SOLA —
+/// was acceptable) — so the fade must not overlap rates a DJ actually
+/// plays at: it starts past the ±20% secondary DJ range and serves true
+/// extremes only (deck-stop/spinback territory, where pitch SHOULD
+/// follow tempo). Within the fade SOLA's transposition clamp (1.35)
+/// additionally soft-limits the correction, keeping the corrected copy
+/// a single coherent pitch that gradually goes flat rather than
+/// grainy.
+const CORRECTION_FADE_START_DEV: f64 = 0.205;
+/// …and fully out here: pure varispeed beyond ~±35%.
+const CORRECTION_FADE_END_DEV: f64 = 0.35;
 /// With SOLA fully carrying the output and the ride settled this close to
 /// unity (rate space), the PV's streaming pipeline is flushed once: the PV
 /// accumulates an envelope sag riding through unity (known inherited
@@ -485,11 +492,11 @@ mod tests {
         // 600 blocks: dwell (344) + alignment wait (bounded by one phase
         // sweep cycle) + the short ramp.
         let input = sine(500.0, BLOCK_FRAMES * 600, 0.5);
-        run_blocks(&mut stage, &input, 1.06); // rate dev 6% < 21.5% engage
+        run_blocks(&mut stage, &input, 1.06); // rate dev 6%: deep inside engage
         assert_eq!(stage.sola_mix(), 1.0, "DJ-range deviation must select SOLA");
 
         let mut stage = KeylockStage::new(SR, 1);
-        run_blocks(&mut stage, &input, 1.30); // rate dev 30% > 22.5% release
+        run_blocks(&mut stage, &input, 1.40); // rate dev 40% > 35.5% release
         assert_eq!(stage.sola_mix(), 0.0, "extreme deviation must select PV");
     }
 
@@ -503,12 +510,12 @@ mod tests {
 
         // Cross out: after the dwell, the mix must ramp toward PV — and a
         // value hovering between the hysteresis bounds must NOT flip back.
-        run_blocks(&mut stage, &chunk, 1.30);
+        run_blocks(&mut stage, &chunk, 1.40);
         assert_eq!(stage.sola_mix(), 0.0, "must hand off to PV");
         run_blocks(
             &mut stage,
             &sine(500.0, BLOCK_FRAMES * 40, 0.5),
-            1.22, // rate dev 22%: inside release, outside engage — no flip
+            1.35, // rate dev 35%: inside release, outside engage — no flip
         );
         assert_eq!(stage.sola_mix(), 0.0, "hysteresis band must hold PV");
     }
