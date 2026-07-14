@@ -26,22 +26,27 @@ use crate::engine::stages::sola::SolaCorrector;
 
 /// SOLA↔PV selection threshold on the tempo-rate deviation `|1 − rate|`
 /// (the DJ-facing number; symmetric where transposition space is not —
-/// rate 0.92 is a 8.7% transposition). A tuning constant, raised twice on
-/// owner listening: 5% → 9% (2026-07-12, PV audibly muffled above 5%) and
-/// 9% → 12% (2026-07-14, PV audibly phasey/robotic at −9.7% on a full
-/// mix while SOLA at −7.4% was near-transparent; measured HF retention at
-/// rate 0.903 is −1.0 dB SOLA vs −2.5 dB PV, and −1.1 vs −3.9 at 1.097).
-/// The whole ±10% DJ fader now runs time-domain with margin; the PV
-/// serves only the bridge into the extreme-rate varispeed fade (which
-/// starts at [`CORRECTION_FADE_START_DEV`], matching this threshold —
-/// SOLA's own splice-cadence cost overtakes the PV's loss at ~±12%,
-/// measured −3.2 dB at rate 0.88 on the adversarial multitone). Final
-/// corpus settlement remains a Stage 7 item.
-pub const SOLA_PV_THRESHOLD: f64 = 0.12;
+/// rate 0.92 is a 8.7% transposition). A tuning constant, raised three
+/// times on owner listening: 5% → 9% (2026-07-12, PV audibly muffled
+/// above 5%), 9% → 12% (2026-07-14, PV phasey/robotic at −9.7% on a full
+/// mix), and 12% → 22% (2026-07-14 again: the same artifact reappeared at
+/// −14.1%, i.e. at every boundary the PV was put behind). The threshold
+/// now equals [`CORRECTION_FADE_END_DEV`]: **SOLA owns the entire
+/// corrected range**, and the PV engages only past the fade end, where
+/// the correction weight is zero and the handoff is inaudible by
+/// construction. Measured on the adversarial multitone the two tie in
+/// the deep fade region (both ≈ −7 to −10 dB at rates 0.82–0.84, fade
+/// attenuation dominating) and SOLA wins on the up side (−3.9 vs −6.7 dB
+/// at 1.141); on real music SOLA's correlation-matched splices land far
+/// cleaner than the fixture suggests. The PV is now a candidate for
+/// removal from the live chain entirely (it costs the chain's FFT WCET
+/// while never audible) — an architectural cleanup awaiting the Stage 7
+/// corpus settlement.
+pub const SOLA_PV_THRESHOLD: f64 = 0.22;
 /// Engage SOLA when the rate deviation falls below this…
-const SOLA_ENGAGE_DEV: f64 = 0.115;
+const SOLA_ENGAGE_DEV: f64 = 0.215;
 /// …and release back to the PV when it rises above this.
-const SOLA_RELEASE_DEV: f64 = 0.125;
+const SOLA_RELEASE_DEV: f64 = 0.225;
 /// Corrector handoff crossfade length, in frames (~1.1 ms at 44.1 kHz).
 /// Deliberately short: the two correctors emit the same pitch but their
 /// relative timing sweeps at `|1 − T|` samples per frame (the PV's latency
@@ -480,11 +485,11 @@ mod tests {
         // 600 blocks: dwell (344) + alignment wait (bounded by one phase
         // sweep cycle) + the short ramp.
         let input = sine(500.0, BLOCK_FRAMES * 600, 0.5);
-        run_blocks(&mut stage, &input, 1.06); // rate dev 6% < 11.5% engage
+        run_blocks(&mut stage, &input, 1.06); // rate dev 6% < 21.5% engage
         assert_eq!(stage.sola_mix(), 1.0, "DJ-range deviation must select SOLA");
 
         let mut stage = KeylockStage::new(SR, 1);
-        run_blocks(&mut stage, &input, 1.16); // rate dev 16% > 12.5% release
+        run_blocks(&mut stage, &input, 1.30); // rate dev 30% > 22.5% release
         assert_eq!(stage.sola_mix(), 0.0, "extreme deviation must select PV");
     }
 
@@ -498,19 +503,22 @@ mod tests {
 
         // Cross out: after the dwell, the mix must ramp toward PV — and a
         // value hovering between the hysteresis bounds must NOT flip back.
-        run_blocks(&mut stage, &chunk, 1.16);
+        run_blocks(&mut stage, &chunk, 1.30);
         assert_eq!(stage.sola_mix(), 0.0, "must hand off to PV");
         run_blocks(
             &mut stage,
             &sine(500.0, BLOCK_FRAMES * 40, 0.5),
-            1.12, // rate dev 12%: inside release, outside engage — no flip
+            1.22, // rate dev 22%: inside release, outside engage — no flip
         );
         assert_eq!(stage.sola_mix(), 0.0, "hysteresis band must hold PV");
     }
 
     #[test]
     fn keylock_holds_pitch_in_both_corrector_modes() {
-        for (rate, label) in [(1.03f64, "sola"), (1.16, "pv")] {
+        // SOLA carries the whole corrected range; test a DJ-range rate at
+        // full correction and a wide rate where correction still dominates
+        // ([`CORRECTION_FADE_START_DEV`] is 0.12 — 1.10 stays inside it).
+        for (rate, label) in [(1.03f64, "sola-dj"), (1.10, "sola-wide")] {
             let mut stage = KeylockStage::new(SR, 1);
             // The stage receives already-varispeeded audio: a 440 Hz source
             // arrives pitched to 440 * rate; the corrector must return it
