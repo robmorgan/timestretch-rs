@@ -602,8 +602,24 @@ Automation: manual
 > (125→118 and 125→132 BPM; measured spectral 0.965/0.970 and level
 > within 0.4 LUFS against gates of ≥ 0.85 and ≤ 1.5).
 >
-> Remaining (manual): settle the three tuning constants with listening +
-> the matrix, ear-verify the two unscored corpus tempos, and the owner
+> **Keylock range settled (2026-07-14, owner listening on a full mix).**
+> Three listening passes drove the selection/fade constants to their
+> final shape: the PV was audibly phasey/robotic at every boundary it
+> was placed behind (−9.7%, then −14.1%), and the old correction fade
+> (starting at 12%) audibly doubled the top end — two pitches at
+> complementary weights — long before its end. Final spec: **SOLA
+> carries the entire corrected range; full single-pitch keylock through
+> ±20% (the whole secondary DJ range); graceful release beyond**
+> (fade 20.5%→35%, with SOLA's transposition clamp soft-flattening the
+> corrected copy). Owner decision: this is the shipped scope line —
+> CDJ-style wide-range (±100%) Master Tempo is explicitly out of scope
+> for the parity campaign; a "wide keylock" deck profile (higher
+> constant latency, big-FFT corrector) is recorded below as a
+> post-cutover feature. The always-inaudible PV is now a removal
+> candidate (chain WCET) at Stage 8/9.
+>
+> Remaining (manual): the structured listening checklist across the
+> corpus, ear-verify the two unscored corpus tempos, and the owner
 > listening sign-off.
 
 ### Why
@@ -902,6 +918,15 @@ covered by the per-stage new-engine gates.
 
 ## Not a Priority Yet
 
+- **Wide-range Master Tempo (a "wide keylock" deck profile).** CDJ-3000
+  class ±100% keylock is a real competitive feature, but it wants a
+  big-FFT corrector (1024–2048) and therefore ~25–50 ms of constant
+  latency — structurally incompatible with the ≤ 15 ms budget of the
+  primary deck path. Post-cutover (after Stage 9), add it as a separate
+  user-selectable engine profile with its own latency contract, like a
+  CDJ range setting (owner decision 2026-07-14: ship full keylock to
+  ±20% + graceful release now; do not gate the parity campaign on wide
+  range).
 - SIMD and architecture-specific acceleration (revisit after Stage 6's WCET
   gates exist to measure it against)
 - Desktop UI/UX polish beyond its role as the reference integration
