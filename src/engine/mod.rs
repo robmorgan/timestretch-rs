@@ -47,6 +47,7 @@
 
 pub mod control;
 pub mod graph;
+pub mod offline;
 pub mod profiles;
 pub mod source;
 pub mod stage;
