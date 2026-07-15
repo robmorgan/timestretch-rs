@@ -1,6 +1,6 @@
 [package]
 name = "timestretch"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Pure Rust audio time stretching library optimized for EDM"
 license = "MIT"
@@ -64,33 +64,13 @@ path = "qa/rubberband_comparison.rs"
 required-features = ["qa-harnesses"]
 
 [[test]]
-name = "streaming_quality"
-path = "qa/streaming_quality.rs"
-required-features = ["qa-harnesses"]
-
-[[test]]
-name = "profile_quality"
-path = "qa/profile_quality.rs"
-required-features = ["qa-harnesses"]
-
-[[test]]
 name = "track_analysis_qa"
 path = "qa/track_analysis_qa.rs"
 required-features = ["qa-harnesses"]
 
 [[test]]
-name = "quality_gates"
-path = "tests/quality_gates.rs"
-required-features = ["qa-harnesses"]
-
-[[test]]
 name = "bpm_accuracy"
 path = "qa/bpm_accuracy.rs"
-required-features = ["qa-harnesses"]
-
-[[test]]
-name = "varispeed_keylock"
-path = "qa/varispeed_keylock.rs"
 required-features = ["qa-harnesses"]
 
 [[test]]

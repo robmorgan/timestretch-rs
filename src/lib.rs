@@ -25,26 +25,29 @@
 //! assert!(output.len() > input.len()); // ~1.5x longer
 //! ```
 //!
-//! # Streaming
+//! # Real-time (pull engine)
 //!
-//! For real-time use, feed audio in chunks via [`StreamProcessor`]:
+//! For real-time use, build the pull engine and let the audio callback
+//! pull exactly the frames it needs:
 //!
 //! ```no_run
-//! use timestretch::{EdmPreset, StreamProcessor, StretchParams};
+//! use timestretch::engine::{Engine, EngineConfig, EngineProfile};
 //!
-//! let params = StretchParams::new(1.0)
-//!     .with_preset(EdmPreset::DjBeatmatch)
-//!     .with_sample_rate(44_100)
-//!     .with_channels(2);
+//! let handles = Engine::build(EngineConfig {
+//!     channels: 2,
+//!     profile: EngineProfile::Keylock,
+//!     ..EngineConfig::default()
+//! }).unwrap();
+//! let (controller, mut processor, mut source) =
+//!     (handles.controller, handles.processor, handles.source);
 //!
-//! let mut processor = StreamProcessor::new(params);
-//!
-//! let input_chunk = vec![0.0f32; 256 * 2];
-//! let mut output_chunk = Vec::with_capacity(1_024);
-//! processor.process_into(&input_chunk, &mut output_chunk).unwrap();
-//! processor.set_stretch_ratio(1.05).unwrap();
-//! let mut remaining = Vec::with_capacity(1_024);
-//! processor.flush_into(&mut remaining).unwrap();
+//! // Feed thread: push interleaved source audio as it becomes available.
+//! source.push(&vec![0.0f32; 8_192 * 2]);
+//! // Control thread (lock-free): retarget tempo any time.
+//! controller.set_tempo_rate(1.02);
+//! // Audio callback: infallible, allocation-free.
+//! let mut out = vec![0.0f32; 256 * 2];
+//! processor.process(&mut out);
 //! ```
 //!
 use rustfft::{num_complex::Complex, FftPlanner};
@@ -54,7 +57,6 @@ pub mod core;
 pub mod engine;
 pub mod error;
 pub mod io;
-pub mod stream;
 pub mod stretch;
 
 pub use analysis::beat::{BeatGrid, TempoSegment};
@@ -68,16 +70,11 @@ pub use core::preanalysis::{
 };
 pub use core::types::{
     AudioBuffer, Channels, CrossfadeMode, EdmPreset, EnvelopePreset, FrameIter, QualityMode,
-    Sample, StreamProfile, StretchParams, TransientThresholdPolicy,
+    Sample, StretchParams, TransientThresholdPolicy,
 };
 pub use core::window::WindowType;
 pub use error::StretchError;
-pub use stream::{
-    ControlPath, StreamLatencyReport, StreamPitchQuality, StreamProcessor, StreamingEngine,
-    TransientResetStats,
-};
 pub use stretch::phase_locking::PhaseLockingMode;
-pub use stretch::stereo::StereoMode;
 
 /// Creates params adjusted for the given buffer's sample rate and channels,
 /// then wraps the processing result in a new AudioBuffer.
@@ -1388,7 +1385,7 @@ mod tests {
         fn check() {
             assert_send_sync::<AudioBuffer>();
             assert_send_sync::<StretchParams>();
-            assert_send_sync::<StreamProcessor>();
+            assert_send_sync::<crate::engine::control::EngineController>();
             assert_send_sync::<StretchError>();
             assert_send_sync::<BeatGrid>();
         }
