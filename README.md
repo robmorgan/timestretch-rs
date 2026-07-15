@@ -13,6 +13,11 @@ time-domain keylock, driven the way a DJ deck drives it. Batch stretching
 runs the same engine graph offline. The only external DSP dependency is
 [`rustfft`](https://crates.io/crates/rustfft).
 
+![Timestretch Desktop playing a track with the beat grid overlay and keylock deck](docs/desktop-app.png)
+
+*The `desktop/` reference app: a deck running the real-time engine with
+beat-grid overlay, beat jumps, looping, and live keylock tempo control.*
+
 ## Features
 
 - **Pull-based real-time engine** — the audio callback pulls exactly the
@@ -131,9 +136,6 @@ seek/cue (`controller.warm_start`), gapless loop wraps
 (`EngineConfig::pre_analysis`) are first-class deck operations — the
 `desktop/` app is the reference integration.
 
-
-Control-to-audio behavior on the default path (all profiles): ratio and
-pitch controls glide with a ~50 ms time constant. Pitch changes reach the
 ### AudioBuffer API
 
 ```rust
