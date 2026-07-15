@@ -27,3 +27,10 @@ Code must be formatted with `rustfmt`.
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 Documentation must build without warnings.
+
+### Desktop
+```bash
+cd desktop && cargo test --all-targets && cargo clippy --all-targets -- -D warnings
+```
+The `desktop/` crate is excluded from the workspace, so the root checks never
+build it; CI checks it separately on macOS (its target platform).
