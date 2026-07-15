@@ -20,7 +20,7 @@ use crate::engine::stage::OnsetEvent;
 /// How far behind the current stage position events are retained, in
 /// frames: covers the corrector latency plus splice-fade spans so a
 /// protection window around a just-passed onset is still visible.
-const KEEP_BEHIND_FRAMES: f64 = 1_024.0;
+pub(crate) const KEEP_BEHIND_FRAMES: f64 = 1_024.0;
 
 /// Scheduling lookahead, in stage frames.
 const HORIZON_FRAMES: f64 = 2_048.0;

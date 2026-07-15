@@ -25,7 +25,8 @@ use symphonia::core::probe::Hint;
 
 use timestretch::analysis::comparison;
 use timestretch::io::wav::{read_wav_file, write_wav_file_float};
-use timestretch::AudioBuffer;
+use timestretch::stretch::hybrid::HybridStretcher;
+use timestretch::{AudioBuffer, EdmPreset, StretchParams};
 
 /// Public-corpus fixture: Valya Kan – Memories [YARN020], CC-BY 4.0,
 /// verified 125.000 BPM (the corpus's cleanest steady-tempo entry).
@@ -213,13 +214,42 @@ fn keylock_meets_external_rubberband_reference() {
             FFT_SIZE,
             HOP_SIZE,
         );
+
+        // Captured-hybrid-baseline comparison (ROADMAP Stage 8): the frozen
+        // batch engine rendered against the same external reference. The
+        // new engine must score at least as well (small tolerance for
+        // metric noise). Retires with the hybrid at Stage 9.
+        let hybrid_params = StretchParams::new(ratio)
+            .with_sample_rate(sample_rate)
+            .with_channels(1)
+            .with_preset(EdmPreset::DjBeatmatch);
+        let hybrid_out = HybridStretcher::new(hybrid_params)
+            .process(window)
+            .expect("hybrid render");
+        let hybrid_len = hybrid_out.len().min(reference.data.len());
+        let hybrid_report = comparison::generate_quality_report(
+            &hybrid_out[..hybrid_len],
+            &reference.data[..hybrid_len],
+            sample_rate,
+            FFT_SIZE,
+            HOP_SIZE,
+        );
         println!(
             "rubberband gate: 125->{target_bpm} BPM (ratio {ratio:.4}): spectral={:.3} \
-             perceptual={:.3} lufs_diff={:+.2} flux={:.3}",
+             perceptual={:.3} lufs_diff={:+.2} flux={:.3} | hybrid baseline: spectral={:.3} \
+             perceptual={:.3}",
             report.spectral_similarity,
             report.perceptual_spectral_similarity,
             report.lufs_difference,
-            report.spectral_flux_similarity
+            report.spectral_flux_similarity,
+            hybrid_report.spectral_similarity,
+            hybrid_report.perceptual_spectral_similarity
+        );
+        assert!(
+            report.spectral_similarity >= hybrid_report.spectral_similarity - 0.02,
+            "batch quality fell below the hybrid baseline: {:.3} vs {:.3}",
+            report.spectral_similarity,
+            hybrid_report.spectral_similarity
         );
 
         // Gates. Thresholds calibrated 2026-07 against rubberband 4.0

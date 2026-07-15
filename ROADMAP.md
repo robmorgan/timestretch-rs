@@ -685,9 +685,38 @@ trusted.
 - Owner listening sign-off recorded here (the one deliberately manual gate
   in this roadmap).
 
-## [ ] Stage 8: Batch/Offline Rebase onto the Engine Graph
+## [x] Stage 8: Batch/Offline Rebase onto the Engine Graph
 
 Automation: auto
+
+> **Completed 2026-07-14.** `src/engine/offline.rs`: batch renders run on
+> the pull engine graph — whole-file pre-analysis (artifact always
+> present; a caller-provided one stays authoritative), constant-rate
+> keylock for the DJ window (rate deviation ≤ 20%), a direct batch
+> FFT-2048 PV for wide ratios, and **exact output length by
+> construction** (`round(frames × ratio)`; latency prefix dropped
+> structurally, source tail pushed through with a latency + kernel flush
+> pad — no truncation heuristics). `stretch()`/`stretch_into()` rebased;
+> per-channel hybrid and its mid/side mode retired (the graph processes
+> channels in lockstep natively). `timestretch-cli` runs the new engine
+> end-to-end with exact frame counts on both paths.
+>
+> Exit criteria: the external-reference gate now renders the frozen
+> hybrid against the same Rubber Band reference — new batch **beats the
+> captured baseline** (spectral 0.965 vs 0.933 at 125→118, 0.970 vs
+> 0.950 at 125→132; assert new ≥ old − 0.02 in CI until the hybrid
+> deletes at Stage 9). `tests/streaming_batch_parity.rs` replaced by
+> `tests/streaming_offline_determinism.rs`: streaming and offline are
+> **sample-identical** at equal rate/artifact, under irregular callback
+> sizes. (The gate immediately caught a real engine defect: timeline
+> eviction retained too little history for the transient cursor's
+> look-behind, so onset mappings — and a SOLA splice — depended on the
+> caller's callback sizes. Retention now covers the look-behind at the
+> slowest rate.)
+>
+> Deferred to Stage 9 (the deletion stage): removing the never-audible
+> PV corrector from the live keylock chain, and the old hybrid/stream
+> code itself.
 
 ### Why
 

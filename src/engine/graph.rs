@@ -40,6 +40,15 @@ const MAX_PENDING_RETARGETS: usize = 8;
 /// consumption position (the SLOPE_WINDOW of the StageCtx build, rounded
 /// up), so the delay-matched rate and its slope never fall off the map.
 const RATE_HISTORY_MARGIN: usize = 256;
+/// Output frames of timeline history the transient cursor's look-behind
+/// can address: onsets up to `KEEP_BEHIND_FRAMES` track frames behind the
+/// playhead map through the timeline, spanning the most output frames at
+/// the slowest tempo rate. Eviction must retain this much or an onset's
+/// mapped position would depend on when eviction last ran — i.e. on the
+/// caller's callback sizes (found by the streaming-vs-offline determinism
+/// gate: a boundary onset mapped differently and moved a splice).
+const TRANSIENT_LOOKBEHIND_MARGIN: usize = (crate::engine::stages::transient::KEEP_BEHIND_FRAMES
+    / crate::engine::control::MIN_TEMPO_RATE) as usize;
 
 /// Audio-thread half of the engine.
 ///
@@ -128,7 +137,10 @@ impl EngineProcessor {
         // delay-matched StageCtx build and the matching evict_before().
         // Checkpoints land once per feed chunk, as close together as
         // FEED_CHUNK / MAX_TEMPO_RATE output frames at the fastest rate.
-        let timeline_capacity = (out_fifo_frames + pipeline_latency_frames + RATE_HISTORY_MARGIN)
+        let timeline_capacity = (out_fifo_frames
+            + pipeline_latency_frames
+            + RATE_HISTORY_MARGIN
+            + TRANSIENT_LOOKBEHIND_MARGIN)
             / (FEED_CHUNK_FRAMES / 4)
             + 16;
         Self {
@@ -200,11 +212,13 @@ impl EngineProcessor {
 
         // Retain rate history back to the stages' consumption horizon:
         // the delay-matched StageCtx reads `pipeline_latency + slope
-        // window` behind the ingest position every block.
-        self.timeline.evict_before(
-            self.media_delivered_frames()
-                .saturating_sub((self.pipeline_latency_frames + RATE_HISTORY_MARGIN) as u64),
-        );
+        // window` behind the ingest position every block, and the
+        // transient cursor maps onsets up to its look-behind window back.
+        self.timeline
+            .evict_before(self.media_delivered_frames().saturating_sub(
+                (self.pipeline_latency_frames + RATE_HISTORY_MARGIN + TRANSIENT_LOOKBEHIND_MARGIN)
+                    as u64,
+            ));
         let position = self
             .timeline
             .map_to_source(self.position_query_frame())

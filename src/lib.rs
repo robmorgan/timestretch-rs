@@ -801,25 +801,18 @@ pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, Stretc
         return Ok(rendered);
     }
 
+    // Batch rendering runs on the pull engine graph (ROADMAP Stage 8):
+    // whole-file pre-analysis, exact output length by construction, and
+    // channels processed in lockstep (stereo phase preserved natively —
+    // the old per-channel hybrid needed a mid/side mode for this).
     let num_channels = params.channels.count();
-    let channels = deinterleave(input, num_channels);
-
-    let channel_outputs = if num_channels == 2
-        && params.stereo_mode == stretch::stereo::StereoMode::MidSide
-    {
-        let (left, right) = stretch::stereo::stretch_mid_side(&channels[0], &channels[1], params)?;
-        vec![left, right]
-    } else {
-        let mut outs: Vec<Vec<f32>> = Vec::with_capacity(num_channels);
-        for channel_data in &channels {
-            let stretcher = stretch::hybrid::HybridStretcher::new(params.clone());
-            let stretched = stretcher.process(channel_data)?;
-            outs.push(stretched);
-        }
-        outs
-    };
-
-    let mut output = interleave(&channel_outputs);
+    let mut output = engine::offline::stretch_offline(
+        input,
+        num_channels,
+        params.sample_rate,
+        params.stretch_ratio,
+        params.pre_analysis.clone().map(std::sync::Arc::new),
+    )?;
 
     if params.normalize {
         normalize_rms(&mut output, input_rms);
@@ -885,38 +878,20 @@ pub fn stretch_into(
         return Ok(n);
     }
 
+    // Same engine-graph batch path as `stretch()` (ROADMAP Stage 8).
     let num_channels = params.channels.count();
-    let channels = deinterleave(input, num_channels);
-
-    let channel_outputs = if num_channels == 2
-        && params.stereo_mode == stretch::stereo::StereoMode::MidSide
-    {
-        let (left, right) = stretch::stereo::stretch_mid_side(&channels[0], &channels[1], params)?;
-        vec![left, right]
-    } else {
-        let mut outs: Vec<Vec<f32>> = Vec::with_capacity(num_channels);
-        for channel_data in &channels {
-            let stretcher = stretch::hybrid::HybridStretcher::new(params.clone());
-            let stretched = stretcher.process(channel_data)?;
-            outs.push(stretched);
-        }
-        outs
-    };
-
-    let min_len = channel_outputs.iter().map(|c| c.len()).min().unwrap_or(0);
-    let total = min_len * num_channels;
-
-    output.reserve(total);
-    let start = output.len();
-    for i in 0..min_len {
-        for ch in &channel_outputs {
-            output.push(ch[i]);
-        }
-    }
-
+    let mut rendered = engine::offline::stretch_offline(
+        input,
+        num_channels,
+        params.sample_rate,
+        params.stretch_ratio,
+        params.pre_analysis.clone().map(std::sync::Arc::new),
+    )?;
     if params.normalize {
-        normalize_rms(&mut output[start..], input_rms);
+        normalize_rms(&mut rendered, input_rms);
     }
+    let total = rendered.len();
+    output.append(&mut rendered);
 
     Ok(total)
 }
