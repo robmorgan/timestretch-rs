@@ -66,10 +66,6 @@ pub struct TimeStretchApp {
 
     // Error messages
     error_message: Option<String>,
-
-    /// Dev harness (`TS_SCREENSHOT=<path>.png`): frames rendered so far,
-    /// used to schedule the self-capture.
-    frame_count: u64,
 }
 
 impl TimeStretchApp {
@@ -139,7 +135,6 @@ impl TimeStretchApp {
             deck_engine: DeckEngine::Keylock,
             target_bpm_text: String::new(),
             error_message: None,
-            frame_count: 0,
         };
         if let Some(path) = initial_file {
             app.load_file(path);
@@ -381,54 +376,6 @@ impl TimeStretchApp {
         let s = secs % 60.0;
         format!("{mins}:{s:05.2}")
     }
-
-    /// Headless verification hooks, inert unless the env vars are set:
-    /// `TS_AUTOPLAY=1` starts playback once a track is loaded;
-    /// `TS_SCREENSHOT=<path>.ppm` self-captures the window ~3 s in (via
-    /// egui's own framebuffer readback — no OS screen-recording
-    /// permission) and then closes the app.
-    fn dev_harness(&mut self, ctx: &egui::Context) {
-        self.frame_count += 1;
-
-        if self.frame_count == 2
-            && std::env::var_os("TS_AUTOPLAY").is_some()
-            && self.source_audio.is_some()
-        {
-            self.start_playback();
-        }
-
-        let Some(shot_path) = std::env::var_os("TS_SCREENSHOT") else {
-            return;
-        };
-        // With the 30 fps repaint cap, frame 90 is ~3 s of playback.
-        if self.frame_count == 90 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
-        }
-        let image = ctx.input(|i| {
-            i.events.iter().find_map(|e| match e {
-                egui::Event::Screenshot { image, .. } => Some(image.clone()),
-                _ => None,
-            })
-        });
-        if let Some(image) = image {
-            if let Err(e) = write_ppm(std::path::Path::new(&shot_path), &image) {
-                log::error!("dev screenshot failed: {e}");
-            }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-    }
-}
-
-/// Writes an egui image as binary PPM (P6), dropping alpha.
-fn write_ppm(path: &std::path::Path, image: &egui::ColorImage) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let [w, h] = image.size;
-    write!(out, "P6\n{w} {h}\n255\n")?;
-    for px in &image.pixels {
-        out.write_all(&[px.r(), px.g(), px.b()])?;
-    }
-    Ok(())
 }
 
 impl eframe::App for TimeStretchApp {
@@ -439,8 +386,6 @@ impl eframe::App for TimeStretchApp {
             let mut st = self.state.lock().unwrap();
             st.position_frames = pos_frames;
         }
-
-        self.dev_harness(ctx);
 
         // Repaint at ~30 fps while playing — enough for a smooth playhead.
         // An uncapped request_repaint() redraws at full display rate
