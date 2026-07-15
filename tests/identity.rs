@@ -1,5 +1,5 @@
 use std::f32::consts::PI;
-use timestretch::{stretch, EdmPreset, StreamProcessor, StretchParams};
+use timestretch::{stretch, EdmPreset, StretchParams};
 
 /// Helper to generate a mono sine wave.
 fn sine_wave(freq: f32, sample_rate: u32, num_samples: usize) -> Vec<f32> {
@@ -635,55 +635,6 @@ fn test_identity_no_spectral_coloring() {
             color_change
         );
     }
-}
-
-#[test]
-fn test_identity_streaming_matches_batch() {
-    let sample_rate = 44100u32;
-    let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
-
-    // Batch
-    let params = StretchParams::new(1.0)
-        .with_sample_rate(sample_rate)
-        .with_channels(1);
-    let batch_output = stretch(&input, &params).unwrap();
-
-    // Streaming
-    let mut processor = StreamProcessor::new(params.clone());
-    let chunk_size = 4096;
-    let mut stream_output = Vec::new();
-    for chunk in input.chunks(chunk_size) {
-        let out = processor.process(chunk).unwrap();
-        stream_output.extend_from_slice(&out);
-    }
-    let remaining = processor.flush().unwrap();
-    stream_output.extend_from_slice(&remaining);
-
-    let batch_ratio = batch_output.len() as f64 / input.len() as f64;
-    let stream_ratio = stream_output.len() as f64 / input.len() as f64;
-    assert!(
-        (batch_ratio - 1.0).abs() < 0.2,
-        "Batch identity ratio: {}",
-        batch_ratio
-    );
-    assert!(
-        (stream_ratio - 1.0).abs() < 0.2,
-        "Streaming identity ratio: {}",
-        stream_ratio
-    );
-
-    let batch_freq = dominant_freq_zcr(&batch_output, sample_rate);
-    let stream_freq = dominant_freq_zcr(&stream_output, sample_rate);
-    assert!(
-        (batch_freq - 440.0).abs() < 50.0,
-        "Batch identity freq: {:.0}",
-        batch_freq
-    );
-    assert!(
-        (stream_freq - 440.0).abs() < 50.0,
-        "Stream identity freq: {:.0}",
-        stream_freq
-    );
 }
 
 #[test]

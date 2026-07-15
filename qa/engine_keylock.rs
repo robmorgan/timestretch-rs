@@ -5,8 +5,8 @@
 //! `cargo test --features qa-harnesses --release --test engine_keylock -- --nocapture`
 //!
 //! Gates:
-//! - Cents-wobble under the ±8%/2 s torture ride: absolute gates at the old
-//!   Live baseline (p95 ≤ 15 / max ≤ 22 cents) plus new ≤ old on the same
+//! - Cents-wobble under the ±8%/2 s torture ride: absolute gates (p95 ≤ 15
+//!   / max ≤ 22 cents, inherited from the deleted old engine's baseline
 //!   fixture.
 //! - Crossover-seam re-summation: no dip or beating at the band seam.
 //!
@@ -20,7 +20,6 @@
 mod ab;
 
 use ab::{render_with_rate_schedule, Arm};
-use timestretch::StreamProfile;
 
 const SAMPLE_RATE: u32 = 44_100;
 const CALLBACK_FRAMES: usize = 256;
@@ -30,7 +29,7 @@ const ESTIMATE_WINDOW: usize = 4_410;
 const ESTIMATE_HOP: usize = 1_102;
 /// Output settle time excluded from the metric (pipeline fill + filters).
 const WARMUP_SECS: f64 = 0.5;
-/// Absolute gates inherited from the old engine's Live-profile baseline
+/// Absolute gates inherited from the deleted old engine's Live baseline
 /// (`qa/varispeed_keylock.rs`: p95 ≤ 15 / max ≤ 22 cents on this ride).
 const P95_CENTS_LIMIT: f64 = 15.0;
 const MAX_CENTS_LIMIT: f64 = 22.0;
@@ -107,22 +106,12 @@ fn keylock_cents_wobble_under_torture_ride() {
         CALLBACK_FRAMES,
         &torture_ride,
     );
-    let old = render_with_rate_schedule(
-        Arm::OldVarispeed(StreamProfile::Live),
-        &input,
-        1,
-        SAMPLE_RATE,
-        CALLBACK_FRAMES,
-        &torture_ride,
-    );
-
     let (new_p95, new_max) = cents_deviation_track(&new.output);
-    let (old_p95, old_max) = cents_deviation_track(&old.output);
-    println!(
-        "keylock cents wobble: new p95={new_p95:.2} max={new_max:.2} | old Live p95={old_p95:.2} max={old_max:.2}"
-    );
+    println!("keylock cents wobble: p95={new_p95:.2} max={new_max:.2}");
 
-    // Absolute gates at the old Live baseline.
+    // Absolute gates (Stage 9: re-anchored on new-engine measurements;
+    // the deleted old engine's Live profile measured p95 ~15 on this
+    // torture fixture).
     assert!(
         new_p95 <= P95_CENTS_LIMIT,
         "keylock p95 wobble {new_p95:.2} cents > {P95_CENTS_LIMIT}"
@@ -130,12 +119,6 @@ fn keylock_cents_wobble_under_torture_ride() {
     assert!(
         new_max <= MAX_CENTS_LIMIT,
         "keylock max wobble {new_max:.2} cents > {MAX_CENTS_LIMIT}"
-    );
-    // Parity: new ≥ old on the same fixture and metric (lower is better);
-    // small tolerance keeps measurement noise from flaking the gate.
-    assert!(
-        new_p95 <= old_p95 * 1.1 + 0.5,
-        "new keylock p95 {new_p95:.2} worse than old {old_p95:.2}"
     );
     assert_eq!(new.underrun_frames, 0);
 }
@@ -320,22 +303,9 @@ fn falsification_render_low_band_listening_pairs() {
             CALLBACK_FRAMES,
             &|_| rate,
         );
-        let old = render_with_rate_schedule(
-            Arm::OldVarispeed(StreamProfile::Live),
-            &input,
-            1,
-            SAMPLE_RATE,
-            CALLBACK_FRAMES,
-            &|_| rate,
-        );
         let tag = format!("{:+.0}pct", (rate - 1.0) * 100.0);
         write_wav(&out_dir.join(format!("new_keylock_{tag}.wav")), &new.output);
-        write_wav(&out_dir.join(format!("old_keylock_{tag}.wav")), &old.output);
-        println!(
-            "rendered {tag}: new {} frames, old {} frames",
-            new.output.len(),
-            old.output.len()
-        );
+        println!("rendered {tag}: {} frames", new.output.len(),);
     }
     println!("listening pairs in {}", out_dir.display());
 }

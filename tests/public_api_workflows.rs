@@ -2,7 +2,7 @@ use std::f32::consts::PI;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use timestretch::{AudioBuffer, Channels, EdmPreset, StreamProcessor, StretchParams};
+use timestretch::{AudioBuffer, Channels, EdmPreset, StretchParams};
 
 fn sine_mono(freq: f32, sample_rate: u32, num_samples: usize) -> AudioBuffer {
     let data: Vec<f32> = (0..num_samples)
@@ -71,34 +71,6 @@ fn stereo_bpm_wav_pipeline_preserves_channel_layout() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn from_tempo_streaming_workflow_handles_midstream_changes() {
-    let mut processor = StreamProcessor::from_tempo(128.0, 126.0, 44_100, 1);
-    let input = sine_mono(440.0, 44_100, 44_100 * 2);
-    let mut output = Vec::new();
-
-    assert_eq!(processor.source_bpm(), Some(128.0));
-    assert_eq!(processor.target_bpm(), Some(126.0));
-
-    for (chunk_idx, chunk) in input.data.chunks(2048).enumerate() {
-        if chunk_idx == 6 {
-            assert!(processor.set_tempo(130.0));
-        }
-        output.extend_from_slice(&processor.process(chunk).unwrap());
-    }
-    output.extend_from_slice(&processor.flush().unwrap());
-
-    let ratio = output.len() as f64 / input.data.len().max(1) as f64;
-    assert_eq!(processor.source_bpm(), Some(128.0));
-    assert_eq!(processor.target_bpm(), Some(130.0));
-    assert!(!output.is_empty());
-    assert!(output.iter().all(|s| s.is_finite()));
-    assert!(
-        (0.75..=1.20).contains(&ratio),
-        "tempo-change workflow produced unreasonable overall ratio {ratio}"
-    );
 }
 
 #[test]

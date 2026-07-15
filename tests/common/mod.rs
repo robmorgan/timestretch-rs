@@ -1,7 +1,5 @@
 use std::f32::consts::PI;
 
-use timestretch::{StreamProcessor, StretchError, StretchParams};
-
 pub fn gen_sine<F>(freq_hz: f32, sr: u32, n: usize, amp_fn: F) -> Vec<f32>
 where
     F: Fn(usize) -> f32,
@@ -207,21 +205,4 @@ pub fn detect_peaks(signal: &[f32], threshold: f32, min_distance: usize) -> Vec<
         }
     }
     peaks
-}
-
-pub fn run_streaming_mono(
-    input: &[f32],
-    params: StretchParams,
-    chunk_size: usize,
-) -> Result<Vec<f32>, StretchError> {
-    let mut processor = StreamProcessor::new(params);
-
-    let mut output = Vec::new();
-    for chunk in input.chunks(chunk_size.max(1)) {
-        let rendered = processor.process(chunk)?;
-        output.extend_from_slice(&rendered);
-    }
-    let tail = processor.flush()?;
-    output.extend_from_slice(&tail);
-    Ok(output)
 }

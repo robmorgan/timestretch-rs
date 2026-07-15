@@ -16,7 +16,6 @@
 mod ab;
 
 use ab::{render_with_rate_schedule, Arm};
-use timestretch::StreamProfile;
 
 const SAMPLE_RATE: u32 = 44_100;
 const CALLBACK_FRAMES: usize = 256;
@@ -47,14 +46,14 @@ fn max_adjacent_diff(samples: &[f32]) -> f32 {
 }
 
 #[test]
-fn ab_adapter_drives_both_engines_over_identical_fixture() {
+fn adapter_drives_both_profiles_over_identical_fixture() {
     let amp = 0.5f32;
     let input = sine(220.0, SAMPLE_RATE as usize * 6, amp);
     // The DJ ride gesture both arms must survive.
     let ride = |t: f64| 1.0 + 0.06 * (2.0 * std::f64::consts::PI * 0.25 * t).sin();
 
-    let old = render_with_rate_schedule(
-        Arm::OldVarispeed(StreamProfile::Live),
+    let keylock = render_with_rate_schedule(
+        Arm::NewKeylock,
         &input,
         1,
         SAMPLE_RATE,
@@ -65,10 +64,10 @@ fn ab_adapter_drives_both_engines_over_identical_fixture() {
         render_with_rate_schedule(Arm::NewTape, &input, 1, SAMPLE_RATE, CALLBACK_FRAMES, &ride);
 
     println!(
-        "A/B smoke: old len={} rms={:.4} max_diff={:.4} | new len={} rms={:.4} max_diff={:.4} underruns={}",
-        old.output.len(),
-        rms(&old.output),
-        max_adjacent_diff(&old.output),
+        "adapter smoke: keylock len={} rms={:.4} max_diff={:.4} | tape len={} rms={:.4} max_diff={:.4} underruns={}",
+        keylock.output.len(),
+        rms(&keylock.output),
+        max_adjacent_diff(&keylock.output),
         new.output.len(),
         rms(&new.output),
         max_adjacent_diff(&new.output),
@@ -77,7 +76,7 @@ fn ab_adapter_drives_both_engines_over_identical_fixture() {
 
     // Both arms cover the fixture: output duration within 5% of the source
     // duration (the ride averages rate ~1.0).
-    for (label, out) in [("old", &old.output), ("new", &new.output)] {
+    for (label, out) in [("keylock", &keylock.output), ("new", &new.output)] {
         let len_err = (out.len() as f64 - input.len() as f64).abs() / input.len() as f64;
         assert!(
             len_err < 0.05,
@@ -89,7 +88,7 @@ fn ab_adapter_drives_both_engines_over_identical_fixture() {
     // Level parity: same tone, same amplitude, both engines near the
     // source RMS (amp/sqrt(2)).
     let source_rms = amp as f64 / std::f64::consts::SQRT_2;
-    for (label, out) in [("old", &old.output), ("new", &new.output)] {
+    for (label, out) in [("keylock", &keylock.output), ("new", &new.output)] {
         let r = rms(out);
         assert!(
             (r - source_rms).abs() / source_rms < 0.1,
@@ -99,14 +98,14 @@ fn ab_adapter_drives_both_engines_over_identical_fixture() {
 
     // Click-freeness on the SAME bound for both arms. Tape mode shifts the
     // tone to 220 * 1.06 max, so the bound uses the shifted frequency; the
-    // keylocked old arm stays at 220 and fits under it trivially.
+    // keylocked arm stays at 220 and fits under it trivially.
     let slew_bound = amp * 2.0 * std::f32::consts::PI * 220.0 * 1.06 / SAMPLE_RATE as f32;
-    // Skip the old arm's PV warmup region, mirroring its own torture gates.
-    let old_scan = &old.output[8192.min(old.output.len())..];
+    // Skip the keylock arm's latency-prime region.
+    let keylock_scan = &keylock.output[8192.min(keylock.output.len())..];
     assert!(
-        max_adjacent_diff(old_scan) <= slew_bound * 6.0,
-        "old arm clicked: {:.5}",
-        max_adjacent_diff(old_scan)
+        max_adjacent_diff(keylock_scan) <= slew_bound * 6.0,
+        "keylock arm clicked: {:.5}",
+        max_adjacent_diff(keylock_scan)
     );
     assert!(
         max_adjacent_diff(&new.output) <= slew_bound * 1.5,

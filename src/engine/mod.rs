@@ -3,7 +3,7 @@
 //! This is the new engine architecture: a stage graph pulled from the audio
 //! callback, with tempo implemented by a varispeed sinc resampler at the
 //! head of the chain. It will replace the push-based
-//! [`StreamProcessor`](crate::StreamProcessor) surface at cutover; until
+//! `StreamProcessor` surface at the Stage 9 cutover; until
 //! then the old engine is feature-frozen and both coexist.
 //!
 //! # Architecture

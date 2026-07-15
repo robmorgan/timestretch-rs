@@ -7,44 +7,48 @@
 
 Pure Rust audio time-stretching library optimized for electronic dance music.
 
-Stretches audio in time without changing its pitch, using a hybrid algorithm that
-combines phase vocoder (for tonal content) with WSOLA (for transients). The only
-external DSP dependency is [`rustfft`](https://crates.io/crates/rustfft).
+Stretches audio in time without changing its pitch, built around a
+real-time-first pull engine: a varispeed tempo axis with a two-band
+time-domain keylock, driven the way a DJ deck drives it. Batch stretching
+runs the same engine graph offline. The only external DSP dependency is
+[`rustfft`](https://crates.io/crates/rustfft).
 
 ## Features
 
-- **Hybrid algorithm** — automatically switches between phase vocoder and WSOLA
-  at transient boundaries so kicks stay punchy while pads stretch smoothly
-- **Exact timeline fidelity** — explicit segment timeline bookkeeping and
-  crossfade compensation keep output duration locked to target tempo
-- **EDM presets** — tuned parameter sets for DJ beatmatching, house loops,
-  halftime effects, ambient stretches, and vocal chops
-- **Stateful streaming PV core** — phase state and overlap tails persist across
-  stream chunks for smoother continuity
-- **Multi-resolution streaming engine** — optional three-band Linkwitz-Riley
-  filterbank with per-band phase vocoders (16384-point sub-bass FFT at the
-  Quality profile) for tighter low-end phase coherence, at a higher
-  buffering latency
-- **Streaming API** — process audio in chunks for real-time use with dynamic
-  stretch ratio and tempo changes
-- **Analyze-on-load pre-analysis** — analyze a track once (CLI `analyze` or
-  `analyze_for_dj`), persist the artifact (BPM, beat grid, transient onsets
-  with strengths, content hash), and every stretch path — batch and
-  streaming — consumes it in place of online detection, with
-  `set_source_position` keeping onsets aligned across seeks
+- **Pull-based real-time engine** — the audio callback pulls exactly the
+  frames it needs (`EngineProcessor::process`): infallible, allocation-free,
+  lock-free on the audio thread, at a constant 12.7 ms pipeline delay
+- **Varispeed-first keylock** — a sinc-resampled tempo axis with a two-band
+  keylock chain: the low band's pitch follows tempo (the club-correct
+  choice), the high band is corrected by a time-domain SOLA corrector with
+  correlation-matched, sub-sample-aligned splices; full single-pitch
+  keylock through the entire ±20% DJ fader, graceful varispeed release at
+  true extremes (deck-stop / spinback)
+- **Deck semantics built in** — lock-free tempo control (immediate or
+  timestamped to an exact output frame), warm-start seek/cue with preroll
+  priming, gapless loop wraps, and a source-position query aligned to what
+  is audible now
+- **One engine, both modes** — batch `stretch()` runs the same graph with
+  whole-file pre-analysis and exact output length by construction;
+  streaming and offline renders are sample-identical at equal rate and
+  artifact (a CI gate, not an aspiration)
+- **Artifact-first analysis** — analyze a track once (`analyze_for_dj`),
+  persist the artifact (BPM, beat grid, transient onsets with strengths),
+  and the engine schedules transient protection from it, with online
+  fallbacks when no artifact is attached
+- **General-purpose beat tracking** — autocorrelation tempogram (50–220 BPM,
+  no EDM-range folding) with a dynamic-programming beat tracker, piecewise
+  tempo segments, and downbeat estimation
 - **Loudness-robust onset detection** — log-compressed spectral flux with a
   robust `median + k·MAD` threshold and an energy-channel gate, so dense
-  mastered material yields usable onsets/BPM (where a plateau-and-multiply
-  detector reads zero) while sustained tones correctly report no beat
-- **Warm-start seek/cue/loop** — `warm_start_seek` re-primes the streaming
-  processor from the audio preceding a jump so playback resumes converged
-  (no cold buffering gap, no phase-vocoder warm-up, ratio/pitch state
-  preserved); `notify_source_jump` wraps loops gaplessly
-- **Stereo coherence hardening** — shared onset/timing map and deterministic
-  channel length agreement in mid/side mode
-- **Sub-bass phase locking** — locks phase below 120 Hz to prevent bass smearing
-- **Quality gates** — benchmark-style pass/fail regression checks for duration,
-  transient alignment, timing coherence, loudness, and spectral similarity
+  mastered material yields usable onsets/BPM while sustained tones
+  correctly report no beat
+- **Externally referenced quality** — CI renders the public CC corpus
+  against Rubber Band CLI references and gates on spectral similarity;
+  an absolute-threshold quality matrix guards pitch stability, transient
+  sharpness, top-octave retention, and click-freeness on every push
+- **WCET-bounded callbacks** — per-callback worst-case cost is measured and
+  gated in CI (p99.9 ≤ half the callback budget)
 - **WAV I/O** — built-in reader/writer for 16-bit, 24-bit, and 32-bit float WAV files
 - **Safe Rust** — `#![forbid(unsafe_code)]`, no panics in library code
 
@@ -90,235 +94,46 @@ let params = StretchParams::new(ratio)
 let output = timestretch::stretch(&input, &params).unwrap();
 ```
 
-### Real-Time Streaming
+### Real-Time (Pull Engine)
 
 ```rust
-use timestretch::{EdmPreset, QualityMode, StreamProcessor, StretchParams};
+use timestretch::engine::{Engine, EngineConfig, EngineProfile};
 
-let params = StretchParams::new(1.02)
-    .with_preset(EdmPreset::DjBeatmatch)
-    .with_sample_rate(44100)
-    .with_channels(2)
-    .with_quality_mode(QualityMode::Balanced);
+let handles = Engine::build(EngineConfig {
+    sample_rate: 44_100,
+    channels: 2,
+    profile: EngineProfile::Keylock, // or Tape: pitch follows tempo
+    ..EngineConfig::default()
+})
+.unwrap();
+let (controller, mut processor, mut source) =
+    (handles.controller, handles.processor, handles.source);
 
-let mut processor = StreamProcessor::new(params);
-let (_, _, _, pending_capacity) = processor.capacities();
-let ratio_hint = processor
-    .current_stretch_ratio()
-    .max(processor.target_stretch_ratio())
-    .max(1.0);
-let input_samples_per_chunk = 1024 * 2; // 1024 stereo frames
-let estimated_output = (input_samples_per_chunk as f64 * ratio_hint).ceil() as usize
-    + pending_capacity;
-let mut output_chunk = Vec::with_capacity(estimated_output);
+// Feed thread: push interleaved source audio, watch `demand_hint`.
+source.set_track_position(0);
+source.push(&interleaved_track[..]);
 
-// Feed chunks as they arrive from your audio driver
-loop {
-    let input_chunk = read_audio_chunk(1024);
-    output_chunk.clear();
-    processor.process_into(&input_chunk, &mut output_chunk).unwrap();
-    play_audio(&output_chunk);
-}
+// UI / control thread (lock-free, wait-free): move tempo any time —
+// immediately, or timestamped to land on an exact output frame.
+controller.set_tempo_rate(128.0 / 126.0);
 
-// Change ratio on the fly (e.g. DJ pitch fader)
-processor.set_stretch_ratio(1.05).expect("valid ratio");
-
-// Flush remaining samples when done
-let mut remaining = Vec::with_capacity(pending_capacity * 2);
-processor.flush_into(&mut remaining).unwrap();
+// Audio callback: fills exactly the requested frames. Infallible,
+// allocation-free, never blocks; underruns deliver counted silence.
+let mut out = vec![0.0f32; 256 * 2];
+processor.process(&mut out);
 ```
 
-If you do not want to manage `Vec` capacity yourself, use
-`StreamProcessor::process()` / `StreamProcessor::flush()` instead.
+The engine has one latency figure, not a profile matrix: the keylock
+chain's constant **12.7 ms** pipeline delay (tape mode is 0 ms), with
+tempo control-to-audio bounded at one resampler feed chunk. Warm-start
+seek/cue (`controller.warm_start`), gapless loop wraps
+(`set_track_position`), and pre-analysis artifacts
+(`EngineConfig::pre_analysis`) are first-class deck operations — the
+`desktop/` app is the reference integration.
 
-### Fixed-Buffer Realtime Callbacks
-
-Use these deterministic APIs when the host owns the callback buffer and you
-need bounded output budgets instead of `Vec` append semantics.
-
-```rust
-use timestretch::{EdmPreset, StreamProcessor, StretchParams};
-
-let params = StretchParams::new(1.02)
-    .with_preset(EdmPreset::DjBeatmatch)
-    .with_sample_rate(44_100)
-    .with_channels(2);
-
-let mut processor = StreamProcessor::new(params);
-
-let input_chunk = vec![0.0f32; 256 * 2];
-let callback_capacity = processor
-    .max_next_process_interleaved_output_samples(input_chunk.len())
-    .unwrap();
-let mut callback_output = vec![0.0f32; callback_capacity];
-
-let written = processor
-    .process_interleaved_into(&input_chunk, &mut callback_output)
-    .unwrap();
-host_submit(&callback_output[..written]);
-
-loop {
-    let written = processor
-        .flush_interleaved_into(&mut callback_output)
-        .unwrap();
-    if written == 0 {
-        break;
-    }
-    host_submit(&callback_output[..written]);
-}
-```
-
-
-### Tempo-Aware Streaming (DJ)
-
-```rust
-use timestretch::StreamProcessor;
-
-let mut processor = StreamProcessor::from_tempo(126.0, 128.0, 44100, 2);
-
-// Move the target deck tempo during playback
-processor.set_tempo(130.0);
-
-println!(
-    "Current target BPM: {:.2}, latency: {:.1} ms",
-    processor.target_bpm().unwrap_or(0.0),
-    processor.latency_secs() * 1000.0
-);
-```
-
-### Streaming Profiles & Latency
-
-Streaming latency and quality are selected together through
-`StreamProfile`. Every profile carries the full DJ tuning bundle; they
-differ only in the FFT/hop configuration that sets the buffering latency.
-
-```rust
-use timestretch::{StreamProcessor, StreamProfile};
-
-let mut processor =
-    StreamProcessor::try_from_tempo_with_profile(126.0, 128.0, 44100, 2, StreamProfile::Live)
-        .expect("valid BPM inputs");
-assert!(processor.latency_secs() * 1000.0 < 40.0);
-
-// Or via params: StretchParams::new(ratio).with_stream_profile(StreamProfile::Club)
-// `try_from_tempo_low_latency` is shorthand for the Live profile.
-```
-
-Measured figures at 44.1 kHz (`tests/streaming_latency.rs` verifies that the
-first output sample appears exactly at the reported gate; `latency_samples()`
-/ `latency_report()` report the real current gate, not a formula):
-
-| Profile | FFT/hop | Buffering gate (ratio in `[0.9, 1.1]`) | Gate beyond ±10% | Steady-ratio similarity | Ratio-ride similarity |
-|---------|-----------|--------------------|--------------------|------|------|
-| Live    | 1024/256  | 1536 fr = 34.8 ms  | 2048 fr = 46.4 ms  | 0.9982 | 0.9982 |
-| Club    | 2048/512  | 3072 fr = 69.7 ms  | 4096 fr = 92.9 ms  | 0.9976 | 0.9969 |
-| Quality | 4096/1024 | 6144 fr = 139.3 ms | 8192 fr = 185.8 ms | 0.9991 | 0.9932 |
-
-Similarity = mean spectral similarity to the source on synthetic EDM material
-(`qa/profile_quality.rs`). At steady stretch the larger windows win; under a
-0.92–1.08 ratio ride the smaller windows track the modulation better — which
-is exactly why `Live` is the DJ control profile.
-
-### Streaming Engines
-
-`StreamProcessor` renders with one of two engines, selected via
-`set_streaming_engine` (at build time, not from the audio callback —
-switching starts a fresh stream):
-
-- `StreamingEngine::Deterministic` (default) — single persistent phase
-  vocoder per channel with scheduled per-band transient phase resets.
-  All figures in the profile table above are this engine.
-- `StreamingEngine::MultiResolution` — three-band Linkwitz-Riley filterbank
-  (sub-bass/mid/high at 200 Hz / 4 kHz) with a per-band phase vocoder whose
-  FFT is tuned to its range: sub-bass `mid × 4`, high `mid / 4`. The
-  buffering gate is set by the sub-bass FFT, so it needs the Club profile
-  or larger — selecting it on Live returns an error.
-
-```rust
-use timestretch::{StreamProcessor, StreamProfile, StreamingEngine, StretchParams};
-
-let params = StretchParams::new(1.05)
-    .with_sample_rate(44100)
-    .with_channels(2)
-    .with_stream_profile(StreamProfile::Club);
-let mut processor = StreamProcessor::new(params);
-processor
-    .set_streaming_engine(StreamingEngine::MultiResolution)
-    .expect("Club/Quality profiles support multi-resolution");
-```
-
-Measured multi-resolution figures at 44.1 kHz (`tests/streaming_latency.rs`
-verifies the first output sample lands exactly at the reported gate):
-
-| Profile | Band FFTs (sub/mid/high) | Buffering gate (ratio in `[0.9, 1.1]`) | Steady-ratio similarity | Ratio-ride similarity |
-|---------|--------------------------|--------------------|------|------|
-| Club    | 8192/2048/512   | 12288 fr = 278.6 ms | 0.9898 | 0.9876 |
-| Quality | 16384/4096/1024 | 24576 fr = 557.3 ms | 0.9898 | 0.9928 |
-
-Trade-off profile on the same synthetic EDM material: the multi-res engine
-ties the single-PV engine at the sub-bass band's similarity ceiling and wins
-the mid band (0.9982 vs 0.9964 at Quality), but gives some broadband
-similarity back in the bands containing the 200 Hz / 4 kHz crossover seams,
-where the independently-stretched bands overlap. Reach for it on
-sub-bass-critical material where low-end phase coherence matters more than
-control latency; keep the deterministic engine for beatmatching feel.
 
 Control-to-audio behavior on the default path (all profiles): ratio and
 pitch controls glide with a ~50 ms time constant. Pitch changes reach the
-output almost immediately (the pitch resampler sits after the vocoder, so
-only the glide applies, plus 16–80 samples of sinc kernel lookahead); ratio
-changes take roughly the buffering gate plus the glide.
-
-### Control Paths (Varispeed-First Keylock)
-
-`StreamProcessor` implements tempo through one of two control paths,
-selected via `set_control_path` (at build time, like engine selection):
-
-- `ControlPath::VocoderTempo` (default) — the phase vocoder implements the
-  tempo change, so tempo control latency is the buffering gate plus the
-  ~50 ms glide. The right path for tape-mode/no-keylock use.
-- `ControlPath::VarispeedFirst` — the tempo fader drives a varispeed sinc
-  resampler at the input (instant, sample-accurate retargets, no glide on
-  the tempo axis), and the vocoder only pitch-corrects at a delay-matched
-  transposition. The buffering gate becomes a **constant pipeline delay**
-  the host compensates in its timeline; tempo control-to-audio collapses to
-  the resampler's kernel lookahead (16 samples at DJ ratios) plus the
-  caller's callback size. Tempo ratios are bounded to `[0.25, 4.0]`.
-
-```rust
-use timestretch::{ControlPath, StreamProcessor, StreamProfile, StretchParams};
-
-let params = StretchParams::new(1.05)
-    .with_sample_rate(44100)
-    .with_channels(2)
-    .with_stream_profile(StreamProfile::Live);
-let mut processor = StreamProcessor::new(params);
-processor
-    .set_control_path(ControlPath::VarispeedFirst)
-    .expect("ratio within the varispeed range");
-
-let report = processor.latency_report();
-// Constant content delay to compensate in the deck timeline:
-let _ = report.pipeline_delay_frames;
-// Tempo fader feel — resampler lookahead only:
-assert!(report.control_to_audio_frames <= 80);
-```
-
-`latency_report()` splits the two figures: `pipeline_delay_frames` (constant
-content delay, equals `latency_samples()`) versus `control_to_audio_frames`
-(tempo-change latency, excluding the caller's callback buffering). Works
-behind both streaming engines.
-
-### Realtime Pitch Control
-
-```rust
-use timestretch::StreamProcessor;
-
-let mut processor = StreamProcessor::from_tempo(126.0, 128.0, 44100, 2);
-processor.set_pitch_scale(1.05).expect("valid pitch scale");
-println!("Current pitch scale control: {:.3}", processor.pitch_scale());
-```
-
 ### AudioBuffer API
 
 ```rust
@@ -427,28 +242,27 @@ timestretch::stretch_wav_file("input.wav", "output.wav", &params).unwrap();
 
 ## How It Works
 
-The library uses a hybrid segmented pipeline:
+The engine is a fixed pull-based stage graph:
 
-1. **Transient detection** — spectral flux with adaptive threshold identifies
-   attack transients (kicks, snares, hi-hats). High-frequency bins (2–8 kHz)
-   are weighted more heavily to catch percussive onsets.
+1. **Varispeed head** — the tempo axis is a windowed-sinc resampler:
+   tempo retargets are instant and sample-accurate, and the source/output
+   timeline mapping is exact (`TimelineMap`).
 
-2. **Beat-aware segmentation (optional)** — transient boundaries can be merged
-   with beat-grid positions and snapped to subdivisions. If provided, an
-   offline pre-analysis artifact is preferred when confidence is high.
+2. **Two-band split (keylock profile)** — Linkwitz-Riley 8th-order at
+   150 Hz. The low band is deliberately NOT pitch-corrected — its pitch
+   follows tempo, which is what club sound systems and DJs expect from a
+   ±8% nudge — so it needs only a delay matched to the corrector.
 
-3. **Segment-wise stretching** — the audio is split at boundaries.
-   Transient segments are stretched with WSOLA (preserves waveform shape and
-   attack character). Tonal segments are stretched with a phase vocoder
-   (preserves frequency content with identity phase locking).
+3. **Time-domain SOLA correction** — the high band is pitch-corrected by
+   an elastic ring reader with correlation-matched, sub-sample-aligned
+   splices, steered around transients by the pre-analysis artifact (or an
+   online detector when none is attached). Full single-pitch keylock
+   through ±20%; beyond that the correction fades to plain varispeed
+   (deck-stop/spinback territory).
 
-4. **Sub-bass treatment** — frequencies below 120 Hz always use phase-locked
-   processing to prevent phase cancellation that would weaken the bass.
-
-5. **Timeline correction** — explicit timeline bookkeeping compensates boundary
-   overlap so concatenation preserves target output duration exactly.
-
-Segment joins use fixed or adaptive raised-cosine crossfades.
+4. **Exact timeline** — the constant 12.7 ms pipeline delay is reported,
+   compensated in position queries, and structurally trimmed in offline
+   renders; output length is exact by construction.
 
 ## Parameters
 
@@ -458,31 +272,22 @@ Segment joins use fixed or adaptive raised-cosine crossfades.
 let params = StretchParams::new(1.5)
     .with_sample_rate(48000)
     .with_channels(2)
-    .with_preset(EdmPreset::HouseLoop)   // apply preset first
-    .with_fft_size(4096)                 // then override individual params
-    .with_hop_size(1024)
-    .with_transient_sensitivity(0.6)
-    .with_elastic_timing(true)
-    .with_crossfade_mode(timestretch::CrossfadeMode::Adaptive)
-    .with_hpss(true)
-    .with_multi_resolution(true)
-    .with_sub_bass_cutoff(100.0)
-    .with_stereo_mode(timestretch::StereoMode::MidSide)
-    .with_phase_locking_mode(timestretch::PhaseLockingMode::RegionOfInfluence)
-    .with_wsola_segment_size(960)
-    .with_wsola_search_range(480)
-    .with_beat_aware(true)
-    .with_beat_snap_confidence_threshold(0.35)
-    .with_beat_snap_tolerance_ms(5.0);
+    .with_preset(EdmPreset::HouseLoop)
+    .with_normalize(true);
 ```
 
-**Defaults:** 44100 Hz, stereo, FFT 4096, hop 1024 (75% overlap), 120 Hz
-sub-bass cutoff, ~20ms WSOLA segments, ~10ms search range.
+Batch `stretch()` runs on the engine graph and ignores the legacy
+per-algorithm knobs (FFT/hop sizes and friends still exist on
+`StretchParams` for the phase-vocoder-based `pitch_shift` path).
+
+**Defaults:** 44100 Hz, stereo, keylock crossover at 150 Hz, constant
+12.7 ms keylock pipeline delay (0 ms in tape mode).
 
 ## Performance
 
-Performance depends heavily on preset, ratio, and mode (streaming vs offline
-batch).
+Performance depends on ratio and mode (real-time pull engine vs offline
+batch). The engine's per-callback worst case is measured and gated in CI
+(`qa/engine_wcet.rs`).
 
 Run opt-in QA harnesses:
 
@@ -523,18 +328,16 @@ See `benchmarks/README.md` for corpus setup and manifest/checksum requirements.
 
 ### Core Types
 
-- **`StretchParams`** — builder-pattern configuration: stretch ratio, sample rate,
-  channels, FFT size, hop size, EDM preset, WSOLA parameters, beat-snap controls,
-  optional pre-analysis artifact, and tempo helpers like `from_tempo()`
+- **`StretchParams`** — builder-pattern configuration: stretch ratio, sample
+  rate, channels, EDM preset, optional pre-analysis artifact, and tempo
+  helpers like `from_tempo()`
 - **`AudioBuffer`** — holds interleaved sample data with metadata (sample rate,
   channel layout)
 - **`EdmPreset`** — enum of tuned parameter sets for EDM workflows
 - **`EnvelopePreset`** — formant/envelope profile (`Off`, `Balanced`, `Vocal`)
-- **`QualityMode`** — explicit streaming profile: `LowLatency` (lean path, HPSS off), `Balanced`, `MaxQuality` (HPSS + adaptive crossfade/phase-lock enabled)
-- **`StreamProcessor`** — chunked real-time processor with on-the-fly ratio/tempo
-  changes, `from_tempo()`/`set_tempo()`, plus both
-  `Vec`-append (`process_into()`/`flush_into()`) and fixed-buffer interleaved
-  (`process_interleaved_into()`/`flush_interleaved_into()`) deterministic APIs
+- **`engine::Engine` / `EngineConfig` / `EngineProfile`** — the pull-based
+  real-time engine: `Engine::build` returns `EngineHandles { controller,
+  processor, source }` (lock-free control / audio-thread pull / source feed)
 - **`PreAnalysisArtifact`** — serializable offline beat/onset analysis artifact
 - **`StretchError`** — error type covering invalid parameters, I/O failures,
   and input-too-short conditions

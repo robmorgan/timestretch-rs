@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.8.0
+
+### Breaking changes — old engine deleted (ROADMAP Stage 9)
+
+The push-based streaming engine and the hybrid batch stretcher are gone;
+the pull engine (`timestretch::engine`) is the only engine, serving both
+real-time and batch.
+
+- Removed: `StreamProcessor`, `StreamingEngine`, `StreamProfile`,
+  `ControlPath`, `StreamLatencyReport`, `StreamPitchQuality`,
+  `TransientResetStats`, `HybridStretcher`, `MultiResolutionStretcher`,
+  `Wsola`, `StereoMode`, and the `stream` module.
+- `StretchParams`: `stereo_mode` / `with_stereo_mode` and
+  `with_stream_profile` removed (the engine processes channels in
+  lockstep natively; profiles were an old-engine latency knob).
+- `timestretch-cli`: `--streaming` and `--chunk-size` removed — batch
+  runs on the engine graph with exact output length.
+- Desktop app: the deck engine selector loses `Legacy (push)`; pull
+  tape/keylock remain. Legacy-only pitch-shift slider removed.
+- QA: old-engine harnesses (`streaming_quality`, `profile_quality`,
+  `varispeed_keylock`, `quality_gates`) deleted; the engine A/B matrix
+  is the quality dashboard, re-anchored on absolute thresholds derived
+  from new-engine measurements.
+- The live keylock chain drops its phase-vocoder corrector entirely
+  (owner listening rejected it at every threshold; SOLA carries the
+  whole corrected range) — chain WCET drops accordingly.
+
+### Kept
+
+- Batch API surface: `stretch`, `stretch_into`, `stretch_buffer`, BPM
+  helpers, `pitch_shift` (still phase-vocoder based), analysis
+  (`analyze_for_dj`, beat tracking), WAV I/O.
+- `tests/streaming_batch_parity.rs` is superseded by
+  `tests/streaming_offline_determinism.rs`: streaming and offline are
+  sample-identical by construction.
+
 ## 0.7.0
 
 ### Breaking changes
