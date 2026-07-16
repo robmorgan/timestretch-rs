@@ -1,8 +1,8 @@
-//! Real-time pull-engine example.
+//! Real-time engine example.
 //!
-//! Demonstrates the pull engine's controller/processor/source split for
+//! Demonstrates the engine's controller/processor/source split for
 //! real-time DJ use, simulating a pitch fader that changes the tempo on
-//! the fly while an audio callback pulls fixed-size buffers.
+//! the fly while an audio callback processes fixed-size buffers.
 //!
 //! Run with: cargo run --example realtime_stream
 

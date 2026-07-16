@@ -1,6 +1,6 @@
-//! Transient-sharpness A/B gate (ROADMAP new Stage 3): at ±4% tempo the
-//! new keylock chain (SOLA corrector active) must preserve kick/hat attacks
-//! at least as sharply as the old engine on the identical fixture.
+//! Transient-sharpness gates (ROADMAP new Stage 3): at ±4% tempo the
+//! keylock chain (SOLA corrector active) must preserve kick/hat attacks,
+//! gated on absolute thresholds derived from Stage 8/9 measurements.
 //!
 //! Run with:
 //! `cargo test --features qa-harnesses --release --test engine_transients -- --nocapture`
@@ -11,7 +11,7 @@
 #[path = "ab/mod.rs"]
 mod ab;
 
-use ab::{render_new_keylock_with_artifact, render_with_rate_schedule, Arm};
+use ab::{render_keylock_with_artifact, render_with_rate_schedule, Arm};
 use timestretch::PreAnalysisArtifact;
 
 const SAMPLE_RATE: u32 = 44_100;
@@ -107,7 +107,7 @@ fn keylock_artifact_guidance_preserves_transients_at_least_as_well_as_online() {
     let artifact = click_train_artifact(num_samples);
 
     for rate in [1.04f64, 0.96] {
-        let with_artifact = render_new_keylock_with_artifact(
+        let with_artifact = render_keylock_with_artifact(
             artifact.clone(),
             &input,
             1,
@@ -116,7 +116,7 @@ fn keylock_artifact_guidance_preserves_transients_at_least_as_well_as_online() {
             &|_| rate,
         );
         let online = render_with_rate_schedule(
-            Arm::NewKeylock,
+            Arm::Keylock,
             &input,
             1,
             SAMPLE_RATE,
@@ -153,25 +153,25 @@ fn keylock_transient_sharpness_at_dj_rates() {
     let input = edm_click_train(SAMPLE_RATE as usize * 10);
 
     for rate in [1.04f64, 0.96] {
-        let new = render_with_rate_schedule(
-            Arm::NewKeylock,
+        let rendered = render_with_rate_schedule(
+            Arm::Keylock,
             &input,
             1,
             SAMPLE_RATE,
             CALLBACK_FRAMES,
             &|_| rate,
         );
-        let new_sharpness = median_sharpness(&new.output, rate);
+        let sharpness = median_sharpness(&rendered.output, rate);
         // Source click rise for reference: 1.5 in one sample.
-        println!("transient sharpness @rate {rate}: {new_sharpness:.3} (source 1.5)");
+        println!("transient sharpness @rate {rate}: {sharpness:.3} (source 1.5)");
 
         // Absolute gate, re-derived at Stage 9 from new-engine
         // measurements (1.16 at rate 1.04, 1.29 at 0.96; the deleted old
         // engine measured 0.71/0.74 on the same fixture and metric).
         assert!(
-            new_sharpness >= 0.90,
-            "rate {rate}: sharpness {new_sharpness:.3} below the 0.90 gate"
+            sharpness >= 0.90,
+            "rate {rate}: sharpness {sharpness:.3} below the 0.90 gate"
         );
-        assert_eq!(new.underrun_frames, 0);
+        assert_eq!(rendered.underrun_frames, 0);
     }
 }

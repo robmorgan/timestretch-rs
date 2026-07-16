@@ -1,13 +1,13 @@
-//! A/B adapter smoke harness (ROADMAP new Stage 1): both engines render the
+//! Adapter smoke harness (ROADMAP new Stage 1): both profiles render the
 //! same fixture through the same interface, and structural metrics compare.
 //!
 //! Run with:
 //! `cargo test --features qa-harnesses --release --test engine_ab -- --nocapture`
 //!
-//! This harness gates only engine-independent structure (click-freeness,
-//! level, timeline length) — the new tape arm intentionally shifts pitch
-//! with tempo, so spectral comparisons start in Stage 2 when the keylock
-//! chain exists.
+//! This harness gates only profile-independent structure (click-freeness,
+//! level, timeline length) — the tape arm intentionally shifts pitch
+//! with tempo, so spectral comparisons live in the keylock-chain
+//! harnesses.
 
 // Each harness compiles the shared adapter separately, so arms another
 // harness uses read as dead code here.
@@ -52,31 +52,24 @@ fn adapter_drives_both_profiles_over_identical_fixture() {
     // The DJ ride gesture both arms must survive.
     let ride = |t: f64| 1.0 + 0.06 * (2.0 * std::f64::consts::PI * 0.25 * t).sin();
 
-    let keylock = render_with_rate_schedule(
-        Arm::NewKeylock,
-        &input,
-        1,
-        SAMPLE_RATE,
-        CALLBACK_FRAMES,
-        &ride,
-    );
-    let new =
-        render_with_rate_schedule(Arm::NewTape, &input, 1, SAMPLE_RATE, CALLBACK_FRAMES, &ride);
+    let keylock =
+        render_with_rate_schedule(Arm::Keylock, &input, 1, SAMPLE_RATE, CALLBACK_FRAMES, &ride);
+    let tape = render_with_rate_schedule(Arm::Tape, &input, 1, SAMPLE_RATE, CALLBACK_FRAMES, &ride);
 
     println!(
         "adapter smoke: keylock len={} rms={:.4} max_diff={:.4} | tape len={} rms={:.4} max_diff={:.4} underruns={}",
         keylock.output.len(),
         rms(&keylock.output),
         max_adjacent_diff(&keylock.output),
-        new.output.len(),
-        rms(&new.output),
-        max_adjacent_diff(&new.output),
-        new.underrun_frames,
+        tape.output.len(),
+        rms(&tape.output),
+        max_adjacent_diff(&tape.output),
+        tape.underrun_frames,
     );
 
     // Both arms cover the fixture: output duration within 5% of the source
     // duration (the ride averages rate ~1.0).
-    for (label, out) in [("keylock", &keylock.output), ("new", &new.output)] {
+    for (label, out) in [("keylock", &keylock.output), ("tape", &tape.output)] {
         let len_err = (out.len() as f64 - input.len() as f64).abs() / input.len() as f64;
         assert!(
             len_err < 0.05,
@@ -88,7 +81,7 @@ fn adapter_drives_both_profiles_over_identical_fixture() {
     // Level parity: same tone, same amplitude, both engines near the
     // source RMS (amp/sqrt(2)).
     let source_rms = amp as f64 / std::f64::consts::SQRT_2;
-    for (label, out) in [("keylock", &keylock.output), ("new", &new.output)] {
+    for (label, out) in [("keylock", &keylock.output), ("tape", &tape.output)] {
         let r = rms(out);
         assert!(
             (r - source_rms).abs() / source_rms < 0.1,
@@ -108,11 +101,11 @@ fn adapter_drives_both_profiles_over_identical_fixture() {
         max_adjacent_diff(keylock_scan)
     );
     assert!(
-        max_adjacent_diff(&new.output) <= slew_bound * 1.5,
-        "new arm clicked: {:.5}",
-        max_adjacent_diff(&new.output)
+        max_adjacent_diff(&tape.output) <= slew_bound * 1.5,
+        "tape arm clicked: {:.5}",
+        max_adjacent_diff(&tape.output)
     );
 
-    // The pull arm must never have starved mid-render.
-    assert_eq!(new.underrun_frames, 0, "A/B feeder must keep the ring fed");
+    // The engine must never have starved mid-render.
+    assert_eq!(tape.underrun_frames, 0, "the feeder must keep the ring fed");
 }

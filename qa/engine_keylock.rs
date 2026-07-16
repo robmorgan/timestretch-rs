@@ -1,4 +1,4 @@
-//! Keylock chain quality gates for the new pull engine (ROADMAP new
+//! Keylock chain quality gates for the engine (ROADMAP new
 //! Stage 2), ported from `qa/varispeed_keylock.rs` via the A/B adapter.
 //!
 //! Run with:
@@ -98,29 +98,29 @@ fn keylock_cents_wobble_under_torture_ride() {
     // 440 Hz (cents-level) while the tempo rides ±8%.
     let input = sine(REFERENCE_HZ, SAMPLE_RATE as usize * 10, 0.7);
 
-    let new = render_with_rate_schedule(
-        Arm::NewKeylock,
+    let rendered = render_with_rate_schedule(
+        Arm::Keylock,
         &input,
         1,
         SAMPLE_RATE,
         CALLBACK_FRAMES,
         &torture_ride,
     );
-    let (new_p95, new_max) = cents_deviation_track(&new.output);
-    println!("keylock cents wobble: p95={new_p95:.2} max={new_max:.2}");
+    let (cents_p95, cents_max) = cents_deviation_track(&rendered.output);
+    println!("keylock cents wobble: p95={cents_p95:.2} max={cents_max:.2}");
 
     // Absolute gates (Stage 9: re-anchored on new-engine measurements;
     // the deleted old engine's Live profile measured p95 ~15 on this
     // torture fixture).
     assert!(
-        new_p95 <= P95_CENTS_LIMIT,
-        "keylock p95 wobble {new_p95:.2} cents > {P95_CENTS_LIMIT}"
+        cents_p95 <= P95_CENTS_LIMIT,
+        "keylock p95 wobble {cents_p95:.2} cents > {P95_CENTS_LIMIT}"
     );
     assert!(
-        new_max <= MAX_CENTS_LIMIT,
-        "keylock max wobble {new_max:.2} cents > {MAX_CENTS_LIMIT}"
+        cents_max <= MAX_CENTS_LIMIT,
+        "keylock max wobble {cents_max:.2} cents > {MAX_CENTS_LIMIT}"
     );
-    assert_eq!(new.underrun_frames, 0);
+    assert_eq!(rendered.underrun_frames, 0);
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn keylock_cents_wobble_sola_band_ride() {
     // must hold pitch tighter than the PV does on the wide ride.
     let input = sine(REFERENCE_HZ, SAMPLE_RATE as usize * 10, 0.7);
     let render = render_with_rate_schedule(
-        Arm::NewKeylock,
+        Arm::Keylock,
         &input,
         1,
         SAMPLE_RATE,
@@ -152,7 +152,7 @@ fn keylock_steady_ratio_is_subcent() {
     // wobble only appears under rides. The old path measured < 1 cent here.
     let input = sine(REFERENCE_HZ, SAMPLE_RATE as usize * 6, 0.7);
     let render = render_with_rate_schedule(
-        Arm::NewKeylock,
+        Arm::Keylock,
         &input,
         1,
         SAMPLE_RATE,
@@ -177,7 +177,7 @@ fn seam_metrics(rate: f64) -> (f64, f64) {
     let seam_hz = 150.0;
     let input = sine(seam_hz, SAMPLE_RATE as usize * 8, 0.6);
     let render = render_with_rate_schedule(
-        Arm::NewKeylock,
+        Arm::Keylock,
         &input,
         1,
         SAMPLE_RATE,
@@ -260,11 +260,11 @@ fn crossover_seam_detuning_at_dj_rates_stays_in_known_envelope() {
     );
 }
 
-/// Falsification experiment (ROADMAP Stage 2): renders listening pairs for
-/// the un-keylocked low band on bass-heavy material at ±8% and ±20%.
+/// Falsification experiment (ROADMAP Stage 2): renders listening material
+/// for the un-keylocked low band on bass-heavy material at ±8% and ±20%.
 ///
-/// For each rate: `new_keylock` (low band follows tempo) vs `old_keylock`
-/// (old engine corrects the full band, sub-bass included). WAVs land in
+/// For each rate: a keylock render (low band follows tempo) against the
+/// source, to audit the two-band decision by ear. WAVs land in
 /// `target/keylock_falsification/`. Run explicitly with:
 /// `cargo test --features qa-harnesses --release --test engine_keylock -- --ignored --nocapture`
 #[test]
@@ -295,8 +295,8 @@ fn falsification_render_low_band_listening_pairs() {
 
     write_wav(&out_dir.join("source.wav"), &input);
     for rate in [1.08, 0.92, 1.2, 0.8] {
-        let new = render_with_rate_schedule(
-            Arm::NewKeylock,
+        let rendered = render_with_rate_schedule(
+            Arm::Keylock,
             &input,
             1,
             SAMPLE_RATE,
@@ -304,8 +304,11 @@ fn falsification_render_low_band_listening_pairs() {
             &|_| rate,
         );
         let tag = format!("{:+.0}pct", (rate - 1.0) * 100.0);
-        write_wav(&out_dir.join(format!("new_keylock_{tag}.wav")), &new.output);
-        println!("rendered {tag}: {} frames", new.output.len(),);
+        write_wav(
+            &out_dir.join(format!("keylock_{tag}.wav")),
+            &rendered.output,
+        );
+        println!("rendered {tag}: {} frames", rendered.output.len(),);
     }
     println!("listening pairs in {}", out_dir.display());
 }

@@ -1,8 +1,8 @@
-//! The pull engine's source-supply contract.
+//! The engine's source-supply contract.
 //!
-//! A pull engine demands a ratio-dependent, variable amount of source per
-//! output block, so the host cannot feed it synchronously the way the old
-//! push API worked. Instead the host owns a [`SourceProducer`] and keeps a
+//! The engine demands a ratio-dependent, variable amount of source per
+//! output block, so the host cannot feed it synchronously, block for
+//! block. Instead the host owns a [`SourceProducer`] and keeps a
 //! lock-free ring topped up; the processor consumes whatever each block
 //! needs. The contract is explicit:
 //!
