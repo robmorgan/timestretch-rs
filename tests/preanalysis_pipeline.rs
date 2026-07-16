@@ -1,8 +1,8 @@
 use std::f32::consts::PI;
 use std::path::PathBuf;
 use timestretch::{
-    analyze_for_dj, read_preanalysis_json, stretch, write_preanalysis_json, EdmPreset,
-    PreAnalysisArtifact, StretchParams,
+    analyze_for_dj, read_preanalysis_json, stretch, write_preanalysis_json, PreAnalysisArtifact,
+    StretchParams,
 };
 
 fn click_train(sample_rate: u32, bpm: f64, seconds: f64) -> Vec<f32> {
@@ -79,14 +79,12 @@ fn test_runtime_uses_confident_preanalysis_when_bpm_missing() {
     let params_with_artifact = StretchParams::new(ratio)
         .with_sample_rate(sample_rate)
         .with_channels(1)
-        .with_preset(EdmPreset::DjBeatmatch)
         .with_pre_analysis(artifact.clone())
         .with_beat_snap_confidence_threshold(0.1);
 
     let params_with_bpm = StretchParams::new(ratio)
         .with_sample_rate(sample_rate)
         .with_channels(1)
-        .with_preset(EdmPreset::DjBeatmatch)
         .with_bpm(artifact.bpm);
 
     let out_artifact =
@@ -123,14 +121,12 @@ fn test_runtime_fallback_when_preanalysis_unavailable() {
     let params_with_bad_artifact = StretchParams::new(ratio)
         .with_sample_rate(sample_rate)
         .with_channels(1)
-        .with_preset(EdmPreset::DjBeatmatch)
         .with_pre_analysis(unavailable_artifact)
         .with_beat_snap_confidence_threshold(0.5);
 
     let params_fallback = StretchParams::new(ratio)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::DjBeatmatch);
+        .with_channels(1);
 
     let out_bad = stretch(&input, &params_with_bad_artifact).expect("fallback stretch should work");
     let out_base = stretch(&input, &params_fallback).expect("base stretch should work");
@@ -160,8 +156,7 @@ fn test_batch_artifact_transient_parity_with_online_detection() {
     let ratio = 1.1;
     let base_params = StretchParams::new(ratio)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::DjBeatmatch);
+        .with_channels(1);
 
     let out_online = stretch(&input, &base_params).expect("online stretch should work");
     let out_artifact = stretch(
@@ -218,8 +213,7 @@ fn test_batch_artifact_skips_online_detection() {
     let ratio = 1.1;
     let base_params = StretchParams::new(ratio)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::DjBeatmatch);
+        .with_channels(1);
 
     let out_online = stretch(&input, &base_params).expect("online stretch should work");
     let out_artifact = stretch(
@@ -260,8 +254,7 @@ fn test_stereo_artifact_parity_with_online_detection() {
     let ratio = 1.1;
     let base_params = StretchParams::new(ratio)
         .with_sample_rate(sample_rate)
-        .with_channels(2)
-        .with_preset(EdmPreset::DjBeatmatch);
+        .with_channels(2);
 
     let out_online = stretch(&interleaved, &base_params).expect("online stereo stretch");
     let out_artifact = stretch(

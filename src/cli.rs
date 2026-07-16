@@ -1,5 +1,5 @@
 use std::path::Path;
-use timestretch::{EdmPreset, PreAnalysisArtifact, StretchParams, WindowType};
+use timestretch::{EnvelopePreset, PreAnalysisArtifact, StretchParams, WindowType};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -23,7 +23,7 @@ fn main() {
     let mut to_bpm: Option<f64> = None;
     let mut auto_bpm = false;
     let mut pitch_factor: Option<f64> = None;
-    let mut preset: Option<EdmPreset> = None;
+    let mut envelope: Option<EnvelopePreset> = None;
     let mut format_24bit = false;
     let mut _format_float = false;
     let mut verbose = false;
@@ -52,9 +52,9 @@ fn main() {
                 i += 1;
                 pitch_factor = Some(parse_f64(&args, i, "pitch"));
             }
-            "--preset" => {
+            "--envelope" => {
                 i += 1;
-                preset = Some(parse_preset(&args, i));
+                envelope = Some(parse_envelope(&args, i));
             }
             "--24bit" => format_24bit = true,
             "--float" => _format_float = true,
@@ -73,20 +73,19 @@ fn main() {
                 i += 1;
                 window_type = Some(parse_window(&args, i));
             }
-            // Legacy positional: ratio [preset]
+            // Legacy positional: ratio
             other => {
                 if ratio.is_none() {
                     match other.parse::<f64>() {
                         Ok(r) => ratio = Some(r),
                         Err(_) => {
-                            // Try as preset name
-                            preset = Some(parse_preset_str(other));
-                            i += 1;
-                            continue;
+                            eprintln!("ERROR: Unknown argument '{}'", other);
+                            std::process::exit(1);
                         }
                     }
-                } else if preset.is_none() {
-                    preset = Some(parse_preset_str(other));
+                } else {
+                    eprintln!("ERROR: Unknown argument '{}'", other);
+                    std::process::exit(1);
                 }
             }
         }
@@ -128,9 +127,6 @@ fn main() {
             std::process::exit(1);
         }
         eprintln!("BPM: {:.1} -> {:.1} (ratio: {:.4})", from, to, from / to);
-        if preset.is_none() {
-            preset = Some(EdmPreset::DjBeatmatch);
-        }
         from / to
     } else if let Some(r) = ratio {
         r
@@ -180,8 +176,8 @@ fn main() {
         .with_sample_rate(buffer.sample_rate)
         .with_channels(buffer.channels.count() as u32);
 
-    if let Some(p) = preset {
-        params = params.with_preset(p);
+    if let Some(e) = envelope {
+        params = params.with_envelope_preset(e);
     }
 
     if let Some(artifact) = pre_analysis.clone() {
@@ -196,14 +192,8 @@ fn main() {
 
     if verbose {
         eprintln!("Parameters: {}", params);
-        eprintln!(
-            "  Transient sensitivity: {:.2}",
-            params.transient_sensitivity
-        );
         eprintln!("  Sub-bass cutoff: {:.0} Hz", params.sub_bass_cutoff);
-        eprintln!("  WSOLA segment: {} samples", params.wsola_segment_size);
-        eprintln!("  WSOLA search: {} samples", params.wsola_search_range);
-        eprintln!("  Beat-aware: {}", params.beat_aware);
+        eprintln!("  Envelope preset: {:?}", params.envelope_preset);
         eprintln!("  Window: {:?}", params.window_type);
         eprintln!("  Normalize: {}", params.normalize);
     }
@@ -368,13 +358,14 @@ fn print_usage() {
     eprintln!();
     eprintln!("Modes:");
     eprintln!("  --ratio <f>                   Stretch ratio (1.5 = 50% slower)");
-    eprintln!("  --from-bpm <f> --to-bpm <f>   BPM matching (auto-selects DJ preset)");
+    eprintln!("  --from-bpm <f> --to-bpm <f>   BPM matching");
     eprintln!("  --auto-bpm --to-bpm <f>       Auto-detect source BPM, match to target");
     eprintln!("  --pitch <f>                   Pitch shift (2.0 = up one octave)");
     eprintln!("  analyze                       Write a reusable pre-analysis artifact");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --preset <name>       dj, house, halftime, ambient, vocal");
+    eprintln!("  --envelope <name>     Formant/envelope profile for --pitch:");
+    eprintln!("                        off, balanced (default), vocal");
     eprintln!("  --window <type>       hann (default), blackman-harris, kaiser:<beta>");
     eprintln!("  --pre-analysis <f>    Use a pre-analysis artifact (from `analyze`);");
     eprintln!("                        validated against the input, ignored if stale");
@@ -388,9 +379,9 @@ fn print_usage() {
     eprintln!("  timestretch-cli in.wav out.wav --ratio 1.5");
     eprintln!("  timestretch-cli in.wav out.wav --from-bpm 126 --to-bpm 128");
     eprintln!("  timestretch-cli in.wav out.wav --auto-bpm --to-bpm 128");
-    eprintln!("  timestretch-cli in.wav out.wav --pitch 0.5 --preset vocal");
+    eprintln!("  timestretch-cli in.wav out.wav --pitch 0.5 --envelope vocal");
     eprintln!("  timestretch-cli in.wav out.wav --ratio 2.0 --window blackman-harris --normalize");
-    eprintln!("  timestretch-cli in.wav out.wav 1.5 house");
+    eprintln!("  timestretch-cli in.wav out.wav 1.5");
     eprintln!("  timestretch-cli analyze in.wav");
     eprintln!(
         "  timestretch-cli in.wav out.wav --ratio 1.05 --pre-analysis in.wav.tsanalysis.json"
@@ -411,12 +402,12 @@ fn parse_f64(args: &[String], idx: usize, name: &str) -> f64 {
     }
 }
 
-fn parse_preset(args: &[String], idx: usize) -> EdmPreset {
+fn parse_envelope(args: &[String], idx: usize) -> EnvelopePreset {
     if idx >= args.len() {
-        eprintln!("ERROR: --preset requires a value");
+        eprintln!("ERROR: --envelope requires a value (off, balanced, vocal)");
         std::process::exit(1);
     }
-    parse_preset_str(&args[idx])
+    parse_envelope_str(&args[idx])
 }
 
 fn parse_window(args: &[String], idx: usize) -> WindowType {
@@ -455,16 +446,17 @@ fn parse_window_str(s: &str) -> WindowType {
     }
 }
 
-fn parse_preset_str(s: &str) -> EdmPreset {
+fn parse_envelope_str(s: &str) -> EnvelopePreset {
     match s {
-        "dj" => EdmPreset::DjBeatmatch,
-        "house" => EdmPreset::HouseLoop,
-        "halftime" => EdmPreset::Halftime,
-        "ambient" => EdmPreset::Ambient,
-        "vocal" => EdmPreset::VocalChop,
+        "off" => EnvelopePreset::Off,
+        "balanced" => EnvelopePreset::Balanced,
+        "vocal" => EnvelopePreset::Vocal,
         other => {
-            eprintln!("WARNING: Unknown preset '{}', using HouseLoop", other);
-            EdmPreset::HouseLoop
+            eprintln!(
+                "ERROR: Unknown envelope profile '{}' (use off, balanced, or vocal)",
+                other
+            );
+            std::process::exit(1);
         }
     }
 }

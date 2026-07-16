@@ -1,6 +1,6 @@
 /// Integration tests for BPM-aware stretch API.
 use std::f32::consts::PI;
-use timestretch::{AudioBuffer, EdmPreset, StretchError, StretchParams};
+use timestretch::{AudioBuffer, StretchError, StretchParams};
 
 fn generate_sine(freq: f32, sample_rate: u32, duration_secs: f64) -> Vec<f32> {
     let num_samples = (sample_rate as f64 * duration_secs) as usize;
@@ -37,8 +37,7 @@ fn test_bpm_stretch_126_to_128() {
 
     let params = StretchParams::new(1.0)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::DjBeatmatch);
+        .with_channels(1);
 
     let output = timestretch::stretch_to_bpm(&input, 126.0, 128.0, &params).unwrap();
 
@@ -60,8 +59,7 @@ fn test_bpm_stretch_128_to_126() {
 
     let params = StretchParams::new(1.0)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::DjBeatmatch);
+        .with_channels(1);
 
     let output = timestretch::stretch_to_bpm(&input, 128.0, 126.0, &params).unwrap();
 
@@ -80,8 +78,7 @@ fn test_bpm_stretch_halftime() {
 
     let params = StretchParams::new(1.0)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::Halftime);
+        .with_channels(1);
 
     let output = timestretch::stretch_to_bpm(&input, 128.0, 64.0, &params).unwrap();
 
@@ -123,8 +120,7 @@ fn test_bpm_stretch_preserves_rms_energy() {
 
     let params = StretchParams::new(1.0)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::DjBeatmatch);
+        .with_channels(1);
 
     let output = timestretch::stretch_to_bpm(&input, 126.0, 128.0, &params).unwrap();
     let output_rms = (output.iter().map(|x| x * x).sum::<f32>() / output.len() as f32).sqrt();
@@ -176,8 +172,7 @@ fn test_bpm_stretch_stereo() {
 
     let params = StretchParams::new(1.0)
         .with_sample_rate(sample_rate)
-        .with_channels(2)
-        .with_preset(EdmPreset::DjBeatmatch);
+        .with_channels(2);
 
     let output = timestretch::stretch_to_bpm(&input, 126.0, 128.0, &params).unwrap();
     assert!(!output.is_empty());
@@ -185,37 +180,11 @@ fn test_bpm_stretch_stereo() {
 }
 
 #[test]
-fn test_bpm_stretch_with_all_presets() {
-    let sample_rate = 44100u32;
-    let input = generate_sine(440.0, sample_rate, 2.0);
-
-    for preset in &[
-        EdmPreset::DjBeatmatch,
-        EdmPreset::HouseLoop,
-        EdmPreset::Halftime,
-        EdmPreset::Ambient,
-        EdmPreset::VocalChop,
-    ] {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(sample_rate)
-            .with_channels(1)
-            .with_preset(*preset);
-
-        let output = timestretch::stretch_to_bpm(&input, 126.0, 128.0, &params).unwrap();
-        assert!(
-            !output.is_empty(),
-            "Preset {:?} produced empty output",
-            preset
-        );
-    }
-}
-
-#[test]
 fn test_bpm_stretch_buffer_api() {
     let sample_rate = 44100u32;
     let buffer = AudioBuffer::from_mono(generate_sine(440.0, sample_rate, 2.0), sample_rate);
 
-    let params = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
+    let params = StretchParams::new(1.0);
 
     let output = timestretch::stretch_bpm_buffer(&buffer, 126.0, 128.0, &params).unwrap();
     assert_eq!(output.sample_rate, sample_rate);
@@ -308,8 +277,7 @@ fn test_bpm_stretch_48khz() {
 
     let params = StretchParams::new(1.0)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::HouseLoop);
+        .with_channels(1);
 
     let output = timestretch::stretch_to_bpm(&input, 126.0, 128.0, &params).unwrap();
     assert!(!output.is_empty());

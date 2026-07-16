@@ -6,7 +6,7 @@
 
 use std::f32::consts::PI;
 use timestretch::io::wav::{read_wav, write_wav_16bit, write_wav_24bit, write_wav_float};
-use timestretch::{stretch_buffer, AudioBuffer, Channels, EdmPreset, StretchParams};
+use timestretch::{stretch_buffer, AudioBuffer, Channels, StretchParams};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -124,7 +124,7 @@ fn test_wav_stretch_16bit_mono() {
     let wav_bytes = write_wav_16bit(&original);
     let decoded = read_wav(&wav_bytes).unwrap();
 
-    let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
+    let params = StretchParams::new(1.5);
     let stretched = stretch_buffer(&decoded, &params).unwrap();
 
     assert_eq!(stretched.sample_rate, 44100);
@@ -155,7 +155,7 @@ fn test_wav_stretch_float_stereo() {
     let wav_bytes = write_wav_float(&original);
     let decoded = read_wav(&wav_bytes).unwrap();
 
-    let params = StretchParams::new(0.75).with_preset(EdmPreset::DjBeatmatch);
+    let params = StretchParams::new(0.75);
     let stretched = stretch_buffer(&decoded, &params).unwrap();
 
     assert_eq!(stretched.sample_rate, 44100);
@@ -183,7 +183,7 @@ fn test_wav_kick_pattern_stretch() {
 
     // Stretch a 128 BPM pattern to play at 126 BPM (DJ beatmatch scenario)
     let ratio = 128.0 / 126.0; // ~1.016
-    let params = StretchParams::new(ratio).with_preset(EdmPreset::DjBeatmatch);
+    let params = StretchParams::new(ratio);
     let stretched = stretch_buffer(&decoded, &params).unwrap();
 
     assert_no_nan_inf(&stretched.data, "kick stretch");
@@ -213,7 +213,7 @@ fn test_wav_kick_pattern_halftime() {
     let wav_bytes = write_wav_float(&kicks);
     let decoded = read_wav(&wav_bytes).unwrap();
 
-    let params = StretchParams::new(2.0).with_preset(EdmPreset::Halftime);
+    let params = StretchParams::new(2.0);
     let stretched = stretch_buffer(&decoded, &params).unwrap();
 
     assert_no_nan_inf(&stretched.data, "kick halftime");
@@ -235,7 +235,7 @@ fn test_wav_16bit_vs_float_stretch_consistency() {
     // Stretch through 16-bit pipeline
     let wav_16 = write_wav_16bit(&original);
     let dec_16 = read_wav(&wav_16).unwrap();
-    let params = StretchParams::new(1.25).with_preset(EdmPreset::HouseLoop);
+    let params = StretchParams::new(1.25);
     let stretched_16 = stretch_buffer(&dec_16, &params).unwrap();
 
     // Stretch through float pipeline
@@ -265,7 +265,7 @@ fn test_wav_roundtrip_48khz() {
     let decoded = read_wav(&wav_bytes).unwrap();
     assert_eq!(decoded.sample_rate, 48000);
 
-    let params = StretchParams::new(1.3).with_preset(EdmPreset::HouseLoop);
+    let params = StretchParams::new(1.3);
     let stretched = stretch_buffer(&decoded, &params).unwrap();
 
     assert_eq!(stretched.sample_rate, 48000);
@@ -279,34 +279,23 @@ fn test_wav_roundtrip_48khz() {
     );
 }
 
-// ── Preset-specific WAV tests ───────────────────────────────────────────────
+// ── Ratio-sweep WAV tests ───────────────────────────────────────────────────
 
 #[test]
-fn test_wav_all_presets_roundtrip() {
+fn test_wav_ratio_sweep_roundtrip() {
     let original = sine_mono(440.0, 44100, 1.0);
     let wav_bytes = write_wav_float(&original);
     let decoded = read_wav(&wav_bytes).unwrap();
 
-    let presets = [
-        (EdmPreset::DjBeatmatch, 1.02),
-        (EdmPreset::HouseLoop, 1.25),
-        (EdmPreset::Halftime, 2.0),
-        (EdmPreset::Ambient, 3.0),
-        (EdmPreset::VocalChop, 0.8),
-    ];
-
-    for (preset, ratio) in presets {
-        let params = StretchParams::new(ratio).with_preset(preset);
+    for ratio in [1.02, 1.25, 2.0, 3.0, 0.8] {
+        let params = StretchParams::new(ratio);
         let stretched = stretch_buffer(&decoded, &params).unwrap();
 
-        assert_no_nan_inf(
-            &stretched.data,
-            &format!("preset {:?} ratio {}", preset, ratio),
-        );
+        assert_no_nan_inf(&stretched.data, &format!("ratio {}", ratio));
         assert!(
             !stretched.data.is_empty(),
-            "Preset {:?} produced empty output",
-            preset
+            "Ratio {} produced empty output",
+            ratio
         );
 
         // No clipping
@@ -317,8 +306,8 @@ fn test_wav_all_presets_roundtrip() {
             .fold(0.0f32, f32::max);
         assert!(
             max_sample < 10.0,
-            "Preset {:?} produced extreme sample: {}",
-            preset,
+            "Ratio {} produced extreme sample: {}",
+            ratio,
             max_sample
         );
     }
@@ -333,7 +322,7 @@ fn test_wav_double_stretch_pipeline() {
     // First stretch: 1.0x → 1.5x through WAV pipeline
     let wav1 = write_wav_float(&original);
     let dec1 = read_wav(&wav1).unwrap();
-    let params1 = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
+    let params1 = StretchParams::new(1.5);
     let stretched1 = stretch_buffer(&dec1, &params1).unwrap();
 
     // Encode the stretched result to WAV and decode it
@@ -342,7 +331,7 @@ fn test_wav_double_stretch_pipeline() {
     assert_eq!(dec2.data.len(), stretched1.data.len());
 
     // Second stretch: compress back to ~original length
-    let params2 = StretchParams::new(1.0 / 1.5).with_preset(EdmPreset::HouseLoop);
+    let params2 = StretchParams::new(1.0 / 1.5);
     let final_output = stretch_buffer(&dec2, &params2).unwrap();
 
     assert_no_nan_inf(&final_output.data, "double stretch");
@@ -407,7 +396,7 @@ fn test_wav_stretch_24bit_mono() {
     let wav_bytes = write_wav_24bit(&original);
     let decoded = read_wav(&wav_bytes).unwrap();
 
-    let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
+    let params = StretchParams::new(1.5);
     let stretched = stretch_buffer(&decoded, &params).unwrap();
 
     assert_eq!(stretched.sample_rate, 44100);
@@ -428,7 +417,7 @@ fn test_wav_24bit_vs_float_stretch_consistency() {
     // Stretch through 24-bit pipeline
     let wav_24 = write_wav_24bit(&original);
     let dec_24 = read_wav(&wav_24).unwrap();
-    let params = StretchParams::new(1.25).with_preset(EdmPreset::HouseLoop);
+    let params = StretchParams::new(1.25);
     let stretched_24 = stretch_buffer(&dec_24, &params).unwrap();
 
     // Stretch through float pipeline
@@ -459,7 +448,7 @@ fn test_mix_to_mono_then_stretch() {
     assert!(mono.is_mono());
     assert_eq!(mono.num_frames(), stereo.num_frames());
 
-    let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
+    let params = StretchParams::new(1.5);
     let stretched = stretch_buffer(&mono, &params).unwrap();
 
     assert!(stretched.is_mono());
@@ -487,7 +476,7 @@ fn test_stereo_left_right_extraction_and_stretch() {
 
     // Stretch left channel alone
     let left_buf = AudioBuffer::from_mono(left, 44100);
-    let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
+    let params = StretchParams::new(1.5);
     let stretched = stretch_buffer(&left_buf, &params).unwrap();
     assert_no_nan_inf(&stretched.data, "left channel stretch");
     assert!(!stretched.is_empty());
@@ -498,7 +487,7 @@ fn test_stereo_left_right_extraction_and_stretch() {
 #[test]
 fn test_wav_preserves_stretched_output() {
     let original = sine_mono(440.0, 44100, 1.0);
-    let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
+    let params = StretchParams::new(1.5);
     let stretched = stretch_buffer(&original, &params).unwrap();
 
     // Save as float WAV and reload — should be bit-identical

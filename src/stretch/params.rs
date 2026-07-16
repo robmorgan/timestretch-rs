@@ -32,12 +32,6 @@ pub fn validate_params(params: &StretchParams) -> Result<(), String> {
             params.fft_size
         ));
     }
-    if params.hop_size == 0 || params.hop_size > params.fft_size {
-        return Err(format!(
-            "Hop size {} must be between 1 and FFT size {}",
-            params.hop_size, params.fft_size
-        ));
-    }
     if !(SAMPLE_RATE_MIN..=SAMPLE_RATE_MAX).contains(&params.sample_rate) {
         return Err(format!(
             "Sample rate {} out of range ({}-{})",
@@ -77,12 +71,6 @@ pub fn validate_params(params: &StretchParams) -> Result<(), String> {
             params.transient_threshold_policy
         ));
     }
-    if !params.residual_mix.is_finite() || !(0.0..=1.5).contains(&params.residual_mix) {
-        return Err(format!(
-            "Residual mix must be finite and in [0,1.5], got {}",
-            params.residual_mix
-        ));
-    }
     if !params.envelope_strength.is_finite() || !(0.0..=2.0).contains(&params.envelope_strength) {
         return Err(format!(
             "Envelope strength must be finite and in [0,2], got {}",
@@ -98,7 +86,6 @@ pub fn validate_params(params: &StretchParams) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::EdmPreset;
 
     #[test]
     fn test_validate_params_valid() {
@@ -126,10 +113,6 @@ mod tests {
 
         params.fft_size = 128;
         assert!(validate_params(&params).is_err()); // Too small
-
-        params.fft_size = 256;
-        params.hop_size = 0;
-        assert!(validate_params(&params).is_err());
     }
 
     #[test]
@@ -155,25 +138,11 @@ mod tests {
         assert!(validate_params(&params).is_err());
 
         params = StretchParams::new(1.0);
-        params.residual_mix = f32::INFINITY;
-        assert!(validate_params(&params).is_err());
-
-        params = StretchParams::new(1.0);
         params.envelope_strength = -0.1;
         assert!(validate_params(&params).is_err());
 
         params = StretchParams::new(1.0);
         params.envelope_order = 0;
         assert!(validate_params(&params).is_err());
-    }
-
-    #[test]
-    fn test_preset_descriptions() {
-        // Just verify all presets have descriptions
-        let _ = EdmPreset::DjBeatmatch.description();
-        let _ = EdmPreset::HouseLoop.description();
-        let _ = EdmPreset::Halftime.description();
-        let _ = EdmPreset::Ambient.description();
-        let _ = EdmPreset::VocalChop.description();
     }
 }

@@ -2,7 +2,7 @@ use std::f32::consts::PI;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use timestretch::{AudioBuffer, Channels, EdmPreset, StretchParams};
+use timestretch::{AudioBuffer, Channels, StretchParams};
 
 fn sine_mono(freq: f32, sample_rate: u32, num_samples: usize) -> AudioBuffer {
     let data: Vec<f32> = (0..num_samples)
@@ -45,8 +45,7 @@ fn stereo_bpm_wav_pipeline_preserves_channel_layout() {
 
     let params = StretchParams::new(1.0)
         .with_sample_rate(44_100)
-        .with_channels(2)
-        .with_preset(EdmPreset::HouseLoop);
+        .with_channels(2);
 
     let result = timestretch::stretch_to_bpm_wav_file(
         input_path.to_str().unwrap(),
@@ -79,8 +78,7 @@ fn resample_stretch_resample_chain_preserves_rate_and_duration() {
     let at_44k = source.resample(44_100);
     let params = StretchParams::new(1.5)
         .with_sample_rate(44_100)
-        .with_channels(1)
-        .with_preset(EdmPreset::HouseLoop);
+        .with_channels(1);
 
     let stretched = timestretch::stretch_buffer(&at_44k, &params).unwrap();
     let playback = stretched.resample(48_000);

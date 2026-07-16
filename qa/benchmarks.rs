@@ -5,7 +5,7 @@
 use std::f32::consts::PI;
 use std::time::Instant;
 
-use timestretch::{EdmPreset, StretchParams};
+use timestretch::StretchParams;
 
 /// Generates a mono sine wave test signal.
 fn generate_sine(sample_rate: u32, freq: f32, duration_secs: f32) -> Vec<f32> {
@@ -178,24 +178,23 @@ fn bench_phase_vocoder_stereo() {
 }
 
 #[test]
-fn bench_edm_presets() {
-    println!("\n=== EDM Preset Benchmarks (5s mono EDM signal) ===");
+fn bench_ratio_sweep() {
+    println!("\n=== Ratio Benchmarks (5s mono EDM signal) ===");
 
     let sample_rate = 44100;
     let signal = generate_edm_signal(sample_rate, 5.0);
     let iterations = 2;
 
-    for (label, preset, ratio) in &[
-        ("DjBeatmatch 1.02x", EdmPreset::DjBeatmatch, 1.02),
-        ("HouseLoop 1.5x", EdmPreset::HouseLoop, 1.5),
-        ("Halftime 2.0x", EdmPreset::Halftime, 2.0),
-        ("Ambient 3.0x", EdmPreset::Ambient, 3.0),
-        ("VocalChop 1.5x", EdmPreset::VocalChop, 1.5),
+    for (label, ratio) in &[
+        ("DJ nudge 1.02x", 1.02),
+        ("Loop fit 1.5x", 1.5),
+        ("Halftime 2.0x", 2.0),
+        ("Extreme 3.0x", 3.0),
+        ("Compress 0.8x", 0.8),
     ] {
         let params = StretchParams::new(*ratio)
             .with_sample_rate(sample_rate)
-            .with_channels(1)
-            .with_preset(*preset);
+            .with_channels(1);
         let result = bench_stretch(label, &signal, &params, iterations);
         result.print();
     }

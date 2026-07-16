@@ -63,21 +63,20 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-timestretch = "0.7.0"
+timestretch = "0.8.0"
 ```
 
 ### One-Shot Stretching
 
 ```rust
-use timestretch::{StretchParams, EdmPreset};
+use timestretch::StretchParams;
 
 // Generate or load audio (f32 samples, -1.0 to 1.0)
 let input: Vec<f32> = load_audio();
 
 let params = StretchParams::new(1.5) // 1.5x longer (slower)
     .with_sample_rate(44100)
-    .with_channels(1)
-    .with_preset(EdmPreset::HouseLoop);
+    .with_channels(1);
 
 let output = timestretch::stretch(&input, &params).unwrap();
 ```
@@ -85,14 +84,13 @@ let output = timestretch::stretch(&input, &params).unwrap();
 ### DJ Beatmatching (126 BPM to 128 BPM)
 
 ```rust
-use timestretch::{StretchParams, EdmPreset, bpm_ratio};
+use timestretch::{StretchParams, bpm_ratio};
 
 let original_bpm = 126.0_f64;
 let target_bpm = 128.0_f64;
 let ratio = bpm_ratio(original_bpm, target_bpm); // source / target = ~0.984
 
 let params = StretchParams::new(ratio)
-    .with_preset(EdmPreset::DjBeatmatch)
     .with_sample_rate(44100)
     .with_channels(2); // stereo
 
@@ -174,12 +172,11 @@ Envelope control quick guide:
 ### BPM-Based Stretching
 
 ```rust
-use timestretch::{StretchParams, EdmPreset};
+use timestretch::StretchParams;
 
 let params = StretchParams::new(1.0) // ratio computed automatically
     .with_sample_rate(44100)
-    .with_channels(2)
-    .with_preset(EdmPreset::DjBeatmatch);
+    .with_channels(2);
 
 // Stretch a 126 BPM track to 128 BPM
 let output = timestretch::stretch_to_bpm(&input, &params, 126.0, 128.0).unwrap();
@@ -190,7 +187,7 @@ let output = timestretch::stretch_to_bpm(&input, &params, 126.0, 128.0).unwrap()
 ```rust
 use timestretch::{
     analyze_for_dj, read_preanalysis_json, stretch, write_preanalysis_json,
-    StretchParams, EdmPreset,
+    StretchParams,
 };
 use std::path::Path;
 
@@ -201,7 +198,6 @@ write_preanalysis_json(Path::new("track.preanalysis.json"), &artifact).unwrap();
 // Load artifact at runtime and attach it to params
 let loaded = read_preanalysis_json(Path::new("track.preanalysis.json")).unwrap();
 let params = StretchParams::new(126.0 / 128.0)
-    .with_preset(EdmPreset::DjBeatmatch)
     .with_sample_rate(44100)
     .with_pre_analysis(loaded)
     .with_beat_snap_confidence_threshold(0.35)
@@ -218,9 +214,8 @@ use timestretch::io::wav;
 // Read a WAV file
 let buffer = wav::read_wav_file("input.wav").unwrap();
 
-// Stretch it
-let params = timestretch::StretchParams::new(2.0)
-    .with_preset(timestretch::EdmPreset::Halftime);
+// Stretch it (2x = halftime)
+let params = timestretch::StretchParams::new(2.0);
 let output = timestretch::stretch_buffer(&buffer, &params).unwrap();
 
 // Write the result (16-bit, 24-bit, or float)
@@ -231,16 +226,6 @@ wav::write_wav_file_float("output_32.wav", &output).unwrap();
 // Or use the one-liner convenience API
 timestretch::stretch_wav_file("input.wav", "output.wav", &params).unwrap();
 ```
-
-## EDM Presets
-
-| Preset | Use Case | Stretch Range | FFT | Transient Sensitivity |
-|--------|----------|---------------|-----|----------------------|
-| `DjBeatmatch` | Live mixing tempo sync | ±1–8% | 4096 | Low (0.3) |
-| `HouseLoop` | General house/techno loops | ±5–25% | 4096 | Medium (0.5) |
-| `Halftime` | Bass music halftime effect | 2x | 4096 | High (0.7) |
-| `Ambient` | Ambient transitions/builds | 2x–4x | 8192 | Low (0.2) |
-| `VocalChop` | Vocal samples & one-shots | ±10–50% | 2048 | Medium-high (0.6) |
 
 ## How It Works
 
@@ -268,19 +253,19 @@ The engine is a fixed stage graph driven from the audio callback:
 
 ## Parameters
 
-`StretchParams` supports a builder pattern for full control:
+`StretchParams` supports a builder pattern:
 
 ```rust
 let params = StretchParams::new(1.5)
     .with_sample_rate(48000)
     .with_channels(2)
-    .with_preset(EdmPreset::HouseLoop)
     .with_normalize(true);
 ```
 
-Batch `stretch()` runs on the engine graph and ignores the legacy
-per-algorithm knobs (FFT/hop sizes and friends still exist on
-`StretchParams` for the phase-vocoder-based `pitch_shift` path).
+Batch `stretch()` runs on the engine graph; ratio, sample rate, channels,
+and the optional pre-analysis artifact are the knobs that matter. The
+FFT/window/envelope fields on `StretchParams` configure the
+phase-vocoder-based `pitch_shift` formant-correction path only.
 
 **Defaults:** 44100 Hz, stereo, keylock crossover at 150 Hz, constant
 12.7 ms keylock pipeline delay (0 ms in tape mode).
@@ -331,12 +316,12 @@ See `benchmarks/README.md` for corpus setup and manifest/checksum requirements.
 ### Core Types
 
 - **`StretchParams`** — builder-pattern configuration: stretch ratio, sample
-  rate, channels, EDM preset, optional pre-analysis artifact, and tempo
-  helpers like `from_tempo()`
+  rate, channels, optional pre-analysis artifact, and tempo helpers like
+  `from_tempo()`
 - **`AudioBuffer`** — holds interleaved sample data with metadata (sample rate,
   channel layout)
-- **`EdmPreset`** — enum of tuned parameter sets for EDM workflows
-- **`EnvelopePreset`** — formant/envelope profile (`Off`, `Balanced`, `Vocal`)
+- **`EnvelopePreset`** — formant/envelope profile for `pitch_shift`
+  (`Off`, `Balanced`, `Vocal`)
 - **`engine::Engine` / `EngineConfig` / `EngineProfile`** — the real-time
   engine: `Engine::build` returns `EngineHandles { controller,
   processor, source }` (lock-free control / audio-thread processing / source feed)

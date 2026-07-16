@@ -13,12 +13,16 @@
 //! - **DJ window** (rate deviation within the keylock's fully-corrected
 //!   range): the engine graph itself, [`EngineProfile::Keylock`] at a
 //!   constant rate. Streaming-vs-offline agreement is true by construction
-//!   — same graph, same constants.
+//!   — same graph, same constants — and that includes the keylock's deck
+//!   semantic: content below the ~150 Hz crossover is NOT pitch-corrected
+//!   (its pitch follows tempo), offline exactly as live (owner decision
+//!   2026-07-16: batch copies the real-time path).
 //! - **Wide ratios** (beyond the corrected range, where the live chain
 //!   deliberately fades toward varispeed — a deck semantic, not a batch
 //!   one): a direct batch [`PhaseVocoder`] render per channel at FFT 2048.
-//!   Quality there is explicitly secondary per the binding EDM/DJ-first
-//!   product boundary; pitch is preserved at any supported ratio.
+//!   Pitch is preserved across the whole spectrum on this path; quality
+//!   (notably low-band level at heavy compression) is explicitly secondary
+//!   per the binding EDM/DJ-first product boundary.
 
 use std::sync::Arc;
 
@@ -40,7 +44,9 @@ pub const OFFLINE_GRAPH_MAX_DEV: f64 = 0.20;
 const WIDE_PV_FFT: usize = 2_048;
 
 /// Renders a whole buffer at a constant stretch `ratio`
-/// (output length / input length; pitch preserved on both paths).
+/// (output length / input length). Pitch is preserved above the keylock
+/// crossover on the graph path (the low band follows tempo, matching the
+/// live deck) and across the whole spectrum on the wide-ratio path.
 ///
 /// `input` is interleaved; the output is interleaved with exactly
 /// `round(input_frames * ratio)` frames. A caller-provided `pre_analysis`

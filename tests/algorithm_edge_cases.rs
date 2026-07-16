@@ -1,7 +1,7 @@
 //! Tests for algorithm edge cases: windows, resampling, frequency analysis,
 //! beat detection, parameter validation, and internal helper functions.
 
-use timestretch::{AudioBuffer, Channels, EdmPreset, StretchParams};
+use timestretch::{AudioBuffer, Channels, StretchParams};
 
 // ===== Window function edge cases =====
 
@@ -424,20 +424,6 @@ fn test_params_just_outside_boundaries() {
 }
 
 #[test]
-fn test_params_hop_size_equals_fft_size() {
-    // hop_size == fft_size (0% overlap) should be valid per validation
-    let params = StretchParams::new(1.5)
-        .with_fft_size(4096)
-        .with_hop_size(4096);
-    // Processing may produce poor quality but should not crash
-    let input: Vec<f32> = (0..44100)
-        .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
-        .collect();
-    let result = timestretch::stretch(&input, &params);
-    assert!(result.is_ok(), "hop=fft should be valid");
-}
-
-#[test]
 fn test_params_very_large_fft_size() {
     let params = StretchParams::new(1.5).with_fft_size(16384);
     // Should be valid (power of 2 and >= 256)
@@ -472,49 +458,9 @@ fn test_params_output_length_calculation() {
 }
 
 #[test]
-fn test_preset_overrides_fft_and_hop() {
-    // DjBeatmatch preset: Hann, hop = fft_size/4 (75% overlap)
-    let params = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
+fn test_default_fft_size() {
+    let params = StretchParams::new(1.0);
     assert_eq!(params.fft_size, 4096);
-    assert_eq!(params.hop_size, 4096 / 4);
-    assert!(params.beat_aware); // Presets enable beat_aware
-
-    // Ambient preset: BH, hop = fft_size/2 (50% overlap)
-    let params = StretchParams::new(1.0).with_preset(EdmPreset::Ambient);
-    assert_eq!(params.fft_size, 8192);
-    assert_eq!(params.hop_size, 8192 / 2);
-
-    // VocalChop preset: Hann, fft_size=4096, hop = fft_size/4
-    let params = StretchParams::new(1.0).with_preset(EdmPreset::VocalChop);
-    assert_eq!(params.fft_size, 4096);
-    assert_eq!(params.hop_size, 4096 / 4);
-}
-
-#[test]
-fn test_preset_after_sample_rate_uses_correct_wsola() {
-    // When preset is applied after sample rate, WSOLA should use the correct rate
-    let params = StretchParams::new(1.0)
-        .with_sample_rate(48000)
-        .with_preset(EdmPreset::HouseLoop);
-    // WSOLA search range should be based on 48000
-    let expected_search_ms = 15.0; // HouseLoop uses WSOLA_SEARCH_MS_MEDIUM = 15ms
-    let expected_samples = (48000.0 * expected_search_ms / 1000.0) as usize;
-    assert_eq!(params.wsola_search_range, expected_samples);
-}
-
-#[test]
-fn test_with_beat_aware_toggle() {
-    let params = StretchParams::new(1.0).with_beat_aware(true);
-    assert!(params.beat_aware);
-
-    let params = StretchParams::new(1.0).with_beat_aware(false);
-    assert!(!params.beat_aware);
-
-    // Preset enables beat_aware, can be overridden
-    let params = StretchParams::new(1.0)
-        .with_preset(EdmPreset::HouseLoop)
-        .with_beat_aware(false);
-    assert!(!params.beat_aware);
 }
 
 // ===== AudioBuffer edge cases =====
@@ -626,8 +572,7 @@ fn test_successive_small_stretches() {
     for _ in 0..5 {
         let params = StretchParams::new(1.02)
             .with_sample_rate(sample_rate)
-            .with_channels(1)
-            .with_preset(EdmPreset::DjBeatmatch);
+            .with_channels(1);
         audio = timestretch::stretch(&audio, &params).unwrap();
     }
 
@@ -724,23 +669,12 @@ fn test_stretch_with_all_builder_methods() {
     let params = StretchParams::new(1.5)
         .with_sample_rate(48000)
         .with_channels(2)
-        .with_preset(EdmPreset::Halftime)
         .with_fft_size(4096)
-        .with_hop_size(512)
-        .with_transient_sensitivity(0.8)
-        .with_sub_bass_cutoff(80.0)
-        .with_wsola_segment_size(1000)
-        .with_wsola_search_range(500)
-        .with_beat_aware(false);
+        .with_sub_bass_cutoff(80.0);
 
     assert_eq!(params.sample_rate, 48000);
     assert_eq!(params.fft_size, 4096);
-    assert_eq!(params.hop_size, 512);
-    assert!((params.transient_sensitivity - 0.8).abs() < 1e-6);
     assert!((params.sub_bass_cutoff - 80.0).abs() < 1e-6);
-    assert_eq!(params.wsola_segment_size, 1000);
-    assert_eq!(params.wsola_search_range, 500);
-    assert!(!params.beat_aware);
 
     // Actually process with these params
     let mut input = vec![0.0f32; 48000 * 2];

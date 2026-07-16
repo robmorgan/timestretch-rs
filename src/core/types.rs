@@ -1149,151 +1149,6 @@ fn interpolate_breakpoints(breakpoints: &[(f64, f32)], time: f64) -> f32 {
     breakpoints[breakpoints.len() - 1].1
 }
 
-/// EDM-specific presets for time stretching.
-///
-/// Each preset tunes the FFT size, hop size, transient sensitivity, and
-/// WSOLA search range for a particular use case. Apply via
-/// [`StretchParams::with_preset`].
-///
-/// # Example
-///
-/// ```
-/// use timestretch::{StretchParams, EdmPreset};
-///
-/// // DJ beatmatching: minimal artifacts at small ratio changes
-/// let dj = StretchParams::new(128.0 / 126.0)
-///     .with_preset(EdmPreset::DjBeatmatch);
-///
-/// // Halftime: stretch to 2x for bass music
-/// let half = StretchParams::new(2.0)
-///     .with_preset(EdmPreset::Halftime);
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EdmPreset {
-    /// Small tempo adjustments for DJ mixing (±1–8%). Prioritizes transparency.
-    DjBeatmatch,
-    /// General purpose for house/techno loops. Balanced quality.
-    HouseLoop,
-    /// Halftime effect — stretch to 2x. Preserves kick punch.
-    Halftime,
-    /// Extreme stretch (2x–4x) for ambient transitions and build-ups.
-    Ambient,
-    /// Optimized for vocal chops and one-shots.
-    VocalChop,
-}
-
-/// Internal configuration values for an EDM preset.
-struct PresetConfig {
-    fft_size: usize,
-    hop_size: usize,
-    transient_sensitivity: f32,
-    wsola_search_ms: f64,
-    wsola_segment_ms: f64,
-    transient_region_ms: f64,
-    window_type: WindowType,
-}
-
-impl EdmPreset {
-    /// Returns a human-readable description of this preset's characteristics.
-    pub fn description(self) -> &'static str {
-        match self {
-            EdmPreset::DjBeatmatch => {
-                "Small tempo adjustments (±1-8%). Maximum transparency, minimal artifacts."
-            }
-            EdmPreset::HouseLoop => {
-                "General purpose for house/techno loops. Balanced quality and performance."
-            }
-            EdmPreset::Halftime => {
-                "Halftime effect (2x stretch). Preserves kick punch and transient clarity."
-            }
-            EdmPreset::Ambient => {
-                "Extreme stretch (2x-4x) for ambient transitions. Smooth, artifact-free."
-            }
-            EdmPreset::VocalChop => {
-                "Optimized for vocal chops and one-shots. Preserves formant character."
-            }
-        }
-    }
-
-    /// Returns the internal parameter configuration for this preset.
-    fn config(self) -> PresetConfig {
-        match self {
-            EdmPreset::DjBeatmatch => PresetConfig {
-                fft_size: 4096,
-                hop_size: 4096 / 4, // 1024: 75% overlap, good COLA with Hann windows
-                transient_sensitivity: 0.3,
-                wsola_search_ms: WSOLA_SEARCH_MS_SMALL,
-                wsola_segment_ms: 50.0, // more context for cross-correlation at small ratios
-                transient_region_ms: 30.0, // kick attack+early decay is 30-50ms
-                window_type: WindowType::Hann, // matched analysis/synthesis windows
-            },
-            EdmPreset::HouseLoop => PresetConfig {
-                fft_size: 4096,
-                hop_size: 4096 / 4, // 1024: 75% overlap, good COLA with Hann windows
-                transient_sensitivity: 0.5,
-                wsola_search_ms: WSOLA_SEARCH_MS_MEDIUM,
-                wsola_segment_ms: 40.0,
-                transient_region_ms: 30.0, // wider region for better kick handling
-                window_type: WindowType::Hann, // matched analysis/synthesis windows
-            },
-            EdmPreset::Halftime => PresetConfig {
-                fft_size: 4096,
-                hop_size: 4096 / 4, // 1024: 75% overlap, good COLA with Hann windows
-                transient_sensitivity: 0.7,
-                wsola_search_ms: WSOLA_SEARCH_MS_LARGE,
-                wsola_segment_ms: 30.0,
-                transient_region_ms: 20.0, // 20ms input = 40ms at 2x in output
-                window_type: WindowType::Hann, // matched analysis/synthesis windows
-            },
-            EdmPreset::Ambient => PresetConfig {
-                fft_size: 8192,
-                hop_size: 8192 / 2, // 4096: 50% overlap eliminates aliasing artifacts
-                transient_sensitivity: 0.2,
-                wsola_search_ms: WSOLA_SEARCH_MS_LARGE,
-                wsola_segment_ms: 20.0,
-                transient_region_ms: 10.0, // ambient has few transients
-                window_type: WindowType::BlackmanHarris, // better sidelobe suppression for long FFT
-            },
-            EdmPreset::VocalChop => PresetConfig {
-                fft_size: 4096,
-                hop_size: 4096 / 4, // 1024: 75% overlap with Hann for better formant resolution
-                transient_sensitivity: 0.6, // phase-based detection reduces false positives
-                wsola_search_ms: WSOLA_SEARCH_MS_MEDIUM,
-                wsola_segment_ms: 25.0,
-                transient_region_ms: 20.0,
-                window_type: WindowType::Hann, // matched analysis/synthesis windows
-            },
-        }
-    }
-}
-
-impl std::fmt::Display for EdmPreset {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EdmPreset::DjBeatmatch => write!(f, "DjBeatmatch"),
-            EdmPreset::HouseLoop => write!(f, "HouseLoop"),
-            EdmPreset::Halftime => write!(f, "Halftime"),
-            EdmPreset::Ambient => write!(f, "Ambient"),
-            EdmPreset::VocalChop => write!(f, "VocalChop"),
-        }
-    }
-}
-
-/// Crossfade mode for segment transitions in the hybrid stretcher.
-///
-/// Controls how the crossfade duration between algorithm segments is determined.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CrossfadeMode {
-    /// Fixed crossfade duration in seconds (e.g., 0.005 for 5ms).
-    Fixed(f64),
-    /// Adaptive crossfade that varies by segment type transition:
-    /// - Tonal→Transient: 3ms (fast transition to preserve onset)
-    /// - Transient→Tonal: 8ms (smooth recovery)
-    /// - Tonal→Tonal: 5ms (default)
-    /// - Transient→Transient: 2ms (minimal blending)
-    Adaptive,
-}
-
 /// Streaming quality/performance mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QualityMode {
@@ -1410,12 +1265,11 @@ impl Default for TransientThresholdPolicy {
 /// # Example
 ///
 /// ```
-/// use timestretch::{StretchParams, EdmPreset};
+/// use timestretch::StretchParams;
 ///
 /// let params = StretchParams::new(1.5)
 ///     .with_sample_rate(44100)
-///     .with_channels(2)
-///     .with_preset(EdmPreset::HouseLoop);
+///     .with_channels(2);
 ///
 /// assert_eq!(params.stretch_ratio, 1.5);
 /// assert_eq!(params.sample_rate, 44100);
@@ -1433,12 +1287,6 @@ pub struct StretchParams {
     pub quality_mode: QualityMode,
     /// FFT size for phase vocoder.
     pub fft_size: usize,
-    /// Hop size (analysis step).
-    pub hop_size: usize,
-    /// Optional EDM preset.
-    pub preset: Option<EdmPreset>,
-    /// Transient detection sensitivity (0.0 to 1.0).
-    pub transient_sensitivity: f32,
     /// Number of lookahead frames used by transient onset confirmation.
     ///
     /// `0` disables lookahead confirmation.
@@ -1459,25 +1307,6 @@ pub struct StretchParams {
     pub transient_threshold_policy: TransientThresholdPolicy,
     /// Sub-bass phase lock cutoff frequency in Hz.
     pub sub_bass_cutoff: f32,
-    /// WSOLA segment size in samples.
-    pub wsola_segment_size: usize,
-    /// WSOLA search range in samples.
-    pub wsola_search_range: usize,
-    /// Whether to use beat-grid-aware segmentation.
-    ///
-    /// When enabled, the hybrid stretcher detects the beat grid and aligns
-    /// segment boundaries to beat positions. This preserves the rhythmic
-    /// groove in 4/4 EDM tracks. Enabled by default for EDM presets.
-    pub beat_aware: bool,
-    /// Whether to split sub-bass into a separate band for independent processing.
-    ///
-    /// When enabled, audio below `sub_bass_cutoff` Hz is extracted and processed
-    /// exclusively through the phase vocoder with rigid phase locking, even during
-    /// transient segments. The remaining audio goes through the normal hybrid
-    /// algorithm (WSOLA for transients, PV for tonal). The two bands are summed
-    /// at the end. This prevents WSOLA from smearing sub-bass during kick drums.
-    /// Enabled by default for EDM presets.
-    pub band_split: bool,
     /// Window function for the phase vocoder.
     ///
     /// Different windows trade off frequency resolution, sidelobe suppression,
@@ -1497,13 +1326,6 @@ pub struct StretchParams {
     /// - [`PhaseLockingMode::RegionOfInfluence`] — influence zones with deviation clamping (better quality)
     /// - [`PhaseLockingMode::Selective`] — confidence-weighted partial locking (balanced)
     pub phase_locking_mode: PhaseLockingMode,
-    /// Enables confidence-driven adaptive phase-lock mode switching per frame.
-    ///
-    /// When enabled, the phase vocoder may switch between Identity, Selective,
-    /// and ROI locking based on frame confidence (spectral crest/flatness) and ratio.
-    /// This keeps harmonic frames coherent while preferring ROI safety on noisy
-    /// or extreme-ratio frames.
-    pub adaptive_phase_locking: bool,
     /// Whether to apply spectral envelope preservation.
     ///
     /// When enabled, the spectral envelope (formant structure) of the input
@@ -1528,74 +1350,6 @@ pub struct StretchParams {
     /// Controls the smoothness of the envelope: lower = smoother, higher = more detail.
     /// Typical values: 30-50 for vocals, 20-30 for general music.
     pub envelope_order: usize,
-    /// Whether to use multi-resolution FFT processing.
-    ///
-    /// When enabled, tonal segments are split into three frequency bands using
-    /// Linkwitz-Riley crossover filters at 200 Hz and 4000 Hz. Each band is
-    /// processed with an FFT size optimized for its frequency range:
-    /// - Sub-bass (0-200 Hz): `fft_size * 4` for precise frequency resolution
-    /// - Mid (200-4000 Hz): `fft_size` (the configured value)
-    /// - High (4000+ Hz): `fft_size / 4` for sharp temporal resolution
-    ///
-    /// This mirrors the approach used by professional time-stretching algorithms
-    /// like Ableton's Complex Pro, and is particularly beneficial for material
-    /// with both sustained bass and transient-rich high frequencies.
-    /// Enabled by default for [`EdmPreset::DjBeatmatch`] and [`EdmPreset::Ambient`].
-    pub multi_resolution: bool,
-    /// Duration in seconds of the transient region around each detected onset.
-    ///
-    /// Controls how much audio around a transient is processed with WSOLA
-    /// instead of the phase vocoder. Larger values protect more of the
-    /// transient's attack and early decay from PV smearing.
-    /// Default: 0.010 (10ms). DjBeatmatch uses 0.030 (30ms).
-    pub transient_region_secs: f64,
-    /// Whether to use elastic beat distribution for non-uniform stretching.
-    ///
-    /// When enabled, beats are anchored to a target beat grid while sustain
-    /// regions absorb the excess time. This preserves rhythmic feel by keeping
-    /// beats at their musically correct positions. The [`elastic_anchor`](Self::elastic_anchor)
-    /// field controls how strongly transients are anchored to ratio 1.0 vs
-    /// the global ratio. Automatically disabled when `stretch_ratio == 1.0`.
-    /// Enabled by default for DjBeatmatch and HouseLoop presets.
-    pub elastic_timing: bool,
-    /// How strongly elastic timing anchors transient segments to ratio 1.0.
-    ///
-    /// Range: 0.0 to 1.0.
-    /// - 0.0: transients get the global stretch ratio (no anchoring, beats move
-    ///   to the target tempo). Best for DJ beatmatching.
-    /// - 1.0: transients stay close to ratio 1.0 (maximum anchoring, beats stay
-    ///   near the original tempo). Best for creative effects like halftime.
-    ///
-    /// Only takes effect when `elastic_timing` is enabled. Default: 0.0.
-    pub elastic_anchor: f64,
-    /// Whether to use HPSS (Harmonic-Percussive Source Separation) pre-processing.
-    ///
-    /// When enabled, tonal segments are separated into harmonic and percussive
-    /// components. The harmonic part is PV-stretched (excellent for sustained tones)
-    /// while the percussive part is WSOLA-stretched (preserves transient detail).
-    /// The two stretched components are summed. This improves quality when harmonic
-    /// and percussive content overlap (e.g., kick drum over a sustained chord).
-    pub hpss_enabled: bool,
-    /// Enables class-aware transient WSOLA adaptation (kick/snare/hat).
-    ///
-    /// When enabled, transient segments are classified on the fly and WSOLA
-    /// parameters are adapted per class (attack copy, search span, crossfade).
-    pub transient_class_adaptive_wsola: bool,
-    /// Enables an explicit residual/noise branch in HPSS tonal routing.
-    ///
-    /// Residual content is estimated as `input - (harmonic + percussive)` and
-    /// stretched independently before recombination.
-    pub residual_branch: bool,
-    /// Mix amount for the explicit residual branch.
-    ///
-    /// `0.0` keeps the branch computed but muted, `1.0` applies full residual.
-    pub residual_mix: f32,
-    /// Crossfade mode for segment transitions.
-    ///
-    /// Controls how crossfade durations are computed at segment boundaries.
-    /// `Fixed` uses a constant duration; `Adaptive` scales based on the
-    /// type of segments being joined (transient→tonal, tonal→transient, etc.).
-    pub crossfade_mode: CrossfadeMode,
     /// Optional BPM for beat-grid-aware stretching.
     ///
     /// When set, transient positions are snapped to the nearest beat subdivision,
@@ -1611,33 +1365,12 @@ pub struct StretchParams {
     pub beat_snap_confidence_threshold: f32,
     /// Max onset-to-grid snap distance in milliseconds.
     pub beat_snap_tolerance_ms: f64,
-    /// Whether to use dynamic WSOLA search range based on stretch ratio.
-    ///
-    /// When enabled, the effective search range scales with the stretch ratio,
-    /// giving the WSOLA algorithm more room to find good matches at extreme
-    /// ratios. The range is capped at 40ms to prevent excessive latency.
-    pub dynamic_wsola_search: bool,
-}
-
-/// Converts a duration in milliseconds to samples at the given sample rate.
-#[inline]
-fn ms_to_samples(ms: f64, sample_rate: u32) -> usize {
-    (sample_rate as f64 * ms / 1000.0) as usize
 }
 
 /// Default sample rate (44.1 kHz CD quality).
 const DEFAULT_SAMPLE_RATE: u32 = 44100;
 /// Default FFT size for phase vocoder (good frequency resolution for bass).
 const DEFAULT_FFT_SIZE: usize = 4096;
-/// Default hop size (FFT/8 = 87.5% overlap for Hann window COLA compliance).
-///
-/// 87.5% overlap (hop = FFT/8) ensures constant-overlap-add (COLA) behavior
-/// with Hann windows is maintained even at high stretch ratios (up to 2.0x).
-/// At FFT/4, a ratio of 2.0 would produce synthesis hop = FFT/2 (only 50%
-/// overlap), violating COLA and causing audible gain modulation.
-const DEFAULT_HOP_SIZE: usize = DEFAULT_FFT_SIZE / 8;
-/// Default transient detection sensitivity (0.0–1.0).
-const DEFAULT_TRANSIENT_SENSITIVITY: f32 = 0.32;
 /// Default transient lookahead-confirmation frame count.
 const DEFAULT_TRANSIENT_LOOKAHEAD_FRAMES: usize = 2;
 /// Default transient lookahead threshold relaxation factor.
@@ -1667,35 +1400,17 @@ const DEFAULT_TRANSIENT_HIGH_SENS_MIN_GAP_FRAMES: usize = 2;
 const DEFAULT_TRANSIENT_HIGH_SENS_SPLIT: f32 = 0.6;
 /// Default sub-bass phase lock cutoff in Hz.
 const DEFAULT_SUB_BASS_CUTOFF: f32 = 120.0;
-/// Default adaptive phase-locking enable flag.
-const DEFAULT_ADAPTIVE_PHASE_LOCKING: bool = false;
 /// Default envelope correction strength.
 const DEFAULT_ENVELOPE_STRENGTH: f32 = 1.0;
 /// Default adaptive envelope-order behavior.
 const DEFAULT_ADAPTIVE_ENVELOPE_ORDER: bool = true;
 /// Default envelope preset.
 const DEFAULT_ENVELOPE_PRESET: EnvelopePreset = EnvelopePreset::Balanced;
-/// Default class-aware transient WSOLA adaptation flag.
-const DEFAULT_TRANSIENT_CLASS_ADAPTIVE_WSOLA: bool = true;
-/// Default explicit residual/noise HPSS branch flag.
-const DEFAULT_RESIDUAL_BRANCH: bool = true;
-/// Default residual/noise branch mix.
-const DEFAULT_RESIDUAL_MIX: f32 = 0.25;
 
-/// Default transient region duration in seconds (~10ms around each onset).
-const DEFAULT_TRANSIENT_REGION_SECS: f64 = 0.015;
 /// Default minimum confidence required for beat-grid snapping decisions.
 const DEFAULT_BEAT_SNAP_CONFIDENCE_THRESHOLD: f32 = 0.35;
 /// Default transient-to-grid snap tolerance in milliseconds.
 const DEFAULT_BEAT_SNAP_TOLERANCE_MS: f64 = 5.0;
-/// Default WSOLA segment duration (~20ms) for transient-friendly segmentation.
-const WSOLA_SEGMENT_MS: f64 = 20.0;
-/// Default WSOLA search range (~10ms) for small stretch ratios.
-const WSOLA_SEARCH_MS_SMALL: f64 = 10.0;
-/// Medium WSOLA search range (~15ms) for moderate stretching.
-const WSOLA_SEARCH_MS_MEDIUM: f64 = 15.0;
-/// Large WSOLA search range (~30ms) for extreme stretch ratios.
-const WSOLA_SEARCH_MS_LARGE: f64 = 30.0;
 
 impl Default for StretchParams {
     /// Returns default parameters with ratio 1.0 (identity), stereo, 44100 Hz.
@@ -1711,13 +1426,10 @@ impl std::fmt::Display for StretchParams {
             "StretchParams(ratio={:.4}, {}Hz, {:?}",
             self.stretch_ratio, self.sample_rate, self.channels
         )?;
-        if let Some(preset) = &self.preset {
-            write!(f, ", preset={}", preset)?;
-        }
         write!(
             f,
-            ", fft={}, hop={}, quality={:?})",
-            self.fft_size, self.hop_size, self.quality_mode
+            ", fft={}, quality={:?})",
+            self.fft_size, self.quality_mode
         )
     }
 }
@@ -1755,9 +1467,6 @@ impl StretchParams {
             channels: Channels::Stereo,
             quality_mode: QualityMode::Balanced,
             fft_size: DEFAULT_FFT_SIZE,
-            hop_size: DEFAULT_HOP_SIZE,
-            preset: None,
-            transient_sensitivity: DEFAULT_TRANSIENT_SENSITIVITY,
             transient_lookahead_frames: DEFAULT_TRANSIENT_LOOKAHEAD_FRAMES,
             transient_lookahead_threshold_relax: DEFAULT_TRANSIENT_LOOKAHEAD_THRESHOLD_RELAX,
             transient_lookahead_peak_retain_ratio: DEFAULT_TRANSIENT_LOOKAHEAD_PEAK_RETAIN_RATIO,
@@ -1765,33 +1474,18 @@ impl StretchParams {
                 DEFAULT_TRANSIENT_STRONG_SPIKE_BYPASS_MULTIPLIER,
             transient_threshold_policy: TransientThresholdPolicy::default(),
             sub_bass_cutoff: DEFAULT_SUB_BASS_CUTOFF,
-            wsola_segment_size: ms_to_samples(WSOLA_SEGMENT_MS, DEFAULT_SAMPLE_RATE),
-            wsola_search_range: ms_to_samples(WSOLA_SEARCH_MS_SMALL, DEFAULT_SAMPLE_RATE),
-            beat_aware: false,
-            band_split: false,
             window_type: WindowType::Hann,
             normalize: false,
             phase_locking_mode: PhaseLockingMode::RegionOfInfluence,
-            adaptive_phase_locking: DEFAULT_ADAPTIVE_PHASE_LOCKING,
             envelope_preservation: true,
             envelope_strength: DEFAULT_ENVELOPE_STRENGTH,
             adaptive_envelope_order: DEFAULT_ADAPTIVE_ENVELOPE_ORDER,
             envelope_preset: DEFAULT_ENVELOPE_PRESET,
             envelope_order: 40,
-            multi_resolution: true,
-            transient_region_secs: DEFAULT_TRANSIENT_REGION_SECS,
-            elastic_timing: false,
-            elastic_anchor: 0.0,
-            hpss_enabled: true,
-            transient_class_adaptive_wsola: DEFAULT_TRANSIENT_CLASS_ADAPTIVE_WSOLA,
-            residual_branch: DEFAULT_RESIDUAL_BRANCH,
-            residual_mix: DEFAULT_RESIDUAL_MIX,
-            crossfade_mode: CrossfadeMode::Fixed(0.012),
             bpm: None,
             pre_analysis: None,
             beat_snap_confidence_threshold: DEFAULT_BEAT_SNAP_CONFIDENCE_THRESHOLD,
             beat_snap_tolerance_ms: DEFAULT_BEAT_SNAP_TOLERANCE_MS,
-            dynamic_wsola_search: false,
         }
     }
 
@@ -1802,20 +1496,8 @@ impl StretchParams {
     }
 
     /// Sets the sample rate.
-    ///
-    /// Recalculates WSOLA segment size and search range for the new sample rate,
-    /// using the preset's values if a preset was set, or defaults otherwise.
     pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
         self.sample_rate = sample_rate;
-        // Recalculate WSOLA params from preset if one was set, otherwise use defaults
-        if let Some(preset) = self.preset {
-            let cfg = preset.config();
-            self.wsola_segment_size = ms_to_samples(cfg.wsola_segment_ms, sample_rate);
-            self.wsola_search_range = ms_to_samples(cfg.wsola_search_ms, sample_rate);
-        } else {
-            self.wsola_segment_size = ms_to_samples(WSOLA_SEGMENT_MS, sample_rate);
-            self.wsola_search_range = ms_to_samples(WSOLA_SEARCH_MS_SMALL, sample_rate);
-        }
         self
     }
 
@@ -1832,102 +1514,15 @@ impl StretchParams {
     /// Sets the quality/performance mode used by streaming processors.
     pub fn with_quality_mode(mut self, mode: QualityMode) -> Self {
         self.quality_mode = mode;
-        match mode {
-            // Keep callback cost deterministic for tiny buffers.
-            QualityMode::LowLatency => {
-                self.hpss_enabled = false;
-                self.adaptive_phase_locking = false;
-                self.residual_branch = false;
-            }
-            // Balanced leaves current tuning untouched.
-            QualityMode::Balanced => {}
-            // Promote hybrid quality features in max-quality profile.
-            QualityMode::MaxQuality => {
-                self.hpss_enabled = true;
-                self.crossfade_mode = CrossfadeMode::Adaptive;
-                self.adaptive_phase_locking = true;
-                self.residual_branch = true;
-                self.apply_envelope_preset(EnvelopePreset::Balanced);
-            }
+        if mode == QualityMode::MaxQuality {
+            self.apply_envelope_preset(EnvelopePreset::Balanced);
         }
-        self
-    }
-
-    /// Sets the EDM preset, overriding FFT size, hop size, transient sensitivity,
-    /// WSOLA params, and transient region size. Call this before other builder
-    /// methods if you want to customize individual parameters after applying a preset.
-    pub fn with_preset(mut self, preset: EdmPreset) -> Self {
-        self.preset = Some(preset);
-        self.beat_aware = true;
-        let cfg = preset.config();
-        self.fft_size = cfg.fft_size;
-        self.hop_size = cfg.hop_size;
-        self.transient_sensitivity = cfg.transient_sensitivity;
-        self.wsola_search_range = ms_to_samples(cfg.wsola_search_ms, self.sample_rate);
-        self.wsola_segment_size = ms_to_samples(cfg.wsola_segment_ms, self.sample_rate);
-        self.transient_region_secs = cfg.transient_region_ms / 1000.0;
-        self.window_type = cfg.window_type;
-        // Apply envelope/formant profile tuned to each preset.
-        let envelope_preset = match preset {
-            EdmPreset::VocalChop => EnvelopePreset::Vocal,
-            EdmPreset::DjBeatmatch
-            | EdmPreset::HouseLoop
-            | EdmPreset::Halftime
-            | EdmPreset::Ambient => EnvelopePreset::Balanced,
-        };
-        self.apply_envelope_preset(envelope_preset);
-        // Enable multi-resolution FFT for transparency-critical and extreme-stretch presets.
-        // DjBeatmatch needs it for transparent tempo changes; Ambient benefits from the
-        // large sub-bass FFT at extreme stretch ratios (2x-4x).
-        self.multi_resolution = matches!(preset, EdmPreset::DjBeatmatch | EdmPreset::Ambient);
-        // Band-split is only useful when multi_resolution is off; multi_resolution
-        // already provides its own per-band sub-bass handling, so enabling both
-        // would create redundant sub-bass processing paths.
-        self.band_split = !self.multi_resolution;
-        // Enable elastic beat distribution for rhythm-critical presets.
-        // DjBeatmatch and HouseLoop use low anchor so beats land at the target BPM;
-        // creative presets like Halftime would use a high anchor to keep beats
-        // near the original tempo (but elastic_timing is off for those).
-        self.elastic_timing = matches!(preset, EdmPreset::DjBeatmatch | EdmPreset::HouseLoop);
-        self.elastic_anchor = match preset {
-            EdmPreset::DjBeatmatch => 0.0,
-            EdmPreset::HouseLoop => 0.1,
-            _ => 0.0,
-        };
-        // Enable HPSS for presets where harmonic/percussive overlap matters
-        self.hpss_enabled = matches!(preset, EdmPreset::DjBeatmatch | EdmPreset::HouseLoop);
-        // Use adaptive crossfade for all presets
-        self.crossfade_mode = CrossfadeMode::Adaptive;
-        // Enable dynamic WSOLA search range for presets where stretch ratio varies
-        self.dynamic_wsola_search = matches!(
-            preset,
-            EdmPreset::DjBeatmatch | EdmPreset::HouseLoop | EdmPreset::Halftime
-        );
-        // Enable adaptive phase-lock switching for EDM presets.
-        self.adaptive_phase_locking = true;
-        // Use class-aware transient tuning and explicit residual branch by default.
-        self.transient_class_adaptive_wsola = true;
-        self.residual_branch = true;
-        self.residual_mix = DEFAULT_RESIDUAL_MIX;
         self
     }
 
     /// Sets the FFT size.
     pub fn with_fft_size(mut self, fft_size: usize) -> Self {
         self.fft_size = fft_size;
-        self.hop_size = fft_size / 4;
-        self
-    }
-
-    /// Sets the hop size (analysis step) directly, overriding the default `fft_size / 4`.
-    pub fn with_hop_size(mut self, hop_size: usize) -> Self {
-        self.hop_size = hop_size;
-        self
-    }
-
-    /// Sets transient sensitivity.
-    pub fn with_transient_sensitivity(mut self, sensitivity: f32) -> Self {
-        self.transient_sensitivity = sensitivity;
         self
     }
 
@@ -2031,37 +1626,6 @@ impl StretchParams {
         self
     }
 
-    /// Sets the WSOLA segment size in samples.
-    pub fn with_wsola_segment_size(mut self, size: usize) -> Self {
-        self.wsola_segment_size = size;
-        self
-    }
-
-    /// Sets the WSOLA search range in samples.
-    pub fn with_wsola_search_range(mut self, range: usize) -> Self {
-        self.wsola_search_range = range;
-        self
-    }
-
-    /// Enables or disables beat-aware segmentation.
-    ///
-    /// When enabled, the hybrid stretcher detects the beat grid and aligns
-    /// segment boundaries to beat positions for better rhythmic preservation.
-    pub fn with_beat_aware(mut self, enabled: bool) -> Self {
-        self.beat_aware = enabled;
-        self
-    }
-
-    /// Enables or disables sub-bass band-split processing.
-    ///
-    /// When enabled, audio below `sub_bass_cutoff` Hz is separated and processed
-    /// exclusively through the phase vocoder, preventing WSOLA from smearing
-    /// bass during kick transients.
-    pub fn with_band_split(mut self, enabled: bool) -> Self {
-        self.band_split = enabled;
-        self
-    }
-
     /// Sets the window function for the phase vocoder.
     ///
     /// - [`WindowType::Hann`] (default) — good general-purpose choice
@@ -2137,88 +1701,6 @@ impl StretchParams {
         self
     }
 
-    /// Enables or disables multi-resolution FFT processing.
-    ///
-    /// When enabled, tonal segments are split into three frequency bands
-    /// (sub-bass/mid/high) using Linkwitz-Riley crossover filters. Each
-    /// band uses an FFT size optimized for its frequency range, improving
-    /// quality for material with both sustained bass and transient-rich
-    /// high frequencies.
-    pub fn with_multi_resolution(mut self, enabled: bool) -> Self {
-        self.multi_resolution = enabled;
-        self
-    }
-
-    /// Sets the transient region duration in seconds.
-    ///
-    /// Controls how much audio around each detected onset is processed with
-    /// WSOLA instead of the phase vocoder. Larger values protect more of the
-    /// transient's attack and early decay from PV smearing.
-    pub fn with_transient_region_secs(mut self, secs: f64) -> Self {
-        self.transient_region_secs = secs;
-        self
-    }
-
-    /// Enables or disables elastic beat distribution.
-    ///
-    /// When enabled and beats are detected, stretch ratios are distributed
-    /// non-uniformly: transient segments stay close to ratio 1.0 while tonal
-    /// segments absorb the excess stretch. Use [`with_elastic_anchor`](Self::with_elastic_anchor)
-    /// to control how strongly transients are anchored to 1.0.
-    pub fn with_elastic_timing(mut self, enabled: bool) -> Self {
-        self.elastic_timing = enabled;
-        self
-    }
-
-    /// Sets how strongly elastic timing anchors transient segments to ratio 1.0.
-    ///
-    /// - 0.0: transients use the global ratio (beats at target tempo, best for DJ)
-    /// - 1.0: transients stay near ratio 1.0 (beats near original tempo, creative effects)
-    ///
-    /// Only takes effect when elastic timing is enabled.
-    pub fn with_elastic_anchor(mut self, anchor: f64) -> Self {
-        self.elastic_anchor = anchor.clamp(0.0, 1.0);
-        self
-    }
-
-    /// Enables or disables HPSS (Harmonic-Percussive Source Separation).
-    ///
-    /// When enabled, tonal segments are separated into harmonic and percussive
-    /// components before stretching. Harmonics use PV, percussive uses WSOLA.
-    pub fn with_hpss(mut self, enabled: bool) -> Self {
-        self.hpss_enabled = enabled;
-        self
-    }
-
-    /// Enables or disables class-aware WSOLA adaptation for transient segments.
-    pub fn with_transient_class_adaptive_wsola(mut self, enabled: bool) -> Self {
-        self.transient_class_adaptive_wsola = enabled;
-        self
-    }
-
-    /// Enables or disables explicit residual/noise branch processing in HPSS routing.
-    pub fn with_residual_branch(mut self, enabled: bool) -> Self {
-        self.residual_branch = enabled;
-        self
-    }
-
-    /// Sets explicit residual/noise branch mix amount.
-    ///
-    /// Clamped to `[0.0, 1.5]`.
-    pub fn with_residual_mix(mut self, mix: f32) -> Self {
-        self.residual_mix = mix.clamp(0.0, 1.5);
-        self
-    }
-
-    /// Sets the crossfade mode for segment transitions.
-    ///
-    /// - `CrossfadeMode::Fixed(secs)` — constant crossfade duration
-    /// - [`CrossfadeMode::Adaptive`] — varies by segment type transition
-    pub fn with_crossfade_mode(mut self, mode: CrossfadeMode) -> Self {
-        self.crossfade_mode = mode;
-        self
-    }
-
     /// Set the BPM for beat-grid-aware stretching.
     ///
     /// When set, transient positions are snapped to the nearest beat subdivision,
@@ -2256,47 +1738,6 @@ impl StretchParams {
         self
     }
 
-    /// Enables or disables dynamic WSOLA search range.
-    ///
-    /// When enabled, the effective search range scales with the stretch ratio,
-    /// giving the WSOLA algorithm more room to find good matches at extreme
-    /// ratios. The range is capped at 40ms to prevent excessive latency.
-    pub fn with_dynamic_wsola_search(mut self, enabled: bool) -> Self {
-        self.dynamic_wsola_search = enabled;
-        self
-    }
-
-    /// Compute the effective WSOLA search range in seconds.
-    ///
-    /// When `dynamic_wsola_search` is true, the base search range (in ms)
-    /// is scaled by the stretch ratio deviation from unity, capped at 40ms.
-    /// Otherwise returns the static search range converted to seconds.
-    pub fn effective_wsola_search_ms(&self) -> f64 {
-        let base_ms = self.wsola_search_range as f64 * 1000.0 / self.sample_rate as f64;
-        if self.dynamic_wsola_search {
-            let ratio_factor = self.stretch_ratio.max(1.0 / self.stretch_ratio);
-            (base_ms * ratio_factor).min(40.0) // cap at 40ms
-        } else {
-            base_ms
-        }
-    }
-
-    /// Compute the effective WSOLA search range in samples.
-    ///
-    /// When `dynamic_wsola_search` is true, the base search range is scaled by
-    /// the stretch ratio deviation from unity, capped at 40ms worth of samples.
-    /// Otherwise returns the static `wsola_search_range`.
-    pub fn effective_wsola_search_range(&self) -> usize {
-        if self.dynamic_wsola_search {
-            let ratio_factor = self.stretch_ratio.max(1.0 / self.stretch_ratio);
-            let base = self.wsola_search_range as f64;
-            let max_samples = 0.040 * self.sample_rate as f64; // 40ms cap
-            (base * ratio_factor).min(max_samples) as usize
-        } else {
-            self.wsola_search_range
-        }
-    }
-
     /// Sets the phase locking algorithm for the phase vocoder.
     ///
     /// - [`PhaseLockingMode::Identity`] — fast but may produce ringing
@@ -2304,12 +1745,6 @@ impl StretchParams {
     /// - [`PhaseLockingMode::Selective`] — balanced locking for mixed material
     pub fn with_phase_locking_mode(mut self, mode: PhaseLockingMode) -> Self {
         self.phase_locking_mode = mode;
-        self
-    }
-
-    /// Enables or disables confidence-driven adaptive phase-lock mode switching.
-    pub fn with_adaptive_phase_locking(mut self, enabled: bool) -> Self {
-        self.adaptive_phase_locking = enabled;
         self
     }
 
@@ -2332,11 +1767,10 @@ impl StretchParams {
     /// # Example
     ///
     /// ```
-    /// use timestretch::{StretchParams, EdmPreset};
+    /// use timestretch::StretchParams;
     ///
     /// // Match a 126 BPM track to 128 BPM
-    /// let params = StretchParams::from_tempo(126.0, 128.0)
-    ///     .with_preset(EdmPreset::DjBeatmatch);
+    /// let params = StretchParams::from_tempo(126.0, 128.0);
     /// assert!((params.stretch_ratio - 126.0 / 128.0).abs() < 1e-10);
     /// ```
     pub fn from_tempo(source_bpm: f64, target_bpm: f64) -> Self {
@@ -2397,23 +1831,16 @@ mod tests {
     fn test_stretch_params_builder() {
         let params = StretchParams::new(1.5)
             .with_sample_rate(48000)
-            .with_channels(2)
-            .with_preset(EdmPreset::HouseLoop);
+            .with_channels(2);
         assert_eq!(params.sample_rate, 48000);
         assert_eq!(params.channels, Channels::Stereo);
-        assert_eq!(params.preset, Some(EdmPreset::HouseLoop));
         assert_eq!(params.fft_size, 4096);
     }
 
     #[test]
     fn test_stretch_params_builder_advanced() {
-        let params = StretchParams::new(1.5)
-            .with_sub_bass_cutoff(100.0)
-            .with_wsola_segment_size(512)
-            .with_wsola_search_range(256);
+        let params = StretchParams::new(1.5).with_sub_bass_cutoff(100.0);
         assert!((params.sub_bass_cutoff - 100.0).abs() < f32::EPSILON);
-        assert_eq!(params.wsola_segment_size, 512);
-        assert_eq!(params.wsola_search_range, 256);
     }
 
     #[test]
@@ -2480,20 +1907,6 @@ mod tests {
     }
 
     #[test]
-    fn test_preset_then_sample_rate_preserves_wsola_params() {
-        // Calling with_preset then with_sample_rate should use preset's WSOLA config
-        let params = StretchParams::new(1.078)
-            .with_preset(EdmPreset::DjBeatmatch)
-            .with_sample_rate(44100)
-            .with_channels(2);
-        // DjBeatmatch: wsola_segment_ms=50, wsola_search_ms=10
-        let expected_segment = ms_to_samples(50.0, 44100);
-        let expected_search = ms_to_samples(10.0, 44100);
-        assert_eq!(params.wsola_segment_size, expected_segment);
-        assert_eq!(params.wsola_search_range, expected_search);
-    }
-
-    #[test]
     fn test_with_transient_threshold_policy_sanitizes() {
         let policy = TransientThresholdPolicy {
             median_window_frames: 0,
@@ -2523,19 +1936,6 @@ mod tests {
             params.transient_threshold_policy.high_sensitivity_split,
             0.0
         );
-    }
-
-    #[test]
-    fn test_preset_transient_region() {
-        let dj = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
-        assert!((dj.transient_region_secs - 0.030).abs() < 1e-6);
-
-        let ambient = StretchParams::new(1.0).with_preset(EdmPreset::Ambient);
-        assert!((ambient.transient_region_secs - 0.010).abs() < 1e-6);
-
-        // Halftime: 20ms input region (will be 40ms in 2x output)
-        let halftime = StretchParams::new(1.0).with_preset(EdmPreset::Halftime);
-        assert!((halftime.transient_region_secs - 0.020).abs() < 1e-6);
     }
 
     #[test]
@@ -2840,29 +2240,10 @@ mod tests {
     }
 
     #[test]
-    fn test_quality_mode_low_latency_disables_hpss_profile() {
+    fn test_quality_mode_max_quality_applies_balanced_envelope() {
         let params = StretchParams::new(1.0)
-            .with_hpss(true)
-            .with_residual_branch(true)
-            .with_adaptive_phase_locking(true)
-            .with_quality_mode(QualityMode::LowLatency);
-        assert!(!params.hpss_enabled);
-        assert!(!params.residual_branch);
-        assert!(!params.adaptive_phase_locking);
-    }
-
-    #[test]
-    fn test_quality_mode_max_quality_enables_hpss_profile() {
-        let params = StretchParams::new(1.0)
-            .with_hpss(false)
-            .with_residual_branch(false)
-            .with_adaptive_phase_locking(false)
-            .with_crossfade_mode(CrossfadeMode::Fixed(0.010))
+            .with_envelope_strength(0.0)
             .with_quality_mode(QualityMode::MaxQuality);
-        assert!(params.hpss_enabled);
-        assert!(params.residual_branch);
-        assert!(params.adaptive_phase_locking);
-        assert_eq!(params.crossfade_mode, CrossfadeMode::Adaptive);
         assert_eq!(params.envelope_preset, EnvelopePreset::Balanced);
         assert!(params.envelope_preservation);
         assert!((params.envelope_strength - 1.0).abs() < 1e-6);
@@ -2889,46 +2270,11 @@ mod tests {
     }
 
     #[test]
-    fn test_residual_mix_clamps() {
-        let low = StretchParams::new(1.0).with_residual_mix(-0.5);
-        assert_eq!(low.residual_mix, 0.0);
-
-        let high = StretchParams::new(1.0).with_residual_mix(2.0);
-        assert_eq!(high.residual_mix, 1.5);
-    }
-
-    #[test]
-    fn test_transient_class_adaptive_wsola_defaults_enabled() {
-        let params = StretchParams::new(1.0);
-        assert!(params.transient_class_adaptive_wsola);
-    }
-
-    #[test]
     fn test_stretch_params_display() {
-        let params = StretchParams::new(1.5)
-            .with_sample_rate(48000)
-            .with_preset(EdmPreset::DjBeatmatch);
+        let params = StretchParams::new(1.5).with_sample_rate(48000);
         let s = format!("{}", params);
         assert!(s.contains("1.5000"));
         assert!(s.contains("48000"));
-        assert!(s.contains("DjBeatmatch"));
-    }
-
-    #[test]
-    fn test_stretch_params_display_no_preset() {
-        let params = StretchParams::new(1.0);
-        let s = format!("{}", params);
-        assert!(s.contains("1.0000"));
-        assert!(!s.contains("preset="));
-    }
-
-    #[test]
-    fn test_edm_preset_display() {
-        assert_eq!(format!("{}", EdmPreset::DjBeatmatch), "DjBeatmatch");
-        assert_eq!(format!("{}", EdmPreset::HouseLoop), "HouseLoop");
-        assert_eq!(format!("{}", EdmPreset::Halftime), "Halftime");
-        assert_eq!(format!("{}", EdmPreset::Ambient), "Ambient");
-        assert_eq!(format!("{}", EdmPreset::VocalChop), "VocalChop");
     }
 
     #[test]
@@ -3155,55 +2501,15 @@ mod tests {
     }
 
     #[test]
-    fn test_adaptive_phase_locking_default_and_builder() {
-        let params = StretchParams::new(1.0);
-        assert!(!params.adaptive_phase_locking);
-
-        let params = StretchParams::new(1.0).with_adaptive_phase_locking(true);
-        assert!(params.adaptive_phase_locking);
-    }
-
-    #[test]
-    fn test_preset_enables_adaptive_phase_locking() {
-        let params = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
-        assert!(params.adaptive_phase_locking);
-    }
-
-    #[test]
     fn test_window_type_default_is_hann() {
         let params = StretchParams::new(1.0);
         assert_eq!(params.window_type, WindowType::Hann);
     }
 
     #[test]
-    fn test_preset_sets_window_type() {
-        // Ambient preset should use Blackman-Harris (better sidelobe suppression)
-        let params = StretchParams::new(2.0).with_preset(EdmPreset::Ambient);
+    fn test_window_type_can_be_overridden() {
+        let params = StretchParams::new(2.0).with_window_type(WindowType::BlackmanHarris);
         assert_eq!(params.window_type, WindowType::BlackmanHarris);
-
-        // DjBeatmatch uses Hann (matched analysis/synthesis, good COLA at 75%)
-        let params = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
-        assert_eq!(params.window_type, WindowType::Hann);
-
-        // HouseLoop uses Hann
-        let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
-        assert_eq!(params.window_type, WindowType::Hann);
-
-        // VocalChop uses Hann
-        let params = StretchParams::new(1.0).with_preset(EdmPreset::VocalChop);
-        assert_eq!(params.window_type, WindowType::Hann);
-
-        // Halftime uses Hann
-        let params = StretchParams::new(2.0).with_preset(EdmPreset::Halftime);
-        assert_eq!(params.window_type, WindowType::Hann);
-    }
-
-    #[test]
-    fn test_preset_window_can_be_overridden() {
-        let params = StretchParams::new(2.0)
-            .with_preset(EdmPreset::Ambient)
-            .with_window_type(WindowType::Hann);
-        assert_eq!(params.window_type, WindowType::Hann);
     }
 
     #[test]
@@ -3217,11 +2523,8 @@ mod tests {
 
     #[test]
     fn test_with_stretch_ratio() {
-        let params = StretchParams::new(1.0)
-            .with_preset(EdmPreset::DjBeatmatch)
-            .with_stretch_ratio(0.984375);
+        let params = StretchParams::new(1.0).with_stretch_ratio(0.984375);
         assert!((params.stretch_ratio - 0.984375).abs() < 1e-10);
-        assert_eq!(params.preset, Some(EdmPreset::DjBeatmatch));
     }
 
     #[test]
@@ -3967,22 +3270,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bpm_none_after_preset() {
-        let params = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
-        assert_eq!(params.bpm, None);
-    }
-
-    #[test]
-    fn test_bpm_preserved_after_preset() {
-        // BPM set before preset should be overwritten (preset doesn't set BPM)
-        let params = StretchParams::new(1.0)
-            .with_bpm(140.0)
-            .with_preset(EdmPreset::HouseLoop);
-        // Preset does not reset bpm, so it should be preserved
-        assert_eq!(params.bpm, Some(140.0));
-    }
-
-    #[test]
     fn test_from_tempo_bpm_is_none() {
         let params = StretchParams::from_tempo(126.0, 128.0);
         assert_eq!(params.bpm, None);
@@ -4018,184 +3305,5 @@ mod tests {
             .with_beat_snap_tolerance_ms(8.0);
         assert!((params.beat_snap_confidence_threshold - 0.75).abs() < f32::EPSILON);
         assert!((params.beat_snap_tolerance_ms - 8.0).abs() < 1e-10);
-    }
-
-    // --- Dynamic WSOLA search tests ---
-
-    #[test]
-    fn test_dynamic_wsola_search_default_is_false() {
-        let params = StretchParams::new(1.0);
-        assert!(!params.dynamic_wsola_search);
-    }
-
-    #[test]
-    fn test_with_dynamic_wsola_search() {
-        let params = StretchParams::new(1.0).with_dynamic_wsola_search(true);
-        assert!(params.dynamic_wsola_search);
-    }
-
-    #[test]
-    fn test_preset_enables_dynamic_wsola_search() {
-        // DjBeatmatch, HouseLoop, Halftime should enable it
-        let dj = StretchParams::new(1.0).with_preset(EdmPreset::DjBeatmatch);
-        assert!(dj.dynamic_wsola_search);
-
-        let house = StretchParams::new(1.0).with_preset(EdmPreset::HouseLoop);
-        assert!(house.dynamic_wsola_search);
-
-        let halftime = StretchParams::new(2.0).with_preset(EdmPreset::Halftime);
-        assert!(halftime.dynamic_wsola_search);
-
-        // Ambient and VocalChop should not enable it
-        let ambient = StretchParams::new(3.0).with_preset(EdmPreset::Ambient);
-        assert!(!ambient.dynamic_wsola_search);
-
-        let vocal = StretchParams::new(1.0).with_preset(EdmPreset::VocalChop);
-        assert!(!vocal.dynamic_wsola_search);
-    }
-
-    #[test]
-    fn test_effective_wsola_search_ms_static() {
-        // With dynamic disabled, should return the static value
-        let params = StretchParams::new(2.0)
-            .with_sample_rate(44100)
-            .with_wsola_search_range(ms_to_samples(10.0, 44100));
-        let ms = params.effective_wsola_search_ms();
-        assert!((ms - 10.0).abs() < 0.5, "Expected ~10ms, got {}", ms);
-    }
-
-    #[test]
-    fn test_effective_wsola_search_ms_dynamic_scales() {
-        // With dynamic enabled at 2x ratio, search should double
-        let params = StretchParams::new(2.0)
-            .with_sample_rate(44100)
-            .with_wsola_search_range(ms_to_samples(10.0, 44100))
-            .with_dynamic_wsola_search(true);
-        let ms = params.effective_wsola_search_ms();
-        assert!((ms - 20.0).abs() < 0.5, "Expected ~20ms, got {}", ms);
-    }
-
-    #[test]
-    fn test_effective_wsola_search_ms_dynamic_caps_at_40() {
-        // At extreme stretch ratio (10x), should cap at 40ms
-        let params = StretchParams::new(10.0)
-            .with_sample_rate(44100)
-            .with_wsola_search_range(ms_to_samples(10.0, 44100))
-            .with_dynamic_wsola_search(true);
-        let ms = params.effective_wsola_search_ms();
-        assert!((ms - 40.0).abs() < 0.5, "Expected cap at 40ms, got {}", ms);
-    }
-
-    #[test]
-    fn test_effective_wsola_search_ms_dynamic_compress() {
-        // With ratio < 1, should use 1/ratio as factor
-        let params = StretchParams::new(0.5)
-            .with_sample_rate(44100)
-            .with_wsola_search_range(ms_to_samples(10.0, 44100))
-            .with_dynamic_wsola_search(true);
-        let ms = params.effective_wsola_search_ms();
-        assert!((ms - 20.0).abs() < 0.5, "Expected ~20ms, got {}", ms);
-    }
-
-    #[test]
-    fn test_effective_wsola_search_range_static() {
-        // With dynamic disabled, should return the raw value
-        let params = StretchParams::new(2.0)
-            .with_sample_rate(44100)
-            .with_wsola_search_range(100);
-        assert_eq!(params.effective_wsola_search_range(), 100);
-    }
-
-    #[test]
-    fn test_effective_wsola_search_range_dynamic_scales() {
-        // At ratio=2.0, base=441 (10ms) → 882 (20ms)
-        let params = StretchParams::new(2.0)
-            .with_sample_rate(44100)
-            .with_wsola_search_range(441)
-            .with_dynamic_wsola_search(true);
-        assert_eq!(params.effective_wsola_search_range(), 882);
-    }
-
-    #[test]
-    fn test_effective_wsola_search_range_dynamic_symmetric() {
-        // ratio=0.5 should use 1/0.5 = 2.0 as factor, same as ratio=2.0
-        let params = StretchParams::new(0.5)
-            .with_sample_rate(44100)
-            .with_wsola_search_range(441)
-            .with_dynamic_wsola_search(true);
-        assert_eq!(params.effective_wsola_search_range(), 882);
-    }
-
-    #[test]
-    fn test_effective_wsola_search_range_dynamic_caps_at_40ms() {
-        // base=1323 (30ms) at ratio=2.0 → 2646 (60ms) but capped at 1764 (40ms)
-        let params = StretchParams::new(2.0)
-            .with_sample_rate(44100)
-            .with_wsola_search_range(1323)
-            .with_dynamic_wsola_search(true);
-        let max_samples = (0.040 * 44100.0) as usize; // 1764
-        assert_eq!(params.effective_wsola_search_range(), max_samples);
-    }
-
-    // --- Preset tuning tests ---
-
-    #[test]
-    fn test_dj_beatmatch_tuning() {
-        let params = StretchParams::new(1.02).with_preset(EdmPreset::DjBeatmatch);
-        assert_eq!(params.fft_size, 4096);
-        assert_eq!(params.hop_size, 1024); // 75% overlap
-        assert!((params.transient_sensitivity - 0.3).abs() < f32::EPSILON);
-        assert_eq!(params.window_type, WindowType::Hann);
-        assert!(params.dynamic_wsola_search);
-    }
-
-    #[test]
-    fn test_house_loop_tuning() {
-        let params = StretchParams::new(1.5).with_preset(EdmPreset::HouseLoop);
-        assert_eq!(params.fft_size, 4096);
-        assert_eq!(params.hop_size, 1024); // 75% overlap
-        assert!((params.transient_region_secs - 0.030).abs() < 1e-6); // 30ms
-        assert_eq!(params.window_type, WindowType::Hann);
-        assert!(params.dynamic_wsola_search);
-    }
-
-    #[test]
-    fn test_halftime_tuning() {
-        let params = StretchParams::new(2.0).with_preset(EdmPreset::Halftime);
-        assert_eq!(params.fft_size, 4096);
-        assert_eq!(params.hop_size, 1024); // 75% overlap
-        assert!((params.transient_region_secs - 0.020).abs() < 1e-6); // 20ms
-        assert_eq!(params.window_type, WindowType::Hann);
-        assert!(params.dynamic_wsola_search);
-        assert_eq!(params.crossfade_mode, CrossfadeMode::Adaptive);
-    }
-
-    #[test]
-    fn test_ambient_tuning() {
-        let params = StretchParams::new(3.0).with_preset(EdmPreset::Ambient);
-        assert_eq!(params.fft_size, 8192);
-        assert_eq!(params.hop_size, 4096); // 50% overlap
-        assert_eq!(params.window_type, WindowType::BlackmanHarris);
-        assert_eq!(params.crossfade_mode, CrossfadeMode::Adaptive);
-        assert!(!params.dynamic_wsola_search);
-    }
-
-    #[test]
-    fn test_vocal_chop_tuning() {
-        let params = StretchParams::new(1.0).with_preset(EdmPreset::VocalChop);
-        assert_eq!(params.fft_size, 4096); // increased from 2048
-        assert_eq!(params.hop_size, 1024);
-        assert!((params.transient_sensitivity - 0.6).abs() < f32::EPSILON);
-        assert_eq!(params.window_type, WindowType::Hann);
-        assert_eq!(params.envelope_preset, EnvelopePreset::Vocal);
-        assert!(params.envelope_preservation);
-        assert!(params.envelope_strength > 1.0);
-        assert!(params.adaptive_envelope_order);
-    }
-
-    #[test]
-    fn test_default_hop_size_is_fft_div_8() {
-        let params = StretchParams::new(1.0);
-        assert_eq!(params.hop_size, params.fft_size / 8);
     }
 }

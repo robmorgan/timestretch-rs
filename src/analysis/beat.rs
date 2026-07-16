@@ -693,20 +693,6 @@ pub fn snap_to_subdivision(position: f64, grid: &[f64], tolerance_samples: f64) 
     }
 }
 
-/// Returns the default beat subdivision for a given preset and stretch ratio.
-///
-/// Different presets use different granularity:
-/// - Default / DjBeatmatch / HouseLoop / VocalChop: 16 (1/16th notes)
-/// - Halftime: 8 (1/8th notes) since time is doubled
-/// - Ambient: 4 (quarter notes) since the material is very slow
-pub fn default_subdivision_for_preset(preset: Option<crate::core::types::EdmPreset>) -> u32 {
-    match preset {
-        Some(crate::core::types::EdmPreset::Halftime) => 8,
-        Some(crate::core::types::EdmPreset::Ambient) => 4,
-        _ => 16,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1078,28 +1064,6 @@ mod tests {
     fn test_snap_to_subdivision_last_position() {
         let grid = vec![0.0, 1000.0, 2000.0];
         assert_eq!(snap_to_subdivision(1990.0, &grid, 100.0), Some(2000.0));
-    }
-
-    // --- default_subdivision_for_preset ---
-
-    #[test]
-    fn test_default_subdivision_for_preset() {
-        use crate::core::types::EdmPreset;
-        assert_eq!(default_subdivision_for_preset(None), 16);
-        assert_eq!(
-            default_subdivision_for_preset(Some(EdmPreset::DjBeatmatch)),
-            16
-        );
-        assert_eq!(
-            default_subdivision_for_preset(Some(EdmPreset::HouseLoop)),
-            16
-        );
-        assert_eq!(default_subdivision_for_preset(Some(EdmPreset::Halftime)), 8);
-        assert_eq!(default_subdivision_for_preset(Some(EdmPreset::Ambient)), 4);
-        assert_eq!(
-            default_subdivision_for_preset(Some(EdmPreset::VocalChop)),
-            16
-        );
     }
 
     // --- Integration: snapping transients to a beat grid ---

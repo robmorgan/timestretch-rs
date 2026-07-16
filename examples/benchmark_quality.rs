@@ -1,6 +1,6 @@
 //! Audio quality benchmark comparing library output against a professional reference.
 //!
-//! Loads an original WAV, stretches it with the DjBeatmatch preset, writes
+//! Loads an original WAV, stretches it, writes
 //! the result, and compares against an Ableton Live 11 Complex Pro reference
 //! using spectral similarity, band-level similarity, cross-correlation, and
 //! transient match scoring.
@@ -18,7 +18,7 @@ use timestretch::analysis::comparison::{
     BandSimilarity, BeatGridRegularityResult,
 };
 use timestretch::io::wav::{read_wav_file, write_wav_file_16bit};
-use timestretch::{EdmPreset, StretchParams};
+use timestretch::StretchParams;
 
 const ORIGINAL_PATH: &str =
     "benchmarks/audio/12247392_Music Sounds Better With You_(Original Mix)_124bpm.wav";
@@ -34,7 +34,7 @@ const FFT_SIZE: usize = 4096;
 const HOP_SIZE: usize = 1024;
 const TRANSIENT_TOLERANCE_MS: f64 = 15.0;
 
-/// Transient detection parameters matching DjBeatmatch preset.
+/// Transient detection parameters for the comparison harness.
 const TRANSIENT_FFT_SIZE: usize = 2048;
 const TRANSIENT_HOP_SIZE: usize = 512;
 const TRANSIENT_SENSITIVITY: f32 = 0.45;
@@ -87,7 +87,6 @@ fn main() {
     println!("\nStretching at ratio {ratio:.4} ({SOURCE_BPM} -> {TARGET_BPM} BPM)");
 
     let params = StretchParams::new(ratio)
-        .with_preset(EdmPreset::DjBeatmatch)
         .with_sample_rate(original.sample_rate)
         .with_channels(original.channels.count() as u32);
 
@@ -171,7 +170,6 @@ fn run_self_test() {
     println!("Stretching at ratio {ratio:.4}...");
 
     let params = StretchParams::new(ratio)
-        .with_preset(EdmPreset::DjBeatmatch)
         .with_sample_rate(original.sample_rate)
         .with_channels(original.channels.count() as u32);
 

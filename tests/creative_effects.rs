@@ -1,7 +1,7 @@
 //! Integration tests for creative audio effects combining new AudioBuffer APIs
 //! with time stretching, demonstrating real-world DJ and production workflows.
 
-use timestretch::{AudioBuffer, EdmPreset, StretchParams, WindowType};
+use timestretch::{AudioBuffer, StretchParams, WindowType};
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -127,8 +127,7 @@ fn pan_then_stretch_stereo() {
 
     let params = StretchParams::new(1.5)
         .with_sample_rate(44100)
-        .with_channels(2)
-        .with_preset(EdmPreset::HouseLoop);
+        .with_channels(2);
     let stretched = timestretch::stretch_buffer(&stereo, &params).unwrap();
     assert!(stretched.is_stereo());
     assert!(!stretched.is_empty());
@@ -333,8 +332,7 @@ fn reverse_riser_effect() {
 
     let params = StretchParams::new(2.0)
         .with_sample_rate(44100)
-        .with_channels(1)
-        .with_preset(EdmPreset::Ambient);
+        .with_channels(1);
     let stretched = timestretch::stretch_buffer(&faded, &params).unwrap();
     assert_finite(&stretched, "reverse_riser");
     assert!(stretched.duration_secs() > 1.5);
@@ -352,8 +350,7 @@ fn tape_stop_effect() {
     // Stretch the decelerating signal
     let params = StretchParams::new(2.0)
         .with_sample_rate(44100)
-        .with_channels(1)
-        .with_preset(EdmPreset::Halftime);
+        .with_channels(1);
     let stretched = timestretch::stretch_buffer(&decelerated, &params).unwrap();
     assert_finite(&stretched, "tape_stop");
 }
@@ -368,8 +365,7 @@ fn dj_transition_with_pan_and_crossfade() {
     // Stretch both to match BPM
     let params = StretchParams::new(128.0 / 126.0)
         .with_sample_rate(44100)
-        .with_channels(2)
-        .with_preset(EdmPreset::DjBeatmatch);
+        .with_channels(2);
     let a_stretched = timestretch::stretch_buffer(&track_a, &params).unwrap();
     let b_stretched = timestretch::stretch_buffer(&track_b, &params).unwrap();
 
@@ -393,8 +389,7 @@ fn layered_synth_pad_production() {
 
     let params = StretchParams::new(1.5)
         .with_sample_rate(44100)
-        .with_channels(1)
-        .with_preset(EdmPreset::Ambient);
+        .with_channels(1);
     let stretched = timestretch::stretch_buffer(&enveloped, &params).unwrap();
     assert_finite(&stretched, "synth_pad");
     assert!(stretched.duration_secs() > 2.5);
@@ -412,8 +407,7 @@ fn granular_freeze_effect() {
 
     let params = StretchParams::new(3.0)
         .with_sample_rate(44100)
-        .with_channels(1)
-        .with_preset(EdmPreset::Ambient);
+        .with_channels(1);
     let stretched = timestretch::stretch_buffer(&repeated, &params).unwrap();
     assert_finite(&stretched, "granular_freeze");
     assert!(stretched.duration_secs() > 2.0);
