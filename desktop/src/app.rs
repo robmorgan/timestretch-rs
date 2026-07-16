@@ -600,8 +600,9 @@ impl TimeStretchApp {
         self.loop_and_jump_panel(ui);
     }
 
-    /// Beat-jump buttons and loop in/out/exit controls. Jumps and loop wraps
-    /// go through the processing thread's warm-start machinery.
+    /// Beat-jump buttons and loop controls (manual in/out/exit plus a
+    /// grid-quantized 4-beat auto-loop). Jumps and loop wraps go through
+    /// the processing thread's warm-start machinery.
     fn loop_and_jump_panel(&mut self, ui: &mut egui::Ui) {
         let has_audio = self.source_audio.is_some();
         let (pos_frames, total_frames, bpm, sample_rate, loop_region, loop_in) = {
@@ -678,6 +679,46 @@ impl TimeStretchApp {
                 .clicked()
             {
                 self.state.lock().unwrap().loop_region = None;
+            }
+
+            // Auto-loop: one click arms a 4-beat loop snapped to the nearest
+            // grid beat (fixed 60/BPM intervals when only a tempo is known,
+            // like jumps); clicking again releases it.
+            let looping = loop_region.is_some();
+            if ui
+                .add_enabled(
+                    if looping { has_audio } else { can_jump },
+                    egui::Button::new("Loop 4").selected(looping),
+                )
+                .clicked()
+            {
+                if looping {
+                    self.state.lock().unwrap().loop_region = None;
+                } else {
+                    let (start, end) = match grid {
+                        Some(g) => {
+                            let i = g.nearest_beat_index(pos_frames as f64).unwrap_or(0);
+                            let start = g.beats[i];
+                            // The grid can run out short of 4 beats near EOF;
+                            // extrapolate at the detected tempo.
+                            let end = match g.beats.get(i + 4) {
+                                Some(&b) => b,
+                                None => start + 4.0 * g.beat_interval_samples(),
+                            };
+                            (start.round().max(0.0) as usize, end.round() as usize)
+                        }
+                        None => (pos_frames, pos_frames + (4 * beat_frames) as usize),
+                    };
+                    // Never past EOF: the deck feed can't reach a loop end
+                    // beyond the source, and an armed loop suppresses the
+                    // end-of-stream stop.
+                    let end = end.min(total_frames);
+                    if end > start {
+                        let mut st = self.state.lock().unwrap();
+                        st.loop_region = Some((start, end));
+                        st.loop_in = None;
+                    }
+                }
             }
 
             match loop_region {
