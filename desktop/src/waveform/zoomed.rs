@@ -8,7 +8,7 @@
 use eframe::egui;
 
 use super::peaks::BandPeaks;
-use super::{overlay_plan, paint_placeholder, palette, GridMarks};
+use super::{GridMarks, overlay_plan, paint_placeholder, palette};
 
 /// View height in points.
 const VIEW_HEIGHT: f32 = 160.0;
