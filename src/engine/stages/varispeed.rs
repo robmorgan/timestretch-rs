@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use crate::core::resample::{SincInterpTable, StreamingSincResampler, STREAM_SINC_HALF_TAPS};
+use crate::core::resample::{STREAM_SINC_HALF_TAPS, SincInterpTable, StreamingSincResampler};
 use crate::engine::control::MIN_TEMPO_RATE;
 
 /// Source frames fed to the resamplers per feed step. Small so that a tempo

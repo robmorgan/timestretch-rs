@@ -1,6 +1,6 @@
 //! Frequency-domain analysis: spectral centroid, band splitting, and energy.
 
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{FftPlanner, num_complex::Complex};
 
 use crate::core::fft::COMPLEX_ZERO;
 

@@ -430,13 +430,12 @@ impl eframe::App for TimeStretchApp {
 impl TimeStretchApp {
     fn file_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui.button("Load Audio File").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
+            if ui.button("Load Audio File").clicked()
+                && let Some(path) = rfd::FileDialog::new()
                     .add_filter("Audio", &["wav", "mp3", "flac", "ogg"])
                     .pick_file()
-                {
-                    self.load_file(path);
-                }
+            {
+                self.load_file(path);
             }
 
             if !self.file_name.is_empty() {
@@ -487,12 +486,12 @@ impl TimeStretchApp {
             },
             &mut self.zoom_span,
         );
-        if let Some(delta_frames) = scrub {
-            if total_frames > 0 {
-                let target = (pos_frames as f64 + delta_frames)
-                    .clamp(0.0, (total_frames - 1) as f64) as usize;
-                self.request_seek(target);
-            }
+        if let Some(delta_frames) = scrub
+            && total_frames > 0
+        {
+            let target =
+                (pos_frames as f64 + delta_frames).clamp(0.0, (total_frames - 1) as f64) as usize;
+            self.request_seek(target);
         }
         ui.add_space(4.0);
 
@@ -516,10 +515,10 @@ impl TimeStretchApp {
         ui.add_space(4.0);
 
         // Overview strip; built lazily on first paint after a track load.
-        if self.overview_texture.is_none() {
-            if let Some(peaks) = &self.band_peaks {
-                self.overview_texture = Some(OverviewTexture::from_peaks(ui.ctx(), peaks));
-            }
+        if self.overview_texture.is_none()
+            && let Some(peaks) = &self.band_peaks
+        {
+            self.overview_texture = Some(OverviewTexture::from_peaks(ui.ctx(), peaks));
         }
         let progress = if total_frames > 0 {
             pos_frames as f32 / total_frames as f32
@@ -537,10 +536,10 @@ impl TimeStretchApp {
                 loop_in,
             },
         );
-        if let Some(frac) = seek_frac {
-            if total_frames > 0 {
-                self.request_seek((frac as f64 * total_frames as f64) as usize);
-            }
+        if let Some(frac) = seek_frac
+            && total_frames > 0
+        {
+            self.request_seek((frac as f64 * total_frames as f64) as usize);
         }
     }
 
@@ -667,12 +666,11 @@ impl TimeStretchApp {
             if ui
                 .add_enabled(can_close, egui::Button::new("Out"))
                 .clicked()
+                && let Some(start) = loop_in
             {
-                if let Some(start) = loop_in {
-                    let mut st = self.state.lock().unwrap();
-                    st.loop_region = Some((start, pos_frames));
-                    st.loop_in = None;
-                }
+                let mut st = self.state.lock().unwrap();
+                st.loop_region = Some((start, pos_frames));
+                st.loop_in = None;
             }
             if ui
                 .add_enabled(loop_region.is_some(), egui::Button::new("Exit"))
@@ -763,14 +761,14 @@ impl TimeStretchApp {
                             egui::TextEdit::singleline(&mut self.target_bpm_text)
                                 .desired_width(60.0),
                         );
-                        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            if let Ok(target) = self.target_bpm_text.parse::<f64>() {
-                                if target > 0.0 {
-                                    // Route through the shared sync point so the
-                                    // tempo fader tracks a typed BPM too.
-                                    self.apply_target_bpm(detected_bpm, target);
-                                }
-                            }
+                        if response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            && let Ok(target) = self.target_bpm_text.parse::<f64>()
+                            && target > 0.0
+                        {
+                            // Route through the shared sync point so the
+                            // tempo fader tracks a typed BPM too.
+                            self.apply_target_bpm(detected_bpm, target);
                         }
                     } else {
                         ui.label("Load a file to detect BPM");

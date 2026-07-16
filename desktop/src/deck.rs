@@ -7,8 +7,8 @@
 //! target and request warm-start priming; loop wraps feed straight across the
 //! seam via a timeline re-anchor.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -172,13 +172,13 @@ pub fn start_deck_thread(
 
             // Loop wrap: jump the feed cursor and re-anchor the timeline.
             // The engine streams straight across the seam — no reset.
-            if let Some((loop_start, loop_end)) = loop_region {
-                if cursor >= loop_end * CHANNELS {
-                    cursor = loop_start * CHANNELS;
-                    jumps.record(fed_frames, loop_start as f64);
-                    source.set_track_position(loop_start as u64);
-                    finished = false;
-                }
+            if let Some((loop_start, loop_end)) = loop_region
+                && cursor >= loop_end * CHANNELS
+            {
+                cursor = loop_start * CHANNELS;
+                jumps.record(fed_frames, loop_start as f64);
+                source.set_track_position(loop_start as u64);
+                finished = false;
             }
 
             // End of stream: flush the resampler lookahead once, then stop

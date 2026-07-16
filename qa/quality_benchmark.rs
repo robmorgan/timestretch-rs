@@ -3,10 +3,10 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{FftPlanner, num_complex::Complex};
 use timestretch::stretch::phase_locking::PhaseLockingMode;
 use timestretch::stretch::phase_vocoder::PhaseVocoder;
-use timestretch::{pitch_shift, stretch, EnvelopePreset, StretchParams, WindowType};
+use timestretch::{EnvelopePreset, StretchParams, WindowType, pitch_shift, stretch};
 
 const SAMPLE_RATE: u32 = 44_100;
 const FFT_SIZE: usize = 2_048;
@@ -587,8 +587,8 @@ fn quality_benchmark_harness_generates_reports() -> Result<(), Box<dyn std::erro
 
 #[test]
 #[ignore = "long-running quality benchmark harness"]
-fn quality_benchmark_pitch_formant_presets_generates_reports(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn quality_benchmark_pitch_formant_presets_generates_reports()
+-> Result<(), Box<dyn std::error::Error>> {
     let out_dir = benchmark_output_dir();
     fs::create_dir_all(&out_dir)?;
 

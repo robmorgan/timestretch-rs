@@ -8,8 +8,8 @@
 //! structures — no locks, no allocation, and nothing on the audio side that
 //! can fail.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Tempo rate hard floor (matches the varispeed control-path range).
 pub const MIN_TEMPO_RATE: f64 = 0.25;

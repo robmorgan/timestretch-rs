@@ -56,7 +56,7 @@ pub use control::{EngineController, MAX_TEMPO_RATE, MIN_TEMPO_RATE};
 pub use graph::EngineProcessor;
 pub use profiles::EngineProfile;
 pub use source::SourceProducer;
-pub use stage::{BlockBuf, Stage, StageCtx, BLOCK_FRAMES};
+pub use stage::{BLOCK_FRAMES, BlockBuf, Stage, StageCtx};
 
 use crate::engine::control::EngineShared;
 use crate::engine::source::SourceRing;
@@ -201,26 +201,34 @@ mod tests {
 
     #[test]
     fn config_validation_rejects_bad_values() {
-        assert!(Engine::build(EngineConfig {
-            channels: 0,
-            ..EngineConfig::default()
-        })
-        .is_err());
-        assert!(Engine::build(EngineConfig {
-            sample_rate: 1000,
-            ..EngineConfig::default()
-        })
-        .is_err());
-        assert!(Engine::build(EngineConfig {
-            max_block_frames: 16,
-            ..EngineConfig::default()
-        })
-        .is_err());
-        assert!(Engine::build(EngineConfig {
-            source_capacity_frames: 100,
-            ..EngineConfig::default()
-        })
-        .is_err());
+        assert!(
+            Engine::build(EngineConfig {
+                channels: 0,
+                ..EngineConfig::default()
+            })
+            .is_err()
+        );
+        assert!(
+            Engine::build(EngineConfig {
+                sample_rate: 1000,
+                ..EngineConfig::default()
+            })
+            .is_err()
+        );
+        assert!(
+            Engine::build(EngineConfig {
+                max_block_frames: 16,
+                ..EngineConfig::default()
+            })
+            .is_err()
+        );
+        assert!(
+            Engine::build(EngineConfig {
+                source_capacity_frames: 100,
+                ..EngineConfig::default()
+            })
+            .is_err()
+        );
         assert!(Engine::build(EngineConfig::default()).is_ok());
     }
 

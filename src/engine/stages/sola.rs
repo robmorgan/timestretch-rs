@@ -16,7 +16,7 @@
 //! Splice decisions are made once per block on the channel mix and applied
 //! to every channel identically, keeping the stereo image intact.
 
-use crate::engine::stage::{OnsetEvent, BLOCK_FRAMES};
+use crate::engine::stage::{BLOCK_FRAMES, OnsetEvent};
 
 /// Half-width of the SOLA read kernel in zero-crossings (64-tap kernel).
 ///
@@ -529,11 +529,7 @@ impl SolaCorrector {
             b_sq += b * b;
         }
         let norm = (a_sq * b_sq).sqrt();
-        if norm < 1e-12 {
-            0.0
-        } else {
-            dot / norm
-        }
+        if norm < 1e-12 { 0.0 } else { dot / norm }
     }
 
     /// Like [`Self::mix_correlation`], but `b_pos` is honoured at fractional
@@ -553,11 +549,7 @@ impl SolaCorrector {
             b_sq += b * b;
         }
         let norm = (a_sq * b_sq).sqrt();
-        if norm < 1e-12 {
-            0.0
-        } else {
-            dot / norm
-        }
+        if norm < 1e-12 { 0.0 } else { dot / norm }
     }
 
     /// RMS of the channel mix over `len` frames starting at `pos`.

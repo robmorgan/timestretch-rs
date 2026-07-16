@@ -17,13 +17,19 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        rust: [stable]
+        # "pinned" = the toolchain in rust-toolchain.toml (same compiler
+        # as local builds); the MSRV row overrides it via the dtolnay
+        # action's RUSTUP_TOOLCHAIN env var.
+        rust: [pinned]
         include:
           - os: ubuntu-latest
-            rust: "1.82.0"  # MSRV
+            rust: "1.85.0"  # MSRV
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - if: matrix.rust == 'pinned'
+        run: rustup toolchain install
+      - if: matrix.rust != 'pinned'
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
@@ -37,7 +43,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Installs the pinned toolchain + components from rust-toolchain.toml.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       # The engine A/B matrix is the quality dashboard: absolute gates
       # re-derived from new-engine measurements at Stage 9 (the old
@@ -64,7 +71,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       # The corpus is CC-licensed netlabel audio fetched from the Internet
       # Archive with pinned SHA-256 (ROADMAP Stage 7). Cached on the fetch
@@ -96,9 +103,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
 
@@ -111,9 +116,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: desktop
@@ -127,9 +130,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - run: rustup toolchain install
       - run: cargo fmt --all --check
 
   doc:
@@ -137,7 +138,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps
         env:

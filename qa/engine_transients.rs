@@ -11,7 +11,7 @@
 #[path = "ab/mod.rs"]
 mod ab;
 
-use ab::{render_keylock_with_artifact, render_with_rate_schedule, Arm};
+use ab::{Arm, render_keylock_with_artifact, render_with_rate_schedule};
 use timestretch::PreAnalysisArtifact;
 
 const SAMPLE_RATE: u32 = 44_100;

@@ -4,7 +4,7 @@
 //! a range of factors, envelope profiles, and channel layouts.
 
 use std::f32::consts::PI;
-use timestretch::{pitch_shift, EnvelopePreset, StretchParams};
+use timestretch::{EnvelopePreset, StretchParams, pitch_shift};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 

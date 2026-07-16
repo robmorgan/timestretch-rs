@@ -4,7 +4,7 @@
 
 use eframe::egui;
 
-use super::{palette, GridMarks};
+use super::{GridMarks, palette};
 
 /// Segment size and gap in points.
 const SEG_SIZE: egui::Vec2 = egui::vec2(16.0, 10.0);

@@ -1,7 +1,7 @@
 /// Spectral quality tests: frequency content preservation, transient timing,
 /// spectral centroid, and harmonic structure after time-stretching.
 use std::f32::consts::PI;
-use timestretch::{stretch, StretchParams};
+use timestretch::{StretchParams, stretch};
 
 const TWO_PI: f32 = 2.0 * PI;
 

@@ -10,8 +10,8 @@
 //! are WSOLA-stretched (preserves transient detail).
 
 use crate::core::fft::COMPLEX_ZERO;
-use crate::core::window::{generate_window, WindowType};
-use rustfft::{num_complex::Complex, FftPlanner};
+use crate::core::window::{WindowType, generate_window};
+use rustfft::{FftPlanner, num_complex::Complex};
 
 /// Parameters for HPSS processing.
 #[derive(Debug, Clone, Copy)]

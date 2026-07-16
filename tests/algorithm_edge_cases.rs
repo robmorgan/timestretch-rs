@@ -7,7 +7,7 @@ use timestretch::{AudioBuffer, Channels, StretchParams};
 
 #[test]
 fn test_window_size_2() {
-    use timestretch::core::window::{generate_window, WindowType};
+    use timestretch::core::window::{WindowType, generate_window};
 
     // Hann of size 2: endpoints should be 0
     let hann = generate_window(WindowType::Hann, 2);
@@ -28,7 +28,7 @@ fn test_window_size_2() {
 
 #[test]
 fn test_window_size_3() {
-    use timestretch::core::window::{generate_window, WindowType};
+    use timestretch::core::window::{WindowType, generate_window};
 
     let hann = generate_window(WindowType::Hann, 3);
     assert_eq!(hann.len(), 3);
@@ -41,7 +41,7 @@ fn test_window_size_3() {
 
 #[test]
 fn test_kaiser_beta_zero() {
-    use timestretch::core::window::{generate_window, WindowType};
+    use timestretch::core::window::{WindowType, generate_window};
 
     // Beta=0 should approximate a rectangular window
     let k = generate_window(WindowType::Kaiser(0), 64);
@@ -59,7 +59,7 @@ fn test_kaiser_beta_zero() {
 
 #[test]
 fn test_kaiser_high_beta() {
-    use timestretch::core::window::{generate_window, WindowType};
+    use timestretch::core::window::{WindowType, generate_window};
 
     // High beta (20.0) — should still produce valid results
     let k = generate_window(WindowType::Kaiser(2000), 256);
@@ -86,7 +86,7 @@ fn test_apply_window_mismatched_lengths() {
     apply_window(&mut data, &window);
     assert!((data[0] - 1.0).abs() < 1e-6); // 2.0 * 0.5
     assert!((data[1] - 3.0).abs() < 1e-6); // 3.0 * 1.0
-                                           // Remaining samples unchanged
+    // Remaining samples unchanged
     assert!((data[2] - 4.0).abs() < 1e-6);
     assert!((data[3] - 5.0).abs() < 1e-6);
 
@@ -113,7 +113,7 @@ fn test_apply_window_copy_mismatched_lengths() {
 
 #[test]
 fn test_window_all_values_finite() {
-    use timestretch::core::window::{generate_window, WindowType};
+    use timestretch::core::window::{WindowType, generate_window};
 
     for size in [1, 2, 3, 4, 7, 16, 64, 256, 1024, 4096] {
         for wt in [
@@ -235,7 +235,7 @@ fn test_resample_cubic_output_length_zero() {
 
 #[test]
 fn test_band_energy_short_input() {
-    use timestretch::analysis::frequency::{compute_band_energy, FrequencyBands};
+    use timestretch::analysis::frequency::{FrequencyBands, compute_band_energy};
 
     // Input shorter than FFT size should return zeros
     let samples = vec![0.5; 100];
@@ -246,7 +246,7 @@ fn test_band_energy_short_input() {
 
 #[test]
 fn test_band_energy_exactly_fft_size() {
-    use timestretch::analysis::frequency::{compute_band_energy, FrequencyBands};
+    use timestretch::analysis::frequency::{FrequencyBands, compute_band_energy};
 
     let fft_size = 4096;
     let samples: Vec<f32> = (0..fft_size)
@@ -263,7 +263,7 @@ fn test_band_energy_exactly_fft_size() {
 
 #[test]
 fn test_band_energy_silence() {
-    use timestretch::analysis::frequency::{compute_band_energy, FrequencyBands};
+    use timestretch::analysis::frequency::{FrequencyBands, compute_band_energy};
 
     let samples = vec![0.0; 4096];
     let (sub, low, mid, high) =
@@ -297,7 +297,7 @@ fn test_freq_to_bin_edge_cases() {
 #[test]
 fn test_split_spectrum_custom_bands() {
     use rustfft::num_complex::Complex;
-    use timestretch::analysis::frequency::{split_spectrum_into_bands, FrequencyBands};
+    use timestretch::analysis::frequency::{FrequencyBands, split_spectrum_into_bands};
 
     let bands = FrequencyBands {
         sub_bass: 60.0, // Very low sub

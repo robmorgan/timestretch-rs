@@ -19,7 +19,7 @@
 #[path = "ab/mod.rs"]
 mod ab;
 
-use ab::{render_with_rate_schedule, Arm};
+use ab::{Arm, render_with_rate_schedule};
 
 const SAMPLE_RATE: u32 = 44_100;
 const CALLBACK_FRAMES: usize = 256;

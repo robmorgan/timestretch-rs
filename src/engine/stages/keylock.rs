@@ -17,8 +17,8 @@
 //! SOLA's transposition clamp soft-flattening the corrected copy so it
 //! stays a single coherent pitch through the fade.
 
-use crate::engine::stage::{BlockBuf, Stage, StageCtx, BLOCK_FRAMES};
-use crate::engine::stages::band_split::{TwoBandSplit, KEYLOCK_CROSSOVER_HZ};
+use crate::engine::stage::{BLOCK_FRAMES, BlockBuf, Stage, StageCtx};
+use crate::engine::stages::band_split::{KEYLOCK_CROSSOVER_HZ, TwoBandSplit};
 use crate::engine::stages::delay::FixedDelay;
 use crate::engine::stages::sola::SolaCorrector;
 

@@ -49,7 +49,7 @@
 //! processor.process(&mut out);
 //! ```
 //!
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{FftPlanner, num_complex::Complex};
 
 pub mod analysis;
 pub mod core;
@@ -60,12 +60,12 @@ pub mod stretch;
 
 pub use analysis::beat::{BeatGrid, TempoSegment};
 pub use analysis::preanalysis::{
-    analyze_for_dj, analyze_for_dj_with_report, downmix_to_mid, AnalysisReport,
+    AnalysisReport, analyze_for_dj, analyze_for_dj_with_report, downmix_to_mid,
 };
 pub use analysis::tempogram::TempoTrackingOptions;
 pub use core::preanalysis::{
-    hash_samples, read_preanalysis_json, write_preanalysis_json, PreAnalysisArtifact,
-    PREANALYSIS_VERSION,
+    PREANALYSIS_VERSION, PreAnalysisArtifact, hash_samples, read_preanalysis_json,
+    write_preanalysis_json,
 };
 pub use core::types::{
     AudioBuffer, Channels, EnvelopePreset, FrameIter, QualityMode, Sample, StretchParams,

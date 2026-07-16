@@ -11,4 +11,4 @@ pub mod window;
 pub use preanalysis::*;
 pub use ring_buffer::RingBuffer;
 pub use types::*;
-pub use window::{apply_window, apply_window_copy, generate_window, WindowType};
+pub use window::{WindowType, apply_window, apply_window_copy, generate_window};

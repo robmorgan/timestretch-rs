@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **MSRV raised from 1.82 to 1.85**; the crate (and the desktop/web apps)
+  now use Rust edition 2024, which also enables cargo's MSRV-aware
+  dependency resolver (v3).
+- Development toolchain pinned to Rust 1.97.0 via `rust-toolchain.toml`;
+  CI's stable jobs build with the pinned compiler instead of floating on
+  latest stable (the MSRV job still tests 1.85.0 explicitly).
+
 ## 0.8.0
 
 ### Breaking changes — old engine deleted (ROADMAP Stage 9)

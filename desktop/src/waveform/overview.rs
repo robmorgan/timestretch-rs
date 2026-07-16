@@ -5,7 +5,7 @@
 use eframe::egui;
 
 use super::peaks::{BandPeaks, PeakLevel};
-use super::{overlay_plan, paint_placeholder, palette, GridMarks};
+use super::{GridMarks, overlay_plan, paint_placeholder, palette};
 
 /// Strip height in points.
 const STRIP_HEIGHT: f32 = 48.0;
@@ -179,10 +179,10 @@ pub fn paint_overview(ui: &mut egui::Ui, params: OverviewParams<'_>) -> Option<f
     );
 
     // Click-to-seek.
-    if response.clicked() {
-        if let Some(pos) = response.interact_pointer_pos() {
-            return Some(((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0));
-        }
+    if response.clicked()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        return Some(((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0));
     }
     None
 }

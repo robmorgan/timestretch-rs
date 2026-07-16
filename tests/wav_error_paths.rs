@@ -85,7 +85,7 @@ fn test_wav_no_fmt_chunk() {
     data.extend_from_slice(b"data");
     data.extend_from_slice(&4u32.to_le_bytes()); // 4 bytes of audio
     data.extend_from_slice(&[0u8; 4]); // audio data
-                                       // Pad to minimum header size
+    // Pad to minimum header size
     while data.len() < 44 {
         data.push(0);
     }
@@ -113,7 +113,7 @@ fn test_wav_fmt_chunk_too_short() {
     data.extend_from_slice(b"fmt ");
     data.extend_from_slice(&8u32.to_le_bytes()); // Only 8 bytes of fmt (needs 16)
     data.extend_from_slice(&[0u8; 8]); // 8 bytes of partial fmt data
-                                       // data chunk
+    // data chunk
     data.extend_from_slice(b"data");
     data.extend_from_slice(&4u32.to_le_bytes());
     data.extend_from_slice(&[0u8; 4]);

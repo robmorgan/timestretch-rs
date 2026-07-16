@@ -1,7 +1,7 @@
 //! Core types shared across the crate: samples, buffers, parameters, and errors.
 
-use crate::core::window::WindowType;
 use crate::core::PreAnalysisArtifact;
+use crate::core::window::WindowType;
 use crate::stretch::phase_locking::PhaseLockingMode;
 
 /// A single audio sample (32-bit float, range -1.0 to 1.0).
@@ -3147,7 +3147,7 @@ mod tests {
         // Frame 0 (time=0.0): gain=1.0
         assert!((faded.data[0] - 1.0).abs() < 1e-6); // L
         assert!((faded.data[1] - 0.5).abs() < 1e-6); // R
-                                                     // Frame 1 (time=0.5): gain=0.5
+        // Frame 1 (time=0.5): gain=0.5
         assert!((faded.data[2] - 0.5).abs() < 1e-6); // L
         assert!((faded.data[3] - 0.25).abs() < 1e-6); // R
     }

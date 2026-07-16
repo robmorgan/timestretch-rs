@@ -4,7 +4,7 @@
 //! preventing the unnatural timbre shifts that occur when the phase vocoder
 //! modifies magnitude relationships between harmonics.
 
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{FftPlanner, num_complex::Complex};
 
 /// Minimum magnitude floor to avoid log(0) in cepstral analysis.
 const LOG_FLOOR: f32 = 1e-10;

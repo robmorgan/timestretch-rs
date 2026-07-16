@@ -10,9 +10,9 @@
 //! confidence, never hard-coded.
 
 use crate::analysis::tempogram::{
-    condition_novelty, estimate_tempo_track, TempoTrack, TempoTrackingOptions,
+    TempoTrack, TempoTrackingOptions, condition_novelty, estimate_tempo_track,
 };
-use crate::analysis::transient::{detect_transients, TransientMap};
+use crate::analysis::transient::{TransientMap, detect_transients};
 
 pub use crate::core::preanalysis::TempoSegment;
 
