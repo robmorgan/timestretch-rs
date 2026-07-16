@@ -20,6 +20,40 @@ const MAX_VARISPEED_RATIO: f64 = 4.0;
 const MAX_TEMPO_FACTOR: f64 = 2.0;
 /// Tempo fader width in points (3x egui's ~100pt default) for fine control.
 const TEMPO_SLIDER_WIDTH: f32 = 300.0;
+/// Auto-loop length ladder: `2^exp` beats. 1/8 beat is still thousands of
+/// frames at DJ tempos — far more than the deck feed needs per wrap.
+const LOOP_EXP_MIN: i32 = -3;
+/// Ladder ceiling: 32 beats (8 bars).
+const LOOP_EXP_MAX: i32 = 5;
+
+/// Auto-loop button label for a `2^exp`-beat length: `1/8` … `1/2`, `1` … `32`.
+fn loop_len_label(exp: i32) -> String {
+    if exp >= 0 {
+        format!("{}", 1u32 << exp)
+    } else {
+        format!("1/{}", 1u32 << -exp)
+    }
+}
+
+/// Frame span of `beats` (a power of two, possibly fractional) measured on
+/// the grid from tracked beat `anchor`: whole-beat spans use the tracked
+/// positions so loops stay on the beat through tempo drift, sub-beat spans
+/// scale the local beat interval. Falls back to the grid's median interval
+/// where the grid runs out (near EOF).
+fn grid_loop_span(g: &timestretch::BeatGrid, anchor: usize, beats: f64) -> f64 {
+    if beats >= 1.0 {
+        match g.beats.get(anchor + beats as usize) {
+            Some(&b) => b - g.beats[anchor],
+            None => beats * g.beat_interval_samples(),
+        }
+    } else {
+        let local = match g.beats.get(anchor + 1) {
+            Some(&b) => b - g.beats[anchor],
+            None => g.beat_interval_samples(),
+        };
+        beats * local
+    }
+}
 
 pub struct TimeStretchApp {
     state: SharedStateHandle,
@@ -63,6 +97,8 @@ pub struct TimeStretchApp {
     preset: PresetChoice,
     deck_engine: DeckEngine,
     target_bpm_text: String,
+    /// Auto-loop length as a ladder exponent (`2^exp` beats).
+    loop_beats_exp: i32,
 
     // Error messages
     error_message: Option<String>,
@@ -134,6 +170,7 @@ impl TimeStretchApp {
             preset: PresetChoice::DjBeatmatch,
             deck_engine: DeckEngine::Keylock,
             target_bpm_text: String::new(),
+            loop_beats_exp: 2,
             error_message: None,
         };
         if let Some(path) = initial_file {
@@ -601,8 +638,9 @@ impl TimeStretchApp {
     }
 
     /// Beat-jump buttons and loop controls (manual in/out/exit plus a
-    /// grid-quantized 4-beat auto-loop). Jumps and loop wraps go through
-    /// the processing thread's warm-start machinery.
+    /// grid-quantized auto-loop with a halve/double length ladder). Jumps
+    /// and loop wraps go through the processing thread's warm-start
+    /// machinery.
     fn loop_and_jump_panel(&mut self, ui: &mut egui::Ui) {
         let has_audio = self.source_audio.is_some();
         let (pos_frames, total_frames, bpm, sample_rate, loop_region, loop_in) = {
@@ -681,43 +719,78 @@ impl TimeStretchApp {
                 self.state.lock().unwrap().loop_region = None;
             }
 
-            // Auto-loop: one click arms a 4-beat loop snapped to the nearest
-            // grid beat (fixed 60/BPM intervals when only a tempo is known,
-            // like jumps); clicking again releases it.
+            // Auto-loop: one click arms a loop of the selected length
+            // snapped to the nearest grid beat (fixed 60/BPM intervals
+            // when only a tempo is known, like jumps); clicking again
+            // releases it. </> halve/double the length, resizing an
+            // active loop in place from its start.
+            //
+            // Loop ends never pass EOF: the deck feed can't reach a loop
+            // end beyond the source, and an armed loop suppresses the
+            // end-of-stream stop.
+            let loop_end_for = |start: usize, beats: f64| -> Option<usize> {
+                let end = start as f64
+                    + match grid {
+                        Some(g) => {
+                            let anchor = g.nearest_beat_index(start as f64).unwrap_or(0);
+                            grid_loop_span(g, anchor, beats)
+                        }
+                        None => beats * beat_frames as f64,
+                    };
+                let end = (end.round() as usize).min(total_frames);
+                (end > start).then_some(end)
+            };
+
             let looping = loop_region.is_some();
+            let can_loop = if looping { has_audio } else { can_jump };
+            let mut new_exp = self.loop_beats_exp;
             if ui
                 .add_enabled(
-                    if looping { has_audio } else { can_jump },
-                    egui::Button::new("Loop 4").selected(looping),
+                    can_loop && self.loop_beats_exp > LOOP_EXP_MIN,
+                    egui::Button::new("<"),
                 )
+                .clicked()
+            {
+                new_exp -= 1;
+            }
+            let label = format!("Loop {}", loop_len_label(self.loop_beats_exp));
+            if ui
+                .add_enabled(can_loop, egui::Button::new(label).selected(looping))
                 .clicked()
             {
                 if looping {
                     self.state.lock().unwrap().loop_region = None;
                 } else {
-                    let (start, end) = match grid {
+                    let start = match grid {
                         Some(g) => {
                             let i = g.nearest_beat_index(pos_frames as f64).unwrap_or(0);
-                            let start = g.beats[i];
-                            // The grid can run out short of 4 beats near EOF;
-                            // extrapolate at the detected tempo.
-                            let end = match g.beats.get(i + 4) {
-                                Some(&b) => b,
-                                None => start + 4.0 * g.beat_interval_samples(),
-                            };
-                            (start.round().max(0.0) as usize, end.round() as usize)
+                            g.beats[i].round().max(0.0) as usize
                         }
-                        None => (pos_frames, pos_frames + (4 * beat_frames) as usize),
+                        None => pos_frames,
                     };
-                    // Never past EOF: the deck feed can't reach a loop end
-                    // beyond the source, and an armed loop suppresses the
-                    // end-of-stream stop.
-                    let end = end.min(total_frames);
-                    if end > start {
+                    if let Some(end) = loop_end_for(start, 2f64.powi(self.loop_beats_exp)) {
                         let mut st = self.state.lock().unwrap();
                         st.loop_region = Some((start, end));
                         st.loop_in = None;
                     }
+                }
+            }
+            if ui
+                .add_enabled(
+                    can_loop && self.loop_beats_exp < LOOP_EXP_MAX,
+                    egui::Button::new(">"),
+                )
+                .clicked()
+            {
+                new_exp += 1;
+            }
+            if new_exp != self.loop_beats_exp {
+                self.loop_beats_exp = new_exp;
+                // Live resize: keep the loop start, requantize the end.
+                if let Some((start, _)) = loop_region
+                    && let Some(end) = loop_end_for(start, 2f64.powi(new_exp))
+                {
+                    self.state.lock().unwrap().loop_region = Some((start, end));
                 }
             }
 
