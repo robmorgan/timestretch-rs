@@ -201,13 +201,23 @@ fn test_batch_artifact_skips_online_detection() {
     let sample_rate = 44100u32;
     let input = click_train(sample_rate, 128.0, 4.0);
 
-    // A usable artifact is authoritative even when it claims there are no
-    // transients. If online detection still ran, both outputs would be
-    // identical because stretching is deterministic.
+    // A usable artifact is authoritative even when its claims disagree
+    // with what online detection would find: no transients, and beats a
+    // half-beat off the clicks (so its splice-protection windows cover
+    // different regions than freshly detected events would). If online
+    // detection still ran, both outputs would be identical because
+    // stretching is deterministic.
     let mut no_transient_artifact = analyze_for_dj(&input, sample_rate);
     no_transient_artifact.transient_onsets.clear();
     no_transient_artifact.transient_strengths.clear();
     no_transient_artifact.onset_band_flux.clear();
+    let half_beat = (60.0 * sample_rate as f64 / 128.0 / 2.0) as usize;
+    for b in &mut no_transient_artifact.beat_positions {
+        *b += half_beat;
+    }
+    for b in &mut no_transient_artifact.beat_positions_fractional {
+        *b += half_beat as f64;
+    }
     assert!(no_transient_artifact.is_usable(sample_rate, 0.1));
 
     let ratio = 1.1;

@@ -329,6 +329,10 @@ fn track_beats_dp(novelty: &[f32], track: &TempoTrack) -> Vec<usize> {
 /// Converts beat frames to fractional sample positions: parabolic
 /// interpolation on the novelty peak, then snapping to a phase-refined
 /// transient onset when one is close (see [`BEAT_ONSET_SNAP_FRAMES`]).
+///
+/// Frame-to-sample conversion adds the map's detection latency so beats
+/// land on the audible attack, matching the (already-compensated) onset
+/// positions they snap to.
 fn refine_beat_positions(
     beat_frames: &[usize],
     novelty: &[f32],
@@ -336,6 +340,7 @@ fn refine_beat_positions(
     hop: usize,
 ) -> Vec<f64> {
     let snap_tolerance_samples = BEAT_ONSET_SNAP_FRAMES * hop as f64;
+    let latency = transients.latency_samples as f64;
     beat_frames
         .iter()
         .map(|&frame| {
@@ -351,7 +356,7 @@ fn refine_beat_positions(
                     pos += (0.5 * (a - c) / denom).clamp(-0.5, 0.5);
                 }
             }
-            let sample_pos = pos * hop as f64;
+            let sample_pos = pos * hop as f64 + latency;
 
             // Prefer the sub-hop position of a coincident detected onset.
             let onsets = &transients.onsets_fractional;
@@ -761,17 +766,87 @@ mod tests {
         assert!((grid.segments[0].bpm - 120.0).abs() < 2.0);
         assert!(grid.confidence > 0.4, "confidence {}", grid.confidence);
 
-        // Beats should land near click positions (multiples of the interval).
+        // Beats must land ON the clicks, not merely near them: a constant
+        // frame-timestamp bias (window start vs. audible attack) once put
+        // every beat ~30 ms early, which the old 10%-of-interval tolerance
+        // (50 ms) never caught. Sharp isolated clicks trip the unwindowed
+        // energy channel a frame or two before the Hann-weighted flux, so
+        // their residual runs a few ms earlier than on kick-shaped onsets
+        // (see detect_beats_land_on_kick_attacks for the tighter bound).
         let interval = 60.0 * sample_rate as f64 / 120.0;
+        let tolerance_ms = 15.0;
+        let mut offsets_ms: Vec<f64> = Vec::new();
         for &b in &grid.beats[1..grid.beats.len() - 1] {
             let nearest = (b / interval).round() * interval;
+            let off_ms = (b - nearest) / sample_rate as f64 * 1000.0;
             assert!(
-                (b - nearest).abs() < interval * 0.1,
-                "beat at {:.1} too far from click at {:.1}",
-                b,
-                nearest
+                off_ms.abs() < tolerance_ms,
+                "beat at {b:.1} is {off_ms:+.1} ms from click at {nearest:.1}"
             );
+            offsets_ms.push(off_ms);
         }
+        // The mean offset catches a systematic bias smaller than the
+        // per-beat tolerance.
+        let mean_ms = offsets_ms.iter().sum::<f64>() / offsets_ms.len() as f64;
+        assert!(
+            mean_ms.abs() < 12.0,
+            "beats are systematically {mean_ms:+.1} ms off the clicks"
+        );
+    }
+
+    /// EDM-shaped kick train (50 Hz decaying body + click attack) with
+    /// exactly known onsets: detected beats must sit on the audible attack.
+    /// Guards the frame-timestamp latency compensation on material where
+    /// the energy channel (not just spectral flux) drives detection.
+    #[test]
+    fn detect_beats_land_on_kick_attacks() {
+        let sr = 44_100u32;
+        let interval = 60.0 * sr as f64 / 125.0;
+        let len = (sr as f64 * 20.0) as usize;
+        let mut x = vec![0.0f32; len];
+        let mut truth = Vec::new();
+        let mut pos = 0.5 * sr as f64;
+        while pos + 4000.0 < len as f64 {
+            let base = pos as usize;
+            truth.push(pos);
+            for j in 0..3000usize {
+                let t = j as f32 / sr as f32;
+                x[base + j] += 0.9 * (-t * 18.0).exp() * (std::f32::consts::TAU * 50.0 * t).sin();
+            }
+            for j in 0..64usize {
+                x[base + j] += 0.5 * (1.0 - j as f32 / 64.0) * if j % 2 == 0 { 1.0 } else { -0.8 };
+            }
+            pos += interval;
+        }
+
+        let grid = detect_beats(&x, sr);
+        assert!((grid.bpm - 125.0).abs() < 2.0, "BPM {:.2}", grid.bpm);
+        assert!(grid.beats.len() > 30, "beats {}", grid.beats.len());
+
+        // First/last beats sit at the DP chain edges where the tracker has
+        // no neighbor on one side; measure the interior.
+        let offsets_ms: Vec<f64> = grid.beats[1..grid.beats.len() - 1]
+            .iter()
+            .map(|&b| {
+                let nearest = truth
+                    .iter()
+                    .map(|&t| b - t)
+                    .min_by(|a, c| a.abs().total_cmp(&c.abs()))
+                    .unwrap();
+                nearest / sr as f64 * 1000.0
+            })
+            .collect();
+        // Per-beat: bounded jitter (occasional one-frame stragglers from
+        // the sub-hop refinement are ~±1.5 hops). Mean: the actual bias
+        // guard — the uncompensated window-start convention sat at −30 ms.
+        for &off in &offsets_ms {
+            assert!(off.abs() < 25.0, "beat {off:+.1} ms from its kick");
+        }
+        let mean_ms = offsets_ms.iter().sum::<f64>() / offsets_ms.len() as f64;
+        assert!(
+            mean_ms.abs() < 5.0,
+            "beats are systematically {mean_ms:+.1} ms off the kicks"
+        );
     }
 
     #[test]

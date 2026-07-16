@@ -5,7 +5,16 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Current schema version written by [`crate::analyze_for_dj`].
-pub const PREANALYSIS_VERSION: u32 = 3;
+///
+/// v4: beat/onset positions are latency-compensated (centered on the
+/// audible attack instead of the analysis-window start; ~29 ms later at
+/// the 2048/512 configuration).
+pub const PREANALYSIS_VERSION: u32 = 4;
+
+/// Oldest schema version whose positions match the current analysis.
+/// Artifacts below this carry the pre-v4 window-start bias and fail
+/// [`PreAnalysisArtifact::matches_source`], so cached sidecars regenerate.
+const MIN_COMPATIBLE_VERSION: u32 = 4;
 
 fn default_artifact_version() -> u32 {
     1
@@ -107,11 +116,17 @@ impl PreAnalysisArtifact {
     }
 
     /// Load-boundary gate: true when the artifact was produced from exactly
-    /// this mono analysis signal.
+    /// this mono analysis signal by a compatible analysis version.
     ///
-    /// Checks sample rate, source length, and content hash. Length and hash
-    /// checks are skipped when the artifact predates them (version 1).
+    /// Checks schema version, sample rate, source length, and content hash.
+    /// Length and hash checks are skipped when the artifact predates them
+    /// (version 1). Artifacts older than `MIN_COMPATIBLE_VERSION` are
+    /// rejected outright: their positions carry the pre-v4 window-start
+    /// bias, so a cached sidecar must be regenerated, not reused.
     pub fn matches_source(&self, samples: &[f32], sample_rate: u32) -> bool {
+        if self.version < MIN_COMPATIBLE_VERSION {
+            return false;
+        }
         if self.sample_rate != sample_rate {
             return false;
         }
@@ -238,10 +253,18 @@ mod tests {
         altered[500] += 0.25;
         assert!(!artifact.matches_source(&altered, 44100), "hash mismatch");
 
-        // Version 1 artifacts (no binding) skip content validation.
+        // Current-version artifacts without binding skip content validation.
         artifact.source_len_samples = 0;
         artifact.content_hash = 0;
         assert!(artifact.matches_source(&altered, 44100));
+
+        // Pre-v4 artifacts carry window-start-biased positions: never
+        // reused at load boundaries, even when otherwise matching.
+        artifact.version = 3;
+        assert!(
+            !artifact.matches_source(&altered, 44100),
+            "stale version must be regenerated"
+        );
     }
 
     #[test]
