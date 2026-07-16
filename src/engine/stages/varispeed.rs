@@ -8,7 +8,7 @@
 //! smoothing, inherited from the proven varispeed-first control path.
 //!
 //! This is deliberately *not* a [`Stage`](crate::engine::stage::Stage):
-//! stages are 1:1 fixed-block processors, while the head owns the pull
+//! stages are 1:1 fixed-block processors, while the head owns the demand
 //! inversion — a ratio-dependent, variable amount of source per output
 //! block.
 

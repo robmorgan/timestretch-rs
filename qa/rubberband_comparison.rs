@@ -12,12 +12,12 @@ const RATIO_ENV: &str = "TIMESTRETCH_RUBBERBAND_RATIO";
 const SOURCE_BPM_ENV: &str = "TIMESTRETCH_RUBBERBAND_SOURCE_BPM";
 const TARGET_BPM_ENV: &str = "TIMESTRETCH_RUBBERBAND_TARGET_BPM";
 const MAX_SECONDS_ENV: &str = "TIMESTRETCH_RUBBERBAND_MAX_SECONDS";
-/// `old` (default) renders through the frozen batch `stretch()`; `new`
-/// renders through the pull engine's keylock chain at constant rate.
-/// The new arm is only meaningful at DJ ratios (0.92–1.08, ±20%
-/// secondary): beyond ~±10% rate deviation the keylock deliberately fades
-/// toward plain varispeed and no longer preserves pitch, while RubberBand
-/// always does.
+/// `batch` (default) renders through offline `stretch()`; `realtime`
+/// renders through the engine's keylock chain at constant rate, callback
+/// by callback. The realtime arm is only meaningful at DJ ratios
+/// (0.92–1.08, ±20% secondary): beyond ~±10% rate deviation the keylock
+/// deliberately fades toward plain varispeed and no longer preserves
+/// pitch, while RubberBand always does.
 const ENGINE_ENV: &str = "TIMESTRETCH_RUBBERBAND_ENGINE";
 const FFT_SIZE: usize = 2048;
 const HOP_SIZE: usize = 512;
@@ -62,10 +62,10 @@ fn resolve_ratio(original: &AudioBuffer, reference: &AudioBuffer) -> Option<f64>
     None
 }
 
-/// Renders through the new pull engine's keylock chain at constant rate
+/// Renders through the engine's keylock chain at constant rate
 /// `1 / ratio`, trimming the pipeline-latency prefix so the output aligns
 /// with the source timeline like the batch render does.
-fn render_new_engine(input: &[f32], sample_rate: u32, ratio: f64) -> Vec<f32> {
+fn render_engine(input: &[f32], sample_rate: u32, ratio: f64) -> Vec<f32> {
     use timestretch::engine::{Engine, EngineConfig, EngineProfile};
     let rate = 1.0 / ratio;
     let handles = Engine::build(EngineConfig {
@@ -102,7 +102,7 @@ fn render_new_engine(input: &[f32], sample_rate: u32, ratio: f64) -> Vec<f32> {
         }
         collected.extend_from_slice(&out);
         if collected.len() > input.len() * 6 + 100_000 {
-            panic!("new-engine render did not terminate");
+            panic!("realtime render did not terminate");
         }
     }
     // Drop the constant pipeline-latency prefix (silence + fill).
@@ -166,9 +166,9 @@ fn benchmark_against_external_rubberband_render() {
         trim_to_seconds(&reference, max_seconds * ratio.max(0.01)).mix_to_mono();
     let original_mono = original.mix_to_mono();
 
-    let engine = std::env::var(ENGINE_ENV).unwrap_or_else(|_| "old".to_string());
-    let stretched = if engine.trim().eq_ignore_ascii_case("new") {
-        render_new_engine(&original_mono.data, original_mono.sample_rate, ratio)
+    let engine = std::env::var(ENGINE_ENV).unwrap_or_else(|_| "batch".to_string());
+    let stretched = if engine.trim().eq_ignore_ascii_case("realtime") {
+        render_engine(&original_mono.data, original_mono.sample_rate, ratio)
     } else {
         let params = StretchParams::new(ratio)
             .with_sample_rate(original_mono.sample_rate)

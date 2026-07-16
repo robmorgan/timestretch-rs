@@ -8,7 +8,7 @@
 Pure Rust audio time-stretching library optimized for electronic dance music.
 
 Stretches audio in time without changing its pitch, built around a
-real-time-first pull engine: a varispeed tempo axis with a two-band
+real-time-first engine: a varispeed tempo axis with a two-band
 time-domain keylock, driven the way a DJ deck drives it. Batch stretching
 runs the same engine graph offline. The only external DSP dependency is
 [`rustfft`](https://crates.io/crates/rustfft).
@@ -20,7 +20,7 @@ beat-grid overlay, beat jumps, looping, and live keylock tempo control.*
 
 ## Features
 
-- **Pull-based real-time engine** — the audio callback pulls exactly the
+- **Real-time engine** — the audio callback gets exactly the
   frames it needs (`EngineProcessor::process`): infallible, allocation-free,
   lock-free on the audio thread, at a constant 12.7 ms pipeline delay
 - **Varispeed-first keylock** — a sinc-resampled tempo axis with a two-band
@@ -97,7 +97,7 @@ let params = StretchParams::new(ratio)
 let output = timestretch::stretch(&input, &params).unwrap();
 ```
 
-### Real-Time (Pull Engine)
+### Real-Time Engine
 
 ```rust
 use timestretch::engine::{Engine, EngineConfig, EngineProfile};
@@ -229,7 +229,7 @@ timestretch::stretch_wav_file("input.wav", "output.wav", &params).unwrap();
 
 ## How It Works
 
-The engine is a fixed pull-based stage graph:
+The engine is a fixed stage graph driven from the audio callback:
 
 1. **Varispeed head** — the tempo axis is a windowed-sinc resampler:
    tempo retargets are instant and sample-accurate, and the source/output
@@ -272,7 +272,7 @@ phase-vocoder-based `pitch_shift` formant-correction path only.
 
 ## Performance
 
-Performance depends on ratio and mode (real-time pull engine vs offline
+Performance depends on ratio and mode (real-time engine vs offline
 batch). The engine's per-callback worst case is measured and gated in CI
 (`qa/engine_wcet.rs`).
 
@@ -322,9 +322,9 @@ See `benchmarks/README.md` for corpus setup and manifest/checksum requirements.
   channel layout)
 - **`EnvelopePreset`** — formant/envelope profile for `pitch_shift`
   (`Off`, `Balanced`, `Vocal`)
-- **`engine::Engine` / `EngineConfig` / `EngineProfile`** — the pull-based
-  real-time engine: `Engine::build` returns `EngineHandles { controller,
-  processor, source }` (lock-free control / audio-thread pull / source feed)
+- **`engine::Engine` / `EngineConfig` / `EngineProfile`** — the real-time
+  engine: `Engine::build` returns `EngineHandles { controller,
+  processor, source }` (lock-free control / audio-thread processing / source feed)
 - **`PreAnalysisArtifact`** — serializable offline beat/onset analysis artifact
 - **`StretchError`** — error type covering invalid parameters, I/O failures,
   and input-too-short conditions

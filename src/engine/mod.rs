@@ -1,10 +1,9 @@
-//! Real-time-first pull-based engine (ROADMAP Stage 1+).
+//! Real-time-first engine.
 //!
-//! This is the new engine architecture: a stage graph pulled from the audio
-//! callback, with tempo implemented by a varispeed sinc resampler at the
-//! head of the chain. It will replace the push-based
-//! `StreamProcessor` surface at the Stage 9 cutover; until
-//! then the old engine is feature-frozen and both coexist.
+//! A stage graph driven from the audio callback, with tempo implemented by
+//! a varispeed sinc resampler at the head of the chain. This is the only
+//! engine: batch [`stretch`](crate::stretch()) runs the same graph offline
+//! (see [`offline`]).
 //!
 //! # Architecture
 //!
@@ -15,7 +14,7 @@
 //! EngineController ──mailbox──▶ (tempo & future params)
 //! ```
 //!
-//! - **Pull API:** [`EngineProcessor::process`] fills exactly the requested
+//! - **Audio-callback API:** [`EngineProcessor::process`] fills exactly the requested
 //!   frames. No `Result`, no allocation, no locks in the audio path;
 //!   invariants are enforced at construction and validation in the hot path
 //!   is debug-only.
@@ -40,7 +39,7 @@
 //! source.push(&track);
 //! controller.set_tempo_rate(1.04); // +4%, pitch follows in tape mode
 //!
-//! // Audio callback side: pull exactly what the device asks for.
+//! // Audio callback side: fill exactly what the device asks for.
 //! let mut out = vec![0.0f32; 256 * 2];
 //! processor.process(&mut out);
 //! ```
@@ -154,7 +153,7 @@ pub struct EngineHandles {
     pub source: SourceProducer,
 }
 
-/// Constructor namespace for the pull engine.
+/// Constructor namespace for the engine.
 #[derive(Debug)]
 pub struct Engine;
 

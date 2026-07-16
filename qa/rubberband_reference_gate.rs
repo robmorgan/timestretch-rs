@@ -1,4 +1,4 @@
-//! External-reference quality gate (ROADMAP Stage 7): the pull engine's
+//! External-reference quality gate (ROADMAP Stage 7): the engine's
 //! keylock chain vs a Rubber Band CLI render of the same public-corpus
 //! track, REQUIRED in CI.
 //!
@@ -6,7 +6,7 @@
 //! this test is self-contained: it decodes a pinned public-corpus track
 //! (see `scripts/fetch_public_corpus.sh`), produces the external reference
 //! by invoking the `rubberband` CLI, renders the same stretch through the
-//! new engine, and gates on spectral similarity and level integrity.
+//! engine, and gates on spectral similarity and level integrity.
 //!
 //! Skips (with a message) when the corpus or the `rubberband` binary is
 //! missing so local `--all-targets` runs stay green; CI exports
@@ -99,10 +99,10 @@ fn decode_mp3(path: &Path) -> (Vec<f32>, u32, usize) {
     (samples, sample_rate, channels)
 }
 
-/// Renders through the new pull engine's keylock chain at constant rate
+/// Renders through the engine's keylock chain at constant rate
 /// `1 / ratio` and trims the pipeline-latency prefix (same driver as
 /// `rubberband_comparison.rs`).
-fn render_new_engine(input: &[f32], sample_rate: u32, ratio: f64) -> Vec<f32> {
+fn render_engine(input: &[f32], sample_rate: u32, ratio: f64) -> Vec<f32> {
     use timestretch::engine::{Engine, EngineConfig, EngineProfile};
     let rate = 1.0 / ratio;
     let handles = Engine::build(EngineConfig {
@@ -139,7 +139,7 @@ fn render_new_engine(input: &[f32], sample_rate: u32, ratio: f64) -> Vec<f32> {
         }
         collected.extend_from_slice(&out);
         if collected.len() > input.len() * 6 + 100_000 {
-            panic!("new-engine render did not terminate");
+            panic!("engine render did not terminate");
         }
     }
     collected.drain(..latency.min(collected.len()));
@@ -202,7 +202,7 @@ fn keylock_meets_external_rubberband_reference() {
         let reference = read_wav_file(reference_wav.to_string_lossy().as_ref())
             .expect("read rubberband reference")
             .mix_to_mono();
-        let stretched = render_new_engine(window, sample_rate, ratio);
+        let stretched = render_engine(window, sample_rate, ratio);
 
         let compare_len = stretched.len().min(reference.data.len());
         assert!(compare_len >= FFT_SIZE, "comparison window too short");

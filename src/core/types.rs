@@ -1716,9 +1716,9 @@ impl StretchParams {
     /// it is authoritative: online transient detection is skipped in favor of
     /// its onset/beat data. Positions are absolute source frames, so batch
     /// input must be the entire analyzed file starting at source frame 0;
-    /// positions past the end of the input are ignored. Streaming consumers
-    /// use `StreamProcessor::set_source_position` to stay aligned after
-    /// seeks.
+    /// positions past the end of the input are ignored. Real-time consumers
+    /// attach the artifact via `EngineConfig::pre_analysis` and use
+    /// `SourceProducer::set_track_position` to stay aligned after seeks.
     pub fn with_pre_analysis(mut self, artifact: PreAnalysisArtifact) -> Self {
         self.pre_analysis = Some(artifact);
         self

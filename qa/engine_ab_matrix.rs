@@ -1,4 +1,4 @@
-//! Full A/B dashboard: old engine vs new, every gated metric family, one
+//! Full metric dashboard: every gated metric family, one
 //! machine-readable report (ROADMAP Stage 7 machine side).
 //!
 //! Run with:
@@ -235,7 +235,7 @@ struct Row {
 }
 
 fn arms() -> [(Arm, &'static str); 1] {
-    [(Arm::NewKeylock, "new-keylock")]
+    [(Arm::Keylock, "keylock")]
 }
 
 fn render(arm: Arm, input: &[f32], rate_at: &dyn Fn(f64) -> f64) -> Vec<f32> {
