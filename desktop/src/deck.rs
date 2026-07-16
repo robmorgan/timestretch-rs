@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use timestretch::engine::{EngineController, SourceProducer};
 
-use crate::state::{AtomicPosition, SharedStateHandle, StopFlag, Transport};
+use crate::state::{AtomicPosition, DeckEngine, SharedStateHandle, StopFlag, Transport};
 
 const CHANNELS: usize = 2;
 /// Interleaved samples pushed per feed batch.
@@ -100,12 +100,13 @@ pub fn start_deck_thread(
         // Frames fed to the engine since the last reset (jump anchors).
         let mut fed_frames: f64 = 0.0;
         let mut last_rate = f64::NAN;
+        let mut last_keylock: Option<bool> = None;
         let mut finished = false;
         let mut prerolled = false;
         let mut last_underruns = 0u64;
 
-        // Publish the chain's constant pipeline delay (0 for tape, the
-        // corrector's constant for keylock) for the UI latency chip;
+        // Publish the chain's constant pipeline delay (the keylock chain's
+        // constant — the same in both deck modes) for the UI latency chip;
         // control-to-audio stays at resampler lookahead either way.
         {
             let mut st = state.lock().unwrap();
@@ -122,13 +123,14 @@ pub fn start_deck_thread(
                 break;
             }
 
-            let (transport, stretch_ratio, seek_req, loop_region) = {
+            let (transport, stretch_ratio, seek_req, loop_region, deck_engine) = {
                 let mut st = state.lock().unwrap();
                 let t = st.transport;
                 let r = st.stretch_ratio;
                 let s = st.seek_request.take();
                 let lr = st.loop_region;
-                (t, r, s, lr)
+                let de = st.deck_engine;
+                (t, r, s, lr, de)
             };
 
             // Tempo: the deck's stretch ratio is output/input length, the
@@ -138,6 +140,16 @@ pub fn start_deck_thread(
             if last_rate.is_nan() || (rate - last_rate).abs() > RATE_UPDATE_EPSILON {
                 controller.set_tempo_rate(rate);
                 last_rate = rate;
+            }
+
+            // Deck mode: the engine always runs the keylock chain; Tape is
+            // its delay-matched varispeed bypass. Forwarded on change (and
+            // once at start, before output unmutes) — the stage crossfades,
+            // so a mid-play switch is instant and click-free.
+            let keylock = deck_engine == DeckEngine::Keylock;
+            if last_keylock != Some(keylock) {
+                controller.set_keylock(keylock);
+                last_keylock = Some(keylock);
             }
 
             if let Some(seek_frame) = seek_req {

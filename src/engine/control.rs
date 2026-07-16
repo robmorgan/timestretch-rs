@@ -36,6 +36,11 @@ pub enum Param {
     /// output discarded, so playback resumes converged (no cold-start
     /// silence-then-warmup at the seek target).
     WarmStart,
+    /// Keylock (pitch correction) enable: 1.0 corrects the high band, 0.0
+    /// bypasses to delay-matched varispeed. The keylock stage crossfades
+    /// between the two over a short ramp, so toggling live is click-free;
+    /// profiles without a keylock stage ignore it.
+    Keylock,
 }
 
 impl Param {
@@ -43,6 +48,7 @@ impl Param {
         match code {
             0 => Some(Param::TempoRate),
             1 => Some(Param::WarmStart),
+            2 => Some(Param::Keylock),
             _ => None,
         }
     }
@@ -51,6 +57,7 @@ impl Param {
         match self {
             Param::TempoRate => 0,
             Param::WarmStart => 1,
+            Param::Keylock => 2,
         }
     }
 }
@@ -96,6 +103,8 @@ pub(crate) struct EngineShared {
     dropped_events: AtomicU64,
     /// Latest tempo target (f64 bits): convergence backstop if events drop.
     tempo_latest_bits: AtomicU64,
+    /// Latest keylock target (f64 bits): convergence backstop if events drop.
+    keylock_latest_bits: AtomicU64,
     /// Output frames the processor filled with silence due to source underrun.
     underrun_frames: AtomicU64,
     /// Fractional source position (f64 bits) of the engine's output head.
@@ -113,6 +122,7 @@ impl EngineShared {
             tail: AtomicUsize::new(0),
             dropped_events: AtomicU64::new(0),
             tempo_latest_bits: AtomicU64::new(initial_tempo_rate.to_bits()),
+            keylock_latest_bits: AtomicU64::new(1.0f64.to_bits()),
             underrun_frames: AtomicU64::new(0),
             source_position_bits: AtomicU64::new(0.0f64.to_bits()),
             delivered_frames: AtomicU64::new(0),
@@ -154,6 +164,10 @@ impl EngineShared {
 
     pub(crate) fn tempo_latest(&self) -> f64 {
         f64::from_bits(self.tempo_latest_bits.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn keylock_latest(&self) -> f64 {
+        f64::from_bits(self.keylock_latest_bits.load(Ordering::Relaxed))
     }
 
     /// Processor-side write of the latest-tempo register (used when a full
@@ -257,6 +271,29 @@ impl EngineController {
         });
     }
 
+    /// Enables or disables keylock (high-band pitch correction) at the next
+    /// block boundary. The keylock stage crossfades over a short ramp
+    /// (~12 ms), so this is safe to toggle during live playback: disabled
+    /// output is delay-matched pure varispeed — pitch follows tempo — at
+    /// the chain's unchanged constant latency. Profiles without a keylock
+    /// stage ignore it.
+    pub fn set_keylock(&self, enabled: bool) {
+        let value: f64 = if enabled { 1.0 } else { 0.0 };
+        self.shared
+            .keylock_latest_bits
+            .store(value.to_bits(), Ordering::Relaxed);
+        self.shared.push_event(ControlEvent {
+            at_frame: APPLY_ASAP,
+            param: Param::Keylock,
+            value,
+        });
+    }
+
+    /// The most recently requested keylock state.
+    pub fn keylock_target(&self) -> bool {
+        self.shared.keylock_latest() >= 0.5
+    }
+
     /// Fractional source position (frames since the first pushed source
     /// frame) of the audio currently leaving the engine.
     pub fn source_position(&self) -> f64 {
@@ -320,6 +357,25 @@ mod tests {
             drained += 1;
         }
         assert_eq!(drained, MAILBOX_SLOTS);
+    }
+
+    #[test]
+    fn keylock_roundtrip_and_latest_register() {
+        let shared = EngineShared::new(1.0);
+        let controller = EngineController::new(Arc::clone(&shared), 44_100);
+        assert!(controller.keylock_target());
+
+        controller.set_keylock(false);
+        let event = shared.pop_event().expect("keylock event");
+        assert_eq!(event.param, Param::Keylock);
+        assert_eq!(event.value, 0.0);
+        // The latest-value register backstops dropped events.
+        assert_eq!(shared.keylock_latest(), 0.0);
+        assert!(!controller.keylock_target());
+
+        controller.set_keylock(true);
+        assert_eq!(shared.pop_event().expect("re-enable").value, 1.0);
+        assert!(controller.keylock_target());
     }
 
     #[test]

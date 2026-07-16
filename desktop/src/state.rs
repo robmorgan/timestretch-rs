@@ -68,8 +68,10 @@ pub struct SharedState {
     pub stretch_ratio: f64,
     pub volume: f32,
     pub preset: PresetChoice,
-    /// Deck engine architecture. Takes effect at the next playback start
-    /// (the two pipelines are wired completely differently).
+    /// Deck engine mode. Forwarded live to the engine's keylock toggle by
+    /// the deck thread (the engine always runs the keylock chain; Tape is
+    /// the delay-matched varispeed bypass), so switching mid-play is
+    /// instant — no rebuild, constant pipeline latency.
     pub deck_engine: DeckEngine,
 
     /// Current playback position in source frames.

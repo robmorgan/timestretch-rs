@@ -94,6 +94,8 @@ pub struct EngineProcessor {
     ring_frames_at_reset: u64,
     /// Remaining blocks of modulation hold.
     modulation_hold_blocks: u32,
+    /// Keylock (pitch-correction) target, 0.0 or 1.0; stages smooth it.
+    keylock_target: f64,
     /// Source frames of warm-start preroll still to prime (0 = not priming).
     prime_source_frames: f64,
     /// Output frames discarded so far (priming; a separate axis from
@@ -168,6 +170,7 @@ impl EngineProcessor {
             anchor: (0, 0),
             ring_frames_at_reset: 0,
             modulation_hold_blocks: 0,
+            keylock_target: 1.0,
             prime_source_frames: 0.0,
             discarded_frames: 0,
             declick_remaining: 0,
@@ -276,6 +279,13 @@ impl EngineProcessor {
             cursor.reset();
         }
         self.modulation_hold_blocks = 0;
+        // Control targets survive reset; re-sync from the latest register in
+        // case the enable event raced the reset drain.
+        self.keylock_target = if self.shared.keylock_latest() >= 0.5 {
+            1.0
+        } else {
+            0.0
+        };
         self.prime_source_frames = 0.0;
         self.discarded_frames = 0;
         self.declick_remaining = 0;
@@ -411,6 +421,15 @@ impl EngineProcessor {
                     self.prime_source_frames = event.value.max(0.0);
                     self.discarded_frames = 0;
                     self.declick_remaining = 0;
+                }
+                Param::Keylock => {
+                    // ASAP-only semantics; the latest-value register is
+                    // authoritative and covers events dropped on overflow.
+                    self.keylock_target = if self.shared.keylock_latest() >= 0.5 {
+                        1.0
+                    } else {
+                        0.0
+                    };
                 }
             }
         }
@@ -585,6 +604,7 @@ impl EngineProcessor {
                 onsets: &events[..event_count],
                 modulation_hold: self.modulation_hold_blocks > 0,
                 has_artifact: self.transient.is_some(),
+                keylock: self.keylock_target,
             };
             for stage in &mut self.stages {
                 stage.process(&mut self.block, &ctx);

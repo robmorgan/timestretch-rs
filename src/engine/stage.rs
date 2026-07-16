@@ -131,6 +131,10 @@ pub struct StageCtx<'a> {
     /// "no events nearby" from "no artifact" so stages know when to run
     /// their online-detection fallbacks.
     pub has_artifact: bool,
+    /// Keylock (pitch-correction) enable target, 0.0 or 1.0. A step, not a
+    /// ramp: the keylock stage smooths it per-sample so live toggles are
+    /// click-free. Stages without a correction path ignore it.
+    pub keylock: f64,
 }
 
 /// One DSP stage in the engine graph.
