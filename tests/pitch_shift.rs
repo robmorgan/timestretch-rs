@@ -1,10 +1,10 @@
 //! Pitch shift integration tests.
 //!
 //! Verify that `pitch_shift()` changes pitch without changing duration, across
-//! a range of factors, presets, and channel layouts.
+//! a range of factors, envelope profiles, and channel layouts.
 
 use std::f32::consts::PI;
-use timestretch::{pitch_shift, EdmPreset, EnvelopePreset, StretchParams};
+use timestretch::{pitch_shift, EnvelopePreset, StretchParams};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -359,34 +359,32 @@ fn test_pitch_shift_silence_in_silence_out() {
     );
 }
 
-// ── Preset compatibility ────────────────────────────────────────────────────
+// ── Envelope profile compatibility ──────────────────────────────────────────
 
 #[test]
-fn test_pitch_shift_with_all_presets() {
+fn test_pitch_shift_with_all_envelope_presets() {
     let input = sine_mono(440.0, 44100, 1.0);
 
-    let presets = [
-        EdmPreset::DjBeatmatch,
-        EdmPreset::HouseLoop,
-        EdmPreset::Halftime,
-        EdmPreset::Ambient,
-        EdmPreset::VocalChop,
+    let profiles = [
+        EnvelopePreset::Off,
+        EnvelopePreset::Balanced,
+        EnvelopePreset::Vocal,
     ];
 
-    for preset in presets {
+    for profile in profiles {
         let params = StretchParams::new(1.0)
             .with_sample_rate(44100)
             .with_channels(1)
-            .with_preset(preset);
+            .with_envelope_preset(profile);
 
         let output = pitch_shift(&input, &params, 1.5).unwrap();
         assert_eq!(
             output.len(),
             input.len(),
-            "Preset {:?} changed output length",
-            preset
+            "Envelope profile {:?} changed output length",
+            profile
         );
-        assert_no_nan_inf(&output, &format!("preset {:?}", preset));
+        assert_no_nan_inf(&output, &format!("envelope profile {:?}", profile));
     }
 }
 

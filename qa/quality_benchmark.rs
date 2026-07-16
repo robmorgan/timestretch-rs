@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use rustfft::{num_complex::Complex, FftPlanner};
 use timestretch::stretch::phase_locking::PhaseLockingMode;
 use timestretch::stretch::phase_vocoder::PhaseVocoder;
-use timestretch::{pitch_shift, stretch, EdmPreset, EnvelopePreset, StretchParams, WindowType};
+use timestretch::{pitch_shift, stretch, EnvelopePreset, StretchParams, WindowType};
 
 const SAMPLE_RATE: u32 = 44_100;
 const FFT_SIZE: usize = 2_048;
@@ -217,9 +217,7 @@ fn run_algorithm(
             let stereo_input: Vec<f32> = input.iter().flat_map(|&s| [s, s]).collect();
             let params = StretchParams::new(ratio)
                 .with_sample_rate(sample_rate)
-                .with_channels(2)
-                .with_preset(EdmPreset::DjBeatmatch)
-                .with_hop_size(4096 / 8);
+                .with_channels(2);
             Ok(AlgorithmOutput {
                 samples: stretch(&stereo_input, &params)?,
                 channels: 2,

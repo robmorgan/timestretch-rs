@@ -4,7 +4,7 @@
 //! peak, rms, and frames() with the time-stretching pipeline to validate
 //! that the utilities work correctly in practice.
 
-use timestretch::{AudioBuffer, Channels, EdmPreset, StretchParams};
+use timestretch::{AudioBuffer, Channels, StretchParams};
 
 /// Generate a mono sine wave at the given frequency.
 fn sine_mono(freq: f32, sample_rate: u32, num_frames: usize) -> AudioBuffer {
@@ -55,8 +55,7 @@ fn test_stretch_then_slice() {
     let input = sine_mono(220.0, 44100, 22050); // 0.5s
     let params = StretchParams::new(2.0)
         .with_sample_rate(44100)
-        .with_channels(1)
-        .with_preset(EdmPreset::Halftime);
+        .with_channels(1);
     let stretched = timestretch::stretch_buffer(&input, &params).unwrap();
 
     // Slice first and second half
@@ -327,8 +326,7 @@ fn test_dj_crossfade_workflow() {
 
     let params = StretchParams::new(126.0 / 128.0) // slight tempo adjust
         .with_sample_rate(44100)
-        .with_channels(1)
-        .with_preset(EdmPreset::DjBeatmatch);
+        .with_channels(1);
 
     let a_stretched = timestretch::stretch_buffer(&track_a, &params).unwrap();
     let b_stretched = timestretch::stretch_buffer(&track_b, &params).unwrap();
@@ -356,8 +354,7 @@ fn test_sample_chop_workflow() {
     // Stretch each chop to 2x (halftime effect)
     let params = StretchParams::new(2.0)
         .with_sample_rate(44100)
-        .with_channels(1)
-        .with_preset(EdmPreset::Halftime);
+        .with_channels(1);
 
     let stretched_chops: Vec<AudioBuffer> = chops
         .iter()

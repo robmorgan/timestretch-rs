@@ -1,7 +1,7 @@
 /// Spectral quality tests: frequency content preservation, transient timing,
 /// spectral centroid, and harmonic structure after time-stretching.
 use std::f32::consts::PI;
-use timestretch::{stretch, EdmPreset, StretchParams};
+use timestretch::{stretch, StretchParams};
 
 const TWO_PI: f32 = 2.0 * PI;
 
@@ -92,8 +92,7 @@ fn test_spectral_multi_tone_preserved() {
 
     let params = StretchParams::new(1.5)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::HouseLoop);
+        .with_channels(1);
 
     let output = stretch(&input, &params).unwrap();
     let skip = 4096.min(output.len() / 4);
@@ -130,8 +129,7 @@ fn test_spectral_sub_bass_preserved_60hz() {
 
     let params = StretchParams::new(1.5)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::HouseLoop);
+        .with_channels(1);
 
     let output = stretch(&input, &params).unwrap();
 
@@ -214,8 +212,7 @@ fn test_spectral_no_new_harmonics() {
 
     let params = StretchParams::new(1.5)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::HouseLoop);
+        .with_channels(1);
 
     let output = stretch(&input, &params).unwrap();
     let skip = 4096.min(output.len() / 4);
@@ -271,8 +268,7 @@ fn test_band_energy_distribution_preserved() {
 
     let params = StretchParams::new(1.5)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::HouseLoop);
+        .with_channels(1);
 
     let output = stretch(&input, &params).unwrap();
     let skip = 4096.min(output.len() / 4);
@@ -318,8 +314,7 @@ fn test_transient_attack_preserved() {
     let ratio = 1.5;
     let params = StretchParams::new(ratio)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::HouseLoop);
+        .with_channels(1);
 
     let output = stretch(&input, &params).unwrap();
 
@@ -477,8 +472,7 @@ fn test_dj_small_ratio_spectral_transparency() {
     let ratio = 126.0 / 128.0;
     let params = StretchParams::new(ratio)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::DjBeatmatch);
+        .with_channels(1);
 
     let output = stretch(&input, &params).unwrap();
     let skip = 4096.min(output.len() / 4);
@@ -512,8 +506,7 @@ fn test_extreme_stretch_still_has_frequency_content() {
 
     let params = StretchParams::new(4.0)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::Ambient);
+        .with_channels(1);
 
     let output = stretch(&input, &params).unwrap();
     let skip = 8192.min(output.len() / 4);

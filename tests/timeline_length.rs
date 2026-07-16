@@ -1,5 +1,5 @@
 use std::f32::consts::PI;
-use timestretch::{stretch, EdmPreset, StretchParams};
+use timestretch::{stretch, StretchParams};
 
 fn generate_long_form_signal(sample_rate: u32, duration_secs: f64, bpm: f64) -> Vec<f32> {
     let total_samples = (sample_rate as f64 * duration_secs) as usize;
@@ -38,16 +38,12 @@ fn test_batch_duration_error_under_point_one_percent_long_form() {
     let sample_rate = 44100u32;
     let input = generate_long_form_signal(sample_rate, 12.0, 124.0);
 
-    let cases = [
-        (126.0 / 128.0, EdmPreset::DjBeatmatch),
-        (1.5, EdmPreset::HouseLoop),
-    ];
+    let cases = [126.0 / 128.0, 1.5];
 
-    for (ratio, preset) in cases {
+    for ratio in cases {
         let params = StretchParams::new(ratio)
             .with_sample_rate(sample_rate)
             .with_channels(1)
-            .with_preset(preset)
             .with_bpm(124.0);
 
         let output = stretch(&input, &params).expect("stretch should succeed");
@@ -56,9 +52,8 @@ fn test_batch_duration_error_under_point_one_percent_long_form() {
 
         assert!(
             err_pct <= 0.1,
-            "ratio {:.4} preset {:?}: duration error {:.6}% > 0.1% (actual={}, expected={})",
+            "ratio {:.4}: duration error {:.6}% > 0.1% (actual={}, expected={})",
             ratio,
-            preset,
             err_pct,
             output.len(),
             expected
@@ -77,7 +72,6 @@ fn test_batch_no_multi_second_tempo_drift() {
     let params = StretchParams::new(ratio)
         .with_sample_rate(sample_rate)
         .with_channels(1)
-        .with_preset(EdmPreset::DjBeatmatch)
         .with_bpm(source_bpm);
 
     let output = stretch(&input, &params).expect("stretch should succeed");

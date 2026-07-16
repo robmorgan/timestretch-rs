@@ -27,6 +27,35 @@ real-time and batch.
   (owner listening rejected it at every threshold; SOLA carries the
   whole corrected range) — chain WCET drops accordingly.
 
+### Breaking changes — EDM presets removed
+
+The preset system predates the engine cutover: none of the tuning knobs
+`with_preset` set ever reached the pull engine, and the docs promised
+behavior (HPSS, elastic timing, multi-resolution FFT, "kick punch") that
+no longer existed. Batch quality is a property of the engine, not a
+parameter matrix.
+
+- Removed: `EdmPreset`, `StretchParams::with_preset`, and the CLI
+  `--preset` flag (plus the legacy positional preset argument).
+  Migration: `VocalChop`'s one live effect survives as
+  `with_envelope_preset(EnvelopePreset::Vocal)` — or `--envelope vocal`
+  on the CLI (new flag: `off`, `balanced`, `vocal`). The other presets
+  need no replacement; the engine ignored them.
+- `StretchParams` loses the dead tuning fields and their builders:
+  `hop_size`, `transient_sensitivity`, `wsola_segment_size`,
+  `wsola_search_range`, `beat_aware`, `band_split`, `multi_resolution`,
+  `transient_region_secs`, `elastic_timing`, `elastic_anchor`,
+  `hpss_enabled`, `transient_class_adaptive_wsola`, `residual_branch`,
+  `residual_mix`, `crossfade_mode`, `dynamic_wsola_search`,
+  `adaptive_phase_locking`, and the `effective_wsola_search_*` helpers.
+  `CrossfadeMode` is removed with them. (`fft_size`, `window_type`, and
+  the envelope fields stay — the `pitch_shift` formant path reads them.)
+- The analytic tonal fast path in `stretch()` is deleted (it only ever
+  fired with a preset set): pure-tone inputs now render through the real
+  engine like everything else, and
+  `tests/stretch_quality_regressions.rs` is rebaselined against measured
+  engine output instead of the analytic bypass.
+
 ### Kept
 
 - Batch API surface: `stretch`, `stretch_into`, `stretch_buffer`, BPM

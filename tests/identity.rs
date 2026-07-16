@@ -1,5 +1,5 @@
 use std::f32::consts::PI;
-use timestretch::{stretch, EdmPreset, StretchParams};
+use timestretch::{stretch, StretchParams};
 
 /// Helper to generate a mono sine wave.
 fn sine_wave(freq: f32, sample_rate: u32, num_samples: usize) -> Vec<f32> {
@@ -148,33 +148,21 @@ fn test_identity_stretch_48khz() {
 }
 
 #[test]
-fn test_identity_all_presets() {
+fn test_identity_default_params() {
     let sample_rate = 44100;
     let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
 
-    let presets = [
-        EdmPreset::DjBeatmatch,
-        EdmPreset::HouseLoop,
-        EdmPreset::Halftime,
-        EdmPreset::Ambient,
-        EdmPreset::VocalChop,
-    ];
+    let params = StretchParams::new(1.0)
+        .with_sample_rate(sample_rate)
+        .with_channels(1);
 
-    for preset in &presets {
-        let params = StretchParams::new(1.0)
-            .with_sample_rate(sample_rate)
-            .with_channels(1)
-            .with_preset(*preset);
-
-        let output = stretch(&input, &params).unwrap();
-        let len_ratio = output.len() as f64 / input.len() as f64;
-        assert!(
-            (len_ratio - 1.0).abs() < 0.2,
-            "Identity with preset {:?}: length ratio {}",
-            preset,
-            len_ratio
-        );
-    }
+    let output = stretch(&input, &params).unwrap();
+    let len_ratio = output.len() as f64 / input.len() as f64;
+    assert!(
+        (len_ratio - 1.0).abs() < 0.2,
+        "Identity: length ratio {}",
+        len_ratio
+    );
 }
 
 #[test]
@@ -380,8 +368,7 @@ fn test_identity_with_transients() {
 
     let params = StretchParams::new(1.0)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::HouseLoop);
+        .with_channels(1);
 
     let output = stretch(&input, &params).unwrap();
 

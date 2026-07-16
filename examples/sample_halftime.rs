@@ -6,7 +6,7 @@
 //! Run with: cargo run --example sample_halftime
 
 use std::f32::consts::PI;
-use timestretch::{EdmPreset, StretchParams};
+use timestretch::StretchParams;
 
 fn main() {
     let sample_rate = 44100u32;
@@ -51,9 +51,8 @@ fn main() {
         duration_secs
     );
 
-    // Apply halftime (120 BPM -> 60 BPM) using the Halftime preset
+    // Apply halftime (120 BPM -> 60 BPM)
     let params = StretchParams::new(1.0)
-        .with_preset(EdmPreset::Halftime)
         .with_sample_rate(sample_rate)
         .with_channels(1);
 

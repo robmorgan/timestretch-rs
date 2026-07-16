@@ -71,37 +71,6 @@ pub fn windowed_rms(signal: &[f32], start: usize, len: usize) -> f64 {
     (sum_sq / (end - start) as f64).sqrt()
 }
 
-pub fn count_positive_zero_crossings(signal: &[f32], start: usize, end: usize) -> usize {
-    if signal.len() < 2 {
-        return 0;
-    }
-    let start = start.min(signal.len() - 1);
-    let end = end.min(signal.len());
-    if end <= start + 1 {
-        return 0;
-    }
-    let mut count = 0usize;
-    for i in start..(end - 1) {
-        if signal[i] <= 0.0 && signal[i + 1] > 0.0 {
-            count += 1;
-        }
-    }
-    count
-}
-
-pub fn estimate_freq_zero_crossings(signal: &[f32], sr: u32, start: usize, end: usize) -> f64 {
-    if end <= start + 1 {
-        return 0.0;
-    }
-    let crossings = count_positive_zero_crossings(signal, start, end) as f64;
-    let duration_secs = (end - start) as f64 / sr as f64;
-    if duration_secs <= 0.0 {
-        0.0
-    } else {
-        crossings / duration_secs
-    }
-}
-
 pub fn best_lag_crosscorr(a: &[f32], b: &[f32], max_lag: usize) -> isize {
     if a.is_empty() || b.is_empty() {
         return 0;

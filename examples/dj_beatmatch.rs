@@ -6,7 +6,7 @@
 //! Run with: cargo run --example dj_beatmatch
 
 use std::f32::consts::PI;
-use timestretch::{EdmPreset, StretchParams};
+use timestretch::StretchParams;
 
 fn main() {
     let sample_rate = 44100u32;
@@ -49,7 +49,6 @@ fn main() {
     // Method 1: Using StretchParams::from_tempo() builder
     println!("\n--- Using from_tempo() ---");
     let params = StretchParams::from_tempo(original_bpm, target_bpm)
-        .with_preset(EdmPreset::DjBeatmatch)
         .with_sample_rate(sample_rate)
         .with_channels(1);
 
@@ -64,7 +63,6 @@ fn main() {
     // Method 2: Using stretch_to_bpm() convenience function
     println!("\n--- Using stretch_to_bpm() ---");
     let params2 = StretchParams::new(1.0)
-        .with_preset(EdmPreset::DjBeatmatch)
         .with_sample_rate(sample_rate)
         .with_channels(1);
 

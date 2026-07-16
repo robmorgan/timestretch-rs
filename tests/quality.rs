@@ -1,4 +1,4 @@
-use timestretch::{stretch, EdmPreset, StretchParams};
+use timestretch::{stretch, StretchParams};
 
 fn sine_wave(freq: f32, sample_rate: u32, num_samples: usize) -> Vec<f32> {
     (0..num_samples)
@@ -109,8 +109,7 @@ fn test_dj_beatmatch_quality() {
     let ratio = 126.0 / 128.0;
     let params = StretchParams::new(ratio)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::DjBeatmatch);
+        .with_channels(1);
 
     let output = stretch(&input, &params).unwrap();
 
@@ -136,8 +135,7 @@ fn test_sub_bass_preserved() {
 
     let params = StretchParams::new(1.5)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::HouseLoop);
+        .with_channels(1);
 
     let output = stretch(&input, &params).unwrap();
 
@@ -180,7 +178,6 @@ fn test_spectral_energy_preserved_small_stretch() {
 
     // Small stretch: 1.05x (DJ beatmatch range)
     let params = StretchParams::new(1.05)
-        .with_preset(EdmPreset::DjBeatmatch)
         .with_sample_rate(sample_rate)
         .with_channels(1);
     let output = timestretch::stretch(&input, &params).unwrap();
@@ -201,7 +198,6 @@ fn test_spectral_energy_preserved_large_stretch() {
     let input = sine_wave(freq, sample_rate, 22050);
 
     let params = StretchParams::new(2.0)
-        .with_preset(EdmPreset::Halftime)
         .with_sample_rate(sample_rate)
         .with_channels(1);
     let output = timestretch::stretch(&input, &params).unwrap();
@@ -344,7 +340,6 @@ fn test_output_not_all_zeros_for_nonsilent_input() {
 fn test_mixed_signal_stretch() {
     let input = generate_mixed_signal(44100, 22050);
     let params = StretchParams::new(1.5)
-        .with_preset(EdmPreset::HouseLoop)
         .with_sample_rate(44100)
         .with_channels(1);
     let output = timestretch::stretch(&input, &params).unwrap();

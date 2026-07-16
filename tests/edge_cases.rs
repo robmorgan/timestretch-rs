@@ -1,5 +1,5 @@
 use std::f32::consts::PI;
-use timestretch::{stretch, EdmPreset, StretchParams};
+use timestretch::{stretch, StretchParams};
 
 fn sine_wave(freq: f32, sample_rate: u32, num_samples: usize) -> Vec<f32> {
     (0..num_samples)
@@ -133,8 +133,7 @@ fn test_extreme_stretch_4x() {
 
     let params = StretchParams::new(4.0)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::Ambient);
+        .with_channels(1);
 
     let output = stretch(&input, &params).unwrap();
     assert!(!output.is_empty());
@@ -294,8 +293,7 @@ fn test_very_low_frequency() {
 
     let params = StretchParams::new(1.5)
         .with_sample_rate(sample_rate)
-        .with_channels(1)
-        .with_preset(EdmPreset::HouseLoop);
+        .with_channels(1);
 
     let output = stretch(&input, &params).unwrap();
     assert!(!output.is_empty());
@@ -353,39 +351,20 @@ fn test_alternating_silence_and_tone() {
     assert!((ratio - 1.5).abs() < 0.5, "Gapped signal ratio: {}", ratio);
 }
 
-// --- Preset compression tests (from agent-2) ---
+// --- Compression tests ---
 
 #[test]
-fn test_all_presets_with_compression() {
+fn test_compression_ratio() {
     let sample_rate = 44100u32;
     let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
 
-    let presets = [
-        EdmPreset::DjBeatmatch,
-        EdmPreset::HouseLoop,
-        EdmPreset::Halftime,
-        EdmPreset::Ambient,
-        EdmPreset::VocalChop,
-    ];
+    let params = StretchParams::new(0.75)
+        .with_sample_rate(sample_rate)
+        .with_channels(1);
 
-    for preset in &presets {
-        let params = StretchParams::new(0.75)
-            .with_sample_rate(sample_rate)
-            .with_channels(1)
-            .with_preset(*preset);
-
-        let output = stretch(&input, &params).unwrap();
-        assert!(
-            !output.is_empty(),
-            "Preset {:?} with 0.75 ratio produced empty output",
-            preset
-        );
-        assert!(
-            output.len() < input.len(),
-            "Preset {:?} with 0.75 ratio didn't compress",
-            preset
-        );
-    }
+    let output = stretch(&input, &params).unwrap();
+    assert!(!output.is_empty(), "0.75 ratio produced empty output");
+    assert!(output.len() < input.len(), "0.75 ratio didn't compress");
 }
 
 // --- Stereo tests ---

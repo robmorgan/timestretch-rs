@@ -166,16 +166,13 @@ struct BestPreset {
 }
 
 // ---------------------------------------------------------------------------
-// Preset list
+// Render variants
 // ---------------------------------------------------------------------------
 
-const ALL_PRESETS: &[(timestretch::EdmPreset, &str)] = &[
-    (timestretch::EdmPreset::DjBeatmatch, "DjBeatmatch"),
-    (timestretch::EdmPreset::HouseLoop, "HouseLoop"),
-    (timestretch::EdmPreset::Halftime, "Halftime"),
-    (timestretch::EdmPreset::Ambient, "Ambient"),
-    (timestretch::EdmPreset::VocalChop, "VocalChop"),
-];
+// The engine has a single batch configuration since the EdmPreset removal;
+// the report schema keeps its per-variant shape so historical JSON stays
+// comparable.
+const ALL_PRESETS: &[&str] = &["default"];
 
 // ---------------------------------------------------------------------------
 // Main test
@@ -381,11 +378,10 @@ fn reference_quality_benchmark() {
                 presets: Vec::new(),
             };
 
-            for &(preset, preset_name) in ALL_PRESETS {
+            for &preset_name in ALL_PRESETS {
                 let params = timestretch::StretchParams::new(ratio)
                     .with_sample_rate(original.sample_rate)
-                    .with_channels(original.channels.count() as u32)
-                    .with_preset(preset);
+                    .with_channels(original.channels.count() as u32);
 
                 let output = timestretch::stretch(&original_data, &params).expect("Stretch failed");
 

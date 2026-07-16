@@ -10,7 +10,7 @@
 //! Run with: cargo run --example dj_mix
 
 use std::f32::consts::PI;
-use timestretch::{AudioBuffer, EdmPreset, StretchParams};
+use timestretch::{AudioBuffer, StretchParams};
 
 fn main() {
     let target_bpm = 128.0;
@@ -64,7 +64,6 @@ fn main() {
     println!("\n--- Step 2: Stretch to {target_bpm} BPM ---");
 
     let params_a = StretchParams::from_tempo(track_a_bpm, target_bpm)
-        .with_preset(EdmPreset::DjBeatmatch)
         .with_sample_rate(target_rate)
         .with_channels(1);
     let stretched_a =
@@ -78,7 +77,6 @@ fn main() {
     );
 
     let params_b = StretchParams::from_tempo(track_b_bpm, target_bpm)
-        .with_preset(EdmPreset::DjBeatmatch)
         .with_sample_rate(target_rate)
         .with_channels(1);
     let stretched_b =

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use timestretch::analysis::comparison;
 use timestretch::io::wav::{read_wav_file, write_wav_file_float};
-use timestretch::{AudioBuffer, EdmPreset, StretchParams};
+use timestretch::{AudioBuffer, StretchParams};
 
 const ORIG_WAV_ENV: &str = "TIMESTRETCH_RUBBERBAND_ORIGINAL_WAV";
 const REF_WAV_ENV: &str = "TIMESTRETCH_RUBBERBAND_REFERENCE_WAV";
@@ -172,8 +172,7 @@ fn benchmark_against_external_rubberband_render() {
     } else {
         let params = StretchParams::new(ratio)
             .with_sample_rate(original_mono.sample_rate)
-            .with_channels(1)
-            .with_preset(EdmPreset::DjBeatmatch);
+            .with_channels(1);
         timestretch::stretch(&original_mono.data, &params).expect("stretch failed")
     };
     assert!(!stretched.is_empty(), "stretched output must not be empty");
