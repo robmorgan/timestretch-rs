@@ -176,7 +176,7 @@ pub fn read_wav(data: &[u8]) -> Result<AudioBuffer, StretchError> {
             return Err(StretchError::InvalidFormat(format!(
                 "Unsupported channel count: {}",
                 n
-            )))
+            )));
         }
     };
 

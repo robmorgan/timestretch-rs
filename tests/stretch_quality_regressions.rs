@@ -4,7 +4,7 @@ use common::{
     best_lag_crosscorr, detect_peaks, energy_at_freq, gen_click_pad, gen_impulse_train, gen_sine,
     gen_two_tone, rmse_with_lag, windowed_rms,
 };
-use timestretch::{stretch, StretchParams};
+use timestretch::{StretchParams, stretch};
 
 const SR: u32 = 44_100;
 const N_IDENTITY: usize = 10_000;

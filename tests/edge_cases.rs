@@ -1,5 +1,5 @@
 use std::f32::consts::PI;
-use timestretch::{stretch, StretchParams};
+use timestretch::{StretchParams, stretch};
 
 fn sine_wave(freq: f32, sample_rate: u32, num_samples: usize) -> Vec<f32> {
     (0..num_samples)

@@ -8,8 +8,8 @@
 
 use std::sync::Arc;
 
-use timestretch::engine::{Engine, EngineConfig, EngineProfile};
 use timestretch::PreAnalysisArtifact;
+use timestretch::engine::{Engine, EngineConfig, EngineProfile};
 
 /// Which profile renders the fixture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

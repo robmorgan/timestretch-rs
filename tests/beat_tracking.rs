@@ -6,7 +6,7 @@
 //! a tempo ramp, a hard tempo step, timing jitter (live-drummer style),
 //! and an accented 4/4 pattern for downbeat phase.
 
-use timestretch::{detect_beat_grid, BeatGrid};
+use timestretch::{BeatGrid, detect_beat_grid};
 
 const SAMPLE_RATE: u32 = 44100;
 /// Standard beat-tracking tolerance: a detection within ±70 ms of a ground

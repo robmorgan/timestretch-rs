@@ -12,13 +12,13 @@
 //! Run with: cargo run --release --example benchmark_quality
 //! Self-test: cargo run --release --example benchmark_quality -- --self-test
 
+use timestretch::StretchParams;
 use timestretch::analysis::comparison::{
-    beat_grid_regularity_with_params, cross_correlation, mean_band_spectral_similarity,
-    mean_spectral_similarity, spectral_similarity, transient_match_score_with_params,
-    BandSimilarity, BeatGridRegularityResult,
+    BandSimilarity, BeatGridRegularityResult, beat_grid_regularity_with_params, cross_correlation,
+    mean_band_spectral_similarity, mean_spectral_similarity, spectral_similarity,
+    transient_match_score_with_params,
 };
 use timestretch::io::wav::{read_wav_file, write_wav_file_16bit};
-use timestretch::StretchParams;
 
 const ORIGINAL_PATH: &str =
     "benchmarks/audio/12247392_Music Sounds Better With You_(Original Mix)_124bpm.wav";

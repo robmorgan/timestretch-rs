@@ -19,8 +19,8 @@
 //!   timeline back to fractional source frames (the `RatioMapFifo`
 //!   mechanism proven in the old varispeed control path).
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::core::resample::STREAM_SINC_MAX_HALF_TAPS;
 
@@ -67,11 +67,7 @@ impl TrackAnchor {
         let ring = self.ring_frame.load(Ordering::Relaxed);
         let track = self.track_frame.load(Ordering::Relaxed);
         let g2 = self.generation.load(Ordering::Acquire);
-        if g1 == g2 {
-            Some((ring, track))
-        } else {
-            None
-        }
+        if g1 == g2 { Some((ring, track)) } else { None }
     }
 }
 

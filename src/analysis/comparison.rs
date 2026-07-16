@@ -6,12 +6,12 @@
 //! similarity, spectral flux comparison, and a comprehensive quality
 //! report for comparing library output against professional reference audio.
 
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{FftPlanner, num_complex::Complex};
 
-use crate::analysis::frequency::{bin_to_freq, freq_to_bin, FrequencyBands};
+use crate::analysis::frequency::{FrequencyBands, bin_to_freq, freq_to_bin};
 use crate::analysis::transient::detect_transients;
 use crate::core::fft::COMPLEX_ZERO;
-use crate::core::window::{generate_window, WindowType};
+use crate::core::window::{WindowType, generate_window};
 
 /// Per-band spectral similarity scores.
 #[derive(Debug, Clone)]
@@ -180,11 +180,7 @@ pub fn mean_spectral_similarity(a: &[f32], b: &[f32], fft_size: usize, hop_size:
     }
 
     let denom = (norm_a_sq * norm_b_sq).sqrt();
-    if denom > 1e-12 {
-        dot / denom
-    } else {
-        0.0
-    }
+    if denom > 1e-12 { dot / denom } else { 0.0 }
 }
 
 /// Computes per-band STFT magnitude cosine similarity.
@@ -395,11 +391,7 @@ pub fn mean_band_spectral_similarity(
             nb += mean_b[i] * mean_b[i];
         }
         let denom = (na * nb).sqrt();
-        if denom > 1e-12 {
-            dot / denom
-        } else {
-            0.0
-        }
+        if denom > 1e-12 { dot / denom } else { 0.0 }
     };
 
     let band_scores: Vec<f64> = band_ranges
@@ -584,11 +576,7 @@ fn a_weight(freq_hz: f64) -> f64 {
     let denom = (f2 + 20.6_f64.powi(2))
         * ((f2 + 107.7_f64.powi(2)) * (f2 + 737.9_f64.powi(2))).sqrt()
         * (f2 + 12194.0_f64.powi(2));
-    if denom > 0.0 {
-        num / denom
-    } else {
-        0.0
-    }
+    if denom > 0.0 { num / denom } else { 0.0 }
 }
 
 /// Computes perceptually-weighted STFT magnitude cosine similarity.

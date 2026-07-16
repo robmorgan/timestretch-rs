@@ -5,8 +5,8 @@
 //! allocation-free after construction.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use timestretch::engine::{Engine, EngineConfig, EngineProfile};
 

@@ -6,7 +6,7 @@
 
 use std::f32::consts::PI;
 use timestretch::io::wav::{read_wav, write_wav_16bit, write_wav_24bit, write_wav_float};
-use timestretch::{stretch_buffer, AudioBuffer, Channels, StretchParams};
+use timestretch::{AudioBuffer, Channels, StretchParams, stretch_buffer};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 

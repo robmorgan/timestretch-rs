@@ -12,8 +12,8 @@
 
 use std::time::Instant;
 
-use timestretch::engine::{Engine, EngineConfig, EngineProfile};
 use timestretch::PreAnalysisArtifact;
+use timestretch::engine::{Engine, EngineConfig, EngineProfile};
 
 const SAMPLE_RATE: u32 = 44_100;
 /// Hard per-callback bound (processing time / callback duration) at the

@@ -3,7 +3,7 @@
 use crate::analysis::beat::detect_beats_from_transients_with_options;
 use crate::analysis::tempogram::TempoTrackingOptions;
 use crate::analysis::transient::detect_transients;
-use crate::core::preanalysis::{hash_samples, PreAnalysisArtifact, PREANALYSIS_VERSION};
+use crate::core::preanalysis::{PREANALYSIS_VERSION, PreAnalysisArtifact, hash_samples};
 
 const PREANALYSIS_FFT_SIZE: usize = 2048;
 const PREANALYSIS_HOP_SIZE: usize = 512;

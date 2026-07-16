@@ -378,9 +378,9 @@ fn test_sample_chop_workflow() {
     let result = AudioBuffer::concatenate(&refs);
 
     assert!(result.num_frames() > full_sample.num_frames()); // Stretched 2x
-                                                             // Peak should be <= 0.8 (normalized) but may be lower due to fade placement.
-                                                             // The exact peak depends on where the strongest sample falls relative to
-                                                             // fade regions, which varies with transient detection weights.
+    // Peak should be <= 0.8 (normalized) but may be lower due to fade placement.
+    // The exact peak depends on where the strongest sample falls relative to
+    // fade regions, which varies with transient detection weights.
     assert!(
         result.peak() > 0.1 && result.peak() <= 0.81,
         "Peak {} should be in (0.1, 0.81]",

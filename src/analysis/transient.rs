@@ -16,7 +16,7 @@
 //! ~10ms temporal precision for onset localization (vs ~50ms for magnitude-only
 //! spectral flux).
 
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{FftPlanner, num_complex::Complex};
 
 use crate::core::fft::COMPLEX_ZERO;
 use crate::core::types::{StretchParams, TransientThresholdPolicy};

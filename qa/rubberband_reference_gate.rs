@@ -17,15 +17,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
+use timestretch::AudioBuffer;
 use timestretch::analysis::comparison;
 use timestretch::io::wav::{read_wav_file, write_wav_file_float};
-use timestretch::AudioBuffer;
 
 /// Public-corpus fixture: Valya Kan – Memories [YARN020], CC-BY 4.0,
 /// verified 125.000 BPM (the corpus's cleanest steady-tempo entry).

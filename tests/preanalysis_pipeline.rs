@@ -1,8 +1,8 @@
 use std::f32::consts::PI;
 use std::path::PathBuf;
 use timestretch::{
-    analyze_for_dj, read_preanalysis_json, stretch, write_preanalysis_json, PreAnalysisArtifact,
-    StretchParams,
+    PreAnalysisArtifact, StretchParams, analyze_for_dj, read_preanalysis_json, stretch,
+    write_preanalysis_json,
 };
 
 fn click_train(sample_rate: u32, bpm: f64, seconds: f64) -> Vec<f32> {

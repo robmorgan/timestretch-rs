@@ -1,5 +1,5 @@
 use std::f32::consts::PI;
-use timestretch::{stretch, StretchParams};
+use timestretch::{StretchParams, stretch};
 
 fn generate_long_form_signal(sample_rate: u32, duration_secs: f64, bpm: f64) -> Vec<f32> {
     let total_samples = (sample_rate as f64 * duration_secs) as usize;

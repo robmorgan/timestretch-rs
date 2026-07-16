@@ -11,11 +11,11 @@ use std::sync::Arc;
 
 use crate::core::preanalysis::PreAnalysisArtifact;
 use crate::core::ring_buffer::RingBuffer;
-use crate::engine::control::{clamp_tempo_rate, EngineShared, Param};
+use crate::engine::control::{EngineShared, Param, clamp_tempo_rate};
 use crate::engine::source::{SourceRing, TimelineMap};
-use crate::engine::stage::{BlockBuf, OnsetEvent, Stage, StageCtx, BLOCK_FRAMES};
-use crate::engine::stages::transient::{TransientCursor, MAX_EVENTS};
-use crate::engine::stages::varispeed::{VarispeedHead, FEED_CHUNK_FRAMES, MAX_OUT_PER_FEED};
+use crate::engine::stage::{BLOCK_FRAMES, BlockBuf, OnsetEvent, Stage, StageCtx};
+use crate::engine::stages::transient::{MAX_EVENTS, TransientCursor};
+use crate::engine::stages::varispeed::{FEED_CHUNK_FRAMES, MAX_OUT_PER_FEED, VarispeedHead};
 
 /// Blocks a fast tempo gesture holds off disruptive stage maintenance
 /// (~46 ms at 44.1 kHz) — the graph-level modulation-hold policy.

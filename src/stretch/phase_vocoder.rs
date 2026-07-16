@@ -1,14 +1,14 @@
 //! Phase vocoder time stretching with identity phase locking and sub-bass phase locking.
 
 use crate::core::fft::{COMPLEX_ZERO, WINDOW_SUM_EPSILON, WINDOW_SUM_FLOOR_RATIO};
-use crate::core::window::{generate_window, WindowType};
+use crate::core::window::{WindowType, generate_window};
 use crate::error::StretchError;
 use crate::stretch::envelope::{
     adaptive_cepstral_order, apply_envelope_correction_with_scratch,
     extract_envelope_with_fft_scratch, spectral_centroid,
 };
-use crate::stretch::phase_locking::{apply_phase_locking_realtime, PhaseLockingMode};
-use rustfft::{num_complex::Complex, FftPlanner};
+use crate::stretch::phase_locking::{PhaseLockingMode, apply_phase_locking_realtime};
+use rustfft::{FftPlanner, num_complex::Complex};
 use std::sync::Arc;
 
 const TWO_PI_F64: f64 = 2.0 * std::f64::consts::PI;
@@ -3642,8 +3642,8 @@ mod tests {
     }
 
     #[test]
-    fn test_set_stretch_ratio_keeps_same_side_carried_compression_seam_when_rebounding_toward_unity(
-    ) {
+    fn test_set_stretch_ratio_keeps_same_side_carried_compression_seam_when_rebounding_toward_unity()
+     {
         let fft_size = 1024;
         let hop = 256;
         let sample_rate = 44100u32;
@@ -3857,8 +3857,8 @@ mod tests {
     }
 
     #[test]
-    fn test_set_stretch_ratio_keeps_same_side_carried_compression_seam_when_stepping_away_from_unity(
-    ) {
+    fn test_set_stretch_ratio_keeps_same_side_carried_compression_seam_when_stepping_away_from_unity()
+     {
         let fft_size = 1024;
         let hop = 256;
         let sample_rate = 44100u32;
@@ -3907,8 +3907,8 @@ mod tests {
     }
 
     #[test]
-    fn test_set_stretch_ratio_keeps_carried_expansion_seam_when_crossing_unity_and_stepping_deeper_into_compression(
-    ) {
+    fn test_set_stretch_ratio_keeps_carried_expansion_seam_when_crossing_unity_and_stepping_deeper_into_compression()
+     {
         let mut pv = PhaseVocoder::new(1024, 256, 0.98, 44_100, 120.0);
         pv.streaming_tail = vec![0.0; 64];
         pv.streaming_tail_phase_ratio = 1.04;
@@ -3928,8 +3928,8 @@ mod tests {
     }
 
     #[test]
-    fn test_set_stretch_ratio_keeps_carried_compression_seam_when_crossing_unity_and_stepping_deeper_into_expansion(
-    ) {
+    fn test_set_stretch_ratio_keeps_carried_compression_seam_when_crossing_unity_and_stepping_deeper_into_expansion()
+     {
         let mut pv = PhaseVocoder::new(1024, 256, 1.02, 44_100, 120.0);
         pv.streaming_tail = vec![0.0; 64];
         pv.streaming_tail_phase_ratio = 0.96;
