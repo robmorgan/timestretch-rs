@@ -1,0 +1,8 @@
+# Pinned working toolchain: local builds and CI's stable jobs use exactly
+# this compiler (CI installs it via `rustup show`; see ci.yml). The MSRV
+# floor lives in Cargo.toml `rust-version` and is tested separately in the
+# CI matrix, where the dtolnay action's RUSTUP_TOOLCHAIN deliberately
+# overrides this file. Upgrading the compiler = editing this one line.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
