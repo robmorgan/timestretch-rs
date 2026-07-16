@@ -1,6 +1,6 @@
 //! Offline (batch) driver over the engine graph — ROADMAP Stage 8.
 //!
-//! Offline mode is the same pull engine with the luxuries a file affords:
+//! Offline mode is the same engine with the luxuries a file affords:
 //! the whole track is pre-analyzed (the artifact is always present, never a
 //! fallback), the source is fed to completion with a kernel-flush pad so
 //! the resampler emits every real sample, and the output length is exact

@@ -3,7 +3,7 @@
 //! was deleted with the old engine at Stage 9, and every gate is anchored
 //! on absolute thresholds re-derived from new-engine measurements).
 //!
-//! Drives the pull engine over deterministic fixtures — source samples,
+//! Drives the engine over deterministic fixtures — source samples,
 //! callback size, and a per-callback tempo-rate schedule.
 
 use std::sync::Arc;
@@ -14,16 +14,16 @@ use timestretch::PreAnalysisArtifact;
 /// Which profile renders the fixture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arm {
-    /// Pull engine, tape profile (pitch follows tempo).
-    NewTape,
-    /// Pull engine, keylock profile (two-band: low band follows tempo,
+    /// Tape profile (pitch follows tempo).
+    Tape,
+    /// Keylock profile (two-band: low band follows tempo,
     /// high band corrected).
-    NewKeylock,
+    Keylock,
 }
 
 /// Renders the new keylock arm with a pre-analysis artifact attached (feed
 /// anchored at track frame 0) — the artifact-first control path.
-pub fn render_new_keylock_with_artifact(
+pub fn render_keylock_with_artifact(
     artifact: Arc<PreAnalysisArtifact>,
     input: &[f32],
     channels: usize,
@@ -31,7 +31,7 @@ pub fn render_new_keylock_with_artifact(
     callback_frames: usize,
     rate_at: &dyn Fn(f64) -> f64,
 ) -> AbRender {
-    render_new_inner(
+    render_inner(
         EngineProfile::Keylock,
         Some(artifact),
         input,
@@ -68,7 +68,7 @@ pub fn render_with_rate_schedule(
     rate_at: &dyn Fn(f64) -> f64,
 ) -> AbRender {
     match arm {
-        Arm::NewTape => render_new(
+        Arm::Tape => render(
             EngineProfile::Tape,
             input,
             channels,
@@ -76,7 +76,7 @@ pub fn render_with_rate_schedule(
             callback_frames,
             rate_at,
         ),
-        Arm::NewKeylock => render_new(
+        Arm::Keylock => render(
             EngineProfile::Keylock,
             input,
             channels,
@@ -87,7 +87,7 @@ pub fn render_with_rate_schedule(
     }
 }
 
-fn render_new(
+fn render(
     profile: EngineProfile,
     input: &[f32],
     channels: usize,
@@ -95,7 +95,7 @@ fn render_new(
     callback_frames: usize,
     rate_at: &dyn Fn(f64) -> f64,
 ) -> AbRender {
-    render_new_inner(
+    render_inner(
         profile,
         None,
         input,
@@ -106,7 +106,7 @@ fn render_new(
     )
 }
 
-fn render_new_inner(
+fn render_inner(
     profile: EngineProfile,
     artifact: Option<Arc<PreAnalysisArtifact>>,
     input: &[f32],

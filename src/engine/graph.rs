@@ -321,7 +321,7 @@ impl EngineProcessor {
         }
     }
 
-    /// Runs warm-start priming within the per-callback budget: pull the
+    /// Runs warm-start priming within the per-callback budget: advance the
     /// graph as normal but discard output, until the discarded output
     /// reaches the frame that plays preroll's end (computed through the
     /// timeline map, so it is exact at any tempo rate).
@@ -480,7 +480,7 @@ impl EngineProcessor {
         self.delivered_frames += (needed_samples / self.channels) as u64;
     }
 
-    /// Pulls source through the graph until the output FIFO holds at least
+    /// Advances source through the graph until the output FIFO holds at least
     /// `needed_samples`, or the source ring runs dry.
     fn fill_out_fifo(&mut self, needed_samples: usize) {
         // Bounded iterations by construction: each pass either consumes

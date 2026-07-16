@@ -25,10 +25,10 @@
 //! assert!(output.len() > input.len()); // ~1.5x longer
 //! ```
 //!
-//! # Real-time (pull engine)
+//! # Real-time engine
 //!
-//! For real-time use, build the pull engine and let the audio callback
-//! pull exactly the frames it needs:
+//! For real-time use, build the engine and let the audio callback fill
+//! exactly the frames it needs:
 //!
 //! ```no_run
 //! use timestretch::engine::{Engine, EngineConfig, EngineProfile};
@@ -798,7 +798,7 @@ pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, Stretc
         return Ok(rendered);
     }
 
-    // Batch rendering runs on the pull engine graph (ROADMAP Stage 8):
+    // Batch rendering runs on the engine graph (ROADMAP Stage 8):
     // whole-file pre-analysis, exact output length by construction, and
     // channels processed in lockstep (stereo phase preserved natively —
     // the old per-channel hybrid needed a mid/side mode for this).

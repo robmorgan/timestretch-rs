@@ -1,4 +1,4 @@
-//! Worst-case callback budget gates for the pull engine (ROADMAP new
+//! Worst-case callback budget gates for the engine (ROADMAP new
 //! Stage 6), extending the callback-budget pattern from
 //! `tests/quality_gates.rs`: per-callback wall time over the callback's
 //! audio duration, gated on p99.9 (a lone OS scheduling hiccup cannot fail
