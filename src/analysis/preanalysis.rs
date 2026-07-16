@@ -114,13 +114,15 @@ pub fn analyze_for_dj_with_report(
     };
 
     let hop = transients.hop_size.max(1);
+    // Onset positions are latency-compensated; undo that to recover the
+    // analysis frame the band flux was measured at.
     let onset_band_flux = transients
         .onsets
         .iter()
         .map(|&onset| {
             transients
                 .per_frame_band_flux
-                .get(onset / hop)
+                .get(onset.saturating_sub(transients.latency_samples) / hop)
                 .copied()
                 .unwrap_or([0.0; 4])
         })

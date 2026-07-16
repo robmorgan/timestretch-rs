@@ -46,6 +46,13 @@ pub const CORRECTION_FADE_START_DEV: f64 = 0.205;
 /// …and fully out here: pure varispeed beyond ~±35%.
 pub const CORRECTION_FADE_END_DEV: f64 = 0.35;
 
+/// Frames the live keylock toggle takes to crossfade between the corrected
+/// and raw high band (~11.6 ms at 44.1 kHz). Long enough to be click-free,
+/// short enough to feel instant on a deck switch; during the ramp the high
+/// band audibly morphs between the two pitches (inherent to any instant
+/// keylock toggle — the CDJ master-tempo behavior).
+pub const KEYLOCK_TOGGLE_FADE_FRAMES: usize = 512;
+
 /// Two-band keylock stage.
 #[derive(Debug)]
 pub(crate) struct KeylockStage {
@@ -61,6 +68,10 @@ pub(crate) struct KeylockStage {
     high: Vec<[f32; BLOCK_FRAMES]>,
     /// Per-channel raw (uncorrected) high band, delayed to alignment.
     high_raw: Vec<[f32; BLOCK_FRAMES]>,
+    /// Smoothed keylock-toggle weight chasing `ctx.keylock` at
+    /// [`KEYLOCK_TOGGLE_FADE_FRAMES`]. NaN = snap to the target on the next
+    /// block (stream start / post-reset: no fade-in from stale state).
+    enable: f32,
 }
 
 impl KeylockStage {
@@ -75,6 +86,7 @@ impl KeylockStage {
             low: vec![[0.0; BLOCK_FRAMES]; channels],
             high: vec![[0.0; BLOCK_FRAMES]; channels],
             high_raw: vec![[0.0; BLOCK_FRAMES]; channels],
+            enable: f32::NAN,
         }
     }
 }
@@ -114,11 +126,28 @@ impl Stage for KeylockStage {
             / (CORRECTION_FADE_END_DEV - CORRECTION_FADE_START_DEV))
             .clamp(0.0, 1.0) as f32;
 
+        // Live keylock toggle: chase the control target per sample so a
+        // mid-play switch is a click-free crossfade. Composes with the
+        // extreme-rate fade multiplicatively; the per-frame weights are
+        // shared across channels so the image stays stable through a fade.
+        let target = (ctx.keylock.clamp(0.0, 1.0)) as f32;
+        if self.enable.is_nan() {
+            self.enable = target;
+        }
+        let step = 1.0 / KEYLOCK_TOGGLE_FADE_FRAMES as f32;
+        let mut enable_w = [0.0f32; BLOCK_FRAMES];
+        let mut enable = self.enable;
+        for w in &mut enable_w {
+            enable += (target - enable).clamp(-step, step);
+            *w = enable;
+        }
+        self.enable = enable;
+
         for ch in 0..block.channels() {
             let out = block.channel_mut(ch);
             for (i, sample) in out.iter_mut().enumerate() {
-                let high =
-                    correction * self.high[ch][i] + (1.0 - correction) * self.high_raw[ch][i];
+                let weight = correction * enable_w[i];
+                let high = weight * self.high[ch][i] + (1.0 - weight) * self.high_raw[ch][i];
                 *sample = self.low[ch][i] + high;
             }
         }
@@ -136,6 +165,7 @@ impl Stage for KeylockStage {
         self.low_delay.reset();
         self.raw_high_delay.reset();
         self.sola.reset();
+        self.enable = f32::NAN;
     }
 }
 
@@ -146,6 +176,15 @@ mod tests {
     const SR: u32 = 44_100;
 
     fn run_blocks(stage: &mut KeylockStage, input: &[f32], rate: f64) -> Vec<f32> {
+        run_blocks_keylock(stage, input, rate, 1.0)
+    }
+
+    fn run_blocks_keylock(
+        stage: &mut KeylockStage,
+        input: &[f32],
+        rate: f64,
+        keylock: f64,
+    ) -> Vec<f32> {
         let mut block = BlockBuf::new(1);
         let ctx = StageCtx {
             embedded_rate: rate,
@@ -153,6 +192,7 @@ mod tests {
             onsets: &[],
             modulation_hold: false,
             has_artifact: false,
+            keylock,
         };
         let mut out = Vec::with_capacity(input.len());
         for chunk in input.chunks_exact(BLOCK_FRAMES) {
@@ -215,6 +255,7 @@ mod tests {
                 onsets: &[],
                 modulation_hold: false,
                 has_artifact: false,
+                keylock: 1.0,
             };
             stage.process(&mut block, &ctx);
             collected.extend_from_slice(block.channel(0));
@@ -258,25 +299,125 @@ mod tests {
             // to 440.
             let shifted = sine(440.0 * rate, SR as usize * 3, 0.6);
             let out = run_blocks(&mut stage, &shifted, rate);
-            let scan = &out[SR as usize..SR as usize * 2];
-            let (mut first, mut last, mut count) = (None, None, 0usize);
-            for i in 1..scan.len() {
-                let (a, b) = (scan[i - 1] as f64, scan[i] as f64);
-                if a <= 0.0 && b > 0.0 {
-                    let t = (i - 1) as f64 + a / (a - b);
-                    if first.is_none() {
-                        first = Some(t);
-                    }
-                    last = Some(t);
-                    count += 1;
-                }
-            }
-            let freq = (count - 1) as f64 * SR as f64 / (last.unwrap() - first.unwrap());
+            let freq = measure_freq(&out[SR as usize..SR as usize * 2]);
             let cents = 1_200.0 * (freq / 440.0).log2();
             assert!(
                 cents.abs() < 12.0,
                 "{label} rate: pitch off by {cents:.1} cents ({freq:.2} Hz)"
             );
         }
+    }
+
+    /// Zero-crossing frequency estimate over a slice (same method as the
+    /// pitch-hold test).
+    fn measure_freq(scan: &[f32]) -> f64 {
+        let (mut first, mut last, mut count) = (None, None, 0usize);
+        for i in 1..scan.len() {
+            let (a, b) = (scan[i - 1] as f64, scan[i] as f64);
+            if a <= 0.0 && b > 0.0 {
+                let t = (i - 1) as f64 + a / (a - b);
+                if first.is_none() {
+                    first = Some(t);
+                }
+                last = Some(t);
+                count += 1;
+            }
+        }
+        (count - 1) as f64 * SR as f64 / (last.unwrap() - first.unwrap())
+    }
+
+    #[test]
+    fn keylock_disabled_is_delay_matched_varispeed() {
+        // With the toggle off from the first block the stage must pass the
+        // varispeeded audio through untouched in pitch and level (the LR8
+        // split re-sums to allpass, so compare frequency and RMS at the
+        // chain's constant delay, not samples).
+        let rate = 1.06f64;
+        let mut stage = KeylockStage::new(SR, 1);
+        let shifted = sine(440.0 * rate, SR as usize * 3, 0.6);
+        let out = run_blocks_keylock(&mut stage, &shifted, rate, 0.0);
+
+        let scan = &out[SR as usize..SR as usize * 2];
+        let freq = measure_freq(scan);
+        let cents = 1200.0 * (freq / (440.0 * rate)).log2();
+        assert!(
+            cents.abs() < 3.0,
+            "bypassed output re-pitched: off by {cents:.1} cents ({freq:.2} Hz)"
+        );
+        let rms = |xs: &[f32]| {
+            (xs.iter().map(|&x| x as f64 * x as f64).sum::<f64>() / xs.len() as f64).sqrt()
+        };
+        let level_db = 20.0 * (rms(scan) / rms(&shifted[SR as usize..SR as usize * 2])).log10();
+        assert!(
+            level_db.abs() < 0.5,
+            "bypassed output level off by {level_db:+.2} dB"
+        );
+    }
+
+    #[test]
+    fn keylock_toggle_is_click_free_and_converges() {
+        // Toggle off then back on mid-stream at a DJ rate. The output must
+        // never step harder than the signal's own slew (no click at either
+        // seam), and after each fade the pitch must settle on the mode's
+        // target (source pitch corrected vs varispeed pitch).
+        let rate = 1.06f64;
+        let secs = SR as usize;
+        let shifted = sine(440.0 * rate, secs * 6, 0.6);
+        let mut stage = KeylockStage::new(SR, 1);
+
+        // One continuous block stream; the toggle flips at 2 s and 4 s.
+        let mut out = Vec::with_capacity(shifted.len());
+        let mut block = BlockBuf::new(1);
+        for (bi, chunk) in shifted.chunks_exact(BLOCK_FRAMES).enumerate() {
+            let start = bi * BLOCK_FRAMES;
+            let keylock = if (secs * 2..secs * 4).contains(&start) {
+                0.0
+            } else {
+                1.0
+            };
+            let ctx = StageCtx {
+                embedded_rate: rate,
+                embedded_rate_slope: 0.0,
+                onsets: &[],
+                modulation_hold: false,
+                has_artifact: false,
+                keylock,
+            };
+            block.channel_mut(0).copy_from_slice(chunk);
+            stage.process(&mut block, &ctx);
+            out.extend_from_slice(block.channel(0));
+        }
+
+        // No click: the largest sample-to-sample step may not exceed the
+        // signal's own maximum slew by more than a small margin. A hard
+        // switch (no ramp) fails this at both toggle points.
+        let max_step = out
+            .windows(2)
+            .skip(secs / 2) // past cold-start convergence
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        let signal_slew = 0.6 * (2.0 * std::f64::consts::PI * 440.0 * rate / SR as f64) as f32;
+        assert!(
+            max_step < signal_slew * 1.5,
+            "toggle clicked: max step {max_step:.4} vs signal slew {signal_slew:.4}"
+        );
+
+        // Converged pitch in each phase (measured well past each fade).
+        let corrected = measure_freq(&out[secs..secs * 2]);
+        let bypassed = measure_freq(&out[secs * 3..secs * 4]);
+        let recorrected = measure_freq(&out[secs * 5..]);
+        let cents = |f: f64, target: f64| 1200.0 * (f / target).log2();
+        assert!(
+            cents(corrected, 440.0).abs() < 12.0,
+            "keylock phase off: {corrected:.2} Hz"
+        );
+        assert!(
+            cents(bypassed, 440.0 * rate).abs() < 12.0,
+            "bypass phase not at varispeed pitch: {bypassed:.2} Hz"
+        );
+        assert!(
+            cents(recorrected, 440.0).abs() < 12.0,
+            "re-enabled phase off: {recorrected:.2} Hz"
+        );
     }
 }

@@ -69,8 +69,9 @@ pub struct BeatGrid {
     /// Piecewise-constant tempo segments covering `beats`, ascending by
     /// `start_beat`; never empty when `beats` is non-empty.
     pub segments: Vec<TempoSegment>,
-    /// Representative tempo in BPM (median over all beat intervals);
-    /// 0.0 when undetected.
+    /// Representative tempo in BPM (median of multi-beat-baseline
+    /// intervals, which cancels per-beat frame-grid quantization); 0.0
+    /// when undetected.
     pub bpm: f64,
     /// Overall grid confidence in [0, 1]: periodicity clarity, beat-level
     /// onset support, and interval regularity against the tempo curve.
@@ -329,6 +330,10 @@ fn track_beats_dp(novelty: &[f32], track: &TempoTrack) -> Vec<usize> {
 /// Converts beat frames to fractional sample positions: parabolic
 /// interpolation on the novelty peak, then snapping to a phase-refined
 /// transient onset when one is close (see [`BEAT_ONSET_SNAP_FRAMES`]).
+///
+/// Frame-to-sample conversion adds the map's detection latency so beats
+/// land on the audible attack, matching the (already-compensated) onset
+/// positions they snap to.
 fn refine_beat_positions(
     beat_frames: &[usize],
     novelty: &[f32],
@@ -336,6 +341,7 @@ fn refine_beat_positions(
     hop: usize,
 ) -> Vec<f64> {
     let snap_tolerance_samples = BEAT_ONSET_SNAP_FRAMES * hop as f64;
+    let latency = transients.latency_samples as f64;
     beat_frames
         .iter()
         .map(|&frame| {
@@ -351,7 +357,7 @@ fn refine_beat_positions(
                     pos += (0.5 * (a - c) / denom).clamp(-0.5, 0.5);
                 }
             }
-            let sample_pos = pos * hop as f64;
+            let sample_pos = pos * hop as f64 + latency;
 
             // Prefer the sub-hop position of a coincident detected onset.
             let onsets = &transients.onsets_fractional;
@@ -377,14 +383,33 @@ fn refine_beat_positions(
         .collect()
 }
 
-/// Median BPM over all beat intervals (0.0 with fewer than two beats).
+/// Maximum baseline length (in beats) for BPM estimation.
+const BPM_BASELINE_BEATS: usize = 16;
+
+/// Representative BPM of a beat sequence (0.0 with fewer than two beats).
+///
+/// Median of K-beat-baseline intervals `(beats[i+K] - beats[i]) / K`.
+/// The median of *adjacent* intervals is biased: refined beat positions
+/// carry a small cyclic error tied to where each beat falls on the
+/// analysis frame grid (period `1 / frac(period_frames)` beats, ~3 at
+/// 125 BPM with a 512 hop), so adjacent intervals repeat an asymmetric
+/// sawtooth whose median sits ~0.2% off the true interval (a flat 125.0
+/// read as 125.2). Position errors telescope over a K-beat span, shrinking
+/// the sawtooth by 1/K, while the median stays robust to dropped beats
+/// and breakdown re-locks. K is capped at a quarter of the available
+/// intervals so a single bad interval contaminates at most ~a third of
+/// the spans — the median still lands on clean ones.
 fn median_bpm(beats: &[f64], sample_rate: u32) -> f64 {
     if beats.len() < 2 {
         return 0.0;
     }
-    let mut intervals: Vec<f64> = beats.windows(2).map(|w| w[1] - w[0]).collect();
-    intervals.sort_by(|a, b| a.total_cmp(b));
-    let median = intervals[intervals.len() / 2];
+    let n = beats.len();
+    let k = BPM_BASELINE_BEATS.min(((n - 1) / 4).max(1));
+    let mut spans: Vec<f64> = (0..n - k)
+        .map(|i| (beats[i + k] - beats[i]) / k as f64)
+        .collect();
+    spans.sort_by(|a, b| a.total_cmp(b));
+    let median = spans[spans.len() / 2];
     if median <= 0.0 {
         return 0.0;
     }
@@ -402,15 +427,11 @@ fn segment_tempo(beats: &[f64], sample_rate: u32) -> Vec<TempoSegment> {
     }
     let intervals: Vec<f64> = beats.windows(2).map(|w| w[1] - w[0]).collect();
 
+    // Interval range `start..end` covers beats `start..=end`; use the
+    // baseline-median estimator so per-segment BPMs don't carry the
+    // adjacent-interval quantization bias (see `median_bpm`).
     let segment_bpm = |range: std::ops::Range<usize>| -> f64 {
-        let mut slice: Vec<f64> = intervals[range].to_vec();
-        slice.sort_by(|a, b| a.total_cmp(b));
-        let median = slice[slice.len() / 2];
-        if median <= 0.0 {
-            0.0
-        } else {
-            60.0 * sample_rate as f64 / median
-        }
+        median_bpm(&beats[range.start..=range.end], sample_rate)
     };
 
     let mut segments = Vec::new();
@@ -761,17 +782,94 @@ mod tests {
         assert!((grid.segments[0].bpm - 120.0).abs() < 2.0);
         assert!(grid.confidence > 0.4, "confidence {}", grid.confidence);
 
-        // Beats should land near click positions (multiples of the interval).
+        // Beats must land ON the clicks, not merely near them: a constant
+        // frame-timestamp bias (window start vs. audible attack) once put
+        // every beat ~30 ms early, which the old 10%-of-interval tolerance
+        // (50 ms) never caught. Sharp isolated clicks trip the unwindowed
+        // energy channel a frame or two before the Hann-weighted flux, so
+        // their residual runs a few ms earlier than on kick-shaped onsets
+        // (see detect_beats_land_on_kick_attacks for the tighter bound).
         let interval = 60.0 * sample_rate as f64 / 120.0;
+        let tolerance_ms = 15.0;
+        let mut offsets_ms: Vec<f64> = Vec::new();
         for &b in &grid.beats[1..grid.beats.len() - 1] {
             let nearest = (b / interval).round() * interval;
+            let off_ms = (b - nearest) / sample_rate as f64 * 1000.0;
             assert!(
-                (b - nearest).abs() < interval * 0.1,
-                "beat at {:.1} too far from click at {:.1}",
-                b,
-                nearest
+                off_ms.abs() < tolerance_ms,
+                "beat at {b:.1} is {off_ms:+.1} ms from click at {nearest:.1}"
             );
+            offsets_ms.push(off_ms);
         }
+        // The mean offset catches a systematic bias smaller than the
+        // per-beat tolerance.
+        let mean_ms = offsets_ms.iter().sum::<f64>() / offsets_ms.len() as f64;
+        assert!(
+            mean_ms.abs() < 12.0,
+            "beats are systematically {mean_ms:+.1} ms off the clicks"
+        );
+    }
+
+    /// EDM-shaped kick train (50 Hz decaying body + click attack) with
+    /// exactly known onsets: detected beats must sit on the audible attack.
+    /// Guards the frame-timestamp latency compensation on material where
+    /// the energy channel (not just spectral flux) drives detection.
+    #[test]
+    fn detect_beats_land_on_kick_attacks() {
+        let sr = 44_100u32;
+        let interval = 60.0 * sr as f64 / 125.0;
+        let len = (sr as f64 * 40.0) as usize;
+        let mut x = vec![0.0f32; len];
+        let mut truth = Vec::new();
+        let mut pos = 0.5 * sr as f64;
+        while pos + 4000.0 < len as f64 {
+            let base = pos as usize;
+            truth.push(pos);
+            for j in 0..3000usize {
+                let t = j as f32 / sr as f32;
+                x[base + j] += 0.9 * (-t * 18.0).exp() * (std::f32::consts::TAU * 50.0 * t).sin();
+            }
+            for j in 0..64usize {
+                x[base + j] += 0.5 * (1.0 - j as f32 / 64.0) * if j % 2 == 0 { 1.0 } else { -0.8 };
+            }
+            pos += interval;
+        }
+
+        let grid = detect_beats(&x, sr);
+        // Tight bound: the inlier-mean estimator cancels the per-beat
+        // frame-grid sawtooth that used to read a flat 125.0 as ~125.23.
+        // Residual error is endpoint beat jitter over the track span.
+        assert!(
+            (grid.bpm - 125.0).abs() < 0.1,
+            "BPM {:.3} (expected 125.000 ± 0.1)",
+            grid.bpm
+        );
+        assert!(grid.beats.len() > 30, "beats {}", grid.beats.len());
+
+        // First/last beats sit at the DP chain edges where the tracker has
+        // no neighbor on one side; measure the interior.
+        let offsets_ms: Vec<f64> = grid.beats[1..grid.beats.len() - 1]
+            .iter()
+            .map(|&b| {
+                let nearest = truth
+                    .iter()
+                    .map(|&t| b - t)
+                    .min_by(|a, c| a.abs().total_cmp(&c.abs()))
+                    .unwrap();
+                nearest / sr as f64 * 1000.0
+            })
+            .collect();
+        // Per-beat: bounded jitter (occasional one-frame stragglers from
+        // the sub-hop refinement are ~±1.5 hops). Mean: the actual bias
+        // guard — the uncompensated window-start convention sat at −30 ms.
+        for &off in &offsets_ms {
+            assert!(off.abs() < 25.0, "beat {off:+.1} ms from its kick");
+        }
+        let mean_ms = offsets_ms.iter().sum::<f64>() / offsets_ms.len() as f64;
+        assert!(
+            mean_ms.abs() < 5.0,
+            "beats are systematically {mean_ms:+.1} ms off the kicks"
+        );
     }
 
     #[test]
@@ -932,6 +1030,42 @@ mod tests {
         assert_eq!(grid.nearest_beat_index(600.0), Some(1));
         assert_eq!(grid.nearest_beat_index(2600.0), Some(2));
         assert_eq!(BeatGrid::empty(44100).nearest_beat_index(100.0), None);
+    }
+
+    /// The exact failure mode the baseline estimator exists for: beats at
+    /// a flat 480 ms period with a cyclic 3-beat position error
+    /// (frame-grid quantization sawtooth). Adjacent intervals cycle
+    /// {483.3, 477.5, 479.2} ms, whose median (479.2 → 125.2 BPM) misreads
+    /// the tempo; multi-beat baselines telescope the error away.
+    #[test]
+    fn median_bpm_immune_to_cyclic_position_error() {
+        let sr = 44_100u32;
+        let interval = 60.0 * sr as f64 / 125.0; // 21168 samples
+        let err_ms = [-3.4, -0.1, -2.6]; // repeating per-beat error
+        let beats: Vec<f64> = (0..64)
+            .map(|k| k as f64 * interval + err_ms[k % 3] * sr as f64 / 1000.0)
+            .collect();
+        let bpm = median_bpm(&beats, sr);
+        assert!(
+            (bpm - 125.0).abs() < 0.02,
+            "cyclic position error must not bias the BPM, got {bpm:.3}"
+        );
+    }
+
+    #[test]
+    fn median_bpm_robust_to_interval_outliers() {
+        let sr = 44_100u32;
+        let interval = 60.0 * sr as f64 / 120.0;
+        // Flat 120 BPM with one dropped beat (double-length gap) mid-track.
+        let mut beats: Vec<f64> = (0..40).map(|k| k as f64 * interval).collect();
+        for b in beats.iter_mut().skip(20) {
+            *b += interval;
+        }
+        let bpm = median_bpm(&beats, sr);
+        assert!(
+            (bpm - 120.0).abs() < 3.0,
+            "a single dropped beat must not derail the median, got {bpm:.3}"
+        );
     }
 
     #[test]

@@ -74,7 +74,8 @@ const MAD_FLOOR_MEDIAN_RATIO: f32 = 0.06;
 /// Result of transient detection: sample positions of detected onsets.
 #[derive(Debug, Clone)]
 pub struct TransientMap {
-    /// Sample positions of detected transient onsets (integer, for backward compatibility).
+    /// Sample positions of detected transient onsets (integer, for backward
+    /// compatibility). Latency-compensated: see [`Self::latency_samples`].
     pub onsets: Vec<usize>,
     /// Fractional-sample onset positions refined using phase information.
     /// These offer sub-sample precision for beat grid alignment.
@@ -88,10 +89,30 @@ pub struct TransientMap {
     pub flux: Vec<f32>,
     /// Hop size used for analysis.
     pub hop_size: usize,
+    /// Constant detection latency added when analysis frames become sample
+    /// positions, in samples (see `detection_latency_samples`). `onsets`
+    /// and `onsets_fractional` already include it; subtract it before
+    /// dividing by [`hop_size`](Self::hop_size) to recover a frame index.
+    pub latency_samples: usize,
     /// Per-frame spectral flux broken down by frequency band.
     /// Each element is `[sub_bass, low, mid, high]` flux for that analysis frame.
     /// Band boundaries: sub-bass <100Hz, low 100-500Hz, mid 500-4000Hz, high >4000Hz.
     pub per_frame_band_flux: Vec<[f32; 4]>,
+}
+
+/// Constant detection latency of the analysis frame grid, in samples.
+///
+/// A frame's flux/energy/phase measurements are timestamped at the window
+/// START (`frame * hop`), but the evidence that marks an onset — the
+/// difference against the previous Hann window — is centered half a window
+/// plus half a hop later. Without compensation every onset (and every beat
+/// tracked on the novelty curve) lands that far BEFORE the audible attack:
+/// ~29 ms at the 2048/512 beat-analysis configuration and 44.1 kHz,
+/// measured as a stable −30 ms bias against ground-truth kick trains.
+/// Adding this back centers detected positions on the attack.
+#[inline]
+pub(crate) fn detection_latency_samples(fft_size: usize, hop_size: usize) -> usize {
+    fft_size / 2 + hop_size / 2
 }
 
 /// Configuration for onset lookahead confirmation.
@@ -377,34 +398,34 @@ struct PhaseDeviationInfo {
     phase_diff: f32,
 }
 
-/// Computes fractional-sample onset positions from integer onset positions
+/// Computes fractional-sample onset positions from onset frame indices
 /// and per-frame phase deviation information.
 ///
 /// Uses the phase deviation at the strongest onset bin to estimate a
 /// sub-frame offset:
 ///   `fractional_offset = -phase_diff / (2 * PI * freq_bin / fft_size)`
 ///
-/// The result is clamped to within one hop of the integer position.
+/// The result is clamped to within one hop of the latency-compensated
+/// integer position (`frame * hop + latency_samples`).
 fn compute_fractional_positions(
-    onsets: &[usize],
+    onset_frames: &[usize],
     deviation_info: &[PhaseDeviationInfo],
     hop_size: usize,
     fft_size: usize,
+    latency_samples: usize,
 ) -> Vec<f64> {
     let two_pi = 2.0 * std::f64::consts::PI;
 
-    onsets
+    onset_frames
         .iter()
-        .map(|&onset_sample| {
-            let frame_idx = onset_sample / hop_size;
-            if frame_idx >= deviation_info.len() {
-                return onset_sample as f64;
-            }
-
-            let info = deviation_info[frame_idx];
+        .map(|&frame_idx| {
+            let onset_sample = (frame_idx * hop_size + latency_samples) as f64;
+            let Some(info) = deviation_info.get(frame_idx) else {
+                return onset_sample;
+            };
             if info.strongest_bin == 0 {
                 // DC bin — no meaningful phase refinement possible
-                return onset_sample as f64;
+                return onset_sample;
             }
 
             // fractional_offset = -phase_diff / (2 * PI * bin / fft_size)
@@ -414,7 +435,7 @@ fn compute_fractional_positions(
             // Clamp to within one hop to prevent wild jumps
             let clamped = fractional_offset.clamp(-(hop_size as f64), hop_size as f64);
 
-            (onset_sample as f64 + clamped).max(0.0)
+            (onset_sample + clamped).max(0.0)
         })
         .collect()
 }
@@ -522,6 +543,7 @@ pub fn detect_transients_with_options(
     sensitivity: f32,
     options: TransientDetectionOptions,
 ) -> TransientMap {
+    let latency_samples = detection_latency_samples(fft_size, hop_size);
     if samples.len() < fft_size {
         return TransientMap {
             onsets: vec![],
@@ -529,6 +551,7 @@ pub fn detect_transients_with_options(
             strengths: vec![],
             flux: vec![],
             hop_size,
+            latency_samples,
             per_frame_band_flux: vec![],
         };
     }
@@ -545,22 +568,34 @@ pub fn detect_transients_with_options(
     // pure windowing/leakage ripple, not real transients — detecting onsets
     // there produces false positives that smear the signal in the stretcher.
     // Real percussive/broadband onsets always carry an energy rise.
-    let onsets = if energy_active {
+    let onset_frames = if energy_active {
         let min_gap = options
             .threshold_policy
             .sanitized()
             .min_gap_for_sensitivity(sensitivity);
-        adaptive_threshold_with_gap(&combined, sensitivity, hop_size, min_gap, options)
+        adaptive_threshold_with_gap(&combined, sensitivity, min_gap, options)
     } else {
         Vec::new()
     };
 
     // Compute onset strengths from detection function values
-    let strengths = compute_onset_strengths(&combined, &onsets, hop_size);
+    let strengths = compute_onset_strengths(&combined, &onset_frames);
 
     // Compute fractional-sample onset positions using phase information
-    let onsets_fractional =
-        compute_fractional_positions(&onsets, &deviation_info, hop_size, fft_size);
+    let onsets_fractional = compute_fractional_positions(
+        &onset_frames,
+        &deviation_info,
+        hop_size,
+        fft_size,
+        latency_samples,
+    );
+
+    // Frame indices become sample positions here, centered on the audible
+    // attack rather than the analysis-window start.
+    let onsets: Vec<usize> = onset_frames
+        .iter()
+        .map(|&f| f * hop_size + latency_samples)
+        .collect();
 
     TransientMap {
         onsets,
@@ -568,6 +603,7 @@ pub fn detect_transients_with_options(
         strengths,
         flux: combined,
         hop_size,
+        latency_samples,
         per_frame_band_flux: band_flux,
     }
 }
@@ -630,10 +666,10 @@ impl Default for TransientDetectionOptions {
 /// Uses a sliding median with multiplicative threshold. The median is robust
 /// to outliers (unlike mean+stddev), making it well-suited for signals with
 /// a mix of strong transients and quiet passages.
+/// Returns onset positions as analysis frame indices.
 fn adaptive_threshold_with_gap(
     flux: &[f32],
     sensitivity: f32,
-    hop_size: usize,
     min_gap_frames: usize,
     options: TransientDetectionOptions,
 ) -> Vec<usize> {
@@ -735,7 +771,7 @@ fn adaptive_threshold_with_gap(
                     continue;
                 }
             }
-            onsets.push(i * hop_size);
+            onsets.push(i);
             last_onset = Some(i);
         }
     }
@@ -745,30 +781,23 @@ fn adaptive_threshold_with_gap(
 
 /// Computes normalized onset strengths from the detection function values.
 ///
-/// For each onset sample position, looks up the detection function value at
-/// the corresponding frame and normalizes all values to [0, 1].
-fn compute_onset_strengths(combined: &[f32], onsets: &[usize], hop_size: usize) -> Vec<f32> {
-    if onsets.is_empty() {
+/// For each onset frame, looks up the detection function value and
+/// normalizes all values to [0, 1].
+fn compute_onset_strengths(combined: &[f32], onset_frames: &[usize]) -> Vec<f32> {
+    if onset_frames.is_empty() {
         return vec![];
     }
 
     // Get raw detection values at each onset frame
-    let raw: Vec<f32> = onsets
+    let raw: Vec<f32> = onset_frames
         .iter()
-        .map(|&onset_sample| {
-            let frame = onset_sample / hop_size;
-            if frame < combined.len() {
-                combined[frame]
-            } else {
-                0.0
-            }
-        })
+        .map(|&frame| combined.get(frame).copied().unwrap_or(0.0))
         .collect();
 
     // Normalize to [0, 1]
     let max_val = raw.iter().copied().fold(0.0f32, f32::max);
     if max_val < 1e-10 {
-        return vec![0.0; onsets.len()];
+        return vec![0.0; onset_frames.len()];
     }
 
     raw.iter().map(|&v| v / max_val).collect()
@@ -778,13 +807,13 @@ fn compute_onset_strengths(combined: &[f32], onsets: &[usize], hop_size: usize) 
 mod tests {
     use super::*;
 
-    /// Test helper: adaptive_threshold with default gap.
-    fn adaptive_threshold(flux: &[f32], sensitivity: f32, hop_size: usize) -> Vec<usize> {
+    /// Test helper: adaptive_threshold with default gap. Returns frame indices.
+    fn adaptive_threshold(flux: &[f32], sensitivity: f32) -> Vec<usize> {
         let options = TransientDetectionOptions::default();
         let min_gap = options
             .threshold_policy
             .min_gap_for_sensitivity(sensitivity);
-        adaptive_threshold_with_gap(flux, sensitivity, hop_size, min_gap, options)
+        adaptive_threshold_with_gap(flux, sensitivity, min_gap, options)
     }
 
     #[test]
@@ -964,7 +993,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_threshold_empty_flux() {
-        let result = adaptive_threshold(&[], 0.5, 512);
+        let result = adaptive_threshold(&[], 0.5);
         assert!(result.is_empty());
     }
 
@@ -974,7 +1003,7 @@ mod tests {
         // With sensitivity 0.5: multiplier = 1 + (1-0.5)*4 = 3.0
         // threshold = 0.001 * 3.0 + 0.01 = 0.013 > 0.001 → no detections
         let flux = vec![0.001f32; 50];
-        let result = adaptive_threshold(&flux, 0.5, 512);
+        let result = adaptive_threshold(&flux, 0.5);
         assert!(
             result.is_empty(),
             "Uniform low flux should produce no onsets"
@@ -986,13 +1015,13 @@ mod tests {
         // Single large spike in otherwise silent flux
         let mut flux = vec![0.0f32; 50];
         flux[25] = 1.0; // big spike
-        let result = adaptive_threshold(&flux, 0.5, 512);
+        let result = adaptive_threshold(&flux, 0.5);
         assert!(
             !result.is_empty(),
             "Large spike should be detected as onset"
         );
-        // Onset position should be flux_index * hop_size
-        assert_eq!(result[0], 25 * 512);
+        // Onset position is the flux frame index
+        assert_eq!(result[0], 25);
     }
 
     #[test]
@@ -1003,7 +1032,6 @@ mod tests {
         let result = adaptive_threshold_with_gap(
             &flux,
             0.5,
-            512,
             TransientDetectionOptions::default()
                 .threshold_policy
                 .min_gap_for_sensitivity(0.5),
@@ -1023,7 +1051,6 @@ mod tests {
         let result = adaptive_threshold_with_gap(
             &flux,
             0.5,
-            512,
             TransientDetectionOptions::default()
                 .threshold_policy
                 .min_gap_for_sensitivity(0.5),
@@ -1032,7 +1059,7 @@ mod tests {
                 ..TransientDetectionOptions::default()
             },
         );
-        assert_eq!(result, vec![25 * 512]);
+        assert_eq!(result, vec![25]);
     }
 
     #[test]
@@ -1073,8 +1100,8 @@ mod tests {
         flux[50] = 0.1;
         flux[80] = 0.1;
 
-        let high_sens = adaptive_threshold(&flux, 0.9, 512);
-        let low_sens = adaptive_threshold(&flux, 0.1, 512);
+        let high_sens = adaptive_threshold(&flux, 0.9);
+        let low_sens = adaptive_threshold(&flux, 0.1);
 
         assert!(
             high_sens.len() >= low_sens.len(),
@@ -1091,13 +1118,10 @@ mod tests {
         flux[10] = 2.0;
         flux[12] = 2.0; // Only 2 frames apart (< MIN_ONSET_GAP_FRAMES=4)
 
-        let result = adaptive_threshold(&flux, 0.5, 512);
+        let result = adaptive_threshold(&flux, 0.5);
 
         // Count onsets near frames 10-12
-        let onsets_near: Vec<_> = result
-            .iter()
-            .filter(|&&pos| (10 * 512..=12 * 512).contains(&pos))
-            .collect();
+        let onsets_near: Vec<_> = result.iter().filter(|&&f| (10..=12).contains(&f)).collect();
         assert!(
             onsets_near.len() <= 1,
             "Close spikes should be deduplicated, got {} onsets",
@@ -1112,7 +1136,7 @@ mod tests {
         flux[10] = 2.0;
         flux[20] = 2.0; // 10 frames apart (> MIN_ONSET_GAP_FRAMES=4)
 
-        let result = adaptive_threshold(&flux, 0.5, 512);
+        let result = adaptive_threshold(&flux, 0.5);
         assert!(
             result.len() >= 2,
             "Well-separated spikes should both be detected, got {}",

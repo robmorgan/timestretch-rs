@@ -269,10 +269,11 @@ impl TimeStretchApp {
             let st = self.state.lock().unwrap();
             st.stretch_ratio
         };
-        let profile = match self.deck_engine {
-            DeckEngine::Keylock => timestretch::engine::EngineProfile::Keylock,
-            DeckEngine::Tape => timestretch::engine::EngineProfile::Tape,
-        };
+        // Always the keylock chain: the Tape/Keylock deck mode is a live
+        // engine parameter (delay-matched high-band crossfade), not a
+        // profile choice — switching mid-play is instant, with constant
+        // pipeline latency in both modes.
+        let profile = timestretch::engine::EngineProfile::Keylock;
         // Analyze-on-load artifact: the engine's primary transient control
         // signal (splice guidance + PV phase resets). Arc-shared with the
         // analysis thread's result.
@@ -795,8 +796,9 @@ impl TimeStretchApp {
                 ui.end_row();
 
                 // Deck engine mode: Tape (pitch follows tempo) vs Keylock
-                // (pitch-preserving). Switching stops playback and rebuilds
-                // the engine with the new profile.
+                // (pitch-preserving). A live engine parameter — the deck
+                // thread forwards it and the keylock stage crossfades
+                // (~12 ms), so switching mid-play is instant and gapless.
                 ui.label("Deck:");
                 ui.horizontal(|ui| {
                     let old_deck = self.deck_engine;
@@ -808,35 +810,23 @@ impl TimeStretchApp {
                             }
                         });
                     if self.deck_engine != old_deck {
-                        // The engine bounds the tempo ratio to the varispeed
-                        // range; pull the fader back in first.
-                        let clamped = self.clamp_stretch_ratio(self.stretch_ratio);
-                        if (clamped - self.stretch_ratio).abs() > f64::EPSILON {
-                            let detected = self.state.lock().unwrap().detected_bpm;
-                            if detected > 0.0 {
-                                self.apply_target_bpm(detected, detected / clamped);
-                            } else {
-                                self.stretch_ratio = clamped;
-                                self.state.lock().unwrap().stretch_ratio = clamped;
-                            }
-                        }
                         self.state.lock().unwrap().deck_engine = self.deck_engine;
-                        self.stop_playback();
                     }
                     match self.deck_engine {
                         DeckEngine::Tape => {
                             ui.label(egui::RichText::new("tape: pitch follows tempo").weak())
                                 .on_hover_text(
-                                    "Tape mode: zero pipeline delay, sample-accurate \
-                                     tempo, pitch follows the fader.",
+                                    "Tape mode: pitch follows the fader (delay-matched \
+                                     varispeed; same constant ~13 ms pipeline delay as \
+                                     keylock, so switching live is seamless).",
                                 );
                         }
                         DeckEngine::Keylock => {
                             ui.label(egui::RichText::new("keylock: two-band").weak())
                                 .on_hover_text(
                                     "Keylock mode: low band follows tempo, high band \
-                                     pitch-corrected by a small FFT at the delay-matched \
-                                     transposition (~13 ms pipeline delay).",
+                                     pitch-corrected at the delay-matched transposition \
+                                     (~13 ms pipeline delay).",
                                 );
                         }
                     }
