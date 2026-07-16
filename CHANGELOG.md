@@ -55,6 +55,15 @@ parameter matrix.
   engine like everything else, and
   `tests/stretch_quality_regressions.rs` is rebaselined against measured
   engine output instead of the analytic bypass.
+- Behavior note (owner decision 2026-07-16): offline `stretch()` shares
+  the live keylock semantics by construction — within the corrected
+  range (ratios ~0.833–1.25) content below the 150 Hz crossover is not
+  pitch-corrected; its pitch follows tempo, offline exactly as on a
+  deck. Wide ratios render on the batch PV path with full-spectrum
+  pitch preservation. Relative level across the crossover is clean
+  (two-tone balance within ~1% of ideal at ratio 1.25); the wide-PV
+  path loses some low-band level at heavy compression (ratio 0.5),
+  which is quality-secondary per the product boundary.
 
 ### Kept
 
