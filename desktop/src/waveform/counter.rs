@@ -41,7 +41,7 @@ pub fn paint_beat_counter(ui: &mut egui::Ui, marks: &GridMarks, position_frames:
             painter.rect_stroke(
                 seg_rect,
                 2.0,
-                egui::Stroke::new(1.0, palette::TEXT_DIM),
+                egui::Stroke::new(1.0_f32, palette::TEXT_DIM),
                 egui::StrokeKind::Inside,
             );
         }

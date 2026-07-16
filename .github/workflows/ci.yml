@@ -102,6 +102,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
 
+  desktop:
+    name: Desktop
+    # The desktop crate is excluded from the workspace, so the root jobs
+    # never build it. macOS is the app's target platform (wgpu -> native
+    # Metal) and the only runner that needs no extra system packages for
+    # eframe/cpal/rfd.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+      - run: cargo test --all-targets
+        working-directory: desktop
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: desktop
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

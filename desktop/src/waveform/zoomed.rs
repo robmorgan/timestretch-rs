@@ -176,7 +176,7 @@ pub fn paint_zoomed(
             if x >= rect.left() && x <= rect.right() {
                 painter.line_segment(
                     [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                    egui::Stroke::new(1.5, palette::LOOP_EDGE),
+                    egui::Stroke::new(1.5_f32, palette::LOOP_EDGE),
                 );
             }
         }
@@ -185,7 +185,7 @@ pub fn paint_zoomed(
         if x >= rect.left() && x <= rect.right() {
             painter.line_segment(
                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(1.5, palette::LOOP_EDGE),
+                egui::Stroke::new(1.5_f32, palette::LOOP_EDGE),
             );
         }
     }
@@ -208,13 +208,13 @@ pub fn paint_zoomed(
                 }
                 (
                     TICK_DOWNBEAT_PX,
-                    egui::Stroke::new(2.0, palette::TICK_DOWNBEAT),
+                    egui::Stroke::new(2.0_f32, palette::TICK_DOWNBEAT),
                 )
             } else {
                 if !plan.draw_beats {
                     continue;
                 }
-                (TICK_BEAT_PX, egui::Stroke::new(1.0, palette::TICK_BEAT))
+                (TICK_BEAT_PX, egui::Stroke::new(1.0_f32, palette::TICK_BEAT))
             };
             let x = frame_to_x(params.marks.frame(i));
             painter.line_segment(
@@ -241,7 +241,7 @@ pub fn paint_zoomed(
             egui::pos2(center_x, rect.top()),
             egui::pos2(center_x, rect.bottom()),
         ],
-        egui::Stroke::new(2.0, palette::PLAYHEAD),
+        egui::Stroke::new(2.0_f32, palette::PLAYHEAD),
     );
 
     // Drag-to-scrub: content follows the pointer.

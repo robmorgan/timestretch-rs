@@ -118,14 +118,14 @@ pub fn paint_overview(ui: &mut egui::Ui, params: OverviewParams<'_>) -> Option<f
         for x in [x0, x1] {
             painter.line_segment(
                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(1.0, palette::LOOP_EDGE),
+                egui::Stroke::new(1.0_f32, palette::LOOP_EDGE),
             );
         }
     } else if let Some(start) = params.loop_in {
         let x = frac_x(start);
         painter.line_segment(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            egui::Stroke::new(1.0, palette::LOOP_EDGE),
+            egui::Stroke::new(1.0_f32, palette::LOOP_EDGE),
         );
     }
 
@@ -152,9 +152,12 @@ pub fn paint_overview(ui: &mut egui::Ui, params: OverviewParams<'_>) -> Option<f
             let x = rect.left()
                 + rect.width() * ((params.marks.frame(i) * inv_total) as f32).clamp(0.0, 1.0);
             let (height, stroke) = if phrase {
-                (TICK_PHRASE_PX, egui::Stroke::new(2.0, palette::TICK_PHRASE))
+                (
+                    TICK_PHRASE_PX,
+                    egui::Stroke::new(2.0_f32, palette::TICK_PHRASE),
+                )
             } else {
-                (TICK_BAR_PX, egui::Stroke::new(1.0, palette::TICK_BEAT))
+                (TICK_BAR_PX, egui::Stroke::new(1.0_f32, palette::TICK_BEAT))
             };
             painter.line_segment(
                 [
@@ -172,7 +175,7 @@ pub fn paint_overview(ui: &mut egui::Ui, params: OverviewParams<'_>) -> Option<f
             egui::pos2(cursor_x, rect.top()),
             egui::pos2(cursor_x, rect.bottom()),
         ],
-        egui::Stroke::new(1.0, palette::CURSOR),
+        egui::Stroke::new(1.0_f32, palette::CURSOR),
     );
 
     // Click-to-seek.
