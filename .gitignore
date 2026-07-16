@@ -3,8 +3,6 @@
 Cargo.lock
 *.wav
 *.raw
-web/pkg/
-web/target/
 desktop/target/
 benchmarks/audio/
 .codex-loop/

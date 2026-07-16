@@ -47,7 +47,7 @@ patch — and confirm the choice with AskUserQuestion before touching files.
 2. `README.md`: bump the install snippet (`timestretch = "X.Y.Z"`). Badges already
    exist at the top; don't duplicate them.
 3. `Cargo.toml`: bump `version`, then `cargo check` to refresh `Cargo.lock`.
-4. `desktop/` and `web/` use `path = ".."` dependencies with no version pin — no
+4. `desktop/` uses a `path = ".."` dependency with no version pin — no
    updates needed there.
 
 ## Phase 4 — CI checks (before committing; run as one background command, ~3 min)
