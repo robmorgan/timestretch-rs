@@ -11,7 +11,7 @@ mod zoomed;
 pub use counter::paint_beat_counter;
 pub use overview::{OverviewParams, OverviewTexture, paint_overview};
 pub use peaks::BandPeaks;
-pub use zoomed::{ZoomSpan, ZoomedParams, paint_zoomed};
+pub use zoomed::{ScrubGesture, ZoomSpan, ZoomedParams, paint_zoomed};
 
 use eframe::egui;
 

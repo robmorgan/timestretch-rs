@@ -87,6 +87,17 @@ impl ZoomSpan {
     }
 }
 
+/// Drag lifecycle of the zoomed view, for audible scrubbing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScrubGesture {
+    /// Pointer moved while dragging: relative scrub distance in source
+    /// frames (content follows the pointer, so dragging right moves the
+    /// position backward).
+    Drag(f64),
+    /// The drag ended this frame.
+    Release,
+}
+
 pub struct ZoomedParams<'a> {
     pub peaks: Option<&'a BandPeaks>,
     pub marks: &'a GridMarks,
@@ -97,14 +108,14 @@ pub struct ZoomedParams<'a> {
     pub loop_in: Option<usize>,
 }
 
-/// Paint the zoomed view. Returns a relative scrub distance in source
-/// frames while the user drags (content follows the pointer, so dragging
-/// right moves the position backward).
+/// Paint the zoomed view. Reports the drag lifecycle while the user
+/// scrubs: pointer deltas as [`ScrubGesture::Drag`] and the drop as
+/// [`ScrubGesture::Release`].
 pub fn paint_zoomed(
     ui: &mut egui::Ui,
     params: ZoomedParams<'_>,
     span: &mut ZoomSpan,
-) -> Option<f64> {
+) -> Option<ScrubGesture> {
     let desired_size = egui::vec2(ui.available_width(), VIEW_HEIGHT);
     let (response, painter) = ui.allocate_painter(desired_size, egui::Sense::drag());
     let rect = response.rect;
@@ -245,11 +256,12 @@ pub fn paint_zoomed(
     );
 
     // Drag-to-scrub: content follows the pointer.
+    if response.drag_stopped() {
+        return Some(ScrubGesture::Release);
+    }
     if response.dragged() {
         let dx = response.drag_delta().x;
-        if dx != 0.0 {
-            return Some(-(dx as f64) / px_per_frame);
-        }
+        return Some(ScrubGesture::Drag(-(dx as f64) / px_per_frame));
     }
     None
 }

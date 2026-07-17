@@ -9,7 +9,8 @@ use crate::deck;
 use crate::decoder;
 use crate::state::*;
 use crate::waveform::{
-    self, BandPeaks, GridMarks, OverviewParams, OverviewTexture, ZoomSpan, ZoomedParams,
+    self, BandPeaks, GridMarks, OverviewParams, OverviewTexture, ScrubGesture, ZoomSpan,
+    ZoomedParams,
 };
 
 const MIN_STRETCH_RATIO: f64 = 0.25;
@@ -59,6 +60,13 @@ pub struct TimeStretchApp {
     state: SharedStateHandle,
     position: Arc<AtomicPosition>,
     stream_active: Arc<AtomicBool>,
+    /// Audible-scrub handshake with the audio callback and deck thread.
+    scrub: Arc<ScrubState>,
+    /// Pointer-implied source frame while a waveform drag is in progress.
+    scrub_pos: Option<f64>,
+    /// Last consumed glide-landing sequence number; each new one fires the
+    /// engine warm-start seek that primes in parallel with the glide.
+    landing_seq_seen: u64,
 
     // Audio engine (lives for the lifetime of the app)
     audio_engine: Option<AudioEngine>,
@@ -152,6 +160,9 @@ impl TimeStretchApp {
             state,
             position,
             stream_active,
+            scrub: Arc::new(ScrubState::new()),
+            scrub_pos: None,
+            landing_seq_seen: 0,
             audio_engine,
             output_sample_rate,
             source_audio: None,
@@ -342,6 +353,8 @@ impl TimeStretchApp {
             Some(sample_rate),
             handles.processor,
             reset_request.clone(),
+            self.scrub.clone(),
+            source.clone(),
         ) {
             Ok(e) => e,
             Err(e) => {
@@ -369,6 +382,7 @@ impl TimeStretchApp {
             self.stream_active.clone(),
             stop_flag,
             reset_request,
+            self.scrub.clone(),
             pipeline_latency_secs,
             warm_start_preroll,
         );
@@ -418,6 +432,19 @@ impl TimeStretchApp {
 
 impl eframe::App for TimeStretchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Scrub glide bookkeeping. During a settle the voice owns the
+        // moving position, so mirror it into the shared playhead; and each
+        // newly published landing fires the parallel engine warm-start.
+        let scrub_phase = self.scrub.phase();
+        if scrub_phase == ScrubPhase::Settling {
+            self.position.store(self.scrub.voice_frame() as usize);
+        }
+        let (landing_seq, landing) = self.scrub.landing();
+        if landing_seq != self.landing_seq_seen {
+            self.landing_seq_seen = landing_seq;
+            self.request_seek(landing as usize);
+        }
+
         // Sync position from atomic counter
         let pos_frames = self.position.load();
         {
@@ -428,8 +455,10 @@ impl eframe::App for TimeStretchApp {
         // Repaint at ~30 fps while playing — enough for a smooth playhead.
         // An uncapped request_repaint() redraws at full display rate
         // (120 Hz on ProMotion) and profiled as ~90% of the app's CPU.
+        // A scrub glide animates the playhead the same way even while
+        // paused, so it keeps the repaint loop alive too.
         let transport = self.state.lock().unwrap().transport;
-        if transport == Transport::Playing {
+        if transport == Transport::Playing || scrub_phase != ScrubPhase::Idle {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
@@ -510,8 +539,12 @@ impl TimeStretchApp {
             )
         };
 
-        // Zoomed scrolling view; dragging scrubs relative to the pointer.
-        let scrub = waveform::paint_zoomed(
+        // Zoomed scrolling view; dragging scrubs audibly relative to the
+        // pointer. During the drag the UI owns the displayed position and
+        // publishes the target to the audio callback's scrub voice; the drop
+        // triggers a single warm-start seek, so playback resumes at normal
+        // speed from wherever the waveform was released.
+        let gesture = waveform::paint_zoomed(
             ui,
             ZoomedParams {
                 peaks: self.band_peaks.as_ref(),
@@ -524,12 +557,44 @@ impl TimeStretchApp {
             },
             &mut self.zoom_span,
         );
-        if let Some(delta_frames) = scrub
-            && total_frames > 0
-        {
-            let target =
-                (pos_frames as f64 + delta_frames).clamp(0.0, (total_frames - 1) as f64) as usize;
-            self.request_seek(target);
+        match gesture {
+            Some(ScrubGesture::Drag(delta_frames)) if total_frames > 0 => {
+                // Re-grabbing a mid-glide platter continues from the voice's
+                // gliding position, not the stale engine playhead.
+                let base = self.scrub_pos.unwrap_or_else(|| {
+                    if self.scrub.phase() == ScrubPhase::Settling {
+                        self.scrub.voice_frame()
+                    } else {
+                        pos_frames as f64
+                    }
+                });
+                let target = (base + delta_frames).clamp(0.0, (total_frames - 1) as f64);
+                if self.scrub_pos.is_none() {
+                    self.scrub.begin(target);
+                } else {
+                    self.scrub.update_target(target);
+                }
+                self.scrub_pos = Some(target);
+                self.position.store(target as usize);
+                self.state.lock().unwrap().position_frames = target as usize;
+            }
+            Some(ScrubGesture::Release) => {
+                if let Some(frame) = self.scrub_pos.take() {
+                    if self.audio_engine.is_some() {
+                        // Momentum glide: the audio callback eases the voice
+                        // toward play speed (or rest), predicts the landing,
+                        // and the landing consumer below warm-starts the
+                        // engine there in parallel.
+                        let playing = self.state.lock().unwrap().transport == Transport::Playing;
+                        self.scrub.release(if playing { 1.0 } else { 0.0 });
+                    } else {
+                        // No audio stream to render a glide — land instantly.
+                        self.scrub.cancel();
+                        self.request_seek(frame as usize);
+                    }
+                }
+            }
+            _ => {}
         }
         ui.add_space(4.0);
 
