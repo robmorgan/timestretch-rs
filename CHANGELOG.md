@@ -1,23 +1,5 @@
 # Changelog
 
-## Unreleased
-
-### Changed
-
-- **MSRV raised from 1.82 to 1.85**; the crate (and the desktop app)
-  now use Rust edition 2024, which also enables cargo's MSRV-aware
-  dependency resolver (v3).
-- Development toolchain pinned to Rust 1.97.0 via `rust-toolchain.toml`;
-  CI's stable jobs build with the pinned compiler instead of floating on
-  latest stable (the MSRV job still tests 1.85.0 explicitly).
-
-### Removed
-
-- The `web/` WASM demo. It was built against the old engine API deleted
-  in 0.8.0 (`StreamProcessor`, `EdmPreset`) and had no CI coverage, so it
-  no longer compiled. Last present at commit `22e5117` if a web demo is
-  ever revived.
-
 ## 0.8.0
 
 ### Breaking changes — old engine deleted (ROADMAP Stage 9)
@@ -82,6 +64,45 @@ parameter matrix.
   (two-tone balance within ~1% of ideal at ratio 1.25); the wide-PV
   path loses some low-band level at heavy compression (ratio 0.5),
   which is quality-secondary per the product boundary.
+
+### Added
+
+- Keylock is a live engine parameter: `EngineController::set_keylock(bool)`
+  (with `keylock_target()` to read the requested state) toggles high-band
+  pitch correction click-free during playback via a ~12 ms per-sample
+  crossfade to delay-matched varispeed. Deck-style Tape/Keylock switching
+  no longer needs an engine rebuild; SOLA stays warm while bypassed so
+  re-engage is instant.
+
+### Changed
+
+- **MSRV raised from 1.82 to 1.85**; the crate (and the desktop app)
+  now use Rust edition 2024, which also enables cargo's MSRV-aware
+  dependency resolver (v3).
+- Development toolchain pinned to Rust 1.97.0 via `rust-toolchain.toml`;
+  CI's stable jobs build with the pinned compiler instead of floating on
+  latest stable (the MSRV job still tests 1.85.0 explicitly).
+
+### Fixed
+
+- Detected BPM no longer carries the analysis frame-grid bias: the
+  representative and per-segment BPMs are computed as the median of
+  K-beat-baseline intervals, so position errors telescope instead of
+  skewing adjacent intervals (a ground-truth 125.000 BPM kick train now
+  reads 125.03 instead of 125.23; a real 125.0 EDM track 124.99 instead
+  of 125.22).
+- Onset and beat positions are compensated for the analysis window's
+  detection latency, so markers land on the audible attack instead of
+  ~29 ms early (measured bias drops from -31.6 ms to -2.6 ms on a
+  ground-truth kick train). `PREANALYSIS_VERSION` bumps to 4; older
+  cached sidecars regenerate automatically.
+
+### Removed
+
+- The `web/` WASM demo. It was built against the old engine API deleted
+  in 0.8.0 (`StreamProcessor`, `EdmPreset`) and had no CI coverage, so it
+  no longer compiled. Last present at commit `22e5117` if a web demo is
+  ever revived.
 
 ### Kept
 
