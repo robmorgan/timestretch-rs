@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use timestretch::PreAnalysisArtifact;
 
@@ -172,6 +172,133 @@ impl AtomicPosition {
 
     pub fn load(&self) -> usize {
         self.frames.load(Ordering::Relaxed) as usize
+    }
+}
+
+/// Scrub gesture lifecycle. `Active` while the pointer holds the waveform;
+/// `Settling` after release while the voice's momentum eases into the
+/// settle-rate target (CDJ vinyl release).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrubPhase {
+    Idle,
+    Active,
+    Settling,
+}
+
+/// Shared scrub state machine: the UI publishes the pointer-implied source
+/// position while the zoomed waveform is dragged; the audio callback chases
+/// it with a raw varispeed reader (bypassing the engine), then owns the
+/// post-release momentum glide. The deck thread yields the playhead while
+/// any phase is engaged and additionally stops feeding while `Active`.
+pub struct ScrubState {
+    /// `ScrubPhase` as u8 (0/1/2).
+    phase: AtomicU8,
+    /// Pointer-target source frame as `f64` bits (valid while `Active`).
+    target_frame: AtomicU64,
+    /// Rate the release glide eases toward, as `f64` bits: 1.0 resumes
+    /// playback speed, 0.0 spins down to rest.
+    settle_rate_target: AtomicU64,
+    /// Voice read position as `f64` bits, published by the audio callback
+    /// every rendered block while engaged; the UI displays it during the
+    /// glide and uses it as the re-grab base.
+    voice_frame: AtomicU64,
+    /// Predicted settle landing frame as `f64` bits, published by the
+    /// callback when a glide starts.
+    landing: AtomicU64,
+    /// Bumped with each published landing; the UI consumes each sequence
+    /// number exactly once to fire the engine warm-start seek.
+    landing_seq: AtomicU64,
+}
+
+impl ScrubState {
+    pub fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(ScrubPhase::Idle as u8),
+            target_frame: AtomicU64::new(0.0f64.to_bits()),
+            settle_rate_target: AtomicU64::new(0.0f64.to_bits()),
+            voice_frame: AtomicU64::new(0.0f64.to_bits()),
+            landing: AtomicU64::new(0.0f64.to_bits()),
+            landing_seq: AtomicU64::new(0),
+        }
+    }
+
+    pub fn phase(&self) -> ScrubPhase {
+        match self.phase.load(Ordering::Acquire) {
+            1 => ScrubPhase::Active,
+            2 => ScrubPhase::Settling,
+            _ => ScrubPhase::Idle,
+        }
+    }
+
+    /// Engage the scrub at `frame` (the playhead where the drag started, or
+    /// the gliding voice position on a mid-settle re-grab). The target is
+    /// published before the phase so the audio callback never sees a stale
+    /// target on engage.
+    pub fn begin(&self, frame: f64) {
+        self.target_frame.store(frame.to_bits(), Ordering::Relaxed);
+        self.voice_frame.store(frame.to_bits(), Ordering::Relaxed);
+        self.phase
+            .store(ScrubPhase::Active as u8, Ordering::Release);
+    }
+
+    pub fn update_target(&self, frame: f64) {
+        self.target_frame.store(frame.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Release the drag into a momentum glide easing toward `rate_target`.
+    pub fn release(&self, rate_target: f64) {
+        self.settle_rate_target
+            .store(rate_target.to_bits(), Ordering::Relaxed);
+        self.phase
+            .store(ScrubPhase::Settling as u8, Ordering::Release);
+    }
+
+    /// Abort the gesture without a glide (no audio stream to render it).
+    pub fn cancel(&self) {
+        self.phase.store(ScrubPhase::Idle as u8, Ordering::Release);
+    }
+
+    /// Callback-side: the glide reached its landing; hand back to the
+    /// engine. CAS so a simultaneous re-grab (`begin` on the UI thread)
+    /// wins over the completion.
+    pub fn finish_settle(&self) {
+        let _ = self.phase.compare_exchange(
+            ScrubPhase::Settling as u8,
+            ScrubPhase::Idle as u8,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn target(&self) -> f64 {
+        f64::from_bits(self.target_frame.load(Ordering::Relaxed))
+    }
+
+    pub fn settle_rate_target(&self) -> f64 {
+        f64::from_bits(self.settle_rate_target.load(Ordering::Relaxed))
+    }
+
+    pub fn publish_voice_frame(&self, frame: f64) {
+        self.voice_frame.store(frame.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn voice_frame(&self) -> f64 {
+        f64::from_bits(self.voice_frame.load(Ordering::Relaxed))
+    }
+
+    /// Callback-side: publish the predicted glide landing. The frame is
+    /// stored before the sequence bump so a consumer that sees the new
+    /// sequence reads the matching landing.
+    pub fn publish_landing(&self, frame: f64) {
+        self.landing.store(frame.to_bits(), Ordering::Relaxed);
+        self.landing_seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// `(sequence, landing frame)` of the most recent glide, for the UI to
+    /// consume once per sequence.
+    pub fn landing(&self) -> (u64, f64) {
+        let seq = self.landing_seq.load(Ordering::Acquire);
+        (seq, f64::from_bits(self.landing.load(Ordering::Relaxed)))
     }
 }
 

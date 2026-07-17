@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use timestretch::engine::{EngineController, SourceProducer};
 
-use crate::state::{AtomicPosition, DeckEngine, SharedStateHandle, StopFlag, Transport};
+use crate::state::{
+    AtomicPosition, DeckEngine, ScrubPhase, ScrubState, SharedStateHandle, StopFlag, Transport,
+};
 
 const CHANNELS: usize = 2;
 /// Interleaved samples pushed per feed batch.
@@ -89,6 +91,7 @@ pub fn start_deck_thread(
     stream_active: Arc<AtomicBool>,
     stop_flag: Arc<StopFlag>,
     reset_request: Arc<AtomicBool>,
+    scrub: Arc<ScrubState>,
     pipeline_latency_secs: f64,
     warm_start_preroll: usize,
 ) -> thread::JoinHandle<()> {
@@ -182,6 +185,20 @@ pub fn start_deck_thread(
                 continue;
             }
 
+            // Audible scrub: while the pointer holds the platter (`Active`)
+            // the audio callback plays its own varispeed voice and leaves
+            // the engine unconsumed, and the UI owns the displayed position
+            // — don't feed, don't publish a stale engine playhead, don't
+            // drive EOF logic. During the release glide (`Settling`) the
+            // loop must keep running so the landing seek (handled above)
+            // resets, feeds preroll, and primes the engine in parallel with
+            // the glide — only the playhead publish stays yielded.
+            let scrub_phase = scrub.phase();
+            if scrub_phase == ScrubPhase::Active {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+
             // Loop wrap: jump the feed cursor and re-anchor the timeline.
             // The engine streams straight across the seam — no reset.
             if let Some((loop_start, loop_end)) = loop_region
@@ -234,11 +251,14 @@ pub fn start_deck_thread(
             stream_active.store(prerolled, Ordering::Relaxed);
 
             // Playhead: map the engine's cumulative consumed-source position
-            // through the jump timeline to an absolute source frame.
+            // through the jump timeline to an absolute source frame. The
+            // glide display belongs to the scrub voice, so don't fight it.
             let consumed = controller.source_position();
             jumps.prune(consumed);
             let playhead = jumps.map(consumed).clamp(0.0, total_frames as f64);
-            position.store(playhead as usize);
+            if scrub_phase == ScrubPhase::Idle {
+                position.store(playhead as usize);
+            }
 
             let underruns = controller.underrun_frames();
             if underruns > last_underruns && !finished {
