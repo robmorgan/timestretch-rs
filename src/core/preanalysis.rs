@@ -145,6 +145,41 @@ impl PreAnalysisArtifact {
     pub fn strength_at(&self, idx: usize) -> f32 {
         self.transient_strengths.get(idx).copied().unwrap_or(1.0)
     }
+
+    /// Rescales every frame-domain position to `sample_rate`, so a track can
+    /// be analyzed once at its native rate and reused at any playback rate.
+    ///
+    /// Positions (beats, onsets, downbeat offset), the analysis hop, and the
+    /// source length scale by the rate ratio; BPM, confidence, indices,
+    /// strengths, and band flux are rate-invariant. The returned artifact's
+    /// content binding is cleared (`source_len_samples`/`content_hash` = 0):
+    /// it no longer corresponds to any concrete signal, so
+    /// [`Self::matches_source`] must be run against the *original* artifact
+    /// at the native rate, never against a resampled copy.
+    ///
+    /// Returns a plain clone when `sample_rate` already matches.
+    pub fn resample_to(&self, sample_rate: u32) -> Self {
+        if sample_rate == self.sample_rate || self.sample_rate == 0 {
+            return self.clone();
+        }
+        let ratio = sample_rate as f64 / self.sample_rate as f64;
+        let scale = |v: usize| (v as f64 * ratio).round() as usize;
+        Self {
+            sample_rate,
+            downbeat_offset_samples: scale(self.downbeat_offset_samples),
+            beat_positions: self.beat_positions.iter().map(|&p| scale(p)).collect(),
+            beat_positions_fractional: self
+                .beat_positions_fractional
+                .iter()
+                .map(|&p| p * ratio)
+                .collect(),
+            transient_onsets: self.transient_onsets.iter().map(|&p| scale(p)).collect(),
+            analysis_hop_size: scale(self.analysis_hop_size),
+            source_len_samples: 0,
+            content_hash: 0,
+            ..self.clone()
+        }
+    }
 }
 
 /// Hashes a mono analysis signal with FNV-1a 64 over each sample's bit
@@ -274,6 +309,51 @@ mod tests {
         artifact.transient_strengths.clear();
         assert_eq!(artifact.strength_at(0), 1.0);
         assert_eq!(artifact.strength_at(999), 1.0);
+    }
+
+    #[test]
+    fn test_resample_to_scales_positions() {
+        let artifact = test_artifact(); // 44.1k, beats at 0 / 22050
+        let resampled = artifact.resample_to(88_200);
+        assert_eq!(resampled.sample_rate, 88_200);
+        assert_eq!(resampled.beat_positions, vec![0, 44_100]);
+        assert_eq!(resampled.beat_positions_fractional, vec![0.0, 44_100.0]);
+        assert_eq!(resampled.transient_onsets, vec![0, 44_100]);
+        assert_eq!(resampled.downbeat_offset_samples, 200);
+        assert_eq!(resampled.analysis_hop_size, 1024);
+        // Rate-invariant fields survive untouched.
+        assert_eq!(resampled.bpm, artifact.bpm);
+        assert_eq!(resampled.confidence, artifact.confidence);
+        assert_eq!(resampled.downbeat_beat_indices, artifact.downbeat_beat_indices);
+        assert_eq!(resampled.tempo_segments, artifact.tempo_segments);
+        assert_eq!(resampled.transient_strengths, artifact.transient_strengths);
+        assert_eq!(resampled.onset_band_flux, artifact.onset_band_flux);
+        assert_eq!(resampled.version, artifact.version);
+    }
+
+    #[test]
+    fn test_resample_to_clears_content_binding() {
+        let samples: Vec<f32> = (0..1000).map(|i| (i as f32 * 0.01).sin()).collect();
+        let mut artifact = test_artifact();
+        artifact.source_len_samples = samples.len();
+        artifact.content_hash = hash_samples(&samples);
+
+        let resampled = artifact.resample_to(48_000);
+        assert_eq!(resampled.source_len_samples, 0);
+        assert_eq!(resampled.content_hash, 0);
+        // Identity keeps the binding.
+        let same = artifact.resample_to(44_100);
+        assert_eq!(same.content_hash, artifact.content_hash);
+        assert_eq!(same.source_len_samples, artifact.source_len_samples);
+    }
+
+    #[test]
+    fn test_resample_round_trip_is_close() {
+        let artifact = test_artifact();
+        let round = artifact.resample_to(48_000).resample_to(44_100);
+        for (a, b) in round.beat_positions.iter().zip(&artifact.beat_positions) {
+            assert!((*a as i64 - *b as i64).abs() <= 1, "{a} vs {b}");
+        }
     }
 
     #[test]
