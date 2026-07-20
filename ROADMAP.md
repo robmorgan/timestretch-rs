@@ -20,6 +20,32 @@ entirely. The fix is a new engine built on the inverted architecture that the
 old roadmap's Stage 15 (varispeed-first keylock) already proved out as a
 retrofit.
 
+## Status (2026-07-19)
+
+The engine rebuild is complete: Stages 1–9 are done, the old engine is
+deleted, and the Definition of Success below holds for the rebuild scope
+(15 ms budget, single engine both modes, machine-verified RT contract,
+required external-reference evidence, 9/9 A/B matrix). The offline
+low-band contract is settled: offline `stretch()` shares the live keylock
+semantics by design — < 150 Hz follows tempo at DJ ratios (shipped in
+0.8.0).
+
+What separates the current state from production grade **for the DJ app**
+is scope, not engine correctness:
+
+- **Stage 10** (general-purpose beat tracking) — the algorithm side has
+  landed; the annotated corpus and its gates have not. Wrong grids on
+  non-EDM material poison beat jumps, loops, and the artifact-driven
+  splice guidance the engine's quality depends on.
+- **Stage 11** (wide-range Master Tempo) — promoted from the backlog now
+  that its post-cutover condition is met.
+- **Stage 12** (robustness hardening) — no-panic guarantees on arbitrary
+  input, fuzzed parsers, long-run soak.
+
+Production grade **as a public library** additionally requires the 1.0
+path at the bottom of this file, which is gated on an explicit owner
+decision about the crate's audience.
+
 ## Architecture Decision (settled July 2026)
 
 The target architecture is settled. These are decisions, not open questions:
@@ -97,6 +123,10 @@ Dependencies form a line: 1 → 2 → 3 → 4 → 5 → 6 → 7 → {8, 9}, with
 Stage 10 is a parallel analysis/UI track: it touches only the analysis front
 end and the desktop app, has no dependency on Stages 4–9, and can be worked
 at any point alongside the engine line.
+
+Stages 11 and 12 are post-cutover tracks, independent of each other and of
+Stage 10. Stage 11 builds on the settled engine graph (Stage 9); Stage 12
+touches no DSP.
 
 ## [x] Stage 1: Walking Skeleton — Pull-Based Engine Core with Varispeed Tape Mode
 
@@ -808,6 +838,39 @@ was built to obsolete.
 
 Automation: auto
 
+> **Status (2026-07-19): algorithm side landed; corpus and gates
+> remaining.** Landed (commit `e0b2410` and follow-ups `36530c9`,
+> `e0049ed`): `src/analysis/tempogram.rs` (autocorrelation tempogram with
+> harmonic reinforcement, wide log-normal prior — no hard folding, the
+> 100–160 EDM fold survives only as an optional soft `hint_range` — and a
+> Viterbi tempo path that may drift or step), the DP beat tracker in
+> `src/analysis/beat.rs`, tempo segments + downbeat indices in the
+> artifact schema (`src/core/preanalysis.rs`), beat-level metrics in
+> `qa/bpm_accuracy.rs` (F-measure ±70 ms, CMLt/AMLt-style continuity,
+> downbeat F-measure) with the harness in CI on every push, and desktop
+> consumption (grid marks in the waveform painters, grid-accurate beat
+> jumps and loop spans in `desktop/src/app.rs`).
+>
+> Remaining before the stage closes — the evidence half of the exit
+> criteria: `benchmarks/manifest.toml` still has **no non-EDM entries, no
+> variable-tempo entries, and no annotated beat grids** (the harness
+> supports annotations; the corpus doesn't exercise them). Needed: the
+> widened corpus with annotated grids, the synthetic tempo-ramp fixture
+> and at least one live-drummer recording, explicit acc2/F-measure floors
+> enforced in CI on the non-EDM subset, and the owner check that desktop
+> grids align on real non-EDM tracks.
+>
+> **External baseline settled (2026-07-19):** the QM beat tracker
+> (qm-dsp's TempoTrackV2/DownBeat, as shipped in Mixxx) runs as a Vamp
+> plugin via Sonic Annotator. It anchors Stage 10 the way the Rubber Band
+> CLI anchors stretch quality: a baseline column in `qa/bpm_accuracy.rs`
+> (ours ≥ QM's on the shared metrics) and machine-generated draft beat
+> annotations for corpus tracks, hand-corrected into the manifest. We
+> consume its *output* only — qm-dsp is GPL-2.0+ and this crate is MIT,
+> so no code is ever ported from it; anything algorithmic we adopt is
+> implemented from the underlying papers, with qm-dsp used solely to
+> cross-check behavior.
+
 ### Why
 
 The analysis front end's beat detector is EDM-only by construction: kick-tuned
@@ -847,6 +910,21 @@ correct grid, not a quality-gated stretch.
   (`snap_to_grid*`, subdivision grids) carry over on the new type.
 - **Novelty front end.** Multi-band onset novelty built on the existing
   spectral-flux machinery, sensitivity generalized beyond kicks.
+- **ODF experiments (gated, from the papers — no qm-dsp code).** Two
+  candidate upgrades to the novelty front end, each accepted only if it
+  moves beat F-measure on the non-EDM subset: a complex-domain detection
+  function (Duxbury/Bello — fuses magnitude and phase prediction error;
+  the known win is soft/tonal onsets, i.e. vocals and live material) as
+  an alternative to the current flux + energy + phase-deviation combine;
+  and adaptive whitening (Stowell & Plumbley — per-bin running-peak
+  normalization ahead of the ODF) for dense mastered material. Both are
+  small against the existing FFT machinery; if a gate doesn't move,
+  the experiment is deleted, not kept as an option.
+- **Downbeat feature A/B.** Compare the current bass-weighted accent
+  feature against beat-synchronous spectral difference (Davies &
+  Plumbley 2006) on annotated downbeats — different signal, sometimes
+  wins where bass doesn't mark the bar (breakbeats, older funk). Keep
+  whichever scores higher; don't maintain both.
 - **Tempo estimation.** Autocorrelation/Fourier tempogram over the novelty
   curve; wide prior (~50–220 BPM); explicit octave-decision policy with
   confidence instead of hard folding. The 100–160 EDM fold survives only as
@@ -871,6 +949,9 @@ correct grid, not a quality-gated stretch.
   (annotated grids in `benchmarks/manifest.toml`); add beat-level scoring —
   F-measure (±70 ms) and octave-tolerant continuity (CMLt/AMLt) — alongside
   acc1/acc2 in `qa/bpm_accuracy.rs`; keep the diffable JSON report.
+  Bootstrap annotations via the QM Vamp baseline (draft grids from Sonic
+  Annotator, hand-corrected into the manifest) and carry the QM scores as
+  a baseline column in the report.
 
 ### Exit Criteria
 
@@ -880,11 +961,131 @@ correct grid, not a quality-gated stretch.
 - Beat F-measure gate on annotated tracks (proposed ≥ 0.85), including a
   synthetic tempo-ramp fixture and at least one live-drummer recording
   tracked within tolerance.
+- External baseline: ≥ the QM beat tracker (Vamp/Sonic Annotator renders)
+  on beat F-measure and acc2 over the widened corpus — no row where QM
+  wins by more than noise.
 - Desktop draws the grid aligned on real tracks; beat jumps land on detected
   beats, not computed intervals; overlay stays responsive (no per-frame
   allocation churn in the paint path).
 - Full-track analysis stays comfortably offline-budget (proposed ≥ 50×
   realtime on the CI reference machine).
+
+## [ ] Stage 11: Wide-Range Master Tempo Profile (post-cutover track)
+
+Automation: auto
+
+### Why
+
+Promoted from "Not a Priority Yet": the owner decision of 2026-07-14
+deferred CDJ-3000-class wide-range keylock until after cutover, and cutover
+completed 2026-07-15. The shipped keylock is single-pitch through ±20% with
+graceful release beyond — correct for the primary deck path, but a real
+competitive gap against hardware Master Tempo. Wide range wants a big-FFT
+corrector (1024–2048) and therefore ~25–50 ms of constant latency, which is
+structurally incompatible with the ≤ 15 ms budget — so it ships as a
+separate user-selectable deck profile with its own honestly-reported
+latency contract, like a CDJ range setting. The primary keylock chain is
+untouched.
+
+**Known risk, validated first:** Stage 7's listening passes found the
+small-FFT PV audibly phasey at every boundary it was placed behind — that
+is why SOLA owns the whole corrected range today. A wide-range corrector is
+a *new* big-FFT PV with identity locking and artifact-driven phase resets
+at a large transposition; whether it can sound acceptable is the
+falsifiable bet of this stage, and it runs first, against CDJ/RubberBand
+references, before any deck plumbing. Named fallback if it fails: keep the
+profile unshipped and the scope line at ±20% — this stage is severable.
+
+### Primary Files
+
+- New: `src/engine/stages/` wide corrector stage; a `WideKeylock` profile
+  in `src/engine/profiles.rs`
+- Reused in place: `src/core/fft.rs`, the artifact reset machinery from
+  `src/engine/stages/transient.rs`, band split from
+  `src/engine/stages/band_split.rs`
+- Integration: desktop profile selector (`desktop/src/app.rs`,
+  `desktop/src/deck.rs`)
+- QA: cents-wobble and transient-sharpness rows extended to ±30–100%;
+  WCET gate for the big-FFT chain in `qa/engine_wcet.rs`
+
+### Work
+
+- Falsification experiment first: batch-render bass-heavy corpus material
+  at ±30/±50/±100% through a prototype big-FFT corrector; A/B against
+  Rubber Band renders and the plain-varispeed release; owner listen
+  recorded here before the profile is built out.
+- Wide corrector stage: big FFT (settle 1024/2048 empirically), identity
+  phase locking, artifact-driven per-band phase resets, low band handled
+  explicitly (the un-keylocked-low-band bet does not extend to ±100% —
+  re-run the Stage 2 experiment at wide ratios and pick keylocked vs free
+  per the evidence).
+- Profile plumbing: separate constant-latency contract through
+  `latency_frames()`; profile switching via the existing warm-start
+  mechanism (no live morph between profiles — a switch is a seek-priced
+  event, documented).
+- WCET flattening for the big-FFT chain (at most one hop per callback, as
+  Stage 6 established for the small chain).
+
+### Exit Criteria
+
+- Single-pitch keylock at ±50% on the structured listening checklist
+  (kicks, vocals, full mixes), with the ±100% edge characterized and its
+  behavior documented — no silent quality cliff.
+- Cents gates hold at wide ratios; WCET p99.9 bound holds for the wide
+  chain at 64-frame callbacks; zero-alloc steady state.
+- Profile latency honestly reported; switching profiles is click-free via
+  warm start.
+- Owner listening sign-off recorded here, including the explicit verdict
+  on the wide-ratio low-band question.
+
+## [ ] Stage 12: Robustness Hardening — No-Panic Surface, Fuzzing, Soak (post-cutover track)
+
+Automation: auto
+
+### Why
+
+The RT contract is machine-verified, but the crate's *input* surface has
+never been hardened: the artifact JSON loader (`src/core/preanalysis.rs`),
+the WAV reader (`src/io/wav.rs`), and the public batch API have no fuzz
+coverage, and there is no enforced policy that arbitrary input produces
+`Err`, never a panic. For a library embedded in a shipping app — and a
+prerequisite for any 1.0 — "does not panic on hostile or degenerate input"
+must be a tested property, not an intention. This stage touches no DSP.
+
+### Primary Files
+
+- New: `fuzz/` (cargo-fuzz targets), a soak harness in `qa/`
+- Audited in place: `src/core/preanalysis.rs` (JSON load path),
+  `src/io/wav.rs`, `src/lib.rs` (param validation), `src/error.rs`,
+  engine constructors in `src/engine/`
+- CI: `.github/workflows/ci.yml` (bounded fuzz on PRs, longer cron run)
+
+### Work
+
+- Fuzz targets: artifact JSON from arbitrary bytes; WAV parsing from
+  arbitrary bytes; the batch `stretch()` API driven by arbitrary params ×
+  degenerate audio (NaN/Inf/denormal samples, zero-length, one sample,
+  extreme rates and sample rates).
+- No-panic policy: every public entry point returns `Err` on invalid
+  input; document the policy in `src/lib.rs`; `debug_assert` stays the
+  hot-path idiom (construction-time invariants are the release-mode
+  guard, per the Stage 1 contract).
+- Long-run soak: hours-equivalent of randomized deck gestures (tempo
+  rides, seeks, loop wraps, profile/keylock toggles, artifact swaps)
+  gated on zero clicks, zero allocation, bounded drift — the
+  torture-test generators already exist, this composes them.
+- CI wiring: short bounded fuzz per PR; scheduled longer run with corpus
+  persistence; crashes minimize into regression tests.
+
+### Exit Criteria
+
+- All fuzz targets run clean for the CI budget; every crash found during
+  the campaign lands as a minimized regression test.
+- Machine-checked: no panic reachable from the public API on arbitrary
+  input (fuzz evidence + audit of `unwrap`/`expect`/`panic!` outside
+  construction and tests).
+- Soak harness green in CI (bounded variant) with the full-length recipe
+  documented for local runs.
 
 ## Disposition of the Previous Roadmap's 16 Stages
 
@@ -987,21 +1188,50 @@ covered by the per-stage new-engine gates.
 
 ## Not a Priority Yet
 
-- **Wide-range Master Tempo (a "wide keylock" deck profile).** CDJ-3000
-  class ±100% keylock is a real competitive feature, but it wants a
-  big-FFT corrector (1024–2048) and therefore ~25–50 ms of constant
-  latency — structurally incompatible with the ≤ 15 ms budget of the
-  primary deck path. Post-cutover (after Stage 9), add it as a separate
-  user-selectable engine profile with its own latency contract, like a
-  CDJ range setting (owner decision 2026-07-14: ship full keylock to
-  ±20% + graceful release now; do not gate the parity campaign on wide
-  range).
+- ~~Wide-range Master Tempo~~ — **promoted to Stage 11** (2026-07-19; its
+  post-cutover condition was met at Stage 9).
+- **Musical key detection** (constant-Q chromagram + Krumhansl-style
+  profile correlation — the GetKeyMode algorithm Mixxx ships). Table-stakes
+  DJ-app feature for harmonic mixing and the natural next analysis feature
+  after Stage 10: it reuses the analyze-on-load pipeline and artifact
+  schema, and needs a chromagram front end this crate doesn't have yet.
+  Implemented from the papers; qm-dsp (GPL-2.0+) is cross-check evidence
+  only, never source (same policy as the Stage 10 baseline).
 - SIMD and architecture-specific acceleration (revisit after Stage 6's WCET
   gates exist to measure it against)
 - Desktop UI/UX polish beyond its role as the reference integration
 - Additional presets, wider API surface, convenience wrappers
 - General-purpose (non-EDM) material *stretch* quality (general-purpose
   analysis — beatgrid/BPM on any material — is Stage 10)
+
+## Path to 1.0 (decision pending — not scheduled)
+
+Everything above targets production grade **for the DJ app**, which is the
+crate's binding customer. Production grade **as a public library** is a
+separate, longer road that the pre-1.0 "API breaks freely" policy
+deliberately defers. It does not get stages until the owner decides the
+crate should take external customers; recorded here so the decision is
+explicit rather than ambient:
+
+- API freeze and semver discipline: audit the 19-function public surface,
+  cut what only the DJ app needs, commit to the rest, 1.0 with a
+  migration-noted changelog.
+- Rustdoc completeness pass on every public item; the README latency
+  table, RT contract, and artifact workflow kept as documented guarantees.
+- The non-EDM *stretch quality* question answered one way or the other:
+  either gated (a corpus and floors, like Stage 10 does for analysis) or
+  documented as an explicit scope boundary in the crate docs — never
+  silently variable.
+- Quality sign-off bus factor: today several gates bottom out in one
+  owner's listening checks on one CI machine class. A public 1.0 wants at
+  least a second listener on the structured checklist and WCET/quality
+  baselines sanity-checked on a second machine class.
+- MSRV and platform support policy stated in the README (currently:
+  pinned 1.97.0 toolchain, MSRV 1.85, CI on Ubuntu/macOS/Windows —
+  implicit, not promised).
+
+Stage 12 (no-panic hardening) is a prerequisite for this path but is
+scheduled regardless — the DJ app benefits either way.
 
 ## Definition of Success
 
@@ -1019,3 +1249,14 @@ covered by the per-stage new-engine gates.
   corpus.
 - A deck built on the engine feels like hardware: instant tempo nudges,
   seamless cue jumps, click-free pitch rides, graceful keylock at extremes.
+
+All of the above hold as of the Stage 9 cutover (2026-07-15). The
+remaining stages extend the definition:
+
+- Trustworthy beat grids on everything a DJ loads — non-EDM, drifting,
+  live material — gated on an annotated corpus (Stage 10).
+- Wide-range Master Tempo available as an opt-in profile with an honest
+  latency contract, or explicitly ruled out by listening evidence
+  (Stage 11).
+- No panic reachable from the public API on arbitrary input,
+  machine-verified by fuzzing (Stage 12).

@@ -324,7 +324,10 @@ mod tests {
         // Rate-invariant fields survive untouched.
         assert_eq!(resampled.bpm, artifact.bpm);
         assert_eq!(resampled.confidence, artifact.confidence);
-        assert_eq!(resampled.downbeat_beat_indices, artifact.downbeat_beat_indices);
+        assert_eq!(
+            resampled.downbeat_beat_indices,
+            artifact.downbeat_beat_indices
+        );
         assert_eq!(resampled.tempo_segments, artifact.tempo_segments);
         assert_eq!(resampled.transient_strengths, artifact.transient_strengths);
         assert_eq!(resampled.onset_band_flux, artifact.onset_band_flux);
