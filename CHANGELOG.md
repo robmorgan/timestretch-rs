@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.1
+
+### Added
+
+- `PreAnalysisArtifact::resample_to`: rescales every frame-domain position
+  (beats, onsets, downbeat offset, analysis hop, source length) to a target
+  sample rate, so a track can be analyzed once at its native rate and
+  reused at any playback rate. Rate-invariant fields (BPM, confidence,
+  downbeat indices, tempo segments, transient strengths, band flux) pass
+  through untouched; the returned artifact's content binding is cleared,
+  since it no longer corresponds to a concrete signal.
+
 ## 0.8.0
 
 ### Breaking changes — old engine deleted (ROADMAP Stage 9)
