@@ -10,6 +10,11 @@
 # harness: they carry no stretched references, may be .wav, .mp3, or .aiff,
 # and are ignored by the reference quality benchmark (even in strict mode).
 #
+# Tracks may also carry a `key` field with the ground-truth musical key in
+# Camelot notation (e.g. key = "3A" for Bb minor); those tracks are scored
+# by the key-detection metrics of the same harness. Sources: Mixed In Key
+# analysis (2026-08-01) or a Camelot tag embedded in the filename.
+#
 # Audio files are NOT checked into git (see .gitignore). Place them under
 # benchmarks/audio/ as described in benchmarks/README.md.
 
@@ -54,6 +59,9 @@ description = "Music Sounds Better With You (Original Mix), 124 BPM, stereo"
 original = "bpm-corpus/12247392_Music Sounds Better With You_(Original Mix).wav"
 original_sha256 = "ddcbfee5fb7d6e62d185836020475de828d90d564720a97e4ada81cbb397b9da"
 bpm = 124.0
+# Rigid-grid fit reads 124.21 — the file runs ~0.17% above the label.
+beats = "annotations/music-sounds-better-with-you.json"
+key = "3A" # Bb minor (Mixed In Key)
 
   [[track.reference]]
   file = "12247392_Music Sounds Better With You_(Original Mix)_115bpm.wav"
@@ -76,6 +84,8 @@ original = "bpm-corpus/13061141_Gimme! Gimme! Gimme!_(Sgt Slick's Melbourne Recu
 original_sha256 = "e7b554443b7046f7ea93e890d47b480d1c4830970398d75942986a3838ba9a3d"
 bpm = 123.0 # TODO: confirm tempo (detector reads 123.0)
 bpm_only = true
+beats = "annotations/gimme-gimme-gimme-sgt-slick-recut.json"
+key = "7A" # D minor (Mixed In Key)
 
 [[track]]
 id = "hot-stuff-original-mix"
@@ -84,6 +94,8 @@ original = "bpm-corpus/14220825_Hot Stuff_(Original Mix).wav"
 original_sha256 = "aaa3a686a73f6793ca59b50cf8f1331a2022bd5d841c5db174fdce1e3543520f"
 bpm = 120.0 # TODO: confirm tempo (detector reads 120.2)
 bpm_only = true
+beats = "annotations/hot-stuff-original-mix.json"
+key = "6A" # G minor (Mixed In Key)
 
 [[track]]
 id = "somebody-to-love-extended-mix"
@@ -92,6 +104,8 @@ original = "bpm-corpus/15650709_Somebody To Love_(Extended Mix).wav"
 original_sha256 = "e15eff5b8b0cbbfd69a0da39789fa9326827d61e39b04f0e63bb7d093edef613"
 bpm = 128.0 # TODO: confirm tempo (detector reads 128.7)
 bpm_only = true
+beats = "annotations/somebody-to-love-extended-mix.json"
+key = "11A" # F# minor (Mixed In Key)
 
 [[track]]
 id = "cold-heart-pnau-extended-mix"
@@ -100,6 +114,26 @@ original = "bpm-corpus/15836669_Cold Heart_(PNAU Extended Mix).wav"
 original_sha256 = "d3e2129136d1d3ddcf42d778f910e6d808d2c739eaaea7f08ac3d779ae2843b3"
 bpm = 116.0 # TODO: confirm tempo (detector reads 115.8; commonly listed 116)
 bpm_only = true
+beats = "annotations/cold-heart-pnau-extended-mix.json"
+key = "3A" # Bb minor (Mixed In Key)
+
+[[track]]
+id = "good-to-you-original-mix"
+description = "Good To You (Original Mix), house"
+original = "bpm-corpus/02 Good To You (Original Mix) - 6A.mp3"
+original_sha256 = "4ab02794401f90d22aee1bb9b9c868e3609d38791b36a7ef5329ed5c64566b07"
+bpm = 118.0 # TODO: confirm tempo (detector reads 118.0)
+bpm_only = true
+key = "6A" # G minor (filename Camelot tag)
+
+[[track]]
+id = "we-come-we-rave-we-love"
+description = "Axwell /\\ Ingrosso - We Come, We Rave, We Love, progressive house"
+original = "bpm-corpus/Axwell-Ingrosso-WeComeWeRaveWeLove-MP3320 - 6A.mp3"
+original_sha256 = "91235d5a3fdf54f4c41e24d48912df71f009d3b466c9084154c1b9187089026d"
+bpm = 125.0 # TODO: confirm tempo (detector reads 125.0)
+bpm_only = true
+key = "6A" # G minor (filename Camelot tag)
 
 
 # --- Public corpus (redistributable; ROADMAP Stage 7) ---
@@ -124,6 +158,7 @@ original = "public-corpus/01-Valya_Kan-December.mp3"
 original_sha256 = "412721bc9404255639c1f929f973b9cb28dd3243dacd68b83613f6c1b98b9ee3"
 bpm = 128.0 # Goertzel 128.000 (64x peak); detector reads 128.13
 bpm_only = true
+beats = "annotations/valya-kan-december.json"
 license = "CC-BY 4.0"
 source_url = "https://archive.org/details/yarn020"
 
@@ -134,6 +169,7 @@ original = "public-corpus/02-Valya_Kan-Memories.mp3"
 original_sha256 = "385e2f65d59019a7185f9668f63ae47b32440140428633f1b5a5f2a8882f97d7"
 bpm = 125.0 # Goertzel 125.000 (598x peak); detector reads 125.10
 bpm_only = true
+beats = "annotations/valya-kan-memories.json"
 license = "CC-BY 4.0"
 source_url = "https://archive.org/details/yarn020"
 
@@ -144,6 +180,7 @@ original = "public-corpus/01-Mehta-Stay_Like_That.mp3"
 original_sha256 = "2c5ac35b903c7bd27870d4544e2f84571f7d1f13064fa75703e298908412ae1f"
 bpm = 119.0 # Goertzel 119.000 (84x peak); detector reads 120.04 (+0.9)
 bpm_only = true
+beats = "annotations/mehta-stay-like-that.json"
 license = "CC-BY 4.0"
 source_url = "https://archive.org/details/yarn021"
 
@@ -154,6 +191,7 @@ original = "public-corpus/33RD_RATE_REVS_-_X_sicmon010.mp3"
 original_sha256 = "e9ffaf3e93107b336023bcdbc8e0be2328378791a7728b041e0ef0b747aee643"
 bpm = 128.0 # Goertzel 128.005 (60x peak); detector reads 128.82
 bpm_only = true
+beats = "annotations/33rd-rate-revs-x.json"
 license = "CC0 1.0"
 source_url = "https://archive.org/details/SICMON010"
 
@@ -164,6 +202,7 @@ original = "public-corpus/33RD_RATE_REVS_-_Group_Therapy_sicmon012.mp3"
 original_sha256 = "50aa9a376fe2e84c050da5a7f2c642792e04b91a30b9d012f9e14ac136ebf0bc"
 bpm = 147.0 # Goertzel 147.005 (149x peak); detector reads 147.66
 bpm_only = true
+beats = "annotations/33rd-rate-revs-group-therapy.json"
 license = "CC0 1.0"
 source_url = "https://archive.org/details/SICMON012"
 
@@ -174,6 +213,7 @@ original = "public-corpus/mtrnc002_01_-_J-Lab_-_Radiophonique.mp3"
 original_sha256 = "dd947b758985479d19728f2fb345ec2a9b5f2c9fb9f4251290c7744cd306f984"
 bpm = 128.0 # Goertzel 127.985 (71x peak); detector reads 126.13 (-1.9!)
 bpm_only = true
+beats = "annotations/j-lab-radiophonique.json"
 license = "CC-BY-SA 3.0"
 source_url = "https://archive.org/details/mtrnc002"
 
@@ -184,6 +224,7 @@ original = "public-corpus/unfound53_01_-_raymundo_mendoza_-_wrist_watch.mp3"
 original_sha256 = "61de8728f4c780be6ddcd47784cb70894b533795b5a919425abf6d85c0ae52ae"
 bpm = 120.0 # Goertzel 120.000 (58x peak); detector reads 118.35 (-1.4)
 bpm_only = true
+beats = "annotations/raymundo-mendoza-wrist-watch.json"
 license = "CC-BY 3.0"
 source_url = "https://archive.org/details/unfound53"
 
@@ -196,6 +237,8 @@ description = "Interplanetary Criminal - Saucers [YARN015], UK garage (swung)"
 original = "public-corpus/01-Interplanetary_Criminal-Saucers.mp3"
 original_sha256 = "cb3a303bd35bc92c27ddfec44db8666c0323913e67e2f8050282f6349651b23a"
 bpm = 126.0 # owner ear-verified 2026-07-14 (detector reads 126.1; swung UKG)
+# No beat annotation: the rigid-grid annotator cannot lock onto the swung
+# 2-step kick pattern (phase_lock 0.07) — needs manual/tapped annotation.
 bpm_only = true
 license = "CC-BY 4.0"
 source_url = "https://archive.org/details/yarn015"
@@ -207,5 +250,6 @@ original = "public-corpus/01-Raptom_Snig-Arf.mp3"
 original_sha256 = "65a82156174ec368355da9b95a118878bf200b1128acdbf725674ffa76e1952e"
 bpm = 125.0 # owner ear-verified 2026-07-14 (detector reads 125.1)
 bpm_only = true
+beats = "annotations/raptom-snig-arf.json"
 license = "CC-BY 4.0"
 source_url = "https://archive.org/details/yarn022"

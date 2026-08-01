@@ -325,6 +325,15 @@ fn run_analyze(args: &[String]) {
         artifact.transient_onsets.len(),
         report.analysis_elapsed_secs
     );
+    match &artifact.key {
+        Some(key) => eprintln!(
+            "Key: {} ({}), confidence {:.2}",
+            key.name(),
+            key.camelot(),
+            key.confidence
+        ),
+        None => eprintln!("Key: undetected"),
+    }
 
     if verbose {
         println!("METRIC odf_median={:.6}", report.odf_median);
@@ -338,6 +347,11 @@ fn run_analyze(args: &[String]) {
         );
         println!("METRIC bpm={:.2}", artifact.bpm);
         println!("METRIC confidence={:.3}", artifact.confidence);
+        if let Some(key) = &artifact.key {
+            println!("METRIC key={}", key.name());
+            println!("METRIC key_camelot={}", key.camelot());
+            println!("METRIC key_confidence={:.3}", key.confidence);
+        }
     }
 
     if let Err(e) = timestretch::write_preanalysis_json(Path::new(&output_path), &artifact) {

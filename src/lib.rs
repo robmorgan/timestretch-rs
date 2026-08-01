@@ -59,13 +59,14 @@ pub mod io;
 pub mod stretch;
 
 pub use analysis::beat::{BeatGrid, TempoSegment};
+pub use analysis::key::detect_key;
 pub use analysis::preanalysis::{
     AnalysisReport, analyze_for_dj, analyze_for_dj_with_report, downmix_to_mid,
 };
 pub use analysis::tempogram::TempoTrackingOptions;
 pub use core::preanalysis::{
-    PREANALYSIS_VERSION, PreAnalysisArtifact, hash_samples, read_preanalysis_json,
-    write_preanalysis_json,
+    KeyEstimate, KeyMode, PREANALYSIS_VERSION, PreAnalysisArtifact, hash_samples,
+    read_preanalysis_json, write_preanalysis_json,
 };
 pub use core::types::{
     AudioBuffer, Channels, EnvelopePreset, FrameIter, QualityMode, Sample, StretchParams,
