@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.9.0
+
+### Breaking changes
+
+- `PreAnalysisArtifact` gains a public `key: Option<KeyEstimate>` field
+  (schema v5). Code constructing the artifact with an exhaustive struct
+  literal must add the field or use `..Default::default()`; existing v4
+  JSON sidecars remain compatible and deserialize with `key = None`.
+
+### Added
+
+- Musical key detection: `detect_key(samples, sample_rate)` estimates the
+  key of a mono signal via HPCP-style chroma (spectral peaks attributed to
+  their candidate fundamentals with decaying weight) scored against the 24
+  rotated Krumhansl-Kessler profiles by Pearson correlation, with global
+  tuning correction for off-A440 masters and a conservatively gated
+  parallel-mode check on a harmonically masked view of the spectrogram.
+  On the key-annotated benchmark corpus it matches Mixed In Key on 6 of 7
+  tracks (85.7% exact, 88.6% MIREX-weighted).
+- `KeyEstimate` / `KeyMode`: root pitch class, mode, and confidence, with
+  `name()` ("A minor") and `camelot()` ("8A") for harmonic-mixing UIs.
+- `analyze_for_dj` now computes the key and stores it in the artifact;
+  `timestretch-cli analyze` prints it (plus `METRIC key=...` lines with
+  `--verbose`).
+
+### QA
+
+- Key ground truth in `benchmarks/manifest.toml` (`key = "3A"` Camelot
+  notation) and MIREX-style key scoring in the BPM accuracy harness:
+  EXACT/FIFTH/RELATIVE/PARALLEL/OTHER classes, a weighted score, and a
+  `TIMESTRETCH_KEY_MIN_EXACT` CI floor.
+- Beat/downbeat ground-truth annotations for 13 corpus tracks plus the
+  `annotate_rigid_grid` example that generated them (rigid-grid phase fit
+  on kick-band onset energy, independent of the production detector), and
+  recorded BPM accuracy baselines under `benchmarks/baselines/`.
+
 ## 0.8.1
 
 ### Added
