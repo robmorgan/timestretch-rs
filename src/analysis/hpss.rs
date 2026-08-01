@@ -228,7 +228,7 @@ pub fn hpss(
 ///
 /// For each bin, the median is computed over a window of `width` frames centered
 /// on the current frame. This enhances temporally stable (harmonic) components.
-fn median_filter_horizontal(mags: &[Vec<f32>], width: usize) -> Vec<Vec<f32>> {
+pub(crate) fn median_filter_horizontal(mags: &[Vec<f32>], width: usize) -> Vec<Vec<f32>> {
     let num_frames = mags.len();
     if num_frames == 0 {
         return vec![];
@@ -261,7 +261,7 @@ fn median_filter_horizontal(mags: &[Vec<f32>], width: usize) -> Vec<Vec<f32>> {
 ///
 /// For each frame, the median is computed over a window of `width` bins centered
 /// on the current bin. This enhances spectrally broad (percussive) components.
-fn median_filter_vertical(mags: &[Vec<f32>], width: usize) -> Vec<Vec<f32>> {
+pub(crate) fn median_filter_vertical(mags: &[Vec<f32>], width: usize) -> Vec<Vec<f32>> {
     let num_frames = mags.len();
     if num_frames == 0 {
         return vec![];

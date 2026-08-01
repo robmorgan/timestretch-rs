@@ -20,6 +20,13 @@
 //! ±70 ms, octave-tolerant continuity (CMLt/AMLt-style), and a downbeat
 //! F-measure when downbeat annotations are present.
 //!
+//! Tracks with a `key` field (ground-truth key in Camelot notation, e.g.
+//! "3A" = Bb minor) are also scored for key detection. The detected key is
+//! classified MIREX-style: EXACT, FIFTH (adjacent on the Camelot wheel,
+//! same mode), RELATIVE (relative major/minor), PARALLEL (same root, other
+//! mode), OTHER, or FAILED (no key detected). The weighted key score
+//! credits near-misses: exact 1.0, fifth 0.5, relative 0.3, parallel 0.2.
+//!
 //! Run with:
 //! `cargo test --features qa-harnesses --release --test bpm_accuracy -- --nocapture`
 //!
@@ -32,6 +39,8 @@
 //!   accuracy percentages (0-100); the test fails below the floor.
 //! - `TIMESTRETCH_BPM_MIN_BEAT_F`: minimum mean beat F-measure percentage
 //!   over annotated tracks; the test fails below the floor.
+//! - `TIMESTRETCH_KEY_MIN_EXACT`: minimum key exact-match percentage over
+//!   key-annotated tracks; the test fails below the floor.
 
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -55,6 +64,7 @@ const MAX_SECONDS_ENV_VAR: &str = "TIMESTRETCH_BPM_MAX_SECONDS";
 const MIN_ACC1_ENV_VAR: &str = "TIMESTRETCH_BPM_MIN_ACC1";
 const MIN_ACC2_ENV_VAR: &str = "TIMESTRETCH_BPM_MIN_ACC2";
 const MIN_BEAT_F_ENV_VAR: &str = "TIMESTRETCH_BPM_MIN_BEAT_F";
+const MIN_KEY_EXACT_ENV_VAR: &str = "TIMESTRETCH_KEY_MIN_EXACT";
 const DEFAULT_TOLERANCE: f64 = 0.02;
 /// Standard beat-tracking hit tolerance for F-measure, in seconds.
 const BEAT_TOLERANCE_SECS: f64 = 0.07;
@@ -84,6 +94,9 @@ struct Track {
     /// Optional beat annotation JSON, relative to `benchmarks/`.
     #[serde(default)]
     beats: Option<String>,
+    /// Optional ground-truth key in Camelot notation (e.g. "3A").
+    #[serde(default)]
+    key: Option<String>,
 }
 
 /// Ground-truth beat annotation: beat (and optionally downbeat) times in
@@ -118,6 +131,85 @@ impl BpmClass {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+enum KeyClass {
+    Exact,
+    Fifth,
+    Relative,
+    Parallel,
+    Other,
+    Failed,
+}
+
+impl KeyClass {
+    fn label(self) -> &'static str {
+        match self {
+            KeyClass::Exact => "EXACT",
+            KeyClass::Fifth => "FIFTH",
+            KeyClass::Relative => "RELATIVE",
+            KeyClass::Parallel => "PARALLEL",
+            KeyClass::Other => "OTHER",
+            KeyClass::Failed => "FAILED",
+        }
+    }
+
+    /// MIREX-style credit for near-misses.
+    fn weight(self) -> f64 {
+        match self {
+            KeyClass::Exact => 1.0,
+            KeyClass::Fifth => 0.5,
+            KeyClass::Relative => 0.3,
+            KeyClass::Parallel => 0.2,
+            KeyClass::Other | KeyClass::Failed => 0.0,
+        }
+    }
+}
+
+/// A key as (root pitch class 0-11 with C = 0, is_minor).
+type ParsedKey = (u8, bool);
+
+/// Parses Camelot notation ("1A".."12B", case-insensitive) into a key.
+fn parse_camelot(s: &str) -> Result<ParsedKey, String> {
+    let s = s.trim().to_ascii_uppercase();
+    if s.len() < 2 {
+        return Err(format!("invalid Camelot key '{}'", s));
+    }
+    let (number_str, letter) = s.split_at(s.len() - 1);
+    let minor = match letter {
+        "A" => true,
+        "B" => false,
+        _ => return Err(format!("invalid Camelot letter in '{}'", s)),
+    };
+    let number: usize = number_str
+        .parse()
+        .map_err(|_| format!("invalid Camelot number in '{}'", s))?;
+    if !(1..=12).contains(&number) {
+        return Err(format!("Camelot number out of range in '{}'", s));
+    }
+    // Invert the wheel: position on the circle of fifths, then multiply by
+    // 7 (the mod-12 inverse of 7) to recover the semitone pitch class.
+    let fifth_index = (if minor { number + 7 } else { number + 4 }) % 12;
+    Ok(((fifth_index * 7 % 12) as u8, minor))
+}
+
+fn classify_key(detected: Option<ParsedKey>, expected: ParsedKey) -> KeyClass {
+    let Some((root, minor)) = detected else {
+        return KeyClass::Failed;
+    };
+    let (exp_root, exp_minor) = expected;
+    let interval = (12 + root - exp_root) % 12;
+    match (minor == exp_minor, interval) {
+        (true, 0) => KeyClass::Exact,
+        (true, 5) | (true, 7) => KeyClass::Fifth,
+        (false, 0) => KeyClass::Parallel,
+        // Relative pair: minor root is 9 semitones above its relative
+        // major (A minor / C major).
+        (false, 9) if minor => KeyClass::Relative,
+        (false, 3) if !minor => KeyClass::Relative,
+        _ => KeyClass::Other,
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct TrackResult {
     id: String,
@@ -140,6 +232,15 @@ struct TrackResult {
     beat_amlt: Option<f64>,
     /// Downbeat F-measure at ±70 ms (annotated tracks with downbeats).
     downbeat_f: Option<f64>,
+    /// Ground-truth key in Camelot notation (key-annotated tracks).
+    expected_key: Option<String>,
+    /// Detected key in Camelot notation (key-annotated tracks; None when
+    /// detection returned nothing).
+    detected_key: Option<String>,
+    /// Key classification (key-annotated tracks).
+    key_class: Option<KeyClass>,
+    /// Detector's key confidence (key-annotated tracks with a detection).
+    key_confidence: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -167,6 +268,19 @@ struct Summary {
     /// Mean downbeat F-measure over tracks with downbeat annotations,
     /// in percent.
     mean_downbeat_f_pct: Option<f64>,
+    /// Number of tracks scored against a key annotation.
+    key_annotated: usize,
+    key_exact: usize,
+    key_fifth: usize,
+    key_relative: usize,
+    key_parallel: usize,
+    key_other: usize,
+    key_failed: usize,
+    /// Percent of key-annotated tracks detected exactly.
+    key_exact_pct: Option<f64>,
+    /// MIREX-style weighted key score in percent (exact 1.0, fifth 0.5,
+    /// relative 0.3, parallel 0.2).
+    key_weighted_pct: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -464,7 +578,11 @@ fn score_file(
     tolerance: f64,
     max_seconds: Option<f64>,
     annotation: Option<&BeatAnnotation>,
+    expected_key: Option<&str>,
 ) -> Result<TrackResult, String> {
+    let expected_key_parsed = expected_key
+        .map(|s| parse_camelot(s).map(|parsed| (s.trim().to_ascii_uppercase(), parsed)))
+        .transpose()?;
     let audio = decode_audio(path)?;
     let data = maybe_trim_interleaved(&audio.data, audio.sample_rate, audio.channels, max_seconds);
     let frames = data.len() / audio.channels.max(1);
@@ -518,6 +636,21 @@ fn score_file(
         None => (None, None, None, None),
     };
 
+    let (expected_key, detected_key, key_class, key_confidence) = match expected_key_parsed {
+        Some((camelot, parsed)) => {
+            let detected = artifact
+                .key
+                .map(|k| (k.root, k.mode == timestretch::KeyMode::Minor));
+            (
+                Some(camelot),
+                artifact.key.map(|k| k.camelot()),
+                Some(classify_key(detected, parsed)),
+                artifact.key.map(|k| k.confidence),
+            )
+        }
+        None => (None, None, None, None),
+    };
+
     Ok(TrackResult {
         id: id.to_string(),
         file: path.display().to_string(),
@@ -532,6 +665,10 @@ fn score_file(
         beat_cmlt,
         beat_amlt,
         downbeat_f,
+        expected_key,
+        detected_key,
+        key_class,
+        key_confidence,
     })
 }
 
@@ -560,6 +697,19 @@ fn print_metric(result: &TrackResult) {
         fmt_ratio(result.beat_amlt),
         fmt_ratio(result.downbeat_f),
     );
+    if let Some(class) = result.key_class {
+        println!(
+            "METRIC track=\"{}\" expected_key={} detected_key={} key_class={} key_confidence={}",
+            result.id,
+            result.expected_key.as_deref().unwrap_or("n/a"),
+            result.detected_key.as_deref().unwrap_or("none"),
+            class.label(),
+            result
+                .key_confidence
+                .map(|c| format!("{:.3}", c))
+                .unwrap_or_else(|| "n/a".to_string()),
+        );
+    }
 }
 
 fn summarize(results: &[TrackResult], skipped: usize, tolerance: f64) -> Summary {
@@ -599,6 +749,27 @@ fn summarize(results: &[TrackResult], skipped: usize, tolerance: f64) -> Summary
     };
     let beat_annotated = results.iter().filter(|r| r.beat_f.is_some()).count();
 
+    let key_count = |class: KeyClass| {
+        results
+            .iter()
+            .filter(|r| r.key_class == Some(class))
+            .count()
+    };
+    let key_annotated = results.iter().filter(|r| r.key_class.is_some()).count();
+    let key_exact = key_count(KeyClass::Exact);
+    let key_weighted: f64 = results
+        .iter()
+        .filter_map(|r| r.key_class)
+        .map(KeyClass::weight)
+        .sum();
+    let key_pct = |v: f64| {
+        if key_annotated == 0 {
+            None
+        } else {
+            Some(v / key_annotated as f64 * 100.0)
+        }
+    };
+
     Summary {
         tracks: scored + skipped,
         scored,
@@ -617,6 +788,15 @@ fn summarize(results: &[TrackResult], skipped: usize, tolerance: f64) -> Summary
         mean_beat_cmlt_pct: mean_pct(results.iter().filter_map(|r| r.beat_cmlt).collect()),
         mean_beat_amlt_pct: mean_pct(results.iter().filter_map(|r| r.beat_amlt).collect()),
         mean_downbeat_f_pct: mean_pct(results.iter().filter_map(|r| r.downbeat_f).collect()),
+        key_annotated,
+        key_exact,
+        key_fifth: key_count(KeyClass::Fifth),
+        key_relative: key_count(KeyClass::Relative),
+        key_parallel: key_count(KeyClass::Parallel),
+        key_other: key_count(KeyClass::Other),
+        key_failed: key_count(KeyClass::Failed),
+        key_exact_pct: key_pct(key_exact as f64),
+        key_weighted_pct: key_pct(key_weighted),
     }
 }
 
@@ -647,6 +827,21 @@ fn print_summary(summary: &Summary) {
         fmt_opt(summary.mean_beat_amlt_pct),
         fmt_opt(summary.mean_downbeat_f_pct),
     );
+    if summary.key_annotated > 0 {
+        println!(
+            "SUMMARY key_annotated={} key_exact={}% key_weighted={}% \
+             exact={} fifth={} relative={} parallel={} other={} failed={}",
+            summary.key_annotated,
+            fmt_opt(summary.key_exact_pct),
+            fmt_opt(summary.key_weighted_pct),
+            summary.key_exact,
+            summary.key_fifth,
+            summary.key_relative,
+            summary.key_parallel,
+            summary.key_other,
+            summary.key_failed,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -891,6 +1086,7 @@ fn bpm_accuracy() {
             tolerance,
             max_seconds,
             annotation.as_ref(),
+            track.key.as_deref(),
         ) {
             Ok(result) => {
                 print_metric(&result);
@@ -957,6 +1153,18 @@ fn bpm_accuracy() {
             min_beat_f
         );
     }
+    if let Some(min_key_exact) = env_f64(MIN_KEY_EXACT_ENV_VAR) {
+        let key_exact_pct = report
+            .summary
+            .key_exact_pct
+            .expect("key exact floor set but no key-annotated tracks were scored");
+        assert!(
+            key_exact_pct >= min_key_exact,
+            "key exact {:.1}% below required minimum {:.1}%",
+            key_exact_pct,
+            min_key_exact
+        );
+    }
 }
 
 /// End-to-end smoke test on checked-in fixtures so the pipeline is exercised
@@ -984,6 +1192,7 @@ fn bpm_accuracy_self_test() {
             DEFAULT_TOLERANCE,
             None,
             Some(&annotation),
+            None,
         )
         .unwrap_or_else(|e| panic!("{}: {}", file, e));
         print_metric(&result);
@@ -1025,6 +1234,66 @@ fn classification() {
     assert!((err - (0.5 / 64.0 * 100.0)).abs() < 1e-9, "err={}", err);
     assert!(octave_folded_err_pct(128.0, 128.0).unwrap() < 1e-12);
     assert_eq!(octave_folded_err_pct(0.0, 128.0), None);
+}
+
+#[test]
+fn camelot_parsing() {
+    // Wheel spot checks: (camelot, pitch class with C = 0, is_minor).
+    for (s, root, minor) in [
+        ("8B", 0, false),  // C major
+        ("8A", 9, true),   // A minor
+        ("1B", 11, false), // B major
+        ("1A", 8, true),   // G# minor
+        ("3A", 10, true),  // Bb minor
+        ("6A", 7, true),   // G minor
+        ("7A", 2, true),   // D minor
+        ("11A", 6, true),  // F# minor
+        ("7B", 5, false),  // F major
+        ("12b", 4, false), // E major, case-insensitive
+    ] {
+        assert_eq!(parse_camelot(s).unwrap(), (root, minor), "camelot {}", s);
+    }
+    assert!(parse_camelot("0A").is_err());
+    assert!(parse_camelot("13B").is_err());
+    assert!(parse_camelot("8C").is_err());
+    assert!(parse_camelot("").is_err());
+}
+
+#[test]
+fn key_classification() {
+    let bbm = parse_camelot("3A").unwrap();
+    assert_eq!(classify_key(Some(bbm), bbm), KeyClass::Exact);
+    // Fifth up/down on the wheel, same mode: Fm (4A) and Ebm (2A).
+    assert_eq!(
+        classify_key(Some(parse_camelot("4A").unwrap()), bbm),
+        KeyClass::Fifth
+    );
+    assert_eq!(
+        classify_key(Some(parse_camelot("2A").unwrap()), bbm),
+        KeyClass::Fifth
+    );
+    // Relative major of Bbm is Db major (3B).
+    assert_eq!(
+        classify_key(Some(parse_camelot("3B").unwrap()), bbm),
+        KeyClass::Relative
+    );
+    // Parallel: Bb major (6B).
+    assert_eq!(
+        classify_key(Some(parse_camelot("6B").unwrap()), bbm),
+        KeyClass::Parallel
+    );
+    // Relative seen from the major side: C major detected as A minor.
+    let c_major = parse_camelot("8B").unwrap();
+    assert_eq!(
+        classify_key(Some(parse_camelot("8A").unwrap()), c_major),
+        KeyClass::Relative
+    );
+    // Unrelated key and failed detection.
+    assert_eq!(
+        classify_key(Some(parse_camelot("9B").unwrap()), bbm),
+        KeyClass::Other
+    );
+    assert_eq!(classify_key(None, bbm), KeyClass::Failed);
 }
 
 #[test]

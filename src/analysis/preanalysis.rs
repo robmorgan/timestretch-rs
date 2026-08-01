@@ -1,6 +1,7 @@
 //! Offline pre-analysis pipeline for DJ beat/onset alignment.
 
 use crate::analysis::beat::detect_beats_from_transients_with_options;
+use crate::analysis::key::detect_key;
 use crate::analysis::tempogram::TempoTrackingOptions;
 use crate::analysis::transient::detect_transients;
 use crate::core::preanalysis::{PREANALYSIS_VERSION, PreAnalysisArtifact, hash_samples};
@@ -154,6 +155,7 @@ pub fn analyze_for_dj_with_report(
         analysis_hop_size: hop,
         source_len_samples: samples.len(),
         content_hash: hash_samples(samples),
+        key: detect_key(samples, sample_rate),
     };
 
     (artifact, report)

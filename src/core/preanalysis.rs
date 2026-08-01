@@ -9,7 +9,10 @@ use std::path::Path;
 /// v4: beat/onset positions are latency-compensated (centered on the
 /// audible attack instead of the analysis-window start; ~29 ms later at
 /// the 2048/512 configuration).
-pub const PREANALYSIS_VERSION: u32 = 4;
+///
+/// v5: adds the optional [`key`](PreAnalysisArtifact::key) estimate. Purely
+/// additive — v4 sidecars stay compatible, they just carry no key.
+pub const PREANALYSIS_VERSION: u32 = 5;
 
 /// Oldest schema version whose positions match the current analysis.
 /// Artifacts below this carry the pre-v4 window-start bias and fail
@@ -18,6 +21,58 @@ const MIN_COMPATIBLE_VERSION: u32 = 4;
 
 fn default_artifact_version() -> u32 {
     1
+}
+
+/// Mode of a detected musical key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyMode {
+    /// Major mode.
+    Major,
+    /// Minor mode.
+    Minor,
+}
+
+/// A detected musical key (schema v5+), produced by
+/// [`crate::analysis::key::detect_key`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct KeyEstimate {
+    /// Root pitch class: 0 = C, 1 = C#, ... 11 = B.
+    pub root: u8,
+    /// Major or minor.
+    pub mode: KeyMode,
+    /// Margin of the winning key over the runner-up, in [0.0, 1.0]. The
+    /// runner-up is often the relative major/minor, so values are modest
+    /// even on clearly tonal material.
+    pub confidence: f32,
+}
+
+impl KeyEstimate {
+    /// Note names using sharps (`"C#"`, not `"Db"`).
+    const NOTE_NAMES: [&'static str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+
+    /// Conventional name, e.g. `"A minor"` or `"F# major"`. Sharps are used
+    /// for all accidentals.
+    pub fn name(&self) -> String {
+        let mode = match self.mode {
+            KeyMode::Major => "major",
+            KeyMode::Minor => "minor",
+        };
+        format!("{} {}", Self::NOTE_NAMES[usize::from(self.root) % 12], mode)
+    }
+
+    /// Camelot wheel notation for harmonic mixing, e.g. `"8B"` for C major
+    /// and `"8A"` for A minor.
+    pub fn camelot(&self) -> String {
+        // Position on the circle of fifths (C = 0, G = 1, ...).
+        let fifth = (usize::from(self.root) * 7) % 12;
+        let (number, letter) = match self.mode {
+            KeyMode::Major => ((fifth + 7) % 12 + 1, 'B'),
+            KeyMode::Minor => ((fifth + 4) % 12 + 1, 'A'),
+        };
+        format!("{number}{letter}")
+    }
 }
 
 /// A stretch of consecutive beats at (locally) constant tempo.
@@ -92,6 +147,10 @@ pub struct PreAnalysisArtifact {
     /// See [`hash_samples`].
     #[serde(default)]
     pub content_hash: u64,
+    /// Detected musical key. `None` when detection was inconclusive or the
+    /// artifact predates schema v5.
+    #[serde(default)]
+    pub key: Option<KeyEstimate>,
 }
 
 impl PreAnalysisArtifact {
@@ -245,6 +304,11 @@ mod tests {
             analysis_hop_size: 512,
             source_len_samples: 44100,
             content_hash: 0,
+            key: Some(KeyEstimate {
+                root: 9,
+                mode: KeyMode::Minor,
+                confidence: 0.4,
+            }),
         }
     }
 
@@ -332,6 +396,7 @@ mod tests {
         assert_eq!(resampled.transient_strengths, artifact.transient_strengths);
         assert_eq!(resampled.onset_band_flux, artifact.onset_band_flux);
         assert_eq!(resampled.version, artifact.version);
+        assert_eq!(resampled.key, artifact.key);
     }
 
     #[test]
@@ -378,5 +443,41 @@ mod tests {
         assert_eq!(artifact.source_len_samples, 0);
         assert_eq!(artifact.content_hash, 0);
         assert!(artifact.is_usable(44100, 0.5));
+    }
+
+    #[test]
+    fn test_v4_json_without_key_parses_as_none() {
+        let mut artifact = test_artifact();
+        artifact.version = 4;
+        artifact.key = None;
+        let json = serde_json::to_string(&artifact).unwrap();
+        let parsed: PreAnalysisArtifact = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.key, None);
+        assert_eq!(parsed.version, 4);
+
+        let round: PreAnalysisArtifact =
+            serde_json::from_str(&serde_json::to_string(&test_artifact()).unwrap()).unwrap();
+        assert_eq!(round.key, test_artifact().key);
+    }
+
+    #[test]
+    fn test_key_names_and_camelot() {
+        let key = |root, mode| KeyEstimate {
+            root,
+            mode,
+            confidence: 1.0,
+        };
+        assert_eq!(key(0, KeyMode::Major).name(), "C major");
+        assert_eq!(key(9, KeyMode::Minor).name(), "A minor");
+        assert_eq!(key(6, KeyMode::Major).name(), "F# major");
+
+        // Camelot wheel: relative keys share a number, fifths are adjacent.
+        assert_eq!(key(0, KeyMode::Major).camelot(), "8B"); // C major
+        assert_eq!(key(9, KeyMode::Minor).camelot(), "8A"); // A minor
+        assert_eq!(key(7, KeyMode::Major).camelot(), "9B"); // G major
+        assert_eq!(key(11, KeyMode::Major).camelot(), "1B"); // B major
+        assert_eq!(key(8, KeyMode::Minor).camelot(), "1A"); // G# minor
+        assert_eq!(key(5, KeyMode::Major).camelot(), "7B"); // F major
+        assert_eq!(key(2, KeyMode::Minor).camelot(), "7A"); // D minor
     }
 }
