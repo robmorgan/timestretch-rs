@@ -14,7 +14,7 @@ use crate::analysis::tempogram::{
 };
 use crate::analysis::transient::{TransientMap, detect_transients};
 
-pub use crate::core::preanalysis::TempoSegment;
+pub use crate::core::preanalysis::{TempoCandidate, TempoSegment};
 
 /// FFT size for beat detection (balances frequency resolution and speed).
 const BEAT_FFT_SIZE: usize = 2048;
@@ -80,6 +80,10 @@ pub struct BeatGrid {
     pub downbeat_confidence: f32,
     /// Sample rate the positions refer to.
     pub sample_rate: u32,
+    /// Ranked tempo hypotheses, highest salience first: the committed
+    /// [`bpm`](Self::bpm) plus its in-range half/double alternatives.
+    /// Empty when no tempo was detected.
+    pub tempo_candidates: Vec<TempoCandidate>,
 }
 
 impl BeatGrid {
@@ -93,6 +97,7 @@ impl BeatGrid {
             confidence: 0.0,
             downbeat_confidence: 0.0,
             sample_rate,
+            tempo_candidates: Vec::new(),
         }
     }
 
@@ -249,6 +254,19 @@ pub(crate) fn detect_beats_from_transients_with_options(
 
     let confidence = grid_confidence(&beat_frames, &novelty, &track);
 
+    // Absolute-BPM candidates from the octave saliences, anchored on the
+    // refined representative tempo so ×2/÷2 are exact for the UI.
+    let mut tempo_candidates: Vec<TempoCandidate> = track
+        .octave_saliences
+        .iter()
+        .filter(|(_, salience)| *salience > 0.0)
+        .map(|&(ratio, salience)| TempoCandidate {
+            bpm: bpm * ratio,
+            salience,
+        })
+        .collect();
+    tempo_candidates.sort_by(|a, b| b.salience.total_cmp(&a.salience));
+
     BeatGrid {
         beats,
         downbeats,
@@ -257,6 +275,7 @@ pub(crate) fn detect_beats_from_transients_with_options(
         confidence,
         downbeat_confidence,
         sample_rate,
+        tempo_candidates,
     }
 }
 
@@ -729,6 +748,7 @@ mod tests {
             confidence: 1.0,
             downbeat_confidence: 1.0,
             sample_rate,
+            tempo_candidates: Vec::new(),
         }
     }
 
@@ -958,6 +978,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tempo_candidates_ranked_with_octave_alternative() {
+        let sample_rate = 44100u32;
+        let samples = click_train(sample_rate, 120.0, 20.0, 0, 0);
+        let grid = detect_beats(&samples, sample_rate);
+        assert!(grid.bpm > 0.0);
+        assert!(!grid.tempo_candidates.is_empty());
+
+        // Sorted by salience, and on a clean click train the committed
+        // tempo ranks first.
+        assert!(
+            grid.tempo_candidates
+                .windows(2)
+                .all(|w| w[0].salience >= w[1].salience)
+        );
+        let first = &grid.tempo_candidates[0];
+        assert!(
+            (first.bpm - grid.bpm).abs() < 1e-9,
+            "committed tempo should rank first: {:.2} vs {:.2}",
+            first.bpm,
+            grid.bpm
+        );
+
+        // The half-tempo alternative is in range (60 BPM) and exactly
+        // half the committed BPM; the double (240) exceeds max_bpm and
+        // must not be offered.
+        let half = grid
+            .tempo_candidates
+            .iter()
+            .find(|c| (c.bpm - grid.bpm * 0.5).abs() < 1e-9)
+            .expect("half-tempo candidate");
+        assert!(half.salience > 0.0 && half.salience < first.salience);
+        assert!(
+            grid.tempo_candidates
+                .iter()
+                .all(|c| c.bpm <= grid.bpm + 1e-9),
+            "240 BPM double is outside the default range: {:?}",
+            grid.tempo_candidates
+        );
+    }
+
+    #[test]
+    fn empty_grid_has_no_tempo_candidates() {
+        assert!(BeatGrid::empty(44100).tempo_candidates.is_empty());
+        let silent = vec![0.0f32; 44100 * 4];
+        assert!(
+            detect_beats(&silent, 44100).tempo_candidates.is_empty(),
+            "silence must not offer tempo candidates"
+        );
+    }
+
     // --- BeatGrid helpers ---
 
     #[test]
@@ -1087,6 +1158,7 @@ mod tests {
             confidence: 1.0,
             downbeat_confidence: 1.0,
             sample_rate: 44100,
+            tempo_candidates: Vec::new(),
         };
         assert!((grid.bpm_at(10000.0) - 120.0).abs() < 1e-9);
         assert!((grid.bpm_at(70000.0) - 132.0).abs() < 1e-9);

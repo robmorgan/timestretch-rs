@@ -345,6 +345,13 @@ fn run_analyze(args: &[String]) {
         ),
         None => eprintln!("Loudness: unmeasured (silent input)"),
     }
+    if artifact.tempo_candidates.len() > 1 {
+        let alternatives: Vec<String> = artifact.tempo_candidates[1..]
+            .iter()
+            .map(|c| format!("{:.1} ({:.2})", c.bpm, c.salience))
+            .collect();
+        eprintln!("Tempo alternatives: {}", alternatives.join(", "));
+    }
 
     if verbose {
         println!("METRIC odf_median={:.6}", report.odf_median);
@@ -367,6 +374,14 @@ fn run_analyze(args: &[String]) {
             println!("METRIC integrated_lufs={:.2}", l.integrated_lufs);
             println!("METRIC true_peak_dbtp={:.2}", l.true_peak_dbtp);
             println!("METRIC loudness_range_lu={:.2}", l.loudness_range_lu);
+        }
+        if !artifact.tempo_candidates.is_empty() {
+            let ranked: Vec<String> = artifact
+                .tempo_candidates
+                .iter()
+                .map(|c| format!("{:.2}:{:.3}", c.bpm, c.salience))
+                .collect();
+            println!("METRIC tempo_candidates={}", ranked.join(","));
         }
     }
 

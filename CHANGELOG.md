@@ -17,6 +17,15 @@
   as `timestretch-cli analyze` now does. The simplified RMS
   `estimate_lufs` in the comparison module is unchanged and remains a
   benchmark-only A/B utility.
+- Ranked tempo candidates: the tempo tracker now scores the half/double
+  metrical alternatives of its chosen path with the same normalized
+  tempogram-salience measure and exposes them as `TempoCandidate`s
+  (`BeatGrid::tempo_candidates`, `TempoTrack::octave_saliences`, and
+  `PreAnalysisArtifact::tempo_candidates` — schema v7, additive).
+  Alternatives outside the tempo search range are not offered. Enables a
+  one-tap "halve/double BPM" correction ranked by measured evidence
+  instead of blind ×2/÷2 buttons; `timestretch-cli analyze` prints the
+  alternatives.
 
 ## 0.9.0
 

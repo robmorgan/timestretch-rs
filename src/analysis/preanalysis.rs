@@ -149,6 +149,7 @@ pub fn analyze_for_dj_with_report(
         beat_positions_fractional: grid.beats,
         downbeat_beat_indices: grid.downbeats,
         tempo_segments: grid.segments,
+        tempo_candidates: grid.tempo_candidates,
         transient_onsets: transients.onsets,
         transient_strengths,
         onset_band_flux,
