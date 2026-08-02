@@ -413,20 +413,27 @@ impl StreamingSincResampler {
             let lo = center.saturating_sub(half_span);
             let hi = (center + half_span + 1).min(total);
 
-            let mut acc = 0.0f64;
+            // Two passes so the compiler can vectorize the second: fill the
+            // kernel weights for this output sample into a fixed stack
+            // buffer (the table lookup does not vectorize), then take plain
+            // dot products over the two contiguous source regions.
+            let mut weights = [0.0f32; 2 * STREAM_SINC_MAX_HALF_TAPS + 1];
+            let n_taps = hi - lo;
             let mut weight_sum = 0.0f64;
-            for idx in lo..hi {
-                let u = ((idx as f64 - center as f64) - frac) * cutoff;
-                let w = self.table.weight(u.abs()) as f64;
-                if w != 0.0 {
-                    let s = if idx < h {
-                        self.history[idx]
-                    } else {
-                        input[idx - h]
-                    };
-                    acc += s as f64 * w;
-                    weight_sum += w;
-                }
+            for (k, w) in weights[..n_taps].iter_mut().enumerate() {
+                let u = (((lo + k) as f64 - center as f64) - frac) * cutoff;
+                let val = self.table.weight(u.abs());
+                *w = val;
+                weight_sum += val as f64;
+            }
+            let mut acc = 0.0f64;
+            if lo < h {
+                let h_end = hi.min(h);
+                acc += dot_f32_f64(&self.history[lo..h_end], &weights[..h_end - lo]);
+            }
+            if hi > h {
+                let in_lo = lo.max(h);
+                acc += dot_f32_f64(&input[in_lo - h..hi - h], &weights[in_lo - lo..n_taps]);
             }
             if weight_sum.abs() > 1e-12 {
                 acc /= weight_sum;
@@ -463,6 +470,27 @@ impl StreamingSincResampler {
         self.reset();
         Ok(())
     }
+}
+
+/// Dot product of equal-length slices, accumulated in f64 across four
+/// independent lanes so the compiler can keep it in vector registers.
+/// Shared by the streaming resampler and the SOLA corrector's ring reads.
+#[inline]
+pub(crate) fn dot_f32_f64(samples: &[f32], weights: &[f32]) -> f64 {
+    debug_assert_eq!(samples.len(), weights.len());
+    let mut acc = [0.0f64; 4];
+    let mut s_chunks = samples.chunks_exact(4);
+    let mut w_chunks = weights.chunks_exact(4);
+    for (s, w) in (&mut s_chunks).zip(&mut w_chunks) {
+        acc[0] += s[0] as f64 * w[0] as f64;
+        acc[1] += s[1] as f64 * w[1] as f64;
+        acc[2] += s[2] as f64 * w[2] as f64;
+        acc[3] += s[3] as f64 * w[3] as f64;
+    }
+    for (s, w) in s_chunks.remainder().iter().zip(w_chunks.remainder()) {
+        acc[0] += *s as f64 * *w as f64;
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3])
 }
 
 /// Modified Bessel function of the first kind, order zero.

@@ -16,6 +16,7 @@
 //! Splice decisions are made once per block on the channel mix and applied
 //! to every channel identically, keeping the stereo image intact.
 
+use crate::core::resample::dot_f32_f64;
 use crate::engine::stage::{BLOCK_FRAMES, OnsetEvent};
 
 /// Half-width of the SOLA read kernel in zero-crossings (64-tap kernel).
@@ -87,6 +88,126 @@ impl ReadInterpTable {
         let a = self.taps[i];
         let b = self.taps[i + 1];
         a + (b - a) * frac
+    }
+
+    /// Fills the full kernel row for fractional phase `frac` (weights for
+    /// tap offsets `1-READ_HALF_TAPS..=READ_HALF_TAPS`) and returns the
+    /// weight sum. One row serves every channel and — for runs of reads at
+    /// integer strides — every frame sharing the phase, so the table lookup
+    /// cost is paid once instead of per read.
+    fn fill_row(&self, frac: f64, row: &mut [f32; READ_TAPS]) -> f64 {
+        let mut wsum = 0.0f64;
+        for (k, w) in row.iter_mut().enumerate() {
+            let j = k as isize + 1 - READ_HALF_TAPS as isize;
+            let val = self.weight((j as f64 - frac).abs());
+            *w = val;
+            wsum += val as f64;
+        }
+        wsum
+    }
+}
+
+/// Full kernel width of the SOLA reader, in taps.
+const READ_TAPS: usize = 2 * READ_HALF_TAPS;
+
+/// One windowed-sinc read kernel: the weight row and normalization for a
+/// specific fractional phase, applicable to any channel's ring at the
+/// matching integer start index.
+struct SincReadKernel {
+    row: [f32; READ_TAPS],
+    wsum: f64,
+    /// First tap's ring index (unmasked; masked per segment in `read`).
+    start: isize,
+}
+
+impl SincReadKernel {
+    #[inline]
+    fn at(table: &ReadInterpTable, pos: f64) -> Self {
+        let center = pos.floor();
+        let frac = pos - center;
+        let mut row = [0.0f32; READ_TAPS];
+        let wsum = table.fill_row(frac, &mut row);
+        Self {
+            row,
+            wsum,
+            start: center as isize + 1 - READ_HALF_TAPS as isize,
+        }
+    }
+
+    /// Normalized kernel dot against one ring, splitting at the ring wrap so
+    /// both segments are contiguous slice dot products.
+    #[inline]
+    fn read(&self, ring: &[f32]) -> f32 {
+        if self.wsum.abs() <= 1e-12 {
+            return 0.0;
+        }
+        (ring_dot(ring, self.start, &self.row) / self.wsum) as f32
+    }
+}
+
+/// Dot product of `weights` against the ring starting at (masked) `start`,
+/// split into at most two contiguous runs at the wrap point.
+#[inline]
+fn ring_dot(ring: &[f32], start: isize, weights: &[f32]) -> f64 {
+    let s = (start as usize) & RING_MASK;
+    let n = weights.len();
+    if s + n <= RING_LEN {
+        dot_f32_f64(&ring[s..s + n], weights)
+    } else {
+        let first = RING_LEN - s;
+        dot_f32_f64(&ring[s..], &weights[..first])
+            + dot_f32_f64(&ring[..n - first], &weights[first..])
+    }
+}
+
+/// Four-lane f64 dot product (see `dot_f32_f64`; correlation windows are
+/// premixed into f64 scratch).
+#[inline]
+fn dot_f64(a: &[f64], b: &[f64]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = [0.0f64; 4];
+    let mut a_chunks = a.chunks_exact(4);
+    let mut b_chunks = b.chunks_exact(4);
+    for (x, y) in (&mut a_chunks).zip(&mut b_chunks) {
+        acc[0] += x[0] * y[0];
+        acc[1] += x[1] * y[1];
+        acc[2] += x[2] * y[2];
+        acc[3] += x[3] * y[3];
+    }
+    for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        acc[0] += x * y;
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3])
+}
+
+/// Four-lane dot product of premixed f64 samples against f32 kernel weights.
+#[inline]
+fn dot_f64_f32(samples: &[f64], weights: &[f32]) -> f64 {
+    debug_assert_eq!(samples.len(), weights.len());
+    let mut acc = [0.0f64; 4];
+    let mut s_chunks = samples.chunks_exact(4);
+    let mut w_chunks = weights.chunks_exact(4);
+    for (s, w) in (&mut s_chunks).zip(&mut w_chunks) {
+        acc[0] += s[0] * w[0] as f64;
+        acc[1] += s[1] * w[1] as f64;
+        acc[2] += s[2] * w[2] as f64;
+        acc[3] += s[3] * w[3] as f64;
+    }
+    for (s, w) in s_chunks.remainder().iter().zip(w_chunks.remainder()) {
+        acc[0] += s * *w as f64;
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3])
+}
+
+/// Sums all channels' rings into `out` starting at (masked) ring index
+/// `start`: the splice search scores the channel mix, and premixing once
+/// turns every candidate's correlation into flat dot products.
+fn mix_channels(channels: &[SolaChannel], start: isize, out: &mut [f64]) {
+    out.fill(0.0);
+    for ch in channels {
+        for (k, m) in out.iter_mut().enumerate() {
+            *m += ch.ring[(start as usize).wrapping_add(k) & RING_MASK] as f64;
+        }
     }
 }
 
@@ -185,6 +306,14 @@ pub(crate) struct SolaCorrector {
     splice_count: u64,
     /// Consecutive blocks with the transposition inside [`REST_DEV`].
     rest_blocks: u32,
+    /// Premixed base window for the splice search ([`CORR_WINDOW`] frames;
+    /// preallocated: `plan_splice` runs on the audio thread).
+    corr_a: Vec<f64>,
+    /// Premixed candidate span for the coarse search (every candidate's
+    /// window is a slice of this).
+    corr_b: Vec<f64>,
+    /// Premixed span for the sub-sample refinement's sinc reads.
+    frac_mix: Vec<f64>,
 }
 
 impl SolaCorrector {
@@ -214,6 +343,9 @@ impl SolaCorrector {
             energy_avg: 0.0,
             splice_count: 0,
             rest_blocks: 0,
+            corr_a: vec![0.0; CORR_WINDOW],
+            corr_b: vec![0.0; 2 * SEARCH_RANGE as usize + CORR_WINDOW],
+            frac_mix: vec![0.0; XFADE_FRAMES + 2 * READ_TAPS],
         }
     }
 
@@ -369,17 +501,20 @@ impl SolaCorrector {
                     1.0 - (self.xfade_remaining as f64 - 1.0) / (XFADE_FRAMES as f64 - 1.0);
                 let g_in = (0.5 - 0.5 * (std::f64::consts::PI * progress).cos()) as f32;
                 let g_out = 1.0 - g_in;
+                let out_kernel = SincReadKernel::at(&self.table, self.xfade_from);
+                let in_kernel = SincReadKernel::at(&self.table, self.read_pos);
                 for (ch, out) in self.channels.iter().zip(io.iter_mut()) {
-                    let a = sinc_read(&ch.ring, self.xfade_from, &self.table);
-                    let b = sinc_read(&ch.ring, self.read_pos, &self.table);
+                    let a = out_kernel.read(&ch.ring);
+                    let b = in_kernel.read(&ch.ring);
                     out[i] = g_out * a + g_in * b;
                 }
                 self.xfade_from += t;
                 self.read_pos += t;
                 self.xfade_remaining -= 1;
             } else {
+                let kernel = SincReadKernel::at(&self.table, self.read_pos);
                 for (ch, out) in self.channels.iter().zip(io.iter_mut()) {
-                    out[i] = sinc_read(&ch.ring, self.read_pos, &self.table);
+                    out[i] = kernel.read(&ch.ring);
                 }
                 self.read_pos += t;
             }
@@ -415,11 +550,17 @@ impl SolaCorrector {
         // lag' = write − (read + jump), jump = lag − nominal = drift.
         let nominal_jump = drift;
         // …searching around that jump for the offset whose audio best
-        // continues what the cursor is currently playing.
+        // continues what the cursor is currently playing. The base window
+        // and the full candidate span are premixed once; every candidate's
+        // normalized correlation is then two flat dot products.
         let (mut best_jump, mut best_score) = (nominal_jump, f64::MIN);
         let base = self.read_pos;
         let lo = nominal_jump as isize - SEARCH_RANGE;
         let hi = nominal_jump as isize + SEARCH_RANGE;
+        let a0 = base.floor() as isize;
+        mix_channels(&self.channels, a0, &mut self.corr_a);
+        let a_sq = dot_f64(&self.corr_a, &self.corr_a);
+        mix_channels(&self.channels, a0 + lo, &mut self.corr_b);
         for jump in lo..=hi {
             let candidate = base + jump as f64;
             if !self.readable_span(candidate, CORR_WINDOW + XFADE_FRAMES) {
@@ -428,12 +569,21 @@ impl SolaCorrector {
             if !force && self.span_hits_onset(onsets, candidate) {
                 continue;
             }
+            let off = (jump - lo) as usize;
+            let b_win = &self.corr_b[off..off + CORR_WINDOW];
+            let b_sq = dot_f64(b_win, b_win);
+            let norm = (a_sq * b_sq).sqrt();
+            let corr = if norm < 1e-12 {
+                0.0
+            } else {
+                dot_f64(&self.corr_a, b_win) / norm
+            };
             // Mild distance penalty: periodic content scores every
             // period-grid candidate identically, and un-penalized ties
             // resolve to the search edge — parking the elastic drift ~a
             // full search range off nominal instead of converging to it.
             let distance = (jump as f64 - nominal_jump).abs() / SEARCH_RANGE as f64;
-            let score = self.mix_correlation(base, candidate, CORR_WINDOW) - 0.02 * distance;
+            let score = corr - 0.02 * distance;
             if score > best_score {
                 best_score = score;
                 best_jump = jump as f64;
@@ -455,11 +605,37 @@ impl SolaCorrector {
         {
             const GRID: usize = 2 * FINE_SEARCH_STEPS as usize + 1;
             let step = FINE_SEARCH_RADIUS / FINE_SEARCH_STEPS as f64;
+            // The base window is a prefix of the coarse search's premix; the
+            // candidates' sinc reads all draw from one premixed span, and
+            // each candidate's fractional phase is constant across its
+            // window, so one kernel row serves all its reads.
+            let a_win = &self.corr_a[..XFADE_FRAMES];
+            let a_sq = dot_f64(a_win, a_win);
+            let span_lo = (base + best_jump - FINE_SEARCH_RADIUS).floor() as isize + 1
+                - READ_HALF_TAPS as isize;
+            mix_channels(&self.channels, span_lo, &mut self.frac_mix);
+            let mut row = [0.0f32; READ_TAPS];
             let mut cs = [0.0f64; GRID];
             let (mut best_k, mut best_c) = (0usize, f64::MIN);
             for (k, c) in cs.iter_mut().enumerate() {
-                let frac = (k as f64 - FINE_SEARCH_STEPS as f64) * step;
-                *c = self.mix_correlation_frac(base, base + best_jump + frac, XFADE_FRAMES);
+                let frac_off = (k as f64 - FINE_SEARCH_STEPS as f64) * step;
+                let b_pos = base + best_jump + frac_off;
+                let b0 = b_pos.floor();
+                let wsum = self.table.fill_row(b_pos - b0, &mut row);
+                let base_off = (b0 as isize + 1 - READ_HALF_TAPS as isize - span_lo) as usize;
+                let (mut dot, mut b_sq) = (0.0f64, 0.0f64);
+                for (i, &a) in a_win.iter().enumerate() {
+                    let seg = &self.frac_mix[base_off + i..base_off + i + READ_TAPS];
+                    let b = if wsum.abs() <= 1e-12 {
+                        0.0
+                    } else {
+                        dot_f64_f32(seg, &row) / wsum
+                    };
+                    dot += a * b;
+                    b_sq += b * b;
+                }
+                let norm = (a_sq * b_sq).sqrt();
+                *c = if norm < 1e-12 { 0.0 } else { dot / norm };
                 if *c > best_c {
                     best_c = *c;
                     best_k = k;
@@ -512,46 +688,6 @@ impl SolaCorrector {
         newest_ok && oldest_ok && started
     }
 
-    /// Normalized cross-correlation between two ring regions on the channel
-    /// mix (mono decision keeps channels phase-coherent).
-    fn mix_correlation(&self, a_pos: f64, b_pos: f64, len: usize) -> f64 {
-        let a0 = a_pos.floor() as usize;
-        let b0 = b_pos.floor() as usize;
-        let (mut dot, mut a_sq, mut b_sq) = (0.0f64, 0.0f64, 0.0f64);
-        for i in 0..len {
-            let (mut a, mut b) = (0.0f64, 0.0f64);
-            for ch in &self.channels {
-                a += ch.ring[(a0 + i) & RING_MASK] as f64;
-                b += ch.ring[(b0 + i) & RING_MASK] as f64;
-            }
-            dot += a * b;
-            a_sq += a * a;
-            b_sq += b * b;
-        }
-        let norm = (a_sq * b_sq).sqrt();
-        if norm < 1e-12 { 0.0 } else { dot / norm }
-    }
-
-    /// Like [`Self::mix_correlation`], but `b_pos` is honoured at fractional
-    /// precision (sinc-interpolated reads) so sub-sample offsets rank
-    /// correctly. `a_pos` stays on the integer grid like the coarse search.
-    fn mix_correlation_frac(&self, a_pos: f64, b_pos: f64, len: usize) -> f64 {
-        let a0 = a_pos.floor() as usize;
-        let (mut dot, mut a_sq, mut b_sq) = (0.0f64, 0.0f64, 0.0f64);
-        for i in 0..len {
-            let (mut a, mut b) = (0.0f64, 0.0f64);
-            for ch in &self.channels {
-                a += ch.ring[(a0 + i) & RING_MASK] as f64;
-                b += sinc_read(&ch.ring, b_pos + i as f64, &self.table) as f64;
-            }
-            dot += a * b;
-            a_sq += a * a;
-            b_sq += b * b;
-        }
-        let norm = (a_sq * b_sq).sqrt();
-        if norm < 1e-12 { 0.0 } else { dot / norm }
-    }
-
     /// RMS of the channel mix over `len` frames starting at `pos`.
     fn region_rms(&self, pos: f64, len: usize) -> f64 {
         let p0 = pos.floor() as usize;
@@ -565,31 +701,6 @@ impl SolaCorrector {
             acc += mix * mix;
         }
         (acc / len as f64).sqrt()
-    }
-}
-
-/// Windowed-sinc random-access read from a ring at a fractional position.
-/// Exact passthrough at integer positions (the kernel is a delta there).
-#[inline]
-fn sinc_read(ring: &[f32], pos: f64, table: &ReadInterpTable) -> f32 {
-    let center = pos.floor();
-    let frac = pos - center;
-    let center = center as isize;
-    let half = READ_HALF_TAPS as isize;
-    let mut acc = 0.0f64;
-    let mut wsum = 0.0f64;
-    for j in (1 - half)..=half {
-        let w = table.weight((j as f64 - frac).abs()) as f64;
-        if w != 0.0 {
-            let idx = (center + j) as usize & RING_MASK;
-            acc += ring[idx] as f64 * w;
-            wsum += w;
-        }
-    }
-    if wsum.abs() > 1e-12 {
-        (acc / wsum) as f32
-    } else {
-        0.0
     }
 }
 
