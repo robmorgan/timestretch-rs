@@ -12,7 +12,11 @@ use std::path::Path;
 ///
 /// v5: adds the optional [`key`](PreAnalysisArtifact::key) estimate. Purely
 /// additive — v4 sidecars stay compatible, they just carry no key.
-pub const PREANALYSIS_VERSION: u32 = 5;
+///
+/// v6: adds the optional [`loudness`](PreAnalysisArtifact::loudness)
+/// measurement. Purely additive — v4/v5 sidecars stay compatible, they
+/// just carry no loudness.
+pub const PREANALYSIS_VERSION: u32 = 6;
 
 /// Oldest schema version whose positions match the current analysis.
 /// Artifacts below this carry the pre-v4 window-start bias and fail
@@ -72,6 +76,38 @@ impl KeyEstimate {
             KeyMode::Minor => ((fifth + 4) % 12 + 1, 'A'),
         };
         format!("{number}{letter}")
+    }
+}
+
+/// ITU-R BS.1770-4 / EBU R128 loudness measurement (schema v6+), produced
+/// by [`crate::analysis::loudness::measure_loudness`].
+///
+/// Measured on the original interleaved audio, not the mono analysis
+/// downmix: BS.1770 sums per-channel energies, so a mid downmix would
+/// read up to ~3 dB low depending on channel correlation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LoudnessMeasurement {
+    /// Integrated (gated) loudness in LUFS.
+    pub integrated_lufs: f64,
+    /// Maximum true peak across channels in dBTP.
+    pub true_peak_dbtp: f64,
+    /// Loudness range in LU (EBU R128 LRA).
+    pub loudness_range_lu: f64,
+}
+
+impl LoudnessMeasurement {
+    /// Gain in dB that brings this track's integrated loudness to
+    /// `target_lufs` (negative when the track is louder than the target).
+    /// The DJ-app autogain primitive.
+    #[inline]
+    pub fn gain_db_to(&self, target_lufs: f64) -> f64 {
+        target_lufs - self.integrated_lufs
+    }
+
+    /// [`Self::gain_db_to`] as a linear amplitude factor.
+    #[inline]
+    pub fn gain_linear_to(&self, target_lufs: f64) -> f64 {
+        10f64.powf(self.gain_db_to(target_lufs) / 20.0)
     }
 }
 
@@ -151,6 +187,13 @@ pub struct PreAnalysisArtifact {
     /// artifact predates schema v5.
     #[serde(default)]
     pub key: Option<KeyEstimate>,
+    /// BS.1770-4 loudness measurement. Not filled by
+    /// [`crate::analyze_for_dj`] (which only sees the mono analysis
+    /// signal): callers measure the original interleaved audio with
+    /// [`crate::measure_loudness`] and store the result here. `None` when
+    /// never measured or the artifact predates schema v6.
+    #[serde(default)]
+    pub loudness: Option<LoudnessMeasurement>,
 }
 
 impl PreAnalysisArtifact {
@@ -309,6 +352,11 @@ mod tests {
                 mode: KeyMode::Minor,
                 confidence: 0.4,
             }),
+            loudness: Some(LoudnessMeasurement {
+                integrated_lufs: -9.5,
+                true_peak_dbtp: -0.2,
+                loudness_range_lu: 4.0,
+            }),
         }
     }
 
@@ -397,6 +445,7 @@ mod tests {
         assert_eq!(resampled.onset_band_flux, artifact.onset_band_flux);
         assert_eq!(resampled.version, artifact.version);
         assert_eq!(resampled.key, artifact.key);
+        assert_eq!(resampled.loudness, artifact.loudness);
     }
 
     #[test]
@@ -450,14 +499,30 @@ mod tests {
         let mut artifact = test_artifact();
         artifact.version = 4;
         artifact.key = None;
+        artifact.loudness = None;
         let json = serde_json::to_string(&artifact).unwrap();
         let parsed: PreAnalysisArtifact = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.key, None);
+        assert_eq!(parsed.loudness, None);
         assert_eq!(parsed.version, 4);
 
         let round: PreAnalysisArtifact =
             serde_json::from_str(&serde_json::to_string(&test_artifact()).unwrap()).unwrap();
         assert_eq!(round.key, test_artifact().key);
+        assert_eq!(round.loudness, test_artifact().loudness);
+    }
+
+    #[test]
+    fn test_v5_json_without_loudness_parses_as_none() {
+        // A v5 sidecar (has key, predates loudness) must stay readable.
+        let mut artifact = test_artifact();
+        artifact.version = 5;
+        artifact.loudness = None;
+        let json = serde_json::to_string(&artifact).unwrap();
+        let parsed: PreAnalysisArtifact = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.loudness, None);
+        assert_eq!(parsed.key, test_artifact().key);
+        assert!(parsed.version >= MIN_COMPATIBLE_VERSION);
     }
 
     #[test]

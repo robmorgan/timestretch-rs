@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- ITU-R BS.1770-4 / EBU R128 loudness metering via the `ebur128` crate
+  (pure Rust): `measure_loudness(interleaved, channels, sample_rate)`
+  returns gated integrated LUFS, oversampled true peak (dBTP), and
+  loudness range (LU) as a `LoudnessMeasurement`, with `gain_db_to` /
+  `gain_linear_to` helpers for track autogain. Measured on the original
+  interleaved channels — BS.1770 sums per-channel energies, so the mono
+  analysis downmix would read up to ~3 dB low.
+- `PreAnalysisArtifact` gains an optional `loudness` field (schema v6,
+  additive — v4/v5 sidecars stay compatible). `analyze_for_dj` does not
+  fill it (it only sees the mono signal); callers measure and store it,
+  as `timestretch-cli analyze` now does. The simplified RMS
+  `estimate_lufs` in the comparison module is unchanged and remains a
+  benchmark-only A/B utility.
+
 ## 0.9.0
 
 ### Breaking changes
