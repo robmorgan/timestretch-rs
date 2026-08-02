@@ -16,7 +16,10 @@ use std::path::Path;
 /// v6: adds the optional [`loudness`](PreAnalysisArtifact::loudness)
 /// measurement. Purely additive — v4/v5 sidecars stay compatible, they
 /// just carry no loudness.
-pub const PREANALYSIS_VERSION: u32 = 6;
+///
+/// v7: adds [`tempo_candidates`](PreAnalysisArtifact::tempo_candidates).
+/// Purely additive — older sidecars stay compatible with an empty list.
+pub const PREANALYSIS_VERSION: u32 = 7;
 
 /// Oldest schema version whose positions match the current analysis.
 /// Artifacts below this carry the pre-v4 window-start bias and fail
@@ -111,6 +114,25 @@ impl LoudnessMeasurement {
     }
 }
 
+/// A ranked tempo hypothesis (schema v7+).
+///
+/// The detector commits to one tempo, but the canonical failure mode of
+/// any tempo tracker is the octave: half/double of the truth. Exposing
+/// the metrical alternatives with their measured salience lets a DJ app
+/// offer a one-tap "halve/double BPM" correction ranked by evidence
+/// instead of blind ×2/÷2 buttons.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TempoCandidate {
+    /// Candidate tempo in BPM.
+    pub bpm: f64,
+    /// Mean normalized tempogram salience along this candidate's tempo
+    /// path, in [0, 1]. Comparable across candidates of the same track.
+    /// The committed tempo is the entry whose `bpm` matches the grid /
+    /// artifact BPM; on clearly periodic material it is also the
+    /// highest-salience entry.
+    pub salience: f32,
+}
+
 /// A stretch of consecutive beats at (locally) constant tempo.
 ///
 /// Serialized in the artifact (schema v3+) and used as the tempo model of
@@ -194,6 +216,11 @@ pub struct PreAnalysisArtifact {
     /// never measured or the artifact predates schema v6.
     #[serde(default)]
     pub loudness: Option<LoudnessMeasurement>,
+    /// Ranked tempo hypotheses, highest salience first: the committed
+    /// tempo plus its in-range metrical alternatives (½×/2×). Empty when
+    /// no tempo was detected or the artifact predates schema v7.
+    #[serde(default)]
+    pub tempo_candidates: Vec<TempoCandidate>,
 }
 
 impl PreAnalysisArtifact {
@@ -357,6 +384,16 @@ mod tests {
                 true_peak_dbtp: -0.2,
                 loudness_range_lu: 4.0,
             }),
+            tempo_candidates: vec![
+                TempoCandidate {
+                    bpm: 128.0,
+                    salience: 0.9,
+                },
+                TempoCandidate {
+                    bpm: 64.0,
+                    salience: 0.5,
+                },
+            ],
         }
     }
 
@@ -446,6 +483,7 @@ mod tests {
         assert_eq!(resampled.version, artifact.version);
         assert_eq!(resampled.key, artifact.key);
         assert_eq!(resampled.loudness, artifact.loudness);
+        assert_eq!(resampled.tempo_candidates, artifact.tempo_candidates);
     }
 
     #[test]
@@ -518,11 +556,30 @@ mod tests {
         let mut artifact = test_artifact();
         artifact.version = 5;
         artifact.loudness = None;
+        artifact.tempo_candidates = Vec::new();
         let json = serde_json::to_string(&artifact).unwrap();
         let parsed: PreAnalysisArtifact = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.loudness, None);
+        assert!(parsed.tempo_candidates.is_empty());
         assert_eq!(parsed.key, test_artifact().key);
         assert!(parsed.version >= MIN_COMPATIBLE_VERSION);
+    }
+
+    #[test]
+    fn test_v6_json_without_candidates_parses_as_empty() {
+        // A v6 sidecar (has loudness, predates tempo candidates) must
+        // stay readable, and the full v7 artifact must round-trip.
+        let mut artifact = test_artifact();
+        artifact.version = 6;
+        artifact.tempo_candidates = Vec::new();
+        let json = serde_json::to_string(&artifact).unwrap();
+        let parsed: PreAnalysisArtifact = serde_json::from_str(&json).unwrap();
+        assert!(parsed.tempo_candidates.is_empty());
+        assert_eq!(parsed.loudness, test_artifact().loudness);
+
+        let round: PreAnalysisArtifact =
+            serde_json::from_str(&serde_json::to_string(&test_artifact()).unwrap()).unwrap();
+        assert_eq!(round.tempo_candidates, test_artifact().tempo_candidates);
     }
 
     #[test]

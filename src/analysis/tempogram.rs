@@ -71,6 +71,12 @@ const NOVELTY_MEAN_WINDOW_SECS: f64 = 0.5;
 /// tolerant without blurring distinct onsets together.
 const NOVELTY_SMOOTH_SECS: f64 = 0.03;
 
+/// BPM ratios evaluated as metrical alternatives to the chosen path.
+/// Halving/doubling covers the canonical octave failure mode; ⅓×/3× lags
+/// mostly fall outside the analyzed range and earn near-zero salience, so
+/// they are not offered.
+const CANDIDATE_BPM_RATIOS: [f64; 2] = [0.5, 2.0];
+
 /// A time-varying tempo estimate over a novelty curve.
 #[derive(Debug, Clone)]
 pub struct TempoTrack {
@@ -79,6 +85,13 @@ pub struct TempoTrack {
     /// Mean normalized salience along the chosen tempo path in [0, 1] —
     /// how clearly periodic the material is.
     pub path_salience: f32,
+    /// Salience of the chosen path and its metrical alternatives, as
+    /// `(bpm_ratio, salience)` pairs: ratio 1.0 is the chosen path (its
+    /// salience equals [`path_salience`](Self::path_salience)); 0.5/2.0
+    /// are the half/double-BPM paths scored by the same measure. Ratios
+    /// whose lags fall outside the analyzed tempo range for every column
+    /// are omitted.
+    pub octave_saliences: Vec<(f64, f32)>,
 }
 
 impl TempoTrack {
@@ -374,6 +387,32 @@ pub fn estimate_tempo_track(
     }
     let path_salience = (salience_sum / salient_cols as f64) as f32;
 
+    // Score the half/double-BPM alternatives with the same measure: mean
+    // normalized salience along the chosen path scaled to the alternative
+    // lag. Columns where the scaled lag leaves the analyzed range score 0,
+    // so an alternative outside the tempo range ranks accordingly low.
+    let mut octave_saliences = vec![(1.0f64, path_salience)];
+    for &ratio in &CANDIDATE_BPM_RATIOS {
+        let mut sum = 0.0f64;
+        let mut in_range = false;
+        for (col, &state) in columns.iter().zip(path.iter()) {
+            let col_max = col.iter().copied().fold(0.0f32, f32::max);
+            if col_max <= 1e-9 {
+                continue;
+            }
+            // BPM ratio r scales the beat period (lag) by 1/r.
+            let scaled_lag = ((lag_min + state) as f64 / ratio).round() as isize;
+            let scaled_state = scaled_lag - lag_min as isize;
+            if scaled_state >= 0 && (scaled_state as usize) < col.len() {
+                sum += (col[scaled_state as usize] / col_max) as f64;
+                in_range = true;
+            }
+        }
+        if in_range {
+            octave_saliences.push((ratio, (sum / salient_cols as f64) as f32));
+        }
+    }
+
     // Refine each column's lag, then interpolate a per-frame period curve
     // between column centers.
     let refined: Vec<f64> = columns
@@ -390,6 +429,7 @@ pub fn estimate_tempo_track(
     Some(TempoTrack {
         period_frames,
         path_salience,
+        octave_saliences,
     })
 }
 
@@ -458,6 +498,39 @@ mod tests {
             bpm_of(mid)
         );
         assert!(track.path_salience > 0.5);
+    }
+
+    #[test]
+    fn octave_candidates_ranked_below_chosen() {
+        let period = 60.0 * FRAME_RATE / 120.0;
+        let novelty = impulse_novelty(3000, period, 0.0);
+        let track =
+            estimate_tempo_track(&novelty, FRAME_RATE, &TempoTrackingOptions::default()).unwrap();
+
+        let chosen = track
+            .octave_saliences
+            .iter()
+            .find(|(r, _)| *r == 1.0)
+            .expect("chosen path present");
+        assert_eq!(chosen.1, track.path_salience);
+
+        // The half-BPM lag (doubled period) stays inside the analyzed
+        // range for a 120 BPM train and must score below the chosen path
+        // (the wide prior favors 120 over 60 on identical evidence).
+        let half = track
+            .octave_saliences
+            .iter()
+            .find(|(r, _)| *r == 0.5)
+            .expect("half-tempo candidate present");
+        assert!(
+            half.1 > 0.0 && half.1 < chosen.1,
+            "half salience {} vs chosen {}",
+            half.1,
+            chosen.1
+        );
+        for &(_, salience) in &track.octave_saliences {
+            assert!(salience <= chosen.1 + 1e-6);
+        }
     }
 
     #[test]

@@ -360,6 +360,7 @@ fn test_beat_grid_interval_samples() {
         confidence: 1.0,
         downbeat_confidence: 1.0,
         sample_rate: 44100,
+        tempo_candidates: Vec::new(),
     };
     let interval = grid.beat_interval_samples();
     // 120 BPM at 44100 Hz = 22050 samples per beat
