@@ -60,7 +60,7 @@ pub mod stretch;
 
 pub use analysis::beat::{BeatGrid, TempoCandidate, TempoSegment};
 pub use analysis::key::detect_key;
-pub use analysis::loudness::measure_loudness;
+pub use analysis::loudness::{MomentaryLoudness, measure_loudness};
 pub use analysis::preanalysis::{
     AnalysisReport, analyze_for_dj, analyze_for_dj_with_report, downmix_to_mid,
 };

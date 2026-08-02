@@ -1,6 +1,6 @@
 [package]
 name = "timestretch"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2024"
 description = "Pure Rust audio time stretching library optimized for EDM"
 license = "MIT"
