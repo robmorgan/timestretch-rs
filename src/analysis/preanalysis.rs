@@ -2,6 +2,7 @@
 
 use crate::analysis::beat::detect_beats_from_transients_with_options;
 use crate::analysis::key::detect_key;
+use crate::analysis::rigid_grid::refine_grid_rigid;
 use crate::analysis::tempogram::TempoTrackingOptions;
 use crate::analysis::transient::detect_transients;
 use crate::core::preanalysis::{PREANALYSIS_VERSION, PreAnalysisArtifact, hash_samples};
@@ -53,6 +54,9 @@ pub struct AnalysisReport {
     pub onset_rate_per_sec: f64,
     /// Wall-clock analysis time in seconds.
     pub analysis_elapsed_secs: f64,
+    /// Whether the rigid-grid fit replaced the tracked beats (quantized
+    /// material) or the tracked grid was kept (live/drifting material).
+    pub rigid_grid_adopted: bool,
 }
 
 /// Produces a reusable beat/onset analysis artifact for runtime snapping.
@@ -89,6 +93,10 @@ pub fn analyze_for_dj_with_report(
             ..TempoTrackingOptions::default()
         },
     );
+    // Quantized material gets a rigid grid (constant BPM + kick-band
+    // phase fit) when it explains the kicks at least as well as the
+    // tracked beats; live/drifting material keeps the tracked grid.
+    let (grid, rigid_grid_adopted) = refine_grid_rigid(samples, sample_rate, grid);
 
     let bpm = if grid.bpm.is_finite() && grid.bpm > 0.0 {
         grid.bpm
@@ -137,6 +145,7 @@ pub fn analyze_for_dj_with_report(
         onset_rate_per_sec: transients.onsets.len() as f64
             / (samples.len() as f64 / sample_rate.max(1) as f64).max(1e-9),
         analysis_elapsed_secs: started.elapsed().as_secs_f64(),
+        rigid_grid_adopted,
     };
 
     let artifact = PreAnalysisArtifact {

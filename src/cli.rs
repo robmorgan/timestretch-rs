@@ -345,6 +345,14 @@ fn run_analyze(args: &[String]) {
         ),
         None => eprintln!("Loudness: unmeasured (silent input)"),
     }
+    eprintln!(
+        "Grid: {}",
+        if report.rigid_grid_adopted {
+            "rigid (quantized material)"
+        } else {
+            "tracked (non-rigid material)"
+        }
+    );
     if artifact.tempo_candidates.len() > 1 {
         let alternatives: Vec<String> = artifact.tempo_candidates[1..]
             .iter()
@@ -375,6 +383,10 @@ fn run_analyze(args: &[String]) {
             println!("METRIC true_peak_dbtp={:.2}", l.true_peak_dbtp);
             println!("METRIC loudness_range_lu={:.2}", l.loudness_range_lu);
         }
+        println!(
+            "METRIC rigid_grid={}",
+            if report.rigid_grid_adopted { 1 } else { 0 }
+        );
         if !artifact.tempo_candidates.is_empty() {
             let ranked: Vec<String> = artifact
                 .tempo_candidates

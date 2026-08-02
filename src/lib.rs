@@ -64,6 +64,7 @@ pub use analysis::loudness::{MomentaryLoudness, measure_loudness};
 pub use analysis::preanalysis::{
     AnalysisReport, analyze_for_dj, analyze_for_dj_with_report, downmix_to_mid,
 };
+pub use analysis::rigid_grid::{RigidGridFit, fit_rigid_grid, refine_grid_rigid};
 pub use analysis::tempogram::TempoTrackingOptions;
 pub use core::preanalysis::{
     KeyEstimate, KeyMode, LoudnessMeasurement, PREANALYSIS_VERSION, PreAnalysisArtifact,
