@@ -232,6 +232,12 @@ struct TrackResult {
     beat_amlt: Option<f64>,
     /// Downbeat F-measure at ±70 ms (annotated tracks with downbeats).
     downbeat_f: Option<f64>,
+    /// Mean signed beat error vs annotation, ms (positive = grid late).
+    beat_offset_mean_ms: Option<f64>,
+    /// Standard deviation of the signed beat error, ms (jitter).
+    beat_offset_std_ms: Option<f64>,
+    /// Linear drift of the signed beat error, ms per minute.
+    beat_offset_drift_ms_per_min: Option<f64>,
     /// Ground-truth key in Camelot notation (key-annotated tracks).
     expected_key: Option<String>,
     /// Detected key in Camelot notation (key-annotated tracks; None when
@@ -425,6 +431,59 @@ fn continuity_ratio(detected: &[f64], truth: &[f64]) -> f64 {
     correct as f64 / truth.len() as f64
 }
 
+/// Signed beat-timing diagnostics against an annotation.
+///
+/// For each annotated beat, takes the closest detection within half the
+/// local inter-annotation interval and records the signed error
+/// (detected − truth). Returns `(mean_ms, std_ms, drift_ms_per_min)` —
+/// the numbers that classify a misaligned grid: constant mean with low
+/// std = phase offset, near-zero mean with high std = jitter, large
+/// drift = period error / segment wander. `None` with fewer than 8
+/// matched beats.
+fn beat_offset_stats(detected: &[f64], truth: &[f64]) -> Option<(f64, f64, f64)> {
+    if detected.is_empty() || truth.len() < 2 {
+        return None;
+    }
+    let mut errs: Vec<(f64, f64)> = Vec::new(); // (truth time, signed error) in seconds
+    for (j, &t) in truth.iter().enumerate() {
+        let idx = detected.partition_point(|&d| d < t);
+        let mut best: Option<f64> = None;
+        for cand in [idx.wrapping_sub(1), idx] {
+            if cand < detected.len() {
+                let e = detected[cand] - t;
+                if best.is_none_or(|b: f64| e.abs() < b.abs()) {
+                    best = Some(e);
+                }
+            }
+        }
+        let interval = if j + 1 < truth.len() {
+            truth[j + 1] - truth[j]
+        } else {
+            truth[j] - truth[j - 1]
+        };
+        if let Some(e) = best {
+            if e.abs() <= interval * 0.5 {
+                errs.push((t, e));
+            }
+        }
+    }
+    if errs.len() < 8 {
+        return None;
+    }
+    let n = errs.len() as f64;
+    let mean = errs.iter().map(|(_, e)| e).sum::<f64>() / n;
+    let var = errs.iter().map(|(_, e)| (e - mean).powi(2)).sum::<f64>() / n;
+    let t_mean = errs.iter().map(|(t, _)| t).sum::<f64>() / n;
+    let mut cov = 0.0f64;
+    let mut t_var = 0.0f64;
+    for (t, e) in &errs {
+        cov += (t - t_mean) * (e - mean);
+        t_var += (t - t_mean).powi(2);
+    }
+    let slope = if t_var > 0.0 { cov / t_var } else { 0.0 };
+    Some((mean * 1e3, var.sqrt() * 1e3, slope * 60.0 * 1e3))
+}
+
 /// Allowed metrical-level variants of an annotation: the annotated level,
 /// half density at both phases, and double density.
 fn metrical_variants(truth: &[f64]) -> Vec<Vec<f64>> {
@@ -597,7 +656,7 @@ fn score_file(
         BpmClass::Wrong | BpmClass::Failed => None,
     };
 
-    let (beat_f, beat_cmlt, beat_amlt, downbeat_f) = match annotation {
+    let (beat_f, beat_cmlt, beat_amlt, downbeat_f, offset_stats) = match annotation {
         Some(ann) => {
             let secs = 1.0 / audio.sample_rate as f64;
             let detected: Vec<f64> = artifact
@@ -614,6 +673,7 @@ fn score_file(
             let f = beat_f_measure(&detected, &truth, BEAT_TOLERANCE_SECS);
             let cmlt = continuity_ratio(&detected, &truth);
             let amlt = continuity_ratio_allowed_levels(&detected, &truth);
+            let offset_stats = beat_offset_stats(&detected, &truth);
             let downbeat_f = if ann.downbeats.is_empty() {
                 None
             } else {
@@ -631,9 +691,9 @@ fn score_file(
                     .collect();
                 Some(beat_f_measure(&detected_db, &truth_db, BEAT_TOLERANCE_SECS))
             };
-            (Some(f), Some(cmlt), Some(amlt), downbeat_f)
+            (Some(f), Some(cmlt), Some(amlt), downbeat_f, offset_stats)
         }
-        None => (None, None, None, None),
+        None => (None, None, None, None, None),
     };
 
     let (expected_key, detected_key, key_class, key_confidence) = match expected_key_parsed {
@@ -665,6 +725,9 @@ fn score_file(
         beat_cmlt,
         beat_amlt,
         downbeat_f,
+        beat_offset_mean_ms: offset_stats.map(|(mean, _, _)| mean),
+        beat_offset_std_ms: offset_stats.map(|(_, std, _)| std),
+        beat_offset_drift_ms_per_min: offset_stats.map(|(_, _, drift)| drift),
         expected_key,
         detected_key,
         key_class,
@@ -697,6 +760,17 @@ fn print_metric(result: &TrackResult) {
         fmt_ratio(result.beat_amlt),
         fmt_ratio(result.downbeat_f),
     );
+    if let (Some(mean), Some(std), Some(drift)) = (
+        result.beat_offset_mean_ms,
+        result.beat_offset_std_ms,
+        result.beat_offset_drift_ms_per_min,
+    ) {
+        println!(
+            "METRIC track=\"{}\" beat_offset_mean_ms={:.1} beat_offset_std_ms={:.1} \
+             beat_offset_drift_ms_per_min={:.2}",
+            result.id, mean, std, drift,
+        );
+    }
     if let Some(class) = result.key_class {
         println!(
             "METRIC track=\"{}\" expected_key={} detected_key={} key_class={} key_confidence={}",
@@ -1294,6 +1368,40 @@ fn key_classification() {
         KeyClass::Other
     );
     assert_eq!(classify_key(None, bbm), KeyClass::Failed);
+}
+
+#[test]
+fn beat_offset_stats_classify_failure_modes() {
+    let truth: Vec<f64> = (0..64).map(|k| k as f64 * 0.5).collect();
+
+    // Perfect detection: everything ~0.
+    let (mean, std, drift) = beat_offset_stats(&truth, &truth).unwrap();
+    assert!(mean.abs() < 1e-9 && std < 1e-9 && drift.abs() < 1e-9);
+
+    // Constant +30 ms: offset shows in the mean, not std or drift.
+    let late: Vec<f64> = truth.iter().map(|&t| t + 0.030).collect();
+    let (mean, std, drift) = beat_offset_stats(&late, &truth).unwrap();
+    assert!((mean - 30.0).abs() < 1e-6, "mean {mean}");
+    assert!(std < 1e-6 && drift.abs() < 1e-6);
+
+    // Alternating ±20 ms jitter: near-zero mean, ~20 ms std.
+    let jitter: Vec<f64> = truth
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| t + if i % 2 == 0 { 0.020 } else { -0.020 })
+        .collect();
+    let (mean, std, _) = beat_offset_stats(&jitter, &truth).unwrap();
+    assert!(mean.abs() < 1e-6, "mean {mean}");
+    assert!((std - 20.0).abs() < 1e-6, "std {std}");
+
+    // 0.1% period error: drift dominates. err(t) = 0.001*t, slope
+    // 0.001 s/s = 60 ms/min.
+    let stretched: Vec<f64> = truth.iter().map(|&t| t * 1.001).collect();
+    let (_, _, drift) = beat_offset_stats(&stretched, &truth).unwrap();
+    assert!((drift - 60.0).abs() < 1.0, "drift {drift}");
+
+    // Too few beats: no stats.
+    assert!(beat_offset_stats(&truth[..4], &truth[..4]).is_none());
 }
 
 #[test]

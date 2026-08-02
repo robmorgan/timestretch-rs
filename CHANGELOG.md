@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Rigid beat grids for quantized material: `analyze_for_dj` now fits a
+  constant-BPM grid (small BPM search around the tracked tempo × full
+  phase circle, scored by kick-band onset energy) and adopts it when the
+  phase fit is decisive, replacing the tracked beats. Live/drifting
+  material keeps the tracked grid (a tempo ramp never adopts). Corpus
+  beat F-measure rose from 71.5% to 93.8% and downbeat F from 20.7% to
+  76.4%; adopted grids align to the annotations at sub-millisecond mean
+  offset. Public API: `fit_rigid_grid`, `refine_grid_rigid`,
+  `RigidGridFit`; `AnalysisReport::rigid_grid_adopted` reports the
+  decision and `timestretch-cli analyze` prints it.
+
+### QA
+
+- Signed beat-offset diagnostics in the BPM accuracy harness: per-track
+  mean/std/drift of the signed beat error vs annotations
+  (`beat_offset_mean_ms`, `beat_offset_std_ms`,
+  `beat_offset_drift_ms_per_min`), distinguishing constant phase offset
+  from jitter from period drift.
+
 ## 0.9.1
 
 ### Added
