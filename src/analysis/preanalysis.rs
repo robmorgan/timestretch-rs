@@ -156,6 +156,9 @@ pub fn analyze_for_dj_with_report(
         source_len_samples: samples.len(),
         content_hash: hash_samples(samples),
         key: detect_key(samples, sample_rate),
+        // Loudness needs the original interleaved channels (BS.1770 sums
+        // per-channel energies); callers fill it via measure_loudness.
+        loudness: None,
     };
 
     (artifact, report)

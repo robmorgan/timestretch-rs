@@ -314,8 +314,12 @@ fn run_analyze(args: &[String]) {
     );
 
     let analysis_signal = timestretch::downmix_to_mid(&buffer.data, buffer.channels.count());
-    let (artifact, report) =
+    let (mut artifact, report) =
         timestretch::analyze_for_dj_with_report(&analysis_signal, buffer.sample_rate);
+    // Loudness is measured on the original interleaved channels, not the
+    // mono analysis downmix (BS.1770 sums per-channel energies).
+    artifact.loudness =
+        timestretch::measure_loudness(&buffer.data, buffer.channels.count(), buffer.sample_rate);
 
     eprintln!(
         "Analysis: {:.1} BPM, confidence {:.2}, {} beats, {} onsets ({:.3}s)",
@@ -334,6 +338,13 @@ fn run_analyze(args: &[String]) {
         ),
         None => eprintln!("Key: undetected"),
     }
+    match &artifact.loudness {
+        Some(l) => eprintln!(
+            "Loudness: {:.1} LUFS integrated, {:.1} dBTP, LRA {:.1} LU",
+            l.integrated_lufs, l.true_peak_dbtp, l.loudness_range_lu
+        ),
+        None => eprintln!("Loudness: unmeasured (silent input)"),
+    }
 
     if verbose {
         println!("METRIC odf_median={:.6}", report.odf_median);
@@ -351,6 +362,11 @@ fn run_analyze(args: &[String]) {
             println!("METRIC key={}", key.name());
             println!("METRIC key_camelot={}", key.camelot());
             println!("METRIC key_confidence={:.3}", key.confidence);
+        }
+        if let Some(l) = &artifact.loudness {
+            println!("METRIC integrated_lufs={:.2}", l.integrated_lufs);
+            println!("METRIC true_peak_dbtp={:.2}", l.true_peak_dbtp);
+            println!("METRIC loudness_range_lu={:.2}", l.loudness_range_lu);
         }
     }
 
