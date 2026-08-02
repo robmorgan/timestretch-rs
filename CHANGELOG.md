@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.10.0
+
+### Added
+
+- `MomentaryLoudness`: a real-time-safe streaming BS.1770-4 momentary
+  (400 ms) loudness meter. Construction allocates; the
+  `push_stereo`/`process`/`momentary_lufs`/`reset` paths never allocate,
+  lock, or panic, so the meter can live inside an audio callback (e.g.
+  per-deck LUFS meters in a DJ mixer). Silence and insufficient data
+  report the finite floor `MomentaryLoudness::SILENCE_LUFS` (-100.0)
+  instead of -inf.
+
 ## 0.9.1
 
 ### Added
