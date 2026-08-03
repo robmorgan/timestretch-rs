@@ -60,11 +60,7 @@ struct Render {
     process_secs: f64,
 }
 
-fn render_stream(
-    input: &[f32],
-    channels: usize,
-    rate_at: &dyn Fn(f64) -> f64,
-) -> Render {
+fn render_stream(input: &[f32], channels: usize, rate_at: &dyn Fn(f64) -> f64) -> Render {
     let handles = Engine::build(EngineConfig {
         sample_rate: SAMPLE_RATE,
         channels,
@@ -216,7 +212,11 @@ fn zero_crossing_freq(window: &[f32]) -> Option<f64> {
     for i in 1..window.len() {
         let (a, b) = (window[i - 1] as f64, window[i] as f64);
         if a <= 0.0 && b > 0.0 {
-            let frac = if (b - a).abs() > 1e-12 { -a / (b - a) } else { 0.0 };
+            let frac = if (b - a).abs() > 1e-12 {
+                -a / (b - a)
+            } else {
+                0.0
+            };
             let t = (i - 1) as f64 + frac;
             if first.is_none() {
                 first = Some(t);
@@ -290,10 +290,8 @@ fn main() {
     let warmup = (WARMUP_SECS * SAMPLE_RATE as f64) as usize;
 
     // --- Timbre: timing-invariant mean spectrum similarity ---
-    let spec_slow =
-        mean_spectral_similarity(&segment_mid, &slow_mid[warmup..], FFT_SIZE, HOP_SIZE);
-    let spec_fast =
-        mean_spectral_similarity(&segment_mid, &fast_mid[warmup..], FFT_SIZE, HOP_SIZE);
+    let spec_slow = mean_spectral_similarity(&segment_mid, &slow_mid[warmup..], FFT_SIZE, HOP_SIZE);
+    let spec_fast = mean_spectral_similarity(&segment_mid, &fast_mid[warmup..], FFT_SIZE, HOP_SIZE);
 
     // --- Transients ---
     let (tf1_slow, exp_slow, found_slow) = transient_f1(&segment_mid, &slow_mid, RATE_SLOW);
