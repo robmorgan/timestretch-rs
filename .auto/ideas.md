@@ -35,3 +35,9 @@
   sample-exact low band. Splice system now has a complete causal map:
   cadence=physics, placement=quiet-graded-gate (won), target=nominal (fixed),
   protection/postponement=always loses, fade=96 amplitude-complementary.
+- Held-out-rate audit (#56): ±3%/±10% (never tuned on) all in-family; spec
+  smooth in |rate−1|, no cadence resonance with scored rates. Track B's F1
+  floor exists even at +3% → dense-disco/detector interaction, material-
+  inherent, not splice damage.
+- ALL generalization axes audited: tracks(4), rates(held-out), callback
+  sizes(bit-exact), stereo side, rides(0.9974). Session fully characterized.
