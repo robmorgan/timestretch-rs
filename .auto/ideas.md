@@ -41,3 +41,7 @@
   inherent, not splice damage.
 - ALL generalization axes audited: tracks(4), rates(held-out), callback
   sizes(bit-exact), stereo side, rides(0.9974). Session fully characterized.
+- Tape-profile audit (#57): streaming varispeed = 0.9992-0.9994 spec sim vs
+  ideal 32-lobe offline resample at every rate. Resampler transparent on real
+  material; the theoretical top-octave droop of the 16-half-tap kernel is a
+  non-issue. Coverage now closed on BOTH engine profiles.
