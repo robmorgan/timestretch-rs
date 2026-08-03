@@ -10,4 +10,4 @@ pub mod phase_locking;
 pub mod phase_vocoder;
 
 pub use phase_locking::PhaseLockingMode;
-pub use phase_vocoder::{PerFrameFlux, PhaseVocoder};
+pub use phase_vocoder::PhaseVocoder;

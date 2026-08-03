@@ -258,6 +258,72 @@ Subjective checks:
 
 ---
 
+## 11. In-Repo Empirical Findings (2026-03 Autoresearch, Legacy Streaming Engine)
+
+Provenance: an automated research loop (March 2026) optimized the old
+`StreamProcessor` streaming path — PV-only, later deleted in the Stage 9 engine
+cutover (d44bb7e, 2026-07-15). Its scores were measured against the also-deleted
+`qa/streaming_quality.rs` benchmark (0–1000 composite; plateaued at ~969.7).
+The full experiment logs and exhaustive parameter sweeps live in git history at
+`autoresearch.md` / `autoresearch.ideas.md` (last version: commit b732b6f). The
+sweeps tuned a gain-compensation mechanism that no longer exists and are
+intentionally not carried forward. The durable findings below were re-checked
+against the current engine (SOLA + varispeed live path; batch PV only as the
+offline wide-ratio fallback, `src/engine/offline.rs`) in August 2026.
+
+### Verified against the current engine (2026-08)
+
+- **PV energy loss is phase-modification destructive interference, not a
+  normalization bug.** Legacy: streaming PV output at ~35–50% input RMS.
+  Re-verified on the offline wide path (`stretch()` at 1.30×, `normalize`
+  off): broadband content drops to 0.64–0.68× input RMS (kick pattern, EDM
+  mix) while a pure sine keeps 0.99×, confirming the coherence mechanism.
+  The engine-graph path (1.10×, SOLA + varispeed) shows no deficit
+  (0.93–1.00×). Mitigation today is the opt-in `params.normalize` RMS match;
+  there is no spectral gain-compensation stage, by design.
+- **Envelope preservation does not measurably affect time-stretch quality;
+  it matters for pitch shift.** The current architecture embodies this:
+  spectral-envelope correction runs only on the pitch-shift/formant path
+  (`src/lib.rs`, gated on `pitch_factor != 1.0`); the offline wide PV
+  constructs with envelope preservation off.
+
+### Partially reproduced (2026-08)
+
+- **Phase-locking mode ranking (legacy: ROI ≥ Identity > Selective).** On the
+  current offline wide path at 1.30× scored against RubberBand references,
+  the result is mixed: RegionOfInfluence improves spectral-flux similarity
+  (kick 0.69 → 0.79, EDM mix 0.79 → 0.83) and nudges spectral/perceptual
+  similarity up, but regresses transient onset match (kick 1.00 → 0.89,
+  EDM 0.95 → 0.89). No clear winner; `Identity` remains the wide-path
+  choice. Revisit only with a listening pass.
+
+### Not reproduced in isolation (2026-08)
+
+- **"Transient phase resets hurt harmonic quality" (legacy: −52 points).**
+  Isolated test on the current PV (streaming entry point, Identity locking,
+  2048/512, steady harmonic chord, periodic `reset_phase_state()`): output
+  re-seeds phase but shows no level dips or spectral degradation
+  (similarity 0.9995 vs the no-reset run). The legacy harm was evidently an
+  interaction with the deleted engine's scheduling/overlap machinery, not a
+  universal PV law. Treat as historical, engine-specific guidance; the reset
+  machinery in `phase_vocoder.rs` is currently dormant (no callers).
+
+### Historical (died with the streaming PV engine — kept as context)
+
+- Adaptive phase-locking **mode switching** mid-stream caused phase
+  discontinuities and hurt quality. (No adaptive switching exists today.)
+- PV preserved high frequencies better than WSOLA; WSOLA lost highs on
+  transient material. (WSOLA is deleted; the SOLA high-band corrector is the
+  current time-domain analog, chosen after listening passes rejected a
+  small-FFT PV corrector as phasey — see `src/engine/stages/keylock.rs`.)
+- Architectural limits of the streaming PV that motivated the engine rewrite:
+  EDM 1.5× centroid shift (broadband 300–3000 Hz loss indistinguishable
+  per-chunk from percussive loss), chunk-boundary effects on harmonic
+  content, and a structural quality gap between streaming PV and the batch
+  hybrid segmentation it was scored against.
+
+---
+
 ## Sources
 
 ### Patents / Patent Records
