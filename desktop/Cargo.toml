@@ -23,3 +23,14 @@ env_logger = "0.11"
 [profile.release]
 opt-level = 2
 lto = "thin"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.4"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"
+objc2-quartz-core = "0.3.2"
+
+[dev-dependencies]
+raw-window-handle = "0.6"
