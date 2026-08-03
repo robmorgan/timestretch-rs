@@ -29,6 +29,9 @@ const MUSIC_PATH: &str =
 /// Second scored track (different material: disco-house, 120 BPM) so the
 /// score is not fit to a single track's splice timing.
 const MUSIC_PATH_B: &str = "benchmarks/audio/bpm-corpus/14220825_Hot Stuff_(Original Mix).wav";
+/// Third scored track (pop-dance, 116 BPM): broader material coverage.
+const MUSIC_PATH_C: &str =
+    "benchmarks/audio/bpm-corpus/15836669_Cold Heart_(PNAU Extended Mix).wav";
 const SAMPLE_RATE: u32 = 44_100;
 const CALLBACK_FRAMES: usize = 256;
 
@@ -333,6 +336,7 @@ fn main() {
     // --- Scored stretch renders on both tracks ---
     let a = score_track(MUSIC_PATH);
     let b = score_track(MUSIC_PATH_B);
+    let c = score_track(MUSIC_PATH_C);
 
     // --- Track A extras: identity, music ride, sine ride ---
     let ride = |t: f64| 1.0 + 0.08 * (2.0 * std::f64::consts::PI * 0.25 * t).sin();
@@ -367,22 +371,24 @@ fn main() {
     let clicks = a
         .clicks
         .max(b.clicks)
+        .max(c.clicks)
         .max(clicks_per_million(&a.segment_mid, &ride_mid));
 
     let underruns = a.underruns
         + b.underruns
+        + c.underruns
         + identity.underrun_frames
         + music_ride.underrun_frames
         + sine_ride.underrun_frames;
 
-    let media_secs = a.media_secs + b.media_secs + MUSIC_SECS as f64;
-    let proc_secs = a.process_secs + b.process_secs + music_ride.process_secs;
+    let media_secs = a.media_secs + b.media_secs + c.media_secs + MUSIC_SECS as f64;
+    let proc_secs = a.process_secs + b.process_secs + c.process_secs + music_ride.process_secs;
     let realtime_x = media_secs / proc_secs;
 
     // --- Composite quality score (0-100, higher is better) ---
     let mean4 = |x: &[f64; 4]| 0.25 * (x[0] + x[1] + x[2] + x[3]);
-    let spec_score = 0.5 * (mean4(&a.spec) + mean4(&b.spec));
-    let transient_score = 0.5 * (mean4(&a.tf1) + mean4(&b.tf1));
+    let spec_score = (mean4(&a.spec) + mean4(&b.spec) + mean4(&c.spec)) / 3.0;
+    let transient_score = (mean4(&a.tf1) + mean4(&b.tf1) + mean4(&c.tf1)) / 3.0;
     let pitch_score = (-p95_cents / 10.0).exp();
     let click_score = (-clicks / 50.0).exp();
     let quality = 100.0
@@ -409,6 +415,14 @@ fn main() {
     println!(
         "B tf1  slow={:.4} fast={:.4} slow2={:.4} fast2={:.4}",
         b.tf1[0], b.tf1[1], b.tf1[2], b.tf1[3]
+    );
+    println!(
+        "C spec slow={:.4} fast={:.4} slow2={:.4} fast2={:.4}",
+        c.spec[0], c.spec[1], c.spec[2], c.spec[3]
+    );
+    println!(
+        "C tf1  slow={:.4} fast={:.4} slow2={:.4} fast2={:.4}",
+        c.tf1[0], c.tf1[1], c.tf1[2], c.tf1[3]
     );
     println!("identity_corr={identity_corr:.4} (latency-aligned frame-wise spectral sim)");
     println!("pitch p95={p95_cents:.2}c max={max_cents:.2}c");
