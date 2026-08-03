@@ -29,3 +29,8 @@
 - Graded quiet gate closed (#43 final): window/asymmetry/endpoint/local-cap
   variants all worse. Its +0.05c pitch cost trades inherently against its F1
   gain through the same 1.0-1.2×avg gate range — composite-optimal as kept.
+- Quiet-gap overshoot failed (#49) with clean theory: the read cursor's home
+  must be NOMINAL — any parked offset mistimes post-gap attacks against the
+  sample-exact low band. Splice system now has a complete causal map:
+  cadence=physics, placement=quiet-graded-gate (won), target=nominal (fixed),
+  protection/postponement=always loses, fade=96 amplitude-complementary.
