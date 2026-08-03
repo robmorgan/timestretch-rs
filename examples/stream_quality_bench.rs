@@ -372,6 +372,11 @@ fn main() {
     // Pitch stability.
     let (p95_cents, max_cents) = cents_stats(&sine_ride.output, 440.0);
 
+    // Ride timbre preservation (monitored, not scored): timing-invariant
+    // mean-spectrum similarity survives the time-varying rate map.
+    let ride_spec =
+        mean_spectral_similarity(&a.segment_mid, &ride_mid[warmup..], FFT_SIZE, HOP_SIZE);
+
     // Clicks (worst across every music render).
     let clicks = a
         .clicks
@@ -452,4 +457,5 @@ fn main() {
     println!("METRIC clicks_per_m={clicks:.1}");
     println!("METRIC underruns={underruns}");
     println!("METRIC realtime_x={realtime_x:.1}");
+    println!("METRIC ride_spec={ride_spec:.4}");
 }
