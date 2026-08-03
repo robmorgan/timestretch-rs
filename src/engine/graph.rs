@@ -103,6 +103,9 @@ pub struct EngineProcessor {
     discarded_frames: u64,
     /// Remaining declick fade-in frames after priming.
     declick_remaining: u32,
+    /// Set while the output sits in an underrun gap: the next real frames
+    /// fade in via the declick ramp instead of stepping out of silence.
+    underrun_declick_pending: bool,
     /// Timestamped retargets awaiting their output frame, sorted ascending.
     pending_retargets: [(u64, f64); MAX_PENDING_RETARGETS],
     pending_retarget_len: usize,
@@ -174,6 +177,7 @@ impl EngineProcessor {
             prime_source_frames: 0.0,
             discarded_frames: 0,
             declick_remaining: 0,
+            underrun_declick_pending: false,
             pending_retargets: [(0, 1.0); MAX_PENDING_RETARGETS],
             pending_retarget_len: 0,
         }
@@ -275,6 +279,7 @@ impl EngineProcessor {
         self.stage_in_frames = 0;
         self.delivered_frames = 0;
         self.underrun_total = 0;
+        self.underrun_declick_pending = false;
         if let Some(cursor) = self.transient.as_mut() {
             cursor.reset();
         }
@@ -476,11 +481,30 @@ impl EngineProcessor {
         self.fill_out_fifo(needed_samples);
 
         let popped = self.out_fifo.pop_slice(out);
+        // Resuming from an underrun gap: ramp the fresh media in via the
+        // declick fade instead of stepping straight out of silence.
+        if popped > 0 && self.underrun_declick_pending {
+            self.underrun_declick_pending = false;
+            self.declick_remaining = DECLICK_FRAMES;
+        }
         if popped < needed_samples {
+            // Fade the real tail into the silence gap: an un-ramped edge
+            // steps by the full signal amplitude (audible click on every
+            // dropout). The mirrored fade-in is armed above for recovery.
+            let real_frames = popped / self.channels;
+            let fade = real_frames.min(DECLICK_FRAMES as usize);
+            for k in 0..fade {
+                let frame = real_frames - fade + k;
+                let gain = 1.0 - (k + 1) as f32 / (fade + 1) as f32;
+                for ch in 0..self.channels {
+                    out[frame * self.channels + ch] *= gain;
+                }
+            }
             out[popped..].fill(0.0);
             let missing_frames = ((needed_samples - popped) / self.channels) as u64;
             self.underrun_total += missing_frames;
             self.shared.add_underrun_frames(missing_frames);
+            self.underrun_declick_pending = true;
         }
         // Post-priming declick: a short linear fade-in on the first real
         // frames after a warm start.
@@ -748,6 +772,51 @@ mod tests {
         source.push(&vec![0.5f32; 4096]);
         processor.process(&mut out);
         assert!(out.iter().any(|&s| s != 0.0), "must recover after refill");
+    }
+
+    #[test]
+    fn underrun_boundaries_are_declicked() {
+        // A dropout mid-tone must not step the output harder than the
+        // tone's own slew: the real tail fades into the silence gap and
+        // the resume fades back in (see `render_chunk`).
+        let handles = Engine::build(EngineConfig {
+            channels: 1,
+            profile: EngineProfile::Tape,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let (mut processor, mut source) = (handles.processor, handles.source);
+
+        let tone = sine(330.0, 44_100.0, 44_100);
+        let mut fed = 0usize;
+        let mut out = vec![0.0f32; 256];
+        let mut collected = Vec::new();
+        // 1) Stream normally, 2) starve for 8 callbacks, 3) resume.
+        for phase in 0..3 {
+            let callbacks = [40usize, 8, 40][phase];
+            for _ in 0..callbacks {
+                if phase != 1 {
+                    while source.occupied_frames() < source.demand_hint(256, 4.0)
+                        && fed < tone.len()
+                    {
+                        let end = (fed + 1024).min(tone.len());
+                        fed += source.push(&tone[fed..end]);
+                    }
+                }
+                processor.process(&mut out);
+                collected.extend_from_slice(&out);
+            }
+        }
+        // Test-helper sine has unit amplitude.
+        let slew = (2.0 * std::f64::consts::PI * 330.0 / 44_100.0) as f32;
+        let worst = collected[2048..]
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst <= slew * 1.5,
+            "dropout boundary clicked: step {worst:.4} vs tone slew {slew:.4}"
+        );
     }
 
     #[test]
