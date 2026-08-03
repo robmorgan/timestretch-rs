@@ -32,6 +32,10 @@ const MUSIC_PATH_B: &str = "benchmarks/audio/bpm-corpus/14220825_Hot Stuff_(Orig
 /// Third scored track (pop-dance, 116 BPM): broader material coverage.
 const MUSIC_PATH_C: &str =
     "benchmarks/audio/bpm-corpus/15836669_Cold Heart_(PNAU Extended Mix).wav";
+/// Fourth scored track (vocal-heavy funky house): vocals are a texture the
+/// first three tracks under-represent.
+const MUSIC_PATH_D: &str =
+    "benchmarks/audio/bpm-corpus/15650709_Somebody To Love_(Extended Mix).wav";
 const SAMPLE_RATE: u32 = 44_100;
 const CALLBACK_FRAMES: usize = 256;
 
@@ -337,6 +341,7 @@ fn main() {
     let a = score_track(MUSIC_PATH);
     let b = score_track(MUSIC_PATH_B);
     let c = score_track(MUSIC_PATH_C);
+    let d = score_track(MUSIC_PATH_D);
 
     // --- Track A extras: identity, music ride, sine ride ---
     let ride = |t: f64| 1.0 + 0.08 * (2.0 * std::f64::consts::PI * 0.25 * t).sin();
@@ -372,11 +377,13 @@ fn main() {
         .clicks
         .max(b.clicks)
         .max(c.clicks)
+        .max(d.clicks)
         .max(clicks_per_million(&a.segment_mid, &ride_mid));
 
     let underruns = a.underruns
         + b.underruns
         + c.underruns
+        + d.underruns
         + identity.underrun_frames
         + music_ride.underrun_frames
         + sine_ride.underrun_frames;
@@ -387,8 +394,8 @@ fn main() {
 
     // --- Composite quality score (0-100, higher is better) ---
     let mean4 = |x: &[f64; 4]| 0.25 * (x[0] + x[1] + x[2] + x[3]);
-    let spec_score = (mean4(&a.spec) + mean4(&b.spec) + mean4(&c.spec)) / 3.0;
-    let transient_score = (mean4(&a.tf1) + mean4(&b.tf1) + mean4(&c.tf1)) / 3.0;
+    let spec_score = (mean4(&a.spec) + mean4(&b.spec) + mean4(&c.spec) + mean4(&d.spec)) / 4.0;
+    let transient_score = (mean4(&a.tf1) + mean4(&b.tf1) + mean4(&c.tf1) + mean4(&d.tf1)) / 4.0;
     let pitch_score = (-p95_cents / 10.0).exp();
     let click_score = (-clicks / 50.0).exp();
     let quality = 100.0
@@ -423,6 +430,14 @@ fn main() {
     println!(
         "C tf1  slow={:.4} fast={:.4} slow2={:.4} fast2={:.4}",
         c.tf1[0], c.tf1[1], c.tf1[2], c.tf1[3]
+    );
+    println!(
+        "D spec slow={:.4} fast={:.4} slow2={:.4} fast2={:.4}",
+        d.spec[0], d.spec[1], d.spec[2], d.spec[3]
+    );
+    println!(
+        "D tf1  slow={:.4} fast={:.4} slow2={:.4} fast2={:.4}",
+        d.tf1[0], d.tf1[1], d.tf1[2], d.tf1[3]
     );
     println!("identity_corr={identity_corr:.4} (latency-aligned frame-wise spectral sim)");
     println!("pitch p95={p95_cents:.2}c max={max_cents:.2}c");
