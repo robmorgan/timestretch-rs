@@ -229,7 +229,7 @@ const FINE_SEARCH_STEPS: isize = 4;
 /// Candidate-region energy above this multiple of the rolling average reads
 /// as a transient: postpone the splice until [`HARD_TRIGGER`]. Online
 /// fallback — artifact onsets take precedence when present.
-const TRANSIENT_POSTPONE_RATIO: f64 = 1.8;
+const TRANSIENT_POSTPONE_RATIO: f64 = 3.0;
 /// Protection window around an artifact onset, in frames: a splice fade
 /// must not overlap `[onset - PRE, onset + POST]` in either the outgoing
 /// or incoming read span (the attack must come from one uncut read).
