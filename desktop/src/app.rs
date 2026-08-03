@@ -660,7 +660,17 @@ impl eframe::App for TimeStretchApp {
         // the playhead the same way even while paused, so it keeps the
         // repaint loop alive too.
         if transport == Transport::Playing || scrub_phase != ScrubPhase::Idle {
-            ctx.request_repaint();
+            // Experiment lever: TIMESTRETCH_REPAINT_MS paces repaints on a
+            // timer instead of every vsync, to test whether a steady
+            // sub-max present cadence makes ProMotion settle into a stable
+            // rate without a display mode switch.
+            match std::env::var("TIMESTRETCH_REPAINT_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                Some(ms) => ctx.request_repaint_after(std::time::Duration::from_millis(ms)),
+                None => ctx.request_repaint(),
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
