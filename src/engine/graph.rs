@@ -106,6 +106,11 @@ pub struct EngineProcessor {
     /// Set while the output sits in an underrun gap: the next real frames
     /// fade in via the declick ramp instead of stepping out of silence.
     underrun_declick_pending: bool,
+    /// Last emitted output frame (per channel): a reset ramps this to zero
+    /// over the next callback so a mid-play seek cuts without a click.
+    last_frame: Vec<f32>,
+    /// Remaining release-ramp frames after a reset.
+    release_remaining: u32,
     /// Timestamped retargets awaiting their output frame, sorted ascending.
     pending_retargets: [(u64, f64); MAX_PENDING_RETARGETS],
     pending_retarget_len: usize,
@@ -178,6 +183,8 @@ impl EngineProcessor {
             discarded_frames: 0,
             declick_remaining: 0,
             underrun_declick_pending: false,
+            last_frame: vec![0.0; channels],
+            release_remaining: 0,
             pending_retargets: [(0, 1.0); MAX_PENDING_RETARGETS],
             pending_retarget_len: 0,
         }
@@ -202,6 +209,9 @@ impl EngineProcessor {
             self.run_priming(budget);
             if self.prime_source_frames > 0.0 {
                 out.fill(0.0);
+                // The release ramp must still play over the priming
+                // silence, or a mid-play seek into a long prime clicks.
+                self.apply_release_ramp(&mut out[..whole]);
                 self.shared
                     .publish_position(self.priming_position(), self.delivered_frames);
                 return;
@@ -280,6 +290,10 @@ impl EngineProcessor {
         self.delivered_frames = 0;
         self.underrun_total = 0;
         self.underrun_declick_pending = false;
+        // Arm the release ramp from the last pre-reset frame (kept across
+        // the reset): a mid-play seek then cuts click-free. At cold start
+        // the held frame is zero and the ramp is a no-op.
+        self.release_remaining = DECLICK_FRAMES;
         if let Some(cursor) = self.transient.as_mut() {
             cursor.reset();
         }
@@ -520,7 +534,36 @@ impl EngineProcessor {
                 self.declick_remaining -= 1;
             }
         }
+        // Post-reset release ramp: bleed the pre-seek output's last frame
+        // to zero so the cut edge never steps (a mid-play seek otherwise
+        // clicks at the full signal amplitude).
+        self.apply_release_ramp(out);
+        // Remember the newest emitted frame for the next reset's ramp.
+        let frames = needed_samples / self.channels;
+        if frames > 0 {
+            for ch in 0..self.channels {
+                self.last_frame[ch] = out[(frames - 1) * self.channels + ch];
+            }
+        }
         self.delivered_frames += (needed_samples / self.channels) as u64;
+    }
+
+    /// Superimposes the post-reset release ramp (pre-seek last frame
+    /// bleeding to zero) onto `out`. No-op once the ramp has run out.
+    fn apply_release_ramp(&mut self, out: &mut [f32]) {
+        if self.release_remaining == 0 {
+            return;
+        }
+        for frame in 0..out.len() / self.channels {
+            if self.release_remaining == 0 {
+                break;
+            }
+            let gain = self.release_remaining as f32 / DECLICK_FRAMES as f32;
+            for ch in 0..self.channels {
+                out[frame * self.channels + ch] += self.last_frame[ch] * gain;
+            }
+            self.release_remaining -= 1;
+        }
     }
 
     /// Advances source through the graph until the output FIFO holds at least
@@ -817,6 +860,60 @@ mod tests {
             worst <= slew * 1.5,
             "dropout boundary clicked: step {worst:.4} vs tone slew {slew:.4}"
         );
+    }
+
+    #[test]
+    fn seek_boundaries_are_declicked() {
+        // A warm-start seek mid-tone must not step the output harder than
+        // the tone's own slew on either side of the cut: the pre-seek tail
+        // release-ramps to zero and the post-prime onset declicks in.
+        for profile in [EngineProfile::Keylock, EngineProfile::Tape] {
+            let handles = Engine::build(EngineConfig {
+                channels: 1,
+                profile,
+                ..EngineConfig::default()
+            })
+            .unwrap();
+            let (controller, mut processor, mut source) =
+                (handles.controller, handles.processor, handles.source);
+            source.set_track_position(0);
+            let track = sine(330.0, 44_100.0, 44_100 * 4);
+            let mut fed = 0usize;
+            let mut out = vec![0.0f32; 256];
+            let mut collected = Vec::new();
+            for _ in 0..170 {
+                while source.occupied_frames() < source.demand_hint(256, 4.0) && fed < track.len() {
+                    let end = (fed + 1024).min(track.len());
+                    fed += source.push(&track[fed..end]);
+                }
+                processor.process(&mut out);
+                collected.extend_from_slice(&out);
+            }
+            // Seek to 2 s (mid-waveform), preroll fed from ahead of it.
+            let preroll = processor.warm_start_preroll_frames();
+            processor.reset();
+            let mut fed2 = 44_100 * 2 - preroll;
+            source.set_track_position(fed2 as u64);
+            controller.warm_start(preroll as u32);
+            for _ in 0..100 {
+                while source.occupied_frames() < source.demand_hint(256, 4.0) && fed2 < track.len()
+                {
+                    let end = (fed2 + 1024).min(track.len());
+                    fed2 += source.push(&track[fed2..end]);
+                }
+                processor.process(&mut out);
+                collected.extend_from_slice(&out);
+            }
+            let slew = (2.0 * std::f64::consts::PI * 330.0 / 44_100.0) as f32;
+            let worst = collected[166 * 256..]
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst <= slew * 1.5,
+                "{profile:?}: seek boundary clicked: step {worst:.4} vs tone slew {slew:.4}"
+            );
+        }
     }
 
     #[test]
