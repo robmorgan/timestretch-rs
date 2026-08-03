@@ -26,3 +26,6 @@
   regular splices, not because of forced ones.
 - Confirmed robust this iteration: side-channel spec 0.95–0.98 (lockstep
   splices preserve image), output bit-invariant across callback sizes 64–1024.
+- Graded quiet gate closed (#43 final): window/asymmetry/endpoint/local-cap
+  variants all worse. Its +0.05c pitch cost trades inherently against its F1
+  gain through the same 1.0-1.2×avg gate range — composite-optimal as kept.
