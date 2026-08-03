@@ -68,3 +68,8 @@
 - Soak audit (#65): 30 min looped-music stream with ride+nudges — underruns 0,
   NaN 0, per-minute RMS stable to 0.2%. No slow drift/leak/level bugs.
   Stability axis closed. All audit axes in the ledger are now green.
+- Offline regression audit (#67): #58's tail-fade provably does NOT touch
+  offline stretch() output (worktree A/B bit-identical). Pre-existing minor
+  tail rolloff at speedup ratios (last 64 samples ~0.62x at ratio 1.08) is
+  upstream offline-drain behavior — possible tiny future item, out of the
+  streaming session's scope.
