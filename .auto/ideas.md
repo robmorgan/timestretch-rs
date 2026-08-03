@@ -81,3 +81,7 @@
   inconsistent (fixes HF tails with 1.27x overshoot, LF still collapses —
   mirror-seam phase reversal defeats correlation matching). Deferred with
   experimental confirmation. NOT a session regression (bit-identical pre-#58).
+- WCET audit (#70): strict 1× local gate — keylock@64 p99.9=0.062 vs 0.5
+  bound (8× headroom). Session's audio-thread additions cost no meaningful
+  callback budget. Audit ledger final: every constraint class green at its
+  strictest available setting.
