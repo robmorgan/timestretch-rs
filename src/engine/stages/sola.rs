@@ -465,8 +465,10 @@ impl SolaCorrector {
             } else if at_rest && settled_drift.abs() > REST_SPLICE_DRIFT {
                 // At sustained rest a parked drift comb-filters the
                 // crossover overlap against the low band's fixed delay;
-                // recenter cleanly.
-                self.try_splice(drift, onsets);
+                // recenter cleanly (bounded: the landing must actually
+                // recenter, or the splice is skipped and the trim bleeds
+                // the drift instead).
+                self.try_rest_splice(drift, onsets);
             }
         }
 
@@ -540,14 +542,33 @@ impl SolaCorrector {
     /// apply until the drift is critical.
     fn try_splice(&mut self, drift: f64, onsets: &[OnsetEvent]) {
         let force = drift.abs() >= HARD_TRIGGER;
-        let _ = self.plan_splice(drift, force, onsets);
+        let _ = self.plan_splice(drift, force, f64::INFINITY, onsets);
+    }
+
+    /// Rest-recenter splice: only candidates that actually bring the lag
+    /// back under the rest threshold qualify. Without this bound, highly
+    /// periodic content lets the zero-jump candidate win on correlation
+    /// (it is literally the same audio) and the corrector enters a limit
+    /// cycle of no-op splices — hundreds of pointless fades per second
+    /// with the drift (and its seam de-phasing) parked forever, while the
+    /// per-splice sub-sample refinement cancels the rest trim's bleed.
+    /// When no candidate qualifies the splice is skipped and the trim
+    /// converges the drift unimpeded.
+    fn try_rest_splice(&mut self, drift: f64, onsets: &[OnsetEvent]) {
+        let _ = self.plan_splice(drift, false, REST_SPLICE_DRIFT, onsets);
     }
 
     /// Plans and starts a correlation-matched splice toward the nominal
     /// lag; unless `force`, a landing region that reads as a transient
     /// postpones it, and candidates whose fade would overlap an artifact
     /// onset's protection window are excluded from the search.
-    fn plan_splice(&mut self, drift: f64, force: bool, onsets: &[OnsetEvent]) -> bool {
+    fn plan_splice(
+        &mut self,
+        drift: f64,
+        force: bool,
+        max_residual: f64,
+        onsets: &[OnsetEvent],
+    ) -> bool {
         // Outgoing span: the fade also reads from the current cursor.
         if !force && self.span_hits_onset(onsets, self.read_pos) {
             return false;
@@ -568,6 +589,12 @@ impl SolaCorrector {
         let a_sq = dot_f64(&self.corr_a, &self.corr_a);
         mix_channels(&self.channels, a0 + lo, &mut self.corr_b);
         for jump in lo..=hi {
+            // Residual-drift bound (rest splices): the landing must leave
+            // the lag within `max_residual` of nominal or the splice is
+            // pointless damage.
+            if (drift - jump as f64).abs() > max_residual {
+                continue;
+            }
             let candidate = base + jump as f64;
             if !self.readable_span(candidate, CORR_WINDOW + XFADE_FRAMES) {
                 continue;

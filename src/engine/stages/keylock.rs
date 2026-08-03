@@ -210,6 +210,82 @@ mod tests {
     }
 
     #[test]
+    fn rest_recenter_never_degenerates_into_noop_splices() {
+        // Regression (autoresearch #62): on highly periodic content the
+        // rest-recenter splice search used to let the zero-jump candidate
+        // win on correlation (identical audio), freezing the parked drift
+        // in a limit cycle of ~500 no-op fades per second — the crossover
+        // seam stayed de-phased forever. Reproduced deterministically at
+        // 48 kHz with a 135 Hz seam tone under a dominant 880 Hz; the
+        // bounded rest splice (residual < REST_SPLICE_DRIFT) plus the
+        // rest trim must recover the seam level after the nudge.
+        let sr = 48_000u32;
+        let srf = sr as f64;
+        let seam_hz = 135.0;
+        let mut stage = KeylockStage::new(sr, 1);
+        let (mut ps, mut ph) = (0.0f64, 0.0f64);
+        let mut block = BlockBuf::new(1);
+        let mut collected = Vec::new();
+        let total_blocks = (8.0 * srf / BLOCK_FRAMES as f64) as usize;
+        for bi in 0..total_blocks {
+            let t = (bi * BLOCK_FRAMES) as f64 / srf;
+            let rate = if t < 2.0 {
+                1.0
+            } else if t < 2.2 {
+                1.0 + 0.04 * (t - 2.0) / 0.2
+            } else if t < 2.3 {
+                1.04
+            } else if t < 2.5 {
+                1.04 - 0.04 * (t - 2.3) / 0.2
+            } else {
+                1.0
+            };
+            for s in block.channel_mut(0).iter_mut() {
+                ps += 2.0 * std::f64::consts::PI * seam_hz * rate / srf;
+                ph += 2.0 * std::f64::consts::PI * 880.0 * rate / srf;
+                *s = 0.15 * ps.sin() as f32 + 0.5 * ph.sin() as f32;
+            }
+            let ctx = StageCtx {
+                embedded_rate: rate,
+                embedded_rate_slope: 0.0,
+                onsets: &[],
+                modulation_hold: false,
+                has_artifact: false,
+                keylock: 1.0,
+            };
+            stage.process(&mut block, &ctx);
+            collected.extend_from_slice(block.channel(0));
+        }
+        let goertzel = |lo: usize, hi: usize| -> f64 {
+            let w = 2.0 * std::f64::consts::PI * seam_hz / srf;
+            let coeff = 2.0 * w.cos();
+            let (mut s1, mut s2) = (0.0f64, 0.0f64);
+            for &x in &collected[lo..hi] {
+                let s0 = x as f64 + coeff * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            (s1 * s1 + s2 * s2 - coeff * s1 * s2) / ((hi - lo) as f64 / 2.0).powi(2)
+        };
+        let sru = sr as usize;
+        let baseline = goertzel(sru, 2 * sru);
+        let after = goertzel(6 * sru, 8 * sru);
+        let loss_db = 10.0 * (after / baseline).log10();
+        // And the splice count must be bounded: the old limit cycle fired
+        // ~500/s indefinitely (thousands over this run).
+        let splices = stage.sola.splice_count();
+        println!("48k seam: post-nudge {loss_db:+.2} dB, {splices} splices");
+        assert!(
+            loss_db > -1.5,
+            "48 kHz seam level did not recover: {loss_db:+.2} dB"
+        );
+        assert!(
+            splices < 400,
+            "rest splices degenerated: {splices} splices over 8 s"
+        );
+    }
+
+    #[test]
     fn seam_level_recovers_after_a_nudge() {
         // A platter nudge drifts SOLA's elastic cursor; if that drift PARKS
         // after the nudge, the high band stays time-shifted against the low
