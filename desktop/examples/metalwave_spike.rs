@@ -349,7 +349,14 @@ mod metalwave {
     }
 
     fn render_loop(st: SendState) {
-        let interval = st.refresh_interval;
+        // METALWAVE_INTERVAL_MS overrides the present cadence, to measure
+        // how the adaptive panel delivers a steady sub-max demand.
+        let interval = std::env::var("METALWAVE_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|ms| ms / 1000.0)
+            .unwrap_or(st.refresh_interval);
+        println!("metal: presenting every {:.2}ms", interval * 1000.0);
         let started = CACurrentMediaTime();
         // Presented-time feedback from the compositor, via
         // addPresentedHandler blocks (fired on a CoreAnimation thread).
