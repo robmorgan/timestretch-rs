@@ -56,7 +56,8 @@
   shortfall callback → tail-fade always applies). Verified by forced exact
   N×256 unity feed + natural drain, both 1.0× slew. Defensive code
   deliberately omitted. Boundary defect class CLOSED with proof.
-- Sample-rate audit (#61): ride pitch identical at 44.1/48/96k (p95 0.40-0.46c).
-  Residual risk documented: seam/bass at 96k on real music unmeasurable
-  without hi-rate corpus (CORR_WINDOW covers 0.4 periods of the 120Hz band
-  bottom at 96k). If hi-rate material lands, run the seam-nudge scenario at 96k.
+- Sample-rate audit (#61) + seam follow-up (#62): ride pitch identical at
+  44.1/48/96k. Chasing the hi-rate seam residual synthetically uncovered a
+  GENERAL rest-recenter limit cycle (zero-jump splices on periodic content,
+  500 no-op fades/s, permanent −2.4 dB seam loss) — FIXED with bounded rest
+  splices + 48k regression test. Seam now +0.00 dB at all three rates.
