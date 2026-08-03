@@ -168,17 +168,24 @@ impl BandPeaks {
         Self { levels }
     }
 
-    /// The level whose bucket density best matches `px_per_sec`: the
-    /// finest level whose buckets are at least one pixel wide (largest
+    /// Index of the level whose bucket density best matches `px_per_sec`:
+    /// the finest level whose buckets are at least one pixel wide (largest
     /// `buckets_per_sec <= px_per_sec`), so bars never go sub-pixel. When
     /// the view is coarser than every level (zoomed way out), the coarsest
-    /// level is the best available.
-    pub fn level_for(&self, px_per_sec: f32) -> &PeakLevel {
+    /// level is the best available. An index rather than a reference so it
+    /// can also key the rasterized tile cache.
+    pub fn level_index_for(&self, px_per_sec: f32) -> usize {
         self.levels
             .iter()
-            .filter(|l| l.buckets_per_sec <= px_per_sec as f64)
-            .max_by(|a, b| a.buckets_per_sec.total_cmp(&b.buckets_per_sec))
-            .unwrap_or_else(|| self.levels.last().unwrap())
+            .enumerate()
+            .filter(|(_, l)| l.buckets_per_sec <= px_per_sec as f64)
+            .max_by(|(_, a), (_, b)| a.buckets_per_sec.total_cmp(&b.buckets_per_sec))
+            .map(|(i, _)| i)
+            .unwrap_or(self.levels.len() - 1)
+    }
+
+    pub fn level(&self, idx: usize) -> &PeakLevel {
+        &self.levels[idx]
     }
 
     /// The coarsest level (≤ ~1024 buckets), used for the overview texture.
@@ -276,13 +283,14 @@ mod tests {
     #[test]
     fn level_for_picks_finest_level_with_pixel_wide_buckets() {
         let peaks = BandPeaks::compute(&test_signal(60.0), 2, 44_100);
+        let density = |px: f32| peaks.level(peaks.level_index_for(px)).buckets_per_sec;
         // Levels: 150, 75, 37.5, 18.75, ~9.4 buckets/s.
-        assert_eq!(peaks.level_for(200.0).buckets_per_sec, 150.0);
-        assert_eq!(peaks.level_for(150.0).buckets_per_sec, 150.0);
-        assert_eq!(peaks.level_for(100.0).buckets_per_sec, 75.0);
-        assert_eq!(peaks.level_for(40.0).buckets_per_sec, 37.5);
+        assert_eq!(density(200.0), 150.0);
+        assert_eq!(density(150.0), 150.0);
+        assert_eq!(density(100.0), 75.0);
+        assert_eq!(density(40.0), 37.5);
         // Below the coarsest density: the coarsest level is the closest fit.
-        assert_eq!(peaks.level_for(1.0).buckets_per_sec, 9.375);
+        assert_eq!(density(1.0), 9.375);
     }
 
     #[test]

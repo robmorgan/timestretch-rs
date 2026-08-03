@@ -1,14 +1,17 @@
 //! Zoomed scrolling waveform: playhead fixed at horizontal center, the
-//! track scrolls underneath. 3-band bars are tessellated per frame from
-//! the pyramid level closest to one bucket per pixel (the content moves
-//! every frame, so a texture would need constant re-upload; a few thousand
-//! rects at the 30 fps repaint cap is cheaper). Beat/downbeat edge ticks,
-//! loop overlay, and drag-to-scrub.
+//! track scrolls underneath. 3-band bars are rasterized into track-space
+//! texture tiles from the pyramid level closest to one bucket per pixel,
+//! cached per (level, tile), so a frame of scrolling is just a few textured
+//! quads at subpixel offsets — cheap enough to repaint at full display
+//! rate. Beat/downbeat edge ticks, loop overlay, and drag-to-scrub stay
+//! immediate-mode on top.
+
+use std::collections::HashMap;
 
 use eframe::egui;
 
-use super::peaks::BandPeaks;
-use super::{GridMarks, overlay_plan, paint_placeholder, palette};
+use super::peaks::{BandPeaks, PeakLevel};
+use super::{GridMarks, overlay_plan, paint_placeholder, palette, render_columns};
 
 /// View height in points.
 const VIEW_HEIGHT: f32 = 160.0;
@@ -87,6 +90,80 @@ impl ZoomSpan {
     }
 }
 
+/// Buckets per cached tile.
+const TILE_BUCKETS: usize = 512;
+/// Tile texture height in pixels (2x the 160pt view for retina crispness).
+const TILE_TEX_HEIGHT: usize = 320;
+/// Tile cache cap. A viewport spans ~4 tiles, so this comfortably holds
+/// the active zoom level plus a few recently visited ones.
+const TILE_CACHE_CAP: usize = 32;
+
+/// Cache of rasterized waveform tiles for the zoomed view, keyed by
+/// (pyramid level, tile index). Tiles live in track space, so scrolling
+/// never invalidates them — they rasterize once when first visible and
+/// evict least-recently-used. Must be cleared when the track (peaks)
+/// changes.
+#[derive(Default)]
+pub struct ZoomedTiles {
+    tiles: HashMap<(usize, usize), CachedTile>,
+    /// Monotonic paint counter stamping tile use, for LRU eviction.
+    clock: u64,
+}
+
+struct CachedTile {
+    tex: egui::TextureHandle,
+    last_used: u64,
+}
+
+impl ZoomedTiles {
+    /// Drop every tile (the peaks they rasterized are gone).
+    pub fn clear(&mut self) {
+        self.tiles.clear();
+    }
+
+    /// The texture for tile `tile_idx` of pyramid level `level_idx`,
+    /// rasterizing it on first use.
+    fn get_or_render(
+        &mut self,
+        ctx: &egui::Context,
+        level: &PeakLevel,
+        level_idx: usize,
+        tile_idx: usize,
+    ) -> egui::TextureId {
+        let clock = self.clock;
+        let entry = self.tiles.entry((level_idx, tile_idx)).or_insert_with(|| {
+            let b0 = tile_idx * TILE_BUCKETS;
+            let b1 = ((tile_idx + 1) * TILE_BUCKETS).min(level.num_buckets());
+            CachedTile {
+                tex: ctx.load_texture(
+                    format!("wave_tile_{level_idx}_{tile_idx}"),
+                    render_columns(level, b0..b1, TILE_TEX_HEIGHT),
+                    egui::TextureOptions::LINEAR,
+                ),
+                last_used: clock,
+            }
+        });
+        entry.last_used = clock;
+        let id = entry.tex.id();
+        if self.tiles.len() > TILE_CACHE_CAP {
+            self.evict_lru();
+        }
+        id
+    }
+
+    /// Drop the least-recently-used tile; never one stamped this paint.
+    fn evict_lru(&mut self) {
+        if let Some((&key, _)) = self
+            .tiles
+            .iter()
+            .filter(|(_, t)| t.last_used < self.clock)
+            .min_by_key(|(_, t)| t.last_used)
+        {
+            self.tiles.remove(&key);
+        }
+    }
+}
+
 /// Drag lifecycle of the zoomed view, for audible scrubbing.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScrubGesture {
@@ -115,6 +192,7 @@ pub fn paint_zoomed(
     ui: &mut egui::Ui,
     params: ZoomedParams<'_>,
     span: &mut ZoomSpan,
+    tiles: &mut ZoomedTiles,
 ) -> Option<ScrubGesture> {
     let desired_size = egui::vec2(ui.available_width(), VIEW_HEIGHT);
     let (response, painter) = ui.allocate_painter(desired_size, egui::Sense::drag());
@@ -137,34 +215,30 @@ pub fn paint_zoomed(
     let end_frame = start_frame + span_frames;
     let frame_to_x = |frame: f64| rect.left() + ((frame - start_frame) * px_per_frame) as f32;
 
-    // 3-band bars from the pyramid level nearest one bucket per pixel.
-    let level = peaks.level_for((px_per_frame * params.sample_rate as f64) as f32);
+    // 3-band bars from the pyramid level nearest one bucket per pixel,
+    // via cached track-space tiles: each visible tile is one textured quad
+    // at a subpixel offset, scissored to the panel rect.
+    let level_idx = peaks.level_index_for((px_per_frame * params.sample_rate as f64) as f32);
+    let level = peaks.level(level_idx);
     let frames_per_bucket = params.sample_rate as f64 / level.buckets_per_sec;
     let first_bucket = (start_frame / frames_per_bucket).floor().max(0.0) as usize;
     let last_bucket = ((end_frame / frames_per_bucket).ceil() as usize).min(level.num_buckets());
-    let center_y = rect.center().y;
-    let half_height = rect.height() * 0.45;
-    let band_colors = [palette::BAND_LOW, palette::BAND_MID, palette::BAND_HIGH];
-    for b in first_bucket..last_bucket {
-        let x0 = frame_to_x(b as f64 * frames_per_bucket).max(rect.left());
-        let x1 = frame_to_x((b + 1) as f64 * frames_per_bucket).min(rect.right());
-        if x1 <= x0 {
-            continue;
-        }
-        // Low paints last (on top): see overview::render_level.
-        for (band, &color) in band_colors.iter().enumerate().rev() {
-            let pos = level.pos[band][b].clamp(0.0, 1.0);
-            let neg = level.neg[band][b].clamp(-1.0, 0.0);
-            if pos == 0.0 && neg == 0.0 {
-                continue;
-            }
-            painter.rect_filled(
+    tiles.clock += 1;
+    if first_bucket < last_bucket {
+        let clipped = painter.with_clip_rect(rect);
+        let full_uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        for t in first_bucket / TILE_BUCKETS..=(last_bucket - 1) / TILE_BUCKETS {
+            let b0 = t * TILE_BUCKETS;
+            let b1 = ((t + 1) * TILE_BUCKETS).min(level.num_buckets());
+            let tex = tiles.get_or_render(ui.ctx(), level, level_idx, t);
+            clipped.image(
+                tex,
                 egui::Rect::from_min_max(
-                    egui::pos2(x0, center_y - pos * half_height),
-                    egui::pos2(x1, center_y - neg * half_height),
+                    egui::pos2(frame_to_x(b0 as f64 * frames_per_bucket), rect.top()),
+                    egui::pos2(frame_to_x(b1 as f64 * frames_per_bucket), rect.bottom()),
                 ),
-                0.0,
-                color,
+                full_uv,
+                egui::Color32::WHITE,
             );
         }
     }
@@ -264,4 +338,55 @@ pub fn paint_zoomed(
         return Some(ScrubGesture::Drag(-(dx as f64) / px_per_frame));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A level with per-bucket variation so rendered tiles are non-trivial.
+    fn synthetic_level(buckets: usize) -> PeakLevel {
+        PeakLevel {
+            buckets_per_sec: 150.0,
+            pos: std::array::from_fn(|band| {
+                (0..buckets)
+                    .map(|b| ((b + band) % 7) as f32 / 7.0)
+                    .collect()
+            }),
+            neg: std::array::from_fn(|band| {
+                (0..buckets)
+                    .map(|b| -(((b + band) % 5) as f32) / 5.0)
+                    .collect()
+            }),
+        }
+    }
+
+    #[test]
+    fn tile_cache_reuses_rendered_tiles() {
+        let ctx = egui::Context::default();
+        let level = synthetic_level(2 * TILE_BUCKETS);
+        let mut tiles = ZoomedTiles::default();
+        tiles.clock += 1;
+        let first = tiles.get_or_render(&ctx, &level, 0, 1);
+        tiles.clock += 1;
+        let again = tiles.get_or_render(&ctx, &level, 0, 1);
+        assert_eq!(first, again);
+        assert_eq!(tiles.tiles.len(), 1);
+    }
+
+    #[test]
+    fn tile_cache_evicts_lru_at_cap() {
+        let ctx = egui::Context::default();
+        let total = TILE_CACHE_CAP + 8;
+        let level = synthetic_level(total * TILE_BUCKETS);
+        let mut tiles = ZoomedTiles::default();
+        for t in 0..total {
+            tiles.clock += 1;
+            tiles.get_or_render(&ctx, &level, 0, t);
+            assert!(tiles.tiles.len() <= TILE_CACHE_CAP);
+        }
+        // The most recent tile survives; the oldest was evicted.
+        assert!(tiles.tiles.contains_key(&(0, total - 1)));
+        assert!(!tiles.tiles.contains_key(&(0, 0)));
+    }
 }

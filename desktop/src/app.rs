@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use crate::audio_engine::AudioEngine;
 use crate::deck;
@@ -10,7 +11,7 @@ use crate::decoder;
 use crate::state::*;
 use crate::waveform::{
     self, BandPeaks, GridMarks, OverviewParams, OverviewTexture, ScrubGesture, ZoomSpan,
-    ZoomedParams,
+    ZoomedParams, ZoomedTiles,
 };
 
 const MIN_STRETCH_RATIO: f64 = 0.25;
@@ -56,10 +57,154 @@ fn grid_loop_span(g: &timestretch::BeatGrid, anchor: usize, beats: f64) -> f64 {
     }
 }
 
+/// How far past a stalled anchor the smoother keeps coasting, in seconds.
+/// A couple of audio buffers: long enough to glide across normal publish
+/// gaps, short enough that an underrun freezes the display quickly.
+const PLAYHEAD_MAX_COAST_SECS: f64 = 0.15;
+/// Prediction errors within this many seconds of travel are measurement
+/// noise: publish-latency jitter, and the engine's splice-aligned source
+/// consumption — keylock splices land on beats, so tracking them literally
+/// makes the waveform lurch every couple of beats even though the audio is
+/// seamless. In-band errors bleed off slowly under a velocity cap instead
+/// of being followed.
+const PLAYHEAD_NOISE_BAND_SECS: f64 = 0.08;
+/// Time constant of the in-band correction.
+const PLAYHEAD_NOISE_TAU_SECS: f64 = 0.4;
+/// In-band correction speed cap, as a fraction of the nominal velocity:
+/// the scroll rate never visibly deviates while an error bleeds off.
+const PLAYHEAD_NOISE_MAX_DEVIATION: f64 = 0.04;
+/// Out-of-band errors are real events (stall, drift) and correct fast.
+const PLAYHEAD_CORRECTION_TAU_SECS: f64 = 0.08;
+/// Prediction error beyond this many seconds of travel — in either
+/// direction — is a discontinuity (seek, loop wrap) and snaps instead of
+/// gliding.
+const PLAYHEAD_SNAP_TRAVEL_SECS: f64 = 0.2;
+
+/// Wall-clock smoother for the painted playhead.
+///
+/// The published playhead only moves when the audio callback consumes a
+/// buffer, and the UI samples that on its own unsynchronized cadence — so
+/// the raw value stair-steps by whole audio buffers at a beat frequency the
+/// eye reads as jitter in the scrolling waveform. While playback runs at a
+/// known rate, extrapolate from the last observed step at that rate and
+/// correct the residual error away exponentially.
+struct PlayheadSmoother {
+    /// Raw playhead at the last observed change.
+    last_raw: usize,
+    /// Extrapolation anchor: the raw playhead when it last changed, and when.
+    anchor_frame: f64,
+    anchor_time: Instant,
+    /// Smoothed position handed to the painters.
+    displayed: f64,
+    last_tick: Instant,
+}
+
+impl PlayheadSmoother {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_raw: 0,
+            anchor_frame: 0.0,
+            anchor_time: now,
+            displayed: 0.0,
+            last_tick: now,
+        }
+    }
+
+    /// Pin the display to `raw` while smoothing is inactive (paused,
+    /// stopped, or a scrub gesture owns the position).
+    fn reset(&mut self, raw: usize, now: Instant) {
+        self.last_raw = raw;
+        self.anchor_frame = raw as f64;
+        self.anchor_time = now;
+        self.displayed = raw as f64;
+        self.last_tick = now;
+    }
+
+    /// Advance the smoothed playhead: `raw` is the shared atomic's current
+    /// value, `rate` the nominal playback speed in source frames per wall
+    /// second (negative while a scrub glide moves backward). Returns the
+    /// position to paint.
+    fn tick(&mut self, raw: usize, rate: f64, now: Instant) -> f64 {
+        // Clamp so a long gap between paints (hidden window) can't teleport.
+        let dt = (now - self.last_tick).as_secs_f64().min(0.1);
+        self.last_tick = now;
+        if raw != self.last_raw {
+            // Backward steps get no special casing: the error ladder below
+            // classifies them by size like any other discrepancy. A splice-
+            // sized re-publish (the keylock engine can report a slightly
+            // earlier source position around a splice) stays inside the
+            // noise band and bleeds off invisibly — snapping the display
+            // backward for it was a visible twitch-right-and-recover. Loop
+            // wraps and seeks are far bigger and still snap.
+            if raw < self.last_raw {
+                log::debug!("playhead: backward raw step {} frames", self.last_raw - raw);
+            }
+            self.last_raw = raw;
+            self.anchor_frame = raw as f64;
+            self.anchor_time = now;
+        }
+        let coast = (now - self.anchor_time)
+            .as_secs_f64()
+            .min(PLAYHEAD_MAX_COAST_SECS);
+        let predicted = self.anchor_frame + rate * coast;
+        self.displayed += rate * dt;
+        let error = predicted - self.displayed;
+        let travel = rate.abs().max(1.0);
+        if error.abs() > travel * PLAYHEAD_SNAP_TRAVEL_SECS {
+            log::debug!("playhead: snap, error {error:.0} frames");
+            self.displayed = predicted;
+        } else if error.abs() > travel * PLAYHEAD_NOISE_BAND_SECS {
+            log::debug!("playhead: out-of-band error {error:.0} frames");
+            self.displayed += error * (1.0 - (-dt / PLAYHEAD_CORRECTION_TAU_SECS).exp());
+        } else {
+            let step = error * (1.0 - (-dt / PLAYHEAD_NOISE_TAU_SECS).exp());
+            let cap = travel * dt * PLAYHEAD_NOISE_MAX_DEVIATION;
+            self.displayed += step.clamp(-cap, cap);
+        }
+        self.displayed
+    }
+}
+
+/// Per-frame snapshot of the shared state, read under a single lock at the
+/// top of `update`. The paint path consumes this instead of re-locking:
+/// the mutex is shared with the deck thread, and repeated per-frame
+/// acquisitions risk blocking long enough to miss the 120 Hz present
+/// deadline (one skipped vsync slot reads as a scroll twitch).
+#[derive(Clone, Copy)]
+struct FrameState {
+    transport: Transport,
+    sample_rate: u32,
+    total_frames: usize,
+    /// Raw published playhead this frame (the smoothed one is
+    /// `TimeStretchApp::display_pos`).
+    position_frames: usize,
+    detected_bpm: f64,
+    loop_region: Option<(usize, usize)>,
+    loop_in: Option<usize>,
+}
+
+impl FrameState {
+    fn duration_secs(&self) -> f64 {
+        if self.sample_rate == 0 {
+            return 0.0;
+        }
+        self.total_frames as f64 / self.sample_rate as f64
+    }
+
+    fn position_secs(&self) -> f64 {
+        if self.sample_rate == 0 {
+            return 0.0;
+        }
+        self.position_frames as f64 / self.sample_rate as f64
+    }
+}
+
 pub struct TimeStretchApp {
     state: SharedStateHandle,
     position: Arc<AtomicPosition>,
     stream_active: Arc<AtomicBool>,
+    /// Output volume shared lock-free with the audio callback.
+    volume_shared: Arc<AtomicVolume>,
     /// Audible-scrub handshake with the audio callback and deck thread.
     scrub: Arc<ScrubState>,
     /// Pointer-implied source frame while a waveform drag is in progress.
@@ -67,6 +212,10 @@ pub struct TimeStretchApp {
     /// Last consumed glide-landing sequence number; each new one fires the
     /// engine warm-start seek that primes in parallel with the glide.
     landing_seq_seen: u64,
+    /// Wall-clock extrapolator that de-jitters the buffer-quantized playhead.
+    playhead_smoother: PlayheadSmoother,
+    /// Smoothed playhead the painters draw, refreshed every `update`.
+    display_pos: f64,
 
     // Audio engine (lives for the lifetime of the app)
     audio_engine: Option<AudioEngine>,
@@ -90,6 +239,8 @@ pub struct TimeStretchApp {
     overview_texture: Option<OverviewTexture>,
     /// Zoomed-view span state (bars/seconds preset).
     zoom_span: ZoomSpan,
+    /// Cached zoomed-view waveform tiles, cleared on track load.
+    zoom_tiles: ZoomedTiles,
 
     /// Beat grid detected on load; drives grid-accurate beat jumps.
     beat_grid: Option<timestretch::BeatGrid>,
@@ -160,9 +311,12 @@ impl TimeStretchApp {
             state,
             position,
             stream_active,
+            volume_shared: Arc::new(AtomicVolume::new(0.8)),
             scrub: Arc::new(ScrubState::new()),
             scrub_pos: None,
             landing_seq_seen: 0,
+            playhead_smoother: PlayheadSmoother::new(Instant::now()),
+            display_pos: 0.0,
             audio_engine,
             output_sample_rate,
             source_audio: None,
@@ -173,6 +327,7 @@ impl TimeStretchApp {
             band_peaks: None,
             overview_texture: None,
             zoom_span: ZoomSpan::default(),
+            zoom_tiles: ZoomedTiles::default(),
             beat_grid: None,
             grid_marks: GridMarks::empty(),
             stretch_ratio: 1.0,
@@ -225,6 +380,7 @@ impl TimeStretchApp {
                     sample_rate,
                 ));
                 self.overview_texture = None;
+                self.zoom_tiles.clear();
 
                 // Detect the beat grid from the channel-aware buffer
                 // (stereo-safe): BPM for the tempo fader plus beat and
@@ -261,7 +417,6 @@ impl TimeStretchApp {
                     st.target_bpm = bpm.max(0.0);
                     st.transport = Transport::Stopped;
                     st.stretch_ratio = self.stretch_ratio;
-                    st.volume = self.volume;
                     st.preset = self.preset;
                     st.pre_analysis = None;
                     st.loop_region = None;
@@ -347,8 +502,9 @@ impl TimeStretchApp {
         let warm_start_preroll = handles.processor.warm_start_preroll_frames();
 
         let reset_request = Arc::new(AtomicBool::new(false));
+        self.volume_shared.store(self.volume);
         let engine = match AudioEngine::new(
-            self.state.clone(),
+            self.volume_shared.clone(),
             self.stream_active.clone(),
             Some(sample_rate),
             handles.processor,
@@ -432,6 +588,7 @@ impl TimeStretchApp {
 
 impl eframe::App for TimeStretchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let frame_start = Instant::now();
         // Scrub glide bookkeeping. During a settle the voice owns the
         // moving position, so mirror it into the shared playhead; and each
         // newly published landing fires the parallel engine warm-start.
@@ -445,21 +602,61 @@ impl eframe::App for TimeStretchApp {
             self.request_seek(landing as usize);
         }
 
-        // Sync position from atomic counter
+        // Sync position from the atomic counter and snapshot everything the
+        // paint path needs under one lock.
         let pos_frames = self.position.load();
-        {
+        let fs = {
             let mut st = self.state.lock().unwrap();
             st.position_frames = pos_frames;
-        }
+            FrameState {
+                transport: st.transport,
+                sample_rate: st.sample_rate,
+                total_frames: st.total_frames,
+                position_frames: pos_frames,
+                detected_bpm: st.detected_bpm,
+                loop_region: st.loop_region,
+                loop_in: st.loop_in,
+            }
+        };
+        let (transport, sample_rate) = (fs.transport, fs.sample_rate);
 
-        // Repaint at ~30 fps while playing — enough for a smooth playhead.
-        // An uncapped request_repaint() redraws at full display rate
-        // (120 Hz on ProMotion) and profiled as ~90% of the app's CPU.
-        // A scrub glide animates the playhead the same way even while
-        // paused, so it keeps the repaint loop alive too.
-        let transport = self.state.lock().unwrap().transport;
+        // The painted playhead: while the engine is streaming steadily (or
+        // a scrub release glide is running), extrapolate between the
+        // buffer-quantized published positions so the waveform scrolls at
+        // wall-clock speed instead of stair-stepping at the audio-buffer/
+        // UI-frame beat frequency. The glide extrapolates with the voice's
+        // published rate, and the smoother carries its state across the
+        // Settling → Idle handoff so the voice → engine position mismatch
+        // bleeds off instead of stepping. A drag (pointer owns the display)
+        // and paused/stopped pin the display to the raw value.
+        let smoothing_rate = match scrub_phase {
+            ScrubPhase::Idle
+                if transport == Transport::Playing
+                    && self.stream_active.load(Ordering::Relaxed) =>
+            {
+                Some(sample_rate as f64 / self.stretch_ratio.max(MIN_STRETCH_RATIO))
+            }
+            ScrubPhase::Settling => Some(self.scrub.voice_rate() * self.output_sample_rate as f64),
+            _ => None,
+        };
+        self.display_pos = match smoothing_rate {
+            Some(rate) => self
+                .playhead_smoother
+                .tick(pos_frames, rate, Instant::now()),
+            None => {
+                self.playhead_smoother.reset(pos_frames, Instant::now());
+                pos_frames as f64
+            }
+        };
+        // Repaint at full display rate while playing: vsync-paced, so the
+        // extrapolated playhead lands on screen at even intervals. This was
+        // ~90% of the app's CPU when the zoomed view tessellated thousands
+        // of rects per frame; with the tile cache a frame is a few textured
+        // quads, so the uncapped loop is affordable. A scrub glide animates
+        // the playhead the same way even while paused, so it keeps the
+        // repaint loop alive too.
         if transport == Transport::Playing || scrub_phase != ScrubPhase::Idle {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            ctx.request_repaint();
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -473,20 +670,36 @@ impl eframe::App for TimeStretchApp {
             }
 
             // File panel
-            self.file_panel(ui);
+            self.file_panel(ui, &fs);
             ui.add_space(8.0);
 
             // Deck waveforms
-            self.deck_panel(ui);
+            self.deck_panel(ui, &fs);
             ui.add_space(8.0);
 
             // Transport
-            self.transport_panel(ui);
+            self.transport_panel(ui, &fs);
             ui.add_space(12.0);
 
             // Controls
-            self.controls_panel(ui);
+            self.controls_panel(ui, &fs);
         });
+
+        // Frame-pacing measurement harness: run with
+        // `RUST_LOG=timestretch_desktop=trace` and diff consecutive `us`
+        // stamps — gaps of ~2 vsync slots are missed present deadlines,
+        // which the eye reads as scroll twitches during pursuit. `cpu_us`
+        // is this update's CPU cost (layout + tessellation submission);
+        // misses without a slow cpu_us are downstream (wakeup/GPU).
+        log::trace!(
+            "frame raw={pos_frames} disp={:.1} cpu_us={} us={}",
+            self.display_pos,
+            frame_start.elapsed().as_micros(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros()
+        );
     }
 
     fn on_exit(&mut self) {
@@ -495,7 +708,7 @@ impl eframe::App for TimeStretchApp {
 }
 
 impl TimeStretchApp {
-    fn file_panel(&mut self, ui: &mut egui::Ui) {
+    fn file_panel(&mut self, ui: &mut egui::Ui, fs: &FrameState) {
         ui.horizontal(|ui| {
             if ui.button("Load Audio File").clicked()
                 && let Some(path) = rfd::FileDialog::new()
@@ -509,14 +722,13 @@ impl TimeStretchApp {
                 ui.separator();
                 ui.label(&self.file_name);
 
-                let st = self.state.lock().unwrap();
                 ui.separator();
-                ui.label(format!("{} Hz", st.sample_rate));
+                ui.label(format!("{} Hz", fs.sample_rate));
                 ui.separator();
-                ui.label(format!("{:.1}s", st.duration_secs()));
+                ui.label(format!("{:.1}s", fs.duration_secs()));
                 ui.separator();
-                if st.detected_bpm > 0.0 {
-                    ui.label(format!("{:.1} BPM", st.detected_bpm));
+                if fs.detected_bpm > 0.0 {
+                    ui.label(format!("{:.1} BPM", fs.detected_bpm));
                 } else {
                     ui.label("BPM: --");
                 }
@@ -527,17 +739,9 @@ impl TimeStretchApp {
     /// CDJ-style deck display: zoomed scrolling waveform on top, beat
     /// counter + zoom controls in a thin row, full-track overview strip
     /// below.
-    fn deck_panel(&mut self, ui: &mut egui::Ui) {
-        let (total_frames, pos_frames, sample_rate, loop_region, loop_in) = {
-            let st = self.state.lock().unwrap();
-            (
-                st.total_frames,
-                st.position_frames,
-                st.sample_rate,
-                st.loop_region,
-                st.loop_in,
-            )
-        };
+    fn deck_panel(&mut self, ui: &mut egui::Ui, fs: &FrameState) {
+        let (total_frames, sample_rate, loop_region, loop_in) =
+            (fs.total_frames, fs.sample_rate, fs.loop_region, fs.loop_in);
 
         // Zoomed scrolling view; dragging scrubs audibly relative to the
         // pointer. During the drag the UI owns the displayed position and
@@ -549,13 +753,14 @@ impl TimeStretchApp {
             ZoomedParams {
                 peaks: self.band_peaks.as_ref(),
                 marks: &self.grid_marks,
-                position_frames: pos_frames as f64,
+                position_frames: self.display_pos,
                 total_frames,
                 sample_rate,
                 loop_region,
                 loop_in,
             },
             &mut self.zoom_span,
+            &mut self.zoom_tiles,
         );
         match gesture {
             Some(ScrubGesture::Drag(delta_frames)) if total_frames > 0 => {
@@ -565,7 +770,9 @@ impl TimeStretchApp {
                     if self.scrub.phase() == ScrubPhase::Settling {
                         self.scrub.voice_frame()
                     } else {
-                        pos_frames as f64
+                        // Anchor the grab to the smoothed position actually
+                        // on screen, not the buffer-quantized raw playhead.
+                        self.display_pos
                     }
                 });
                 let target = (base + delta_frames).clamp(0.0, (total_frames - 1) as f64);
@@ -600,7 +807,7 @@ impl TimeStretchApp {
 
         // Counter row: bar.beat readout, beat segments, zoom controls.
         ui.horizontal(|ui| {
-            waveform::paint_beat_counter(ui, &self.grid_marks, pos_frames as f64);
+            waveform::paint_beat_counter(ui, &self.grid_marks, self.display_pos);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("+").clicked() {
                     self.zoom_span.zoom_in();
@@ -624,7 +831,7 @@ impl TimeStretchApp {
             self.overview_texture = Some(OverviewTexture::from_peaks(ui.ctx(), peaks));
         }
         let progress = if total_frames > 0 {
-            pos_frames as f32 / total_frames as f32
+            (self.display_pos / total_frames as f64) as f32
         } else {
             0.0
         };
@@ -663,11 +870,9 @@ impl TimeStretchApp {
         }
     }
 
-    fn transport_panel(&mut self, ui: &mut egui::Ui) {
-        let (transport, pos_secs, duration_secs) = {
-            let st = self.state.lock().unwrap();
-            (st.transport, st.position_secs(), st.duration_secs())
-        };
+    fn transport_panel(&mut self, ui: &mut egui::Ui, fs: &FrameState) {
+        let (transport, pos_secs, duration_secs) =
+            (fs.transport, fs.position_secs(), fs.duration_secs());
 
         ui.horizontal(|ui| {
             let play_label = match transport {
@@ -699,26 +904,23 @@ impl TimeStretchApp {
             ));
         });
 
-        self.loop_and_jump_panel(ui);
+        self.loop_and_jump_panel(ui, fs);
     }
 
     /// Beat-jump buttons and loop controls (manual in/out/exit plus a
     /// grid-quantized auto-loop with a halve/double length ladder). Jumps
     /// and loop wraps go through the processing thread's warm-start
     /// machinery.
-    fn loop_and_jump_panel(&mut self, ui: &mut egui::Ui) {
+    fn loop_and_jump_panel(&mut self, ui: &mut egui::Ui, fs: &FrameState) {
         let has_audio = self.source_audio.is_some();
-        let (pos_frames, total_frames, bpm, sample_rate, loop_region, loop_in) = {
-            let st = self.state.lock().unwrap();
-            (
-                st.position_frames,
-                st.total_frames,
-                st.detected_bpm,
-                st.sample_rate,
-                st.loop_region,
-                st.loop_in,
-            )
-        };
+        let (pos_frames, total_frames, bpm, sample_rate, loop_region, loop_in) = (
+            fs.position_frames,
+            fs.total_frames,
+            fs.detected_bpm,
+            fs.sample_rate,
+            fs.loop_region,
+            fs.loop_in,
+        );
 
         ui.horizontal(|ui| {
             // Beat jumps: relative seeks by whole beats on the detected
@@ -872,7 +1074,7 @@ impl TimeStretchApp {
         });
     }
 
-    fn controls_panel(&mut self, ui: &mut egui::Ui) {
+    fn controls_panel(&mut self, ui: &mut egui::Ui, fs: &FrameState) {
         egui::Grid::new("controls_grid")
             .num_columns(2)
             .spacing([16.0, 8.0])
@@ -880,7 +1082,7 @@ impl TimeStretchApp {
                 // Tempo control. With a detected BPM it is a CDJ-style tempo
                 // fader in BPM (0.1-BPM steps, centered on the track tempo);
                 // otherwise it falls back to a raw stretch-ratio slider.
-                let detected = self.state.lock().unwrap().detected_bpm;
+                let detected = fs.detected_bpm;
                 ui.label("Tempo:");
                 ui.horizontal(|ui| {
                     if detected > 0.0 {
@@ -930,7 +1132,7 @@ impl TimeStretchApp {
                 ui.end_row();
 
                 // BPM panel
-                let detected_bpm = self.state.lock().unwrap().detected_bpm;
+                let detected_bpm = fs.detected_bpm;
                 ui.label("BPM:");
                 ui.horizontal(|ui| {
                     if detected_bpm > 0.0 {
@@ -1023,7 +1225,7 @@ impl TimeStretchApp {
                             .custom_formatter(|v, _| format!("{}%", (v * 100.0) as u32)),
                     );
                     if (self.volume - old_vol).abs() > 0.001 {
-                        self.state.lock().unwrap().volume = self.volume;
+                        self.volume_shared.store(self.volume);
                     }
                 });
                 ui.end_row();
@@ -1088,4 +1290,184 @@ fn spawn_pre_analysis(
             log::info!("Pre-analysis: discarding stale result (newer file loaded)");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    const SR: f64 = 44100.0;
+    const BUFFER: usize = 512;
+    /// UI paint interval (~30 fps).
+    const TICK_SECS: f64 = 0.033;
+
+    /// Raw playhead as the deck publishes it: quantized to whole audio
+    /// buffers of elapsed wall-clock playback.
+    fn raw_at(t_secs: f64) -> usize {
+        ((t_secs * SR) as usize / BUFFER) * BUFFER
+    }
+
+    /// Run `n` UI ticks of steady playback starting at tick `start`,
+    /// returning the painted position after each tick.
+    fn run_steady(sm: &mut PlayheadSmoother, t0: Instant, start: usize, n: usize) -> Vec<f64> {
+        (start..start + n)
+            .map(|i| {
+                let t = i as f64 * TICK_SECS;
+                sm.tick(raw_at(t), SR, t0 + Duration::from_secs_f64(t))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn steady_playback_scrolls_evenly() {
+        let t0 = Instant::now();
+        let mut sm = PlayheadSmoother::new(t0);
+        // Warm up past the initial convergence, then measure.
+        run_steady(&mut sm, t0, 1, 30);
+        let painted = run_steady(&mut sm, t0, 31, 70);
+        let deltas: Vec<f64> = painted.windows(2).map(|w| w[1] - w[0]).collect();
+        let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+        let worst = deltas.iter().map(|d| (d - mean).abs()).fold(0.0, f64::max);
+        // The raw value stair-steps by whole buffers, so its per-tick deltas
+        // vary by ±35%; the smoothed playhead must advance at wall-clock
+        // speed with the wobble filtered well below that.
+        assert!((mean - SR * TICK_SECS).abs() < SR * 0.005, "mean {mean}");
+        assert!(worst < mean * 0.15, "worst deviation {worst}, mean {mean}");
+    }
+
+    #[test]
+    fn forward_seek_snaps_instead_of_gliding() {
+        let t0 = Instant::now();
+        let mut sm = PlayheadSmoother::new(t0);
+        run_steady(&mut sm, t0, 1, 30);
+        let target = raw_at(30.0 * TICK_SECS) + (5.0 * SR) as usize;
+        let painted = sm.tick(target, SR, t0 + Duration::from_secs_f64(31.0 * TICK_SECS));
+        assert!((painted - target as f64).abs() < 1.0, "painted {painted}");
+    }
+
+    #[test]
+    fn loop_wrap_snaps_backward() {
+        let t0 = Instant::now();
+        let mut sm = PlayheadSmoother::new(t0);
+        run_steady(&mut sm, t0, 1, 30);
+        // A loop wrap moves the raw playhead backward by the loop length —
+        // beyond the snap threshold, so the display jumps with it.
+        let target = raw_at(30.0 * TICK_SECS).saturating_sub((0.5 * SR) as usize);
+        let painted = sm.tick(target, SR, t0 + Duration::from_secs_f64(31.0 * TICK_SECS));
+        assert!(
+            (painted - target as f64).abs() < SR * TICK_SECS * 2.0,
+            "painted {painted}, target {target}"
+        );
+    }
+
+    #[test]
+    fn splice_backward_step_never_moves_display_backward() {
+        let t0 = Instant::now();
+        let mut sm = PlayheadSmoother::new(t0);
+        run_steady(&mut sm, t0, 1, 30);
+        // The keylock engine re-publishes a slightly earlier source
+        // position around a splice. The painted playhead must keep moving
+        // forward at near-nominal speed — a backward blip on screen is the
+        // "twitch right and snap back" artifact.
+        let shift = (0.03 * SR) as usize;
+        let mut last = sm.tick(
+            raw_at(30.0 * TICK_SECS).saturating_sub(shift),
+            SR,
+            t0 + Duration::from_secs_f64(30.0 * TICK_SECS),
+        );
+        for i in 31..80 {
+            let t = i as f64 * TICK_SECS;
+            let painted = sm.tick(
+                raw_at(t).saturating_sub(shift),
+                SR,
+                t0 + Duration::from_secs_f64(t),
+            );
+            let delta = painted - last;
+            assert!(delta > 0.0, "tick {i}: display moved backward ({delta})");
+            assert!(
+                (delta - SR * TICK_SECS).abs()
+                    < SR * TICK_SECS * PLAYHEAD_NOISE_MAX_DEVIATION * 1.5,
+                "tick {i}: delta {delta} deviates from nominal {}",
+                SR * TICK_SECS
+            );
+            last = painted;
+        }
+    }
+
+    #[test]
+    fn splice_sized_jump_bleeds_off_without_lurch() {
+        let t0 = Instant::now();
+        let mut sm = PlayheadSmoother::new(t0);
+        run_steady(&mut sm, t0, 1, 30);
+        // The keylock engine re-anchors its consumption by a splice-sized
+        // 40 ms at a beat; the painted scroll rate must stay within the
+        // noise-band velocity cap instead of reproducing the lurch.
+        let jump = (0.04 * SR) as usize;
+        let mut last = sm.tick(
+            raw_at(30.0 * TICK_SECS) + jump,
+            SR,
+            t0 + Duration::from_secs_f64(30.0 * TICK_SECS),
+        );
+        let mut worst_dev = 0.0f64;
+        for i in 31..80 {
+            let t = i as f64 * TICK_SECS;
+            let painted = sm.tick(raw_at(t) + jump, SR, t0 + Duration::from_secs_f64(t));
+            worst_dev = worst_dev.max((painted - last - SR * TICK_SECS).abs());
+            last = painted;
+        }
+        assert!(
+            worst_dev < SR * TICK_SECS * PLAYHEAD_NOISE_MAX_DEVIATION * 1.5,
+            "worst deviation {worst_dev} frames"
+        );
+    }
+
+    #[test]
+    fn backward_glide_tracks_without_snapping() {
+        let t0 = Instant::now();
+        let mut sm = PlayheadSmoother::new(t0);
+        // A scrub throw moving backward at 2x, published per output block.
+        let rate = -2.0 * SR;
+        let start = 8.0 * SR;
+        sm.reset(start as usize, t0);
+        let mut last = start;
+        for i in 1..40 {
+            let t = i as f64 * TICK_SECS;
+            let raw = ((start + rate * t) as usize / BUFFER) * BUFFER;
+            let painted = sm.tick(raw, rate, t0 + Duration::from_secs_f64(t));
+            let delta = painted - last;
+            last = painted;
+            if i > 5 {
+                assert!(
+                    (delta - rate * TICK_SECS).abs() < rate.abs() * TICK_SECS * 0.15,
+                    "tick {i}: delta {delta}, nominal {}",
+                    rate * TICK_SECS
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stalled_source_freezes_the_display() {
+        let t0 = Instant::now();
+        let mut sm = PlayheadSmoother::new(t0);
+        run_steady(&mut sm, t0, 1, 30);
+        let frozen = raw_at(30.0 * TICK_SECS);
+        // Underrun/EOF drain: the raw value stops moving. The display may
+        // coast a couple of buffers past it but must then hold still.
+        let painted: Vec<f64> = (31..61)
+            .map(|i| {
+                let t = i as f64 * TICK_SECS;
+                sm.tick(frozen, SR, t0 + Duration::from_secs_f64(t))
+            })
+            .collect();
+        let last = *painted.last().unwrap();
+        assert!(
+            last - frozen as f64 <= SR * 0.25,
+            "coasted too far: {} past the stall",
+            last - frozen as f64
+        );
+        let late_drift = painted[29] - painted[24];
+        assert!(late_drift < 1.0, "still moving during stall: {late_drift}");
+    }
 }

@@ -11,7 +11,7 @@ mod zoomed;
 pub use counter::paint_beat_counter;
 pub use overview::{OverviewParams, OverviewTexture, paint_overview};
 pub use peaks::BandPeaks;
-pub use zoomed::{ScrubGesture, ZoomSpan, ZoomedParams, paint_zoomed};
+pub use zoomed::{ScrubGesture, ZoomSpan, ZoomedParams, ZoomedTiles, paint_zoomed};
 
 use eframe::egui;
 
@@ -225,6 +225,36 @@ pub(crate) fn overlay_plan(width_px: f32, beat_count: usize, downbeat_count: usi
     }
 }
 
+/// Rasterizes a range of a peak level's buckets into a transparent-
+/// background image, one column per bucket. Bands paint in high → mid →
+/// low order — low on top — so kick-heavy passages read blue and highs
+/// surface only where the lows drop out (CDJ RGB semantics; in a dense
+/// master the high band's *peak* is near full scale everywhere and would
+/// bury the image if on top).
+pub(crate) fn render_columns(
+    level: &peaks::PeakLevel,
+    buckets: std::ops::Range<usize>,
+    height: usize,
+) -> egui::ColorImage {
+    let width = buckets.len().max(1);
+    let mut image = egui::ColorImage::new([width, height], egui::Color32::TRANSPARENT);
+    let center = height as f32 / 2.0;
+    let half_height = height as f32 * 0.45;
+    let band_colors = [palette::BAND_LOW, palette::BAND_MID, palette::BAND_HIGH];
+    for (x, b) in buckets.enumerate() {
+        for (band, &color) in band_colors.iter().enumerate().rev() {
+            let pos = level.pos[band][b].clamp(0.0, 1.0);
+            let neg = level.neg[band][b].clamp(-1.0, 0.0);
+            let top = (center - pos * half_height).floor().max(0.0) as usize;
+            let bottom = ((center - neg * half_height).ceil() as usize).min(height);
+            for y in top..bottom {
+                image.pixels[y * width + x] = color;
+            }
+        }
+    }
+    image
+}
+
 /// Paint the "load a file" placeholder shared by both waveform panels.
 pub(crate) fn paint_placeholder(painter: &egui::Painter, rect: egui::Rect) {
     painter.text(
@@ -239,6 +269,37 @@ pub(crate) fn paint_placeholder(painter: &egui::Painter, rect: egui::Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_columns_subrange_matches_full_render() {
+        let buckets = 64;
+        let level = peaks::PeakLevel {
+            buckets_per_sec: 150.0,
+            pos: std::array::from_fn(|band| {
+                (0..buckets)
+                    .map(|b| ((b + band) % 7) as f32 / 7.0)
+                    .collect()
+            }),
+            neg: std::array::from_fn(|band| {
+                (0..buckets)
+                    .map(|b| -(((b + band) % 5) as f32) / 5.0)
+                    .collect()
+            }),
+        };
+        let height = 32;
+        let full = render_columns(&level, 0..buckets, height);
+        let (lo, hi) = (10, 20);
+        let sub = render_columns(&level, lo..hi, height);
+        for y in 0..height {
+            for x in 0..(hi - lo) {
+                assert_eq!(
+                    sub.pixels[y * (hi - lo) + x],
+                    full.pixels[y * buckets + lo + x],
+                    "pixel mismatch at ({x}, {y})"
+                );
+            }
+        }
+    }
 
     #[test]
     fn overlay_never_empty_on_long_tracks() {
