@@ -1,8 +1,22 @@
-- slow2 spectral loss is sub_bass (0.905) + low (0.941): the un-keylocked low band pitch-follows tempo by design (listening-validated). A click-free low-band corrector (time-domain, long windows) could lift spec_sim at hard ratios but was deliberately deleted (Stage 9 PV rejection was for the HIGH band; low band never keylocked). Big architectural swing — try only after cheap levers exhausted.
-- transient_f1 recall gap: found 147 vs expected 164 onsets at +6.5% — splice fades smear attacks; online (no-artifact) protection is a crude block-RMS ratio (TRANSIENT_POSTPONE_RATIO=3.0).
-- Consider a benchmark render with the .tsanalysis.json artifact attached (artifact-first path) as an extra scored scenario.
-- Low-band keylock (time-domain, long-window SOLA on <150Hz) would lift spec_sim ~+0.04 (~+1.2 quality) at hard ratios, BUT fights the listening-validated pitch-following-bass design (Stage 2 falsification). Only attempt with a plan to A/B via rendered listening pairs.
-- transient_f1 asymptote ~0.91 is aggregate splice-flux noise raising the ODF median+MAD floor (attacks verified present, contrast >= input). Levers: fewer/cleaner splices at |T-1|>10%.
-- Checks timeout observed with XFADE=128 (sola test may degenerate) — if reproduced, investigate before any fade-length change.
-- Artifact-attached renders measured: F1 +0.006..+0.017 at slowdowns, wash at speedup. Not a lever.
-- Low-band keylock is BLOCKED by the ≤15ms pipeline latency gate (560-frame lag cannot host a >period-length correlation window for 50Hz content). Spec_sim hard-ratio loss is therefore an architectural floor under current latency budget.
+# Ideas backlog
+
+## Open
+- Owner listening check: crossover 150→120 Hz (kept, metric-validated on 3
+  tracks) corrects 120-150Hz bass through SOLA splices instead of clean
+  pitch-follow. Render A/B pairs at ±8% and ±16% before shipping.
+- If latency budget is ever raised above 15 ms: low-band keylock (long-window
+  time-domain corrector) would lift spec_sim ~+0.04 at hard ratios.
+- transient_f1 ~0.92 asymptote = aggregate splice-flux noise raising the
+  detector's ODF floor (attacks verified present). Only a fundamentally
+  different corrector (e.g. hybrid PV — listening-rejected in 2026-07) or
+  lower splice cadence could move it.
+
+## Closed (do not retry — see .auto/log.jsonl ASI for details)
+- All SOLA params bidirectionally optimal: DRIFT 192/HARD 320, XFADE 96,
+  SEARCH 160, CORR_WINDOW 320 (pitch-gated), postpone 3.0, quiet 0.6/96.
+- Failed structures: online onset protection (2x), skip-span protection (2x),
+  preemptive pre-attack splicing, overshoot jumps, adaptive fade length,
+  correlation-adaptive fade law, landing-energy penalty, rate smoothing
+  (breaks retarget contract), FINE steps 8, cutoff 0.90 (tie), crossover
+  100/110/135.
+- Artifact-attached path: +0.01 F1 at slowdowns only — not a lever.
