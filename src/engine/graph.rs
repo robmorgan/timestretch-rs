@@ -1135,10 +1135,15 @@ mod tests {
             post_seek.extend_from_slice(&out);
         }
 
-        // Find the end of the priming silence.
-        let first_sound = post_seek
+        // Find the end of the priming silence. The first DECLICK_FRAMES
+        // carry the intentional release ramp (the pre-seek tail bleeding
+        // to zero at the cut edge — see `apply_release_ramp`), so the
+        // search for resumed MEDIA starts past it.
+        let ramp = DECLICK_FRAMES as usize;
+        let first_sound = post_seek[ramp..]
             .iter()
             .position(|s| s.abs() > 1e-4)
+            .map(|p| p + ramp)
             .expect("audio must resume after priming");
         assert!(
             first_sound < 256 * 8,
