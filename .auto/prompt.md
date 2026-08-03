@@ -66,11 +66,13 @@ ratios ±14–16% (RATE_SLOW2=104/124, RATE_FAST2=140/124) for sensitivity.
 (cold streaming path) — the SOLA onset protection runs on its online energy
 heuristic only.
 
-## Current Best (exp #37, 3-track metric): quality=95.50
-spec_sim=0.9646 transient_f1=0.9162 pitch=0.41/0.51c identity=0.9885 rt=~78x
-Both DSP wins validated by 3-track ablation: quiet-gap splicing (+0.34),
-crossover 150→120 Hz (+0.17). Benchmark now: tracks A (MSBWY 124bpm house),
-B (Hot Stuff 120bpm disco, weakest F1), C (Cold Heart 116bpm pop-dance).
+## Current Best (exp #43, 3-track metric): quality=95.58
+spec_sim=0.9642 transient_f1=0.9223 pitch=0.46/0.68c identity=0.9885 rt=~65x
+Validated DSP wins: quiet-gap splicing (+0.34), crossover 150→120 Hz (+0.17),
+graded quiet gate 0.6→1.2 over drift 96→192 (+0.08, F1 up on all 3 tracks;
+endpoint bracketed: 1.0 and 1.5 both worse). Benchmark: tracks A (MSBWY
+124bpm house), B (Hot Stuff 120bpm disco, weakest F1), C (Cold Heart 116bpm
+pop-dance).
 
 ## Previous best note (2-track era): quality=95.13
 spec_sim=0.9600 transient_f1=0.9083 pitch=0.41/0.51c identity=0.9885 rt=~82x
