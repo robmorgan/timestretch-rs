@@ -76,6 +76,8 @@
   220Hz by splice luck; low band intact — it's an exact delay). Content
   plays ~4ms early, not lost. Speedup/unity tails are clean (cursor lags
   behind nominal). Repro: stretch 2s sine, compare last-64 peak vs mid at
-  ratios {1.04..1.16}. Fix would need drift-to-zero drain semantics in the
-  corrector at finish() — deferred: ~4ms loop-point softening vs corrector
-  end-of-stream complexity. NOT a session regression (bit-identical pre-#58).
+  ratios {1.04..1.16}. Fix REQUIRES drift-to-zero drain semantics in the
+  corrector at finish(): mirror-padded flush was tried (#69) and is
+  inconsistent (fixes HF tails with 1.27x overshoot, LF still collapses —
+  mirror-seam phase reversal defeats correlation matching). Deferred with
+  experimental confirmation. NOT a session regression (bit-identical pre-#58).
