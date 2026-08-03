@@ -57,6 +57,24 @@ fn grid_loop_span(g: &timestretch::BeatGrid, anchor: usize, beats: f64) -> f64 {
     }
 }
 
+/// Repaint pacing while the deck is playing, in milliseconds.
+/// `TIMESTRETCH_REPAINT_MS` overrides it; `0` presents every vsync
+/// (the old behavior, which makes ProMotion hunt and skip slots).
+const PLAYING_REPAINT_MS: u64 = 33;
+
+/// The playing-state repaint interval: the default pacing unless
+/// overridden by `TIMESTRETCH_REPAINT_MS` (read once); `None` = uncapped.
+fn playing_repaint_interval() -> Option<std::time::Duration> {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| {
+        std::env::var("TIMESTRETCH_REPAINT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(PLAYING_REPAINT_MS)
+    });
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
 /// How far past a stalled anchor the smoother keeps coasting, in seconds.
 /// A couple of audio buffers: long enough to glide across normal publish
 /// gaps, short enough that an underrun freezes the display quickly.
@@ -652,23 +670,18 @@ impl eframe::App for TimeStretchApp {
                 pos_frames as f64
             }
         };
-        // Repaint at full display rate while playing: vsync-paced, so the
-        // extrapolated playhead lands on screen at even intervals. This was
-        // ~90% of the app's CPU when the zoomed view tessellated thousands
-        // of rects per frame; with the tile cache a frame is a few textured
-        // quads, so the uncapped loop is affordable. A scrub glide animates
+        // Repaint on a steady timer while playing (a scrub glide animates
         // the playhead the same way even while paused, so it keeps the
-        // repaint loop alive too.
+        // repaint loop alive too). Steadiness beats rate here: presenting
+        // every vsync makes ProMotion hunt for a refresh rate, and the
+        // hunting transitions skip slots (~2/s) that read as scroll
+        // twitches; a constant sub-max cadence lets the panel settle —
+        // glass-measured 0 missed slots over 40 s at 33 ms, with wakes
+        // arriving at <1 ms spread. The playhead smoother extrapolates
+        // per measured dt, so the paced cadence stays spatially exact.
         if transport == Transport::Playing || scrub_phase != ScrubPhase::Idle {
-            // Experiment lever: TIMESTRETCH_REPAINT_MS paces repaints on a
-            // timer instead of every vsync, to test whether a steady
-            // sub-max present cadence makes ProMotion settle into a stable
-            // rate without a display mode switch.
-            match std::env::var("TIMESTRETCH_REPAINT_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-            {
-                Some(ms) => ctx.request_repaint_after(std::time::Duration::from_millis(ms)),
+            match playing_repaint_interval() {
+                Some(interval) => ctx.request_repaint_after(interval),
                 None => ctx.request_repaint(),
             }
         }
