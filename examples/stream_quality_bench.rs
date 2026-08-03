@@ -18,9 +18,7 @@
 //!
 //! Run with: cargo run --release --example stream_quality_bench
 
-use timestretch::analysis::comparison::{
-    mean_band_spectral_similarity, mean_spectral_similarity, spectral_similarity,
-};
+use timestretch::analysis::comparison::{mean_spectral_similarity, spectral_similarity};
 use timestretch::analysis::preanalysis::downmix_to_mid;
 use timestretch::analysis::transient::detect_transients;
 use timestretch::engine::{Engine, EngineConfig, EngineProfile};
@@ -28,6 +26,9 @@ use timestretch::io::wav::read_wav_file;
 
 const MUSIC_PATH: &str =
     "benchmarks/audio/bpm-corpus/12247392_Music Sounds Better With You_(Original Mix).wav";
+/// Second scored track (different material: disco-house, 120 BPM) so the
+/// score is not fit to a single track's splice timing.
+const MUSIC_PATH_B: &str = "benchmarks/audio/bpm-corpus/14220825_Hot Stuff_(Original Mix).wav";
 const SAMPLE_RATE: u32 = 44_100;
 const CALLBACK_FRAMES: usize = 256;
 
@@ -271,10 +272,23 @@ fn cents_stats(output: &[f32], reference_hz: f64) -> (f64, f64) {
     (p95, max)
 }
 
-fn main() {
-    // --- Fixtures ---
-    let music = read_wav_file(MUSIC_PATH).unwrap_or_else(|e| {
-        panic!("missing corpus file {MUSIC_PATH}: {e}");
+/// Per-track stretch-quality scores over the four fixed-rate renders.
+struct TrackScores {
+    spec: [f64; 4],
+    tf1: [f64; 4],
+    clicks: f64,
+    underruns: u64,
+    media_secs: f64,
+    process_secs: f64,
+    /// Mid downmix of the segment (reused for identity/ride on track A).
+    segment: Vec<f32>,
+    segment_mid: Vec<f32>,
+    channels: usize,
+}
+
+fn score_track(path: &str) -> TrackScores {
+    let music = read_wav_file(path).unwrap_or_else(|e| {
+        panic!("missing corpus file {path}: {e}");
     });
     assert_eq!(music.sample_rate, SAMPLE_RATE, "expected 44.1 kHz corpus");
     let ch = music.channels.count();
@@ -282,93 +296,93 @@ fn main() {
     let take = MUSIC_SECS * SAMPLE_RATE as usize * ch;
     let segment: Vec<f32> = music.data[skip..skip + take].to_vec();
     let segment_mid = downmix_to_mid(&segment, ch);
+    let warmup = (WARMUP_SECS * SAMPLE_RATE as f64) as usize;
 
+    let rates = [RATE_SLOW, RATE_FAST, RATE_SLOW2, RATE_FAST2];
+    let mut spec = [0.0f64; 4];
+    let mut tf1 = [0.0f64; 4];
+    let mut clicks = 0.0f64;
+    let mut underruns = 0u64;
+    let mut process_secs = 0.0f64;
+    for (i, &rate) in rates.iter().enumerate() {
+        let render = render_stream(&segment, ch, &move |_| rate);
+        let mid = downmix_to_mid(&render.output, ch);
+        spec[i] = mean_spectral_similarity(&segment_mid, &mid[warmup..], FFT_SIZE, HOP_SIZE);
+        let (f1, _, _) = transient_f1(&segment_mid, &mid, rate, render.latency_frames);
+        tf1[i] = f1;
+        clicks = clicks.max(clicks_per_million(&segment_mid, &mid));
+        underruns += render.underrun_frames;
+        process_secs += render.process_secs;
+    }
+    TrackScores {
+        spec,
+        tf1,
+        clicks,
+        underruns,
+        media_secs: 4.0 * MUSIC_SECS as f64,
+        process_secs,
+        segment,
+        segment_mid,
+        channels: ch,
+    }
+}
+
+fn main() {
+    let warmup = (WARMUP_SECS * SAMPLE_RATE as f64) as usize;
+
+    // --- Scored stretch renders on both tracks ---
+    let a = score_track(MUSIC_PATH);
+    let b = score_track(MUSIC_PATH_B);
+
+    // --- Track A extras: identity, music ride, sine ride ---
+    let ride = |t: f64| 1.0 + 0.08 * (2.0 * std::f64::consts::PI * 0.25 * t).sin();
+    let ch = a.channels;
+    let identity = render_stream(&a.segment, ch, &|_| 1.0);
+    let music_ride = render_stream(&a.segment, ch, &ride);
     let sine: Vec<f32> = (0..SAMPLE_RATE as usize * 10)
         .map(|i| {
             0.5 * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / SAMPLE_RATE as f64).sin() as f32
         })
         .collect();
-
-    let ride = |t: f64| 1.0 + 0.08 * (2.0 * std::f64::consts::PI * 0.25 * t).sin();
-
-    // --- Renders ---
-    let slow = render_stream(&segment, ch, &|_| RATE_SLOW);
-    let fast = render_stream(&segment, ch, &|_| RATE_FAST);
-    let slow2 = render_stream(&segment, ch, &|_| RATE_SLOW2);
-    let fast2 = render_stream(&segment, ch, &|_| RATE_FAST2);
-    let identity = render_stream(&segment, ch, &|_| 1.0);
-    let music_ride = render_stream(&segment, ch, &ride);
     let sine_ride = render_stream(&sine, 1, &ride);
 
-    let slow_mid = downmix_to_mid(&slow.output, ch);
-    let fast_mid = downmix_to_mid(&fast.output, ch);
-    let slow2_mid = downmix_to_mid(&slow2.output, ch);
-    let fast2_mid = downmix_to_mid(&fast2.output, ch);
     let identity_mid = downmix_to_mid(&identity.output, ch);
     let ride_mid = downmix_to_mid(&music_ride.output, ch);
 
-    let warmup = (WARMUP_SECS * SAMPLE_RATE as f64) as usize;
-
-    // --- Timbre: timing-invariant mean spectrum similarity ---
-    let spec_slow = mean_spectral_similarity(&segment_mid, &slow_mid[warmup..], FFT_SIZE, HOP_SIZE);
-    let spec_fast = mean_spectral_similarity(&segment_mid, &fast_mid[warmup..], FFT_SIZE, HOP_SIZE);
-    let spec_slow2 =
-        mean_spectral_similarity(&segment_mid, &slow2_mid[warmup..], FFT_SIZE, HOP_SIZE);
-    let spec_fast2 =
-        mean_spectral_similarity(&segment_mid, &fast2_mid[warmup..], FFT_SIZE, HOP_SIZE);
-
-    // --- Transients ---
-    let (tf1_slow, exp_slow, found_slow) =
-        transient_f1(&segment_mid, &slow_mid, RATE_SLOW, slow.latency_frames);
-    let (tf1_fast, exp_fast, found_fast) =
-        transient_f1(&segment_mid, &fast_mid, RATE_FAST, fast.latency_frames);
-    let (tf1_slow2, _, _) =
-        transient_f1(&segment_mid, &slow2_mid, RATE_SLOW2, slow2.latency_frames);
-    let (tf1_fast2, _, _) =
-        transient_f1(&segment_mid, &fast2_mid, RATE_FAST2, fast2.latency_frames);
-
-    // --- Identity transparency: latency-aligned frame-wise magnitude
-    // spectral similarity (phase-blind: the LR8 crossover re-sums to
-    // allpass, so waveform correlation would punish inaudible phase).
+    // Identity transparency: latency-aligned frame-wise magnitude spectral
+    // similarity (phase-blind: the LR8 crossover re-sums to allpass, so
+    // waveform correlation would punish inaudible phase).
     let identity_corr = {
         let lat = identity.latency_frames;
-        let n = (identity_mid.len() - lat).min(segment_mid.len()) - warmup;
-        let a = &segment_mid[warmup..warmup + n];
-        let b = &identity_mid[warmup + lat..warmup + lat + n];
-        spectral_similarity(a, b, 2048, 512)
+        let n = (identity_mid.len() - lat).min(a.segment_mid.len()) - warmup;
+        let sa = &a.segment_mid[warmup..warmup + n];
+        let sb = &identity_mid[warmup + lat..warmup + lat + n];
+        spectral_similarity(sa, sb, 2048, 512)
     };
 
-    // --- Pitch stability ---
+    // Pitch stability.
     let (p95_cents, max_cents) = cents_stats(&sine_ride.output, 440.0);
 
-    // --- Clicks (worst across the music renders) ---
-    let clicks = clicks_per_million(&segment_mid, &slow_mid)
-        .max(clicks_per_million(&segment_mid, &fast_mid))
-        .max(clicks_per_million(&segment_mid, &slow2_mid))
-        .max(clicks_per_million(&segment_mid, &fast2_mid))
-        .max(clicks_per_million(&segment_mid, &ride_mid));
+    // Clicks (worst across every music render).
+    let clicks = a
+        .clicks
+        .max(b.clicks)
+        .max(clicks_per_million(&a.segment_mid, &ride_mid));
 
-    // --- Underruns across all renders (must stay 0) ---
-    let underruns = slow.underrun_frames
-        + fast.underrun_frames
-        + slow2.underrun_frames
-        + fast2.underrun_frames
+    let underruns = a.underruns
+        + b.underruns
         + identity.underrun_frames
         + music_ride.underrun_frames
         + sine_ride.underrun_frames;
 
-    // --- Throughput (media seconds per process second, music renders) ---
-    let media_secs = 5.0 * MUSIC_SECS as f64;
-    let proc_secs = slow.process_secs
-        + fast.process_secs
-        + slow2.process_secs
-        + fast2.process_secs
-        + music_ride.process_secs;
+    let media_secs = a.media_secs + b.media_secs + MUSIC_SECS as f64;
+    let proc_secs = a.process_secs + b.process_secs + music_ride.process_secs;
     let realtime_x = media_secs / proc_secs;
 
     // --- Composite quality score (0-100, higher is better) ---
-    let spec_score = 0.25 * (spec_slow + spec_fast + spec_slow2 + spec_fast2);
-    let transient_score = 0.25 * (tf1_slow + tf1_fast + tf1_slow2 + tf1_fast2);
+    let mean4 = |x: &[f64; 4]| 0.25 * (x[0] + x[1] + x[2] + x[3]);
+    let spec_score = 0.5 * (mean4(&a.spec) + mean4(&b.spec));
+    let transient_score = 0.5 * (mean4(&a.tf1) + mean4(&b.tf1));
     let pitch_score = (-p95_cents / 10.0).exp();
     let click_score = (-clicks / 50.0).exp();
     let quality = 100.0
@@ -381,32 +395,28 @@ fn main() {
 
     println!("--- streaming quality ---");
     println!(
-        "spec slow={spec_slow:.4} fast={spec_fast:.4} slow2={spec_slow2:.4} fast2={spec_fast2:.4}"
-    );
-    // Diagnostic only (not scored): where the hard-slowdown loss lives.
-    let bands = mean_band_spectral_similarity(
-        &segment_mid,
-        &slow2_mid[warmup..],
-        FFT_SIZE,
-        HOP_SIZE,
-        SAMPLE_RATE,
+        "A spec slow={:.4} fast={:.4} slow2={:.4} fast2={:.4}",
+        a.spec[0], a.spec[1], a.spec[2], a.spec[3]
     );
     println!(
-        "slow2 bands: sub_bass={:.4} low={:.4} mid={:.4} high={:.4}",
-        bands.sub_bass, bands.low, bands.mid, bands.high
+        "A tf1  slow={:.4} fast={:.4} slow2={:.4} fast2={:.4}",
+        a.tf1[0], a.tf1[1], a.tf1[2], a.tf1[3]
     );
     println!(
-        "transient_f1 slow={tf1_slow:.4} (exp {exp_slow} found {found_slow}) \
-         fast={tf1_fast:.4} (exp {exp_fast} found {found_fast}) \
-         slow2={tf1_slow2:.4} fast2={tf1_fast2:.4}"
+        "B spec slow={:.4} fast={:.4} slow2={:.4} fast2={:.4}",
+        b.spec[0], b.spec[1], b.spec[2], b.spec[3]
+    );
+    println!(
+        "B tf1  slow={:.4} fast={:.4} slow2={:.4} fast2={:.4}",
+        b.tf1[0], b.tf1[1], b.tf1[2], b.tf1[3]
     );
     println!("identity_corr={identity_corr:.4} (latency-aligned frame-wise spectral sim)");
     println!("pitch p95={p95_cents:.2}c max={max_cents:.2}c");
     println!("clicks/M={clicks:.1} underruns={underruns}");
     println!();
     println!("METRIC quality={quality:.3}");
-    println!("METRIC spec_sim={:.4}", spec_score);
-    println!("METRIC transient_f1={:.4}", transient_score);
+    println!("METRIC spec_sim={spec_score:.4}");
+    println!("METRIC transient_f1={transient_score:.4}");
     println!("METRIC pitch_p95_cents={p95_cents:.2}");
     println!("METRIC pitch_max_cents={max_cents:.2}");
     println!("METRIC identity_corr={identity_corr:.4}");
