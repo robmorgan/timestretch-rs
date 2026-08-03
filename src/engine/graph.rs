@@ -103,6 +103,14 @@ pub struct EngineProcessor {
     discarded_frames: u64,
     /// Remaining declick fade-in frames after priming.
     declick_remaining: u32,
+    /// Set while the output sits in an underrun gap: the next real frames
+    /// fade in via the declick ramp instead of stepping out of silence.
+    underrun_declick_pending: bool,
+    /// Last emitted output frame (per channel): a reset ramps this to zero
+    /// over the next callback so a mid-play seek cuts without a click.
+    last_frame: Vec<f32>,
+    /// Remaining release-ramp frames after a reset.
+    release_remaining: u32,
     /// Timestamped retargets awaiting their output frame, sorted ascending.
     pending_retargets: [(u64, f64); MAX_PENDING_RETARGETS],
     pending_retarget_len: usize,
@@ -174,6 +182,9 @@ impl EngineProcessor {
             prime_source_frames: 0.0,
             discarded_frames: 0,
             declick_remaining: 0,
+            underrun_declick_pending: false,
+            last_frame: vec![0.0; channels],
+            release_remaining: 0,
             pending_retargets: [(0, 1.0); MAX_PENDING_RETARGETS],
             pending_retarget_len: 0,
         }
@@ -198,6 +209,9 @@ impl EngineProcessor {
             self.run_priming(budget);
             if self.prime_source_frames > 0.0 {
                 out.fill(0.0);
+                // The release ramp must still play over the priming
+                // silence, or a mid-play seek into a long prime clicks.
+                self.apply_release_ramp(&mut out[..whole]);
                 self.shared
                     .publish_position(self.priming_position(), self.delivered_frames);
                 return;
@@ -275,6 +289,11 @@ impl EngineProcessor {
         self.stage_in_frames = 0;
         self.delivered_frames = 0;
         self.underrun_total = 0;
+        self.underrun_declick_pending = false;
+        // Arm the release ramp from the last pre-reset frame (kept across
+        // the reset): a mid-play seek then cuts click-free. At cold start
+        // the held frame is zero and the ramp is a no-op.
+        self.release_remaining = DECLICK_FRAMES;
         if let Some(cursor) = self.transient.as_mut() {
             cursor.reset();
         }
@@ -476,11 +495,30 @@ impl EngineProcessor {
         self.fill_out_fifo(needed_samples);
 
         let popped = self.out_fifo.pop_slice(out);
+        // Resuming from an underrun gap: ramp the fresh media in via the
+        // declick fade instead of stepping straight out of silence.
+        if popped > 0 && self.underrun_declick_pending {
+            self.underrun_declick_pending = false;
+            self.declick_remaining = DECLICK_FRAMES;
+        }
         if popped < needed_samples {
+            // Fade the real tail into the silence gap: an un-ramped edge
+            // steps by the full signal amplitude (audible click on every
+            // dropout). The mirrored fade-in is armed above for recovery.
+            let real_frames = popped / self.channels;
+            let fade = real_frames.min(DECLICK_FRAMES as usize);
+            for k in 0..fade {
+                let frame = real_frames - fade + k;
+                let gain = 1.0 - (k + 1) as f32 / (fade + 1) as f32;
+                for ch in 0..self.channels {
+                    out[frame * self.channels + ch] *= gain;
+                }
+            }
             out[popped..].fill(0.0);
             let missing_frames = ((needed_samples - popped) / self.channels) as u64;
             self.underrun_total += missing_frames;
             self.shared.add_underrun_frames(missing_frames);
+            self.underrun_declick_pending = true;
         }
         // Post-priming declick: a short linear fade-in on the first real
         // frames after a warm start.
@@ -496,7 +534,36 @@ impl EngineProcessor {
                 self.declick_remaining -= 1;
             }
         }
+        // Post-reset release ramp: bleed the pre-seek output's last frame
+        // to zero so the cut edge never steps (a mid-play seek otherwise
+        // clicks at the full signal amplitude).
+        self.apply_release_ramp(out);
+        // Remember the newest emitted frame for the next reset's ramp.
+        let frames = needed_samples / self.channels;
+        if frames > 0 {
+            for ch in 0..self.channels {
+                self.last_frame[ch] = out[(frames - 1) * self.channels + ch];
+            }
+        }
         self.delivered_frames += (needed_samples / self.channels) as u64;
+    }
+
+    /// Superimposes the post-reset release ramp (pre-seek last frame
+    /// bleeding to zero) onto `out`. No-op once the ramp has run out.
+    fn apply_release_ramp(&mut self, out: &mut [f32]) {
+        if self.release_remaining == 0 {
+            return;
+        }
+        for frame in 0..out.len() / self.channels {
+            if self.release_remaining == 0 {
+                break;
+            }
+            let gain = self.release_remaining as f32 / DECLICK_FRAMES as f32;
+            for ch in 0..self.channels {
+                out[frame * self.channels + ch] += self.last_frame[ch] * gain;
+            }
+            self.release_remaining -= 1;
+        }
     }
 
     /// Advances source through the graph until the output FIFO holds at least
@@ -751,6 +818,105 @@ mod tests {
     }
 
     #[test]
+    fn underrun_boundaries_are_declicked() {
+        // A dropout mid-tone must not step the output harder than the
+        // tone's own slew: the real tail fades into the silence gap and
+        // the resume fades back in (see `render_chunk`).
+        let handles = Engine::build(EngineConfig {
+            channels: 1,
+            profile: EngineProfile::Tape,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let (mut processor, mut source) = (handles.processor, handles.source);
+
+        let tone = sine(330.0, 44_100.0, 44_100);
+        let mut fed = 0usize;
+        let mut out = vec![0.0f32; 256];
+        let mut collected = Vec::new();
+        // 1) Stream normally, 2) starve for 8 callbacks, 3) resume.
+        for phase in 0..3 {
+            let callbacks = [40usize, 8, 40][phase];
+            for _ in 0..callbacks {
+                if phase != 1 {
+                    while source.occupied_frames() < source.demand_hint(256, 4.0)
+                        && fed < tone.len()
+                    {
+                        let end = (fed + 1024).min(tone.len());
+                        fed += source.push(&tone[fed..end]);
+                    }
+                }
+                processor.process(&mut out);
+                collected.extend_from_slice(&out);
+            }
+        }
+        // Test-helper sine has unit amplitude.
+        let slew = (2.0 * std::f64::consts::PI * 330.0 / 44_100.0) as f32;
+        let worst = collected[2048..]
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst <= slew * 1.5,
+            "dropout boundary clicked: step {worst:.4} vs tone slew {slew:.4}"
+        );
+    }
+
+    #[test]
+    fn seek_boundaries_are_declicked() {
+        // A warm-start seek mid-tone must not step the output harder than
+        // the tone's own slew on either side of the cut: the pre-seek tail
+        // release-ramps to zero and the post-prime onset declicks in.
+        for profile in [EngineProfile::Keylock, EngineProfile::Tape] {
+            let handles = Engine::build(EngineConfig {
+                channels: 1,
+                profile,
+                ..EngineConfig::default()
+            })
+            .unwrap();
+            let (controller, mut processor, mut source) =
+                (handles.controller, handles.processor, handles.source);
+            source.set_track_position(0);
+            let track = sine(330.0, 44_100.0, 44_100 * 4);
+            let mut fed = 0usize;
+            let mut out = vec![0.0f32; 256];
+            let mut collected = Vec::new();
+            for _ in 0..170 {
+                while source.occupied_frames() < source.demand_hint(256, 4.0) && fed < track.len() {
+                    let end = (fed + 1024).min(track.len());
+                    fed += source.push(&track[fed..end]);
+                }
+                processor.process(&mut out);
+                collected.extend_from_slice(&out);
+            }
+            // Seek to 2 s (mid-waveform), preroll fed from ahead of it.
+            let preroll = processor.warm_start_preroll_frames();
+            processor.reset();
+            let mut fed2 = 44_100 * 2 - preroll;
+            source.set_track_position(fed2 as u64);
+            controller.warm_start(preroll as u32);
+            for _ in 0..100 {
+                while source.occupied_frames() < source.demand_hint(256, 4.0) && fed2 < track.len()
+                {
+                    let end = (fed2 + 1024).min(track.len());
+                    fed2 += source.push(&track[fed2..end]);
+                }
+                processor.process(&mut out);
+                collected.extend_from_slice(&out);
+            }
+            let slew = (2.0 * std::f64::consts::PI * 330.0 / 44_100.0) as f32;
+            let worst = collected[166 * 256..]
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst <= slew * 1.5,
+                "{profile:?}: seek boundary clicked: step {worst:.4} vs tone slew {slew:.4}"
+            );
+        }
+    }
+
+    #[test]
     fn odd_callback_sizes_fill_exactly() {
         let handles = Engine::build(EngineConfig {
             channels: 1,
@@ -969,10 +1135,15 @@ mod tests {
             post_seek.extend_from_slice(&out);
         }
 
-        // Find the end of the priming silence.
-        let first_sound = post_seek
+        // Find the end of the priming silence. The first DECLICK_FRAMES
+        // carry the intentional release ramp (the pre-seek tail bleeding
+        // to zero at the cut edge — see `apply_release_ramp`), so the
+        // search for resumed MEDIA starts past it.
+        let ramp = DECLICK_FRAMES as usize;
+        let first_sound = post_seek[ramp..]
             .iter()
             .position(|s| s.abs() > 1e-4)
+            .map(|p| p + ramp)
             .expect("audio must resume after priming");
         assert!(
             first_sound < 256 * 8,

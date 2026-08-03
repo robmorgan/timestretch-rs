@@ -17,7 +17,7 @@ use crate::core::crossover::LinkwitzRiley8;
 /// A tuning constant: low enough that pitch-following bass stays below the
 /// pitch-salience range, high enough to keep kick fundamentals out of the
 /// PV. Settled with corpus evidence in Stage 7 (ROADMAP).
-pub const KEYLOCK_CROSSOVER_HZ: f64 = 150.0;
+pub const KEYLOCK_CROSSOVER_HZ: f64 = 120.0;
 
 /// Per-channel two-band splitter.
 #[derive(Debug)]

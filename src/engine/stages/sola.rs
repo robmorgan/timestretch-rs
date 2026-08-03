@@ -238,6 +238,12 @@ const ONSET_PROTECT_POST: f64 = 512.0;
 /// With drift beyond this, a masked window right after an onset/beat is
 /// taken opportunistically even though the trigger has not been reached.
 const OPPORTUNISTIC_DRIFT: f64 = 96.0;
+/// Quiet-gap opportunism: with drift beyond [`OPPORTUNISTIC_DRIFT`], a
+/// splice whose outgoing and incoming regions both sit below this multiple
+/// of the rolling average energy is taken early — small corrections in
+/// quiet moments instead of letting drift accrue to a forced splice that
+/// may land on an attack.
+const QUIET_SPLICE_RATIO: f64 = 0.6;
 /// The masked window after an onset where a splice hides best.
 const MASKED_WINDOW_START: f64 = 768.0;
 const MASKED_WINDOW_END: f64 = 2_048.0;
@@ -442,11 +448,27 @@ impl SolaCorrector {
                 // Beat-synchronous placement: a pending correction hides
                 // best right after a hit.
                 self.try_splice(drift, onsets);
+            } else if drift.abs() > OPPORTUNISTIC_DRIFT
+                && self.energy_avg > 1e-6
+                && self.region_rms(self.read_pos, CORR_WINDOW)
+                    < QUIET_SPLICE_RATIO * self.energy_avg
+                && self.region_rms(self.read_pos + drift, CORR_WINDOW)
+                    < QUIET_SPLICE_RATIO * self.energy_avg
+            {
+                // Quiet-gap placement: correct early where nothing is
+                // playing loudly, so fewer splices are ever forced near
+                // attacks. (A drift-graded gate was tried and won on a
+                // 3-track corpus but washed out on 4 — the fixed strict
+                // gate is simpler and at least as good; see autoresearch
+                // log #43/#51.)
+                self.try_splice(drift, onsets);
             } else if at_rest && settled_drift.abs() > REST_SPLICE_DRIFT {
                 // At sustained rest a parked drift comb-filters the
                 // crossover overlap against the low band's fixed delay;
-                // recenter cleanly.
-                self.try_splice(drift, onsets);
+                // recenter cleanly (bounded: the landing must actually
+                // recenter, or the splice is skipped and the trim bleeds
+                // the drift instead).
+                self.try_rest_splice(drift, onsets);
             }
         }
 
@@ -520,14 +542,33 @@ impl SolaCorrector {
     /// apply until the drift is critical.
     fn try_splice(&mut self, drift: f64, onsets: &[OnsetEvent]) {
         let force = drift.abs() >= HARD_TRIGGER;
-        let _ = self.plan_splice(drift, force, onsets);
+        let _ = self.plan_splice(drift, force, f64::INFINITY, onsets);
+    }
+
+    /// Rest-recenter splice: only candidates that actually bring the lag
+    /// back under the rest threshold qualify. Without this bound, highly
+    /// periodic content lets the zero-jump candidate win on correlation
+    /// (it is literally the same audio) and the corrector enters a limit
+    /// cycle of no-op splices — hundreds of pointless fades per second
+    /// with the drift (and its seam de-phasing) parked forever, while the
+    /// per-splice sub-sample refinement cancels the rest trim's bleed.
+    /// When no candidate qualifies the splice is skipped and the trim
+    /// converges the drift unimpeded.
+    fn try_rest_splice(&mut self, drift: f64, onsets: &[OnsetEvent]) {
+        let _ = self.plan_splice(drift, false, REST_SPLICE_DRIFT, onsets);
     }
 
     /// Plans and starts a correlation-matched splice toward the nominal
     /// lag; unless `force`, a landing region that reads as a transient
     /// postpones it, and candidates whose fade would overlap an artifact
     /// onset's protection window are excluded from the search.
-    fn plan_splice(&mut self, drift: f64, force: bool, onsets: &[OnsetEvent]) -> bool {
+    fn plan_splice(
+        &mut self,
+        drift: f64,
+        force: bool,
+        max_residual: f64,
+        onsets: &[OnsetEvent],
+    ) -> bool {
         // Outgoing span: the fade also reads from the current cursor.
         if !force && self.span_hits_onset(onsets, self.read_pos) {
             return false;
@@ -548,6 +589,12 @@ impl SolaCorrector {
         let a_sq = dot_f64(&self.corr_a, &self.corr_a);
         mix_channels(&self.channels, a0 + lo, &mut self.corr_b);
         for jump in lo..=hi {
+            // Residual-drift bound (rest splices): the landing must leave
+            // the lag within `max_residual` of nominal or the splice is
+            // pointless damage.
+            if (drift - jump as f64).abs() > max_residual {
+                continue;
+            }
             let candidate = base + jump as f64;
             if !self.readable_span(candidate, CORR_WINDOW + XFADE_FRAMES) {
                 continue;
