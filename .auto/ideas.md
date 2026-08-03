@@ -1,9 +1,10 @@
 # Ideas backlog
 
 ## Open
-- Owner listening check: crossover 150→120 Hz (kept, metric-validated on 3
-  tracks) corrects 120-150Hz bass through SOLA splices instead of clean
-  pitch-follow. Render A/B pairs at ±8% and ±16% before shipping.
+- Owner listening check: crossover 150→120 Hz (kept; metric-validated on 4
+  tracks, win GROWS with corpus width — bass-heavy material gains most).
+  Corrects 120-150Hz bass through SOLA splices instead of clean pitch-follow.
+  Render A/B pairs at ±8% and ±16% before shipping.
 - If latency budget is ever raised above 15 ms: low-band keylock (long-window
   time-domain corrector) would lift spec_sim ~+0.04 at hard ratios.
 - transient_f1 ~0.92 asymptote = aggregate splice-flux noise raising the
