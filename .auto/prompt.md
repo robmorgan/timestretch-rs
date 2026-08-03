@@ -66,5 +66,24 @@ ratios ±14–16% (RATE_SLOW2=104/124, RATE_FAST2=140/124) for sensitivity.
 (cold streaming path) — the SOLA onset protection runs on its online energy
 heuristic only.
 
+## Current Best (exp #13): quality=96.26
+spec_sim=0.957 transient_f1=0.9496 pitch=0.43/0.53c identity=0.9909 rt=85x
+
 ## What's Been Tried
-(update as experiments accumulate)
+- Harness fixes (big): latency compensation (+13ms reported), phase-blind
+  identity metric, hard ratios ±14-16%, transient hop 512→256 (detector
+  quantization ceiling was F1≈0.93 — anything tuned before that fix was
+  suspect and got re-validated).
+- KEEP: TRANSIENT_POSTPONE_RATIO 3.0→1.8 (validated post-fix, +0.007 F1).
+- DISCARD: DRIFT/HARD trigger 128/256 and 256/448 (192/320 locally optimal
+  both directions); XFADE 48 and 64 (96 optimal, 64-keep was noise-fit);
+  SEARCH_RANGE 224 (parks drift off-nominal, −40% throughput);
+  postpone ratio 1.4 (over-postponement → bigger forced jumps);
+  online onset detection at SOLA ingest (both with and without
+  masked-window placement — protection just postpones splices into bigger
+  forced jumps; artifact-less onset protection is a dead end).
+- Insight: SOLA splice params sit at a sharp local optimum. transient F1
+  loss at hard ratios likely from fades through attacks forced by HARD
+  trigger + high-band drift timing skew vs exact low band.
+- spec_sim hard-ratio loss is sub_bass/low band pitch-following (by design,
+  listening-validated; benchmark counts it — do NOT game the metric).
