@@ -37,6 +37,16 @@
 //! already the best-case regime. Env levers for re-testing:
 //! `METALWAVE_STATIC_EGUI=1`, `METALWAVE_OWN_WINDOW=1`,
 //! `METALWAVE_NO_PIN=1`.
+//!
+//! ## Root cause confirmed: ProMotion adaptive rate switching
+//!
+//! Switching the built-in panel to a **fixed 60 Hz** display mode
+//! (CGConfigureDisplayWithDisplayMode; the panel offers no fixed 120)
+//! collapses the misses: empty-eframe probe 2.0/s → 0.33/s, full deck app
+//! 1.4–2/s → 0.10/s, with a clean 16.68 ms p50 cadence. The "twitch" is
+//! the panel's adaptive rate transitions, not the app, eframe, or
+//! WindowServer scheduling per se. A uniform fixed-60 cadence reads
+//! smoother in pursuit than adaptive-120 with ~2 hiccups/s.
 
 #[cfg(not(target_os = "macos"))]
 fn main() {

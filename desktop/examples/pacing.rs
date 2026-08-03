@@ -28,9 +28,18 @@ impl eframe::App for Probe {
         }
         if self.start.elapsed().as_secs_f64() > 14.0 {
             let secs = 12.0;
-            let misses: Vec<&f64> = self.dts_ms.iter().filter(|d| **d > 12.5).collect();
+            // Threshold defaults to 1.5 slots at 120 Hz; override for other
+            // fixed refresh rates (e.g. PACING_MISS_MS=25 at 60 Hz).
+            let threshold: f64 = std::env::var("PACING_MISS_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(12.5);
+            let mut sorted = self.dts_ms.clone();
+            sorted.sort_by(f64::total_cmp);
+            let p50 = sorted[sorted.len() / 2];
+            let misses: Vec<&f64> = self.dts_ms.iter().filter(|d| **d > threshold).collect();
             println!(
-                "frames {} over {secs:.0}s, misses {} ({:.2}/s): {:?}",
+                "frames {} over {secs:.0}s, p50 {p50:.2}ms, misses {} ({:.2}/s): {:?}",
                 self.dts_ms.len(),
                 misses.len(),
                 misses.len() as f64 / secs,
