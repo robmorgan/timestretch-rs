@@ -56,3 +56,7 @@
   shortfall callback → tail-fade always applies). Verified by forced exact
   N×256 unity feed + natural drain, both 1.0× slew. Defensive code
   deliberately omitted. Boundary defect class CLOSED with proof.
+- Sample-rate audit (#61): ride pitch identical at 44.1/48/96k (p95 0.40-0.46c).
+  Residual risk documented: seam/bass at 96k on real music unmeasurable
+  without hi-rate corpus (CORR_WINDOW covers 0.4 periods of the 120Hz band
+  bottom at 96k). If hi-rate material lands, run the seam-nudge scenario at 96k.
