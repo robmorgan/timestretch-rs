@@ -61,3 +61,7 @@
   GENERAL rest-recenter limit cycle (zero-jump splices on periodic content,
   500 no-op fades/s, permanent −2.4 dB seam loss) — FIXED with bounded rest
   splices + 48k regression test. Seam now +0.00 dB at all three rates.
+- Main-path cadence audit (#64): sustained-rate splice cadence on periodic
+  content is at/below expected (jumps average ≥192; lo = drift−160 ≥ 32
+  structurally excludes no-op candidates). The #62 degeneracy class is fully
+  closed: rest path was the only entry point, now residual-bounded.
