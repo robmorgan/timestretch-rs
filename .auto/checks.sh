@@ -4,7 +4,7 @@ cd "$(dirname "$0")/.."
 
 cargo fmt --all --check
 
-if ! out=$(cargo clippy --all-targets -- -D warnings -q 2>&1); then
+if ! out=$(cargo clippy -q --all-targets -- -D warnings 2>&1); then
   echo "$out" | tail -40
   exit 1
 fi
