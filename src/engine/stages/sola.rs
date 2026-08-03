@@ -238,6 +238,12 @@ const ONSET_PROTECT_POST: f64 = 512.0;
 /// With drift beyond this, a masked window right after an onset/beat is
 /// taken opportunistically even though the trigger has not been reached.
 const OPPORTUNISTIC_DRIFT: f64 = 96.0;
+/// Quiet-gap opportunism: with drift beyond [`OPPORTUNISTIC_DRIFT`], a
+/// splice whose outgoing and incoming regions both sit below this multiple
+/// of the rolling average energy is taken early — small corrections in
+/// quiet moments instead of letting drift accrue to a forced splice that
+/// may land on an attack.
+const QUIET_SPLICE_RATIO: f64 = 0.6;
 /// The masked window after an onset where a splice hides best.
 const MASKED_WINDOW_START: f64 = 768.0;
 const MASKED_WINDOW_END: f64 = 2_048.0;
@@ -441,6 +447,17 @@ impl SolaCorrector {
             } else if drift.abs() > OPPORTUNISTIC_DRIFT && self.in_masked_window(onsets) {
                 // Beat-synchronous placement: a pending correction hides
                 // best right after a hit.
+                self.try_splice(drift, onsets);
+            } else if drift.abs() > OPPORTUNISTIC_DRIFT
+                && self.energy_avg > 1e-6
+                && self.region_rms(self.read_pos, CORR_WINDOW)
+                    < QUIET_SPLICE_RATIO * self.energy_avg
+                && self.region_rms(self.read_pos + drift, CORR_WINDOW)
+                    < QUIET_SPLICE_RATIO * self.energy_avg
+            {
+                // Quiet-gap placement: correct early where nothing is
+                // playing loudly, so fewer splices are ever forced near
+                // attacks.
                 self.try_splice(drift, onsets);
             } else if at_rest && settled_drift.abs() > REST_SPLICE_DRIFT {
                 // At sustained rest a parked drift comb-filters the
