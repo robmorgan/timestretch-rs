@@ -20,3 +20,9 @@
   (breaks retarget contract), FINE steps 8, cutoff 0.90 (tie), crossover
   100/110/135.
 - Artifact-attached path: +0.01 F1 at slowdowns only — not a lever.
+- Exp #42 insight: HARD_TRIGGER forcing NEVER fires on real music at DJ rates
+  (320→384 was bit-identical). All splice damage flows through the regular
+  DRIFT/quiet-gap path; postponement schemes failed because they re-time
+  regular splices, not because of forced ones.
+- Confirmed robust this iteration: side-channel spec 0.95–0.98 (lockstep
+  splices preserve image), output bit-invariant across callback sizes 64–1024.
