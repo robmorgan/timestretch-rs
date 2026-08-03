@@ -1,0 +1,3 @@
+- slow2 spectral loss is sub_bass (0.905) + low (0.941): the un-keylocked low band pitch-follows tempo by design (listening-validated). A click-free low-band corrector (time-domain, long windows) could lift spec_sim at hard ratios but was deliberately deleted (Stage 9 PV rejection was for the HIGH band; low band never keylocked). Big architectural swing — try only after cheap levers exhausted.
+- transient_f1 recall gap: found 147 vs expected 164 onsets at +6.5% — splice fades smear attacks; online (no-artifact) protection is a crude block-RMS ratio (TRANSIENT_POSTPONE_RATIO=3.0).
+- Consider a benchmark render with the .tsanalysis.json artifact attached (artifact-first path) as an extra scored scenario.
