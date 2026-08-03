@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::scrub::ScrubVoice;
-use crate::state::{ScrubPhase, ScrubState, SharedStateHandle};
+use crate::state::{AtomicVolume, ScrubPhase, ScrubState};
 
 /// Scrub voice crossfade time in seconds (engage and release).
 const SCRUB_MIX_SECS: f32 = 0.005;
@@ -34,7 +34,7 @@ impl AudioEngine {
     /// read of `source_audio` chasing the published pointer position — the
     /// audible CDJ-style scrub — and back to the engine on release.
     pub fn new(
-        state: SharedStateHandle,
+        volume: Arc<AtomicVolume>,
         stream_active: Arc<AtomicBool>,
         desired_sample_rate: Option<u32>,
         mut processor: timestretch::engine::EngineProcessor,
@@ -128,6 +128,7 @@ impl AudioEngine {
                             }
                         }
                         scrub.publish_voice_frame(voice.position());
+                        scrub.publish_voice_rate(voice.rate());
                         let mix_target: f32 = if scrubbing { 1.0 } else { 0.0 };
                         for (frame, voice_frame) in
                             data.chunks_exact_mut(2).zip(scratch.chunks_exact(2))
@@ -148,10 +149,9 @@ impl AudioEngine {
                         }
                     }
 
-                    let volume = {
-                        let st = state.lock().unwrap();
-                        st.volume
-                    };
+                    // Lock-free: a realtime thread must never wait on the
+                    // UI's state mutex.
+                    let volume = volume.load();
                     for sample in data.iter_mut() {
                         *sample *= volume;
                     }

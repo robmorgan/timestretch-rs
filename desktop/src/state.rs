@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use timestretch::PreAnalysisArtifact;
 
@@ -66,7 +66,6 @@ impl DeckEngine {
 pub struct SharedState {
     pub transport: Transport,
     pub stretch_ratio: f64,
-    pub volume: f32,
     pub preset: PresetChoice,
     /// Deck engine mode. Forwarded live to the engine's keylock toggle by
     /// the deck thread (the engine always runs the keylock chain; Tape is
@@ -121,7 +120,6 @@ impl SharedState {
         Self {
             transport: Transport::Stopped,
             stretch_ratio: 1.0,
-            volume: 0.8,
             preset: PresetChoice::DjBeatmatch,
             deck_engine: DeckEngine::Keylock,
             position_frames: 0,
@@ -138,19 +136,29 @@ impl SharedState {
             loop_in: None,
         }
     }
+}
 
-    pub fn duration_secs(&self) -> f64 {
-        if self.sample_rate == 0 {
-            return 0.0;
+/// Lock-free output volume (f32 bits): the realtime audio callback must
+/// never take the shared-state mutex — blocking on the UI thread mid-
+/// layout risks output underruns, and the contention can push a UI frame
+/// past its present deadline.
+pub struct AtomicVolume {
+    bits: AtomicU32,
+}
+
+impl AtomicVolume {
+    pub fn new(volume: f32) -> Self {
+        Self {
+            bits: AtomicU32::new(volume.to_bits()),
         }
-        self.total_frames as f64 / self.sample_rate as f64
     }
 
-    pub fn position_secs(&self) -> f64 {
-        if self.sample_rate == 0 {
-            return 0.0;
-        }
-        self.position_frames as f64 / self.sample_rate as f64
+    pub fn store(&self, volume: f32) {
+        self.bits.store(volume.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn load(&self) -> f32 {
+        f32::from_bits(self.bits.load(Ordering::Relaxed))
     }
 }
 
@@ -202,6 +210,10 @@ pub struct ScrubState {
     /// every rendered block while engaged; the UI displays it during the
     /// glide and uses it as the re-grab base.
     voice_frame: AtomicU64,
+    /// Voice rate as `f64` bits (source frames per output frame, sign =
+    /// direction), published next to `voice_frame`; the UI's playhead
+    /// smoother extrapolates the glide display with it.
+    voice_rate: AtomicU64,
     /// Predicted settle landing frame as `f64` bits, published by the
     /// callback when a glide starts.
     landing: AtomicU64,
@@ -217,6 +229,7 @@ impl ScrubState {
             target_frame: AtomicU64::new(0.0f64.to_bits()),
             settle_rate_target: AtomicU64::new(0.0f64.to_bits()),
             voice_frame: AtomicU64::new(0.0f64.to_bits()),
+            voice_rate: AtomicU64::new(0.0f64.to_bits()),
             landing: AtomicU64::new(0.0f64.to_bits()),
             landing_seq: AtomicU64::new(0),
         }
@@ -284,6 +297,15 @@ impl ScrubState {
 
     pub fn voice_frame(&self) -> f64 {
         f64::from_bits(self.voice_frame.load(Ordering::Relaxed))
+    }
+
+    pub fn publish_voice_rate(&self, rate: f64) {
+        self.voice_rate.store(rate.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Voice rate in source frames per output frame (sign = direction).
+    pub fn voice_rate(&self) -> f64 {
+        f64::from_bits(self.voice_rate.load(Ordering::Relaxed))
     }
 
     /// Callback-side: publish the predicted glide landing. The frame is

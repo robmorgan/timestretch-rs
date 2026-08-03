@@ -4,8 +4,8 @@
 
 use eframe::egui;
 
-use super::peaks::{BandPeaks, PeakLevel};
-use super::{GridMarks, overlay_plan, paint_placeholder, palette};
+use super::peaks::BandPeaks;
+use super::{GridMarks, overlay_plan, paint_placeholder, palette, render_columns};
 
 /// Strip height in points.
 const STRIP_HEIGHT: f32 = 48.0;
@@ -25,39 +25,15 @@ pub struct OverviewTexture {
 
 impl OverviewTexture {
     pub fn from_peaks(ctx: &egui::Context, peaks: &BandPeaks) -> Self {
+        let level = peaks.coarsest();
         Self {
             tex: ctx.load_texture(
                 "waveform_overview",
-                render_level(peaks.coarsest()),
+                render_columns(level, 0..level.num_buckets(), TEX_HEIGHT),
                 egui::TextureOptions::LINEAR,
             ),
         }
     }
-}
-
-/// Rasterizes a peak level into a transparent-background image, one column
-/// per bucket. Bands paint in high → mid → low order — low on top — so
-/// kick-heavy passages read blue and highs surface only where the lows
-/// drop out (CDJ RGB semantics; in a dense master the high band's *peak*
-/// is near full scale everywhere and would bury the image if on top).
-fn render_level(level: &PeakLevel) -> egui::ColorImage {
-    let width = level.num_buckets().max(1);
-    let mut image = egui::ColorImage::new([width, TEX_HEIGHT], egui::Color32::TRANSPARENT);
-    let center = TEX_HEIGHT as f32 / 2.0;
-    let half_height = TEX_HEIGHT as f32 * 0.45;
-    let band_colors = [palette::BAND_LOW, palette::BAND_MID, palette::BAND_HIGH];
-    for x in 0..level.num_buckets() {
-        for (band, &color) in band_colors.iter().enumerate().rev() {
-            let pos = level.pos[band][x].clamp(0.0, 1.0);
-            let neg = level.neg[band][x].clamp(-1.0, 0.0);
-            let top = (center - pos * half_height).floor().max(0.0) as usize;
-            let bottom = (center - neg * half_height).ceil() as usize;
-            for y in top..bottom.min(TEX_HEIGHT) {
-                image.pixels[y * width + x] = color;
-            }
-        }
-    }
-    image
 }
 
 pub struct OverviewParams<'a> {

@@ -82,6 +82,11 @@ impl ScrubVoice {
         self.pos
     }
 
+    /// Current advance in source frames per output frame (sign = direction).
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+
     /// Start the release glide easing the current rate toward `rate_target`
     /// and return the predicted landing frame. The trajectory is simulated
     /// once with the same per-frame arithmetic [`render_settle`] runs, so
