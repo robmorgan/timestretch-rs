@@ -68,8 +68,14 @@
 - Soak audit (#65): 30 min looped-music stream with ride+nudges — underruns 0,
   NaN 0, per-minute RMS stable to 0.2%. No slow drift/leak/level bugs.
   Stability axis closed. All audit axes in the ledger are now green.
-- Offline regression audit (#67): #58's tail-fade provably does NOT touch
-  offline stretch() output (worktree A/B bit-identical). Pre-existing minor
-  tail rolloff at speedup ratios (last 64 samples ~0.62x at ratio 1.08) is
-  upstream offline-drain behavior — possible tiny future item, out of the
-  streaming session's scope.
+- Offline tail rolloff FULLY CHARACTERIZED (#67, #68): pre-existing, only
+  on SLOWDOWN renders (ratio>1): SOLA's elastic cursor runs ahead of
+  nominal lag by up to DRIFT_TRIGGER (~192 frames) at transposition>1, so
+  it enters the flush zeros early — the last ~4ms of expected output has
+  the high band faded toward silence (0.20-0.35x at 517Hz; variable at
+  220Hz by splice luck; low band intact — it's an exact delay). Content
+  plays ~4ms early, not lost. Speedup/unity tails are clean (cursor lags
+  behind nominal). Repro: stretch 2s sine, compare last-64 peak vs mid at
+  ratios {1.04..1.16}. Fix would need drift-to-zero drain semantics in the
+  corrector at finish() — deferred: ~4ms loop-point softening vs corrector
+  end-of-stream complexity. NOT a session regression (bit-identical pre-#58).
