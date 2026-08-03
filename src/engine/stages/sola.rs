@@ -448,20 +448,20 @@ impl SolaCorrector {
                 // Beat-synchronous placement: a pending correction hides
                 // best right after a hit.
                 self.try_splice(drift, onsets);
-            } else if drift.abs() > OPPORTUNISTIC_DRIFT && self.energy_avg > 1e-6 {
-                // Quiet-gap placement with a graded gate: the required
-                // quietness relaxes as drift approaches the trigger, so
-                // each splice fires at the quietest moment available in
-                // its window instead of at an arbitrary drift crossing.
-                let t = ((drift.abs() - OPPORTUNISTIC_DRIFT)
-                    / (DRIFT_TRIGGER - OPPORTUNISTIC_DRIFT))
-                    .clamp(0.0, 1.0);
-                let gate = (QUIET_SPLICE_RATIO + t * (1.2 - QUIET_SPLICE_RATIO)) * self.energy_avg;
-                if self.region_rms(self.read_pos, CORR_WINDOW) < gate
-                    && self.region_rms(self.read_pos + drift, CORR_WINDOW) < gate
-                {
-                    self.try_splice(drift, onsets);
-                }
+            } else if drift.abs() > OPPORTUNISTIC_DRIFT
+                && self.energy_avg > 1e-6
+                && self.region_rms(self.read_pos, CORR_WINDOW)
+                    < QUIET_SPLICE_RATIO * self.energy_avg
+                && self.region_rms(self.read_pos + drift, CORR_WINDOW)
+                    < QUIET_SPLICE_RATIO * self.energy_avg
+            {
+                // Quiet-gap placement: correct early where nothing is
+                // playing loudly, so fewer splices are ever forced near
+                // attacks. (A drift-graded gate was tried and won on a
+                // 3-track corpus but washed out on 4 — the fixed strict
+                // gate is simpler and at least as good; see autoresearch
+                // log #43/#51.)
+                self.try_splice(drift, onsets);
             } else if at_rest && settled_drift.abs() > REST_SPLICE_DRIFT {
                 // At sustained rest a parked drift comb-filters the
                 // crossover overlap against the low band's fixed delay;
