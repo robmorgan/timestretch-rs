@@ -217,7 +217,7 @@ const CORR_WINDOW: usize = 320;
 /// worsen ride pitch stability (each fade interpolates between copies at
 /// a sub-period offset, and more estimation windows straddle a fade), so
 /// seam-content preservation leans on the correlation window instead.
-const XFADE_FRAMES: usize = 96;
+const XFADE_FRAMES: usize = 64;
 /// Sinc half-width plus slack the read cursor keeps behind the write head.
 const MIN_READ_MARGIN: f64 = (READ_HALF_TAPS + 4) as f64;
 /// Sub-sample splice refinement half-range, in frames: after the integer
