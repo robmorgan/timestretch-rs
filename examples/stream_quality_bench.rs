@@ -18,7 +18,7 @@
 //!
 //! Run with: cargo run --release --example stream_quality_bench
 
-use timestretch::analysis::comparison::{cross_correlation, mean_spectral_similarity};
+use timestretch::analysis::comparison::{mean_spectral_similarity, spectral_similarity};
 use timestretch::analysis::preanalysis::downmix_to_mid;
 use timestretch::analysis::transient::detect_transients;
 use timestretch::engine::{Engine, EngineConfig, EngineProfile};
@@ -33,9 +33,12 @@ const CALLBACK_FRAMES: usize = 256;
 const MUSIC_SKIP_SECS: usize = 10;
 const MUSIC_SECS: usize = 40;
 
-/// Stretch rates: 124->115 BPM slowdown, 124->132 BPM speedup.
+/// Stretch rates: moderate (124->115 / 124->132 BPM) and hard
+/// (124->104 / 124->140 BPM) slowdowns and speedups.
 const RATE_SLOW: f64 = 115.0 / 124.0;
 const RATE_FAST: f64 = 132.0 / 124.0;
+const RATE_SLOW2: f64 = 104.0 / 124.0;
+const RATE_FAST2: f64 = 140.0 / 124.0;
 
 const FFT_SIZE: usize = 4096;
 const HOP_SIZE: usize = 1024;
@@ -58,6 +61,8 @@ struct Render {
     underrun_frames: u64,
     /// Wall-clock processing time in seconds (process() calls only).
     process_secs: f64,
+    /// Reported pipeline latency in frames (constant, compensated in metrics).
+    latency_frames: usize,
 }
 
 fn render_stream(input: &[f32], channels: usize, rate_at: &dyn Fn(f64) -> f64) -> Render {
@@ -73,6 +78,7 @@ fn render_stream(input: &[f32], channels: usize, rate_at: &dyn Fn(f64) -> f64) -
     .expect("engine builds");
     let (controller, mut processor, mut source) =
         (handles.controller, handles.processor, handles.source);
+    let latency_frames = processor.pipeline_latency_frames();
     source.set_track_position(0);
 
     let mut feed_cursor = 0usize;
@@ -112,6 +118,7 @@ fn render_stream(input: &[f32], channels: usize, rate_at: &dyn Fn(f64) -> f64) -
                 output,
                 underrun_frames: underruns_before,
                 process_secs,
+                latency_frames,
             };
         }
         output.extend_from_slice(&out);
@@ -128,7 +135,13 @@ fn render_stream(input: &[f32], channels: usize, rate_at: &dyn Fn(f64) -> f64) -
 // ---------------------------------------------------------------------------
 
 /// F1 between input onsets mapped through the stretch ratio and output onsets.
-fn transient_f1(input_mid: &[f32], output_mid: &[f32], rate: f64) -> (f64, usize, usize) {
+/// `latency` is the engine's reported constant pipeline delay in frames.
+fn transient_f1(
+    input_mid: &[f32],
+    output_mid: &[f32],
+    rate: f64,
+    latency: usize,
+) -> (f64, usize, usize) {
     let in_map = detect_transients(
         input_mid,
         SAMPLE_RATE,
@@ -147,11 +160,12 @@ fn transient_f1(input_mid: &[f32], output_mid: &[f32], rate: f64) -> (f64, usize
     let warmup = (WARMUP_SECS * SAMPLE_RATE as f64) as i64;
 
     // Expected output positions of the input onsets (tempo rate > 1 means
-    // faster playback, so output time = input time / rate).
+    // faster playback, so output time = input time / rate), shifted by the
+    // engine's constant reported latency.
     let expected: Vec<i64> = in_map
         .onsets
         .iter()
-        .map(|&s| (s as f64 / rate) as i64)
+        .map(|&s| (s as f64 / rate) as i64 + latency as i64)
         .filter(|&s| s >= warmup && s < output_mid.len() as i64 - tol)
         .collect();
     let found: Vec<i64> = out_map
@@ -278,12 +292,16 @@ fn main() {
     // --- Renders ---
     let slow = render_stream(&segment, ch, &|_| RATE_SLOW);
     let fast = render_stream(&segment, ch, &|_| RATE_FAST);
+    let slow2 = render_stream(&segment, ch, &|_| RATE_SLOW2);
+    let fast2 = render_stream(&segment, ch, &|_| RATE_FAST2);
     let identity = render_stream(&segment, ch, &|_| 1.0);
     let music_ride = render_stream(&segment, ch, &ride);
     let sine_ride = render_stream(&sine, 1, &ride);
 
     let slow_mid = downmix_to_mid(&slow.output, ch);
     let fast_mid = downmix_to_mid(&fast.output, ch);
+    let slow2_mid = downmix_to_mid(&slow2.output, ch);
+    let fast2_mid = downmix_to_mid(&fast2.output, ch);
     let identity_mid = downmix_to_mid(&identity.output, ch);
     let ride_mid = downmix_to_mid(&music_ride.output, ch);
 
@@ -292,14 +310,31 @@ fn main() {
     // --- Timbre: timing-invariant mean spectrum similarity ---
     let spec_slow = mean_spectral_similarity(&segment_mid, &slow_mid[warmup..], FFT_SIZE, HOP_SIZE);
     let spec_fast = mean_spectral_similarity(&segment_mid, &fast_mid[warmup..], FFT_SIZE, HOP_SIZE);
+    let spec_slow2 =
+        mean_spectral_similarity(&segment_mid, &slow2_mid[warmup..], FFT_SIZE, HOP_SIZE);
+    let spec_fast2 =
+        mean_spectral_similarity(&segment_mid, &fast2_mid[warmup..], FFT_SIZE, HOP_SIZE);
 
     // --- Transients ---
-    let (tf1_slow, exp_slow, found_slow) = transient_f1(&segment_mid, &slow_mid, RATE_SLOW);
-    let (tf1_fast, exp_fast, found_fast) = transient_f1(&segment_mid, &fast_mid, RATE_FAST);
+    let (tf1_slow, exp_slow, found_slow) =
+        transient_f1(&segment_mid, &slow_mid, RATE_SLOW, slow.latency_frames);
+    let (tf1_fast, exp_fast, found_fast) =
+        transient_f1(&segment_mid, &fast_mid, RATE_FAST, fast.latency_frames);
+    let (tf1_slow2, _, _) =
+        transient_f1(&segment_mid, &slow2_mid, RATE_SLOW2, slow2.latency_frames);
+    let (tf1_fast2, _, _) =
+        transient_f1(&segment_mid, &fast2_mid, RATE_FAST2, fast2.latency_frames);
 
-    // --- Identity transparency ---
-    let xc = cross_correlation(&segment_mid, &identity_mid[warmup..]);
-    let identity_corr = xc.peak_value.abs();
+    // --- Identity transparency: latency-aligned frame-wise magnitude
+    // spectral similarity (phase-blind: the LR8 crossover re-sums to
+    // allpass, so waveform correlation would punish inaudible phase).
+    let identity_corr = {
+        let lat = identity.latency_frames;
+        let n = (identity_mid.len() - lat).min(segment_mid.len()) - warmup;
+        let a = &segment_mid[warmup..warmup + n];
+        let b = &identity_mid[warmup + lat..warmup + lat + n];
+        spectral_similarity(a, b, 2048, 512)
+    };
 
     // --- Pitch stability ---
     let (p95_cents, max_cents) = cents_stats(&sine_ride.output, 440.0);
@@ -307,23 +342,31 @@ fn main() {
     // --- Clicks (worst across the music renders) ---
     let clicks = clicks_per_million(&segment_mid, &slow_mid)
         .max(clicks_per_million(&segment_mid, &fast_mid))
+        .max(clicks_per_million(&segment_mid, &slow2_mid))
+        .max(clicks_per_million(&segment_mid, &fast2_mid))
         .max(clicks_per_million(&segment_mid, &ride_mid));
 
     // --- Underruns across all renders (must stay 0) ---
     let underruns = slow.underrun_frames
         + fast.underrun_frames
+        + slow2.underrun_frames
+        + fast2.underrun_frames
         + identity.underrun_frames
         + music_ride.underrun_frames
         + sine_ride.underrun_frames;
 
     // --- Throughput (media seconds per process second, music renders) ---
-    let media_secs = 3.0 * MUSIC_SECS as f64;
-    let proc_secs = slow.process_secs + fast.process_secs + music_ride.process_secs;
+    let media_secs = 5.0 * MUSIC_SECS as f64;
+    let proc_secs = slow.process_secs
+        + fast.process_secs
+        + slow2.process_secs
+        + fast2.process_secs
+        + music_ride.process_secs;
     let realtime_x = media_secs / proc_secs;
 
     // --- Composite quality score (0-100, higher is better) ---
-    let spec_score = 0.5 * (spec_slow + spec_fast);
-    let transient_score = 0.5 * (tf1_slow + tf1_fast);
+    let spec_score = 0.25 * (spec_slow + spec_fast + spec_slow2 + spec_fast2);
+    let transient_score = 0.25 * (tf1_slow + tf1_fast + tf1_slow2 + tf1_fast2);
     let pitch_score = (-p95_cents / 10.0).exp();
     let click_score = (-clicks / 50.0).exp();
     let quality = 100.0
@@ -335,12 +378,15 @@ fn main() {
         * if underruns > 0 { 0.5 } else { 1.0 };
 
     println!("--- streaming quality ---");
-    println!("spec_slow={spec_slow:.4} spec_fast={spec_fast:.4}");
+    println!(
+        "spec slow={spec_slow:.4} fast={spec_fast:.4} slow2={spec_slow2:.4} fast2={spec_fast2:.4}"
+    );
     println!(
         "transient_f1 slow={tf1_slow:.4} (exp {exp_slow} found {found_slow}) \
-         fast={tf1_fast:.4} (exp {exp_fast} found {found_fast})"
+         fast={tf1_fast:.4} (exp {exp_fast} found {found_fast}) \
+         slow2={tf1_slow2:.4} fast2={tf1_fast2:.4}"
     );
-    println!("identity_corr={identity_corr:.4} (lag {})", xc.peak_offset);
+    println!("identity_corr={identity_corr:.4} (latency-aligned frame-wise spectral sim)");
     println!("pitch p95={p95_cents:.2}c max={max_cents:.2}c");
     println!("clicks/M={clicks:.1} underruns={underruns}");
     println!();

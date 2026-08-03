@@ -49,13 +49,22 @@ suite) runs automatically after passing benchmarks (~1–2 min warm).
 - Real-time path must stay allocation-free (tests/engine_realtime_allocations.rs gates this).
 - Keep `underruns` at 0 and `realtime_x` comfortably above realtime.
 
-## Baseline (2026-02-13)
-quality=81.87 | spec_sim=0.981 transient_f1=0.607 (slow 0.726 / fast 0.489)
-pitch p95=0.43c max=0.53c | identity_corr=0.505 | clicks=0 underruns=0 realtime_x≈90
+## Baseline (2026-02-13, calibrated harness)
+quality=95.34 | spec_sim=0.957 (slow 0.978 / fast 0.985 / slow2 0.916 / fast2 0.949)
+transient_f1=0.919 (0.917/0.933/0.902/0.924) | identity_corr=0.991
+pitch p95=0.43c max=0.53c | clicks=0 underruns=0 realtime_x≈55
 
-**Biggest lever**: transient_f1, especially the speedup render (0.489) —
-transients smear/double when speeding up. Second lever: identity_corr (0.505
-at rate 1.0 — the keylock chain is far from transparent even with no stretch).
+Harness calibration notes (2026-02-13): initial harness had a latency bias
+(engine reports ~13 ms constant pipeline latency; compensating raised
+transient_f1 from 0.61→0.92 with zero code change), and used waveform xcorr
+for identity (LR8 crossover is allpass → inaudible phase punished; switched
+to latency-aligned frame-wise magnitude spectral similarity). Also added hard
+ratios ±14–16% (RATE_SLOW2=104/124, RATE_FAST2=140/124) for sensitivity.
+
+**Biggest levers**: spec_sim at hard ratios (slow2 0.916 — spectral damage at
+−16%), transient_f1 across the board (~0.92). Renders use pre_analysis: None
+(cold streaming path) — the SOLA onset protection runs on its online energy
+heuristic only.
 
 ## What's Been Tried
 (update as experiments accumulate)
