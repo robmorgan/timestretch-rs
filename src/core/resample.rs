@@ -189,13 +189,23 @@ const STREAM_SINC_CUTOFF_RAMP_END: f64 = 1.1;
 /// of the cursor plus slack for cursor drift near block boundaries.
 const STREAM_SINC_HISTORY: usize = 192;
 
+/// Tap count of one polyphase row of the unity-cutoff kernel: offsets
+/// `1 - STREAM_SINC_HALF_TAPS ..= STREAM_SINC_HALF_TAPS` (the omitted
+/// leftmost offset's weight is identically zero for every phase).
+pub(crate) const STREAM_SINC_ROW_TAPS: usize = 2 * STREAM_SINC_HALF_TAPS;
+
 /// Immutable Kaiser-windowed sinc prototype shared across channels.
 ///
 /// Stores one side of the symmetric kernel sampled at `STREAM_SINC_PHASES`
 /// points per zero-crossing; lookups linearly interpolate between entries.
+/// The same samples are additionally laid out as contiguous polyphase rows
+/// (one full unity-cutoff kernel per phase), so the common non-dilated case
+/// fills its weight row by lerping two contiguous rows instead of gathering
+/// per tap.
 #[derive(Debug)]
 pub struct SincInterpTable {
     taps: Vec<f32>,
+    rows: Vec<f32>,
 }
 
 impl SincInterpTable {
@@ -221,7 +231,24 @@ impl SincInterpTable {
             };
             *tap = (sinc_val * window) as f32;
         }
-        Arc::new(Self { taps })
+        let rows = polyphase_rows(&taps, STREAM_SINC_HALF_TAPS, STREAM_SINC_PHASES);
+        Arc::new(Self { taps, rows })
+    }
+
+    /// Fills the unity-cutoff kernel row for fractional phase `frac`
+    /// (weights for tap offsets `1 - half ..= half`) by lerping the two
+    /// bracketing polyphase rows, and returns the weight sum. Only valid
+    /// when the kernel is not dilated (`cutoff == 1.0`); the dilated case
+    /// samples the prototype per tap via [`Self::weight`].
+    #[inline]
+    pub(crate) fn fill_row_unity(&self, frac: f64, row: &mut [f32]) -> f64 {
+        fill_row_lerp(
+            &self.rows,
+            STREAM_SINC_ROW_TAPS,
+            STREAM_SINC_PHASES,
+            frac,
+            row,
+        )
     }
 
     /// Kernel weight at absolute offset `u_abs` (in zero-crossings).
@@ -256,13 +283,24 @@ impl SincInterpTable {
 /// All state is fixed-size: no allocations after construction.
 #[derive(Debug, Clone)]
 pub struct StreamingSincResampler {
+    inner: MultiSincResampler,
+}
+
+/// The engine's multi-channel resampling core: one shared fractional cursor
+/// driving N per-channel histories in lockstep. Every channel sees the same
+/// step sequence, so each output sample's kernel weight row is computed once
+/// and applied to all channels ([`StreamingSincResampler`] is the
+/// single-channel public wrapper).
+#[derive(Debug, Clone)]
+pub(crate) struct MultiSincResampler {
     table: Arc<SincInterpTable>,
-    history: [f32; STREAM_SINC_HISTORY],
+    /// One history per channel (lockstep; the cursor is shared).
+    histories: Vec<[f32; STREAM_SINC_HISTORY]>,
     /// Fractional source cursor in the local frame (history starts at 0).
     src_pos: f64,
     /// Step at the end of the previous block; ramp anchor for the next one.
     prev_step: f64,
-    /// Total input samples fed since the last reset.
+    /// Total input samples fed per channel since the last reset.
     fed_total: u64,
     has_started: bool,
 }
@@ -271,22 +309,13 @@ impl StreamingSincResampler {
     /// Creates a resampler sharing the given prototype table.
     pub fn new(table: Arc<SincInterpTable>) -> Self {
         Self {
-            table,
-            history: [0.0; STREAM_SINC_HISTORY],
-            src_pos: STREAM_SINC_HISTORY as f64,
-            prev_step: 1.0,
-            fed_total: 0,
-            has_started: false,
+            inner: MultiSincResampler::new(table, 1),
         }
     }
 
     /// Clears all state back to stream start.
     pub fn reset(&mut self) {
-        self.history.fill(0.0);
-        self.src_pos = STREAM_SINC_HISTORY as f64;
-        self.prev_step = 1.0;
-        self.fed_total = 0;
-        self.has_started = false;
+        self.inner.reset();
     }
 
     /// Fractional source position (in input samples fed since the last
@@ -299,12 +328,12 @@ impl StreamingSincResampler {
     /// making it suitable for driving source-position bookkeeping when the
     /// resampler sits ahead of downstream processing.
     pub fn next_output_source_pos(&self) -> f64 {
-        self.fed_total as f64 + self.src_pos - STREAM_SINC_HISTORY as f64
+        self.inner.next_output_source_pos()
     }
 
     /// Returns whether any input has been consumed since the last reset.
     pub fn is_engaged(&self) -> bool {
-        self.has_started
+        self.inner.has_started
     }
 
     /// Lookahead of the current kernel in samples (8 at step <= 1).
@@ -316,32 +345,7 @@ impl StreamingSincResampler {
     /// samples held back as lookahead. [`STREAM_SINC_HALF_TAPS`] at unity or
     /// pitch-down, up to [`STREAM_SINC_MAX_HALF_TAPS`] when pitching up.
     pub fn current_half_span(&self) -> usize {
-        Self::half_span_for_step(self.prev_step)
-    }
-
-    /// Normalized kernel cutoff for a given step (1.0 = input Nyquist).
-    ///
-    /// For step <= 1 the kernel is a pure interpolator (delta at unity). For
-    /// step > 1 the cutoff shrinks to `1/step`, additionally scaled by
-    /// `STREAM_SINC_CUTOFF_SCALE` (ramped in over
-    /// `1.0..STREAM_SINC_CUTOFF_RAMP_END`) so the stopband edge sits at the
-    /// fold frequency.
-    #[inline]
-    fn cutoff_for_step(step: f64) -> f64 {
-        if step <= 1.0 {
-            return 1.0;
-        }
-        let s = step.min(STREAM_SINC_MAX_STEP);
-        let t = ((s - 1.0) / (STREAM_SINC_CUTOFF_RAMP_END - 1.0)).min(1.0);
-        let g = 1.0 - (1.0 - STREAM_SINC_CUTOFF_SCALE) * t;
-        g / s
-    }
-
-    /// Half-span of the (possibly dilated) kernel for a given step.
-    #[inline]
-    fn half_span_for_step(step: f64) -> usize {
-        ((STREAM_SINC_HALF_TAPS as f64 / Self::cutoff_for_step(step)).ceil() as usize)
-            .min(STREAM_SINC_MAX_HALF_TAPS)
+        MultiSincResampler::half_span_for_step(self.inner.prev_step)
     }
 
     /// Resamples `input`, ramping the step linearly from the previous block's
@@ -372,8 +376,107 @@ impl StreamingSincResampler {
         output: &mut Vec<f32>,
         max_out: usize,
     ) -> Result<(), StretchError> {
-        output.clear();
-        if input.is_empty() {
+        self.inner.process_flat_capped(
+            input,
+            input.len(),
+            step,
+            std::slice::from_mut(output),
+            max_out,
+        )
+    }
+
+    /// Drains the lookahead tail by feeding just enough zeros to release all
+    /// outputs covering real input, then resets.
+    pub fn flush_into(&mut self, step: f64, output: &mut Vec<f32>) -> Result<(), StretchError> {
+        if !self.inner.has_started {
+            output.clear();
+            return Ok(());
+        }
+        let zeros = [0.0f32; STREAM_SINC_MAX_HALF_TAPS + 2];
+        let drain = MultiSincResampler::half_span_for_step(step.max(self.inner.prev_step)) + 2;
+        self.process_into(&zeros[..drain], step, output)?;
+        self.reset();
+        Ok(())
+    }
+}
+
+impl MultiSincResampler {
+    /// Creates a lockstep resampler bank sharing the given prototype table.
+    pub(crate) fn new(table: Arc<SincInterpTable>, channels: usize) -> Self {
+        Self {
+            table,
+            histories: vec![[0.0; STREAM_SINC_HISTORY]; channels],
+            src_pos: STREAM_SINC_HISTORY as f64,
+            prev_step: 1.0,
+            fed_total: 0,
+            has_started: false,
+        }
+    }
+
+    /// Clears all state back to stream start.
+    pub(crate) fn reset(&mut self) {
+        for history in &mut self.histories {
+            history.fill(0.0);
+        }
+        self.src_pos = STREAM_SINC_HISTORY as f64;
+        self.prev_step = 1.0;
+        self.fed_total = 0;
+        self.has_started = false;
+    }
+
+    /// Fractional source position (frames since reset) of the next output
+    /// frame the bank will emit (see
+    /// [`StreamingSincResampler::next_output_source_pos`]).
+    pub(crate) fn next_output_source_pos(&self) -> f64 {
+        self.fed_total as f64 + self.src_pos - STREAM_SINC_HISTORY as f64
+    }
+
+    /// Normalized kernel cutoff for a given step (1.0 = input Nyquist).
+    ///
+    /// For step <= 1 the kernel is a pure interpolator (delta at unity). For
+    /// step > 1 the cutoff shrinks to `1/step`, additionally scaled by
+    /// `STREAM_SINC_CUTOFF_SCALE` (ramped in over
+    /// `1.0..STREAM_SINC_CUTOFF_RAMP_END`) so the stopband edge sits at the
+    /// fold frequency.
+    #[inline]
+    fn cutoff_for_step(step: f64) -> f64 {
+        if step <= 1.0 {
+            return 1.0;
+        }
+        let s = step.min(STREAM_SINC_MAX_STEP);
+        let t = ((s - 1.0) / (STREAM_SINC_CUTOFF_RAMP_END - 1.0)).min(1.0);
+        let g = 1.0 - (1.0 - STREAM_SINC_CUTOFF_SCALE) * t;
+        g / s
+    }
+
+    /// Half-span of the (possibly dilated) kernel for a given step.
+    #[inline]
+    pub(crate) fn half_span_for_step(step: f64) -> usize {
+        ((STREAM_SINC_HALF_TAPS as f64 / Self::cutoff_for_step(step)).ceil() as usize)
+            .min(STREAM_SINC_MAX_HALF_TAPS)
+    }
+
+    /// Resamples every channel in lockstep: channel `c`'s input is
+    /// `inputs[c * frames..(c + 1) * frames]` (channel-contiguous
+    /// deinterleaved layout) and its output is appended to `outputs[c]`.
+    /// One kernel weight row is computed per output sample and applied to
+    /// all channels. Step ramp, emission cap, and overflow semantics are
+    /// those of [`StreamingSincResampler::process_into_capped`].
+    pub(crate) fn process_flat_capped(
+        &mut self,
+        inputs: &[f32],
+        frames: usize,
+        step: f64,
+        outputs: &mut [Vec<f32>],
+        max_out: usize,
+    ) -> Result<(), StretchError> {
+        let channels = self.histories.len();
+        debug_assert_eq!(outputs.len(), channels);
+        debug_assert_eq!(inputs.len(), channels * frames);
+        for out in outputs.iter_mut() {
+            out.clear();
+        }
+        if frames == 0 {
             return Ok(());
         }
 
@@ -386,90 +489,145 @@ impl StreamingSincResampler {
         self.has_started = true;
 
         let h = STREAM_SINC_HISTORY;
-        let total = h + input.len();
+        let total = h + frames;
         // Widest kernel needed anywhere in this block gates emission so every
         // output has its full right half-kernel available.
         let half_span_max = Self::half_span_for_step(step_begin.max(step_end));
-        let inv_input_len = 1.0 / input.len() as f64;
+        let inv_input_len = 1.0 / frames as f64;
 
         let mut pos = self.src_pos;
         let start_pos = pos;
-        while pos + half_span_max as f64 + 1.0 <= total as f64 && output.len() < max_out {
-            if output.len() == output.capacity() {
+        let mut emitted = 0usize;
+        while pos + half_span_max as f64 + 1.0 <= total as f64 && emitted < max_out {
+            if outputs.iter().any(|out| out.len() == out.capacity()) {
                 return Err(StretchError::BufferOverflow {
                     buffer: "stream_pitch_resample_output",
-                    requested: output.len().saturating_add(1),
-                    available: output.capacity(),
+                    requested: emitted.saturating_add(1),
+                    available: outputs[0].capacity(),
                 });
             }
 
             let t = ((pos - start_pos) * inv_input_len).clamp(0.0, 1.0);
             let step_now = step_begin + (step_end - step_begin) * t;
             let cutoff = Self::cutoff_for_step(step_now);
-            let half_span = Self::half_span_for_step(step_now);
 
             let center = pos.floor() as usize;
             let frac = pos - center as f64;
-            let lo = center.saturating_sub(half_span);
-            let hi = (center + half_span + 1).min(total);
 
-            // Two passes so the compiler can vectorize the second: fill the
-            // kernel weights for this output sample into a fixed stack
-            // buffer (the table lookup does not vectorize), then take plain
-            // dot products over the two contiguous source regions.
+            // Weight row for this output sample, shared by every channel.
+            // Non-dilated kernels (step <= 1, by far the common case at DJ
+            // rates) lerp two contiguous polyphase rows; dilated kernels
+            // sample the prototype per tap. The polyphase row omits the
+            // leftmost offset whose weight is identically zero, hence the
+            // differing `lo`.
             let mut weights = [0.0f32; 2 * STREAM_SINC_MAX_HALF_TAPS + 1];
-            let n_taps = hi - lo;
-            let mut weight_sum = 0.0f64;
-            for (k, w) in weights[..n_taps].iter_mut().enumerate() {
-                let u = (((lo + k) as f64 - center as f64) - frac) * cutoff;
-                let val = self.table.weight(u.abs());
-                *w = val;
-                weight_sum += val as f64;
+            let (lo, hi, n_taps, weight_sum) =
+                if cutoff == 1.0 && center >= STREAM_SINC_HALF_TAPS - 1 {
+                    let lo = center - (STREAM_SINC_HALF_TAPS - 1);
+                    let hi = center + STREAM_SINC_HALF_TAPS + 1;
+                    let row = &mut weights[..STREAM_SINC_ROW_TAPS];
+                    let weight_sum = self.table.fill_row_unity(frac, row);
+                    (lo, hi, STREAM_SINC_ROW_TAPS, weight_sum)
+                } else {
+                    let half_span = Self::half_span_for_step(step_now);
+                    let lo = center.saturating_sub(half_span);
+                    let hi = (center + half_span + 1).min(total);
+                    let n_taps = hi - lo;
+                    let mut weight_sum = 0.0f64;
+                    for (k, w) in weights[..n_taps].iter_mut().enumerate() {
+                        let u = (((lo + k) as f64 - center as f64) - frac) * cutoff;
+                        let val = self.table.weight(u.abs());
+                        *w = val;
+                        weight_sum += val as f64;
+                    }
+                    (lo, hi, n_taps, weight_sum)
+                };
+            let weights = &weights[..n_taps];
+
+            for (ch, out) in outputs.iter_mut().enumerate() {
+                let history = &self.histories[ch];
+                let input = &inputs[ch * frames..(ch + 1) * frames];
+                let mut acc = 0.0f64;
+                if lo < h {
+                    let h_end = hi.min(h);
+                    acc += dot_f32_f64(&history[lo..h_end], &weights[..h_end - lo]);
+                }
+                if hi > h {
+                    let in_lo = lo.max(h);
+                    acc += dot_f32_f64(&input[in_lo - h..hi - h], &weights[in_lo - lo..]);
+                }
+                if weight_sum.abs() > 1e-12 {
+                    acc /= weight_sum;
+                }
+                out.push(acc as f32);
             }
-            let mut acc = 0.0f64;
-            if lo < h {
-                let h_end = hi.min(h);
-                acc += dot_f32_f64(&self.history[lo..h_end], &weights[..h_end - lo]);
-            }
-            if hi > h {
-                let in_lo = lo.max(h);
-                acc += dot_f32_f64(&input[in_lo - h..hi - h], &weights[in_lo - lo..n_taps]);
-            }
-            if weight_sum.abs() > 1e-12 {
-                acc /= weight_sum;
-            }
-            output.push(acc as f32);
+            emitted += 1;
             pos += step_now;
         }
 
-        // Retain the last `h` samples of (history ++ input) and rebase the
-        // cursor into the new local frame.
-        let n = input.len();
-        if n >= h {
-            self.history.copy_from_slice(&input[n - h..]);
-        } else {
-            self.history.copy_within(n.., 0);
-            self.history[h - n..].copy_from_slice(input);
+        // Retain the last `h` samples of (history ++ input) per channel and
+        // rebase the cursor into the new local frame.
+        for (ch, history) in self.histories.iter_mut().enumerate() {
+            let input = &inputs[ch * frames..(ch + 1) * frames];
+            if frames >= h {
+                history.copy_from_slice(&input[frames - h..]);
+            } else {
+                history.copy_within(frames.., 0);
+                history[h - frames..].copy_from_slice(input);
+            }
         }
-        self.src_pos = pos - n as f64;
+        self.src_pos = pos - frames as f64;
         self.prev_step = step_end;
-        self.fed_total += n as u64;
+        self.fed_total += frames as u64;
         Ok(())
     }
+}
 
-    /// Drains the lookahead tail by feeding just enough zeros to release all
-    /// outputs covering real input, then resets.
-    pub fn flush_into(&mut self, step: f64, output: &mut Vec<f32>) -> Result<(), StretchError> {
-        if !self.has_started {
-            output.clear();
-            return Ok(());
+/// Lays a one-sided prototype (`taps[i]` = kernel at `i / phases`
+/// zero-crossings) out as contiguous polyphase rows: row `p` holds the full
+/// kernel for fractional phase `p / phases` at tap offsets
+/// `1 - half ..= half`. Rows `0..=phases` exist so a phase lerp can always
+/// read row `p + 1`. Entries at or beyond the kernel edge are exactly zero,
+/// mirroring the lookup guard.
+pub(crate) fn polyphase_rows(taps: &[f32], half: usize, phases: usize) -> Vec<f32> {
+    let width = 2 * half;
+    let edge = (half * phases) as isize;
+    let mut rows = vec![0.0f32; (phases + 2) * width];
+    for p in 0..=phases + 1 {
+        for k in 0..width {
+            let j = k as isize + 1 - half as isize;
+            let idx = (j * phases as isize - p as isize).abs();
+            rows[p * width + k] = if idx >= edge { 0.0 } else { taps[idx as usize] };
         }
-        let zeros = [0.0f32; STREAM_SINC_MAX_HALF_TAPS + 2];
-        let drain = Self::half_span_for_step(step.max(self.prev_step)) + 2;
-        self.process_into(&zeros[..drain], step, output)?;
-        self.reset();
-        Ok(())
     }
+    rows
+}
+
+/// Fills `row` with the kernel for fractional phase `frac` by lerping the
+/// two bracketing polyphase rows of `rows` (layout per [`polyphase_rows`]);
+/// returns the weight sum. Contiguous loads and a constant lerp factor —
+/// the whole fill vectorizes.
+#[inline]
+pub(crate) fn fill_row_lerp(
+    rows: &[f32],
+    width: usize,
+    phases: usize,
+    frac: f64,
+    row: &mut [f32],
+) -> f64 {
+    debug_assert_eq!(row.len(), width);
+    let x = frac * phases as f64;
+    let p = x as usize;
+    let r = (x - p as f64) as f32;
+    let row_a = &rows[p * width..(p + 1) * width];
+    let row_b = &rows[(p + 1) * width..(p + 2) * width];
+    let mut wsum = 0.0f64;
+    for ((w, &a), &b) in row.iter_mut().zip(row_a).zip(row_b) {
+        let val = a + (b - a) * r;
+        *w = val;
+        wsum += val as f64;
+    }
+    wsum
 }
 
 /// Dot product of equal-length slices, accumulated in f64 across four

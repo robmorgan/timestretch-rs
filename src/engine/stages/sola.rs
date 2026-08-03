@@ -16,7 +16,7 @@
 //! Splice decisions are made once per block on the channel mix and applied
 //! to every channel identically, keeping the stereo image intact.
 
-use crate::core::resample::dot_f32_f64;
+use crate::core::resample::{dot_f32_f64, fill_row_lerp, polyphase_rows};
 use crate::engine::stage::{BLOCK_FRAMES, OnsetEvent};
 
 /// Half-width of the SOLA read kernel in zero-crossings (64-tap kernel).
@@ -34,10 +34,13 @@ const READ_PHASES: usize = 512;
 /// Kaiser beta (~−90 dB stopband, same family as the shared prototype).
 const READ_KAISER_BETA: f64 = 9.0;
 
-/// Windowed-sinc interpolation table for the SOLA reader.
+/// Windowed-sinc interpolation table for the SOLA reader, stored as
+/// contiguous polyphase rows (one full kernel per fractional phase; see
+/// [`polyphase_rows`]) so a read's weight row fills as a vectorizable lerp
+/// of two rows.
 #[derive(Debug)]
 struct ReadInterpTable {
-    taps: Vec<f32>,
+    rows: Vec<f32>,
 }
 
 impl ReadInterpTable {
@@ -74,36 +77,19 @@ impl ReadInterpTable {
             };
             *tap = (sinc_val * window) as f32;
         }
-        Self { taps }
-    }
-
-    #[inline]
-    fn weight(&self, u_abs: f64) -> f32 {
-        if u_abs >= READ_HALF_TAPS as f64 {
-            return 0.0;
+        Self {
+            rows: polyphase_rows(&taps, READ_HALF_TAPS, READ_PHASES),
         }
-        let x = u_abs * READ_PHASES as f64;
-        let i = x as usize;
-        let frac = (x - i as f64) as f32;
-        let a = self.taps[i];
-        let b = self.taps[i + 1];
-        a + (b - a) * frac
     }
 
     /// Fills the full kernel row for fractional phase `frac` (weights for
     /// tap offsets `1-READ_HALF_TAPS..=READ_HALF_TAPS`) and returns the
     /// weight sum. One row serves every channel and — for runs of reads at
-    /// integer strides — every frame sharing the phase, so the table lookup
+    /// integer strides — every frame sharing the phase, so the row fill
     /// cost is paid once instead of per read.
+    #[inline]
     fn fill_row(&self, frac: f64, row: &mut [f32; READ_TAPS]) -> f64 {
-        let mut wsum = 0.0f64;
-        for (k, w) in row.iter_mut().enumerate() {
-            let j = k as isize + 1 - READ_HALF_TAPS as isize;
-            let val = self.weight((j as f64 - frac).abs());
-            *w = val;
-            wsum += val as f64;
-        }
-        wsum
+        fill_row_lerp(&self.rows, READ_TAPS, READ_PHASES, frac, row)
     }
 }
 
