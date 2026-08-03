@@ -76,11 +76,19 @@
   220Hz by splice luck; low band intact — it's an exact delay). Content
   plays ~4ms early, not lost. Speedup/unity tails are clean (cursor lags
   behind nominal). Repro: stretch 2s sine, compare last-64 peak vs mid at
-  ratios {1.04..1.16}. Fix REQUIRES drift-to-zero drain semantics in the
-  corrector at finish(): mirror-padded flush was tried (#69) and is
-  inconsistent (fixes HF tails with 1.27x overshoot, LF still collapses —
-  mirror-seam phase reversal defeats correlation matching). Deferred with
-  experimental confirmation. NOT a session regression (bit-identical pre-#58).
+  ratios {1.04..1.16}. Fix REQUIRES drift-to-zero drain semantics; deferral now verified
+  three ways: judgment (#68), experiment (#69: mirror-padded flush is
+  inconsistent — HF fixed with 1.27x overshoot, LF still collapses at the
+  mirror seam), and plumbing (#71: NO finished-flag exists engine-side —
+  source.finish() only pushes silence; the audio thread cannot see the
+  media end; and StageCtx is public API, so a drain-horizon field is a
+  semver design decision). CONCRETE FIX SPEC for the owner: (1) carry an
+  end-of-media track frame through the ring anchor or a control event,
+  (2) surface remaining-real-frames in StageCtx (breaking for external
+  Stage impls — consider #[non_exhaustive]), (3) SOLA: within ~1024 frames
+  of the horizon, one bounded recentering splice (reuse #62's max_residual
+  machinery), then hold nominal. NOT a session regression (bit-identical
+  pre-#58).
 - WCET audit (#70): strict 1× local gate — keylock@64 p99.9=0.062 vs 0.5
   bound (8× headroom). Session's audio-thread additions cost no meaningful
   callback budget. Audit ledger final: every constraint class green at its

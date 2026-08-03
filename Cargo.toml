@@ -98,3 +98,8 @@ required-features = ["qa-harnesses"]
 name = "engine_ab_matrix"
 path = "qa/engine_ab_matrix.rs"
 required-features = ["qa-harnesses"]
+
+[[test]]
+name = "wide_falsification"
+path = "qa/wide_falsification.rs"
+required-features = ["qa-harnesses"]
