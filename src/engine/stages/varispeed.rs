@@ -1,11 +1,12 @@
 //! The varispeed head: the engine's tempo axis.
 //!
 //! Sits at the front of every profile chain and converts source frames into
-//! output frames at the current tempo rate by driving one
-//! [`StreamingSincResampler`] per channel. Tempo retargets apply to the very
-//! next fed chunk with no control glide — the resampler's own intra-chunk
-//! step ramp (one 32-frame feed chunk, sub-millisecond) is the only
-//! smoothing, inherited from the proven varispeed-first control path.
+//! output frames at the current tempo rate by driving a
+//! `MultiSincResampler` — all channels in lockstep, one kernel weight row
+//! per output frame. Tempo retargets apply to the very next fed chunk with
+//! no control glide — the resampler's own intra-chunk step ramp (one
+//! 32-frame feed chunk, sub-millisecond) is the only smoothing, inherited
+//! from the proven varispeed-first control path.
 //!
 //! This is deliberately *not* a [`Stage`](crate::engine::stage::Stage):
 //! stages are 1:1 fixed-block processors, while the head owns the demand
@@ -14,7 +15,7 @@
 
 use std::sync::Arc;
 
-use crate::core::resample::{STREAM_SINC_HALF_TAPS, SincInterpTable, StreamingSincResampler};
+use crate::core::resample::{MultiSincResampler, STREAM_SINC_HALF_TAPS, SincInterpTable};
 use crate::engine::control::MIN_TEMPO_RATE;
 
 /// Source frames fed to the resamplers per feed step. Small so that a tempo
@@ -26,12 +27,12 @@ pub(crate) const FEED_CHUNK_FRAMES: usize = 32;
 /// supported rate), used to size scratch buffers at construction.
 pub(crate) const MAX_OUT_PER_FEED: usize = (FEED_CHUNK_FRAMES as f64 / MIN_TEMPO_RATE) as usize + 2;
 
-/// Per-channel varispeed resampling head.
+/// Lockstep multi-channel varispeed resampling head.
 #[derive(Debug)]
 pub(crate) struct VarispeedHead {
-    resamplers: Vec<StreamingSincResampler>,
+    resampler: MultiSincResampler,
     channels: usize,
-    /// Mono scratch for one channel's deinterleaved feed chunk.
+    /// Channel-contiguous scratch for the deinterleaved feed chunk.
     ch_in: Vec<f32>,
     /// Per-channel emitted output for the current feed step.
     ch_out: Vec<Vec<f32>>,
@@ -41,11 +42,9 @@ impl VarispeedHead {
     pub(crate) fn new(channels: usize) -> Self {
         let table = SincInterpTable::new_stream_default();
         Self {
-            resamplers: (0..channels)
-                .map(|_| StreamingSincResampler::new(Arc::clone(&table)))
-                .collect(),
+            resampler: MultiSincResampler::new(Arc::clone(&table), channels),
             channels,
-            ch_in: vec![0.0; FEED_CHUNK_FRAMES],
+            ch_in: vec![0.0; channels * FEED_CHUNK_FRAMES],
             ch_out: (0..channels)
                 .map(|_| Vec::with_capacity(MAX_OUT_PER_FEED))
                 .collect(),
@@ -79,18 +78,19 @@ impl VarispeedHead {
 
         for ch in 0..self.channels {
             for f in 0..frames {
-                self.ch_in[f] = interleaved[f * self.channels + ch];
+                self.ch_in[ch * frames + f] = interleaved[f * self.channels + ch];
             }
-            // Capacity is construction-guaranteed for the clamped rate
-            // range, so overflow is unreachable; debug builds assert it.
-            let result = self.resamplers[ch].process_into_capped(
-                &self.ch_in[..frames],
-                rate,
-                &mut self.ch_out[ch],
-                max_out,
-            );
-            debug_assert!(result.is_ok(), "varispeed scratch overflow: {result:?}");
         }
+        // Capacity is construction-guaranteed for the clamped rate
+        // range, so overflow is unreachable; debug builds assert it.
+        let result = self.resampler.process_flat_capped(
+            &self.ch_in[..self.channels * frames],
+            frames,
+            rate,
+            &mut self.ch_out,
+            max_out,
+        );
+        debug_assert!(result.is_ok(), "varispeed scratch overflow: {result:?}");
 
         let produced = self.ch_out[0].len();
         debug_assert!(self.ch_out.iter().all(|out| out.len() == produced));
@@ -106,7 +106,7 @@ impl VarispeedHead {
     /// Fractional source position (frames since reset) of the next output
     /// frame the head will emit.
     pub(crate) fn source_pos(&self) -> f64 {
-        self.resamplers[0].next_output_source_pos()
+        self.resampler.next_output_source_pos()
     }
 
     /// Kernel lookahead of the resampler at unity/pitch-down, in frames.
@@ -116,9 +116,7 @@ impl VarispeedHead {
 
     /// Clears all resampler state back to stream start.
     pub(crate) fn reset(&mut self) {
-        for resampler in &mut self.resamplers {
-            resampler.reset();
-        }
+        self.resampler.reset();
         for out in &mut self.ch_out {
             out.clear();
         }
