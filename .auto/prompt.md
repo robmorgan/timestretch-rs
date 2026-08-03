@@ -120,3 +120,11 @@ either address review feedback or start a new objective via init_experiment.
   quiet-gap drift 64, quiet ratio 0.5/0.75.
 - Low-band keylock BLOCKED by <=15ms latency gate. Artifact path: +0.01 F1
   at slowdowns only — not a lever.
+
+## OPERATIONAL WARNING (exp #71, standing rule)
+log_experiment's discard/checks_failed revert appears to CLEAN UNTRACKED
+FILES. Owner WIP (qa/wide_falsification.rs, scripts/wide_falsification.sh)
+vanished during #71's revert — unrecoverable via git (never staged).
+STANDING RULE: before every run_experiment that could revert, snapshot any
+untracked non-.auto files to .auto/untracked-snapshots/ (cp -a). Never use
+`git add -A` while owner WIP may be present (would inject it into PR #32).
