@@ -46,7 +46,7 @@ const FFT_SIZE: usize = 4096;
 const HOP_SIZE: usize = 1024;
 const TRANSIENT_TOLERANCE_MS: f64 = 15.0;
 const TRANSIENT_FFT: usize = 2048;
-const TRANSIENT_HOP: usize = 512;
+const TRANSIENT_HOP: usize = 256;
 const TRANSIENT_SENSITIVITY: f32 = 0.45;
 
 /// Output settle time excluded from all metrics (pipeline fill + filters).
