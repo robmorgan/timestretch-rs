@@ -45,3 +45,9 @@
   ideal 32-lobe offline resample at every rate. Resampler transparent on real
   material; the theoretical top-octave droop of the 16-half-tap kernel is a
   non-issue. Coverage now closed on BOTH engine profiles.
+- Boundary-click audit + fixes (#58, #59): underrun starve/resume was 4.3×
+  slew, warm-start seek was 11.7× slew (Keylock) — both now 1.0× via
+  tail-fade + release-ramp + declick-in, with regression tests. Remaining
+  edges to audit in this defect class: keylock toggle (has its own fade,
+  probably fine per tests) and end-of-stream terminal shortfall (now tail-
+  faded by the underrun path automatically).
