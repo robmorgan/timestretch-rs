@@ -66,8 +66,10 @@ ratios ±14–16% (RATE_SLOW2=104/124, RATE_FAST2=140/124) for sensitivity.
 (cold streaming path) — the SOLA onset protection runs on its online energy
 heuristic only.
 
-## Current Best (exp #13): quality=96.26
-spec_sim=0.957 transient_f1=0.9496 pitch=0.43/0.53c identity=0.9909 rt=85x
+## Current Best (exp #21, 2-track metric): quality=95.08
+spec_sim=0.9587 transient_f1=0.9084 pitch=0.43/0.53c identity=0.9909 rt=~80x
+Net DSP win so far: quiet-gap opportunistic splicing (+0.41). All SOLA
+micro-params confirmed locally optimal on the 2-track metric.
 
 ## What's Been Tried
 - Harness fixes (big): latency compensation (+13ms reported), phase-blind
@@ -87,3 +89,13 @@ spec_sim=0.957 transient_f1=0.9496 pitch=0.43/0.53c identity=0.9909 rt=85x
   trigger + high-band drift timing skew vs exact low band.
 - spec_sim hard-ratio loss is sub_bass/low band pitch-following (by design,
   listening-validated; benchmark counts it — do NOT game the metric).
+- Track B (Hot Stuff) added to score; earlier single-track keeps re-validated
+  (postpone 1.8 reverted to 3.0, XFADE 64 reverted to 96).
+- transient_f1 ~0.91 asymptote is aggregate splice-flux noise raising the
+  detector's median+MAD floor (attacks verified present with >= input
+  contrast). NOT individual onset deletions (skip-span protection failed).
+- Failed: skip-span attack protection (2 variants), adaptive fade length,
+  correlation-adaptive fade power law, FINE_SEARCH 8, CUTOFF_SCALE 0.90 (tie),
+  quiet-gap drift 64, quiet ratio 0.5/0.75.
+- Low-band keylock BLOCKED by <=15ms latency gate. Artifact path: +0.01 F1
+  at slowdowns only — not a lever.
