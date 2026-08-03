@@ -466,7 +466,7 @@ fn test_large_fft_size() {
 // --- Quality verification tests (from agent-1) ---
 
 #[test]
-fn test_wsola_compression_accuracy() {
+fn test_compression_ratio_accuracy() {
     let sample_rate = 44100;
     let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
 

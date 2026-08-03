@@ -50,11 +50,6 @@ path = "qa/benchmarks.rs"
 required-features = ["qa-harnesses"]
 
 [[test]]
-name = "quality_benchmark"
-path = "qa/quality_benchmark.rs"
-required-features = ["qa-harnesses"]
-
-[[test]]
 name = "reference_quality"
 path = "qa/reference_quality.rs"
 required-features = ["qa-harnesses"]

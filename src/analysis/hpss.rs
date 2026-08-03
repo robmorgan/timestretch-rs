@@ -5,9 +5,8 @@
 //! content is identified by temporal continuity (horizontal median), while
 //! percussive content is identified by spectral broadband energy (vertical median).
 //!
-//! Used as a pre-processing step for the hybrid stretcher: harmonic components
-//! are PV-stretched (excellent for sustained tones) while percussive components
-//! are WSOLA-stretched (preserves transient detail).
+//! The median-filter primitives are used by musical key detection
+//! (`analysis::key`) to isolate harmonic content before chroma extraction.
 
 use crate::core::fft::COMPLEX_ZERO;
 use crate::core::window::{WindowType, generate_window};
@@ -118,7 +117,7 @@ pub fn hpss(
     // sharp bin-to-bin transitions that create spectral notches in the
     // recombined output.  A small frequency-axis moving-average softens
     // these notches.  Tonal frames (sine, vocal) keep raw masks to
-    // prevent harmonic leakage into the percussive WSOLA path.
+    // prevent harmonic leakage into the percussive component.
     let mut h_mask_buf = vec![0.0f32; num_bins];
     let mut h_mask_smooth = vec![0.0f32; num_bins];
     const MASK_SMOOTH_RADIUS_LIGHT: usize = 1; // 3-bin window (lightly percussive)

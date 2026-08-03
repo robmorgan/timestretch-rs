@@ -153,21 +153,6 @@ This test uses synthetic DJ-like material and fails on regressions for:
 - loudness deviation
 - spectral similarity by band
 
-## Synthetic Quality Harness (Including Pitch/Formant)
-
-Run the full synthetic benchmark harness (ignored by default because it is slower):
-
-```bash
-cargo test --features qa-harnesses --test quality_benchmark -- --ignored --nocapture
-```
-
-Outputs are written to `target/quality_benchmark/`:
-
-- `quality_report.csv` (baseline PV vs overhauled hybrid time-stretch metrics)
-- `pitch_formant_report.csv` (pitch-shift metrics for `EnvelopePreset::Off` vs `EnvelopePreset::Vocal`)
-- `pitch_formant_delta.csv` (vocal-minus-off deltas per pitch factor)
-- `*.wav` and `spectrogram_*.csv` artifacts for manual listening/visual inspection
-
 ## Metrics
 
 | Metric | Description |

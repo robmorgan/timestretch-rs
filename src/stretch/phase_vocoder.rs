@@ -975,8 +975,7 @@ impl PhaseVocoder {
     /// Call once at build time with the caller's rolling-window capacity so
     /// [`Self::process_streaming_into`] performs no allocations afterwards,
     /// even as the stretch ratio moves (bounded by `max_ratio`) and the
-    /// render window size varies between calls. Mirrors
-    /// `MultiResolutionStretcher::reserve_streaming_capacity`.
+    /// render window size varies between calls.
     pub fn reserve_streaming_capacity(&mut self, max_window_frames: usize, max_ratio: f64) {
         fn reserve_to(buf: &mut Vec<f32>, capacity: usize) {
             if buf.capacity() < capacity {
