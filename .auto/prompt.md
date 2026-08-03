@@ -83,6 +83,15 @@ tempo gestures). All other SOLA/crossover params confirmed locally optimal;
 crossover<110 breaks F1, CORR_WINDOW>320 breaks real pitch accuracy
 (regression test catches 27-cent drift).
 
+## SESSION COMPLETE (exp #66, 2026-02-14)
+PR #32 open and fully green on CI (10/10 incl. Windows, MSRV 1.85, corpus
+gates). Final: quality=95.52. All audit axes green (tracks, held-out rates,
+44.1/48/96k, profiles, callbacks, stereo, boundaries, degeneracy, 30-min
+soak, cross-platform). Awaiting: PR review + crossover-120 listening verdict
+(pairs in benchmarks/audio/output/listening/). A resuming agent should NOT
+re-tune the mapped parameter space — see ideas.md Closed list — and should
+either address review feedback or start a new objective via init_experiment.
+
 ## What's Been Tried
 - Harness fixes (big): latency compensation (+13ms reported), phase-blind
   identity metric, hard ratios ±14-16%, transient hop 512→256 (detector
