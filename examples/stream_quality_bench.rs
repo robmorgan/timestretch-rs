@@ -18,7 +18,9 @@
 //!
 //! Run with: cargo run --release --example stream_quality_bench
 
-use timestretch::analysis::comparison::{mean_spectral_similarity, spectral_similarity};
+use timestretch::analysis::comparison::{
+    mean_band_spectral_similarity, mean_spectral_similarity, spectral_similarity,
+};
 use timestretch::analysis::preanalysis::downmix_to_mid;
 use timestretch::analysis::transient::detect_transients;
 use timestretch::engine::{Engine, EngineConfig, EngineProfile};
@@ -380,6 +382,18 @@ fn main() {
     println!("--- streaming quality ---");
     println!(
         "spec slow={spec_slow:.4} fast={spec_fast:.4} slow2={spec_slow2:.4} fast2={spec_fast2:.4}"
+    );
+    // Diagnostic only (not scored): where the hard-slowdown loss lives.
+    let bands = mean_band_spectral_similarity(
+        &segment_mid,
+        &slow2_mid[warmup..],
+        FFT_SIZE,
+        HOP_SIZE,
+        SAMPLE_RATE,
+    );
+    println!(
+        "slow2 bands: sub_bass={:.4} low={:.4} mid={:.4} high={:.4}",
+        bands.sub_bass, bands.low, bands.mid, bands.high
     );
     println!(
         "transient_f1 slow={tf1_slow:.4} (exp {exp_slow} found {found_slow}) \
