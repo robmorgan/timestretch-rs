@@ -51,3 +51,8 @@
   edges to audit in this defect class: keylock toggle (has its own fade,
   probably fine per tests) and end-of-stream terminal shortfall (now tail-
   faded by the underrun path automatically).
+- Aligned-boundary audit (#60): the popped==0-after-full-callback hole is
+  structurally unreachable (sinc lookahead lands terminal media in a
+  shortfall callback → tail-fade always applies). Verified by forced exact
+  N×256 unity feed + natural drain, both 1.0× slew. Defensive code
+  deliberately omitted. Boundary defect class CLOSED with proof.
