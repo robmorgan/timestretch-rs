@@ -258,6 +258,9 @@ pub struct TimeStretchApp {
     target_bpm_text: String,
     /// Auto-loop length as a ladder exponent (`2^exp` beats).
     loop_beats_exp: i32,
+    /// Fixed-refresh display pin; `Some` while the display is pinned
+    /// (dropping restores the previous mode).
+    refresh_pin: Option<crate::display_refresh::RefreshPin>,
 
     // Error messages
     error_message: Option<String>,
@@ -338,6 +341,7 @@ impl TimeStretchApp {
             target_bpm_text: String::new(),
             loop_beats_exp: 2,
             error_message: None,
+            refresh_pin: None,
         };
         if let Some(path) = initial_file {
             app.load_file(path);
@@ -703,6 +707,9 @@ impl eframe::App for TimeStretchApp {
     }
 
     fn on_exit(&mut self) {
+        // Drop the pin explicitly so the display mode is restored even if
+        // the app value itself never gets dropped on this exit path.
+        self.refresh_pin = None;
         self.stop_processing_thread();
     }
 }
@@ -1213,6 +1220,46 @@ impl TimeStretchApp {
                     }
                 });
                 ui.end_row();
+
+                // Fixed-refresh pin: ProMotion's adaptive rate switching
+                // skips ~2 vsync slots/s in any windowed macOS app, which
+                // reads as waveform scroll twitches; a fixed rate is
+                // near-perfectly clean (see examples/metalwave_spike.rs).
+                if cfg!(target_os = "macos") {
+                    ui.label("Display:");
+                    ui.horizontal(|ui| {
+                        let mut pinned = self.refresh_pin.is_some();
+                        let changed = ui
+                            .checkbox(&mut pinned, "Fixed refresh")
+                            .on_hover_text(
+                                "Pin the display to a fixed refresh rate for perfectly \
+                                 even waveform scrolling (ProMotion's adaptive rate \
+                                 causes visible micro-stutters). Session-scoped: \
+                                 restored on untick, app exit, or logout.",
+                            )
+                            .changed();
+                        if changed {
+                            if pinned {
+                                match crate::display_refresh::RefreshPin::pin() {
+                                    Ok(pin) => self.refresh_pin = Some(pin),
+                                    Err(e) => {
+                                        self.error_message = Some(format!("Fixed refresh: {e}"));
+                                    }
+                                }
+                            } else {
+                                // Dropping the pin restores the prior mode.
+                                self.refresh_pin = None;
+                            }
+                        }
+                        if let Some(pin) = &self.refresh_pin {
+                            ui.label(
+                                egui::RichText::new(format!("pinned {:.0} Hz", pin.pinned_hz()))
+                                    .weak(),
+                            );
+                        }
+                    });
+                    ui.end_row();
+                }
 
                 // Volume
                 ui.label("Volume:");
