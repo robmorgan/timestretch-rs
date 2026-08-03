@@ -65,3 +65,6 @@
   content is at/below expected (jumps average ≥192; lo = drift−160 ≥ 32
   structurally excludes no-op candidates). The #62 degeneracy class is fully
   closed: rest path was the only entry point, now residual-bounded.
+- Soak audit (#65): 30 min looped-music stream with ride+nudges — underruns 0,
+  NaN 0, per-minute RMS stable to 0.2%. No slow drift/leak/level bugs.
+  Stability axis closed. All audit axes in the ledger are now green.
