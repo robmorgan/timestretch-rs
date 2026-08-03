@@ -66,10 +66,13 @@ ratios ±14–16% (RATE_SLOW2=104/124, RATE_FAST2=140/124) for sensitivity.
 (cold streaming path) — the SOLA onset protection runs on its online energy
 heuristic only.
 
-## Current Best (exp #21, 2-track metric): quality=95.08
-spec_sim=0.9587 transient_f1=0.9084 pitch=0.43/0.53c identity=0.9909 rt=~80x
-Net DSP win so far: quiet-gap opportunistic splicing (+0.41). All SOLA
-micro-params confirmed locally optimal on the 2-track metric.
+## Current Best (exp #32, 2-track metric): quality=95.13
+spec_sim=0.9600 transient_f1=0.9083 pitch=0.41/0.51c identity=0.9885 rt=~82x
+Net DSP wins: quiet-gap opportunistic splicing (+0.41), crossover 150→120 Hz
+(+0.05, systematic spec gain; flag for owner listening check on bass at
+tempo gestures). All other SOLA/crossover params confirmed locally optimal;
+crossover<110 breaks F1, CORR_WINDOW>320 breaks real pitch accuracy
+(regression test catches 27-cent drift).
 
 ## What's Been Tried
 - Harness fixes (big): latency compensation (+13ms reported), phase-blind
