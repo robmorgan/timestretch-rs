@@ -4,3 +4,5 @@
 - Low-band keylock (time-domain, long-window SOLA on <150Hz) would lift spec_sim ~+0.04 (~+1.2 quality) at hard ratios, BUT fights the listening-validated pitch-following-bass design (Stage 2 falsification). Only attempt with a plan to A/B via rendered listening pairs.
 - transient_f1 asymptote ~0.91 is aggregate splice-flux noise raising the ODF median+MAD floor (attacks verified present, contrast >= input). Levers: fewer/cleaner splices at |T-1|>10%.
 - Checks timeout observed with XFADE=128 (sola test may degenerate) — if reproduced, investigate before any fade-length change.
+- Artifact-attached renders measured: F1 +0.006..+0.017 at slowdowns, wash at speedup. Not a lever.
+- Low-band keylock is BLOCKED by the ≤15ms pipeline latency gate (560-frame lag cannot host a >period-length correlation window for 50Hz content). Spec_sim hard-ratio loss is therefore an architectural floor under current latency budget.
