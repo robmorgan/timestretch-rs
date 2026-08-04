@@ -974,6 +974,51 @@ correct grid, not a quality-gated stretch.
 
 Automation: auto
 
+> **Falsification experiment — result: the bet holds (2026-08-04).
+> Proceed to build-out.** Harness: `qa/wide_falsification.rs` via
+> `./scripts/wide_falsification.sh` (renders + `summary.csv` in
+> `target/wide_falsification/`, Rubber Band CLI 4.0.0 references incl.
+> `--fine`, level-matched `norm/` copies for listening).
+>
+> Metric half, three rounds: the reset-driven FFT-2048 identity prototype
+> holds 0.85–0.91 spectral / 0.82–0.88 perceptual vs Rubber Band at
+> ±30/±50/+100 % with zero clicks. The −75 % blowup (+7 LUFS spurious
+> energy, up to ~2 000 clicks/M) proved to be a **75 %-overlap artifact —
+> hop = FFT/8 eliminates it on all five tracks** (zero clicks, normal
+> level, RB similarity 0.83–0.89). FFT 4096 wins only on synthetic tones,
+> is consistently worse on real mixes (transient smear), and its ~93 ms
+> window is outside the profile's latency contract — dead end. Metrics
+> twice failed to predict the ear verdicts (down-side robotiness scored
+> *above* the clean up-side; blend 0.20 vs 0.40 metrically identical) —
+> reconfirming owner listening as the binding gate.
+>
+> Listening half (owner, 2026-08-04, three passes; bass-heavy corpus
+> msbwy / hot_stuff / somebody / saucers + the synthetic bass fixture,
+> ~20 s excerpts at +30/−30/+50/−50/+100/−75 %): round 1 — all arms
+> below Rubber Band; compressions clearly better than expansions, which
+> sounded "roboty" (cause found: the phase-gradient coherence blend
+> tapers to **zero** approaching ratio 2.5, so big slowdowns ran with no
+> vertical coherence). Round 2 — blend held on + hop/8 rescued −30 %
+> outright and kept −50 % together; residual robotiness remained. Round
+> 3 — `blend_hop8` and `blend40_hop8` best in class and mutually
+> near-indistinguishable (possible slight bass edge to 0.40, owner
+> unsure). **Verdicts: −50 % is shippable ("the audience couldn't tell
+> the difference, producers would"); +50 % is shippable (RB "cleaner,
+> wider, more open," ours "a bit crowded," but subtle).** The RB gap is
+> real and accepted: single-FFT identity PV vs R3's multi-resolution
+> engine.
+>
+> Settled config for the build-out: FFT 2048, hop 256 (87.5 % overlap),
+> Hann, identity locking, rigid sub-bass < 100 Hz, artifact-driven
+> per-band resets (Stage-9 `begin_block` policy), coherence blend held
+> at wide ratios via `PhaseVocoder::set_wide_ratio_coherence_blend`
+> (strength 0.20–0.40; exact value settled by ear in build-out
+> listening). WCET note: hop/8 doubles the hop rate — the flattening
+> budget is one 2048-point FFT per 8 blocks per channel. Carried open:
+> the wide-ratio low-band verdict (`widepv_lowfree` renders exist,
+> not yet auditioned — exit criterion) and the ±100 %/−75 % edge
+> listening characterization (metrically clean in the hop/8 family).
+
 ### Why
 
 Promoted from "Not a Priority Yet": the owner decision of 2026-07-14
