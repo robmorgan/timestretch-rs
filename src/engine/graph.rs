@@ -339,14 +339,22 @@ impl EngineProcessor {
     }
 
     /// Preroll frames the host should feed ahead of a warm-start target so
-    /// every stage resumes converged: the chain's constant latency plus a
-    /// full analysis window of history (IIR splits and correctors settle
-    /// well within it). Tape chains only need the resampler margin.
+    /// every stage resumes converged: the chain's constant latency plus the
+    /// largest per-stage settle need (a full analysis window of history —
+    /// IIR splits and the small correctors settle inside the 1024-frame
+    /// default; the wide keylock's big FFT asks for more). Tape chains only
+    /// need the resampler margin.
     pub fn warm_start_preroll_frames(&self) -> usize {
         if self.stages.is_empty() {
             64
         } else {
-            self.pipeline_latency_frames + 1_024
+            let settle = self
+                .stages
+                .iter()
+                .map(|stage| stage.warm_start_settle_frames())
+                .max()
+                .unwrap_or(1_024);
+            self.pipeline_latency_frames + settle
         }
     }
 

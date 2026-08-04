@@ -5,6 +5,7 @@
 
 use crate::engine::stage::Stage;
 use crate::engine::stages::keylock::KeylockStage;
+use crate::engine::stages::wide_keylock::WideKeylockStage;
 
 /// Which fixed stage chain the engine runs after the varispeed head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -14,12 +15,21 @@ pub enum EngineProfile {
     /// (and the walking skeleton for everything else).
     #[default]
     Tape,
-    /// Keylock: band split at ~150 Hz; the low band passes un-corrected
+    /// Keylock: band split at 120 Hz; the low band passes un-corrected
     /// through a matching delay (pitch follows tempo — inaudible at DJ
-    /// ratios), the high band is pitch-corrected by a small-FFT phase
-    /// vocoder at the delay-matched transposition. Pipeline delay ≈ 9.6 ms
-    /// at 44.1 kHz.
+    /// ratios), the high band is pitch-corrected by the time-domain SOLA
+    /// corrector at the delay-matched transposition. Full keylock through
+    /// ±20%, fading to plain varispeed beyond ±35%. Pipeline delay
+    /// ≈ 12.7 ms at 44.1 kHz (the primary deck contract).
     Keylock,
+    /// Wide-range Master Tempo (CDJ "WIDE" range setting): a big-FFT
+    /// identity-locked phase-vocoder corrector keylocks the FULL spectrum
+    /// across the engine's whole tempo range (rates 0.25–2.0) with no
+    /// correction fade. Pipeline delay ≈ 48.6 ms at 44.1 kHz — a
+    /// deliberately different latency contract from [`Self::Keylock`],
+    /// reported honestly via the graph; switching profiles is a
+    /// seek-priced rebuild, not a live morph (ROADMAP Stage 11).
+    WideKeylock,
 }
 
 /// Builds the stage chain for a profile. Tape is the empty chain: the
@@ -32,5 +42,8 @@ pub(crate) fn build_stages(
     match profile {
         EngineProfile::Tape => Vec::new(),
         EngineProfile::Keylock => vec![Box::new(KeylockStage::new(sample_rate, channels))],
+        EngineProfile::WideKeylock => {
+            vec![Box::new(WideKeylockStage::new(sample_rate, channels))]
+        }
     }
 }

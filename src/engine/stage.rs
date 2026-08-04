@@ -171,6 +171,14 @@ pub trait Stage: Send {
         let _ = history;
         self.reset();
     }
+
+    /// History frames beyond the chain's constant latency this stage
+    /// needs to resume converged from a warm start. The default covers
+    /// IIR splits and the small time-domain correctors; big-FFT stages
+    /// override with their analysis-window need.
+    fn warm_start_settle_frames(&self) -> usize {
+        1_024
+    }
 }
 
 #[cfg(test)]
