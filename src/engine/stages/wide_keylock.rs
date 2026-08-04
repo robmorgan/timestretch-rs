@@ -32,8 +32,8 @@
 //! onset re-locks the mid/high bands once, and the low bands too when
 //! the onset is strong and its flux actually lives there — gated on a
 //! DELAYED copy of `modulation_hold`, because the graph latches the hold
-//! at control time while this stage's audio runs ~[`HOLD_DELAY_BLOCKS`]
-//! blocks behind.
+//! at control time while this stage's audio runs `HOLD_DELAY_BLOCKS`
+//! (~67) blocks behind.
 
 use std::sync::Arc;
 
@@ -285,6 +285,15 @@ impl Stage for WideKeylockStage {
         // THIS audio, not the control target. The resampler additionally
         // ramps its step across each render, so a rate step lands as a
         // sub-hop glide.
+        // Delay-matched transposition, evaluated exactly at
+        // `ctx.embedded_rate`: a slope-based lookahead scan (±512 frames,
+        // 2026-08-04) found zero offset optimal — the residual ride
+        // wobble (3.2 cents p95 at ±8%, ~38 at the full-range torture
+        // ride) is the irreducible per-chunk quantization of correcting
+        // one hop at one constant T against the intra-chunk varispeed
+        // glide, not a delay-matching error. SOLA's per-sample elastic
+        // read keeps the narrow profile an order of magnitude tighter
+        // under rides; this profile trades that for the 8x range.
         let target = if ctx.embedded_rate.is_finite() && ctx.embedded_rate > 0.0 {
             (1.0 / ctx.embedded_rate).clamp(WIDE_TRANSPOSITION_MIN, WIDE_TRANSPOSITION_MAX)
         } else {
