@@ -69,8 +69,12 @@ pub use analysis::tempogram::TempoTrackingOptions;
 pub use analysis::waveform::{BandPeaks, NUM_BANDS, PeakLevel};
 pub use core::preanalysis::{
     KeyEstimate, KeyMode, LoudnessMeasurement, PREANALYSIS_VERSION, PreAnalysisArtifact,
-    hash_samples, read_preanalysis_json, write_preanalysis_json,
+    hash_samples,
 };
+// Deprecated JSON sidecar API, re-exported for downstream compatibility
+// while consumers migrate to the `.tsa` container (`io::tsa`).
+#[allow(deprecated)]
+pub use core::preanalysis::{read_preanalysis_json, write_preanalysis_json};
 pub use core::types::{
     AudioBuffer, Channels, EnvelopePreset, FrameIter, QualityMode, Sample, StretchParams,
     TransientThresholdPolicy,

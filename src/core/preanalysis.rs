@@ -347,6 +347,10 @@ pub fn hash_samples(samples: &[f32]) -> u64 {
 }
 
 /// Writes a pre-analysis artifact as JSON.
+#[deprecated(
+    since = "0.11.0",
+    note = "use `write_analysis_file` with the `.tsa` container (`crate::io::tsa`), which also carries waveform peaks"
+)]
 pub fn write_preanalysis_json(
     path: &Path,
     artifact: &PreAnalysisArtifact,
@@ -359,6 +363,10 @@ pub fn write_preanalysis_json(
 }
 
 /// Reads a pre-analysis artifact from JSON.
+#[deprecated(
+    since = "0.11.0",
+    note = "use `read_analysis_file` / `read_analysis_file_validated` on the `.tsa` container (`crate::io::tsa`)"
+)]
 pub fn read_preanalysis_json(path: &Path) -> Result<PreAnalysisArtifact, StretchError> {
     let data = std::fs::read_to_string(path)?;
     serde_json::from_str(&data).map_err(|e| {

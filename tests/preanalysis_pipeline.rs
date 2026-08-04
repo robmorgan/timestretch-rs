@@ -1,9 +1,9 @@
 use std::f32::consts::PI;
 use std::path::PathBuf;
-use timestretch::{
-    PreAnalysisArtifact, StretchParams, analyze_for_dj, read_preanalysis_json, stretch,
-    write_preanalysis_json,
-};
+use timestretch::{PreAnalysisArtifact, StretchParams, analyze_for_dj, stretch};
+// Deprecated JSON pair, still round-trip-tested until removal.
+#[allow(deprecated)]
+use timestretch::{read_preanalysis_json, write_preanalysis_json};
 
 fn click_train(sample_rate: u32, bpm: f64, seconds: f64) -> Vec<f32> {
     let len = (sample_rate as f64 * seconds) as usize;
@@ -42,7 +42,9 @@ fn detect_peaks(signal: &[f32], threshold: f32, min_distance: usize) -> Vec<usiz
     peaks
 }
 
+/// The deprecated JSON path must keep round-tripping until it's removed.
 #[test]
+#[allow(deprecated)]
 fn test_preanalysis_roundtrip_json() {
     let sample_rate = 44100u32;
     let input = click_train(sample_rate, 128.0, 4.0);
@@ -67,6 +69,32 @@ fn test_preanalysis_roundtrip_json() {
     assert_eq!(read_back.source_len_samples, artifact.source_len_samples);
     assert_eq!(read_back.content_hash, artifact.content_hash);
     assert!(read_back.matches_source(&input, sample_rate));
+}
+
+#[test]
+fn test_analysis_file_roundtrip_tsa() {
+    let sample_rate = 44100u32;
+    let input = click_train(sample_rate, 128.0, 4.0);
+    let artifact = analyze_for_dj(&input, sample_rate);
+
+    let mut analysis = timestretch::AnalysisFile::for_source(&input, sample_rate);
+    analysis.artifact = Some(artifact.clone());
+    analysis.peaks = Some(timestretch::BandPeaks::compute(&input, 1, sample_rate));
+    let path = PathBuf::from("target/test_preanalysis_roundtrip.tsa");
+    timestretch::write_analysis_file(&path, &analysis).expect("write should succeed");
+
+    let back = timestretch::read_analysis_file_validated(
+        &path,
+        sample_rate,
+        analysis.source_len_samples,
+        analysis.content_hash,
+    )
+    .expect("validated read should succeed against the real identity");
+    let read_back = back.artifact.expect("artifact chunk present");
+    assert_eq!(read_back.bpm, artifact.bpm);
+    assert_eq!(read_back.beat_positions, artifact.beat_positions);
+    assert!(read_back.matches_source(&input, sample_rate));
+    assert!(back.peaks.is_some(), "peaks chunk present");
 }
 
 #[test]

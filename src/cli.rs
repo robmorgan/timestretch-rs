@@ -142,7 +142,7 @@ fn main() {
     // mismatched sidecar must never abort a render: warn and fall back to
     // online analysis instead.
     let pre_analysis: Option<PreAnalysisArtifact> = pre_analysis_path.as_ref().and_then(|path| {
-        let artifact = match timestretch::read_preanalysis_json(Path::new(path)) {
+        let artifact = match read_artifact_any_format(Path::new(path)) {
             Ok(artifact) => artifact,
             Err(e) => {
                 eprintln!(
@@ -266,10 +266,12 @@ fn main() {
 /// `timestretch-cli analyze <input.wav> [-o artifact.json]`
 ///
 /// Runs offline pre-analysis once and writes the reusable artifact as JSON
-/// (default: a `.tsanalysis.json` sidecar next to the input file).
+/// (default: a `.tsa` analysis-container sidecar next to the input file).
 fn run_analyze(args: &[String]) {
     if args.len() < 3 {
-        eprintln!("Usage: timestretch-cli analyze <input.wav> [-o <artifact.json>] [--verbose]");
+        eprintln!(
+            "Usage: timestretch-cli analyze <input.wav> [-o <artifact.tsa|artifact.json>] [--verbose]"
+        );
         std::process::exit(1);
     }
     let input_path = &args[2];
@@ -397,35 +399,83 @@ fn run_analyze(args: &[String]) {
         }
     }
 
-    if let Err(e) = timestretch::write_preanalysis_json(Path::new(&output_path), &artifact) {
+    let write_result = if wants_legacy_json(&output_path) {
+        eprintln!(
+            "NOTE: JSON artifact sidecars are deprecated; omit -o (or use a .tsa path) \
+             to write the .tsa analysis container instead"
+        );
+        #[allow(deprecated)]
+        timestretch::write_preanalysis_json(Path::new(&output_path), &artifact)
+    } else {
+        // The full analysis container: artifact plus waveform peaks, so
+        // one `analyze` run pre-computes everything an app needs at load.
+        let mut analysis =
+            timestretch::AnalysisFile::for_source(&analysis_signal, buffer.sample_rate);
+        analysis.peaks = Some(timestretch::BandPeaks::compute(
+            &analysis_signal,
+            1,
+            buffer.sample_rate,
+        ));
+        analysis.artifact = Some(artifact);
+        timestretch::write_analysis_file(Path::new(&output_path), &analysis)
+    };
+    if let Err(e) = write_result {
         eprintln!("ERROR: Failed to write {}: {}", output_path, e);
         std::process::exit(1);
     }
     eprintln!("Written to {}", output_path);
 }
 
-/// Default artifact path: `<input>.tsanalysis.json` next to the audio file.
+/// Default artifact path: `<input>.tsa` next to the audio file.
 fn default_sidecar_path(input_path: &str) -> String {
-    format!("{}.tsanalysis.json", input_path)
+    format!("{}.tsa", input_path)
+}
+
+/// Whether an explicit `-o` path asks for the deprecated JSON format.
+fn wants_legacy_json(output_path: &str) -> bool {
+    Path::new(output_path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+}
+
+/// Reads an artifact from either format: `.tsa` containers are detected by
+/// their magic bytes; anything else parses as the legacy JSON sidecar.
+fn read_artifact_any_format(path: &Path) -> Result<PreAnalysisArtifact, timestretch::StretchError> {
+    let is_tsa = std::fs::read(path)
+        .map(|bytes| bytes.starts_with(b"TSAF"))
+        .unwrap_or(false);
+    if is_tsa {
+        timestretch::read_analysis_file(path)?
+            .artifact
+            .ok_or_else(|| {
+                timestretch::StretchError::InvalidFormat(
+                    "analysis container has no artifact chunk".to_string(),
+                )
+            })
+    } else {
+        #[allow(deprecated)]
+        timestretch::read_preanalysis_json(path)
+    }
 }
 
 fn print_usage() {
     eprintln!("Usage: timestretch-cli <input.wav> <output.wav> [options]");
-    eprintln!("       timestretch-cli analyze <input.wav> [-o <artifact.json>]");
+    eprintln!("       timestretch-cli analyze <input.wav> [-o <artifact.tsa|artifact.json>]");
     eprintln!();
     eprintln!("Modes:");
     eprintln!("  --ratio <f>                   Stretch ratio (1.5 = 50% slower)");
     eprintln!("  --from-bpm <f> --to-bpm <f>   BPM matching");
     eprintln!("  --auto-bpm --to-bpm <f>       Auto-detect source BPM, match to target");
     eprintln!("  --pitch <f>                   Pitch shift (2.0 = up one octave)");
-    eprintln!("  analyze                       Write a reusable pre-analysis artifact");
+    eprintln!("  analyze                       Write a reusable .tsa analysis container");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --envelope <name>     Formant/envelope profile for --pitch:");
     eprintln!("                        off, balanced (default), vocal");
     eprintln!("  --window <type>       hann (default), blackman-harris, kaiser:<beta>");
-    eprintln!("  --pre-analysis <f>    Use a pre-analysis artifact (from `analyze`);");
-    eprintln!("                        validated against the input, ignored if stale");
+    eprintln!("  --pre-analysis <f>    Use an analysis file (from `analyze`; .tsa or");
+    eprintln!("                        legacy .json), validated against the input,");
+    eprintln!("                        ignored if stale");
     eprintln!("  --normalize, -n       Match output RMS to input (default: on)");
     eprintln!("  --no-normalize        Disable RMS matching");
     eprintln!("  --24bit               Write 24-bit PCM output (default: 16-bit)");
@@ -440,9 +490,7 @@ fn print_usage() {
     eprintln!("  timestretch-cli in.wav out.wav --ratio 2.0 --window blackman-harris --normalize");
     eprintln!("  timestretch-cli in.wav out.wav 1.5");
     eprintln!("  timestretch-cli analyze in.wav");
-    eprintln!(
-        "  timestretch-cli in.wav out.wav --ratio 1.05 --pre-analysis in.wav.tsanalysis.json"
-    );
+    eprintln!("  timestretch-cli in.wav out.wav --ratio 1.05 --pre-analysis in.wav.tsa");
 }
 
 fn parse_f64(args: &[String], idx: usize, name: &str) -> f64 {
