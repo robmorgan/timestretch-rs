@@ -9,3 +9,4 @@ benchmarks/audio/
 .codex-plan-loop/
 *.tsanalysis.json
 *.tspeaks
+*.tsa
