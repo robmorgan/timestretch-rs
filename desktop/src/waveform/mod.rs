@@ -3,6 +3,7 @@
 //! bar.beat counter. Shared grid/palette machinery lives here; the painters
 //! live in the submodules.
 
+pub mod cache;
 mod counter;
 mod overview;
 mod peaks;
@@ -11,6 +12,8 @@ mod zoomed;
 pub use counter::paint_beat_counter;
 pub use overview::{OverviewParams, OverviewTexture, paint_overview};
 pub use peaks::BandPeaks;
+#[cfg(test)]
+pub use peaks::NUM_BANDS;
 pub use zoomed::{ScrubGesture, ZoomSpan, ZoomedParams, ZoomedTiles, paint_zoomed};
 
 use eframe::egui;

@@ -10,16 +10,16 @@
 pub const NUM_BANDS: usize = 3;
 
 /// Base peak resolution in buckets per second of audio.
-const BASE_BUCKETS_PER_SEC: f64 = 150.0;
+pub(crate) const BASE_BUCKETS_PER_SEC: f64 = 150.0;
 
 /// The pyramid stops halving once a level has at most this many buckets;
 /// the coarsest level is what the full-track overview texture rasterizes.
 const COARSEST_TARGET_BUCKETS: usize = 1024;
 
 /// Low/mid crossover frequency in Hz.
-const CROSSOVER_LOW_HZ: f64 = 200.0;
+pub(crate) const CROSSOVER_LOW_HZ: f64 = 200.0;
 /// Mid/high crossover frequency in Hz.
-const CROSSOVER_HIGH_HZ: f64 = 2_000.0;
+pub(crate) const CROSSOVER_HIGH_HZ: f64 = 2_000.0;
 
 /// One resolution level: per-band positive/negative peaks per bucket.
 pub struct PeakLevel {
@@ -112,6 +112,13 @@ impl Biquad {
     }
 }
 
+/// Base-level bucket count for `num_frames` mono frames at `sample_rate`.
+/// The cache validates its stored bucket count against this exact formula.
+pub(crate) fn base_num_buckets(num_frames: usize, sample_rate: u32) -> usize {
+    let sr = sample_rate.max(1) as f64;
+    ((num_frames as f64 * BASE_BUCKETS_PER_SEC / sr).ceil() as usize).max(1)
+}
+
 impl BandPeaks {
     /// Compute the pyramid from interleaved samples (mixed to mono for
     /// display). One O(n) pass over the samples; offline, so the biquads'
@@ -120,7 +127,7 @@ impl BandPeaks {
         let channels = channels.max(1);
         let num_frames = samples.len() / channels;
         let sr = sample_rate.max(1) as f64;
-        let num_buckets = ((num_frames as f64 * BASE_BUCKETS_PER_SEC / sr).ceil() as usize).max(1);
+        let num_buckets = base_num_buckets(num_frames, sample_rate);
 
         let mut pos: [Vec<f32>; NUM_BANDS] = std::array::from_fn(|_| vec![0.0; num_buckets]);
         let mut neg: [Vec<f32>; NUM_BANDS] = std::array::from_fn(|_| vec![0.0; num_buckets]);
@@ -157,11 +164,17 @@ impl BandPeaks {
             }
         }
 
-        let mut levels = vec![PeakLevel {
+        Self::from_base_level(PeakLevel {
             buckets_per_sec: BASE_BUCKETS_PER_SEC,
             pos,
             neg,
-        }];
+        })
+    }
+
+    /// Build the full pyramid from a base (finest) level — either freshly
+    /// computed or deserialized from the peaks cache.
+    pub(crate) fn from_base_level(base: PeakLevel) -> Self {
+        let mut levels = vec![base];
         while levels.last().unwrap().num_buckets() > COARSEST_TARGET_BUCKETS {
             levels.push(halve(levels.last().unwrap()));
         }
@@ -291,6 +304,37 @@ mod tests {
         assert_eq!(density(40.0), 37.5);
         // Below the coarsest density: the coarsest level is the closest fit.
         assert_eq!(density(1.0), 9.375);
+    }
+
+    #[test]
+    fn from_base_level_matches_compute() {
+        let computed = BandPeaks::compute(&test_signal(60.0), 2, 44_100);
+        let base = PeakLevel {
+            buckets_per_sec: computed.levels[0].buckets_per_sec,
+            pos: computed.levels[0].pos.clone(),
+            neg: computed.levels[0].neg.clone(),
+        };
+        let rebuilt = BandPeaks::from_base_level(base);
+        assert_eq!(rebuilt.levels.len(), computed.levels.len());
+        for (a, b) in rebuilt.levels.iter().zip(&computed.levels) {
+            assert_eq!(a.buckets_per_sec, b.buckets_per_sec);
+            for band in 0..NUM_BANDS {
+                assert_eq!(a.pos[band], b.pos[band]);
+                assert_eq!(a.neg[band], b.neg[band]);
+            }
+        }
+    }
+
+    #[test]
+    fn base_num_buckets_matches_compute() {
+        let secs = 10.0;
+        let peaks = BandPeaks::compute(&test_signal(secs), 2, 44_100);
+        let num_frames = (secs * 44_100.0) as usize;
+        assert_eq!(
+            peaks.levels[0].num_buckets(),
+            base_num_buckets(num_frames, 44_100)
+        );
+        assert_eq!(base_num_buckets(0, 44_100), 1);
     }
 
     #[test]

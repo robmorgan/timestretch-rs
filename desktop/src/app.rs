@@ -1,6 +1,7 @@
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -217,6 +218,44 @@ impl FrameState {
     }
 }
 
+/// Messages from the background load worker, in order: one `Track`, then
+/// (after a successful decode) one `Analysis` when the pre-analysis
+/// artifact lands.
+enum LoadMsg {
+    Track(Result<LoadedTrack, String>),
+    Analysis(Arc<timestretch::PreAnalysisArtifact>),
+}
+
+/// Everything `install_track` needs once decode + peaks complete.
+struct LoadedTrack {
+    path: PathBuf,
+    /// Interleaved samples, as decoded.
+    samples: Arc<Vec<f32>>,
+    sample_rate: u32,
+    num_frames: usize,
+    peaks: BandPeaks,
+}
+
+/// An in-flight background load, replaced wholesale on each `load_file`:
+/// dropping the old receiver makes the stale worker's sends fail silently.
+struct LoadInProgress {
+    rx: mpsc::Receiver<LoadMsg>,
+    /// True once `Track` has been installed (spinner off; may still be
+    /// awaiting `Analysis` on a pre-analysis cache miss).
+    track_received: bool,
+}
+
+/// Bundled inputs for [`run_load_worker`].
+struct LoadRequest {
+    path: PathBuf,
+    state: SharedStateHandle,
+    /// `analysis_generation` at spawn; results are discarded on mismatch.
+    generation: u64,
+    tx: mpsc::Sender<LoadMsg>,
+    /// For waking the UI when results land (the app may be idle-paused).
+    ctx: egui::Context,
+}
+
 pub struct TimeStretchApp {
     state: SharedStateHandle,
     position: Arc<AtomicPosition>,
@@ -249,6 +288,11 @@ pub struct TimeStretchApp {
     // File info
     file_name: String,
     file_path: Option<PathBuf>,
+    /// Background decode + analysis in flight; polled each `update`.
+    pending_load: Option<LoadInProgress>,
+    /// Context handle for background threads to request repaints — also
+    /// covers the argv initial-file load spawned before the first frame.
+    egui_ctx: egui::Context,
 
     // Waveform
     band_peaks: Option<BandPeaks>,
@@ -343,6 +387,8 @@ impl TimeStretchApp {
             stop_flag: None,
             file_name: String::new(),
             file_path: None,
+            pending_load: None,
+            egui_ctx: cc.egui_ctx.clone(),
             band_peaks: None,
             overview_texture: None,
             zoom_span: ZoomSpan::default(),
@@ -365,6 +411,10 @@ impl TimeStretchApp {
         app
     }
 
+    /// Kicks off a background load: decode, peaks (cached in a `.tspeaks`
+    /// sidecar), and pre-analysis all run on a worker thread, so the UI
+    /// stays responsive however long the track is. Results arrive through
+    /// [`Self::poll_pending_load`].
     fn load_file(&mut self, path: PathBuf) {
         // Stop any existing playback
         self.stop_playback();
@@ -377,97 +427,151 @@ impl TimeStretchApp {
 
         log::info!("Loading file: {}", path.display());
 
-        match decoder::decode_file(&path) {
-            Ok(decoded) => {
-                log::info!(
-                    "Decoded: {} frames, {} Hz, {} ch",
-                    decoded.num_frames,
-                    decoded.sample_rate,
-                    decoded.channels
-                );
+        // Clear the old track everywhere before the worker starts — the
+        // deck must not stay interactable against audio that's going away.
+        self.file_path = None;
+        self.source_audio = None;
+        self.band_peaks = None;
+        self.overview_texture = None;
+        self.zoom_tiles.clear();
+        self.grid_marks = GridMarks::empty();
+        self.beat_grid = None;
+        // A fresh track starts at its own tempo (fader centered) and
+        // unity ratio, regardless of any prior track's settings.
+        self.stretch_ratio = 1.0;
+        self.target_bpm = 0.0;
+        self.target_bpm_text.clear();
+        self.position.store(0);
 
-                let sample_rate = decoded.sample_rate;
-                let num_frames = decoded.num_frames;
-                let channel_layout = timestretch::Channels::from_count(decoded.channels as usize)
-                    .unwrap_or(timestretch::Channels::Stereo);
-                let bpm_buffer =
-                    timestretch::AudioBuffer::new(decoded.samples, sample_rate, channel_layout);
+        // The generation bump happens HERE, at spawn — not again at
+        // install, or every worker's artifact would look stale.
+        let generation = {
+            let mut st = self.state.lock().unwrap();
+            st.total_frames = 0;
+            st.position_frames = 0;
+            st.detected_bpm = 0.0;
+            st.target_bpm = 0.0;
+            st.transport = Transport::Stopped;
+            st.stretch_ratio = 1.0;
+            st.pre_analysis = None;
+            st.loop_region = None;
+            st.loop_in = None;
+            st.analysis_generation += 1;
+            st.analysis_generation
+        };
 
-                // Compute the 3-band waveform peak pyramid
-                self.band_peaks = Some(BandPeaks::compute(
-                    &bpm_buffer.data,
-                    channel_layout.count(),
-                    sample_rate,
-                ));
-                self.overview_texture = None;
-                self.zoom_tiles.clear();
+        let (tx, rx) = mpsc::channel();
+        // Replacing the slot drops any previous receiver: a superseded
+        // worker's sends fail silently and its artifact store is rejected
+        // by the generation guard.
+        self.pending_load = Some(LoadInProgress {
+            rx,
+            track_received: false,
+        });
+        let req = LoadRequest {
+            path,
+            state: self.state.clone(),
+            generation,
+            tx,
+            ctx: self.egui_ctx.clone(),
+        };
+        std::thread::spawn(move || run_load_worker(req));
+    }
 
-                // Detect the beat grid from the channel-aware buffer
-                // (stereo-safe): BPM for the tempo fader plus beat and
-                // downbeat positions for the overlay and beat jumps.
-                let grid = timestretch::detect_beat_grid_buffer(&bpm_buffer);
-                let bpm = grid.bpm;
-                log::info!(
-                    "Detected BPM: {bpm:.1} ({} beats, {} segments, confidence {:.2})",
-                    grid.beats.len(),
-                    grid.segments.len(),
-                    grid.confidence
-                );
-                self.grid_marks = GridMarks::from_grid(&grid);
-                self.beat_grid = Some(grid);
-                self.target_bpm_text = if bpm > 0.0 {
-                    format!("{bpm:.1}")
-                } else {
-                    String::new()
-                };
-                // A fresh track starts at its own tempo (fader centered) and
-                // unity ratio, regardless of any prior track's settings.
-                self.stretch_ratio = 1.0;
-                self.target_bpm = bpm.max(0.0);
-                let num_channels = bpm_buffer.channels.count();
-                let samples = Arc::new(bpm_buffer.into_data());
-
-                // Update shared state
-                let analysis_generation = {
-                    let mut st = self.state.lock().unwrap();
-                    st.sample_rate = sample_rate;
-                    st.total_frames = num_frames;
-                    st.position_frames = 0;
-                    st.detected_bpm = bpm;
-                    st.target_bpm = bpm.max(0.0);
-                    st.transport = Transport::Stopped;
-                    st.stretch_ratio = self.stretch_ratio;
-                    st.preset = self.preset;
-                    st.pre_analysis = None;
-                    st.loop_region = None;
-                    st.loop_in = None;
-                    st.analysis_generation += 1;
-                    st.analysis_generation
-                };
-
-                // Analyze-on-load: a matching sidecar is used immediately;
-                // otherwise a background thread analyzes once and caches the
-                // result next to the file. `detect_bpm_buffer` above keeps
-                // the UI BPM instant either way — the artifact upgrades
-                // subsequent processor rebuilds when it lands.
-                spawn_pre_analysis(
-                    self.state.clone(),
-                    samples.clone(),
-                    num_channels,
-                    sample_rate,
-                    sidecar_path(&path),
-                    analysis_generation,
-                );
-
-                self.source_audio = Some(samples);
-                self.file_path = Some(path);
-                self.output_sample_rate = sample_rate;
-                self.position.store(0);
+    /// Drains the load worker's channel: installs the decoded track, then
+    /// the analysis when it lands. Called at the top of every `update`.
+    fn poll_pending_load(&mut self) {
+        loop {
+            let msg = match &self.pending_load {
+                Some(pending) => pending.rx.try_recv(),
+                None => return,
+            };
+            match msg {
+                Ok(LoadMsg::Track(Ok(track))) => {
+                    self.install_track(track);
+                    if let Some(pending) = &mut self.pending_load {
+                        pending.track_received = true;
+                    }
+                }
+                Ok(LoadMsg::Track(Err(msg))) => {
+                    log::error!("{msg}");
+                    self.error_message = Some(msg);
+                    self.pending_load = None;
+                }
+                Ok(LoadMsg::Analysis(artifact)) => {
+                    self.install_analysis(&artifact);
+                    self.pending_load = None;
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    // Worker gone without a final message: panic safety net.
+                    let had_track = self
+                        .pending_load
+                        .as_ref()
+                        .is_some_and(|pending| pending.track_received);
+                    self.pending_load = None;
+                    if !had_track {
+                        self.error_message = Some("Load thread exited unexpectedly".to_string());
+                    }
+                    return;
+                }
             }
-            Err(e) => {
-                self.error_message = Some(format!("Failed to load: {e}"));
-                log::error!("Failed to load file: {e}");
-            }
+        }
+    }
+
+    /// Installs a completed decode + peaks result — everything the old
+    /// synchronous load did except the beat grid, which arrives separately
+    /// via [`LoadMsg::Analysis`].
+    fn install_track(&mut self, track: LoadedTrack) {
+        self.band_peaks = Some(track.peaks);
+        self.overview_texture = None;
+        self.zoom_tiles.clear();
+
+        {
+            let mut st = self.state.lock().unwrap();
+            st.sample_rate = track.sample_rate;
+            st.total_frames = track.num_frames;
+            st.position_frames = 0;
+            st.transport = Transport::Stopped;
+            st.stretch_ratio = self.stretch_ratio;
+            st.preset = self.preset;
+        }
+
+        self.source_audio = Some(track.samples);
+        self.file_path = Some(track.path);
+        self.output_sample_rate = track.sample_rate;
+        self.position.store(0);
+    }
+
+    /// Installs the pre-analysis artifact as the UI's beat grid + BPM —
+    /// the artifact is the same analysis the engine consumes, so the fader
+    /// and the splice guidance now agree by construction.
+    fn install_analysis(&mut self, artifact: &timestretch::PreAnalysisArtifact) {
+        let grid = grid_from_artifact(artifact);
+        let bpm = grid.bpm;
+        log::info!(
+            "Detected BPM: {bpm:.1} ({} beats, {} segments, confidence {:.2})",
+            grid.beats.len(),
+            grid.segments.len(),
+            grid.confidence
+        );
+        self.grid_marks = GridMarks::from_grid(&grid);
+        self.beat_grid = Some(grid);
+        if bpm > 0.0 {
+            // Honor whatever ratio is set by the time analysis lands
+            // (unity on a fresh load): the fader binds to effective BPM.
+            let effective = bpm / self.stretch_ratio.max(MIN_STRETCH_RATIO);
+            self.target_bpm = effective;
+            self.target_bpm_text = format!("{effective:.1}");
+            let mut st = self.state.lock().unwrap();
+            st.detected_bpm = bpm;
+            st.target_bpm = effective;
+        } else {
+            self.target_bpm = 0.0;
+            self.target_bpm_text.clear();
+            let mut st = self.state.lock().unwrap();
+            st.detected_bpm = 0.0;
+            st.target_bpm = 0.0;
         }
     }
 
@@ -611,6 +715,8 @@ impl TimeStretchApp {
 impl eframe::App for TimeStretchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let frame_start = Instant::now();
+        // Install any background load results before painting from them.
+        self.poll_pending_load();
         // Scrub glide bookkeeping. During a settle the voice owns the
         // moving position, so mirror it into the shared playhead; and each
         // newly published landing fires the parallel engine warm-start.
@@ -745,7 +851,15 @@ impl TimeStretchApp {
                 self.load_file(path);
             }
 
-            if !self.file_name.is_empty() {
+            let decoding = self
+                .pending_load
+                .as_ref()
+                .is_some_and(|pending| !pending.track_received);
+            if decoding {
+                ui.separator();
+                ui.spinner();
+                ui.label(format!("Loading {}…", self.file_name));
+            } else if !self.file_name.is_empty() {
                 ui.separator();
                 ui.label(&self.file_name);
 
@@ -758,6 +872,10 @@ impl TimeStretchApp {
                     ui.label(format!("{:.1} BPM", fs.detected_bpm));
                 } else {
                     ui.label("BPM: --");
+                    if self.pending_load.is_some() {
+                        // Track installed; analysis still running.
+                        ui.spinner();
+                    }
                 }
             }
         });
@@ -1320,62 +1438,350 @@ fn sidecar_path(audio_path: &std::path::Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-/// Loads a matching sidecar artifact or analyzes the track on a background
-/// thread, storing the result in shared state for the next processor rebuild.
+/// The background load: decode, peaks (with `.tspeaks` sidecar cache),
+/// then pre-analysis (with `.tsanalysis.json` sidecar cache) — one decode,
+/// one downmix, one hash, shared by everything. Sidecar writes are
+/// best-effort: a read-only volume must not break loading.
 ///
-/// The result is discarded if another file was loaded in the meantime
-/// (`generation` mismatch). Sidecar writes are best-effort: a read-only
-/// volume must not break analysis.
-fn spawn_pre_analysis(
-    state: SharedStateHandle,
-    samples: Arc<Vec<f32>>,
-    num_channels: usize,
-    sample_rate: u32,
-    sidecar: PathBuf,
-    generation: u64,
-) {
-    std::thread::spawn(move || {
-        let analysis_signal = timestretch::downmix_to_mid(&samples, num_channels);
+/// Results are dropped if another file was loaded in the meantime (the
+/// receiver is gone and the `generation` guard rejects the artifact).
+fn run_load_worker(req: LoadRequest) {
+    let LoadRequest {
+        path,
+        state,
+        generation,
+        tx,
+        ctx,
+    } = req;
 
-        let artifact = match timestretch::read_preanalysis_json(&sidecar) {
-            Ok(cached) if cached.matches_source(&analysis_signal, sample_rate) => {
-                log::info!("Pre-analysis: using cached sidecar {}", sidecar.display());
+    let decoded = match decoder::decode_file(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = tx.send(LoadMsg::Track(Err(format!("Failed to load: {e}"))));
+            ctx.request_repaint();
+            return;
+        }
+    };
+    log::info!(
+        "Decoded: {} frames, {} Hz, {} ch",
+        decoded.num_frames,
+        decoded.sample_rate,
+        decoded.channels
+    );
+    let sample_rate = decoded.sample_rate;
+    let num_frames = decoded.num_frames;
+    let num_channels = (decoded.channels as usize).max(1);
+
+    // One mono downmix + one hash serve the peaks cache key, the peaks
+    // computation, and the pre-analysis below.
+    let mono = timestretch::downmix_to_mid(&decoded.samples, num_channels);
+    let content_hash = timestretch::hash_samples(&mono);
+
+    let cache_path = waveform::cache::peaks_cache_path(&path);
+    let peaks =
+        match waveform::cache::read_validated(&cache_path, sample_rate, mono.len(), content_hash) {
+            Some(cached) => {
+                log::info!("Peaks: using cached sidecar {}", cache_path.display());
                 cached
             }
-            _ => {
+            None => {
                 let start = std::time::Instant::now();
-                let fresh = timestretch::analyze_for_dj(&analysis_signal, sample_rate);
-                log::info!(
-                    "Pre-analysis: {:.1} BPM, confidence {:.2}, {} beats, {} onsets ({:.2}s)",
-                    fresh.bpm,
-                    fresh.confidence,
-                    fresh.beat_positions.len(),
-                    fresh.transient_onsets.len(),
-                    start.elapsed().as_secs_f64()
-                );
-                if let Err(e) = timestretch::write_preanalysis_json(&sidecar, &fresh) {
-                    log::warn!(
-                        "Pre-analysis: could not cache sidecar {}: {e}",
-                        sidecar.display()
-                    );
+                // Computed from the hashed mono signal (not the interleaved
+                // stereo): identical bucket count, per-quantization-identical
+                // values, half the filter work — and the persisted peaks
+                // derive from exactly the signal that keys them.
+                let fresh = BandPeaks::compute(&mono, 1, sample_rate);
+                log::info!("Peaks: computed in {:.2}s", start.elapsed().as_secs_f64());
+                if let Err(e) = waveform::cache::write(
+                    &cache_path,
+                    &fresh,
+                    sample_rate,
+                    mono.len(),
+                    content_hash,
+                ) {
+                    log::warn!("Peaks: could not cache {}: {e}", cache_path.display());
                 }
                 fresh
             }
         };
 
-        let mut st = state.lock().unwrap();
-        if st.analysis_generation == generation {
-            st.pre_analysis = Some(Arc::new(artifact));
-        } else {
-            log::info!("Pre-analysis: discarding stale result (newer file loaded)");
+    let track = LoadedTrack {
+        path: path.clone(),
+        samples: Arc::new(decoded.samples),
+        sample_rate,
+        num_frames,
+        peaks,
+    };
+    if tx.send(LoadMsg::Track(Ok(track))).is_err() {
+        // A newer load replaced this one; skip the expensive analysis too.
+        return;
+    }
+    ctx.request_repaint();
+
+    // Pre-analysis: beat grid + BPM for the UI, splice guidance for the
+    // engine. Skip early when a newer load has already started.
+    if state.lock().unwrap().analysis_generation != generation {
+        return;
+    }
+    let sidecar = sidecar_path(&path);
+    let artifact = match timestretch::read_preanalysis_json(&sidecar) {
+        Ok(cached) if cached.matches_source(&mono, sample_rate) => {
+            log::info!("Pre-analysis: using cached sidecar {}", sidecar.display());
+            cached
         }
-    });
+        _ => {
+            let start = std::time::Instant::now();
+            let fresh = timestretch::analyze_for_dj(&mono, sample_rate);
+            log::info!(
+                "Pre-analysis: {:.1} BPM, confidence {:.2}, {} beats, {} onsets ({:.2}s)",
+                fresh.bpm,
+                fresh.confidence,
+                fresh.beat_positions.len(),
+                fresh.transient_onsets.len(),
+                start.elapsed().as_secs_f64()
+            );
+            if let Err(e) = timestretch::write_preanalysis_json(&sidecar, &fresh) {
+                log::warn!(
+                    "Pre-analysis: could not cache sidecar {}: {e}",
+                    sidecar.display()
+                );
+            }
+            fresh
+        }
+    };
+
+    let artifact = Arc::new(artifact);
+    {
+        // Store worker-side (not only via the channel) so `start_playback`
+        // sees the artifact even if `update` hasn't polled — e.g. with the
+        // window minimized.
+        let mut st = state.lock().unwrap();
+        if st.analysis_generation != generation {
+            log::info!("Pre-analysis: discarding stale result (newer file loaded)");
+            return;
+        }
+        st.pre_analysis = Some(artifact.clone());
+    }
+    let _ = tx.send(LoadMsg::Analysis(artifact));
+    ctx.request_repaint();
+}
+
+/// Rebuilds the [`timestretch::BeatGrid`] view of a pre-analysis artifact:
+/// beats, downbeats, and segments are stored verbatim in the artifact, so
+/// this is a field-by-field copy. Keeps beat jumps and auto-loops working
+/// from cached analysis without a duplicate detection pass.
+fn grid_from_artifact(artifact: &timestretch::PreAnalysisArtifact) -> timestretch::BeatGrid {
+    let mut grid = timestretch::BeatGrid::empty(artifact.sample_rate);
+    grid.beats = if artifact.beat_positions_fractional.is_empty() {
+        // Pre-fractional sidecars (can't occur at the current minimum
+        // compatible version, but free to guard).
+        artifact.beat_positions.iter().map(|&p| p as f64).collect()
+    } else {
+        artifact.beat_positions_fractional.clone()
+    };
+    grid.downbeats = artifact.downbeat_beat_indices.clone();
+    grid.segments = artifact.tempo_segments.clone();
+    grid.tempo_candidates = artifact.tempo_candidates.clone();
+    grid.bpm = artifact.bpm;
+    grid.confidence = artifact.confidence;
+    grid
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn grid_from_artifact_copies_beats_downbeats_segments() {
+        let artifact = timestretch::PreAnalysisArtifact {
+            sample_rate: 44_100,
+            bpm: 123.4,
+            confidence: 0.9,
+            beat_positions_fractional: vec![100.5, 200.25, 300.0, 400.75],
+            downbeat_beat_indices: vec![0, 2],
+            tempo_segments: vec![timestretch::TempoSegment {
+                start_beat: 0,
+                bpm: 123.4,
+            }],
+            ..Default::default()
+        };
+        let grid = grid_from_artifact(&artifact);
+        assert_eq!(grid.beats, artifact.beat_positions_fractional);
+        assert_eq!(grid.downbeats, artifact.downbeat_beat_indices);
+        assert_eq!(grid.segments.len(), 1);
+        assert_eq!(grid.bpm, 123.4);
+        assert_eq!(grid.sample_rate, 44_100);
+        let marks = GridMarks::from_grid(&grid);
+        assert!(marks.is_usable());
+        assert_eq!(marks.downbeat_count(), 2);
+    }
+
+    #[test]
+    fn grid_from_artifact_falls_back_to_integer_positions() {
+        let artifact = timestretch::PreAnalysisArtifact {
+            sample_rate: 44_100,
+            bpm: 120.0,
+            beat_positions: vec![100, 200, 300],
+            ..Default::default()
+        };
+        let grid = grid_from_artifact(&artifact);
+        assert_eq!(grid.beats, vec![100.0, 200.0, 300.0]);
+    }
+
+    #[test]
+    fn grid_from_artifact_empty_artifact_yields_unusable_grid() {
+        let grid = grid_from_artifact(&timestretch::PreAnalysisArtifact::default());
+        assert!(grid.beats.is_empty());
+        assert!(!GridMarks::from_grid(&grid).is_usable());
+    }
+
+    /// Unique temp dir per test.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tsload_test_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Hand-writes a minimal mono 16-bit PCM WAV: a steady 120 BPM kick-ish
+    /// pulse train so beat analysis has something to find.
+    fn write_test_wav(path: &std::path::Path, secs: f64) {
+        let sr = 44_100u32;
+        let n = (secs * sr as f64) as usize;
+        let mut pcm = Vec::with_capacity(n * 2);
+        let beat_period = (sr as f64 * 0.5) as usize; // 120 BPM
+        for i in 0..n {
+            let since_beat = i % beat_period;
+            // 60 Hz burst with a fast decay after each beat onset.
+            let env = (-(since_beat as f64) / (sr as f64 * 0.05)).exp();
+            let s =
+                (0.8 * env * (std::f64::consts::TAU * 60.0 * i as f64 / sr as f64).sin()) as f32;
+            pcm.extend_from_slice(&((s * i16::MAX as f32) as i16).to_le_bytes());
+        }
+        let data_len = pcm.len() as u32;
+        let mut wav = Vec::with_capacity(44 + pcm.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&sr.to_le_bytes());
+        wav.extend_from_slice(&(sr * 2).to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.extend_from_slice(&pcm);
+        std::fs::write(path, wav).unwrap();
+    }
+
+    fn worker_request(
+        wav: &std::path::Path,
+        state: &SharedStateHandle,
+        generation: u64,
+    ) -> (LoadRequest, mpsc::Receiver<LoadMsg>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            LoadRequest {
+                path: wav.to_path_buf(),
+                state: state.clone(),
+                generation,
+                tx,
+                ctx: egui::Context::default(),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn load_worker_sends_track_then_analysis_and_caches_peaks() {
+        let dir = temp_dir("worker");
+        let wav = dir.join("track.wav");
+        write_test_wav(&wav, 4.0);
+        let state: SharedStateHandle = Arc::new(Mutex::new(SharedState::new()));
+        state.lock().unwrap().analysis_generation = 7;
+
+        let (req, rx) = worker_request(&wav, &state, 7);
+        run_load_worker(req);
+
+        let first = rx.recv().expect("worker must send a Track message");
+        let LoadMsg::Track(Ok(track)) = first else {
+            panic!("expected Track(Ok), got an error or Analysis first");
+        };
+        assert_eq!(track.sample_rate, 44_100);
+        assert_eq!(track.num_frames, 4 * 44_100);
+        let LoadMsg::Analysis(artifact) = rx.recv().expect("worker must send Analysis") else {
+            panic!("expected Analysis after Track");
+        };
+        assert!(artifact.bpm > 0.0, "pulse train should yield a BPM");
+        assert!(state.lock().unwrap().pre_analysis.is_some());
+        // Suffix-append convention: track.wav.tspeaks.
+        assert!(dir.join("track.wav.tspeaks").exists());
+        assert!(dir.join("track.wav.tsanalysis.json").exists());
+
+        // Second run against the same file: both sidecars hit; results
+        // equivalent.
+        let (req2, rx2) = worker_request(&wav, &state, 7);
+        run_load_worker(req2);
+        let LoadMsg::Track(Ok(track2)) = rx2.recv().unwrap() else {
+            panic!("cache-hit run must still yield Track(Ok)");
+        };
+        assert_eq!(track2.num_frames, track.num_frames);
+        let base = track.peaks.level(0);
+        let base2 = track2.peaks.level(0);
+        assert_eq!(base.num_buckets(), base2.num_buckets());
+        // The cached pyramid is quantized; the fresh one wasn't. Values
+        // must agree within one quantization step.
+        for band in 0..waveform::NUM_BANDS {
+            for (a, b) in base.pos[band].iter().zip(&base2.pos[band]) {
+                assert!((a - b).abs() <= 1.0 / 255.0 + f32::EPSILON);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_worker_decode_error_sends_err() {
+        let dir = temp_dir("decode_err");
+        let bogus = dir.join("not_audio.wav");
+        std::fs::write(&bogus, b"this is not a wav file").unwrap();
+        let state: SharedStateHandle = Arc::new(Mutex::new(SharedState::new()));
+        let (req, rx) = worker_request(&bogus, &state, 1);
+        run_load_worker(req);
+        let LoadMsg::Track(Err(msg)) = rx.recv().unwrap() else {
+            panic!("expected Track(Err) for garbage input");
+        };
+        assert!(msg.starts_with("Failed to load"));
+        assert!(
+            rx.recv().is_err(),
+            "no Analysis after a failed decode; channel must just close"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_generation_skips_artifact_store() {
+        let dir = temp_dir("stale");
+        let wav = dir.join("track.wav");
+        write_test_wav(&wav, 2.0);
+        let state: SharedStateHandle = Arc::new(Mutex::new(SharedState::new()));
+        // The worker was spawned at generation 3, but a newer load bumped
+        // the shared state to 4 before analysis finished.
+        state.lock().unwrap().analysis_generation = 4;
+        let (req, rx) = worker_request(&wav, &state, 3);
+        run_load_worker(req);
+        let LoadMsg::Track(Ok(_)) = rx.recv().unwrap() else {
+            panic!("decode + peaks still complete for a stale worker");
+        };
+        assert!(
+            rx.recv().is_err(),
+            "stale worker must skip analysis entirely"
+        );
+        assert!(state.lock().unwrap().pre_analysis.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn deck_range_maps_to_profiles_and_labels() {
