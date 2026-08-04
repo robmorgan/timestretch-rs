@@ -29,7 +29,20 @@
 //!   coherence — the down-side "roboty" candidate cause from the first
 //!   listening round).
 //! - `widepv_hop8` — the prototype at 87.5% overlap (hop = FFT/8):
-//!   denser synthesis grid for expansions, 2x compute.
+//!   denser synthesis grid for expansions, 2x compute. Round-2 metrics:
+//!   this alone eliminates the -75% pathology (the +7 LUFS/click blowup
+//!   is a 75%-overlap artifact — zero clicks at 87.5% on all tracks).
+//! - `widepv_blend_hop8` — coherence blend + 87.5% overlap combined:
+//!   the ear-validated robotiness fix plus the edge fix, the leading
+//!   shippable-config candidate.
+//! - `widepv_blend40_hop8` — the combo with the blend held at 0.40
+//!   (double the shipped strength): round-2 verdict still heard residual
+//!   robotiness at -50%, so this probes harder vertical locking.
+//! - `widepv_4096` — FFT 4096 / hop 512 / blend 0.20: frequency
+//!   resolution against tonal beating. CHARACTERIZATION ONLY — a 4096
+//!   window is ~93 ms at 44.1 kHz, outside the profile's 25-50 ms
+//!   latency contract; if only this sounds right, that is a finding
+//!   about the contract, not a shippable config.
 //! - `rubberband` — external reference via the `rubberband` CLI (plus a
 //!   `rubberband_fine` R3 render when the installed version supports
 //!   `--fine`).
@@ -139,10 +152,11 @@ type ResetSchedule = Vec<(usize, [bool; 4])>;
 struct WidePvConfig {
     fft: usize,
     hop: usize,
-    /// Hold the phase-gradient coherence blend at full strength at wide
-    /// ratios (the shipped taper zeroes it approaching 2.5x — the
-    /// down-side "roboty" candidate cause).
-    coherence_blend: bool,
+    /// Hold the phase-gradient coherence blend at this strength at wide
+    /// ratios; 0.0 = shipped taper, which zeroes it approaching 2.5x —
+    /// the confirmed down-side "roboty" cause. Shipped near-unity
+    /// strength is 0.20.
+    coherence_blend: f64,
 }
 
 impl WidePvConfig {
@@ -150,12 +164,12 @@ impl WidePvConfig {
         Self {
             fft,
             hop: fft / 4,
-            coherence_blend: false,
+            coherence_blend: 0.0,
         }
     }
 
-    fn with_coherence_blend(mut self) -> Self {
-        self.coherence_blend = true;
+    fn with_coherence_blend(mut self, blend: f64) -> Self {
+        self.coherence_blend = blend;
         self
     }
 
@@ -257,8 +271,8 @@ fn wide_pv_render_mono(
         WindowType::Hann,
         PhaseLockingMode::Identity,
     );
-    if config.coherence_blend {
-        pv.set_wide_ratio_coherence_blend(true);
+    if config.coherence_blend > 0.0 {
+        pv.set_wide_ratio_coherence_blend(config.coherence_blend);
     }
     pv.reserve_streaming_capacity(fft_size + hop, ratio.max(1.0) + 0.5);
 
@@ -795,7 +809,7 @@ fn falsification_render_wide_listening_matrix() {
                         ch,
                         sample_rate,
                         ratio,
-                        WidePvConfig::new(WIDE_FFT).with_coherence_blend(),
+                        WidePvConfig::new(WIDE_FFT).with_coherence_blend(0.20),
                         Some(&artifact),
                     )
                     .0
@@ -809,6 +823,51 @@ fn falsification_render_wide_listening_matrix() {
                         sample_rate,
                         ratio,
                         WidePvConfig::new(WIDE_FFT).with_hop(WIDE_FFT / 8),
+                        Some(&artifact),
+                    )
+                    .0
+                }),
+            ));
+            renders.push((
+                "widepv_blend_hop8",
+                render_per_channel(interleaved, channels, |ch| {
+                    wide_pv_render_mono(
+                        ch,
+                        sample_rate,
+                        ratio,
+                        WidePvConfig::new(WIDE_FFT)
+                            .with_hop(WIDE_FFT / 8)
+                            .with_coherence_blend(0.20),
+                        Some(&artifact),
+                    )
+                    .0
+                }),
+            ));
+            renders.push((
+                "widepv_blend40_hop8",
+                render_per_channel(interleaved, channels, |ch| {
+                    wide_pv_render_mono(
+                        ch,
+                        sample_rate,
+                        ratio,
+                        WidePvConfig::new(WIDE_FFT)
+                            .with_hop(WIDE_FFT / 8)
+                            .with_coherence_blend(0.40),
+                        Some(&artifact),
+                    )
+                    .0
+                }),
+            ));
+            renders.push((
+                "widepv_4096",
+                render_per_channel(interleaved, channels, |ch| {
+                    wide_pv_render_mono(
+                        ch,
+                        sample_rate,
+                        ratio,
+                        WidePvConfig::new(4096)
+                            .with_hop(512)
+                            .with_coherence_blend(0.20),
                         Some(&artifact),
                     )
                     .0
@@ -1011,9 +1070,21 @@ fn wide_renders_have_exact_length() {
             ("widepv", WidePvConfig::new(WIDE_FFT)),
             (
                 "cohblend",
-                WidePvConfig::new(WIDE_FFT).with_coherence_blend(),
+                WidePvConfig::new(WIDE_FFT).with_coherence_blend(0.20),
             ),
             ("hop8", WidePvConfig::new(WIDE_FFT).with_hop(WIDE_FFT / 8)),
+            (
+                "blend40_hop8",
+                WidePvConfig::new(WIDE_FFT)
+                    .with_hop(WIDE_FFT / 8)
+                    .with_coherence_blend(0.40),
+            ),
+            (
+                "fft4096",
+                WidePvConfig::new(4096)
+                    .with_hop(512)
+                    .with_coherence_blend(0.20),
+            ),
         ] {
             let (out, _) = wide_pv_render_mono(&input, SAMPLE_RATE, ratio, config, None);
             assert_eq!(out.len(), expected, "{label} length at rate {rate}");
@@ -1041,7 +1112,7 @@ fn wide_renders_have_exact_length() {
 fn coherence_blend_engages_only_at_wide_expansion() {
     let input = bass_fixture(4);
     let base = WidePvConfig::new(WIDE_FFT);
-    let blend = base.with_coherence_blend();
+    let blend = base.with_coherence_blend(0.20);
     let rel_diff = |ratio: f64| {
         let (a, _) = wide_pv_render_mono(&input, SAMPLE_RATE, ratio, base, None);
         let (b, _) = wide_pv_render_mono(&input, SAMPLE_RATE, ratio, blend, None);
