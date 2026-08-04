@@ -66,6 +66,7 @@ pub use analysis::preanalysis::{
 };
 pub use analysis::rigid_grid::{RigidGridFit, fit_rigid_grid, refine_grid_rigid};
 pub use analysis::tempogram::TempoTrackingOptions;
+pub use analysis::waveform::{BandPeaks, NUM_BANDS, PeakLevel};
 pub use core::preanalysis::{
     KeyEstimate, KeyMode, LoudnessMeasurement, PREANALYSIS_VERSION, PreAnalysisArtifact,
     hash_samples, read_preanalysis_json, write_preanalysis_json,
@@ -76,6 +77,10 @@ pub use core::types::{
 };
 pub use core::window::WindowType;
 pub use error::StretchError;
+pub use io::tsa::{
+    AnalysisFile, TSA_CONTAINER_VERSION, analysis_file_path, read_analysis_file,
+    read_analysis_file_validated, write_analysis_file,
+};
 pub use stretch::phase_locking::PhaseLockingMode;
 
 /// Creates params adjusted for the given buffer's sample rate and channels,

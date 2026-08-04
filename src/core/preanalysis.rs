@@ -253,16 +253,36 @@ impl PreAnalysisArtifact {
     /// rejected outright: their positions carry the pre-v4 window-start
     /// bias, so a cached sidecar must be regenerated, not reused.
     pub fn matches_source(&self, samples: &[f32], sample_rate: u32) -> bool {
+        // Hash only when the artifact actually binds one (matches_identity
+        // skips the comparison when the artifact's hash is 0 either way).
+        let hash = if self.content_hash != 0 {
+            hash_samples(samples)
+        } else {
+            0
+        };
+        self.matches_identity(sample_rate, samples.len(), hash)
+    }
+
+    /// [`Self::matches_source`] without the samples in hand: checks the
+    /// same schema-version gate and the precomputed length/hash identity,
+    /// skipping each binding the artifact predates. For callers that
+    /// already hold the identity (e.g. the `.tsa` container's file header).
+    pub fn matches_identity(
+        &self,
+        sample_rate: u32,
+        source_len_samples: usize,
+        content_hash: u64,
+    ) -> bool {
         if self.version < MIN_COMPATIBLE_VERSION {
             return false;
         }
         if self.sample_rate != sample_rate {
             return false;
         }
-        if self.source_len_samples != 0 && self.source_len_samples != samples.len() {
+        if self.source_len_samples != 0 && self.source_len_samples != source_len_samples {
             return false;
         }
-        if self.content_hash != 0 && self.content_hash != hash_samples(samples) {
+        if self.content_hash != 0 && self.content_hash != content_hash {
             return false;
         }
         true
