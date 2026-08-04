@@ -100,6 +100,16 @@ const LOW_BAND_FLUX_FRACTION: f32 = 0.25;
 /// Only retune the PV pair beyond this transposition change.
 const TRANSPOSITION_EPSILON: f64 = 1e-4;
 
+/// Per-block log-space transposition slew clamp. An instant full-range
+/// sync snap (rate 2.0 → 0.5 = two octaves of transposition) stepped
+/// straight into the PV tears its overlap-add seam audibly (~4× the
+/// tone slew, measured); clamping T movement to this much natural log
+/// per 32-frame block bounds the per-render ratio step while settling a
+/// full-range snap in ~30 ms — perceptually instant, and continuous
+/// rides never engage the clamp. The resampler's step anchor tracks the
+/// slewed T, so stream balance stays exact.
+const TRANSPOSITION_SLEW_LN_PER_BLOCK: f64 = 0.05;
+
 /// The graph latches `modulation_hold` at CONTROL time and counts it in
 /// ingest blocks; this stage's audio runs its own constant delay behind
 /// ingest, so low-band reset gating reads the hold through a shift
@@ -275,11 +285,16 @@ impl Stage for WideKeylockStage {
         // THIS audio, not the control target. The resampler additionally
         // ramps its step across each render, so a rate step lands as a
         // sub-hop glide.
-        let transposition = if ctx.embedded_rate.is_finite() && ctx.embedded_rate > 0.0 {
+        let target = if ctx.embedded_rate.is_finite() && ctx.embedded_rate > 0.0 {
             (1.0 / ctx.embedded_rate).clamp(WIDE_TRANSPOSITION_MIN, WIDE_TRANSPOSITION_MAX)
         } else {
             1.0
         };
+        let slew_step = (target.ln() - self.transposition.ln()).clamp(
+            -TRANSPOSITION_SLEW_LN_PER_BLOCK,
+            TRANSPOSITION_SLEW_LN_PER_BLOCK,
+        );
+        let transposition = (self.transposition.ln() + slew_step).exp();
         if (transposition - self.transposition).abs() > TRANSPOSITION_EPSILON {
             self.transposition = transposition;
             for ch in &mut self.channels {

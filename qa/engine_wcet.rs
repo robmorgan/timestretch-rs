@@ -94,9 +94,34 @@ struct WcetReport {
     callbacks: usize,
 }
 
-/// Runs one configuration: full deck workload — tempo ride crossing the
-/// corrector threshold, a mid-run warm-start seek (priming callbacks are
-/// measured too), artifact attached.
+/// Per-profile tempo ride: the workload must exercise the transpositions
+/// the profile exists for.
+fn ride_rate(profile: EngineProfile, t: f64) -> f64 {
+    let lfo = (2.0 * std::f64::consts::PI * 0.25 * t).sin();
+    match profile {
+        // Narrow profiles: ±10% crossing the SOLA selection threshold
+        // (worst churn for the keylock chain).
+        EngineProfile::Tape | EngineProfile::Keylock => 1.0 + 0.1 * lfo,
+        // Wide profile: the full deck range 0.5–2.0, crossing unity — the
+        // corrector's whole transposition span, dilated resampler kernel
+        // included.
+        EngineProfile::WideKeylock => 1.25 + 0.75 * lfo,
+    }
+}
+
+/// Max rate the profile's ride reaches (feed-hint headroom: at rate 2.0
+/// the engine consumes 2× the callback; the old flat 1.2 hint starved
+/// the wide row into measuring the cheap underrun path).
+fn ride_max_rate(profile: EngineProfile) -> f64 {
+    match profile {
+        EngineProfile::Tape | EngineProfile::Keylock => 1.2,
+        EngineProfile::WideKeylock => 2.2,
+    }
+}
+
+/// Runs one configuration: full deck workload — a profile-matched tempo
+/// ride, a mid-run warm-start seek (priming callbacks are measured too),
+/// artifact attached.
 fn measure(profile: EngineProfile, callback_frames: usize, seconds: usize) -> WcetReport {
     let (audio, artifact) = fixture(seconds + 2);
     let handles = Engine::build(EngineConfig {
@@ -123,8 +148,7 @@ fn measure(profile: EngineProfile, callback_frames: usize, seconds: usize) -> Wc
 
     for cb in 0..total_callbacks {
         let t = (cb * callback_frames) as f64 / SAMPLE_RATE as f64;
-        // Ride crossing the SOLA/PV threshold (worst selection churn).
-        controller.set_tempo_rate(1.0 + 0.1 * (2.0 * std::f64::consts::PI * 0.25 * t).sin());
+        controller.set_tempo_rate(ride_rate(profile, t));
         if cb == seek_at {
             // Mid-run warm-start seek: priming work is part of the WCET.
             processor.reset();
@@ -134,7 +158,8 @@ fn measure(profile: EngineProfile, callback_frames: usize, seconds: usize) -> Wc
             source.set_track_position(feed_from as u64);
             controller.warm_start(preroll as u32);
         }
-        while source.occupied_frames() < source.demand_hint(callback_frames, 1.2) {
+        while source.occupied_frames() < source.demand_hint(callback_frames, ride_max_rate(profile))
+        {
             let end = (cursor + 8_192).min(audio.len());
             let accepted = source.push(&audio[cursor..end]);
             cursor += accepted * 2;
@@ -179,6 +204,7 @@ fn engine_worst_case_callback_budget() {
     let mut failures = Vec::new();
     for (profile, label) in [
         (EngineProfile::Keylock, "keylock"),
+        (EngineProfile::WideKeylock, "wide_keylock"),
         (EngineProfile::Tape, "tape"),
     ] {
         for callback_frames in [64usize, 256, 1024] {
