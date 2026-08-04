@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `EngineProfile::WideKeylock`: wide-range Master Tempo deck profile
+  (ROADMAP Stage 11) — a full-spectrum FFT-2048 identity-locked
+  phase-vocoder corrector with artifact-driven per-band phase resets,
+  keylocking across the engine's whole tempo range (rates 0.25–2.0)
+  with no correction fade. Constant pipeline delay 2144 frames
+  (48.6 ms at 44.1 kHz), its own honest latency contract alongside the
+  untouched 12.7 ms keylock chain. Semver note: adding the enum variant
+  breaks external exhaustive `match`es over `EngineProfile`.
+- `StreamingSincResampler::set_step_anchor`: pins the step-ramp anchor
+  so uniformly-produced chunks are consumed uniformly (the wide
+  corrector's stream-balance requirement).
+- `PhaseVocoder::set_wide_ratio_coherence_blend`: holds the
+  phase-gradient coherence blend at wide stretch ratios instead of the
+  shipped taper (the falsification-confirmed fix for robotic wide
+  slowdowns).
+- `Stage::warm_start_settle_frames`: per-stage warm-start history need;
+  the graph's preroll now takes the chain maximum (keylock preroll
+  unchanged).
+- Desktop: a Range selector (Standard | Wide) with seek-priced engine
+  rebuild that preserves the playhead, and a live pipeline-latency
+  readout next to it.
+
 ## 0.10.0
 
 ### Added

@@ -14,7 +14,7 @@
 //!   range): the engine graph itself, [`EngineProfile::Keylock`] at a
 //!   constant rate. Streaming-vs-offline agreement is true by construction
 //!   — same graph, same constants — and that includes the keylock's deck
-//!   semantic: content below the ~150 Hz crossover is NOT pitch-corrected
+//!   semantic: content below the 120 Hz crossover is NOT pitch-corrected
 //!   (its pitch follows tempo), offline exactly as live (owner decision
 //!   2026-07-16: batch copies the real-time path).
 //! - **Wide ratios** (beyond the corrected range, where the live chain

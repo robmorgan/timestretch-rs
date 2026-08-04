@@ -273,6 +273,7 @@ pub struct TimeStretchApp {
     volume: f32,
     preset: PresetChoice,
     deck_engine: DeckEngine,
+    deck_range: DeckRange,
     target_bpm_text: String,
     /// Auto-loop length as a ladder exponent (`2^exp` beats).
     loop_beats_exp: i32,
@@ -353,6 +354,7 @@ impl TimeStretchApp {
             volume: 0.8,
             preset: PresetChoice::DjBeatmatch,
             deck_engine: DeckEngine::Keylock,
+            deck_range: DeckRange::Standard,
             target_bpm_text: String::new(),
             loop_beats_exp: 2,
             error_message: None,
@@ -490,11 +492,13 @@ impl TimeStretchApp {
             let st = self.state.lock().unwrap();
             st.stretch_ratio
         };
-        // Always the keylock chain: the Tape/Keylock deck mode is a live
-        // engine parameter (delay-matched high-band crossfade), not a
-        // profile choice — switching mid-play is instant, with constant
-        // pipeline latency in both modes.
-        let profile = timestretch::engine::EngineProfile::Keylock;
+        // The tempo range picks the profile (Standard = primary keylock
+        // chain, Wide = wide-range Master Tempo chain); the Tape/Keylock
+        // deck mode stays a live engine parameter (delay-matched
+        // crossfade) INSIDE whichever profile is running — switching deck
+        // mode mid-play is instant, switching range is a seek-priced
+        // rebuild handled by the range selector.
+        let profile = self.state.lock().unwrap().deck_range.profile();
         // Analyze-on-load artifact: the engine's primary transient control
         // signal (splice guidance + PV phase resets). Arc-shared with the
         // analysis thread's result.
@@ -1216,16 +1220,16 @@ impl TimeStretchApp {
                     if self.deck_engine != old_deck {
                         self.state.lock().unwrap().deck_engine = self.deck_engine;
                     }
-                    match self.deck_engine {
-                        DeckEngine::Tape => {
+                    match (self.deck_engine, self.deck_range) {
+                        (DeckEngine::Tape, _) => {
                             ui.label(egui::RichText::new("tape: pitch follows tempo").weak())
                                 .on_hover_text(
                                     "Tape mode: pitch follows the fader (delay-matched \
-                                     varispeed; same constant ~13 ms pipeline delay as \
-                                     keylock, so switching live is seamless).",
+                                     varispeed at the active range's constant pipeline \
+                                     delay, so switching live is seamless).",
                                 );
                         }
-                        DeckEngine::Keylock => {
+                        (DeckEngine::Keylock, DeckRange::Standard) => {
                             ui.label(egui::RichText::new("keylock: two-band").weak())
                                 .on_hover_text(
                                     "Keylock mode: low band follows tempo, high band \
@@ -1233,6 +1237,59 @@ impl TimeStretchApp {
                                      (~13 ms pipeline delay).",
                                 );
                         }
+                        (DeckEngine::Keylock, DeckRange::Wide) => {
+                            ui.label(egui::RichText::new("keylock: full-spectrum").weak())
+                                .on_hover_text(
+                                    "Wide-range Master Tempo: the full spectrum is \
+                                     pitch-corrected across the whole tempo range \
+                                     (~49 ms pipeline delay).",
+                                );
+                        }
+                    }
+                });
+                ui.end_row();
+
+                // Tempo range: Standard (primary keylock chain, ±20% full
+                // keylock, ~13 ms) vs Wide (CDJ-style wide-range Master
+                // Tempo, ~49 ms). A range change rebuilds the engine and
+                // restores the playhead via warm-start seek.
+                ui.label("Range:");
+                ui.horizontal(|ui| {
+                    let old_range = self.deck_range;
+                    egui::ComboBox::from_id_salt("deck_range_combo")
+                        .selected_text(self.deck_range.label())
+                        .show_ui(ui, |ui| {
+                            for &range in DeckRange::ALL {
+                                ui.selectable_value(&mut self.deck_range, range, range.label());
+                            }
+                        });
+                    if old_range.rebuild_needed(self.deck_range) {
+                        let (transport, latency_secs) = {
+                            let mut st = self.state.lock().unwrap();
+                            st.deck_range = self.deck_range;
+                            (st.transport, st.reported_latency_secs)
+                        };
+                        let _ = latency_secs;
+                        if transport != Transport::Stopped {
+                            // Seek-priced rebuild: keep the playhead (NOT
+                            // stop_playback — that zeroes the position).
+                            let pos = self.position.load();
+                            self.stop_processing_thread();
+                            self.start_playback();
+                            self.request_seek(pos);
+                        }
+                    }
+                    let latency_ms = {
+                        let st = self.state.lock().unwrap();
+                        st.reported_latency_secs * 1_000.0
+                    };
+                    if latency_ms > 0.0 {
+                        ui.label(egui::RichText::new(format!("{latency_ms:.1} ms")).weak())
+                            .on_hover_text(
+                                "Constant pipeline delay reported by the active engine \
+                                 (host-compensated; each range has its own honest \
+                                 figure).",
+                            );
                     }
                 });
                 ui.end_row();
@@ -1319,6 +1376,29 @@ fn spawn_pre_analysis(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn deck_range_maps_to_profiles_and_labels() {
+        assert_eq!(DeckRange::ALL.len(), 2);
+        assert_eq!(
+            DeckRange::Standard.profile(),
+            timestretch::engine::EngineProfile::Keylock
+        );
+        assert_eq!(
+            DeckRange::Wide.profile(),
+            timestretch::engine::EngineProfile::WideKeylock
+        );
+        assert_eq!(DeckRange::Standard.label(), "Standard");
+        assert_eq!(DeckRange::Wide.label(), "Wide");
+    }
+
+    #[test]
+    fn only_range_changes_require_a_rebuild() {
+        assert!(DeckRange::Standard.rebuild_needed(DeckRange::Wide));
+        assert!(DeckRange::Wide.rebuild_needed(DeckRange::Standard));
+        assert!(!DeckRange::Standard.rebuild_needed(DeckRange::Standard));
+        assert!(!DeckRange::Wide.rebuild_needed(DeckRange::Wide));
+    }
 
     const SR: f64 = 44100.0;
     const BUFFER: usize = 512;
