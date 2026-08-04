@@ -58,10 +58,12 @@ pub const WIDE_HOP: usize = WIDE_FFT / 8;
 /// shipped offline wide path).
 pub const WIDE_SUB_BASS_CUTOFF_HZ: f32 = 100.0;
 
-/// Phase-gradient coherence blend held at wide ratios (0.20 vs 0.40 is
-/// below metric resolution; 0.40 is the owner's round-3 lean — settled
-/// by ear at Stage 11 C4).
-pub const WIDE_COHERENCE_BLEND: f64 = 0.40;
+/// Phase-gradient coherence blend held at wide ratios. Settled by ear on
+/// the LIVE stage (owner, 2026-08-04): 0.20 marginally better than 0.40
+/// — reversing the offline round-3 lean toward 0.40; the difference is
+/// below metric resolution either way, and 0.20 matches the shipped
+/// near-unity taper strength.
+pub const WIDE_COHERENCE_BLEND: f64 = 0.20;
 
 /// Transposition clamp: `1/rate` over the engine's tempo range
 /// [0.25, 2.0] maps to [0.5, 4.0] — exactly the streaming resampler's

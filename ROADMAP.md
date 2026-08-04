@@ -970,7 +970,7 @@ correct grid, not a quality-gated stretch.
 - Full-track analysis stays comfortably offline-budget (proposed ≥ 50×
   realtime on the CI reference machine).
 
-## [ ] Stage 11: Wide-Range Master Tempo Profile (post-cutover track)
+## [x] Stage 11: Wide-Range Master Tempo Profile (post-cutover track)
 
 Automation: auto
 
@@ -1018,6 +1018,42 @@ Automation: auto
 > the wide-ratio low-band verdict (`widepv_lowfree` renders exist,
 > not yet auditioned — exit criterion) and the ±100 %/−75 % edge
 > listening characterization (metrically clean in the hop/8 family).
+>
+> **COMPLETE — build-out shipped, owner sign-off recorded 2026-08-04.**
+> Live chain: `WideKeylockStage` (FFT 2048 / hop 256 / identity /
+> full-spectrum, no correction fade, T clamp [0.5, 4.0] = the
+> resampler's exact step range), artifact-only flux-gated per-band
+> resets with a latency-delayed modulation-hold read, keylock-toggle
+> crossfade, constant 2144-frame (48.6 ms) contract. Two mechanisms
+> found and fixed by the gates during build-out: the resampler ramp's
+> harmonic-mean consumption drifts stream balance by hop/2·ln(T₁/T₀)
+> across sweeps (fixed: `set_step_anchor` — uniform chunks consumed
+> uniformly), and instant full-range T steps tear the overlap-add seam
+> (fixed: log-space transposition slew, full-range snap settles ≈30 ms).
+> Metric half: strict WCET p99.9 0.328 vs 0.5 bound at 64-frame
+> callbacks (no channel staggering needed — the named contingency stays
+> unshipped); zero-alloc steady state + multi-callback warm start;
+> torture rides/snaps click-free; wide matrix gates pinned (steady
+> cents 0.09–0.50 p95 at rates 0.7–2.0; ride wobble 3.3 cents p95 at
+> ±8 % / 38 at the full-range torture ride — the structural
+> chunked-correction ceiling vs SOLA's per-sample elastic 0.5, a
+> ±512-frame slope-lookahead scan confirmed zero offset optimal;
+> synthetic-delta sharpness pinned loosely as big-window smear).
+> Listening half (owner, 2026-08-04, live desktop deck): **keylock now
+> holds beyond ±20 %** where the primary chain releases; range flip is
+> a click-free seek-priced rebuild with the playhead preserved and the
+> honest latency chip updating. **Low-band verdict (exit criterion):
+> keylocked full spectrum — `widepv_resets` beat `widepv_lowfree` in
+> the offline A/B; the stage is Corrected-only, no band split.**
+> Coherence blend settled at **0.20** (live A/B: marginally better than
+> 0.40, reversing the offline round-3 lean; both below metric
+> resolution). Edge characterization at −75 %: pitch stays locked;
+> bass reads bitcrushed/distorted, vocals robotic and raspy ("through
+> a guitar amp") — documented degradation well outside the ±50 %
+> shippable verdict, no silent cliff. The Rubber Band gap stands as
+> accepted at the falsification: audibly behind R3 at all wide rates,
+> shippable per the owner's call. Desktop ships the Range selector
+> (Standard | Wide); README now carries the per-profile latency matrix.
 
 ### Why
 
