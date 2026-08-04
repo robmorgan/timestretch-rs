@@ -27,9 +27,12 @@
 //!   `rubberband_fine` R3 render when the installed version supports
 //!   `--fine`).
 //!
-//! Tempo rates default to +30/-30/+50/-50/+100%. -100% tempo is a stop
-//! (rate 0), so the down-side edge is characterized at rate 0.5 (time
-//! ratio 2.0), the deepest meaningful slowdown.
+//! Tempo rates default to +30/-30/+50/-50/+100/-75%. -100% tempo is a
+//! stop (rate 0, time ratio undefined), so the down-side edge cannot be
+//! rendered at all; instead rate 0.25 (-75%, time ratio 4x) probes how
+//! the corrector degrades as rate approaches zero (PV ratio grows toward
+//! spectral freeze) — the "edge characterized, no gate" point the exit
+//! criteria ask for, alongside +100% on the up side.
 //!
 //! Run the self-checks (no corpus or CLI needed):
 //! `cargo test --features qa-harnesses --release --test wide_falsification -- --nocapture`
@@ -72,8 +75,10 @@ mod ab;
 
 use ab::{Arm, render_with_rate_schedule};
 
-/// Tempo rates under test (time ratio is the reciprocal).
-const DEFAULT_RATES: [f64; 5] = [1.30, 0.70, 1.50, 0.50, 2.00];
+/// Tempo rates under test (time ratio is the reciprocal). 0.25 is the
+/// down-side edge probe: -100% is a stop, so -75% (time ratio 4x) is the
+/// deepest rendered point.
+const DEFAULT_RATES: [f64; 6] = [1.30, 0.70, 1.50, 0.50, 2.00, 0.25];
 
 /// Prototype FFT sizes: 2048 matches the shipped `stretch_wide_pv`
 /// constants; 1024 is the empirical-settle candidate. Hop is FFT/4 (75%
