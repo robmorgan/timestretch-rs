@@ -98,6 +98,11 @@ pub struct OnsetEvent {
     pub strength: f32,
     /// True for beatgrid positions, false for detected onsets.
     pub beat: bool,
+    /// Per-band spectral flux at this onset `[sub_bass, low, mid, high]`
+    /// (artifact `onset_band_flux`; beats and artifacts without flux data
+    /// publish `[1.0; 4]`). Consumers gate band-selective work on it —
+    /// note the `Default` of `[0.0; 4]` reads as "no flux anywhere".
+    pub band_flux: [f32; 4],
 }
 
 /// Per-block context the graph hands every stage.
