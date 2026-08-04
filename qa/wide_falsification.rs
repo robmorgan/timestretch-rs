@@ -23,6 +23,13 @@
 //!   (<120 Hz) follows tempo, high band through the prototype. A/B vs
 //!   `widepv_resets` is the wide-ratio low-band verdict the exit criteria
 //!   ask for.
+//! - `widepv_cohblend` — the prototype with the phase-gradient coherence
+//!   blend held at full strength at wide ratios (the shipped taper
+//!   zeroes it approaching 2.5x, leaving big slowdowns with no vertical
+//!   coherence — the down-side "roboty" candidate cause from the first
+//!   listening round).
+//! - `widepv_hop8` — the prototype at 87.5% overlap (hop = FFT/8):
+//!   denser synthesis grid for expansions, 2x compute.
 //! - `rubberband` — external reference via the `rubberband` CLI (plus a
 //!   `rubberband_fine` R3 render when the installed version supports
 //!   `--fine`).
@@ -127,6 +134,37 @@ fn rate_tag(rate: f64) -> String {
 /// One onset's scheduled reset: (position in padded frames, band mask).
 type ResetSchedule = Vec<(usize, [bool; 4])>;
 
+/// PV configuration for one prototype arm.
+#[derive(Clone, Copy)]
+struct WidePvConfig {
+    fft: usize,
+    hop: usize,
+    /// Hold the phase-gradient coherence blend at full strength at wide
+    /// ratios (the shipped taper zeroes it approaching 2.5x — the
+    /// down-side "roboty" candidate cause).
+    coherence_blend: bool,
+}
+
+impl WidePvConfig {
+    fn new(fft: usize) -> Self {
+        Self {
+            fft,
+            hop: fft / 4,
+            coherence_blend: false,
+        }
+    }
+
+    fn with_coherence_blend(mut self) -> Self {
+        self.coherence_blend = true;
+        self
+    }
+
+    fn with_hop(mut self, hop: usize) -> Self {
+        self.hop = hop;
+        self
+    }
+}
+
 /// Builds the per-band reset schedule from an artifact's onsets, in the
 /// padded coordinates of [`wide_pv_render_mono`]. Policy inherited from
 /// the Stage-9 corrector's `begin_block`: mids/highs always re-lock, the
@@ -172,14 +210,16 @@ fn wide_pv_render_mono(
     mono: &[f32],
     sample_rate: u32,
     ratio: f64,
-    fft_size: usize,
+    config: WidePvConfig,
     artifact: Option<&PreAnalysisArtifact>,
 ) -> (Vec<f32>, u64) {
     use timestretch::stretch::phase_vocoder::PhaseVocoder;
 
+    let WidePvConfig {
+        fft: fft_size, hop, ..
+    } = config;
     let frames = mono.len();
     let expected = (frames as f64 * ratio).round() as usize;
-    let hop = fft_size / 4;
     if frames < fft_size {
         // Matches the shipped short-input fallback's spirit: resample to
         // length, pitch follows.
@@ -217,6 +257,9 @@ fn wide_pv_render_mono(
         WindowType::Hann,
         PhaseLockingMode::Identity,
     );
+    if config.coherence_blend {
+        pv.set_wide_ratio_coherence_blend(true);
+    }
     pv.reserve_streaming_capacity(fft_size + hop, ratio.max(1.0) + 0.5);
 
     let schedule = artifact
@@ -274,7 +317,7 @@ fn lowfree_render_mono(
     mono: &[f32],
     sample_rate: u32,
     ratio: f64,
-    fft_size: usize,
+    config: WidePvConfig,
     artifact: Option<&PreAnalysisArtifact>,
 ) -> Vec<f32> {
     let expected = (mono.len() as f64 * ratio).round() as usize;
@@ -284,7 +327,7 @@ fn lowfree_render_mono(
     xover.process(mono, &mut low, &mut high);
 
     let low_stretched = resample_sinc_default(&low, expected.max(1));
-    let (mut out, _) = wide_pv_render_mono(&high, sample_rate, ratio, fft_size, artifact);
+    let (mut out, _) = wide_pv_render_mono(&high, sample_rate, ratio, config, artifact);
     for (o, &l) in out.iter_mut().zip(low_stretched.iter()) {
         *o += l;
     }
@@ -710,19 +753,65 @@ fn falsification_render_wide_listening_matrix() {
             renders.push((
                 "widepv_resets",
                 render_per_channel(interleaved, channels, |ch| {
-                    wide_pv_render_mono(ch, sample_rate, ratio, WIDE_FFT, Some(&artifact)).0
+                    wide_pv_render_mono(
+                        ch,
+                        sample_rate,
+                        ratio,
+                        WidePvConfig::new(WIDE_FFT),
+                        Some(&artifact),
+                    )
+                    .0
                 }),
             ));
             renders.push((
                 "widepv_1024",
                 render_per_channel(interleaved, channels, |ch| {
-                    wide_pv_render_mono(ch, sample_rate, ratio, WIDE_FFT_SMALL, Some(&artifact)).0
+                    wide_pv_render_mono(
+                        ch,
+                        sample_rate,
+                        ratio,
+                        WidePvConfig::new(WIDE_FFT_SMALL),
+                        Some(&artifact),
+                    )
+                    .0
                 }),
             ));
             renders.push((
                 "widepv_lowfree",
                 render_per_channel(interleaved, channels, |ch| {
-                    lowfree_render_mono(ch, sample_rate, ratio, WIDE_FFT, Some(&artifact))
+                    lowfree_render_mono(
+                        ch,
+                        sample_rate,
+                        ratio,
+                        WidePvConfig::new(WIDE_FFT),
+                        Some(&artifact),
+                    )
+                }),
+            ));
+            renders.push((
+                "widepv_cohblend",
+                render_per_channel(interleaved, channels, |ch| {
+                    wide_pv_render_mono(
+                        ch,
+                        sample_rate,
+                        ratio,
+                        WidePvConfig::new(WIDE_FFT).with_coherence_blend(),
+                        Some(&artifact),
+                    )
+                    .0
+                }),
+            ));
+            renders.push((
+                "widepv_hop8",
+                render_per_channel(interleaved, channels, |ch| {
+                    wide_pv_render_mono(
+                        ch,
+                        sample_rate,
+                        ratio,
+                        WidePvConfig::new(WIDE_FFT).with_hop(WIDE_FFT / 8),
+                        Some(&artifact),
+                    )
+                    .0
                 }),
             ));
 
@@ -844,7 +933,8 @@ fn wide_pv_identity_round_trip() {
 
     let input = bass_fixture(4);
     for fft in [WIDE_FFT, WIDE_FFT_SMALL] {
-        let (out, fired) = wide_pv_render_mono(&input, SAMPLE_RATE, 1.0, fft, None);
+        let (out, fired) =
+            wide_pv_render_mono(&input, SAMPLE_RATE, 1.0, WidePvConfig::new(fft), None);
         assert_eq!(out.len(), input.len(), "identity length (fft {fft})");
         assert_eq!(fired, 0, "no artifact, no resets");
         let hop = fft / 4;
@@ -917,17 +1007,67 @@ fn wide_renders_have_exact_length() {
     for rate in DEFAULT_RATES {
         let ratio = 1.0 / rate;
         let expected = (frames as f64 * ratio).round() as usize;
-        let (out, _) = wide_pv_render_mono(&input, SAMPLE_RATE, ratio, WIDE_FFT, None);
-        assert_eq!(out.len(), expected, "widepv length at rate {rate}");
-        // The trailing edge must be real content, not the resize backfill:
-        // the end mirror pad guarantees the streaming tail covers it.
-        let tail = &out[expected.saturating_sub(2_048)..];
-        let tail_rms =
-            (tail.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / tail.len() as f64).sqrt();
-        assert!(tail_rms > 0.01, "output tail is silence at rate {rate}");
-        let low = lowfree_render_mono(&input, SAMPLE_RATE, ratio, WIDE_FFT, None);
+        for (label, config) in [
+            ("widepv", WidePvConfig::new(WIDE_FFT)),
+            (
+                "cohblend",
+                WidePvConfig::new(WIDE_FFT).with_coherence_blend(),
+            ),
+            ("hop8", WidePvConfig::new(WIDE_FFT).with_hop(WIDE_FFT / 8)),
+        ] {
+            let (out, _) = wide_pv_render_mono(&input, SAMPLE_RATE, ratio, config, None);
+            assert_eq!(out.len(), expected, "{label} length at rate {rate}");
+            // The trailing edge must be real content, not the resize
+            // backfill: the end mirror pad guarantees the streaming tail
+            // covers it.
+            let tail = &out[expected.saturating_sub(2_048)..];
+            let tail_rms = (tail.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>()
+                / tail.len() as f64)
+                .sqrt();
+            assert!(tail_rms > 0.01, "{label} tail is silence at rate {rate}");
+        }
+        let low = lowfree_render_mono(
+            &input,
+            SAMPLE_RATE,
+            ratio,
+            WidePvConfig::new(WIDE_FFT),
+            None,
+        );
         assert_eq!(low.len(), expected, "lowfree length at rate {rate}");
     }
+}
+
+#[test]
+fn coherence_blend_engages_only_at_wide_expansion() {
+    let input = bass_fixture(4);
+    let base = WidePvConfig::new(WIDE_FFT);
+    let blend = base.with_coherence_blend();
+    let rel_diff = |ratio: f64| {
+        let (a, _) = wide_pv_render_mono(&input, SAMPLE_RATE, ratio, base, None);
+        let (b, _) = wide_pv_render_mono(&input, SAMPLE_RATE, ratio, blend, None);
+        let diff: f64 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| ((x - y) as f64).powi(2))
+            .sum();
+        let reference: f64 = a.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        (diff / reference.max(1e-12)).sqrt()
+    };
+
+    // At unity the shipped taper is already at full strength, so the knob
+    // must be a no-op; at 2x expansion the shipped taper is zero, so the
+    // knob must change the render.
+    let at_unity = rel_diff(1.0);
+    let at_expansion = rel_diff(2.0);
+    println!("cohblend rel diff: unity {at_unity:.6}, 2x expansion {at_expansion:.6}");
+    assert!(
+        at_unity < 1e-6,
+        "cohblend altered the unity render: {at_unity}"
+    );
+    assert!(
+        at_expansion > 1e-3,
+        "cohblend had no effect at 2x expansion: {at_expansion}"
+    );
 }
 
 #[test]
@@ -966,9 +1106,20 @@ fn artifact_resets_fire_and_change_the_render() {
     );
 
     let ratio = 1.0 / 1.5;
-    let (with_resets, fired) =
-        wide_pv_render_mono(&input, SAMPLE_RATE, ratio, WIDE_FFT, Some(&artifact));
-    let (without, _) = wide_pv_render_mono(&input, SAMPLE_RATE, ratio, WIDE_FFT, None);
+    let (with_resets, fired) = wide_pv_render_mono(
+        &input,
+        SAMPLE_RATE,
+        ratio,
+        WidePvConfig::new(WIDE_FFT),
+        Some(&artifact),
+    );
+    let (without, _) = wide_pv_render_mono(
+        &input,
+        SAMPLE_RATE,
+        ratio,
+        WidePvConfig::new(WIDE_FFT),
+        None,
+    );
     println!(
         "resets fired: {fired} ({} onsets in artifact)",
         artifact.transient_onsets.len()
