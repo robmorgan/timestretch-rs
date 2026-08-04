@@ -61,6 +61,13 @@ enum Gesture {
     /// release 9.5%) twice per 4 s cycle, forcing repeated corrector
     /// handoffs mid-gesture.
     ThresholdRide,
+    /// Wide-profile fader ride across the full deck range: 1.25 + 0.75 *
+    /// sin(2*pi*0.25*t), sweeping rate 0.5..2.0 (transposition 2.0..0.5)
+    /// through unity twice per cycle.
+    WideRide,
+    /// Wide-profile sync snaps: instant jumps 2.0 / 0.5 / 1.0 within each
+    /// second — full-range transposition steps.
+    WideSnap,
 }
 
 impl Gesture {
@@ -92,6 +99,17 @@ impl Gesture {
                     1.0
                 }
             }
+            Gesture::WideRide => 1.25 + 0.75 * (2.0 * std::f64::consts::PI * 0.25 * t_secs).sin(),
+            Gesture::WideSnap => {
+                let phase = t_secs.fract();
+                if phase < 0.4 {
+                    2.0
+                } else if phase < 0.8 {
+                    0.5
+                } else {
+                    1.0
+                }
+            }
         }
     }
 
@@ -101,6 +119,7 @@ impl Gesture {
             Gesture::Ride => 1.06,
             Gesture::Snap => 1.08,
             Gesture::ThresholdRide => 1.11,
+            Gesture::WideRide | Gesture::WideSnap => 2.0,
         }
     }
 
@@ -110,6 +129,8 @@ impl Gesture {
             Gesture::Ride => "ride",
             Gesture::Snap => "snap",
             Gesture::ThresholdRide => "threshold-ride",
+            Gesture::WideRide => "wide-ride",
+            Gesture::WideSnap => "wide-snap",
         }
     }
 }
@@ -146,7 +167,8 @@ fn stream_profile_with_gesture(
         controller.set_tempo_rate(gesture.target_rate_at(t));
 
         while feed_cursor < input.len()
-            && source.occupied_frames() < source.demand_hint(CALLBACK_FRAMES, 1.1)
+            && source.occupied_frames()
+                < source.demand_hint(CALLBACK_FRAMES, gesture.max_rate() as f64 + 0.1)
         {
             let end = (feed_cursor + 4096 * channels).min(input.len());
             let accepted = source.push(&input[feed_cursor..end]);
@@ -275,6 +297,68 @@ fn assert_keylock_torture(gesture: Gesture) {
         p95,
         p95_bound
     );
+}
+
+/// Wide-profile torture: the corrected tone must stay click-free through
+/// full-range gestures (ROADMAP Stage 11 — no correction fade means the
+/// corrector rides every gesture end to end).
+fn assert_wide_keylock_torture(gesture: Gesture) {
+    let freq = 220.0f32;
+    let amp = 0.5f32;
+    // Rides dipping to rate 0.5 consume media at half speed but the
+    // adapter renders 70% of the source duration in callbacks; 12 s of
+    // source keeps every callback covered at the wide extremes.
+    let input = sine(freq, SAMPLE_RATE as usize * 12, amp);
+    let output = stream_profile_with_gesture(EngineProfile::WideKeylock, &input, 1, gesture);
+
+    // Skip the pipeline-delay prefix of silence (2144 frames) plus settle.
+    let scan = &output[16_384..];
+    let theoretical = sine_max_slew(freq, amp, 1.0);
+    let hard_bound = theoretical * 3.0;
+    let p95_bound = theoretical * 1.3;
+
+    let (max_idx, max_diff) = max_adjacent_diff(scan);
+    let p95 = p95_adjacent_diff(scan);
+    println!(
+        "wide-torture[{}]: len={} max_diff={:.5}@{} p95={:.5} bounds={:.5}/{:.5}",
+        gesture.label(),
+        output.len(),
+        max_diff,
+        max_idx,
+        p95,
+        hard_bound,
+        p95_bound,
+    );
+    assert!(
+        max_diff <= hard_bound,
+        "wide torture[{}]: click at {}: {:.5} > {:.5}",
+        gesture.label(),
+        max_idx,
+        max_diff,
+        hard_bound
+    );
+    assert!(
+        p95 <= p95_bound,
+        "wide torture[{}]: p95 {:.5} > {:.5}",
+        gesture.label(),
+        p95,
+        p95_bound
+    );
+}
+
+#[test]
+fn engine_wide_keylock_torture_ride_no_clicks() {
+    assert_wide_keylock_torture(Gesture::WideRide);
+}
+
+#[test]
+fn engine_wide_keylock_torture_snap_no_clicks() {
+    assert_wide_keylock_torture(Gesture::WideSnap);
+}
+
+#[test]
+fn engine_wide_keylock_torture_nudge_no_clicks() {
+    assert_wide_keylock_torture(Gesture::Nudge);
 }
 
 #[test]

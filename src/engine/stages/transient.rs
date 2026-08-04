@@ -19,8 +19,10 @@ use crate::engine::stage::OnsetEvent;
 
 /// How far behind the current stage position events are retained, in
 /// frames: covers the corrector latency plus splice-fade spans so a
-/// protection window around a just-passed onset is still visible.
-pub(crate) const KEEP_BEHIND_FRAMES: f64 = 1_024.0;
+/// protection window around a just-passed onset is still visible. Sized
+/// for the deepest-lag corrector — the wide keylock chain's 2112-frame
+/// delay plus hop/fade span (SOLA's 560 needs far less).
+pub(crate) const KEEP_BEHIND_FRAMES: f64 = 3_072.0;
 
 /// Scheduling lookahead, in stage frames.
 const HORIZON_FRAMES: f64 = 2_048.0;
@@ -106,6 +108,15 @@ impl TransientCursor {
                 stage_frame,
                 strength: self.artifact.strength_at(idx),
                 beat: false,
+                // Legacy artifacts without flux data publish full flux so
+                // strength stays the only gate (matches the offline
+                // prototype's fallback).
+                band_flux: self
+                    .artifact
+                    .onset_band_flux
+                    .get(idx)
+                    .copied()
+                    .unwrap_or([1.0; 4]),
             };
             self.len += 1;
             idx += 1;
@@ -126,6 +137,7 @@ impl TransientCursor {
                 stage_frame,
                 strength: 1.0,
                 beat: true,
+                band_flux: [1.0; 4],
             };
             self.len += 1;
             idx += 1;

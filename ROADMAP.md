@@ -970,9 +970,90 @@ correct grid, not a quality-gated stretch.
 - Full-track analysis stays comfortably offline-budget (proposed ≥ 50×
   realtime on the CI reference machine).
 
-## [ ] Stage 11: Wide-Range Master Tempo Profile (post-cutover track)
+## [x] Stage 11: Wide-Range Master Tempo Profile (post-cutover track)
 
 Automation: auto
+
+> **Falsification experiment — result: the bet holds (2026-08-04).
+> Proceed to build-out.** Harness: `qa/wide_falsification.rs` via
+> `./scripts/wide_falsification.sh` (renders + `summary.csv` in
+> `target/wide_falsification/`, Rubber Band CLI 4.0.0 references incl.
+> `--fine`, level-matched `norm/` copies for listening).
+>
+> Metric half, three rounds: the reset-driven FFT-2048 identity prototype
+> holds 0.85–0.91 spectral / 0.82–0.88 perceptual vs Rubber Band at
+> ±30/±50/+100 % with zero clicks. The −75 % blowup (+7 LUFS spurious
+> energy, up to ~2 000 clicks/M) proved to be a **75 %-overlap artifact —
+> hop = FFT/8 eliminates it on all five tracks** (zero clicks, normal
+> level, RB similarity 0.83–0.89). FFT 4096 wins only on synthetic tones,
+> is consistently worse on real mixes (transient smear), and its ~93 ms
+> window is outside the profile's latency contract — dead end. Metrics
+> twice failed to predict the ear verdicts (down-side robotiness scored
+> *above* the clean up-side; blend 0.20 vs 0.40 metrically identical) —
+> reconfirming owner listening as the binding gate.
+>
+> Listening half (owner, 2026-08-04, three passes; bass-heavy corpus
+> msbwy / hot_stuff / somebody / saucers + the synthetic bass fixture,
+> ~20 s excerpts at +30/−30/+50/−50/+100/−75 %): round 1 — all arms
+> below Rubber Band; compressions clearly better than expansions, which
+> sounded "roboty" (cause found: the phase-gradient coherence blend
+> tapers to **zero** approaching ratio 2.5, so big slowdowns ran with no
+> vertical coherence). Round 2 — blend held on + hop/8 rescued −30 %
+> outright and kept −50 % together; residual robotiness remained. Round
+> 3 — `blend_hop8` and `blend40_hop8` best in class and mutually
+> near-indistinguishable (possible slight bass edge to 0.40, owner
+> unsure). **Verdicts: −50 % is shippable ("the audience couldn't tell
+> the difference, producers would"); +50 % is shippable (RB "cleaner,
+> wider, more open," ours "a bit crowded," but subtle).** The RB gap is
+> real and accepted: single-FFT identity PV vs R3's multi-resolution
+> engine.
+>
+> Settled config for the build-out: FFT 2048, hop 256 (87.5 % overlap),
+> Hann, identity locking, rigid sub-bass < 100 Hz, artifact-driven
+> per-band resets (Stage-9 `begin_block` policy), coherence blend held
+> at wide ratios via `PhaseVocoder::set_wide_ratio_coherence_blend`
+> (strength 0.20–0.40; exact value settled by ear in build-out
+> listening). WCET note: hop/8 doubles the hop rate — the flattening
+> budget is one 2048-point FFT per 8 blocks per channel. Carried open:
+> the wide-ratio low-band verdict (`widepv_lowfree` renders exist,
+> not yet auditioned — exit criterion) and the ±100 %/−75 % edge
+> listening characterization (metrically clean in the hop/8 family).
+>
+> **COMPLETE — build-out shipped, owner sign-off recorded 2026-08-04.**
+> Live chain: `WideKeylockStage` (FFT 2048 / hop 256 / identity /
+> full-spectrum, no correction fade, T clamp [0.5, 4.0] = the
+> resampler's exact step range), artifact-only flux-gated per-band
+> resets with a latency-delayed modulation-hold read, keylock-toggle
+> crossfade, constant 2144-frame (48.6 ms) contract. Two mechanisms
+> found and fixed by the gates during build-out: the resampler ramp's
+> harmonic-mean consumption drifts stream balance by hop/2·ln(T₁/T₀)
+> across sweeps (fixed: `set_step_anchor` — uniform chunks consumed
+> uniformly), and instant full-range T steps tear the overlap-add seam
+> (fixed: log-space transposition slew, full-range snap settles ≈30 ms).
+> Metric half: strict WCET p99.9 0.328 vs 0.5 bound at 64-frame
+> callbacks (no channel staggering needed — the named contingency stays
+> unshipped); zero-alloc steady state + multi-callback warm start;
+> torture rides/snaps click-free; wide matrix gates pinned (steady
+> cents 0.09–0.50 p95 at rates 0.7–2.0; ride wobble 3.3 cents p95 at
+> ±8 % / 38 at the full-range torture ride — the structural
+> chunked-correction ceiling vs SOLA's per-sample elastic 0.5, a
+> ±512-frame slope-lookahead scan confirmed zero offset optimal;
+> synthetic-delta sharpness pinned loosely as big-window smear).
+> Listening half (owner, 2026-08-04, live desktop deck): **keylock now
+> holds beyond ±20 %** where the primary chain releases; range flip is
+> a click-free seek-priced rebuild with the playhead preserved and the
+> honest latency chip updating. **Low-band verdict (exit criterion):
+> keylocked full spectrum — `widepv_resets` beat `widepv_lowfree` in
+> the offline A/B; the stage is Corrected-only, no band split.**
+> Coherence blend settled at **0.20** (live A/B: marginally better than
+> 0.40, reversing the offline round-3 lean; both below metric
+> resolution). Edge characterization at −75 %: pitch stays locked;
+> bass reads bitcrushed/distorted, vocals robotic and raspy ("through
+> a guitar amp") — documented degradation well outside the ±50 %
+> shippable verdict, no silent cliff. The Rubber Band gap stands as
+> accepted at the falsification: audibly behind R3 at all wide rates,
+> shippable per the owner's call. Desktop ships the Range selector
+> (Standard | Wide); README now carries the per-profile latency matrix.
 
 ### Why
 

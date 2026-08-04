@@ -318,6 +318,23 @@ impl StreamingSincResampler {
         self.inner.reset();
     }
 
+    /// Pins the step-ramp anchor to `step`, so the next
+    /// [`process_into`](Self::process_into) consumes at a constant step
+    /// instead of ramping from the previous block's final step.
+    ///
+    /// The ramp exists to smear large per-call step changes (the
+    /// varispeed head's zipper guard); a caller that feeds chunks each
+    /// produced at one uniform rate — the wide keylock corrector, whose
+    /// PV renders a whole hop at a single transposition — must consume
+    /// them uniformly too, or the ramp's harmonic-mean consumption
+    /// systematically drifts the stream balance by `hop/2 · ln(T₁/T₀)`
+    /// across a transposition sweep.
+    pub fn set_step_anchor(&mut self, step: f64) {
+        if self.inner.has_started && step.is_finite() && step > 0.0 {
+            self.inner.prev_step = step;
+        }
+    }
+
     /// Fractional source position (in input samples fed since the last
     /// reset) of the *next* output sample this resampler will emit.
     ///

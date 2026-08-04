@@ -19,6 +19,19 @@ pub enum Arm {
     /// Keylock profile (two-band: low band follows tempo,
     /// high band corrected).
     Keylock,
+    /// Wide-range Master Tempo profile (full-spectrum big-FFT corrector,
+    /// no correction fade — ROADMAP Stage 11).
+    WideKeylock,
+}
+
+impl Arm {
+    fn profile(self) -> EngineProfile {
+        match self {
+            Arm::Tape => EngineProfile::Tape,
+            Arm::Keylock => EngineProfile::Keylock,
+            Arm::WideKeylock => EngineProfile::WideKeylock,
+        }
+    }
 }
 
 /// Renders the new keylock arm with a pre-analysis artifact attached (feed
@@ -31,8 +44,29 @@ pub fn render_keylock_with_artifact(
     callback_frames: usize,
     rate_at: &dyn Fn(f64) -> f64,
 ) -> AbRender {
+    render_arm_with_artifact(
+        Arm::Keylock,
+        artifact,
+        input,
+        channels,
+        sample_rate,
+        callback_frames,
+        rate_at,
+    )
+}
+
+/// [`render_keylock_with_artifact`] for any corrected arm.
+pub fn render_arm_with_artifact(
+    arm: Arm,
+    artifact: Arc<PreAnalysisArtifact>,
+    input: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    callback_frames: usize,
+    rate_at: &dyn Fn(f64) -> f64,
+) -> AbRender {
     render_inner(
-        EngineProfile::Keylock,
+        arm.profile(),
         Some(artifact),
         input,
         channels,
@@ -51,6 +85,9 @@ pub struct AbRender {
     /// expected end-of-stream shortfall, which the adapter uses to detect
     /// termination and trims from the output.
     pub underrun_frames: u64,
+    /// The rendered chain's reported constant pipeline delay — use this
+    /// instead of hardcoding a profile's latency into metrics.
+    pub latency_frames: usize,
 }
 
 /// Streams `input` through the chosen arm at `callback_frames` per callback,
@@ -67,24 +104,14 @@ pub fn render_with_rate_schedule(
     callback_frames: usize,
     rate_at: &dyn Fn(f64) -> f64,
 ) -> AbRender {
-    match arm {
-        Arm::Tape => render(
-            EngineProfile::Tape,
-            input,
-            channels,
-            sample_rate,
-            callback_frames,
-            rate_at,
-        ),
-        Arm::Keylock => render(
-            EngineProfile::Keylock,
-            input,
-            channels,
-            sample_rate,
-            callback_frames,
-            rate_at,
-        ),
-    }
+    render(
+        arm.profile(),
+        input,
+        channels,
+        sample_rate,
+        callback_frames,
+        rate_at,
+    )
 }
 
 fn render(
@@ -128,6 +155,7 @@ fn render_inner(
     let (controller, mut processor, mut source) =
         (handles.controller, handles.processor, handles.source);
     source.set_track_position(0);
+    let latency_frames = processor.pipeline_latency_frames();
 
     let mut feed_cursor = 0usize;
     let mut finished = false;
@@ -164,6 +192,7 @@ fn render_inner(
             return AbRender {
                 output,
                 underrun_frames: underruns_before,
+                latency_frames,
             };
         }
         output.extend_from_slice(&out);

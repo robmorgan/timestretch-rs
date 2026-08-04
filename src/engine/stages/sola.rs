@@ -873,6 +873,7 @@ mod tests {
                         stage_frame: onset,
                         strength: 0.9,
                         beat: false,
+                        band_flux: [1.0; 4],
                     });
                 }
                 onset += 4_410.0;

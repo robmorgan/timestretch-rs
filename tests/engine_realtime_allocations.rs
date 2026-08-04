@@ -393,6 +393,133 @@ fn engine_warm_start_no_heap_activity() {
 }
 
 #[test]
+fn engine_wide_keylock_steady_state_no_heap_activity() {
+    // ROADMAP Stage 11 exit criterion: zero-alloc steady state for the
+    // wide chain (big-FFT PV + dilated-kernel resampler) under
+    // per-callback tempo retargets. The warmup MUST sweep the FULL wide
+    // rate range (0.5–2.0) so every transposition-dependent buffer —
+    // the PV's streaming accumulators at ratio 4, the resampler's
+    // dilated weight path — reaches capacity before tracking starts.
+    let _guard = ALLOC_TEST_MUTEX
+        .lock()
+        .expect("allocation test mutex poisoned");
+    const SAMPLE_RATE: u32 = 44_100;
+    const CALLBACK_FRAMES: usize = 256;
+    const WARMUP_ITERS: usize = 256;
+    const MEASURE_ITERS: usize = 96;
+
+    let handles = Engine::build(EngineConfig {
+        profile: EngineProfile::WideKeylock,
+        ..EngineConfig::default()
+    })
+    .expect("engine builds");
+    let (controller, mut processor, mut source) =
+        (handles.controller, handles.processor, handles.source);
+
+    let feed = test_chunk_stereo(4096, SAMPLE_RATE as f32, 0);
+    let mut out = vec![0.0f32; CALLBACK_FRAMES * 2];
+
+    source.push(&feed);
+    for i in 0..WARMUP_ITERS {
+        // Full wide sweep: rate 0.5..2.0 (T 2.0..0.5) plus the deep edge
+        // once (rate 0.25 → T 4.0, the dilation ceiling).
+        let t = i as f64 / WARMUP_ITERS as f64;
+        let rate = if i < WARMUP_ITERS / 8 {
+            0.25
+        } else {
+            1.25 + 0.75 * (2.0 * std::f64::consts::PI * t).sin()
+        };
+        controller.set_tempo_rate(rate);
+        while source.occupied_frames() < source.demand_hint(CALLBACK_FRAMES, 2.2) {
+            source.push(&feed);
+        }
+        processor.process(&mut out);
+    }
+
+    begin_alloc_tracking();
+    for i in 0..MEASURE_ITERS {
+        let t = i as f64 / MEASURE_ITERS as f64;
+        controller.set_tempo_rate(1.25 + 0.75 * (2.0 * std::f64::consts::PI * t).sin());
+        while source.occupied_frames() < source.demand_hint(CALLBACK_FRAMES, 2.2) {
+            source.push(&feed);
+        }
+        processor.process(&mut out);
+    }
+    let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
+
+    assert_eq!(
+        controller.underrun_frames(),
+        0,
+        "wide keylock steady state must not underrun"
+    );
+    assert_eq!(
+        alloc_calls + realloc_calls,
+        0,
+        "wide keylock steady state allocated: alloc_calls={alloc_calls}, \
+         realloc_calls={realloc_calls}, alloc_bytes={alloc_bytes}, realloc_bytes={realloc_bytes}"
+    );
+}
+
+#[test]
+fn engine_wide_keylock_warm_start_no_heap_activity() {
+    // The wide preroll (latency + settle ≈ 4.4k frames) exceeds the
+    // per-callback priming budget, exercising the multi-callback priming
+    // loop the keylock row never reaches — it too must be alloc-free.
+    let _guard = ALLOC_TEST_MUTEX
+        .lock()
+        .expect("allocation test mutex poisoned");
+    const CALLBACK_FRAMES: usize = 256;
+
+    let handles = Engine::build(EngineConfig {
+        profile: EngineProfile::WideKeylock,
+        ..EngineConfig::default()
+    })
+    .expect("engine builds");
+    let (controller, mut processor, mut source) =
+        (handles.controller, handles.processor, handles.source);
+
+    let feed = test_chunk_stereo(4096, 44_100.0, 0);
+    let mut out = vec![0.0f32; CALLBACK_FRAMES * 2];
+
+    source.push(&feed);
+    for _ in 0..64 {
+        while source.occupied_frames() < source.demand_hint(CALLBACK_FRAMES, 1.1) {
+            source.push(&feed);
+        }
+        processor.process(&mut out);
+    }
+    let preroll = processor.warm_start_preroll_frames();
+    processor.reset();
+    source.set_track_position(0);
+    controller.warm_start(preroll as u32);
+    for _ in 0..48 {
+        while source.occupied_frames() < source.demand_hint(CALLBACK_FRAMES, 1.1) {
+            source.push(&feed);
+        }
+        processor.process(&mut out);
+    }
+
+    begin_alloc_tracking();
+    processor.reset();
+    source.set_track_position(0);
+    controller.warm_start(preroll as u32);
+    for _ in 0..48 {
+        while source.occupied_frames() < source.demand_hint(CALLBACK_FRAMES, 1.1) {
+            source.push(&feed);
+        }
+        processor.process(&mut out);
+    }
+    let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
+
+    assert_eq!(
+        alloc_calls + realloc_calls,
+        0,
+        "wide warm start allocated: alloc_calls={alloc_calls}, realloc_calls={realloc_calls}, \
+         alloc_bytes={alloc_bytes}, realloc_bytes={realloc_bytes}"
+    );
+}
+
+#[test]
 fn engine_underrun_and_recovery_no_heap_activity() {
     let _guard = ALLOC_TEST_MUTEX
         .lock()

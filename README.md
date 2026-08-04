@@ -22,7 +22,8 @@ beat-grid overlay, beat jumps, looping, and live keylock tempo control.*
 
 - **Real-time engine** — the audio callback gets exactly the
   frames it needs (`EngineProcessor::process`): infallible, allocation-free,
-  lock-free on the audio thread, at a constant 12.7 ms pipeline delay
+  lock-free on the audio thread, at a constant per-profile pipeline delay
+  (12.7 ms keylock, 48.6 ms wide-range Master Tempo, 0 ms tape)
 - **Varispeed-first keylock** — a sinc-resampled tempo axis with a two-band
   keylock chain: the low band's pitch follows tempo (the club-correct
   choice), the high band is corrected by a time-domain SOLA corrector with
@@ -126,9 +127,12 @@ let mut out = vec![0.0f32; 256 * 2];
 processor.process(&mut out);
 ```
 
-The engine has one latency figure, not a profile matrix: the keylock
-chain's constant **12.7 ms** pipeline delay (tape mode is 0 ms), with
-tempo control-to-audio bounded at one resampler feed chunk. Warm-start
+Each profile has one honest constant latency figure: the keylock chain's
+**12.7 ms** pipeline delay, the wide-range Master Tempo chain's
+**48.6 ms** (`EngineProfile::WideKeylock` — CDJ-style full-spectrum
+keylock across tempo rates 0.25–2.0, a deliberately different contract),
+and tape's **0 ms** — with tempo control-to-audio bounded at one
+resampler feed chunk in every profile. Warm-start
 seek/cue (`controller.warm_start`), gapless loop wraps
 (`set_track_position`), and pre-analysis artifacts
 (`EngineConfig::pre_analysis`) are first-class deck operations — the
@@ -247,9 +251,10 @@ The engine is a fixed stage graph driven from the audio callback:
    through ±20%; beyond that the correction fades to plain varispeed
    (deck-stop/spinback territory).
 
-4. **Exact timeline** — the constant 12.7 ms pipeline delay is reported,
-   compensated in position queries, and structurally trimmed in offline
-   renders; output length is exact by construction.
+4. **Exact timeline** — each profile's constant pipeline delay (12.7 ms
+   keylock, 48.6 ms wide) is reported, compensated in position queries,
+   and structurally trimmed in offline renders; output length is exact by
+   construction.
 
 ## Parameters
 

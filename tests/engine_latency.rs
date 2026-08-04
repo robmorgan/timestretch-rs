@@ -224,6 +224,71 @@ fn keylock_control_to_audio_unchanged_from_tape() {
 }
 
 #[test]
+fn wide_keylock_control_to_audio_unchanged_from_tape() {
+    // Same contract as the keylock row for the wide chain (ROADMAP Stage
+    // 11): the profile adds a CONSTANT (larger) pipeline delay; a tempo
+    // retarget must become audible within lookahead + one block past it.
+    // The low-band ramp trick is unavailable — the wide corrector
+    // keylocks the full spectrum — so the probe runs with the keylock
+    // toggle OFF: the bypass arm is a pure matched delay, and the ramp
+    // slope reads the tempo rate directly with no crossover group-delay
+    // term.
+    const CALLBACK_FRAMES: usize = 128;
+    let handles = Engine::build(EngineConfig {
+        sample_rate: SAMPLE_RATE,
+        channels: 1,
+        profile: EngineProfile::WideKeylock,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let (controller, mut processor, mut source) =
+        (handles.controller, handles.processor, handles.source);
+    controller.set_keylock(false);
+    let pipeline = processor.pipeline_latency_frames();
+
+    let ramp: Vec<f32> = (0..262_144).map(|i| i as f32 * 1e-4).collect();
+    source.push(&ramp[..32_768]);
+    let mut feed_cursor = 32_768usize;
+
+    let mut out = vec![0.0f32; CALLBACK_FRAMES];
+    let mut collected: Vec<f32> = Vec::new();
+    let retarget_at_callback = 60usize;
+    let new_rate = 1.30f64;
+
+    for cb in 0..220 {
+        if cb == retarget_at_callback {
+            controller.set_tempo_rate(new_rate);
+        }
+        if source.occupied_frames() < source.demand_hint(CALLBACK_FRAMES, 2.0) {
+            let end = (feed_cursor + 8192).min(ramp.len());
+            source.push(&ramp[feed_cursor..end]);
+            feed_cursor = end;
+        }
+        processor.process(&mut out);
+        collected.extend_from_slice(&out);
+    }
+    assert_eq!(controller.underrun_frames(), 0);
+
+    let request_frame = retarget_at_callback * CALLBACK_FRAMES;
+    let mut first_change = None;
+    for j in request_frame..collected.len() - 8 {
+        let slope = (collected[j + 8] - collected[j]) as f64 / 8.0 / 1e-4;
+        if (slope - 1.0).abs() > 0.05 {
+            first_change = Some(j);
+            break;
+        }
+    }
+    let first_change = first_change.expect("retarget must become audible");
+    let measured_extra = first_change as i64 - request_frame as i64 - pipeline as i64;
+    let gate = (16 + CALLBACK_FRAMES + 64) as i64;
+    assert!(
+        measured_extra <= gate,
+        "wide keylock control-to-audio: retarget audible {measured_extra} frames past \
+         the constant pipeline delay (gate {gate})"
+    );
+}
+
+#[test]
 fn timestamped_retarget_lands_on_exact_output_sample() {
     // ROADMAP Stage 5 exit criterion: a timestamped tempo step lands on
     // the requested output sample exactly. The ramp fixture makes the

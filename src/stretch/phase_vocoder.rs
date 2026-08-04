@@ -103,6 +103,11 @@ pub struct PhaseVocoder {
     phase_locking_mode: PhaseLockingMode,
     /// Enables confidence-driven adaptive phase-lock mode switching.
     adaptive_phase_locking: bool,
+    /// When positive, holds the phase-gradient coherence blend at this
+    /// strength at wide ratios instead of tapering it out (batch/QA
+    /// experiment knob, see ROADMAP Stage 11; the live engine never sets
+    /// this). 0.0 = shipped taper behavior.
+    wide_coherence_blend: f64,
     /// Short-lived state that tightens phase behavior right after a transient reset.
     transient_focus_frames: usize,
     /// Previous effective ratio used to slew phase advance through a seam.
@@ -362,6 +367,7 @@ impl PhaseVocoder {
             sub_bass_bin,
             phase_locking_mode,
             adaptive_phase_locking: false,
+            wide_coherence_blend: 0.0,
             transient_focus_frames: 0,
             ratio_change_phase_from: stretch_ratio,
             ratio_change_phase_frames: 0,
@@ -702,6 +708,17 @@ impl PhaseVocoder {
     #[inline]
     pub fn adaptive_phase_locking(&self) -> bool {
         self.adaptive_phase_locking
+    }
+
+    /// Holds the phase-gradient coherence blend at `blend` strength at
+    /// wide ratios instead of tapering it out past |ratio - 1| (Stage 11
+    /// falsification knob: the taper leaves expansions ≥ 2x with no
+    /// vertical-coherence help, the confirmed cause of robotic
+    /// slowdowns). `0.0` restores the shipped taper; the shipped
+    /// near-unity strength is 0.20. Clamped to `[0.0, 1.0]`.
+    #[inline]
+    pub fn set_wide_ratio_coherence_blend(&mut self, blend: f64) {
+        self.wide_coherence_blend = blend.clamp(0.0, 1.0);
     }
 
     /// Sets envelope correction strength (clamped to `[0.0, 2.0]`).
@@ -1545,13 +1562,20 @@ impl PhaseVocoder {
         // Apply up to 2.5x ratio with a tapering blend around unity:
         // full strength near ratio≈1.0, gradually reduced as we move away on
         // either side (compression or expansion) to avoid over-locking artifacts.
-        if !self.transient_focus_active() && !self.peaks.is_empty() && hop_ratio < 2.5 {
-            let ratio_distance = (hop_ratio - 1.0).abs();
-            // For ratios >1.0, taper gradient locking faster to avoid
-            // over-locking smearing at larger slowdowns.
-            let taper_span = if hop_ratio > 1.0 { 1.2 } else { 1.5 };
-            let gradient_blend =
-                PHASE_GRADIENT_BLEND * (1.0 - (ratio_distance / taper_span).clamp(0.0, 1.0));
+        if !self.transient_focus_active()
+            && !self.peaks.is_empty()
+            && (hop_ratio < 2.5 || self.wide_coherence_blend > 0.0)
+        {
+            let gradient_blend = if self.wide_coherence_blend > 0.0 {
+                // Stage 11 experiment: hold this blend at wide ratios.
+                self.wide_coherence_blend
+            } else {
+                let ratio_distance = (hop_ratio - 1.0).abs();
+                // For ratios >1.0, taper gradient locking faster to avoid
+                // over-locking smearing at larger slowdowns.
+                let taper_span = if hop_ratio > 1.0 { 1.2 } else { 1.5 };
+                PHASE_GRADIENT_BLEND * (1.0 - (ratio_distance / taper_span).clamp(0.0, 1.0))
+            };
             for bin in self.sub_bass_bin..num_bins {
                 if self.peaks.binary_search(&bin).is_ok() {
                     continue; // Peak bins keep their phase (they are the anchors)

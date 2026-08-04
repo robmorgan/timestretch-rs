@@ -62,16 +62,57 @@ impl DeckEngine {
     }
 }
 
+/// Tempo-range profile driving the deck, like a CDJ range setting.
+///
+/// `Standard` runs the primary keylock chain (full keylock through ±20%,
+/// ~13 ms pipeline delay); `Wide` runs the wide-range Master Tempo chain
+/// (full-spectrum keylock across the whole 0.25–2.0 rate range, ~49 ms).
+/// Unlike the Tape/Keylock deck mode — a live parameter inside either
+/// profile — changing the range REBUILDS the engine: a seek-priced event,
+/// never a live morph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeckRange {
+    Standard,
+    Wide,
+}
+
+impl DeckRange {
+    pub const ALL: &'static [DeckRange] = &[DeckRange::Standard, DeckRange::Wide];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            DeckRange::Standard => "Standard",
+            DeckRange::Wide => "Wide",
+        }
+    }
+
+    pub fn profile(&self) -> timestretch::engine::EngineProfile {
+        match self {
+            DeckRange::Standard => timestretch::engine::EngineProfile::Keylock,
+            DeckRange::Wide => timestretch::engine::EngineProfile::WideKeylock,
+        }
+    }
+
+    /// Whether switching from `self` to `to` requires an engine rebuild
+    /// (profile change = seek-priced; everything else is live).
+    pub fn rebuild_needed(&self, to: DeckRange) -> bool {
+        self != &to
+    }
+}
+
 /// State shared between UI, processing, and audio threads.
 pub struct SharedState {
     pub transport: Transport,
     pub stretch_ratio: f64,
     pub preset: PresetChoice,
     /// Deck engine mode. Forwarded live to the engine's keylock toggle by
-    /// the deck thread (the engine always runs the keylock chain; Tape is
+    /// the deck thread (the engine always runs a keylock chain; Tape is
     /// the delay-matched varispeed bypass), so switching mid-play is
     /// instant — no rebuild, constant pipeline latency.
     pub deck_engine: DeckEngine,
+    /// Tempo-range profile (Standard/Wide). A range change rebuilds the
+    /// engine and restores the playhead via warm-start seek.
+    pub deck_range: DeckRange,
 
     /// Current playback position in source frames.
     pub position_frames: usize,
@@ -122,6 +163,7 @@ impl SharedState {
             stretch_ratio: 1.0,
             preset: PresetChoice::DjBeatmatch,
             deck_engine: DeckEngine::Keylock,
+            deck_range: DeckRange::Standard,
             position_frames: 0,
             total_frames: 0,
             sample_rate: 44100,

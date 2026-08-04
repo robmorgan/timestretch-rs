@@ -6,3 +6,4 @@ pub mod keylock;
 pub mod sola;
 pub mod transient;
 pub mod varispeed;
+pub mod wide_keylock;

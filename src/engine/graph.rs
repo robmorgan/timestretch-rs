@@ -339,14 +339,22 @@ impl EngineProcessor {
     }
 
     /// Preroll frames the host should feed ahead of a warm-start target so
-    /// every stage resumes converged: the chain's constant latency plus a
-    /// full analysis window of history (IIR splits and correctors settle
-    /// well within it). Tape chains only need the resampler margin.
+    /// every stage resumes converged: the chain's constant latency plus the
+    /// largest per-stage settle need (a full analysis window of history —
+    /// IIR splits and the small correctors settle inside the 1024-frame
+    /// default; the wide keylock's big FFT asks for more). Tape chains only
+    /// need the resampler margin.
     pub fn warm_start_preroll_frames(&self) -> usize {
         if self.stages.is_empty() {
             64
         } else {
-            self.pipeline_latency_frames + 1_024
+            let settle = self
+                .stages
+                .iter()
+                .map(|stage| stage.warm_start_settle_frames())
+                .max()
+                .unwrap_or(1_024);
+            self.pipeline_latency_frames + settle
         }
     }
 
@@ -867,7 +875,11 @@ mod tests {
         // A warm-start seek mid-tone must not step the output harder than
         // the tone's own slew on either side of the cut: the pre-seek tail
         // release-ramps to zero and the post-prime onset declicks in.
-        for profile in [EngineProfile::Keylock, EngineProfile::Tape] {
+        for profile in [
+            EngineProfile::Keylock,
+            EngineProfile::WideKeylock,
+            EngineProfile::Tape,
+        ] {
             let handles = Engine::build(EngineConfig {
                 channels: 1,
                 profile,
@@ -1091,13 +1103,72 @@ mod tests {
     }
 
     #[test]
+    fn wide_keylock_pipeline_latency_within_budget_and_reported_exactly() {
+        // The wide profile's own contract (ROADMAP Stage 11): ≤ 55 ms,
+        // never folded into the keylock chain's 15 ms gate above. Onset
+        // smear tolerance is one PV hop — the corrector renders on a
+        // 256-frame grid.
+        let handles = Engine::build(EngineConfig {
+            channels: 1,
+            profile: EngineProfile::WideKeylock,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let (mut processor, mut source) = (handles.processor, handles.source);
+
+        let latency = processor.pipeline_latency_frames();
+        assert_eq!(
+            latency,
+            crate::engine::stages::wide_keylock::WIDE_KEYLOCK_LATENCY_FRAMES,
+            "wide chain latency must be the stage's constant"
+        );
+        assert!(
+            latency as f64 / 44_100.0 <= 0.055,
+            "wide keylock pipeline latency {latency} frames exceeds 55 ms"
+        );
+
+        let mut input = vec![0.0f32; 32_768];
+        for (i, s) in input.iter_mut().enumerate().skip(4_096) {
+            *s = 0.6 * (2.0 * std::f32::consts::PI * 900.0 * (i - 4_096) as f32 / 44_100.0).sin();
+        }
+        source.push(&input);
+        let mut out = vec![0.0f32; 16_384];
+        processor.process(&mut out);
+
+        let onset = out
+            .iter()
+            .position(|s| s.abs() > 1e-3)
+            .expect("onset must appear");
+        let expected = 4_096 + latency;
+        assert!(
+            (onset as i64 - expected as i64).abs()
+                <= crate::engine::stages::wide_keylock::WIDE_HOP as i64,
+            "onset at {onset}, expected {expected} (reported latency {latency})"
+        );
+    }
+
+    #[test]
     fn warm_start_resumes_at_steady_level_immediately() {
+        // 2048-sample first-sound bound: priming a 1.5k-frame preroll at
+        // the per-callback budget stays inside eight 256-frame callbacks.
+        warm_start_steady_level_for(EngineProfile::Keylock, 256 * 8);
+    }
+
+    #[test]
+    fn wide_keylock_warm_start_resumes_at_steady_level() {
+        // The wide chain's preroll (latency 2144 + settle 2304) spans
+        // several priming callbacks under the 2×-callback budget; the
+        // bound scales with the preroll it must discard.
+        warm_start_steady_level_for(EngineProfile::WideKeylock, 256 * 24);
+    }
+
+    fn warm_start_steady_level_for(profile: EngineProfile, first_sound_bound: usize) {
         // Ported warm-start semantics: after reset + preroll priming, the
         // FIRST audible output (past the declick fade) is at steady level —
         // no cold-start silence gap, no converging warble.
         let handles = Engine::build(EngineConfig {
             channels: 1,
-            profile: EngineProfile::Keylock,
+            profile,
             initial_tempo_rate: 1.05,
             ..EngineConfig::default()
         })
@@ -1146,8 +1217,8 @@ mod tests {
             .map(|p| p + ramp)
             .expect("audio must resume after priming");
         assert!(
-            first_sound < 256 * 8,
-            "priming took too long: first sound at {first_sound}"
+            first_sound < first_sound_bound,
+            "priming took too long: first sound at {first_sound} (bound {first_sound_bound})"
         );
         // Right after the 64-frame declick, the level must already be
         // steady (converged correctors, primed filters): compare the first

@@ -98,6 +98,11 @@ pub struct OnsetEvent {
     pub strength: f32,
     /// True for beatgrid positions, false for detected onsets.
     pub beat: bool,
+    /// Per-band spectral flux at this onset `[sub_bass, low, mid, high]`
+    /// (artifact `onset_band_flux`; beats and artifacts without flux data
+    /// publish `[1.0; 4]`). Consumers gate band-selective work on it —
+    /// note the `Default` of `[0.0; 4]` reads as "no flux anywhere".
+    pub band_flux: [f32; 4],
 }
 
 /// Per-block context the graph hands every stage.
@@ -165,6 +170,14 @@ pub trait Stage: Send {
     fn prime(&mut self, history: &[f32]) {
         let _ = history;
         self.reset();
+    }
+
+    /// History frames beyond the chain's constant latency this stage
+    /// needs to resume converged from a warm start. The default covers
+    /// IIR splits and the small time-domain correctors; big-FFT stages
+    /// override with their analysis-window need.
+    fn warm_start_settle_frames(&self) -> usize {
+        1_024
     }
 }
 
