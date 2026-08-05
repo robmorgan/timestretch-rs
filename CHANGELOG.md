@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.11.0
 
 ### Breaking changes
 
@@ -32,6 +32,10 @@
 - `StreamingSincResampler::set_step_anchor`: pins the step-ramp anchor
   so uniformly-produced chunks are consumed uniformly (the wide
   corrector's stream-balance requirement).
+- `StreamingSincResampler::flush_into`: drains the sinc lookahead tail
+  (feeding just enough zeros to release every output covering real
+  input), then resets — so callers can end a stream without losing the
+  final half-window of audio.
 - `PhaseVocoder::set_wide_ratio_coherence_blend`: holds the
   phase-gradient coherence blend at wide stretch ratios instead of the
   shipped taper (the falsification-confirmed fix for robotic wide
