@@ -3,11 +3,13 @@
 //! bar.beat counter. Shared grid/palette machinery lives here; the painters
 //! live in the submodules.
 
-pub mod cache;
 mod counter;
 mod overview;
-mod peaks;
 mod zoomed;
+
+/// The peaks pyramid lives in the library now (`.tsa` PEAK chunk); the
+/// alias keeps the painters' `peaks::` paths reading naturally.
+use timestretch::analysis::waveform as peaks;
 
 pub use counter::paint_beat_counter;
 pub use overview::{OverviewParams, OverviewTexture, paint_overview};

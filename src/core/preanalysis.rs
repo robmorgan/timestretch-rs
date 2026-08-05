@@ -253,16 +253,36 @@ impl PreAnalysisArtifact {
     /// rejected outright: their positions carry the pre-v4 window-start
     /// bias, so a cached sidecar must be regenerated, not reused.
     pub fn matches_source(&self, samples: &[f32], sample_rate: u32) -> bool {
+        // Hash only when the artifact actually binds one (matches_identity
+        // skips the comparison when the artifact's hash is 0 either way).
+        let hash = if self.content_hash != 0 {
+            hash_samples(samples)
+        } else {
+            0
+        };
+        self.matches_identity(sample_rate, samples.len(), hash)
+    }
+
+    /// [`Self::matches_source`] without the samples in hand: checks the
+    /// same schema-version gate and the precomputed length/hash identity,
+    /// skipping each binding the artifact predates. For callers that
+    /// already hold the identity (e.g. the `.tsa` container's file header).
+    pub fn matches_identity(
+        &self,
+        sample_rate: u32,
+        source_len_samples: usize,
+        content_hash: u64,
+    ) -> bool {
         if self.version < MIN_COMPATIBLE_VERSION {
             return false;
         }
         if self.sample_rate != sample_rate {
             return false;
         }
-        if self.source_len_samples != 0 && self.source_len_samples != samples.len() {
+        if self.source_len_samples != 0 && self.source_len_samples != source_len_samples {
             return false;
         }
-        if self.content_hash != 0 && self.content_hash != hash_samples(samples) {
+        if self.content_hash != 0 && self.content_hash != content_hash {
             return false;
         }
         true
@@ -327,6 +347,10 @@ pub fn hash_samples(samples: &[f32]) -> u64 {
 }
 
 /// Writes a pre-analysis artifact as JSON.
+#[deprecated(
+    since = "0.11.0",
+    note = "use `write_analysis_file` with the `.tsa` container (`crate::io::tsa`), which also carries waveform peaks"
+)]
 pub fn write_preanalysis_json(
     path: &Path,
     artifact: &PreAnalysisArtifact,
@@ -339,6 +363,10 @@ pub fn write_preanalysis_json(
 }
 
 /// Reads a pre-analysis artifact from JSON.
+#[deprecated(
+    since = "0.11.0",
+    note = "use `read_analysis_file` / `read_analysis_file_validated` on the `.tsa` container (`crate::io::tsa`)"
+)]
 pub fn read_preanalysis_json(path: &Path) -> Result<PreAnalysisArtifact, StretchError> {
     let data = std::fs::read_to_string(path)?;
     serde_json::from_str(&data).map_err(|e| {

@@ -1431,17 +1431,29 @@ impl TimeStretchApp {
     }
 }
 
-/// Sidecar artifact path for a loaded audio file: `<file>.tsanalysis.json`.
-fn sidecar_path(audio_path: &std::path::Path) -> PathBuf {
+/// Legacy JSON artifact sidecar (`<file>.tsanalysis.json`): read only to
+/// migrate old analyses into the `.tsa` container, deleted once superseded.
+fn legacy_json_path(audio_path: &std::path::Path) -> PathBuf {
     let mut os = audio_path.as_os_str().to_os_string();
     os.push(".tsanalysis.json");
     PathBuf::from(os)
 }
 
-/// The background load: decode, peaks (with `.tspeaks` sidecar cache),
-/// then pre-analysis (with `.tsanalysis.json` sidecar cache) — one decode,
-/// one downmix, one hash, shared by everything. Sidecar writes are
-/// best-effort: a read-only volume must not break loading.
+/// Legacy peaks sidecar (`<file>.tspeaks`): never read anymore — peaks
+/// recompute in milliseconds — deleted once superseded by the container.
+fn legacy_peaks_path(audio_path: &std::path::Path) -> PathBuf {
+    let mut os = audio_path.as_os_str().to_os_string();
+    os.push(".tspeaks");
+    PathBuf::from(os)
+}
+
+/// The background load: decode, then the single `.tsa` analysis container
+/// — peaks ship to the UI immediately, pre-analysis follows. One decode,
+/// one downmix, one hash, shared by everything. Container writes are
+/// best-effort: a read-only volume must not break loading. A valid legacy
+/// `.tsanalysis.json` artifact is absorbed into the container (skipping
+/// the slow re-analysis), and both legacy sidecars are deleted once the
+/// on-disk container supersedes them.
 ///
 /// Results are dropped if another file was loaded in the meantime (the
 /// receiver is gone and the `generation` guard rejects the artifact).
@@ -1472,45 +1484,76 @@ fn run_load_worker(req: LoadRequest) {
     let num_frames = decoded.num_frames;
     let num_channels = (decoded.channels as usize).max(1);
 
-    // One mono downmix + one hash serve the peaks cache key, the peaks
-    // computation, and the pre-analysis below.
+    // One mono downmix + one hash: the container identity, the peaks
+    // input, and the pre-analysis input.
     let mono = timestretch::downmix_to_mid(&decoded.samples, num_channels);
     let content_hash = timestretch::hash_samples(&mono);
 
-    let cache_path = waveform::cache::peaks_cache_path(&path);
-    let peaks =
-        match waveform::cache::read_validated(&cache_path, sample_rate, mono.len(), content_hash) {
-            Some(cached) => {
-                log::info!("Peaks: using cached sidecar {}", cache_path.display());
-                cached
+    let tsa_path = timestretch::analysis_file_path(&path);
+    let on_disk =
+        timestretch::read_analysis_file_validated(&tsa_path, sample_rate, mono.len(), content_hash);
+    // Whether the container on disk already supersedes both legacy
+    // sidecars; kept true across best-effort rewrites of the same content.
+    let mut persisted_complete = on_disk
+        .as_ref()
+        .is_some_and(|af| af.artifact.is_some() && af.peaks.is_some());
+    let mut analysis = match on_disk {
+        Some(af) => {
+            log::info!("Analysis: using cached container {}", tsa_path.display());
+            af
+        }
+        None => timestretch::AnalysisFile::for_source(&mono, sample_rate),
+    };
+    let mut dirty = false;
+
+    // Legacy migration: absorb a still-valid JSON artifact so the slow
+    // re-analysis is skipped. The legacy `.tspeaks` cache is deliberately
+    // NOT read — recomputing peaks costs milliseconds, keeping its parser
+    // alive costs a hundred lines.
+    if analysis.artifact.is_none() {
+        #[allow(deprecated)]
+        let legacy = timestretch::read_preanalysis_json(&legacy_json_path(&path));
+        if let Ok(legacy) = legacy
+            && legacy.matches_source(&mono, sample_rate)
+        {
+            log::info!(
+                "Pre-analysis: migrating legacy JSON sidecar into {}",
+                tsa_path.display()
+            );
+            analysis.artifact = Some(legacy);
+            dirty = true;
+        }
+    }
+
+    if analysis.peaks.is_none() {
+        let start = std::time::Instant::now();
+        // Computed from the hashed mono signal (not the interleaved
+        // stereo): identical bucket count, per-quantization-identical
+        // values, half the filter work — and the persisted peaks derive
+        // from exactly the signal that keys them.
+        analysis.peaks = Some(BandPeaks::compute(&mono, 1, sample_rate));
+        log::info!("Peaks: computed in {:.2}s", start.elapsed().as_secs_f64());
+        dirty = true;
+    }
+
+    // Write #1, before the Track send: peaks (and any migrated artifact)
+    // survive a crash during the slow analysis below.
+    if dirty {
+        match timestretch::write_analysis_file(&tsa_path, &analysis) {
+            Ok(()) => {
+                persisted_complete = analysis.artifact.is_some();
+                dirty = false;
             }
-            None => {
-                let start = std::time::Instant::now();
-                // Computed from the hashed mono signal (not the interleaved
-                // stereo): identical bucket count, per-quantization-identical
-                // values, half the filter work — and the persisted peaks
-                // derive from exactly the signal that keys them.
-                let fresh = BandPeaks::compute(&mono, 1, sample_rate);
-                log::info!("Peaks: computed in {:.2}s", start.elapsed().as_secs_f64());
-                if let Err(e) = waveform::cache::write(
-                    &cache_path,
-                    &fresh,
-                    sample_rate,
-                    mono.len(),
-                    content_hash,
-                ) {
-                    log::warn!("Peaks: could not cache {}: {e}", cache_path.display());
-                }
-                fresh
-            }
-        };
+            Err(e) => log::warn!("Analysis: could not write {}: {e}", tsa_path.display()),
+        }
+    }
 
     let track = LoadedTrack {
         path: path.clone(),
         samples: Arc::new(decoded.samples),
         sample_rate,
         num_frames,
-        peaks,
+        peaks: analysis.peaks.clone().expect("peaks were just ensured"),
     };
     if tx.send(LoadMsg::Track(Ok(track))).is_err() {
         // A newer load replaced this one; skip the expensive analysis too.
@@ -1523,13 +1566,9 @@ fn run_load_worker(req: LoadRequest) {
     if state.lock().unwrap().analysis_generation != generation {
         return;
     }
-    let sidecar = sidecar_path(&path);
-    let artifact = match timestretch::read_preanalysis_json(&sidecar) {
-        Ok(cached) if cached.matches_source(&mono, sample_rate) => {
-            log::info!("Pre-analysis: using cached sidecar {}", sidecar.display());
-            cached
-        }
-        _ => {
+    let artifact = match analysis.artifact.clone() {
+        Some(cached) => cached,
+        None => {
             let start = std::time::Instant::now();
             let fresh = timestretch::analyze_for_dj(&mono, sample_rate);
             log::info!(
@@ -1540,15 +1579,34 @@ fn run_load_worker(req: LoadRequest) {
                 fresh.transient_onsets.len(),
                 start.elapsed().as_secs_f64()
             );
-            if let Err(e) = timestretch::write_preanalysis_json(&sidecar, &fresh) {
-                log::warn!(
-                    "Pre-analysis: could not cache sidecar {}: {e}",
-                    sidecar.display()
-                );
-            }
+            analysis.artifact = Some(fresh.clone());
+            dirty = true;
             fresh
         }
     };
+
+    // Write #2: the container now carries both chunks. No read-modify-
+    // write — this worker holds the whole file.
+    if dirty {
+        match timestretch::write_analysis_file(&tsa_path, &analysis) {
+            Ok(()) => persisted_complete = true,
+            Err(e) => log::warn!("Analysis: could not write {}: {e}", tsa_path.display()),
+        }
+    }
+
+    // Once the on-disk container supersedes both legacy sidecars — it
+    // holds a valid artifact AND peaks for exactly this audio — delete
+    // them so tracks converge to the single `.tsa` file. Only these two
+    // sibling paths are ever touched (Halo's `.halo.*` variants are not).
+    if persisted_complete {
+        for legacy in [legacy_json_path(&path), legacy_peaks_path(&path)] {
+            match std::fs::remove_file(&legacy) {
+                Ok(()) => log::info!("Removed superseded legacy sidecar {}", legacy.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log::warn!("Could not remove legacy sidecar {}: {e}", legacy.display()),
+            }
+        }
+    }
 
     let artifact = Arc::new(artifact);
     {
@@ -1696,7 +1754,7 @@ mod tests {
     }
 
     #[test]
-    fn load_worker_sends_track_then_analysis_and_caches_peaks() {
+    fn load_worker_writes_single_tsa() {
         let dir = temp_dir("worker");
         let wav = dir.join("track.wav");
         write_test_wav(&wav, 4.0);
@@ -1717,11 +1775,12 @@ mod tests {
         };
         assert!(artifact.bpm > 0.0, "pulse train should yield a BPM");
         assert!(state.lock().unwrap().pre_analysis.is_some());
-        // Suffix-append convention: track.wav.tspeaks.
-        assert!(dir.join("track.wav.tspeaks").exists());
-        assert!(dir.join("track.wav.tsanalysis.json").exists());
+        // One sidecar, suffix-append convention — and no legacy files.
+        assert!(dir.join("track.wav.tsa").exists());
+        assert!(!dir.join("track.wav.tspeaks").exists());
+        assert!(!dir.join("track.wav.tsanalysis.json").exists());
 
-        // Second run against the same file: both sidecars hit; results
+        // Second run against the same file: pure container hit; results
         // equivalent.
         let (req2, rx2) = worker_request(&wav, &state, 7);
         run_load_worker(req2);
@@ -1739,6 +1798,115 @@ mod tests {
                 assert!((a - b).abs() <= 1.0 / 255.0 + f32::EPSILON);
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Run one worker and drain its channel; panics on decode errors.
+    fn run_worker_to_completion(wav: &std::path::Path, state: &SharedStateHandle, generation: u64) {
+        let (req, rx) = worker_request(wav, state, generation);
+        run_load_worker(req);
+        while let Ok(msg) = rx.recv() {
+            if let LoadMsg::Track(Err(e)) = msg {
+                panic!("worker failed: {e}");
+            }
+        }
+    }
+
+    /// Analyze the test WAV's mono signal the same way the worker does.
+    fn analyzed_artifact(wav: &std::path::Path) -> timestretch::PreAnalysisArtifact {
+        let decoded = decoder::decode_file(wav).unwrap();
+        let mono =
+            timestretch::downmix_to_mid(&decoded.samples, (decoded.channels as usize).max(1));
+        timestretch::analyze_for_dj(&mono, decoded.sample_rate)
+    }
+
+    #[test]
+    fn load_worker_migrates_legacy_json() {
+        let dir = temp_dir("migrate");
+        let wav = dir.join("track.wav");
+        write_test_wav(&wav, 4.0);
+        // Pre-seed a valid legacy JSON artifact and a garbage .tspeaks
+        // (its contents are never read — only superseded and deleted). The
+        // distinctive confidence value marks this exact artifact: a fresh
+        // re-analysis would never reproduce it, so its presence in the
+        // container proves absorption. (Exact float equality is off the
+        // table — serde_json's default f64 parsing can be one ulp off.)
+        let mut real = analyzed_artifact(&wav);
+        real.confidence = 0.4242;
+        #[allow(deprecated)]
+        timestretch::write_preanalysis_json(&legacy_json_path(&wav), &real).unwrap();
+        std::fs::write(legacy_peaks_path(&wav), b"garbage bytes").unwrap();
+
+        let state: SharedStateHandle = Arc::new(Mutex::new(SharedState::new()));
+        run_worker_to_completion(&wav, &state, 0);
+
+        // The marked artifact was absorbed (not re-analyzed), the container
+        // is complete, the legacy files are gone.
+        let tsa = timestretch::read_analysis_file(&dir.join("track.wav.tsa")).unwrap();
+        let migrated = tsa.artifact.expect("artifact chunk present");
+        assert!(
+            (migrated.confidence - 0.4242).abs() < 1e-6,
+            "marker confidence proves absorption, got {}",
+            migrated.confidence
+        );
+        assert!((migrated.bpm - real.bpm).abs() < 1e-9);
+        assert_eq!(migrated.beat_positions, real.beat_positions);
+        assert!(tsa.peaks.is_some(), "peaks chunk present");
+        assert!(!legacy_json_path(&wav).exists(), "legacy JSON deleted");
+        assert!(!legacy_peaks_path(&wav).exists(), "legacy .tspeaks deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_worker_deletes_partial_legacy_files() {
+        // Each legacy file alone: absorbed/superseded, then deleted.
+        for (tag, json, tspeaks) in [("json_only", true, false), ("tspeaks_only", false, true)] {
+            let dir = temp_dir(tag);
+            let wav = dir.join("track.wav");
+            write_test_wav(&wav, 2.0);
+            if json {
+                let real = analyzed_artifact(&wav);
+                #[allow(deprecated)]
+                timestretch::write_preanalysis_json(&legacy_json_path(&wav), &real).unwrap();
+            }
+            if tspeaks {
+                std::fs::write(legacy_peaks_path(&wav), b"garbage").unwrap();
+            }
+            let state: SharedStateHandle = Arc::new(Mutex::new(SharedState::new()));
+            run_worker_to_completion(&wav, &state, 0);
+            assert!(dir.join("track.wav.tsa").exists(), "{tag}: .tsa written");
+            assert!(!legacy_json_path(&wav).exists(), "{tag}: JSON gone");
+            assert!(!legacy_peaks_path(&wav).exists(), "{tag}: .tspeaks gone");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn load_worker_stale_legacy_json_not_absorbed() {
+        let dir = temp_dir("stale_json");
+        let wav = dir.join("track.wav");
+        write_test_wav(&wav, 2.0);
+        // A legacy artifact whose content hash mismatches this audio.
+        let stale = timestretch::PreAnalysisArtifact {
+            version: timestretch::PREANALYSIS_VERSION,
+            sample_rate: 44_100,
+            bpm: 99.9,
+            source_len_samples: 12_345,
+            content_hash: 0xDEAD_BEEF,
+            ..Default::default()
+        };
+        #[allow(deprecated)]
+        timestretch::write_preanalysis_json(&legacy_json_path(&wav), &stale).unwrap();
+
+        let state: SharedStateHandle = Arc::new(Mutex::new(SharedState::new()));
+        run_worker_to_completion(&wav, &state, 0);
+
+        // Fresh analysis ran (not the stale 99.9 BPM), and the stale JSON
+        // was still deleted — superseded by the fresh ARTF chunk.
+        let tsa = timestretch::read_analysis_file(&dir.join("track.wav.tsa")).unwrap();
+        let artifact = tsa.artifact.expect("fresh artifact present");
+        assert_ne!(artifact.bpm, 99.9, "stale artifact must not be absorbed");
+        assert!(!legacy_json_path(&wav).exists(), "stale JSON deleted");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1780,6 +1948,11 @@ mod tests {
             "stale worker must skip analysis entirely"
         );
         assert!(state.lock().unwrap().pre_analysis.is_none());
+        // Write #1 still persisted the peaks — but no artifact was
+        // computed for the stale generation.
+        let tsa = timestretch::read_analysis_file(&dir.join("track.wav.tsa")).unwrap();
+        assert!(tsa.peaks.is_some(), "peaks persisted before the bail");
+        assert!(tsa.artifact.is_none(), "no artifact for a stale worker");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

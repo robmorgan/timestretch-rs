@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `timestretch-cli analyze` writes the binary `.tsa` analysis container
+  by default (`<input>.tsa`) instead of `<input>.tsanalysis.json`; an
+  explicit `-o out.json` keeps the legacy JSON format. `--pre-analysis`
+  accepts either format.
+- Desktop: tracks now converge to a single `.tsa` sidecar. Valid legacy
+  `.tsanalysis.json` artifacts are absorbed into the container on load
+  and both legacy sidecars (`.tsanalysis.json`, `.tspeaks`) are deleted
+  once the on-disk container supersedes them.
+
+### Deprecated
+
+- `read_preanalysis_json` / `write_preanalysis_json`: use the `.tsa`
+  analysis container (`io::tsa`) instead. The JSON pair keeps working
+  while downstream consumers migrate.
+
 ### Added
 
 - `EngineProfile::WideKeylock`: wide-range Master Tempo deck profile
@@ -25,6 +42,29 @@
 - Desktop: a Range selector (Standard | Wide) with seek-priced engine
   rebuild that preserves the playhead, and a live pipeline-latency
   readout next to it.
+- `.tsa` analysis container (`io::tsa`): one content-bound file per
+  track holding the pre-analysis artifact and the 3-band waveform peaks
+  as versioned chunks (unknown chunks skip forward-compatibly; readers
+  reject-don't-panic on hostile input). Two API layers: bytes
+  (`AnalysisFile::to_bytes`/`from_bytes`/`from_bytes_validated`, for
+  apps that store analysis blobs in their own database keyed by
+  `content_hash`) and sidecar file wrappers with atomic writes
+  (`read_analysis_file`, `read_analysis_file_validated`,
+  `write_analysis_file`, `analysis_file_path` — `<audio>.tsa`).
+  `timestretch-cli analyze` writes both chunks, making it a complete
+  offline pre-analysis tool.
+- `analysis::waveform`: the desktop app's 3-band waveform peaks pyramid
+  moved into the library (`BandPeaks`, `PeakLevel`, `NUM_BANDS`) so any
+  frontend gets display peaks without reimplementing the analyzer.
+- `PreAnalysisArtifact::matches_identity`: `matches_source` semantics
+  for callers that already hold the (rate, length, hash) identity;
+  `matches_source` now delegates to it.
+
+### Removed
+
+- Desktop `.tspeaks` sidecar format (introduced on an unreleased
+  branch): superseded by the `.tsa` container's PEAK chunk; existing
+  files are deleted after migration, peaks recompute in milliseconds.
 
 ## 0.10.0
 

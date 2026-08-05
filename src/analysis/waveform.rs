@@ -22,6 +22,7 @@ pub(crate) const CROSSOVER_LOW_HZ: f64 = 200.0;
 pub(crate) const CROSSOVER_HIGH_HZ: f64 = 2_000.0;
 
 /// One resolution level: per-band positive/negative peaks per bucket.
+#[derive(Clone)]
 pub struct PeakLevel {
     /// Buckets per second of audio at this level.
     pub buckets_per_sec: f64,
@@ -39,6 +40,7 @@ impl PeakLevel {
 
 /// The full pyramid: `levels[0]` is the finest (150 buckets/s), each
 /// following level halves the bucket count.
+#[derive(Clone)]
 pub struct BandPeaks {
     levels: Vec<PeakLevel>,
 }

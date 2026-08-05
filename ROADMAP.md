@@ -1126,30 +1126,30 @@ Automation: auto
 ### Why
 
 The RT contract is machine-verified, but the crate's *input* surface has
-never been hardened: the artifact JSON loader (`src/core/preanalysis.rs`),
-the WAV reader (`src/io/wav.rs`), the desktop app's binary peaks-cache
-loader (`desktop/src/waveform/cache.rs`), and the public batch API have no
-fuzz coverage, and there is no enforced policy that arbitrary input
-produces `Err`, never a panic. For a library embedded in a shipping app — and a
+never been hardened: the `.tsa` analysis-container loader
+(`src/io/tsa.rs`), the deprecated artifact JSON loader
+(`src/core/preanalysis.rs`), the WAV reader (`src/io/wav.rs`), and the
+public batch API have no fuzz coverage, and there is no enforced policy
+that arbitrary input produces `Err`, never a panic. For a library embedded in a shipping app — and a
 prerequisite for any 1.0 — "does not panic on hostile or degenerate input"
 must be a tested property, not an intention. This stage touches no DSP.
 
 ### Primary Files
 
 - New: `fuzz/` (cargo-fuzz targets), a soak harness in `qa/`
-- Audited in place: `src/core/preanalysis.rs` (JSON load path),
-  `src/io/wav.rs`, `desktop/src/waveform/cache.rs` (`.tspeaks` binary
-  load path), `src/lib.rs` (param validation), `src/error.rs`,
+- Audited in place: `src/io/tsa.rs` (`.tsa` container load path),
+  `src/core/preanalysis.rs` (deprecated JSON load path),
+  `src/io/wav.rs`, `src/lib.rs` (param validation), `src/error.rs`,
   engine constructors in `src/engine/`
 - CI: `.github/workflows/ci.yml` (bounded fuzz on PRs, longer cron run)
 
 ### Work
 
-- Fuzz targets: artifact JSON from arbitrary bytes; WAV parsing from
-  arbitrary bytes; the `.tspeaks` binary peaks cache from arbitrary bytes
-  (its reader is already written to reject-not-panic, with a unit-test
+- Fuzz targets: the `.tsa` analysis container from arbitrary bytes (its
+  reader is already written to reject-not-panic, with a unit-test
   corruption matrix — the fuzzer's job is to prove that property holds);
-  the batch `stretch()` API driven by arbitrary params ×
+  the deprecated artifact JSON from arbitrary bytes; WAV parsing from
+  arbitrary bytes; the batch `stretch()` API driven by arbitrary params ×
   degenerate audio (NaN/Inf/denormal samples, zero-length, one sample,
   extreme rates and sample rates).
 - No-panic policy: every public entry point returns `Err` on invalid

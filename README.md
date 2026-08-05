@@ -190,25 +190,33 @@ let output = timestretch::stretch_to_bpm(&input, &params, 126.0, 128.0).unwrap()
 
 ```rust
 use timestretch::{
-    analyze_for_dj, read_preanalysis_json, stretch, write_preanalysis_json,
-    StretchParams,
+    analyze_for_dj, read_analysis_file, write_analysis_file, stretch,
+    AnalysisFile, BandPeaks, StretchParams,
 };
 use std::path::Path;
 
-// Build a reusable analysis artifact once (offline)
-let artifact = analyze_for_dj(&input, 44100);
-write_preanalysis_json(Path::new("track.preanalysis.json"), &artifact).unwrap();
+// Build the `.tsa` analysis container once (offline): the beat/onset
+// artifact plus the 3-band waveform peaks a player UI needs at load.
+let mut analysis = AnalysisFile::for_source(&input, 44100);
+analysis.artifact = Some(analyze_for_dj(&input, 44100));
+analysis.peaks = Some(BandPeaks::compute(&input, 1, 44100));
+write_analysis_file(Path::new("track.wav.tsa"), &analysis).unwrap();
 
-// Load artifact at runtime and attach it to params
-let loaded = read_preanalysis_json(Path::new("track.preanalysis.json")).unwrap();
+// Load it at runtime and attach the artifact to params
+let loaded = read_analysis_file(Path::new("track.wav.tsa")).unwrap();
 let params = StretchParams::new(126.0 / 128.0)
     .with_sample_rate(44100)
-    .with_pre_analysis(loaded)
+    .with_pre_analysis(loaded.artifact.unwrap())
     .with_beat_snap_confidence_threshold(0.35)
     .with_beat_snap_tolerance_ms(5.0);
 
 let output = stretch(&input, &params).unwrap();
 ```
+
+Apps that keep analysis in their own database rather than sidecar files
+can use the bytes layer directly — `AnalysisFile::to_bytes` /
+`from_bytes` / `from_bytes_validated` — and key blobs by
+`AnalysisFile::content_hash`.
 
 ### WAV File I/O
 
@@ -356,10 +364,13 @@ See `benchmarks/README.md` for corpus setup and manifest/checksum requirements.
 - `detect_beat_grid_buffer(&AudioBuffer)` — detect beat grid from an `AudioBuffer`
 - `bpm_ratio(source_bpm, target_bpm)` — compute stretch ratio for BPM change
 
-**Pre-analysis artifact pipeline:**
+**Pre-analysis pipeline (`.tsa` analysis container):**
 - `analyze_for_dj(&[f32], sample_rate)` — generate offline beat/onset artifact
-- `write_preanalysis_json(path, &PreAnalysisArtifact)` — write artifact JSON
-- `read_preanalysis_json(path)` — read artifact JSON
+- `AnalysisFile` — one container per track: identity header + artifact + waveform peaks; `to_bytes`/`from_bytes`/`from_bytes_validated` for database-backed storage
+- `write_analysis_file(path, &AnalysisFile)` / `read_analysis_file(path)` / `read_analysis_file_validated(path, rate, len, hash)` — sidecar I/O (atomic writes)
+- `analysis_file_path(audio_path)` — sidecar convention: `<audio>.tsa`
+- `BandPeaks::compute(&[f32], channels, sample_rate)` — 3-band waveform peaks pyramid
+- `write_preanalysis_json` / `read_preanalysis_json` — deprecated: legacy JSON sidecars (use the `.tsa` container)
 
 **WAV file convenience:**
 - `stretch_wav_file(input, output, &StretchParams)` — read, stretch, and write a WAV file

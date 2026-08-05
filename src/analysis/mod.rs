@@ -10,6 +10,7 @@ pub mod preanalysis;
 pub mod rigid_grid;
 pub mod tempogram;
 pub mod transient;
+pub mod waveform;
 
 pub use beat::*;
 pub use comparison::*;
@@ -20,3 +21,4 @@ pub use preanalysis::*;
 pub use rigid_grid::*;
 pub use tempogram::*;
 pub use transient::*;
+pub use waveform::*;
