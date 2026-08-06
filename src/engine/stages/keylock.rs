@@ -72,6 +72,12 @@ pub(crate) struct KeylockStage {
     /// [`KEYLOCK_TOGGLE_FADE_FRAMES`]. NaN = snap to the target on the next
     /// block (stream start / post-reset: no fade-in from stale state).
     enable: f32,
+    /// Smoothed extreme-rate correction weight chasing the per-block
+    /// deviation target at the same slew bound as `enable`. The fade
+    /// crossfades two DIFFERENTLY-PITCHED copies of the high band, so a
+    /// per-block step here is a click source under fast tempo gestures
+    /// (Stage 13 review, finding D6). NaN = snap, as `enable`.
+    correction: f32,
 }
 
 impl KeylockStage {
@@ -87,6 +93,7 @@ impl KeylockStage {
             high: vec![[0.0; BLOCK_FRAMES]; channels],
             high_raw: vec![[0.0; BLOCK_FRAMES]; channels],
             enable: f32::NAN,
+            correction: f32::NAN,
         }
     }
 }
@@ -122,31 +129,40 @@ impl Stage for KeylockStage {
         // Extreme-rate correction weight: 1 inside the DJ range, fading to
         // plain varispeed (pitch follows tempo) beyond it.
         let deviation = (ctx.embedded_rate - 1.0).abs();
-        let correction = ((CORRECTION_FADE_END_DEV - deviation)
+        let correction_target = ((CORRECTION_FADE_END_DEV - deviation)
             / (CORRECTION_FADE_END_DEV - CORRECTION_FADE_START_DEV))
             .clamp(0.0, 1.0) as f32;
 
-        // Live keylock toggle: chase the control target per sample so a
-        // mid-play switch is a click-free crossfade. Composes with the
-        // extreme-rate fade multiplicatively; the per-frame weights are
-        // shared across channels so the image stays stable through a fade.
+        // Live keylock toggle and extreme-rate fade: chase both targets per
+        // sample so a mid-play switch OR a fast tempo gesture through the
+        // fade band is a click-free crossfade (the fade blends two
+        // differently-pitched copies, so a per-block weight step is a
+        // discontinuity between unrelated waveforms). The per-frame weights
+        // are shared across channels so the image stays stable through a
+        // fade.
         let target = (ctx.keylock.clamp(0.0, 1.0)) as f32;
         if self.enable.is_nan() {
             self.enable = target;
         }
+        if self.correction.is_nan() {
+            self.correction = correction_target;
+        }
         let step = 1.0 / KEYLOCK_TOGGLE_FADE_FRAMES as f32;
-        let mut enable_w = [0.0f32; BLOCK_FRAMES];
+        let mut weight_w = [0.0f32; BLOCK_FRAMES];
         let mut enable = self.enable;
-        for w in &mut enable_w {
+        let mut correction = self.correction;
+        for w in &mut weight_w {
             enable += (target - enable).clamp(-step, step);
-            *w = enable;
+            correction += (correction_target - correction).clamp(-step, step);
+            *w = correction * enable;
         }
         self.enable = enable;
+        self.correction = correction;
 
         for ch in 0..block.channels() {
             let out = block.channel_mut(ch);
             for (i, sample) in out.iter_mut().enumerate() {
-                let weight = correction * enable_w[i];
+                let weight = weight_w[i];
                 let high = weight * self.high[ch][i] + (1.0 - weight) * self.high_raw[ch][i];
                 *sample = self.low[ch][i] + high;
             }
@@ -166,6 +182,7 @@ impl Stage for KeylockStage {
         self.raw_high_delay.reset();
         self.sola.reset();
         self.enable = f32::NAN;
+        self.correction = f32::NAN;
     }
 }
 
@@ -207,6 +224,58 @@ mod tests {
         (0..len)
             .map(|i| amp * (2.0 * std::f64::consts::PI * freq * i as f64 / SR as f64).sin() as f32)
             .collect()
+    }
+
+    #[test]
+    fn fade_band_rate_steps_are_click_free() {
+        // The extreme-rate fade crossfades the corrected and raw high
+        // bands — two DIFFERENTLY-PITCHED copies. Rate gestures that jump
+        // across the fade band (dev 0.205→0.35) used to step the fade
+        // weight once per 32-frame block, splicing between unrelated
+        // waveforms mid-tone (Stage 13 review, finding D6). Toggle the
+        // rate between the band's edges repeatedly (so some step lands at
+        // adverse phase) and bound the output's sample-to-sample delta by
+        // the tone's own slew: measured ~0.9x the bound with the
+        // per-sample chase, up to ~3.5x with per-block steps.
+        let freq = 2_000.0;
+        let amp = 0.5f32;
+        let mut stage = KeylockStage::new(SR, 1);
+        let input = sine(freq, 4 * SR as usize, amp);
+        let mut block = BlockBuf::new(1);
+        let mut out = Vec::with_capacity(input.len());
+        for (bi, chunk) in input.chunks_exact(BLOCK_FRAMES).enumerate() {
+            let t = (bi * BLOCK_FRAMES) as f64 / SR as f64;
+            // Warm up inside the corrected range, then square-wave across
+            // the fade band every ~15 ms.
+            let rate = if t < 1.0 || (t / 0.015) as usize % 2 == 0 {
+                1.22
+            } else {
+                1.34
+            };
+            let ctx = StageCtx {
+                embedded_rate: rate,
+                embedded_rate_slope: 0.0,
+                onsets: &[],
+                modulation_hold: false,
+                has_artifact: false,
+                keylock: 1.0,
+            };
+            block.channel_mut(0).copy_from_slice(chunk);
+            stage.process(&mut block, &ctx);
+            out.extend_from_slice(block.channel(0));
+        }
+        // Skip warm-up + latency; scan the toggling region.
+        let start = SR as usize + KEYLOCK_LATENCY_FRAMES;
+        let max_delta = out[start..]
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        let tone_slew = amp * 2.0 * std::f32::consts::PI * freq as f32 / SR as f32;
+        assert!(
+            max_delta < 1.5 * tone_slew,
+            "fade-band rate steps click: max sample delta {max_delta:.4} vs tone slew bound \
+             {tone_slew:.4}"
+        );
     }
 
     #[test]
