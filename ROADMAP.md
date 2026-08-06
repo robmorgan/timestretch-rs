@@ -300,8 +300,13 @@ Automation: auto
 > bound is the load-bearing part. Gated by
 > `seam_survives_a_sustained_mild_ride` (fails pre-fix at −7.14). QA
 > harnesses `engine_keylock` + `engine_transients` promoted into CI.
-> Remaining: the optional correlation-reference/strength items (evidence-
-> gated), the modulation_hold experiment, and the owner mix-in listen.
+> **Owner mix-in listen passed (2026-08-06, live desktop deck, this
+> branch): "definitely an improvement" — bass body stable through a
+> sustained gentle ride.** With the fade-band click gate (D6, PR #37) and
+> the QA harnesses in CI, the stage's mandatory exit criteria are met on
+> merge. The correlation-reference/strength items and the
+> modulation_hold wiring experiment stay explicitly optional — each
+> lands only if it moves a gate, and the stage does not wait for them.
 
 ### Why
 
