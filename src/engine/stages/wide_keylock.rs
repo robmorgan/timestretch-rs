@@ -142,6 +142,13 @@ pub(crate) struct WideKeylockStage {
     raw: Vec<[f32; BLOCK_FRAMES]>,
     /// Per-channel corrected scratch popped from the FIFOs.
     corrected: Vec<[f32; BLOCK_FRAMES]>,
+    /// Mid/side encode scratch (stereo only). The corrected path
+    /// processes M/S instead of L/R (ROADMAP Stage 14): two independent
+    /// phase vocoders on L and R let their phase states diverge and the
+    /// center image wander; in M/S, centered content lives entirely in M
+    /// under ONE vocoder, and identical L/R yields S = 0 exactly — so
+    /// the corrected image cannot wander. The raw/toggle path stays L/R.
+    ms: Vec<[f32; BLOCK_FRAMES]>,
     /// Transposition currently applied to the PV/resampler pair.
     transposition: f64,
     sample_rate: u32,
@@ -217,6 +224,7 @@ impl WideKeylockStage {
             raw_delay,
             raw: vec![[0.0; BLOCK_FRAMES]; num_channels],
             corrected: vec![[0.0; BLOCK_FRAMES]; num_channels],
+            ms: vec![[0.0; BLOCK_FRAMES]; num_channels],
             transposition: 1.0,
             sample_rate,
             ingested: 0.0,
@@ -315,6 +323,21 @@ impl Stage for WideKeylockStage {
 
         self.begin_block(ctx);
 
+        // Stereo runs the corrected path in mid/side (see the `ms` field
+        // doc); other channel counts pass through per-channel.
+        let stereo = block.channels() == 2;
+        if stereo {
+            let (l, r) = (block.channel(0), block.channel(1));
+            for i in 0..BLOCK_FRAMES {
+                self.ms[0][i] = 0.5 * (l[i] + r[i]);
+                self.ms[1][i] = 0.5 * (l[i] - r[i]);
+            }
+        } else {
+            for ch in 0..block.channels() {
+                self.ms[ch].copy_from_slice(block.channel(ch));
+            }
+        }
+
         // Channels in order 0..n (FixedDelay's shared-cursor contract).
         for ch in 0..block.channels() {
             self.raw[ch].copy_from_slice(block.channel(ch));
@@ -322,7 +345,7 @@ impl Stage for WideKeylockStage {
 
             let state = &mut self.channels[ch];
             debug_assert!(state.window.len() + BLOCK_FRAMES <= WINDOW_CAPACITY);
-            state.window.extend_from_slice(block.channel(ch));
+            state.window.extend_from_slice(&self.ms[ch]);
 
             // Render at most ONE hop per block: per-callback FFT work is
             // bounded by construction. Steady state hops once per 8
@@ -394,6 +417,16 @@ impl Stage for WideKeylockStage {
             *w = enable;
         }
         self.enable = enable;
+
+        // Decode the corrected M/S pair back to L/R before the toggle
+        // blend (the raw arm is L/R throughout).
+        if stereo {
+            for i in 0..BLOCK_FRAMES {
+                let (m, side) = (self.corrected[0][i], self.corrected[1][i]);
+                self.corrected[0][i] = m + side;
+                self.corrected[1][i] = m - side;
+            }
+        }
 
         for ch in 0..block.channels() {
             let out = block.channel_mut(ch);

@@ -65,7 +65,28 @@ pub fn stretch_offline(
     debug_assert_eq!(input.len() % channels.max(1), 0);
     let rate = 1.0 / ratio;
     if (1.0 - rate).abs() <= OFFLINE_GRAPH_MAX_DEV {
-        stretch_via_graph(input, channels, sample_rate, ratio, pre_analysis)
+        stretch_via_graph(
+            input,
+            channels,
+            sample_rate,
+            ratio,
+            pre_analysis,
+            EngineProfile::Keylock,
+        )
+    } else if (crate::engine::MIN_TEMPO_RATE..=crate::engine::MAX_TEMPO_RATE).contains(&rate) {
+        // Wide ratios inside the engine's rate range run the SHIPPED wide
+        // corrector (ROADMAP Stage 14): offline and live wide renders are
+        // the same algorithm, stereo image handling included. The direct
+        // batch PV below survives only for ratios beyond any deck use
+        // (> 4x either way).
+        stretch_via_graph(
+            input,
+            channels,
+            sample_rate,
+            ratio,
+            pre_analysis,
+            EngineProfile::WideKeylock,
+        )
     } else {
         stretch_wide_pv(input, channels, sample_rate, ratio)
     }
@@ -78,6 +99,7 @@ fn stretch_via_graph(
     sample_rate: u32,
     ratio: f64,
     pre_analysis: Option<Arc<PreAnalysisArtifact>>,
+    profile: EngineProfile,
 ) -> Result<Vec<f32>, StretchError> {
     let rate = 1.0 / ratio;
     let frames = input.len() / channels;
@@ -100,7 +122,7 @@ fn stretch_via_graph(
     let handles = Engine::build(EngineConfig {
         sample_rate,
         channels,
-        profile: EngineProfile::Keylock,
+        profile,
         initial_tempo_rate: rate,
         pre_analysis: Some(artifact),
         ..EngineConfig::default()
