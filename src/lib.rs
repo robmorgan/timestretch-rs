@@ -549,6 +549,13 @@ pub fn stretch_into(
         return Ok(0);
     }
 
+    // Fast identity path: parity with `stretch()`'s exact passthrough at
+    // ratio 1.0.
+    if (params.stretch_ratio - 1.0).abs() <= f64::EPSILON {
+        output.extend_from_slice(input);
+        return Ok(input.len());
+    }
+
     let input_rms = if params.normalize {
         compute_rms(input)
     } else {

@@ -166,7 +166,10 @@ fn stretch_wide_pv(
 ) -> Result<Vec<f32>, StretchError> {
     let frames = input.len() / channels;
     let expected_frames = (frames as f64 * ratio).round() as usize;
-    let hop = WIDE_PV_FFT / 4;
+    // 87.5% overlap, matching the live wide stage: hop = FFT/4 is the
+    // documented -75% tempo level/click blowup configuration (see
+    // WIDE_HOP in engine/stages/wide_keylock.rs).
+    let hop = WIDE_PV_FFT / 8;
 
     // Inputs shorter than an analysis window can't be phase-vocoded;
     // resample to length (pitch follows — matches the old short-input

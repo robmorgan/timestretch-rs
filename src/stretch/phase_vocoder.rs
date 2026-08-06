@@ -1294,8 +1294,9 @@ impl PhaseVocoder {
                     let bin_if_blend = (if_blend * dist_scale).min(0.20);
                     let locked = self.new_phases[bin] as f64;
                     let if_est = self.if_phases_backup[bin] as f64;
+                    // Wrapped-difference blend (see the gradient blend above).
                     self.new_phases[bin] =
-                        ((1.0 - bin_if_blend) * locked + bin_if_blend * if_est) as f32;
+                        (locked + bin_if_blend * wrap_phase_f64(if_est - locked)) as f32;
                 }
             }
 
@@ -1485,6 +1486,16 @@ impl PhaseVocoder {
                 continue;
             }
 
+            // DC and Nyquist of a real signal are real-valued: hold the
+            // analysis phase (0 or PI) instead of accumulating a synthetic
+            // phase that would break Hermitian symmetry at reconstruction.
+            if bin == 0 || bin == num_bins - 1 {
+                self.phase_accum[bin] = phase;
+                self.new_phases[bin] = phase as f32;
+                self.prev_phase[bin] = phase;
+                continue;
+            }
+
             if bin < self.sub_bass_bin {
                 // Sub-bass IF estimation: same instantaneous-frequency approach
                 // as standard bins, but without parabolic interpolation (sub-bass
@@ -1494,7 +1505,12 @@ impl PhaseVocoder {
                 let expected_diff = self.expected_phase_advance[bin];
                 let phase_diff = phase - self.prev_phase[bin];
                 let deviation = wrap_phase_f64(phase_diff - expected_diff);
-                self.phase_accum[bin] += (expected_diff + deviation) * phase_hop_ratio;
+                // Keep the accumulator wrapped: it is only ever consumed via
+                // `from_polar` and phase differences, and an unwrapped value
+                // loses precision to the per-frame f32 downcast as it grows.
+                self.phase_accum[bin] = wrap_phase_f64(
+                    self.phase_accum[bin] + (expected_diff + deviation) * phase_hop_ratio,
+                );
             } else {
                 // Standard IF estimation:
                 //   phase_diff = current_phase - prev_phase
@@ -1549,7 +1565,7 @@ impl PhaseVocoder {
                     (expected_diff + deviation) * phase_hop_ratio
                 };
 
-                self.phase_accum[bin] += phase_advance;
+                self.phase_accum[bin] = wrap_phase_f64(self.phase_accum[bin] + phase_advance);
             }
 
             self.new_phases[bin] = self.phase_accum[bin] as f32;
@@ -1625,8 +1641,12 @@ impl PhaseVocoder {
                     self.analysis_phases[bin] as f64 - self.analysis_phases[nearest_peak] as f64;
                 let propagated = self.new_phases[nearest_peak] as f64 + gradient;
                 let independent = self.new_phases[bin] as f64;
-                self.new_phases[bin] =
-                    ((1.0 - effective_blend) * independent + effective_blend * propagated) as f32;
+                // Blend along the wrapped difference: phases are angles, and
+                // a linear mix of raw values that sit different multiples of
+                // 2*PI apart lands on a meaningless intermediate angle.
+                self.new_phases[bin] = (independent
+                    + effective_blend * wrap_phase_f64(propagated - independent))
+                    as f32;
             }
         }
     }
@@ -1638,6 +1658,12 @@ impl PhaseVocoder {
         for i in 0..num_bins {
             self.fft_buffer[i] = Complex::from_polar(self.magnitudes[i], self.new_phases[i]);
         }
+        // DC and Nyquist of a real signal are real: project onto the real
+        // axis so the mirrored spectrum below is exactly Hermitian and the
+        // inverse FFT is real by construction (their held analysis phases
+        // are 0 or PI, so this preserves signed magnitude).
+        self.fft_buffer[0] = Complex::new(self.fft_buffer[0].re, 0.0);
+        self.fft_buffer[num_bins - 1] = Complex::new(self.fft_buffer[num_bins - 1].re, 0.0);
         for bin in 1..num_bins - 1 {
             self.fft_buffer[self.fft_size - bin] = self.fft_buffer[bin].conj();
         }
@@ -2124,13 +2150,16 @@ mod tests {
         configure(&mut unfocused);
         unfocused.advance_phases(num_bins, 1.0, 1.0);
 
-        let independent_phase = focused.expected_phase_advance[target_bin] as f32;
+        // The accumulator stays wrapped, so phases compare modulo 2*PI.
+        let independent_phase = wrap_phase_f64(focused.expected_phase_advance[target_bin]) as f32;
         assert!(
-            (focused.new_phases[target_bin] - independent_phase).abs() < 1e-6,
+            wrap_phase_f64((focused.new_phases[target_bin] - independent_phase) as f64).abs()
+                < 1e-6,
             "transient focus should keep non-peak bins on their independently advanced phase instead of reapplying the gradient field"
         );
         assert!(
-            (unfocused.new_phases[target_bin] - independent_phase).abs() > 1e-3,
+            wrap_phase_f64((unfocused.new_phases[target_bin] - independent_phase) as f64).abs()
+                > 1e-3,
             "without transient focus the same non-peak bin should still be pulled by phase-gradient integration"
         );
     }

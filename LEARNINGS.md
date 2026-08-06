@@ -171,6 +171,16 @@ public API. This is the evidence base for ROADMAP Stages 13–17.
    (`lib.rs:481-483`). No test anywhere runs the PV itself at ratio 1.0.
    Related: `stretch_into` lacks the 1.0 bypass entirely.
 
+**Stage 13 follow-up finding (2026-08-05, during the fix):** hop = FFT/8
+attenuates tones in the PV's rigid sub-bass region (< ~107 Hz at FFT 2048)
+by 5–15× at ratio 2.0, while tones just above the boundary hold the ideal
+balance (probe sweep 70–150 Hz; the old offline hop = FFT/4 kept sub-bass
+clean at ratio 2 but is the documented blowup at ratio 4). This is a trait
+of the *shipped live* wide configuration — consistent with Stage 11's
+"−75%: bass reads bitcrushed" note — now pinned by
+`tests/stretch_quality_regressions.rs` so it cannot silently worsen.
+Improving sub-bass at heavy slowdown is Stage 14/16 material.
+
 **Structural limitations (not bugs — recorded so they aren't re-litigated):**
 
 - SOLA tonal-HF granulation is the mechanism working as designed; the fix

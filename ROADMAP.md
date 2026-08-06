@@ -214,6 +214,17 @@ benefits regardless. Touches no DSP.
 
 Automation: auto
 
+> **Status (2026-08-05): implementation landed** (branch
+> `fix/pv-phase-hygiene`): wrapped accumulator, wrapped-difference
+> blends, real DC/Nyquist, offline hop = FFT/8, `stretch_into` bypass
+> parity, `tests/pv_null.rs`. Measured: PV-direct null at ratio 1.0
+> 59 → 139 dB SER; 5 kHz purity at ratio 1.5 ~25 → ~57 dB. Follow-up
+> finding recorded in LEARNINGS.md: hop/8 pins a rigid sub-bass
+> attenuation at heavy slowdown (live-path trait, now gated so it can't
+> silently worsen). Remaining exit criteria: wide falsification sidecar
+> re-run, and the owner listen at ±50% including the Rubber Band A/B
+> re-baseline.
+
 ### Why
 
 The 2026-08-05 review confirmed four correctness bugs in the wide-ratio
