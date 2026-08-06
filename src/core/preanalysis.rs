@@ -26,11 +26,8 @@ use std::path::Path;
 /// ambiguous: they may carry either the old wandering grids or the new
 /// rigid ones. Forcing regeneration disambiguates.
 ///
-/// POLICY (learned from the v7 ambiguity, see LEARNINGS.md): bump
-/// `PREANALYSIS_VERSION` on any release whose analysis output changes
-/// materially, and raise `MIN_COMPATIBLE_VERSION` with it whenever cached
-/// results from the previous version would be *worse* than re-analysis —
-/// schema compatibility alone is not the bar. Checked at release time via
+/// The bump-when policy for these two constants lives in CLAUDE.md
+/// ("Analysis Version Policy") and is checked at release time via
 /// RELEASE_CHECKLIST.md.
 pub const PREANALYSIS_VERSION: u32 = 8;
 

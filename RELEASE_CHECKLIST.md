@@ -4,13 +4,11 @@ Complements the `/release` flow (CHANGELOG fold, version bump, CI checks,
 signed tag, publish). Human judgment items that the automation cannot
 decide:
 
-- [ ] **Analysis version policy** (`src/core/preanalysis.rs`): if any
-  analysis output changed materially this release (beat grids, onsets,
-  key, tempo candidates — not just schema), bump `PREANALYSIS_VERSION`;
-  if cached artifacts from the previous version would now be *worse* than
-  re-analysis, raise `MIN_COMPATIBLE_VERSION` too so sidecars regenerate.
-  (Learned from v0.10.0 shipping the rigid-grid fit without a bump —
-  LEARNINGS.md.)
+- [ ] **Analysis version policy** (CLAUDE.md "Analysis Version Policy"):
+  if any analysis output changed materially this release, bump
+  `PREANALYSIS_VERSION` in `src/core/preanalysis.rs`; if cached artifacts
+  from the previous version would now be *worse* than re-analysis, raise
+  `MIN_COMPATIBLE_VERSION` too so sidecars regenerate.
 - [ ] CI green on the shipping surface: `cargo test --all-targets`,
   clippy `-D warnings`, `cargo fmt --check`, docs with
   `RUSTDOCFLAGS="-D warnings"`, and the desktop crate checks.
