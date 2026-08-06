@@ -43,6 +43,25 @@ const MIN_BEATS: usize = 16;
 /// Minimum phase decisiveness to adopt the rigid grid — the annotator's
 /// own "trust without ear-verification" threshold.
 const MIN_PHASE_LOCK: f32 = 0.3;
+/// Secondary adoption path (ROADMAP Stage 10): a fit whose phase lock is
+/// below the threshold still adopts when the DP-tracked beats — an
+/// INDEPENDENT estimator (full-band novelty + dynamic programming, not
+/// the kick-band phase circle) — land on the rigid grid at this rate.
+/// Heavily syncopated disco puts swung bassline energy at scattered
+/// subdivision phases, deflating the lock metric on exactly the material
+/// where both estimators agree the grid is right (corpus: MSBWY lock
+/// 0.112 / agreement 0.98, Hot Stuff 0.109 / 0.90 — while a tempo-ramp
+/// control that phase_lock alone would wrongly trust at 0.77 measures
+/// 0.25, and Somebody To Love's genuine estimator disagreement measures
+/// 0.28). Both slot-exclusion and onset-sharpness disambiguation were
+/// prototyped first and failed on this class (LEARNINGS.md). The
+/// measured populations cluster at ≤ 0.28 (non-rigid / disagreement)
+/// and ≥ 0.90 (corroborated); the threshold splits the gap with margin
+/// on both sides rather than sitting on either cluster.
+const CORROBORATION_MIN_AGREEMENT: f64 = 0.6;
+/// Tolerance for a tracked beat to count as landing on the rigid grid.
+/// Same figure as the smear radius: one vinyl-tight beat placement.
+const CORROBORATION_TOL_SECS: f64 = SMEAR_RADIUS_SECS;
 /// Sanity floor: under a timing-tolerant (smeared) objective the rigid
 /// grid must reach at least this fraction of the tracked beats' score,
 /// so a decisive-but-wrong fit (e.g. seeded off an octave-wrong tempo on
@@ -194,7 +213,27 @@ pub fn refine_grid_rigid(samples: &[f32], sample_rate: u32, grid: BeatGrid) -> (
         return (grid, false);
     };
     if fit.phase_lock < MIN_PHASE_LOCK {
-        return (grid, false);
+        // Corroborated adoption: the tracked beats are an independent
+        // estimator; when ≥ 90% of them land on the rigid grid within a
+        // beat-placement tolerance, low phase lock reflects syncopated
+        // subdivision energy, not grid ambiguity. Genuinely non-rigid
+        // material (ramps, drift) fails this hard — the tracked cursor
+        // walks off a constant grid.
+        let sr = sample_rate as f64;
+        let period = 60.0 / fit.bpm;
+        let hits = grid
+            .beats
+            .iter()
+            .filter(|&&b| {
+                let t = b / sr;
+                let k = ((t - fit.phase_secs) / period).round();
+                (t - (fit.phase_secs + k * period)).abs() <= CORROBORATION_TOL_SECS
+            })
+            .count();
+        let agreement = hits as f64 / grid.beats.len() as f64;
+        if agreement < CORROBORATION_MIN_AGREEMENT {
+            return (grid, false);
+        }
     }
 
     // Sanity floor under a timing-tolerant objective: smear the onset
@@ -475,6 +514,90 @@ mod tests {
             assert!(((w[1] - w[0]) - period).abs() < 1e-6);
         }
         assert!(!grid.downbeats.is_empty());
+    }
+
+    /// Kick train with strong swung bass stabs at ~3/16 and ~5/16 of each
+    /// beat — the syncopated-disco profile that deflates `phase_lock`
+    /// below the adoption threshold (subdivision energy rivals the kick
+    /// at scattered phases) while the DP tracker still locks the kicks.
+    fn syncopated_train(bpm: f64, seconds: f64) -> Vec<f32> {
+        let len = (SR as f64 * seconds) as usize;
+        let mut out = vec![0.0f32; len];
+        let period = 60.0 * SR as f64 / bpm;
+        let thump = |out: &mut Vec<f32>, at: usize, amp: f64, hz: f64, decay: f64| {
+            for i in 0..3000.min(len.saturating_sub(at)) {
+                let t = i as f64 / SR as f64;
+                out[at + i] +=
+                    (amp * (-t * decay).exp() * (2.0 * std::f64::consts::PI * hz * t).sin()) as f32;
+            }
+        };
+        let mut pos = 0.0f64;
+        while (pos as usize) < len {
+            // Kick: low-band thump plus the broadband beater click real
+            // kicks carry (and synthetic pure-sine "kicks" lack) — the
+            // full-band tracker keys on the click, the kick-band fit on
+            // the thump.
+            thump(&mut out, pos as usize, 0.9, 60.0, 40.0);
+            thump(&mut out, pos as usize, 0.5, 3000.0, 400.0);
+            // Swung bass stabs: off-grid subdivisions, kick-band register,
+            // nearly kick-strength.
+            thump(&mut out, (pos + 0.19 * period) as usize, 0.4, 70.0, 30.0);
+            thump(&mut out, (pos + 0.31 * period) as usize, 0.35, 80.0, 30.0);
+            pos += period;
+        }
+        out
+    }
+
+    #[test]
+    fn refine_adopts_via_tracked_beat_corroboration() {
+        let samples = syncopated_train(122.0, 30.0);
+        let tracked = detect_beats(&samples, SR);
+        let fit = fit_rigid_grid(&samples, SR, tracked.bpm).expect("fit");
+        // Fixture must actually exercise the corroboration path: the lock
+        // metric alone would reject this material.
+        assert!(
+            fit.phase_lock < MIN_PHASE_LOCK,
+            "fixture no longer deflates phase_lock ({}) — the corroboration \
+             path is untested",
+            fit.phase_lock
+        );
+        let (grid, adopted) = refine_grid_rigid(&samples, SR, tracked);
+        assert!(
+            adopted,
+            "corroborated syncopated material should adopt (lock {})",
+            fit.phase_lock
+        );
+        // And the adopted phase must be the KICKS, not a bass subdivision.
+        let period = 60.0 * SR as f64 / grid.bpm;
+        let first = grid.beats[grid.beats.len() / 2];
+        let frac = (first / period).fract();
+        let dist = frac.min(1.0 - frac);
+        assert!(
+            dist < 0.05,
+            "adopted grid sits {dist:.3} periods off the kick train"
+        );
+    }
+
+    #[test]
+    fn refine_rejects_corroboration_when_tracker_disagrees() {
+        // Same syncopated audio, but a tracked grid whose beats DRIFT off
+        // any constant grid (the wandering-tracker case): the independent
+        // estimators disagree, so low lock must stay unadopted.
+        let samples = syncopated_train(122.0, 30.0);
+        let tracked = detect_beats(&samples, SR);
+        let mut drifting = tracked.clone();
+        let period = 60.0 * SR as f64 / drifting.bpm;
+        let n = drifting.beats.len().max(1) as f64;
+        for (i, b) in drifting.beats.iter_mut().enumerate() {
+            // Linear drift sweeping one full period across the track, so
+            // the tracked beats visit every phase of the rigid grid.
+            *b += period * i as f64 / n;
+        }
+        let (_grid, adopted) = refine_grid_rigid(&samples, SR, drifting);
+        assert!(
+            !adopted,
+            "drifting tracked beats must not corroborate a rigid fit"
+        );
     }
 
     #[test]

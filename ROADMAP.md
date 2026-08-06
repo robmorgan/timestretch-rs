@@ -159,12 +159,19 @@ intervals draws instead).
   synthetic tempo-ramp fixture, at least one live-drummer recording);
   explicit acc2/F-measure floors on the non-EDM subset in CI; the QM Vamp
   baseline column (output-only — qm-dsp is GPL, never source).
-- **Offbeat-bass disambiguation for the rigid fit**: the low phase_lock on
-  disco-bass tracks comes from sub-150 Hz bassline onsets scoring competing
-  phases. Candidates: weight the kick envelope by onset sharpness, or test
-  whether the competitor phase sits specifically at a half/quarter-period
-  offset before counting it against decisiveness. Do **not** lower the 0.3
-  gate to chase these tracks (recorded lesson).
+- ~~Offbeat-bass disambiguation~~ **done 2026-08-07** (branch
+  `feat/rigid-grid-offbeat-disambiguation`): both roadmap candidates
+  (slot exclusion, onset-sharpness weighting) were prototyped and failed
+  on the class — swung rivals sit at scattered subdivision phases.
+  Landed instead: **tracked-beat corroboration** — a below-threshold fit
+  adopts when ≥ 60% of the DP tracker's beats (an independent estimator)
+  land on the rigid grid within 25 ms. Corpus: MSBWY and Hot Stuff now
+  adopt (beat F 0.95/0.93 → 1.00, downbeat F → 1.0, offsets sub-ms);
+  33rd Rate Revs X downbeat F 0 → 1.0; Somebody To Love honestly stays
+  out (agreement 0.28 — genuine estimator disagreement, the "annotated
+  phase-indecisive" bucket); a tempo-ramp control that phase_lock alone
+  would wrongly trust at 0.77 is rejected at 0.25. The 0.3 gate itself
+  is untouched. PREANALYSIS_VERSION → 9/9 per the CLAUDE.md policy.
 - ~~Artifact invalidation policy~~ **done 2026-08-06**: versions bumped
   to 8/8 so ambiguous v4–v7 sidecars regenerate; policy written into the
   `src/core/preanalysis.rs` constant docs and RELEASE_CHECKLIST.md (which
@@ -177,9 +184,10 @@ intervals draws instead).
   floors enforced in CI (proposed acc2 ≥ 90%, beat F ≥ 0.85).
 - Tempo-ramp fixture and live-drummer recording tracked within tolerance;
   no row where the QM baseline wins by more than noise.
-- The three known non-adopters either adopt correctly under the
-  disambiguation work or are annotated as genuinely phase-indecisive with
-  the desktop showing an honest low-confidence grid.
+- ~~The three known non-adopters~~ two of three adopt with sub-ms offsets
+  (2026-08-07); Somebody To Love is measured as genuine estimator
+  disagreement — remaining: annotate it as phase-indecisive and verify
+  the desktop shows an honest low-confidence grid for it.
 - Version-bump policy documented and applied on the next analysis change.
 
 ## [ ] Stage 12: Robustness Hardening — No-Panic Surface, Fuzzing, Soak
