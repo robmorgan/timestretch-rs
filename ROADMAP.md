@@ -285,9 +285,28 @@ Automation: auto
 > wide stage is its sole consumer and WHY SOLA deliberately does not read
 > it (suppressing opportunistic splices during rides would push drift into
 > forced onset-unprotected splices) — wiring it remains the evidence-gated
-> experiment below. Remaining: seam recovery under continuous rides, the
-> optional correlation-reference/strength items, and promoting the two QA
-> harnesses into CI.
+> experiment below.
+>
+> **Seam recovery under motion landed 2026-08-06** (branch
+> `feat/ride-seam-recovery`): characterization showed sustained mild rides
+> (0.5–1% deviation — the mix-in gesture) comb the seam at −7 dB for the
+> whole ride, because drift sawtooths to the full 192-frame trigger and
+> rest recovery needs stillness. Fix: a mild-motion BOUNDED recenter
+> (rest-splice mechanism, no dwell) at drift > 96 when deviation < 1.2%.
+> Measured: worst comb −7.1 → −4.4 dB, riding steady-state −2.5 → −1.2 dB,
+> safe profiles bit-identical, ~5 bounded splices/s. A first attempt that
+> tightened the general trigger made things WORSE (−5.5 dB persistent) —
+> unbounded early splices park on the dominant-period grid; the landing
+> bound is the load-bearing part. Gated by
+> `seam_survives_a_sustained_mild_ride` (fails pre-fix at −7.14). QA
+> harnesses `engine_keylock` + `engine_transients` promoted into CI.
+> **Owner mix-in listen passed (2026-08-06, live desktop deck, this
+> branch): "definitely an improvement" — bass body stable through a
+> sustained gentle ride.** With the fade-band click gate (D6, PR #37) and
+> the QA harnesses in CI, the stage's mandatory exit criteria are met on
+> merge. The correlation-reference/strength items and the
+> modulation_hold wiring experiment stay explicitly optional — each
+> lands only if it moves a gate, and the stage does not wait for them.
 
 ### Why
 

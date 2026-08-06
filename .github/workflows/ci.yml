@@ -60,6 +60,12 @@ jobs:
         env:
           TIMESTRETCH_STRICT_CALLBACK_BUDGET: "1"
           TIMESTRETCH_CALLBACK_BUDGET_MULTIPLIER: "2.0"
+      # Ride-quality gates (ROADMAP Stage 15 promotion): cents wobble on
+      # sustained rides and transient sharpness — the two harnesses most
+      # directly tied to how the deck sounds under the fader; previously
+      # local-only.
+      - run: cargo test --features qa-harnesses --release --test engine_keylock -- --nocapture
+      - run: cargo test --features qa-harnesses --release --test engine_transients -- --nocapture
       - uses: actions/upload-artifact@v4
         with:
           name: quality-dashboard-${{ github.run_id }}

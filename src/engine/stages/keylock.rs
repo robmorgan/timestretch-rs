@@ -227,6 +227,88 @@ mod tests {
     }
 
     #[test]
+    fn seam_survives_a_sustained_mild_ride() {
+        // ROADMAP Stage 15: a DJ riding the fader gently (±0.6% here) used
+        // to let SOLA's drift sawtooth to the full 192-frame trigger,
+        // comb-filtering the crossover seam at −7 dB for as long as the
+        // ride lasted (rest recovery needs ~150 ms of stillness a moving
+        // fader never provides). The mild-motion bounded recenter caps the
+        // sawtooth at ~96 frames: measured worst −4.4 dB / riding mean
+        // −1.5 dB on this fixture. Gates pin those with margin, plus a
+        // splice-count bound so the fix cannot degenerate into churn.
+        let seam_hz = 135.0;
+        let srf = SR as f64;
+        let mut stage = KeylockStage::new(SR, 1);
+        let mut block = BlockBuf::new(1);
+        let mut collected = Vec::new();
+        let (mut ps, mut ph) = (0.0f64, 0.0f64);
+        let total_blocks = (30.0 * srf / BLOCK_FRAMES as f64) as usize;
+        for bi in 0..total_blocks {
+            let t = (bi * BLOCK_FRAMES) as f64 / srf;
+            let rate = if t < 2.0 {
+                1.0
+            } else {
+                1.0 + 0.006 * (2.0 * std::f64::consts::PI * 0.3 * (t - 2.0)).sin()
+            };
+            for s in block.channel_mut(0).iter_mut() {
+                ps += 2.0 * std::f64::consts::PI * seam_hz * rate / srf;
+                ph += 2.0 * std::f64::consts::PI * 880.0 * rate / srf;
+                *s = 0.15 * ps.sin() as f32 + 0.5 * ph.sin() as f32;
+            }
+            let ctx = StageCtx {
+                embedded_rate: rate,
+                embedded_rate_slope: 0.0,
+                onsets: &[],
+                modulation_hold: false,
+                has_artifact: false,
+                keylock: 1.0,
+            };
+            stage.process(&mut block, &ctx);
+            collected.extend_from_slice(block.channel(0));
+        }
+        let goertzel = |lo: usize, hi: usize| -> f64 {
+            let w = 2.0 * std::f64::consts::PI * seam_hz / srf;
+            let coeff = 2.0 * w.cos();
+            let (mut s1, mut s2) = (0.0f64, 0.0f64);
+            for &x in &collected[lo..hi] {
+                let s0 = x as f64 + coeff * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            (s1 * s1 + s2 * s2 - coeff * s1 * s2).sqrt() / ((hi - lo) as f64 / 2.0)
+        };
+        let win = (0.25 * srf) as usize;
+        let baseline = (goertzel(2 * win, 3 * win) + goertzel(3 * win, 4 * win)) / 2.0;
+        let mut worst = 0.0f64;
+        let mut tail = Vec::new();
+        for k in 8..collected.len() / win {
+            let db = 20.0 * (goertzel(k * win, (k + 1) * win) / baseline).log10();
+            worst = worst.min(db);
+            if k * win > collected.len() - 12 * win {
+                tail.push(db);
+            }
+        }
+        let tail_mean = tail.iter().sum::<f64>() / tail.len() as f64;
+        let splices = stage.sola.splice_count();
+        println!(
+            "mild ride seam: worst {worst:+.2} dB, tail {tail_mean:+.2} dB, {splices} splices"
+        );
+        assert!(
+            worst > -6.0,
+            "seam comb too deep during mild ride: worst {worst:+.2} dB (pre-Stage-15: −7)"
+        );
+        assert!(
+            tail_mean > -3.0,
+            "seam still de-phased while riding: tail mean {tail_mean:+.2} dB (pre-Stage-15: −2.5 \
+             and not recovering)"
+        );
+        assert!(
+            splices < 400,
+            "mild-motion recentering degenerated into splice churn: {splices} over 30 s"
+        );
+    }
+
+    #[test]
     fn fade_band_rate_steps_are_click_free() {
         // The extreme-rate fade crossfades the corrected and raw high
         // bands — two DIFFERENTLY-PITCHED copies. Rate gestures that jump

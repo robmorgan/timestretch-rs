@@ -203,6 +203,22 @@ const RING_MASK: usize = RING_LEN - 1;
 
 /// Drift from the nominal lag that triggers a splice, in frames.
 const DRIFT_TRIGGER: f64 = 192.0;
+/// Under MILD transposition deviations (below [`MILD_DEV`]) drift beyond
+/// this fires a BOUNDED recenter splice (the rest-splice mechanism, no
+/// dwell). Rationale (ROADMAP Stage 15): a sustained 0.5–1% ride lets
+/// drift sawtooth to the full [`DRIFT_TRIGGER`] — a ~2–4 ms high-band
+/// shift against the low band's rigid delay, comb-filtering the
+/// crossover seam at −7 dB for as long as the ride lasts. Recentring at
+/// 96 frames caps the shift at ~2 ms for ~3–5 splices/s — well under the
+/// ~18/s the shipped ±8% path already carries. The landing bound matters:
+/// an UNbounded splice on periodic content parks on the dominant-period
+/// grid (or zero-jump limit-cycles, autoresearch #62) and makes the seam
+/// WORSE — measured −5.5 dB persistent vs −2 dB with the bound. At
+/// strong deviations nothing changes: combing there is brief, and
+/// tighter triggers would multiply splice granulation.
+const MILD_DRIFT_TRIGGER: f64 = 96.0;
+/// Deviation ceiling for the mild-motion bounded recenter.
+const MILD_DEV: f64 = 0.012;
 /// Drift at which a splice is forced even through a transient.
 const HARD_TRIGGER: f64 = 320.0;
 /// Correlation search half-range around the nominal jump, in frames.
@@ -462,6 +478,14 @@ impl SolaCorrector {
                 // gate is simpler and at least as good; see autoresearch
                 // log #43/#51.)
                 self.try_splice(drift, onsets);
+            } else if deviation < MILD_DEV && settled_drift.abs() > MILD_DRIFT_TRIGGER {
+                // Mild-motion bounded recenter (ROADMAP Stage 15): during
+                // sustained gentle rides the seam combs for the whole ride
+                // unless drift is kept small; the bounded landing (must
+                // actually recenter, or skip and let drift ride to the
+                // normal trigger) avoids the periodic-content parking that
+                // an unbounded early splice causes.
+                self.try_rest_splice(drift, onsets);
             } else if at_rest && settled_drift.abs() > REST_SPLICE_DRIFT {
                 // At sustained rest a parked drift comb-filters the
                 // crossover overlap against the low band's fixed delay;
