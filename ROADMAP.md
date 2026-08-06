@@ -220,9 +220,18 @@ Automation: auto
 > 59 → 139 dB SER; 5 kHz purity at ratio 1.5 ~25 → ~57 dB. Follow-up
 > finding recorded in LEARNINGS.md: hop/8 pins a rigid sub-bass
 > attenuation at heavy slowdown (live-path trait, now gated so it can't
-> silently worsen). Remaining exit criteria: wide falsification sidecar
-> re-run, and the owner listen at ±50% including the Rubber Band A/B
-> re-baseline.
+> silently worsen). Merged to main 2026-08-06 (PR #36).
+>
+> **Falsification sidecar re-run (2026-08-06): no regression, measurable
+> gains.** 300-row A/B vs the saved Stage 11 summary: the shipped arm
+> (`widepv_blend_hop8`) improved mean |LUFS error| vs source 2.75 →
+> 1.90 dB with Rubber Band spectral similarity held (0.76–0.99) and
+> ZERO click increases anywhere; the diagnostic arms that ran the buggy
+> phase paths hardest (1024/bare/cohblend/resets) dropped ~80–125
+> clicks/M — the fixes removed real artifacts, not just theoretical
+> ones. Renders + level-matched `norm/` copies in
+> `target/wide_falsification/`. Remaining exit criterion: the owner
+> listen at ±50% including the Rubber Band A/B re-baseline.
 
 ### Why
 
