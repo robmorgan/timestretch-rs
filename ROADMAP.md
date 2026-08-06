@@ -157,11 +157,10 @@ intervals draws instead).
   whether the competitor phase sits specifically at a half/quarter-period
   offset before counting it against decisiveness. Do **not** lower the 0.3
   gate to chase these tracks (recorded lesson).
-- **Artifact invalidation policy**: bump `PREANALYSIS_VERSION` /
-  `MIN_COMPATIBLE_VERSION` whenever analysis output changes materially
-  (the rigid-grid fix shipped without a bump, so pre-v0.10 sidecars keep
-  serving worse grids until deleted). Write the policy into
-  `src/core/preanalysis.rs` docs and the release checklist.
+- ~~Artifact invalidation policy~~ **done 2026-08-06**: versions bumped
+  to 8/8 so ambiguous v4–v7 sidecars regenerate; policy written into the
+  `src/core/preanalysis.rs` constant docs and RELEASE_CHECKLIST.md (which
+  was also rebuilt — it still referenced the pre-cutover engine).
 - Desktop owner check: grids visually aligned on real non-EDM tracks.
 
 ### Exit Criteria
@@ -335,6 +334,19 @@ broken `LR8Crossover` kept only for baselines that no longer exist.
 ## [ ] Stage 15: DJ-Band Ride Polish — Seam Recovery and Fade Smoothing
 
 Automation: auto
+
+> **Status (2026-08-06): fade smoothing and the modulation-hold
+> contradiction resolved** (branch `fix/fade-ramp-hold-doc-artifact-version`):
+> the extreme-rate correction weight now chases its target per sample at
+> the toggle-fade slew bound, gated by a fade-band rate-step click test
+> (per-block steps measured ~3.5× the tone-slew bound; the chase ~0.9×).
+> `modulation_hold` resolved as a doc fix: `stage.rs` now records that the
+> wide stage is its sole consumer and WHY SOLA deliberately does not read
+> it (suppressing opportunistic splices during rides would push drift into
+> forced onset-unprotected splices) — wiring it remains the evidence-gated
+> experiment below. Remaining: seam recovery under continuous rides, the
+> optional correlation-reference/strength items, and promoting the two QA
+> harnesses into CI.
 
 ### Why
 

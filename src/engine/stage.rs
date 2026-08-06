@@ -127,10 +127,16 @@ pub struct StageCtx<'a> {
     /// by up to ~2k), in stage-timeline coordinates. Empty when no
     /// artifact is attached — stages fall back to online heuristics.
     pub onsets: &'a [OnsetEvent],
-    /// True while a fast control gesture is in flight: stages suppress
-    /// disruptive maintenance (low-band phase resets, discretionary
-    /// splices) until the ride settles — the graph-level re-expression of
-    /// the old engine's modulation-hold latches.
+    /// True while a fast control gesture is in flight — the graph-level
+    /// re-expression of the old engine's modulation-hold latches. Sole
+    /// consumer today: the wide keylock stage, which holds LOW-BAND phase
+    /// resets until the ride settles (delay-matched through its latency).
+    /// The narrow keylock chain deliberately does NOT read it: SOLA's
+    /// discretionary work is already gated by its own stricter rest-dwell
+    /// machinery, and suppressing its opportunistic splices during rides
+    /// would push drift into forced (onset-unprotected) splices — wiring
+    /// it there is a ROADMAP Stage 15 experiment, gated on seam/click
+    /// measurements, not a given.
     pub modulation_hold: bool,
     /// Whether a pre-analysis artifact is attached at all. Distinguishes
     /// "no events nearby" from "no artifact" so stages know when to run

@@ -19,12 +19,24 @@ use std::path::Path;
 ///
 /// v7: adds [`tempo_candidates`](PreAnalysisArtifact::tempo_candidates).
 /// Purely additive — older sidecars stay compatible with an empty list.
-pub const PREANALYSIS_VERSION: u32 = 7;
+///
+/// v8: no schema change — bumped (with `MIN_COMPATIBLE_VERSION`) because
+/// the rigid-grid beat fit (v0.10.0) materially changed beat positions on
+/// quantized material without a version bump, so v7 artifacts are
+/// ambiguous: they may carry either the old wandering grids or the new
+/// rigid ones. Forcing regeneration disambiguates.
+///
+/// The bump-when policy for these two constants lives in CLAUDE.md
+/// ("Analysis Version Policy") and is checked at release time via
+/// RELEASE_CHECKLIST.md.
+pub const PREANALYSIS_VERSION: u32 = 8;
 
-/// Oldest schema version whose positions match the current analysis.
-/// Artifacts below this carry the pre-v4 window-start bias and fail
-/// [`PreAnalysisArtifact::matches_source`], so cached sidecars regenerate.
-const MIN_COMPATIBLE_VERSION: u32 = 4;
+/// Oldest schema version whose *analysis results* match the current
+/// detector. Artifacts below this fail
+/// [`PreAnalysisArtifact::matches_source`], so cached sidecars regenerate:
+/// pre-v4 carried the window-start bias; v4–v7 predate (or are ambiguous
+/// about) the rigid-grid beat fit.
+const MIN_COMPATIBLE_VERSION: u32 = 8;
 
 fn default_artifact_version() -> u32 {
     1
@@ -580,7 +592,10 @@ mod tests {
 
     #[test]
     fn test_v5_json_without_loudness_parses_as_none() {
-        // A v5 sidecar (has key, predates loudness) must stay readable.
+        // A v5 sidecar (has key, predates loudness) must stay READABLE —
+        // but as of v8 it is no longer cache-valid: v4–v7 artifacts are
+        // ambiguous about the rigid-grid beat fit, so `matches_source`
+        // rejects them and they regenerate.
         let mut artifact = test_artifact();
         artifact.version = 5;
         artifact.loudness = None;
@@ -590,7 +605,8 @@ mod tests {
         assert_eq!(parsed.loudness, None);
         assert!(parsed.tempo_candidates.is_empty());
         assert_eq!(parsed.key, test_artifact().key);
-        assert!(parsed.version >= MIN_COMPATIBLE_VERSION);
+        assert!(parsed.version < MIN_COMPATIBLE_VERSION);
+        assert!(!parsed.matches_source(&[0.0; 4], 44100));
     }
 
     #[test]
