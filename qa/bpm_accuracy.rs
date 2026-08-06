@@ -1241,6 +1241,84 @@ fn bpm_accuracy() {
     }
 }
 
+/// ROADMAP Stage 10 variable-tempo evidence: a synthetic 120 → 132 BPM
+/// linear ramp (kick thump + beater click; beat times recorded during
+/// synthesis, so ground truth is exact by construction) must be tracked
+/// by the SHIPPING analysis path — `analyze_for_dj`, which includes both
+/// rigid-grid adoption gates. This doubles as the end-to-end guard that
+/// no adoption gate flattens a ramp onto a constant grid (`phase_lock`
+/// reads a deceptive ~0.77 on this class; the smeared sanity floor is
+/// what rejects it at high lock, and the corroboration agreement — 0.25
+/// here — guards the low-lock entry).
+#[test]
+fn tempo_ramp_fixture_tracks_within_tolerance() {
+    let sr = 44_100u32;
+    let srf = sr as f64;
+    let seconds = 45.0;
+    let len = (srf * seconds) as usize;
+    let mut audio = vec![0.0f32; len];
+    let mut truth: Vec<f64> = Vec::new();
+    let mut pos = 0.0f64;
+    while (pos as usize) < len {
+        let at = pos as usize;
+        truth.push(pos / srf);
+        for i in 0..3000.min(len - at) {
+            let t = i as f64 / srf;
+            audio[at + i] +=
+                (0.9 * (-t * 40.0).exp() * (2.0 * std::f64::consts::PI * 60.0 * t).sin()
+                    + 0.5 * (-t * 400.0).exp() * (2.0 * std::f64::consts::PI * 3000.0 * t).sin())
+                    as f32;
+        }
+        let frac = pos / len as f64;
+        let bpm = 120.0 + 12.0 * frac;
+        pos += 60.0 * srf / bpm;
+    }
+
+    let artifact = timestretch::analyze_for_dj(&audio, sr);
+    let detected: Vec<f64> = artifact
+        .beat_positions_fractional
+        .iter()
+        .map(|&p| p / srf)
+        .collect();
+
+    // Score the interior (clear of analysis warm-up and the tail).
+    let interior: Vec<f64> = truth
+        .iter()
+        .copied()
+        .filter(|&t| t > 2.0 && t < seconds - 2.0)
+        .collect();
+    let f = beat_f_measure(&detected, &interior, BEAT_TOLERANCE_SECS);
+    let continuity = continuity_ratio(&detected, &interior);
+    println!("tempo ramp: beat F {f:.3}, continuity {continuity:.3}");
+    assert!(
+        f >= 0.85,
+        "tempo ramp under-tracked: beat F {f:.3} (Stage 10 floor 0.85)"
+    );
+    assert!(
+        continuity >= 0.75,
+        "tempo ramp tracking fragmented: continuity {continuity:.3}"
+    );
+
+    // The detected grid must actually FOLLOW the ramp — a constant grid
+    // (wrongly adopted rigid fit) scores near-zero F here anyway, but
+    // assert the tempo trend directly so the failure reads clearly.
+    let mean_interval = |beats: &[f64]| -> f64 {
+        let iv: Vec<f64> = beats.windows(2).map(|w| w[1] - w[0]).collect();
+        iv.iter().sum::<f64>() / iv.len().max(1) as f64
+    };
+    let early: Vec<f64> = detected.iter().copied().filter(|&t| t < 10.0).collect();
+    let late: Vec<f64> = detected
+        .iter()
+        .copied()
+        .filter(|&t| t > seconds - 10.0)
+        .collect();
+    let (e, l) = (mean_interval(&early), mean_interval(&late));
+    assert!(
+        l < e * 0.97,
+        "detected grid does not follow the ramp: early interval {e:.4}s vs late {l:.4}s"
+    );
+}
+
 /// End-to-end smoke test on checked-in fixtures so the pipeline is exercised
 /// even when no benchmark corpus is present locally.
 #[test]
