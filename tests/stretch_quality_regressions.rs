@@ -107,7 +107,11 @@ fn test_sinusoid_2x_offline_preserves_pitch_and_shape() {
         len_diff
     );
 
-    let f_est = dominant_freq(&output[2000..4000], freq as f64, 40.0);
+    // Measure in the steady-state middle: the first ~4000 samples carry the
+    // batch path's edge-ramp content, whose instantaneous frequency reads
+    // low (zero-crossing sweep: 440.26 Hz in the leading segment vs
+    // 440.97–441.18 Hz across the middle at the Stage 13 hop = FFT/8).
+    let f_est = dominant_freq(&output[6000..14000], freq as f64, 40.0);
     assert!(
         (f_est - freq as f64).abs() < 0.35,
         "ratio=2.0 frequency drift too large: expected={}Hz got={:.6}Hz",
@@ -177,19 +181,29 @@ fn test_ratio_sweep_sine_length_and_pitch() {
 // pitch-corrected — its pitch follows tempo, exactly as on a deck — so
 // the 100 Hz partial lands at 100/ratio Hz on that path and at 100 Hz on
 // the wide-ratio PV path. Balance bounds are engine-measured baselines
-// (ideal amplitude ratio 0.35/0.65 ≈ 0.538); the wide margin at ratio 0.5
-// reflects the wide-PV's known low-band level loss at heavy compression,
-// which is quality-secondary per the EDM/DJ-first product boundary.
+// (ideal amplitude ratio 0.35/0.65 ≈ 0.538). The ratio-0.5 band once sat
+// at 1.5–4.0 — the wide-PV's low-band level loss at heavy compression;
+// the Stage 13 phase-hygiene fixes plus hop = FFT/8 shrank that loss
+// (measured balance 0.753, re-pinned with margin).
 #[test]
 fn test_ratio_sweep_two_tone_peak_bins() {
     let n = 12_000usize;
     // (ratio, expected low-tone Hz, balance range for e1000/e_low)
     let cases = [
-        (0.5, 100.0, 1.5..4.0),
+        (0.5, 100.0, 0.55..1.15),
         (0.75, 100.0, 0.5..1.1),
         (1.0, 100.0, 0.49..0.59),
         (1.25, 80.0, 0.40..0.75),
-        (2.0, 100.0, 0.35..0.72),
+        // Ratio 2.0: hop = FFT/8 (the live wide stage's mandatory overlap,
+        // adopted offline at Stage 13) attenuates tones in the rigid
+        // sub-bass region (< ~107 Hz) at heavy slowdown — measured balance
+        // 2.14 vs ~0.5 at the old hop = FFT/4, while tones above the
+        // boundary stay at the ideal balance (probe 2026-08-05, LEARNINGS).
+        // The old hop kept sub-bass cleaner at ratio 2 but is the
+        // documented level/click blowup at ratio 4; offline follows the
+        // live configuration. Band pins the current loss so it cannot
+        // silently worsen; improving it is Stage 14/16 territory.
+        (2.0, 100.0, 1.3..3.4),
     ];
     for (ratio, f_low, balance_range) in cases {
         let input = gen_two_tone(100.0, 0.65, 1000.0, 0.35, SR, n);
