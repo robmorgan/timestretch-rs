@@ -281,3 +281,36 @@ in PR #37; the core seam item in PR #38 (`c767181`/`629d6d6` line).
   gentle ride.** Optional items (fractional correlation reference,
   strength-aware protection, modulation_hold wiring) remain
   evidence-gated: each lands only if it moves a gate.
+
+## Stage 10 — Tracked-Beat Corroboration for Rigid Grids (2026-08-07)
+
+The three rigid-grid non-adopters (MSBWY, Hot Stuff, Somebody To Love —
+syncopated disco, lock 0.109–0.181 vs the 0.3 gate) resisted both
+roadmap disambiguation candidates, prototyped and measured before the
+fix landed:
+
+- **Slot exclusion failed**: rival-phase landscapes showed the
+  competitors at *swung* subdivision offsets (Hot Stuff peaks at
+  6–10/32 period, MSBWY at 25/32), not one excludable anti-phase slot;
+  stacking exclusion zones until specific tracks pass is
+  threshold-lowering in disguise.
+- **Onset-sharpness weighting failed**: squared-envelope emphasis helped
+  two tracks but made Hot Stuff WORSE (0.109 → 0.072) — disco bass is as
+  punchy as the kick in the kick band.
+- **What worked: corroboration by an independent estimator.** The DP
+  tracker (full-band novelty, not the kick-band phase circle)
+  independently lands ≥ 90% of its beats on the rigid grid for the truly
+  rigid tracks (MSBWY 0.98, Hot Stuff 0.90) and collapses on genuinely
+  non-rigid material (tempo-ramp control 0.25 — which phase_lock alone
+  would wrongly trust at 0.77 — and Somebody 0.28, real estimator
+  disagreement). Adoption gate: lock ≥ 0.3 OR agreement ≥ 0.6 (mid-gap
+  between the measured ≤ 0.28 and ≥ 0.90 clusters), sanity floor
+  unchanged.
+
+Corpus results: MSBWY/Hot Stuff beat F 0.95/0.93 → **1.00**, downbeat F
+→ 1.0, offsets sub-ms; 33rd Rate Revs X downbeat F 0 → 1.0; 13/16
+harness rows byte-identical; ramp/jitter unit controls green.
+PREANALYSIS_VERSION → 9/9 (first application of the CLAUDE.md policy).
+Lessons: two agreeing independent estimators beat one reshaped metric —
+and when a fixture needs a beater click before the tracker behaves like
+it does on real kicks, the fixture was the problem, not the tracker.
