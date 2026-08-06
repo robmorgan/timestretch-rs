@@ -252,3 +252,32 @@ ratio 1.0.
   stash A/B before touching the band — one "regression" was an
   improvement, one was the pre-existing live-path sub-bass trait
   surfacing (recorded above).
+
+## Stage 15 — DJ-Band Ride Polish (2026-08-07)
+
+Fade-band per-sample ramp (D6) and the `modulation_hold` contract landed
+in PR #37; the core seam item in PR #38 (`c767181`/`629d6d6` line).
+
+- **Characterization before code**: sustained mild rides (0.5–1%
+  deviation — the mix-in gesture) held the 120 Hz crossover seam at
+  −7 dB for the whole ride; drift sawtooths to the full 192-frame
+  trigger and rest recovery needs ~150 ms of stillness. Strong rides and
+  parked faders were already fine.
+- **Fix**: mild-motion bounded recenter — the rest-splice mechanism
+  without its dwell, at drift > 96 when deviation < 1.2%. Measured:
+  worst comb −7.1 → −4.4 dB, riding steady-state −2.5 → −1.2 dB, safe
+  profiles bit-identical, ~5 bounded splices/s.
+- **Negative result worth keeping**: simply tightening the general drift
+  trigger made everything WORSE (−5.5 dB persistent, even at rest) —
+  unbounded early splices park drift on the dominant-period grid on
+  periodic content (the #62 pathology). The landing bound is the
+  load-bearing part of early splicing, not the trigger level.
+- Gates: `seam_survives_a_sustained_mild_ride` (fails pre-fix at
+  −7.14 dB), `fade_band_rate_steps_are_click_free` (fails pre-fix at
+  ~3.5× tone slew); `qa/engine_keylock` + `qa/engine_transients`
+  promoted into CI. Cents-wobble and A/B-matrix gates unchanged.
+- **Owner listen (2026-08-06, live desktop deck, branch `629d6d6`):
+  "definitely an improvement" — bass body stable through a sustained
+  gentle ride.** Optional items (fractional correlation reference,
+  strength-aware protection, modulation_hold wiring) remain
+  evidence-gated: each lands only if it moves a gate.

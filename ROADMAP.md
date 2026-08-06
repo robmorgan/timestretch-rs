@@ -32,13 +32,17 @@ contract (zero-alloc, WCET-gated), Rubber Band reference gate in CI.
 Stage 13 (wide-path phase hygiene) completed 2026-08-06 — four confirmed
 correctness bugs fixed, null SER 59→139 dB, owner ±50% verdict "significantly
 better," Rubber Band gap narrowed (R3 still ahead); archived in LEARNINGS.md.
+Stage 15 (DJ-band ride polish) completed 2026-08-07 (PRs #37/#38) — fade-band
+clicks gated, seam comb during sustained mild rides −7.1→−4.4 dB with the
+mild-motion bounded recenter, ride-quality harnesses in CI, owner mix-in
+listen passed; archived in LEARNINGS.md. Its optional items (correlation
+reference, strength gating, modulation_hold wiring) remain evidence-gated
+ideas, not scheduled work.
 
 Open, in priority order for the DJ app:
 
 - **Stage 10** — beat-grid trust on everything a DJ loads (evidence half +
   the offbeat-bass non-adopters).
-- **Stage 15** — DJ-band ride polish (seam recovery under continuous rides,
-  fade-band zipper).
 - **Stage 14** — wide-path consolidation (offline uses the shipped stage,
   stereo coupling, dead-code removal).
 - **Stage 16** — tonal-HF granulation: measure audibility on real material,
@@ -118,8 +122,8 @@ corrected bass can win when latency permits.
 ## Stage Sequence
 
 Stages are independent tracks except: 16's verdict gates any future
-DJ-band tonal-quality stage. (Stage 13, which 14 and 16 depended on, is
-complete.) Suggested order: 10 and 15 in parallel, then 14, 16, 17, 12.
+DJ-band tonal-quality stage. (Stages 13 and 15 are complete.) Suggested
+order: 10, then 14, 16, 17, 12.
 
 ## [ ] Stage 10: General-Purpose Beat Tracking and BPM Detection
 
@@ -272,87 +276,6 @@ broken `LR8Crossover` kept only for baselines that no longer exist.
   chain (A/B matrix re-run green).
 - Owner listen at ±30/±50% vs pre-consolidation renders.
 
-## [ ] Stage 15: DJ-Band Ride Polish — Seam Recovery and Fade Smoothing
-
-Automation: auto
-
-> **Status (2026-08-06): fade smoothing and the modulation-hold
-> contradiction resolved** (branch `fix/fade-ramp-hold-doc-artifact-version`):
-> the extreme-rate correction weight now chases its target per sample at
-> the toggle-fade slew bound, gated by a fade-band rate-step click test
-> (per-block steps measured ~3.5× the tone-slew bound; the chase ~0.9×).
-> `modulation_hold` resolved as a doc fix: `stage.rs` now records that the
-> wide stage is its sole consumer and WHY SOLA deliberately does not read
-> it (suppressing opportunistic splices during rides would push drift into
-> forced onset-unprotected splices) — wiring it remains the evidence-gated
-> experiment below.
->
-> **Seam recovery under motion landed 2026-08-06** (branch
-> `feat/ride-seam-recovery`): characterization showed sustained mild rides
-> (0.5–1% deviation — the mix-in gesture) comb the seam at −7 dB for the
-> whole ride, because drift sawtooths to the full 192-frame trigger and
-> rest recovery needs stillness. Fix: a mild-motion BOUNDED recenter
-> (rest-splice mechanism, no dwell) at drift > 96 when deviation < 1.2%.
-> Measured: worst comb −7.1 → −4.4 dB, riding steady-state −2.5 → −1.2 dB,
-> safe profiles bit-identical, ~5 bounded splices/s. A first attempt that
-> tightened the general trigger made things WORSE (−5.5 dB persistent) —
-> unbounded early splices park on the dominant-period grid; the landing
-> bound is the load-bearing part. Gated by
-> `seam_survives_a_sustained_mild_ride` (fails pre-fix at −7.14). QA
-> harnesses `engine_keylock` + `engine_transients` promoted into CI.
-> **Owner mix-in listen passed (2026-08-06, live desktop deck, this
-> branch): "definitely an improvement" — bass body stable through a
-> sustained gentle ride.** With the fade-band click gate (D6, PR #37) and
-> the QA harnesses in CI, the stage's mandatory exit criteria are met on
-> merge. The correlation-reference/strength items and the
-> modulation_hold wiring experiment stay explicitly optional — each
-> lands only if it moves a gate, and the stage does not wait for them.
-
-### Why
-
-Three review findings degrade exactly the gesture DJs perform most —
-riding the fader (details in LEARNINGS.md): (1) the crossover seam combs
-while SOLA's elastic drift is parked, and rest recentering requires
-~150 ms of *sustained* near-unity, which a continuous ride never provides;
-(2) beyond ±20.5% the correction fade steps its gain per 32-frame block
-between two differently-pitched signals — the one unsmoothed control in
-the chain; (3) `ctx.modulation_hold` is documented as suppressing
-discretionary splices but is never delivered to SOLA.
-
-### Primary Files
-
-- `src/engine/stages/sola.rs`, `src/engine/stages/keylock.rs`,
-  `src/engine/stage.rs` (doc or plumbing), `qa/engine_keylock.rs` (new
-  ride-seam and fade-band gates; promote this harness plus
-  `qa/engine_transients.rs` into the CI quality-gates job)
-
-### Work
-
-- **Seam recovery under motion**: extend the drift-bleed trim (currently
-  rest-gated) to act — sub-JND — during sustained rides, or lower the
-  effective drift ceiling during rides so parked offsets can't persist for
-  the length of a mix-in. Measure with a seam-tone comb-depth metric over
-  a 30 s continuous ±8% ride (the existing seam fixtures compose).
-- **Per-sample correction-fade ramp** (`keylock.rs:124-127`), mirroring
-  the `enable_w` per-sample chase; add a fade-band ride click gate
-  (deviation sweep 0.18→0.30).
-- **`modulation_hold` truth**: either forward it into SOLA's discretionary
-  splice gating (rest recenter, quiet-gap opportunism) or fix the
-  `stage.rs:130-134` doc to match reality. Decide by measuring splice
-  audibility during rides with/without the hold.
-- Optional, evidence-gated: fractionally align SOLA's correlation
-  reference to the read cursor phase (`sola.rs:587-588`) and use
-  `OnsetEvent.strength` to scale protection windows — each lands only if a
-  gate moves.
-
-### Exit Criteria
-
-- Seam comb depth during a continuous ±8% ride bounded and gated (target
-  from measurement; the post-nudge recovery gate stays green).
-- Zero clicks through the fade band under fast rides.
-- `qa/engine_keylock.rs` and `qa/engine_transients.rs` run in CI.
-- Owner listen: bass body stable through a sustained mix-in ride.
-
 ## [ ] Stage 16: Tonal-HF Granulation — Measure, Then Decide
 
 Automation: manual
@@ -487,7 +410,7 @@ in addition:
   done), its offline and live renders are the same algorithm, and stereo
   coherence is gated (Stage 14).
 - Riding the fader degrades nothing that holding it steady doesn't
-  (Stage 15).
+  (Stage 15, done — seam and fade gates hold in CI).
 - The tonal-HF granulation floor has a recorded listening verdict — fixed,
   or documented as scope (Stage 16).
 - No public path resamples without anti-aliasing (Stage 17).
