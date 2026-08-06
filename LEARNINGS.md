@@ -225,3 +225,30 @@ Improving sub-bass at heavy slowdown is Stage 14/16 material.
   stale evidence and gets a cheap re-audition (ROADMAP Stages 13/16), not
   silent standing. Corollary: record the implementation state (commit,
   known defects) alongside every recorded listening verdict.
+
+## Stage 13 — Wide-Path Phase Hygiene (2026-08-06)
+
+Fixed the four confirmed phase-domain defects from the quality review
+(commit `fb7dcfa`, merged PR #36; fade/hold/version follow-ups in PR #37):
+wrapped `phase_accum`, wrapped-difference coherence blends, real
+DC/Nyquist, offline wide hop = FFT/8, `stretch_into` bypass parity, plus
+`tests/pv_null.rs` — the first tests to exercise the vocoder itself at
+ratio 1.0.
+
+- **Measured (A/B vs pre-fix)**: PV-direct null at ratio 1.0 went 59 →
+  139 dB SER; 5 kHz purity at ratio 1.5 went ~25 → ~57 dB, flat over the
+  render. Falsification sidecar re-run (300 rows vs the Stage 11
+  baseline): shipped arm improved mean |LUFS error| 2.75 → 1.90 dB, RB
+  similarity held, zero click increases; the diagnostic arms running the
+  buggy paths hardest dropped ~80–125 clicks/M.
+- **Owner listen (2026-08-06, ±50%, `norm/` level-matched renders,
+  implementation `fb7dcfa` + sidecar rerun)**: "significantly better"
+  than the Stage 11 renders; **the Rubber Band gap narrowed but R3
+  remains ahead** — the wide-rate acceptance holds on fresher, smaller
+  evidence.
+- Re-pinning lesson: two wide-path baselines had encoded pre-fix behavior
+  (an edge-ramp-biased pitch measurement window; a two-tone balance band
+  built around the old low-band loss). Every re-pin was attributed by
+  stash A/B before touching the band — one "regression" was an
+  improvement, one was the pre-existing live-path sub-bass trait
+  surfacing (recorded above).

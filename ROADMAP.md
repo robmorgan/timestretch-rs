@@ -29,10 +29,12 @@ transient control, `.tsa` analysis container (v0.11.0), musical key
 detection, rigid beat grids for quantized material, machine-verified RT
 contract (zero-alloc, WCET-gated), Rubber Band reference gate in CI.
 
+Stage 13 (wide-path phase hygiene) completed 2026-08-06 — four confirmed
+correctness bugs fixed, null SER 59→139 dB, owner ±50% verdict "significantly
+better," Rubber Band gap narrowed (R3 still ahead); archived in LEARNINGS.md.
+
 Open, in priority order for the DJ app:
 
-- **Stage 13** — wide-path phase hygiene: four confirmed correctness bugs,
-  small diffs, zero DJ-chain risk.
 - **Stage 10** — beat-grid trust on everything a DJ loads (evidence half +
   the offbeat-bass non-adopters).
 - **Stage 15** — DJ-band ride polish (seam recovery under continuous rides,
@@ -78,9 +80,12 @@ exactly the "phasey" artifact that condemned it:
 - *The accepted wide-rate Rubber Band gap* (Stage 11 verdict: audibly
   behind R3, shippable).
 
-Both verdicts stand as shipped behavior, but their evidence is stale:
-Stage 16 re-auditions the first on a post-Stage-13 PV, and Stage 13's
-exit listen re-baselines the second. The un-keylocked low band is **not**
+Both verdicts stand as shipped behavior. The second was re-baselined at
+Stage 13's exit listen (2026-08-06, commit `fb7dcfa`+sidecar rerun): the
+fixed PV sounds "significantly better" at ±50% and the gap to R3
+narrowed, though R3 remains ahead — the acceptance holds with fresher,
+smaller evidence. The first still awaits the Stage 16 re-audition on the
+fixed PV. The un-keylocked low band is **not**
 similarly contaminated — its load-bearing justification at DJ ratios is
 the ≤ 15 ms latency budget (a bass-resolving FFT cannot fit), which no
 review finding touches; Stage 11's full-spectrum result already shows
@@ -98,8 +103,9 @@ corrected bass can win when latency permits.
   named fallback before build-out.
 - **The accepted scope lines stay accepted until re-litigated with
   evidence**: sub-120 Hz follows tempo at DJ ratios; the wide-rate Rubber
-  Band gap ("audibly behind R3, shippable") stands per the Stage 11
-  sign-off.
+  Band gap stands, re-baselined smaller at Stage 13 (2026-08-06: R3
+  still ahead at ±50%, but the fixed PV is "significantly better" than
+  the Stage 11 renders).
 
 ## Principles
 
@@ -111,11 +117,9 @@ corrected bass can win when latency permits.
 
 ## Stage Sequence
 
-Stages are independent tracks except: 13 → 14 (hygiene lands before
-consolidation rebaselines wide-path QA), 13 → 16 (the re-audition needs
-the fixed PV), and 16's verdict gates any future DJ-band tonal-quality
-stage. Suggested order: 13 first (hours, pure win), then 10 and 15 in
-parallel, then 14, 16, 17, 12.
+Stages are independent tracks except: 16's verdict gates any future
+DJ-band tonal-quality stage. (Stage 13, which 14 and 16 depended on, is
+complete.) Suggested order: 10 and 15 in parallel, then 14, 16, 17, 12.
 
 ## [ ] Stage 10: General-Purpose Beat Tracking and BPM Detection
 
@@ -208,78 +212,6 @@ benefits regardless. Touches no DSP.
 - Machine-checked: no panic reachable from the public API on arbitrary
   input.
 - Soak harness green in CI (bounded), full-length recipe documented.
-
-## [ ] Stage 13: Wide-Path Phase Hygiene
-
-Automation: auto
-
-> **Status (2026-08-05): implementation landed** (branch
-> `fix/pv-phase-hygiene`): wrapped accumulator, wrapped-difference
-> blends, real DC/Nyquist, offline hop = FFT/8, `stretch_into` bypass
-> parity, `tests/pv_null.rs`. Measured: PV-direct null at ratio 1.0
-> 59 → 139 dB SER; 5 kHz purity at ratio 1.5 ~25 → ~57 dB. Follow-up
-> finding recorded in LEARNINGS.md: hop/8 pins a rigid sub-bass
-> attenuation at heavy slowdown (live-path trait, now gated so it can't
-> silently worsen). Merged to main 2026-08-06 (PR #36).
->
-> **Falsification sidecar re-run (2026-08-06): no regression, measurable
-> gains.** 300-row A/B vs the saved Stage 11 summary: the shipped arm
-> (`widepv_blend_hop8`) improved mean |LUFS error| vs source 2.75 →
-> 1.90 dB with Rubber Band spectral similarity held (0.76–0.99) and
-> ZERO click increases anywhere; the diagnostic arms that ran the buggy
-> phase paths hardest (1024/bare/cohblend/resets) dropped ~80–125
-> clicks/M — the fixes removed real artifacts, not just theoretical
-> ones. Renders + level-matched `norm/` copies in
-> `target/wide_falsification/`. Remaining exit criterion: the owner
-> listen at ±50% including the Rubber Band A/B re-baseline.
-
-### Why
-
-The 2026-08-05 review confirmed four correctness bugs in the wide-ratio
-phase vocoder (evidence and line references in LEARNINGS.md). All are
-small, mechanical fixes that exclusively touch the wide path — the shipping
-DJ ±20% chain has zero regression exposure — and they aim directly at the
-one quality gap the project has formally conceded ("audibly behind R3 at
-all wide rates"). This is the cheapest real quality work in the repo.
-
-### Primary Files
-
-- `src/stretch/phase_vocoder.rs` (accumulator wrap, blend fixes,
-  DC/Nyquist), `src/engine/offline.rs` (hop constant), `src/lib.rs`
-  (`stretch_into` bypass parity), new `tests/pv_null.rs`
-
-### Work
-
-- **Wrap `phase_accum`** into (−π, π] after each accumulation (three sites
-  + seeds). Kills the f32-downcast precision decay on long
-  streams/renders; makes the `:1555` downcast harmless.
-- **Wrapped-difference blends**: replace both linear phase mixes with
-  `φ₁ + b·wrap(φ₂ − φ₁)` (gradient blend `:1624-1629`, IF blend
-  `:1295-1298`).
-- **Force DC and Nyquist real** in `reconstruct_spectrum` (sign-preserving
-  magnitude, zero imaginary part).
-- **Offline wide hop → `WIDE_PV_FFT / 8`** (`offline.rs:169`) — the live
-  stage documents FFT/4 as the −75% blowup configuration.
-- **`stretch_into` gets the ratio-1.0 exact-passthrough fast path**
-  matching `stretch()`.
-- **PV-direct null test** (the review's biggest test gap): drive
-  `PhaseVocoder` itself at ratio 1.0, batch and streaming, on a
-  tone+noise mix; report peak residual, RMS residual, SER, latency offset,
-  and output-length delta. Gate SER after the blend fix (the blends are
-  the current dominant error term at 1.0). Add a long-render purity-decay
-  test (10-min tone; last 10 s within 3 dB of first 10 s) gating the
-  accumulator wrap.
-
-### Exit Criteria
-
-- All four fixes landed; PV null and purity-decay tests green and gated.
-- Wide falsification objective sidecar re-run: no click/LUFS regression;
-  offline ratio-4.0 render now matches the live-path click/level profile.
-- Owner spot-listen at ±50% (the wrapped blends will shift wide output):
-  no regression vs the Stage 11 renders — and the Rubber Band A/B re-run
-  at the Stage 11 rates, since the accepted wide-rate gap was measured
-  against the pre-fix PV. Record here whether the gap narrowed; the
-  Stage 11 acceptance is a floor, not a ceiling.
 
 ## [ ] Stage 14: Wide-Path Consolidation and Stereo Coherence
 
@@ -419,8 +351,8 @@ killed the small-FFT PV — and settled "SOLA owns the corrected range" —
 was run against a PV carrying the Stage 13 defects, whose unwrapped-phase
 blends manufacture exactly the phasiness that condemned it (see the
 Architecture evidence caveat). So: falsification-style listening first,
-on fixed implementations, build-out only on evidence. Depends on
-Stage 13.
+on fixed implementations, build-out only on evidence. Stage 13 (the
+dependency) is complete — the fixed PV is available to audition.
 
 ### Work
 
@@ -499,8 +431,9 @@ the same care. Off the DJ hot path, but it is public API quality.
 - SIMD / architecture-specific acceleration (WCET gates exist to measure
   any attempt against; current headroom is comfortable).
 - Cross-frame peak tracking / multi-resolution wide path — the RB-class
-  coherence work. Revisit only if Stage 13+14 listening still shows the
-  wide gap mattering in practice; the Stage 11 acceptance stands.
+  coherence work. Revisit only if post-Stage-14 listening still shows the
+  wide gap mattering in practice; Stage 13 already narrowed it (owner
+  verdict 2026-08-06) and the acceptance stands.
 - Desktop UI/UX polish beyond its role as the reference integration.
 - Additional presets, wider API surface, convenience wrappers.
 - General-purpose (non-EDM) *stretch* quality (analysis generality is
@@ -531,9 +464,9 @@ in addition:
 
 - Trustworthy beat grids on everything a DJ loads, gated on an annotated
   corpus that includes non-EDM and variable-tempo material (Stage 10).
-- The wide-ratio path is free of known correctness defects, its offline
-  and live renders are the same algorithm, and stereo coherence is gated
-  (Stages 13–14).
+- The wide-ratio path is free of known correctness defects (Stage 13,
+  done), its offline and live renders are the same algorithm, and stereo
+  coherence is gated (Stage 14).
 - Riding the fader degrades nothing that holding it steady doesn't
   (Stage 15).
 - The tonal-HF granulation floor has a recorded listening verdict — fixed,
