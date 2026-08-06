@@ -154,11 +154,12 @@ intervals draws instead).
 
 ### Work
 
-- **Corpus evidence half** (unchanged from the original stage): non-EDM and
-  variable-tempo entries with annotated grids (hip-hop ~90, DnB ~174, a
-  synthetic tempo-ramp fixture, at least one live-drummer recording);
-  explicit acc2/F-measure floors on the non-EDM subset in CI; the QM Vamp
-  baseline column (output-only — qm-dsp is GPL, never source).
+- **Corpus evidence half**: non-EDM entries with annotated grids (hip-hop
+  ~90, DnB ~174, at least one live-drummer recording); explicit
+  acc2/F-measure floors on the non-EDM subset in CI; the QM Vamp baseline
+  column (output-only — qm-dsp is GPL, never source). The synthetic
+  tempo-ramp fixture is ~~done~~ (2026-08-07, in-harness, no committed
+  audio).
 - ~~Offbeat-bass disambiguation~~ **done 2026-08-07** (branch
   `feat/rigid-grid-offbeat-disambiguation`): both roadmap candidates
   (slot exclusion, onset-sharpness weighting) were prototyped and failed
@@ -172,6 +173,12 @@ intervals draws instead).
   phase-indecisive" bucket); a tempo-ramp control that phase_lock alone
   would wrongly trust at 0.77 is rejected at 0.25. The 0.3 gate itself
   is untouched. PREANALYSIS_VERSION → 9/9 per the CLAUDE.md policy.
+  **Desktop owner check passed 2026-08-07** ("the grids are spot on" —
+  Hot Stuff/MSBWY markers dead-on after sidecar regeneration). The
+  synthetic tempo-ramp fixture also landed (merged with PR #39): 120→132
+  BPM ramp with exact ground truth, scored through the shipping path in
+  the CI harness — beat F 0.956 vs the 0.85 floor, continuity 1.000,
+  tempo-trend asserted.
 - ~~Artifact invalidation policy~~ **done 2026-08-06**: versions bumped
   to 8/8 so ambiguous v4–v7 sidecars regenerate; policy written into the
   `src/core/preanalysis.rs` constant docs and RELEASE_CHECKLIST.md (which
