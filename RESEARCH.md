@@ -305,8 +305,10 @@ offline wide-ratio fallback, `src/engine/offline.rs`) in August 2026.
   re-seeds phase but shows no level dips or spectral degradation
   (similarity 0.9995 vs the no-reset run). The legacy harm was evidently an
   interaction with the deleted engine's scheduling/overlap machinery, not a
-  universal PV law. Treat as historical, engine-specific guidance; the reset
-  machinery in `phase_vocoder.rs` is currently dormant (no callers).
+  universal PV law. Treat as historical, engine-specific guidance. The reset
+  machinery is live: the wide keylock stage calls
+  `reset_phase_state_bands` on onset events
+  (`src/engine/stages/wide_keylock.rs`).
 
 ### Historical (died with the streaming PV engine — kept as context)
 

@@ -197,11 +197,11 @@ Improving sub-bass at heavy slowdown is Stage 14/16 material.
   fractional cursor while candidates are sinc-interpolated
   (`sola.rs:587-588` vs `:645-668`) — sub-sample splice alignment is
   measured against a phase-offset reference.
-- Minor dead weight: `hop_synthesis` field is DSP-dead; the envelope
-  "correction" is provably ×1.0 (`phase_vocoder.rs:1333-1335`, dormant);
-  ~200 lines of seam re-anchoring cases are dead in production but pinned by
-  ~25 tests; three `bessel_i0` copies; stale `Makefile`/`qa/README.md`/
-  `RESEARCH.md` references.
+- Minor dead weight (all removed in the Stage 14 dead-code sweep): the
+  DSP-dead `hop_synthesis` field; the dormant identity envelope
+  "correction"; ~200 lines of production-dead seam re-anchoring pinned only
+  by its own tests; three `bessel_i0` copies; stale
+  `Makefile`/`qa/README.md`/`RESEARCH.md` references.
 
 **Cross-cutting lessons this review adds:**
 

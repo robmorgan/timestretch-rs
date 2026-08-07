@@ -125,27 +125,28 @@ Outputs are written to `target/rubberband_benchmark/`:
 
 ## CI Quality Gate Subset
 
-CI enforces a corpus-independent benchmark subset via:
+CI enforces corpus-independent quality gates via the engine harnesses:
 
 ```bash
-cargo test --features qa-harnesses --test quality_gates -- --nocapture
+cargo test --features qa-harnesses --release --test engine_ab_matrix -- --nocapture
+cargo test --features qa-harnesses --release --test engine_keylock -- --nocapture
 ```
 
 CI also enforces a strict worst-case callback-time budget gate in release mode:
 
 ```bash
-TIMESTRETCH_STRICT_CALLBACK_BUDGET=1 cargo test --features qa-harnesses --release --test quality_gates -- --nocapture
+TIMESTRETCH_STRICT_CALLBACK_BUDGET=1 cargo test --features qa-harnesses --release --test engine_wcet -- --nocapture
 ```
 
 To emit machine-readable dashboard artifacts locally:
 
 ```bash
-TIMESTRETCH_QUALITY_DASHBOARD_DIR=target/quality_dashboard cargo test --features qa-harnesses --test quality_gates -- --nocapture
+TIMESTRETCH_QUALITY_DASHBOARD_DIR=target/quality_dashboard cargo test --features qa-harnesses --release --test engine_ab_matrix -- --nocapture
 ```
 
-This writes per-gate CSV files under `target/quality_dashboard/`.
+This writes the `ab_matrix.csv` dashboard under `target/quality_dashboard/`.
 
-This test uses synthetic DJ-like material and fails on regressions for:
+These harnesses use synthetic DJ-like material and fail on regressions for:
 
 - duration error
 - transient alignment

@@ -5,19 +5,32 @@ These harnesses are excluded from default `cargo test`.
 Run them explicitly with `--features qa-harnesses`, for example:
 
 - `cargo test --features qa-harnesses --release --test benchmarks -- --nocapture`
-- `cargo test --features qa-harnesses --test quality_gates -- --nocapture`
+- `cargo test --features qa-harnesses --release --test engine_ab_matrix -- --nocapture`
+- `cargo test --features qa-harnesses --release --test engine_keylock -- --nocapture`
+- `TIMESTRETCH_STRICT_CALLBACK_BUDGET=1 cargo test --features qa-harnesses --release --test engine_wcet -- --nocapture`
 - `cargo test --features qa-harnesses --test reference_quality -- --nocapture`
 - `cargo test --features qa-harnesses --release --test bpm_accuracy -- --nocapture`
-- `cargo test --features qa-harnesses --release --test varispeed_keylock -- --nocapture`
 
-## Varispeed Keylock (`varispeed_keylock`)
+## Engine Keylock (`engine_keylock`)
 
-Stage 15 pitch-stability gate: streams a pure 440 Hz tone through the
-±8%/2 s DJ ratio ride on both control paths and measures instantaneous
-frequency deviation in cents (interpolated zero crossings, 100 ms windows).
-The varispeed-first path is gated absolutely on the Live profile (p95/max)
-and relative to the vocoder-tempo baseline on every profile; the baseline
-rows are printed for comparison.
+Keylock-chain pitch-stability gate: streams a pure 440 Hz tone through the
+±8%/2 s DJ ratio ride and measures instantaneous frequency deviation in
+cents (interpolated zero crossings, 100 ms windows), gated absolutely on
+p95/max, plus a crossover-seam re-summation gate at the band seam.
+
+## Engine A/B Matrix (`engine_ab_matrix`)
+
+Full metric dashboard: every gated metric family, one machine-readable
+report (`ab_matrix.csv` in `TIMESTRETCH_QUALITY_DASHBOARD_DIR` or
+`target/ab_matrix/`) with one row per (metric, fixture, arm) and an
+absolute gate per metric.
+
+## Engine WCET (`engine_wcet`)
+
+Worst-case callback budget gates: per-callback wall time over the
+callback's audio duration, gated on p99.9. Timing assertions are enabled
+with `TIMESTRETCH_STRICT_CALLBACK_BUDGET=1`; without it the harness
+measures and prints only.
 
 ## BPM Accuracy (`bpm_accuracy`)
 
