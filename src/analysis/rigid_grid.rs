@@ -62,6 +62,12 @@ const CORROBORATION_MIN_AGREEMENT: f64 = 0.6;
 /// Tolerance for a tracked beat to count as landing on the rigid grid.
 /// Same figure as the smear radius: one vinyl-tight beat placement.
 const CORROBORATION_TOL_SECS: f64 = SMEAR_RADIUS_SECS;
+/// Confidence ceiling reported when BOTH adoption gates decline a fit
+/// (indecisive phase and no tracked-beat corroboration): estimator
+/// disagreement on quantized material means the tracked grid's phase is
+/// suspect no matter how internally consistent it looks. Below the
+/// desktop's low-confidence display threshold (0.6) by design.
+const PHASE_UNTRUSTED_CONFIDENCE_CAP: f32 = 0.5;
 /// Sanity floor: under a timing-tolerant (smeared) objective the rigid
 /// grid must reach at least this fraction of the tracked beats' score,
 /// so a decisive-but-wrong fit (e.g. seeded off an octave-wrong tempo on
@@ -232,6 +238,19 @@ pub fn refine_grid_rigid(samples: &[f32], sample_rate: u32, grid: BeatGrid) -> (
             .count();
         let agreement = hits as f64 / grid.beats.len() as f64;
         if agreement < CORROBORATION_MIN_AGREEMENT {
+            // Both adoption gates failed: the kick-band fit found the
+            // exact tempo but its phase is indecisive AND the tracked
+            // beats do not corroborate it — the two independent
+            // estimators genuinely disagree, which is positive evidence
+            // the surviving tracked grid's PHASE is untrustworthy on
+            // quantized material (corpus: Somebody To Love, beat F 0.31
+            // yet raw confidence 0.845 — the confidence metric scores
+            // internal consistency, not ground truth). Cap the reported
+            // confidence so hosts can show an honest low-confidence
+            // grid; ramps and live material are unaffected (their fits
+            // are declined by the sanity floor or never reach here).
+            let mut grid = grid;
+            grid.confidence = grid.confidence.min(PHASE_UNTRUSTED_CONFIDENCE_CAP);
             return (grid, false);
         }
     }
@@ -593,10 +612,15 @@ mod tests {
             // the tracked beats visit every phase of the rigid grid.
             *b += period * i as f64 / n;
         }
-        let (_grid, adopted) = refine_grid_rigid(&samples, SR, drifting);
+        let (grid, adopted) = refine_grid_rigid(&samples, SR, drifting);
         assert!(
             !adopted,
             "drifting tracked beats must not corroborate a rigid fit"
+        );
+        assert!(
+            grid.confidence <= PHASE_UNTRUSTED_CONFIDENCE_CAP,
+            "estimator disagreement must cap reported confidence, got {}",
+            grid.confidence
         );
     }
 

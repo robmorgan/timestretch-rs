@@ -52,6 +52,38 @@ pub(crate) mod palette {
     pub const PLAYED_TINT: Color32 = Color32::from_rgb(110, 110, 118);
 }
 
+/// Grid-confidence threshold below which the deck presents the grid as
+/// tentative: beat/downbeat ticks draw dimmed and the counter row shows a
+/// "grid: low confidence" hint.
+///
+/// What `timestretch::BeatGrid::confidence` means:
+/// - Tracked (DP) grids score 0.4 * tempogram path salience + 0.3 *
+///   beat-level onset support + 0.3 * interval regularity
+///   (`grid_confidence`, src/analysis/beat.rs:600-631).
+/// - Rigid-adopted grids keep at least that: confidence =
+///   `grid.confidence.max(fit.phase_lock)` (src/analysis/rigid_grid.rs:298),
+///   so rigid adoption never lowers the reading.
+///
+/// Corpus evidence (benchmarks/baselines/bpm_accuracy_baseline_latest.json):
+/// every real-music grid across the 16-track corpus — rigid-adopted or
+/// tracked — reports confidence 0.79-0.94. 0.6 sits with clear margin below
+/// that cluster, so a healthy grid never dims, while grids whose own
+/// evidence collapses (weak periodicity or poor beat-level onset support:
+/// ambient, rubato, speech-heavy material) fall through the salience and
+/// support terms of the formula and flag.
+///
+/// Honest limit: this flag cannot catch a wandering DP grid on quantized
+/// material — somebody-to-love-extended-mix measures confidence 0.845 with
+/// beat F 0.31 in the same baseline, because the metric scores internal
+/// consistency, not ground truth. That failure class is handled upstream by
+/// rigid-grid adoption and tracked-beat corroboration
+/// (src/analysis/rigid_grid.rs:45-61), not by this display threshold.
+pub(crate) const LOW_CONFIDENCE_THRESHOLD: f32 = 0.6;
+
+/// Gamma-space multiplier applied to tick colors on a low-confidence grid
+/// (~40% alpha versions of the palette colors).
+pub(crate) const LOW_CONFIDENCE_TICK_DIM: f32 = 0.4;
+
 /// Beats in a bar for the counter/phrase math. The Stage 10 grid carries a
 /// 4/4 prior; bars with other beat counts wrap modulo 4 for display.
 const BEATS_PER_BAR: usize = 4;
@@ -73,6 +105,10 @@ pub struct GridMarks {
     beat_in_bar: Vec<u8>,
     /// Median beat interval in frames (0.0 when fewer than 2 beats).
     median_beat_frames: f64,
+    /// Whether the detector's grid confidence fell below
+    /// [`LOW_CONFIDENCE_THRESHOLD`]; painters dim their ticks and the
+    /// counter row shows a hint.
+    low_confidence: bool,
 }
 
 impl GridMarks {
@@ -83,6 +119,7 @@ impl GridMarks {
             bar_of: Vec::new(),
             beat_in_bar: Vec::new(),
             median_beat_frames: 0.0,
+            low_confidence: false,
         }
     }
 
@@ -133,6 +170,7 @@ impl GridMarks {
             bar_of,
             beat_in_bar,
             median_beat_frames,
+            low_confidence: grid.confidence < LOW_CONFIDENCE_THRESHOLD,
         }
     }
 
@@ -143,6 +181,12 @@ impl GridMarks {
     /// Whether there is enough grid to draw/count against.
     pub fn is_usable(&self) -> bool {
         self.frames.len() >= 2
+    }
+
+    /// Whether the detector reported this grid below
+    /// [`LOW_CONFIDENCE_THRESHOLD`] (ticks dim, counter hints).
+    pub fn low_confidence(&self) -> bool {
+        self.low_confidence
     }
 
     pub fn frame(&self, i: usize) -> f64 {
@@ -410,6 +454,31 @@ mod tests {
             .collect();
         // Bars 1 and 17 -> beat indices 0 and 64.
         assert_eq!(phrase_beats, vec![0, 64]);
+    }
+
+    #[test]
+    fn low_confidence_flag_tracks_grid_confidence() {
+        let mut grid = timestretch::BeatGrid::empty(100);
+        grid.beats = (0..16).map(|i| i as f64 * 100.0).collect();
+        grid.downbeats = vec![0, 4, 8, 12];
+        grid.bpm = 60.0;
+
+        // Corpus-healthy reading (tracked or rigid-adopted): not flagged.
+        grid.confidence = 0.85;
+        assert!(!GridMarks::from_grid(&grid).low_confidence());
+
+        // Collapsed evidence (weak periodicity / onset support): flagged.
+        grid.confidence = 0.3;
+        assert!(GridMarks::from_grid(&grid).low_confidence());
+
+        // Exactly at the threshold: not low — the gate is strict-less-than.
+        grid.confidence = LOW_CONFIDENCE_THRESHOLD;
+        assert!(!GridMarks::from_grid(&grid).low_confidence());
+    }
+
+    #[test]
+    fn empty_marks_are_not_flagged_low_confidence() {
+        assert!(!GridMarks::empty().low_confidence());
     }
 
     #[test]

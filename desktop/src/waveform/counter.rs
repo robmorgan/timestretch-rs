@@ -46,4 +46,14 @@ pub fn paint_beat_counter(ui: &mut egui::Ui, marks: &GridMarks, position_frames:
             );
         }
     }
+
+    // Honest-display hint: the waveform ticks are drawn dimmed for this
+    // grid, and this says why.
+    if marks.low_confidence() {
+        ui.label(
+            egui::RichText::new("grid: low confidence")
+                .small()
+                .color(palette::TEXT_DIM),
+        );
+    }
 }

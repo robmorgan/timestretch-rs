@@ -275,8 +275,18 @@ pub fn paint_zoomed(
         }
     }
 
-    // Beat/downbeat edge ticks (top and bottom), density-adaptive.
+    // Beat/downbeat edge ticks (top and bottom), density-adaptive. On a
+    // low-confidence grid the ticks draw dimmed — the grid is a hint, not
+    // an assertion.
     if params.marks.is_usable() {
+        let (beat_color, downbeat_color) = if params.marks.low_confidence() {
+            (
+                palette::TICK_BEAT.gamma_multiply(super::LOW_CONFIDENCE_TICK_DIM),
+                palette::TICK_DOWNBEAT.gamma_multiply(super::LOW_CONFIDENCE_TICK_DIM),
+            )
+        } else {
+            (palette::TICK_BEAT, palette::TICK_DOWNBEAT)
+        };
         let visible = params.marks.visible_range(start_frame, end_frame);
         let downbeats = visible
             .clone()
@@ -291,15 +301,12 @@ pub fn paint_zoomed(
                 if bar == 0 || !(bar - 1).is_multiple_of(stride) {
                     continue;
                 }
-                (
-                    TICK_DOWNBEAT_PX,
-                    egui::Stroke::new(2.0_f32, palette::TICK_DOWNBEAT),
-                )
+                (TICK_DOWNBEAT_PX, egui::Stroke::new(2.0_f32, downbeat_color))
             } else {
                 if !plan.draw_beats {
                     continue;
                 }
-                (TICK_BEAT_PX, egui::Stroke::new(1.0_f32, palette::TICK_BEAT))
+                (TICK_BEAT_PX, egui::Stroke::new(1.0_f32, beat_color))
             };
             let x = frame_to_x(params.marks.frame(i));
             painter.line_segment(

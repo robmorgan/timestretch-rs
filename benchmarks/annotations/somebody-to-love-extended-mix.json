@@ -979,6 +979,8 @@
     "fitted_phase_secs": 0.0035,
     "generator": "annotate_rigid_grid (rigid grid at manifest BPM, kick-band phase fit)",
     "manifest_bpm": 128.0,
+    "note": "2026-08-07: genuinely phase-indecisive. The rigid fit lands on the exact manifest BPM but phase_lock measures 0.181 (below the 0.3 adoption gate) AND tracked-beat corroboration is only 0.28 (below CORROBORATION_MIN_AGREEMENT = 0.6, src/analysis/rigid_grid.rs) - the two independent estimators (kick-band phase circle vs full-band DP tracker) genuinely disagree, so the rigid grid is correctly not adopted. See LEARNINGS.md 'Stage 10 - Tracked-Beat Corroboration for Rigid Grids'.",
+    "phase_indecisive": true,
     "phase_lock": 0.165,
     "verified_by_ear": false
   }
