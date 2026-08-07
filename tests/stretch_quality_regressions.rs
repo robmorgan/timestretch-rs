@@ -180,30 +180,23 @@ fn test_ratio_sweep_sine_length_and_pitch() {
 // ~0.833–1.25) content below the 150 Hz crossover is deliberately NOT
 // pitch-corrected — its pitch follows tempo, exactly as on a deck — so
 // the 100 Hz partial lands at 100/ratio Hz on that path and at 100 Hz on
-// the wide-ratio PV path. Balance bounds are engine-measured baselines
-// (ideal amplitude ratio 0.35/0.65 ≈ 0.538). The ratio-0.5 band once sat
-// at 1.5–4.0 — the wide-PV's low-band level loss at heavy compression;
-// the Stage 13 phase-hygiene fixes plus hop = FFT/8 shrank that loss
-// (measured balance 0.753, re-pinned with margin).
+// the wide-ratio path. Balance bounds are engine-measured baselines
+// (ideal amplitude ratio 0.35/0.65 ≈ 0.538). History: the batch wide-PV
+// lost low-band level at heavy ratios (0.5-band once 1.5–4.0; 2.0-band
+// pinned a rigid sub-bass attenuation at 1.3–3.4 after Stage 13). The
+// Stage 14 consolidation routes wide ratios through the live
+// WideKeylockStage — PV at unity, resampler transposing — and the
+// balance measures at the ideal (~0.53–0.56) at every wide ratio.
 #[test]
 fn test_ratio_sweep_two_tone_peak_bins() {
     let n = 12_000usize;
     // (ratio, expected low-tone Hz, balance range for e1000/e_low)
     let cases = [
-        (0.5, 100.0, 0.55..1.15),
-        (0.75, 100.0, 0.5..1.1),
+        (0.5, 100.0, 0.45..0.65),
+        (0.75, 100.0, 0.45..0.65),
         (1.0, 100.0, 0.49..0.59),
         (1.25, 80.0, 0.40..0.75),
-        // Ratio 2.0: hop = FFT/8 (the live wide stage's mandatory overlap,
-        // adopted offline at Stage 13) attenuates tones in the rigid
-        // sub-bass region (< ~107 Hz) at heavy slowdown — measured balance
-        // 2.14 vs ~0.5 at the old hop = FFT/4, while tones above the
-        // boundary stay at the ideal balance (probe 2026-08-05, LEARNINGS).
-        // The old hop kept sub-bass cleaner at ratio 2 but is the
-        // documented level/click blowup at ratio 4; offline follows the
-        // live configuration. Band pins the current loss so it cannot
-        // silently worsen; improving it is Stage 14/16 territory.
-        (2.0, 100.0, 1.3..3.4),
+        (2.0, 100.0, 0.45..0.65),
     ];
     for (ratio, f_low, balance_range) in cases {
         let input = gen_two_tone(100.0, 0.65, 1000.0, 0.35, SR, n);

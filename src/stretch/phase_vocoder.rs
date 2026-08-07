@@ -17,7 +17,7 @@ const PEAKS_CAPACITY_DIVISOR: usize = 4;
 /// Blend factor for phase gradient integration (soft vertical coherence).
 const PHASE_GRADIENT_BLEND: f64 = 0.20;
 /// Minimum magnitude to consider a bin as a spectral peak (avoids noise peaks).
-const MIN_PEAK_MAGNITUDE: f32 = 1e-8;
+use crate::stretch::phase_locking::MIN_PEAK_MAGNITUDE;
 /// Treat values this close to integers as integral synthesis positions.
 const SYNTH_POS_EPSILON: f64 = 1e-9;
 /// Floor used in adaptive locking feature extraction.

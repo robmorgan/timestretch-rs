@@ -25,6 +25,11 @@
 
 use std::f32::consts::PI;
 
+/// Minimum magnitude for a bin to count as a spectral peak — shared by
+/// the vocoder's IF-refinement pass and the locking region pass so both
+/// operate on the same peak set.
+pub(crate) const MIN_PEAK_MAGNITUDE: f32 = 1e-8;
+
 /// Phase locking mode for the phase vocoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhaseLockingMode {
@@ -194,7 +199,14 @@ fn fill_spectral_peaks(
     }
     let search_start = start_bin.max(1);
     for k in search_start..num_bins - 1 {
-        if magnitudes[k] > magnitudes[k - 1] && magnitudes[k] > magnitudes[k + 1] {
+        // Same magnitude floor as the vocoder's own peak pass (ROADMAP
+        // Stage 14 unification): without it the two passes disagree in
+        // quiet passages, where noise-floor ripple here counted as peaks
+        // and anchored real bins to numerically random rotations.
+        if magnitudes[k] > MIN_PEAK_MAGNITUDE
+            && magnitudes[k] > magnitudes[k - 1]
+            && magnitudes[k] > magnitudes[k + 1]
+        {
             peaks_out.push(k);
         }
     }

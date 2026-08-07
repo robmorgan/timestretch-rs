@@ -37,11 +37,15 @@ fn fixture(len: usize) -> Vec<f32> {
 /// callback sizes) at a constant rate, with the same artifact offline
 /// analysis would compute.
 fn render_streaming(input: &[f32], rate: f64) -> Vec<f32> {
+    render_streaming_with(input, rate, EngineProfile::Keylock)
+}
+
+fn render_streaming_with(input: &[f32], rate: f64, profile: EngineProfile) -> Vec<f32> {
     let artifact = Arc::new(timestretch::analyze_for_dj(input, SR));
     let handles = Engine::build(EngineConfig {
         sample_rate: SR,
         channels: 1,
-        profile: EngineProfile::Keylock,
+        profile,
         initial_tempo_rate: rate,
         pre_analysis: Some(artifact),
         ..EngineConfig::default()
@@ -105,6 +109,31 @@ fn streaming_and_offline_are_sample_identical() {
             assert!(
                 a == b,
                 "sample {i} differs at rate {rate}: offline {a} vs streaming {b}"
+            );
+        }
+    }
+}
+
+/// ROADMAP Stage 14: the consolidation routes offline wide ratios
+/// through the shipped `WideKeylockStage`, so the determinism property
+/// extends to wide rates — offline and a wide-profile pull render at the
+/// same constant rate must be sample-identical.
+#[test]
+fn streaming_and_offline_are_sample_identical_at_wide_rates() {
+    let input = fixture(SR as usize * 4);
+    for rate in [0.5f64, 1.5] {
+        let ratio = 1.0 / rate;
+        let offline = stretch_offline(&input, 1, SR, ratio, None).unwrap();
+        let streaming = render_streaming_with(&input, rate, EngineProfile::WideKeylock);
+        assert_eq!(
+            offline.len(),
+            streaming.len(),
+            "length differs at wide rate {rate}"
+        );
+        for (i, (a, b)) in offline.iter().zip(streaming.iter()).enumerate() {
+            assert!(
+                a == b,
+                "sample {i} differs at wide rate {rate}: offline {a} vs streaming {b}"
             );
         }
     }

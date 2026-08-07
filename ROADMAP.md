@@ -236,6 +236,22 @@ benefits regardless. Touches no DSP.
 
 Automation: auto
 
+> **Status (2026-08-07): behavior half landed** (branch
+> `feat/wide-path-consolidation`): offline wide ratios inside the engine
+> range now render through the shipped `WideKeylockStage` (the batch PV
+> survives only beyond 4× either way); streaming-vs-offline determinism
+> extended to wide rates (sample-identical at 0.5×/1.5×); the two-tone
+> sub-bass attenuation pinned at Stage 13 is GONE through the live stage
+> (balance at the ideal at every wide ratio — the live PV runs at unity
+> with the resampler transposing); the corrected stereo path runs in
+> mid/side (identical channels stay bit-identical, center cannot leak
+> into side by construction — honest measurement: the per-channel leak
+> was modest, 64.6 → 70.9 dB rejection, so the audible width verdict
+> belongs to the owner listen); peak-magnitude floor unified across the
+> vocoder and locking passes. Remaining: the dead-code/doc sweep
+> (separate PR) and the owner ±30/±50 listen (note: M/S touches exactly
+> the "a bit crowded vs R3" quality heard at Stage 11).
+
 ### Why
 
 Offline wide ratios run a *different algorithm configuration* than the
