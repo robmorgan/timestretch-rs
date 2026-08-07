@@ -194,7 +194,6 @@ impl WideKeylockStage {
                     WindowType::Hann,
                     PhaseLockingMode::Identity,
                 );
-                pv.set_smooth_ratio_updates(true);
                 pv.set_wide_ratio_coherence_blend(WIDE_COHERENCE_BLEND);
                 pv.reserve_streaming_capacity(WINDOW_CAPACITY, WIDE_TRANSPOSITION_MAX + 0.5);
                 let mut out_fifo = RingBuffer::with_capacity(OUT_FIFO_CAPACITY);

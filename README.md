@@ -300,14 +300,15 @@ cargo test --features qa-harnesses --release --test benchmarks -- --nocapture
 # M0 baseline command (strict corpus validation + archive)
 ./benchmarks/run_m0_baseline.sh
 
-# Quality-gate benchmark subset (CI-enforced)
-cargo test --features qa-harnesses --release --test quality_gates -- --nocapture
+# Quality-gate harnesses (CI-enforced)
+cargo test --features qa-harnesses --release --test engine_ab_matrix -- --nocapture
+cargo test --features qa-harnesses --release --test engine_keylock -- --nocapture
 
-# Strict callback-budget gate (same mode used in CI quality-gates job)
-TIMESTRETCH_STRICT_CALLBACK_BUDGET=1 cargo test --features qa-harnesses --release --test quality_gates -- --nocapture
+# Strict callback-budget gate (same mode used in CI)
+TIMESTRETCH_STRICT_CALLBACK_BUDGET=1 cargo test --features qa-harnesses --release --test engine_wcet -- --nocapture
 
-# Emit quality dashboard CSV artifacts (one file per quality gate)
-TIMESTRETCH_QUALITY_DASHBOARD_DIR=target/quality_dashboard cargo test --features qa-harnesses --release --test quality_gates -- --nocapture
+# Emit the quality dashboard CSV artifact (ab_matrix.csv)
+TIMESTRETCH_QUALITY_DASHBOARD_DIR=target/quality_dashboard cargo test --features qa-harnesses --release --test engine_ab_matrix -- --nocapture
 
 # Reference-quality comparison (strict corpus required)
 TIMESTRETCH_STRICT_REFERENCE_BENCHMARK=1 TIMESTRETCH_REFERENCE_MAX_SECONDS=30 cargo test --features qa-harnesses --test reference_quality -- --nocapture

@@ -670,7 +670,11 @@ pub(crate) fn dot_f32_f64(samples: &[f32], weights: &[f32]) -> f64 {
 
 /// Modified Bessel function of the first kind, order zero.
 /// Approximated using the power series expansion.
-fn bessel_i0(x: f64) -> f64 {
+///
+/// Shared crate-wide (Kaiser windows in `core::window`, the SOLA read
+/// interpolation table, and the resampler kernels all use this one
+/// implementation).
+pub(crate) fn bessel_i0(x: f64) -> f64 {
     let mut sum = 1.0f64;
     let mut term = 1.0f64;
     let half_x = x * 0.5;

@@ -3,10 +3,6 @@
 use crate::core::fft::{COMPLEX_ZERO, WINDOW_SUM_EPSILON, WINDOW_SUM_FLOOR_RATIO};
 use crate::core::window::{WindowType, generate_window};
 use crate::error::StretchError;
-use crate::stretch::envelope::{
-    adaptive_cepstral_order, apply_envelope_correction_with_scratch,
-    extract_envelope_with_fft_scratch, spectral_centroid,
-};
 use crate::stretch::phase_locking::{PhaseLockingMode, apply_phase_locking_realtime};
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::sync::Arc;
@@ -38,25 +34,10 @@ const ADAPTIVE_SELECTIVE_RATIO_DISTANCE_MAX: f64 = 0.65;
 const ADAPTIVE_FORCE_ROI_RATIO_DISTANCE: f64 = 0.75;
 /// Number of synthesis frames to keep transient-focused locking active.
 const TRANSIENT_FOCUS_FRAMES: usize = 3;
-/// Briefly tighten phase locking after a meaningful runtime ratio step.
-const RATIO_CHANGE_FOCUS_FRAMES: usize = 3;
-/// Keep continuity focus active slightly longer when automation reverses direction mid-seam.
-const RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES: usize = 1;
-/// Keep continuity focus active slightly longer when a new step must re-anchor
-/// to an older carried seam that is still farther from unity than the in-flight ratio.
-const RATIO_CHANGE_CARRIED_SEAM_FOCUS_EXTRA_FRAMES: usize = 1;
-/// Hold a far carried seam for one synthesis frame before slewing toward the new target.
-const RATIO_CHANGE_CARRIED_SEAM_HOLD_FRAMES: usize = 1;
-/// Ignore tiny ratio deltas that are below the modulation-seam risk zone.
-const RATIO_CHANGE_FOCUS_TRIGGER: f64 = 1e-3;
-/// Cap extra continuity-focus extension so long tails do not pin identity locking.
-const RATIO_CHANGE_TAIL_FOCUS_MAX_FRAMES: usize = 6;
 /// Phase vocoder state for time stretching.
 pub struct PhaseVocoder {
     fft_size: usize,
-    sample_rate: u32,
     hop_analysis: usize,
-    hop_synthesis: usize,
     stretch_ratio: f64,
     /// Absolute synthesis position (in samples) of the next frame start.
     synthesis_pos: f64,
@@ -110,37 +91,6 @@ pub struct PhaseVocoder {
     wide_coherence_blend: f64,
     /// Short-lived state that tightens phase behavior right after a transient reset.
     transient_focus_frames: usize,
-    /// Previous effective ratio used to slew phase advance through a seam.
-    ratio_change_phase_from: f64,
-    /// Remaining frames in the phase-ratio continuity slew.
-    ratio_change_phase_frames: usize,
-    /// Total frames scheduled for the current phase-ratio continuity slew.
-    ratio_change_phase_total_frames: usize,
-    /// Initial seam-hold frames that should stay pinned to `ratio_change_phase_from`.
-    ratio_change_phase_hold_frames: usize,
-    /// Ratio updates arrive as a smooth small-step stream; skip the
-    /// continuity-focus seam machinery (see `set_smooth_ratio_updates`).
-    smooth_ratio_updates: bool,
-    /// Whether spectral envelope preservation is enabled.
-    envelope_preservation: bool,
-    /// Envelope correction strength (0 = off, 1 = full, >1 stronger).
-    envelope_strength: f32,
-    /// Enables adaptive per-frame envelope order selection.
-    adaptive_envelope_order: bool,
-    /// Cepstral order for envelope extraction.
-    envelope_order: usize,
-    /// Reusable buffer for cepstral analysis.
-    cepstrum_buf: Vec<Complex<f32>>,
-    /// Reusable buffer for analysis envelope.
-    analysis_envelope: Vec<f32>,
-    /// Reusable buffer for synthesis envelope.
-    synthesis_envelope: Vec<f32>,
-    /// Reusable noise-floor scratch for SNR-aware envelope correction.
-    envelope_noise_floor_scratch: Vec<f32>,
-    /// Scratch buffer for envelope IFFT execution.
-    envelope_ifft_scratch: Vec<Complex<f32>>,
-    /// Scratch buffer for envelope FFT execution.
-    envelope_fft_scratch: Vec<Complex<f32>>,
     /// Precomputed overlap-add gain (`synthesis_window / fft_size`).
     ola_gain: Vec<f32>,
     /// f64 view of `ola_gain` to avoid per-sample casts in fractional OLA path.
@@ -166,8 +116,6 @@ pub struct PhaseVocoder {
     /// the next normalization pass does not suddenly tighten the overlap
     /// floor at the chunk boundary.
     streaming_tail_ratio: f64,
-    /// Ratio that generated the unresolved carried seam at the chunk boundary.
-    streaming_tail_phase_ratio: f64,
     /// Reusable accumulation buffer for streaming overlap-add.
     streaming_accum_output: Vec<f32>,
     /// Reusable window-sum accumulation buffer for streaming overlap-add.
@@ -177,48 +125,6 @@ pub struct PhaseVocoder {
 #[inline]
 fn streaming_tail_normalize_ratio(carried_tail_ratio: f64, current_ratio: f64) -> f64 {
     carried_tail_ratio.max(current_ratio)
-}
-
-#[inline]
-fn ratio_is_meaningfully_above_unity(ratio: f64) -> bool {
-    ratio > 1.0 + RATIO_CHANGE_FOCUS_TRIGGER
-}
-
-#[inline]
-fn ratio_is_meaningfully_below_unity(ratio: f64) -> bool {
-    ratio < 1.0 - RATIO_CHANGE_FOCUS_TRIGGER
-}
-
-#[inline]
-fn continuity_focus_frames_for_ratio_change(
-    base_frames: usize,
-    tail_samples: usize,
-    hop: usize,
-) -> usize {
-    if tail_samples == 0 || hop == 0 {
-        return base_frames;
-    }
-
-    base_frames.max(
-        tail_samples
-            .div_ceil(hop)
-            .saturating_add(1)
-            .min(RATIO_CHANGE_TAIL_FOCUS_MAX_FRAMES),
-    )
-}
-
-#[inline]
-fn ratio_change_reverses_inflight_direction(
-    continuity_phase_from: f64,
-    prior_ratio: f64,
-    next_ratio: f64,
-) -> bool {
-    let prior_direction = prior_ratio - continuity_phase_from;
-    let next_direction = next_ratio - prior_ratio;
-
-    prior_direction.abs() >= RATIO_CHANGE_FOCUS_TRIGGER
-        && next_direction.abs() >= RATIO_CHANGE_FOCUS_TRIGGER
-        && prior_direction.signum() != next_direction.signum()
 }
 
 impl PhaseVocoder {
@@ -270,33 +176,6 @@ impl PhaseVocoder {
         window_type: WindowType,
         phase_locking_mode: PhaseLockingMode,
     ) -> Self {
-        Self::with_all_options(
-            fft_size,
-            hop_analysis,
-            stretch_ratio,
-            sample_rate,
-            sub_bass_cutoff,
-            window_type,
-            phase_locking_mode,
-            false,
-            40,
-        )
-    }
-
-    /// Creates a new phase vocoder with all configuration options including envelope preservation.
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_all_options(
-        fft_size: usize,
-        hop_analysis: usize,
-        stretch_ratio: f64,
-        sample_rate: u32,
-        sub_bass_cutoff: f32,
-        window_type: WindowType,
-        phase_locking_mode: PhaseLockingMode,
-        envelope_preservation: bool,
-        envelope_order: usize,
-    ) -> Self {
-        let hop_synthesis = (hop_analysis as f64 * stretch_ratio).round() as usize;
         let window = generate_window(window_type, fft_size);
         // Match synthesis window to analysis window type for a proper window product.
         // Using the same window type ensures the overlap-add normalization works
@@ -342,9 +221,7 @@ impl PhaseVocoder {
 
         Self {
             fft_size,
-            sample_rate,
             hop_analysis,
-            hop_synthesis,
             stretch_ratio,
             synthesis_pos: 0.0,
             synthesis_emitted: 0,
@@ -369,21 +246,6 @@ impl PhaseVocoder {
             adaptive_phase_locking: false,
             wide_coherence_blend: 0.0,
             transient_focus_frames: 0,
-            ratio_change_phase_from: stretch_ratio,
-            ratio_change_phase_frames: 0,
-            ratio_change_phase_total_frames: 0,
-            ratio_change_phase_hold_frames: 0,
-            smooth_ratio_updates: false,
-            envelope_preservation,
-            envelope_strength: 1.0,
-            adaptive_envelope_order: true,
-            envelope_order,
-            cepstrum_buf: Vec::new(),
-            analysis_envelope: Vec::new(),
-            synthesis_envelope: Vec::new(),
-            envelope_noise_floor_scratch: Vec::with_capacity(num_bins),
-            envelope_ifft_scratch: vec![COMPLEX_ZERO; fft_inverse_scratch_len],
-            envelope_fft_scratch: vec![COMPLEX_ZERO; fft_forward_scratch_len],
             ola_gain,
             ola_gain_f64,
             ola_window_product,
@@ -394,7 +256,6 @@ impl PhaseVocoder {
             streaming_tail: Vec::new(),
             streaming_tail_window_sum: Vec::new(),
             streaming_tail_ratio: stretch_ratio,
-            streaming_tail_phase_ratio: stretch_ratio,
             streaming_accum_output: Vec::new(),
             streaming_accum_window_sum: Vec::new(),
         }
@@ -412,255 +273,24 @@ impl PhaseVocoder {
         self.hop_analysis
     }
 
-    /// Returns the synthesis hop size.
-    #[inline]
-    pub fn hop_synthesis(&self) -> usize {
-        self.hop_synthesis
-    }
-
     /// Returns the sub-bass bin cutoff index.
     #[inline]
     pub fn sub_bass_bin(&self) -> usize {
         self.sub_bass_bin
     }
 
-    /// Declares that runtime ratio updates arrive as a smooth, small-step
-    /// stream (e.g. the varispeed-first control path's delay-matched
-    /// transposition) rather than as discrete automation jumps.
-    ///
-    /// Disables the ratio-change continuity-focus machinery: phase advance
-    /// always follows the current hop ratio instead of slewing from (or
-    /// holding at) a previous ratio to mask a seam. Under continuous
-    /// modulation the seam-masking slew reads as sustained pitch deviation
-    /// on tonal content, which smooth callers must not pay — their per-render
-    /// deltas are too small to produce an audible seam in the first place.
-    #[inline]
-    pub fn set_smooth_ratio_updates(&mut self, smooth: bool) {
-        self.smooth_ratio_updates = smooth;
-        if smooth {
-            self.ratio_change_phase_frames = 0;
-            self.ratio_change_phase_total_frames = 0;
-            self.ratio_change_phase_hold_frames = 0;
-            self.ratio_change_phase_from = self.stretch_ratio;
-        }
-    }
-
     /// Updates the stretch ratio without resetting phase state.
     ///
-    /// This recalculates the synthesis hop size from the new ratio while
-    /// preserving all accumulated phase information. Meaningful runtime ratio
-    /// steps also engage a short continuity-focus window so the first few
-    /// post-change frames prefer tighter phase coherence at the seam (unless
-    /// [`Self::set_smooth_ratio_updates`] is active).
+    /// Phase advance follows the new ratio from the next synthesized frame
+    /// while all accumulated phase information is preserved. Production
+    /// callers update the ratio as a smooth, small-step stream (the wide
+    /// keylock stage slews it per block), so no seam masking is needed.
+    /// Any overlap tail carried across a streaming emit boundary keeps its
+    /// own normalization ratio (see `streaming_tail_ratio`), so output
+    /// rendered at the previous ratio is still normalized at that ratio.
     #[inline]
     pub fn set_stretch_ratio(&mut self, stretch_ratio: f64) {
-        if self.smooth_ratio_updates {
-            self.stretch_ratio = stretch_ratio;
-            self.hop_synthesis = (self.hop_analysis as f64 * stretch_ratio).round() as usize;
-            self.ratio_change_phase_from = stretch_ratio;
-            return;
-        }
-        let prior_ratio = self.stretch_ratio;
-        let ratio_delta = (stretch_ratio - prior_ratio).abs();
-        let in_flight_phase_ratio = self.continuity_focus_phase_ratio(prior_ratio);
-        let mut continuity_phase_from = in_flight_phase_ratio;
-        let mut reanchored_to_carried_seam = false;
-        if !self.streaming_tail.is_empty() {
-            let carried_phase_ratio = self.streaming_tail_phase_ratio;
-            if ratio_is_meaningfully_above_unity(carried_phase_ratio)
-                && !ratio_is_meaningfully_above_unity(continuity_phase_from)
-                && !ratio_is_meaningfully_below_unity(stretch_ratio)
-                && carried_phase_ratio > continuity_phase_from + RATIO_CHANGE_FOCUS_TRIGGER
-            {
-                // If the explicit continuity window has already drained back
-                // near unity but an older expanded overlap is still unresolved,
-                // keep near-unity follow-up nudges anchored to that carried
-                // seam. Otherwise tiny automation steps can stop refreshing the
-                // seam hold while the older expansion tail is still audible.
-                continuity_phase_from = carried_phase_ratio;
-                reanchored_to_carried_seam = true;
-            } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
-                && !ratio_is_meaningfully_below_unity(continuity_phase_from)
-                && !ratio_is_meaningfully_above_unity(stretch_ratio)
-                && carried_phase_ratio + RATIO_CHANGE_FOCUS_TRIGGER < continuity_phase_from
-            {
-                // Mirror the same protection for unresolved compression tails
-                // that remain audibly below unity after the continuity window
-                // has drifted back toward neutral.
-                continuity_phase_from = carried_phase_ratio;
-                reanchored_to_carried_seam = true;
-            } else if ratio_is_meaningfully_above_unity(carried_phase_ratio)
-                && ratio_is_meaningfully_below_unity(continuity_phase_from)
-                && !ratio_is_meaningfully_below_unity(stretch_ratio)
-            {
-                // Short-interval cross-unity modulation can retarget back
-                // toward unity before the previous expansion seam has fully
-                // drained. Keep the seam slew anchored to that carried
-                // expansion overlap so the next callback does not restart from
-                // an already-compressed phase ratio while the older expanded
-                // tail is still audible.
-                continuity_phase_from = carried_phase_ratio;
-                reanchored_to_carried_seam = true;
-            } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
-                && ratio_is_meaningfully_above_unity(continuity_phase_from)
-                && !ratio_is_meaningfully_above_unity(stretch_ratio)
-            {
-                // Mirror the same protection for a carried compression seam so
-                // a rebound back toward unity does not restart from an already
-                // expanded in-flight ratio while the older compressed overlap
-                // is still draining.
-                continuity_phase_from = carried_phase_ratio;
-                reanchored_to_carried_seam = true;
-            } else if ratio_is_meaningfully_above_unity(carried_phase_ratio)
-                && ratio_is_meaningfully_below_unity(continuity_phase_from)
-                && stretch_ratio < continuity_phase_from - RATIO_CHANGE_FOCUS_TRIGGER
-            {
-                // If automation crosses unity and immediately digs farther into
-                // compression before the previous expansion seam drains, keep
-                // the restart anchored to that older carried seam. Otherwise
-                // the continuity slew restarts from the fresher compression
-                // ratio and leaves the unresolved expansion overlap to snap on
-                // the next callback.
-                continuity_phase_from = carried_phase_ratio;
-                reanchored_to_carried_seam = true;
-            } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
-                && ratio_is_meaningfully_above_unity(continuity_phase_from)
-                && stretch_ratio > continuity_phase_from + RATIO_CHANGE_FOCUS_TRIGGER
-            {
-                // Mirror the same protection for a carried compression seam
-                // when automation rebounds across unity and immediately pushes
-                // farther into expansion before the older overlap drains.
-                continuity_phase_from = carried_phase_ratio;
-                reanchored_to_carried_seam = true;
-            } else if ratio_is_meaningfully_above_unity(carried_phase_ratio)
-                && ratio_is_meaningfully_above_unity(continuity_phase_from)
-                && stretch_ratio + RATIO_CHANGE_FOCUS_TRIGGER < continuity_phase_from
-                && carried_phase_ratio > continuity_phase_from
-            {
-                // The unresolved seam can still be more expanded than the
-                // in-flight phase slew after a short same-side rebound. Keep
-                // the restart anchored to that older seam so fast automation
-                // does not relax the overlap twice before it has fully drained.
-                continuity_phase_from = carried_phase_ratio;
-                reanchored_to_carried_seam = true;
-            } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
-                && ratio_is_meaningfully_below_unity(continuity_phase_from)
-                && stretch_ratio - RATIO_CHANGE_FOCUS_TRIGGER > continuity_phase_from
-                && carried_phase_ratio < continuity_phase_from
-            {
-                // Mirror the same protection for unresolved compression seams
-                // when the target rebounds back toward unity without crossing it.
-                continuity_phase_from = carried_phase_ratio;
-                reanchored_to_carried_seam = true;
-            } else if ratio_is_meaningfully_above_unity(carried_phase_ratio)
-                && ratio_is_meaningfully_above_unity(continuity_phase_from)
-                && stretch_ratio > continuity_phase_from + RATIO_CHANGE_FOCUS_TRIGGER
-                && carried_phase_ratio > continuity_phase_from
-            {
-                // If a short same-side relaxation is followed immediately by a
-                // renewed expansion step, keep the restart anchored to the
-                // older carried seam until that overlap drains. Restarting
-                // from the weaker in-flight ratio would loosen the overlap
-                // once, then tighten it again on the next callback.
-                continuity_phase_from = carried_phase_ratio;
-                reanchored_to_carried_seam = true;
-            } else if ratio_is_meaningfully_above_unity(carried_phase_ratio)
-                && ratio_is_meaningfully_below_unity(continuity_phase_from)
-                && stretch_ratio < continuity_phase_from
-                && stretch_ratio + RATIO_CHANGE_FOCUS_TRIGGER >= continuity_phase_from
-            {
-                // A tiny follow-up push deeper into compression can arrive
-                // while an older expansion seam is still unresolved. Keep the
-                // continuity slew anchored to that carried seam so the overlap
-                // does not restart from the fresher compression ratio just
-                // because the latest nudge itself is sub-threshold.
-                continuity_phase_from = carried_phase_ratio;
-                reanchored_to_carried_seam = true;
-            } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
-                && ratio_is_meaningfully_above_unity(continuity_phase_from)
-                && stretch_ratio > continuity_phase_from
-                && stretch_ratio - RATIO_CHANGE_FOCUS_TRIGGER <= continuity_phase_from
-            {
-                // Mirror the same protection for a carried compression seam
-                // when a tiny follow-up push deeper into expansion lands
-                // before the older opposite-side overlap has drained.
-                continuity_phase_from = carried_phase_ratio;
-                reanchored_to_carried_seam = true;
-            } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
-                && ratio_is_meaningfully_below_unity(continuity_phase_from)
-                && stretch_ratio + RATIO_CHANGE_FOCUS_TRIGGER < continuity_phase_from
-                && carried_phase_ratio < continuity_phase_from
-            {
-                // Mirror the same protection for unresolved compression seams
-                // when modulation briefly relaxes toward unity and then pushes
-                // deeper into compression before the older overlap has drained.
-                continuity_phase_from = carried_phase_ratio;
-                reanchored_to_carried_seam = true;
-            } else if ratio_is_meaningfully_above_unity(carried_phase_ratio)
-                && ratio_is_meaningfully_above_unity(continuity_phase_from)
-                && carried_phase_ratio > continuity_phase_from + RATIO_CHANGE_FOCUS_TRIGGER
-                && !ratio_is_meaningfully_below_unity(stretch_ratio)
-                && stretch_ratio <= continuity_phase_from + RATIO_CHANGE_FOCUS_TRIGGER
-            {
-                // Tiny same-side follow-up nudges can arrive while an older,
-                // more-expanded overlap is still audible. Keep the continuity
-                // slew anchored to that carried seam so the overlap does not
-                // relax just because the automation step itself is below the
-                // usual trigger threshold.
-                continuity_phase_from = carried_phase_ratio;
-                reanchored_to_carried_seam = true;
-            } else if ratio_is_meaningfully_below_unity(carried_phase_ratio)
-                && ratio_is_meaningfully_below_unity(continuity_phase_from)
-                && carried_phase_ratio + RATIO_CHANGE_FOCUS_TRIGGER < continuity_phase_from
-                && !ratio_is_meaningfully_above_unity(stretch_ratio)
-                && stretch_ratio + RATIO_CHANGE_FOCUS_TRIGGER >= continuity_phase_from
-            {
-                // Mirror the same protection for unresolved compression seams
-                // when a tiny same-side nudge lands near the in-flight ratio
-                // while the older, more-compressed overlap is still draining.
-                continuity_phase_from = carried_phase_ratio;
-                reanchored_to_carried_seam = true;
-            }
-        }
-        let reversed_direction = ratio_change_reverses_inflight_direction(
-            continuity_phase_from,
-            prior_ratio,
-            stretch_ratio,
-        );
-        let reanchored_far_from_inflight = reanchored_to_carried_seam
-            && (continuity_phase_from - in_flight_phase_ratio).abs() >= RATIO_CHANGE_FOCUS_TRIGGER;
-        let continuity_delta = (stretch_ratio - continuity_phase_from).abs();
         self.stretch_ratio = stretch_ratio;
-        self.hop_synthesis = (self.hop_analysis as f64 * stretch_ratio).round() as usize;
-        if ratio_delta >= RATIO_CHANGE_FOCUS_TRIGGER
-            || continuity_delta >= RATIO_CHANGE_FOCUS_TRIGGER
-        {
-            // Fast automation can land another meaningful ratio step before the
-            // previous continuity-focus window drains. Refresh the window so
-            // late seam frames do not relax back into looser locking mid-burst.
-            let mut continuity_focus_frames = continuity_focus_frames_for_ratio_change(
-                RATIO_CHANGE_FOCUS_FRAMES,
-                self.streaming_tail.len(),
-                self.hop_analysis,
-            );
-            if reversed_direction {
-                continuity_focus_frames = continuity_focus_frames
-                    .saturating_add(RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES);
-            }
-            if reanchored_far_from_inflight {
-                continuity_focus_frames = continuity_focus_frames
-                    .saturating_add(RATIO_CHANGE_CARRIED_SEAM_FOCUS_EXTRA_FRAMES);
-            }
-            self.ratio_change_phase_from = continuity_phase_from;
-            self.ratio_change_phase_frames = continuity_focus_frames;
-            self.ratio_change_phase_total_frames = continuity_focus_frames;
-            self.ratio_change_phase_hold_frames = if reanchored_far_from_inflight {
-                RATIO_CHANGE_CARRIED_SEAM_HOLD_FRAMES.min(continuity_focus_frames)
-            } else {
-                0
-            };
-            self.transient_focus_frames = self.transient_focus_frames.max(continuity_focus_frames);
-        }
     }
 
     /// Resets the phase accumulator and previous-phase buffers.
@@ -674,10 +304,6 @@ impl PhaseVocoder {
         self.prev_phase.fill(0.0);
         self.phase_seed_pending.fill(true);
         self.transient_focus_frames = 0;
-        self.ratio_change_phase_frames = 0;
-        self.ratio_change_phase_total_frames = 0;
-        self.ratio_change_phase_hold_frames = 0;
-        self.ratio_change_phase_from = self.stretch_ratio;
     }
 
     /// Clears ALL per-stream state — phase history, the held streaming
@@ -693,7 +319,6 @@ impl PhaseVocoder {
         self.streaming_tail.clear();
         self.streaming_tail_window_sum.clear();
         self.streaming_tail_ratio = self.stretch_ratio;
-        self.streaming_tail_phase_ratio = self.stretch_ratio;
         self.synthesis_pos = 0.0;
         self.synthesis_emitted = 0;
     }
@@ -719,18 +344,6 @@ impl PhaseVocoder {
     #[inline]
     pub fn set_wide_ratio_coherence_blend(&mut self, blend: f64) {
         self.wide_coherence_blend = blend.clamp(0.0, 1.0);
-    }
-
-    /// Sets envelope correction strength (clamped to `[0.0, 2.0]`).
-    #[inline]
-    pub fn set_envelope_strength(&mut self, strength: f32) {
-        self.envelope_strength = strength.clamp(0.0, 2.0);
-    }
-
-    /// Enables or disables adaptive per-frame envelope-order selection.
-    #[inline]
-    pub fn set_adaptive_envelope_order(&mut self, enabled: bool) {
-        self.adaptive_envelope_order = enabled;
     }
 
     /// Selectively resets phase state for specific frequency bands.
@@ -776,7 +389,6 @@ impl PhaseVocoder {
         self.streaming_tail.clear();
         self.streaming_tail_window_sum.clear();
         self.streaming_tail_ratio = self.stretch_ratio;
-        self.streaming_tail_phase_ratio = self.stretch_ratio;
 
         // Mirror-pad input to stabilize edge normalization.
         //
@@ -839,7 +451,7 @@ impl PhaseVocoder {
                 padded[start_pad + input.len() + i] = input[input.len() - 1 - i] * fade;
             }
 
-            let (_num_frames, output_len, _) = self.process_core(&padded, true)?;
+            let (_num_frames, output_len) = self.process_core(&padded, true)?;
             let mut output = self.output_buf[..output_len].to_vec();
             Self::normalize_output(
                 &mut output,
@@ -927,7 +539,7 @@ impl PhaseVocoder {
         }
 
         // Fallback: process without padding (short inputs or edge cases).
-        let (_num_frames, output_len, _) = self.process_core(input, true)?;
+        let (_num_frames, output_len) = self.process_core(input, true)?;
         let mut output = self.output_buf[..output_len].to_vec();
         Self::normalize_output(
             &mut output,
@@ -993,7 +605,7 @@ impl PhaseVocoder {
             return Ok(());
         }
 
-        let (emit_len, output_len, last_phase_hop_ratio) = self.process_core(input, false)?;
+        let (emit_len, output_len) = self.process_core(input, false)?;
         if output.capacity() < emit_len {
             return Err(StretchError::BufferOverflow {
                 buffer: "phase_vocoder_stream_output",
@@ -1017,7 +629,6 @@ impl PhaseVocoder {
             .copy_from_slice(&self.window_sum_buf[..output_len]);
 
         let carried_tail_ratio = self.streaming_tail_ratio;
-        let carried_tail_phase_ratio = self.streaming_tail_phase_ratio;
         let tail_len = self
             .streaming_tail
             .len()
@@ -1083,13 +694,6 @@ impl PhaseVocoder {
         } else {
             self.stretch_ratio
         };
-        self.streaming_tail_phase_ratio = if self.streaming_tail.is_empty() {
-            self.stretch_ratio
-        } else if emit_len < tail_len {
-            carried_tail_phase_ratio
-        } else {
-            last_phase_hop_ratio
-        };
         Ok(())
     }
 
@@ -1106,7 +710,6 @@ impl PhaseVocoder {
             self.streaming_tail.clear();
             self.streaming_tail_window_sum.clear();
             self.streaming_tail_ratio = self.stretch_ratio;
-            self.streaming_tail_phase_ratio = self.stretch_ratio;
             self.synthesis_pos = 0.0;
             self.synthesis_emitted = 0;
             output.clear();
@@ -1134,7 +737,6 @@ impl PhaseVocoder {
         self.streaming_tail.clear();
         self.streaming_tail_window_sum.clear();
         self.streaming_tail_ratio = self.stretch_ratio;
-        self.streaming_tail_phase_ratio = self.stretch_ratio;
         self.synthesis_pos = 0.0;
         self.synthesis_emitted = 0;
         Ok(())
@@ -1142,17 +744,15 @@ impl PhaseVocoder {
 
     /// Shared PV core used by both batch and streaming paths.
     ///
-    /// Returns `(emit_len, output_len, tail_phase_ratio)` where `output_len` samples are
+    /// Returns `(emit_len, output_len)` where `output_len` samples are
     /// accumulated (unnormalized) into `self.output_buf` and
-    /// `self.window_sum_buf`, `emit_len` is the number of samples finalized
-    /// for streaming emission (`floor(next_synthesis_pos)`), and
-    /// `tail_phase_ratio` is the effective phase ratio used by the first
-    /// overlap that survives past the callback boundary.
+    /// `self.window_sum_buf`, and `emit_len` is the number of samples
+    /// finalized for streaming emission (`floor(next_synthesis_pos)`).
     fn process_core(
         &mut self,
         input: &[f32],
         reset_phase_state: bool,
-    ) -> Result<(usize, usize, f64), StretchError> {
+    ) -> Result<(usize, usize), StretchError> {
         if input.len() < self.fft_size {
             return Err(StretchError::InputTooShort {
                 provided: input.len(),
@@ -1168,10 +768,6 @@ impl PhaseVocoder {
             self.prev_phase.fill(0.0);
             self.phase_seed_pending.fill(true);
             self.transient_focus_frames = 0;
-            self.ratio_change_phase_frames = 0;
-            self.ratio_change_phase_total_frames = 0;
-            self.ratio_change_phase_hold_frames = 0;
-            self.ratio_change_phase_from = self.stretch_ratio;
             self.synthesis_pos = 0.0;
             self.synthesis_emitted = 0;
         }
@@ -1210,29 +806,17 @@ impl PhaseVocoder {
         self.window_sum_buf.fill(0.0);
 
         let mut synthesis_frame_pos = start_synthesis_pos;
-        let mut carried_tail_phase_ratio = hop_ratio;
-        let mut recorded_carried_tail_phase_ratio = false;
         for frame_idx in 0..num_frames {
             let analysis_pos = frame_idx * self.hop_analysis;
             let synthesis_pos = snap_near_integer(synthesis_frame_pos);
             let synthesis_floor = synthesis_pos.floor() as usize;
             let frac = synthesis_pos - synthesis_floor as f64;
-            let phase_hop_ratio = self.continuity_focus_phase_ratio(hop_ratio);
 
             self.analyze_frame(
                 &input[analysis_pos..analysis_pos + self.fft_size],
                 &fft_forward,
             );
-            self.advance_phases(num_bins, hop_ratio, phase_hop_ratio);
-            let frame_end = synthesis_floor.saturating_add(
-                self.fft_size
-                    .saturating_sub(1)
-                    .saturating_add(usize::from(frac > SYNTH_POS_EPSILON)),
-            );
-            if !recorded_carried_tail_phase_ratio && frame_end >= emit_len {
-                carried_tail_phase_ratio = phase_hop_ratio;
-                recorded_carried_tail_phase_ratio = true;
-            }
+            self.advance_phases(num_bins, hop_ratio);
 
             // Save IF-estimated phases before phase locking overwrites them.
             self.if_phases_backup[..num_bins].copy_from_slice(&self.new_phases[..num_bins]);
@@ -1300,65 +884,6 @@ impl PhaseVocoder {
                 }
             }
 
-            // Spectral envelope preservation: correct magnitudes so formant
-            // structure matches the original analysis frame, preventing
-            // unnatural timbre shifts.
-            if !transient_focus && self.envelope_preservation && self.envelope_strength > 0.0 {
-                let effective_order = if self.adaptive_envelope_order {
-                    let centroid =
-                        spectral_centroid(&self.magnitudes, self.sample_rate, self.fft_size);
-                    adaptive_cepstral_order(centroid, self.fft_size)
-                } else {
-                    self.envelope_order
-                };
-                // Extract envelope from the original analysis magnitudes
-                extract_envelope_with_fft_scratch(
-                    &self.magnitudes,
-                    num_bins,
-                    effective_order,
-                    &fft_forward,
-                    &fft_inverse,
-                    &mut self.envelope_fft_scratch,
-                    &mut self.envelope_ifft_scratch,
-                    &mut self.cepstrum_buf,
-                    &mut self.analysis_envelope,
-                );
-
-                // The synthesis magnitudes are the same (PV doesn't change
-                // magnitudes), but after phase locking the spectral shape
-                // may shift slightly. We extract the synthesis envelope from
-                // the current magnitudes and correct.
-                // Clone analysis envelope as synthesis baseline since magnitudes
-                // haven't changed. The correction step then normalizes any
-                // spectral tilt introduced by windowing or overlap.
-                self.synthesis_envelope.clear();
-                self.synthesis_envelope
-                    .extend_from_slice(&self.analysis_envelope);
-
-                self.if_phases_backup[..num_bins].copy_from_slice(&self.magnitudes[..num_bins]);
-
-                apply_envelope_correction_with_scratch(
-                    &mut self.magnitudes,
-                    &self.analysis_envelope,
-                    &self.synthesis_envelope,
-                    num_bins,
-                    self.sub_bass_bin,
-                    &mut self.envelope_noise_floor_scratch,
-                );
-
-                // Blend toward corrected magnitudes based on configured strength.
-                // `1.0` keeps full correction; values in (0,1) soften correction;
-                // values >1.0 emphasize correction.
-                if (self.envelope_strength - 1.0).abs() > 1e-6 {
-                    for bin in self.sub_bass_bin..num_bins {
-                        let corrected = self.magnitudes[bin];
-                        let original = self.if_phases_backup[bin];
-                        self.magnitudes[bin] =
-                            original + (corrected - original) * self.envelope_strength;
-                    }
-                }
-            }
-
             self.reconstruct_spectrum(num_bins);
             fft_inverse.process_with_scratch(&mut self.fft_buffer, &mut self.fft_inverse_scratch);
 
@@ -1393,7 +918,7 @@ impl PhaseVocoder {
         let next_local_synthesis_pos = snap_near_integer(synthesis_frame_pos);
         self.synthesis_pos = self.synthesis_emitted as f64 + next_local_synthesis_pos;
 
-        Ok((emit_len, output_len, carried_tail_phase_ratio))
+        Ok((emit_len, output_len))
     }
 
     /// Windows the input frame and transforms to frequency domain.
@@ -1422,10 +947,10 @@ impl PhaseVocoder {
     /// 2. Detect spectral peaks and compute refined instantaneous frequencies via
     ///    parabolic interpolation of the log-magnitude spectrum.
     /// 3. Advance phases using instantaneous frequency (IF) estimation: compute the
-    ///    true frequency of each bin from the phase difference, then resynthesize at
-    ///    the correct rate using `inst_freq * hop_synthesis`. This naturally handles
-    ///    the stretch ratio without explicit hop_ratio multiplication and eliminates
-    ///    cumulative phase drift.
+    ///    true per-hop phase advance of each bin from the phase difference, then
+    ///    scale it by the f64 stretch ratio to resynthesize at the correct rate.
+    ///    This handles the stretch ratio directly and eliminates cumulative
+    ///    phase drift.
     /// 4. Apply soft phase gradient integration to propagate coherent phase from
     ///    peaks to nearby non-peak bins.
     ///
@@ -1437,7 +962,7 @@ impl PhaseVocoder {
     /// over long signals. The final phases are converted back to f32 for the
     /// spectrum reconstruction step.
     #[inline]
-    fn advance_phases(&mut self, num_bins: usize, hop_ratio: f64, phase_hop_ratio: f64) {
+    fn advance_phases(&mut self, num_bins: usize, hop_ratio: f64) {
         let hop_a = self.hop_analysis as f64;
         let fft = self.fft_size as f64;
 
@@ -1464,11 +989,11 @@ impl PhaseVocoder {
 
         // --- Pass 3: Advance phases using instantaneous frequency (IF) estimation ---
         //
-        // For each bin we compute the true instantaneous frequency from the phase
+        // For each bin we compute the true per-hop phase advance from the phase
         // difference between consecutive frames, then advance the synthesis phase
-        // accumulator by `inst_freq * hop_synthesis`. This naturally accounts for
-        // the stretch ratio and eliminates cumulative drift that occurs with the
-        // simpler `(expected + deviation) * hop_ratio` approach.
+        // accumulator by that advance multiplied by the f64 stretch ratio. Doing
+        // the scaling as a single f64 multiplication eliminates the cumulative
+        // drift that a separate div+mul through an integer synthesis hop causes.
         //
         // For spectral peak bins, parabolic interpolation of the log-magnitude
         // spectrum refines the frequency estimate to sub-bin precision (~1 Hz
@@ -1508,16 +1033,14 @@ impl PhaseVocoder {
                 // Keep the accumulator wrapped: it is only ever consumed via
                 // `from_polar` and phase differences, and an unwrapped value
                 // loses precision to the per-frame f32 downcast as it grows.
-                self.phase_accum[bin] = wrap_phase_f64(
-                    self.phase_accum[bin] + (expected_diff + deviation) * phase_hop_ratio,
-                );
+                self.phase_accum[bin] =
+                    wrap_phase_f64(self.phase_accum[bin] + (expected_diff + deviation) * hop_ratio);
             } else {
                 // Standard IF estimation:
                 //   phase_diff = current_phase - prev_phase
                 //   expected_diff = 2*pi * bin * hop_analysis / fft_size
                 //   deviation = wrap(phase_diff - expected_diff)
-                //   inst_freq = (expected_diff + deviation) / hop_analysis  [rad/sample]
-                //   phase_accum += inst_freq * hop_synthesis
+                //   phase_accum += (expected_diff + deviation) * stretch_ratio
                 let expected_diff = self.expected_phase_advance[bin]; // 2*pi*bin*hop_a/fft
                 let phase_diff = phase - self.prev_phase[bin];
                 let deviation = wrap_phase_f64(phase_diff - expected_diff);
@@ -1525,12 +1048,10 @@ impl PhaseVocoder {
                 // For peak bins, use parabolic interpolation of log-magnitude
                 // to refine the frequency estimate to sub-bin precision.
                 //
-                // The phase advance for synthesis is computed as:
-                //   inst_freq * hop_synthesis = (expected + deviation) * hop_synthesis / hop_analysis
-                //
-                // To minimize floating-point roundoff (especially at ratio 1.0 where
-                // hop_s == hop_a), we compute `(expected + deviation) * (hop_s / hop_a)`
-                // using a single ratio multiplication rather than separate div+mul.
+                // The synthesis phase advance is `(expected + deviation)` scaled by
+                // the f64 stretch ratio in a single multiplication. This minimizes
+                // floating-point roundoff (especially at ratio 1.0, where the
+                // advance must be bit-exact with the analysis advance).
                 let is_peak = self.peaks.binary_search(&bin).is_ok();
                 let phase_advance = if is_peak
                     && bin >= 1
@@ -1557,12 +1078,12 @@ impl PhaseVocoder {
                         // Refined expected phase advance based on interpolated bin position
                         let refined_expected = TWO_PI_F64 * (bin as f64 + p) * hop_a / fft;
                         let refined_deviation = wrap_phase_f64(phase_diff - refined_expected);
-                        (refined_expected + refined_deviation) * phase_hop_ratio
+                        (refined_expected + refined_deviation) * hop_ratio
                     } else {
-                        (expected_diff + deviation) * phase_hop_ratio
+                        (expected_diff + deviation) * hop_ratio
                     }
                 } else {
-                    (expected_diff + deviation) * phase_hop_ratio
+                    (expected_diff + deviation) * hop_ratio
                 };
 
                 self.phase_accum[bin] = wrap_phase_f64(self.phase_accum[bin] + phase_advance);
@@ -1778,32 +1299,8 @@ impl PhaseVocoder {
     }
 
     #[inline]
-    fn continuity_focus_phase_ratio(&self, hop_ratio: f64) -> f64 {
-        if self.ratio_change_phase_frames == 0 || self.ratio_change_phase_total_frames == 0 {
-            return hop_ratio;
-        }
-
-        let remaining = self
-            .ratio_change_phase_frames
-            .min(self.ratio_change_phase_total_frames);
-        let completed = self.ratio_change_phase_total_frames - remaining;
-        let hold_frames = self
-            .ratio_change_phase_hold_frames
-            .min(self.ratio_change_phase_total_frames);
-        if completed < hold_frames {
-            return self.ratio_change_phase_from;
-        }
-
-        let effective_completed = completed - hold_frames;
-        let effective_total = self.ratio_change_phase_total_frames - hold_frames;
-        let progress = (effective_completed as f64 + 1.0) / (effective_total as f64 + 1.0);
-        self.ratio_change_phase_from + (hop_ratio - self.ratio_change_phase_from) * progress
-    }
-
-    #[inline]
     fn decay_transient_focus(&mut self) {
         self.transient_focus_frames = self.transient_focus_frames.saturating_sub(1);
-        self.ratio_change_phase_frames = self.ratio_change_phase_frames.saturating_sub(1);
     }
 }
 
@@ -1812,14 +1309,11 @@ impl std::fmt::Debug for PhaseVocoder {
         f.debug_struct("PhaseVocoder")
             .field("fft_size", &self.fft_size)
             .field("hop_analysis", &self.hop_analysis)
-            .field("hop_synthesis", &self.hop_synthesis)
             .field("stretch_ratio", &self.stretch_ratio)
             .field("synthesis_pos", &self.synthesis_pos)
             .field("sub_bass_bin", &self.sub_bass_bin)
             .field("phase_locking_mode", &self.phase_locking_mode)
             .field("adaptive_phase_locking", &self.adaptive_phase_locking)
-            .field("envelope_strength", &self.envelope_strength)
-            .field("adaptive_envelope_order", &self.adaptive_envelope_order)
             .field("streaming_tail_len", &self.streaming_tail.len())
             .finish()
     }
@@ -1980,24 +1474,6 @@ mod tests {
     }
 
     #[test]
-    fn test_envelope_strength_setter_clamps() {
-        let mut pv = PhaseVocoder::new(1024, 256, 1.0, 44100, 120.0);
-        pv.set_envelope_strength(3.0);
-        assert!((pv.envelope_strength - 2.0).abs() < 1e-6);
-        pv.set_envelope_strength(-1.0);
-        assert!((pv.envelope_strength - 0.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_adaptive_envelope_order_setter() {
-        let mut pv = PhaseVocoder::new(1024, 256, 1.0, 44100, 120.0);
-        pv.set_adaptive_envelope_order(false);
-        assert!(!pv.adaptive_envelope_order);
-        pv.set_adaptive_envelope_order(true);
-        assert!(pv.adaptive_envelope_order);
-    }
-
-    #[test]
     fn test_reset_phase_state_bands_enables_transient_focus_for_audible_bands() {
         let sample_rate = 44_100u32;
         let mut pv = PhaseVocoder::new(1024, 256, 1.0, sample_rate, 120.0);
@@ -2100,7 +1576,7 @@ mod tests {
             pv.fft_buffer[bin] = Complex::from_polar(1.0, phase);
         }
 
-        pv.advance_phases(num_bins, 1.0, 1.0);
+        pv.advance_phases(num_bins, 1.0);
 
         let seeded_phase = pv.analysis_phases[target_bin] as f64;
         assert!(
@@ -2144,11 +1620,11 @@ mod tests {
         let mut focused = PhaseVocoder::new(1024, 256, 1.0, sample_rate, 0.0);
         configure(&mut focused);
         focused.transient_focus_frames = 1;
-        focused.advance_phases(num_bins, 1.0, 1.0);
+        focused.advance_phases(num_bins, 1.0);
 
         let mut unfocused = PhaseVocoder::new(1024, 256, 1.0, sample_rate, 0.0);
         configure(&mut unfocused);
-        unfocused.advance_phases(num_bins, 1.0, 1.0);
+        unfocused.advance_phases(num_bins, 1.0);
 
         // The accumulator stays wrapped, so phases compare modulo 2*PI.
         let independent_phase = wrap_phase_f64(focused.expected_phase_advance[target_bin]) as f32;
@@ -2768,18 +2244,6 @@ mod tests {
     // --- set_stretch_ratio ---
 
     #[test]
-    fn test_set_stretch_ratio_updates_hop_synthesis() {
-        let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
-        assert_eq!(pv.hop_synthesis(), 1024); // 1024 * 1.0 = 1024
-
-        pv.set_stretch_ratio(2.0);
-        assert_eq!(pv.hop_synthesis(), 2048); // 1024 * 2.0 = 2048
-
-        pv.set_stretch_ratio(0.5);
-        assert_eq!(pv.hop_synthesis(), 512); // 1024 * 0.5 = 512
-    }
-
-    #[test]
     fn test_set_stretch_ratio_preserves_phase_state() {
         // Process some audio, then change ratio and process more.
         // Phase should be continuous (no reset).
@@ -2801,171 +2265,6 @@ mod tests {
         let output2 = pv.process(&input).unwrap();
         assert!(!output2.is_empty());
         assert!(output2.len() > output1.len()); // 1.5x should be longer
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_engages_brief_continuity_focus_for_meaningful_step() {
-        let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
-        assert_eq!(pv.transient_focus_frames, 0);
-
-        pv.set_stretch_ratio(1.002);
-        assert_eq!(
-            pv.transient_focus_frames, RATIO_CHANGE_FOCUS_FRAMES,
-            "meaningful runtime ratio steps should briefly tighten post-change phase locking"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_ignores_tiny_steps_for_continuity_focus() {
-        let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
-        assert_eq!(pv.transient_focus_frames, 0);
-
-        pv.set_stretch_ratio(1.0005);
-        assert_eq!(
-            pv.transient_focus_frames, 0,
-            "sub-threshold ratio nudges should not burn the continuity-focus window"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_refreshes_continuity_focus_during_repeated_short_interval_modulation()
-    {
-        let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
-        pv.set_stretch_ratio(1.002);
-        assert_eq!(pv.transient_focus_frames, RATIO_CHANGE_FOCUS_FRAMES);
-
-        pv.transient_focus_frames = 1;
-        pv.set_stretch_ratio(1.004);
-        assert_eq!(
-            pv.transient_focus_frames, RATIO_CHANGE_FOCUS_FRAMES,
-            "follow-up ratio steps should refresh continuity focus so repeated short-interval modulation keeps seam locking tight"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_restarts_phase_ratio_slew_from_current_effective_ratio() {
-        let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
-
-        pv.set_stretch_ratio(1.12);
-        assert!(
-            (pv.continuity_focus_phase_ratio(pv.stretch_ratio) - 1.03).abs() < 1e-12,
-            "the first continuity-focus frame should only move partway toward the new ratio"
-        );
-
-        pv.decay_transient_focus();
-        assert!(
-            (pv.continuity_focus_phase_ratio(pv.stretch_ratio) - 1.06).abs() < 1e-12,
-            "the effective phase ratio should keep gliding toward the target while the seam window drains"
-        );
-
-        pv.set_stretch_ratio(0.92);
-        assert!(
-            (pv.ratio_change_phase_from - 1.06).abs() < 1e-12,
-            "a repeated short-interval modulation step should restart from the in-flight effective phase ratio, not the stale previous target"
-        );
-        assert!(
-            (pv.continuity_focus_phase_ratio(pv.stretch_ratio) - 1.032).abs() < 1e-12,
-            "the restarted seam slew should still glide from the current effective ratio into the new target, but a direction reversal now keeps the seam on a slightly longer continuity window"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_extends_continuity_focus_for_direction_reversal() {
-        let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
-
-        pv.set_stretch_ratio(1.12);
-        pv.decay_transient_focus();
-        assert!(
-            (pv.continuity_focus_phase_ratio(pv.stretch_ratio) - 1.06).abs() < 1e-12,
-            "test setup should leave an in-flight continuity slew before reversing direction"
-        );
-
-        pv.set_stretch_ratio(0.92);
-        assert_eq!(
-            pv.transient_focus_frames,
-            RATIO_CHANGE_FOCUS_FRAMES + RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES,
-            "direction-reversing ratio steps should hold continuity focus for one extra frame so the seam does not relax too early"
-        );
-        assert_eq!(
-            pv.ratio_change_phase_total_frames,
-            RATIO_CHANGE_FOCUS_FRAMES + RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES,
-            "the phase-ratio slew should use the same extended window as transient focus during a reversal"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_reengages_continuity_focus_after_window_drains() {
-        let mut pv = PhaseVocoder::new(4096, 1024, 1.0, 44100, 120.0);
-        pv.set_stretch_ratio(1.002);
-        pv.transient_focus_frames = 0;
-
-        pv.set_stretch_ratio(1.004);
-        assert_eq!(
-            pv.transient_focus_frames, RATIO_CHANGE_FOCUS_FRAMES,
-            "a new ratio step should re-engage continuity focus once the prior seam window has drained"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_reengages_focus_for_small_nudge_when_carried_seam_is_still_far() {
-        let mut pv = PhaseVocoder::new(1024, 256, 1.0002, 44_100, 120.0);
-        pv.streaming_tail = vec![0.0; 64];
-        pv.streaming_tail_phase_ratio = 1.04;
-        pv.ratio_change_phase_from = 1.04;
-        pv.ratio_change_phase_total_frames = RATIO_CHANGE_FOCUS_FRAMES;
-        pv.ratio_change_phase_frames = 0;
-        pv.transient_focus_frames = 0;
-
-        pv.set_stretch_ratio(1.0006);
-
-        assert!(
-            pv.transient_focus_frames >= RATIO_CHANGE_FOCUS_FRAMES,
-            "a near-unity nudge should still re-engage continuity focus when the unresolved carried seam remains meaningfully expanded"
-        );
-        assert!(
-            (pv.ratio_change_phase_from - 1.04).abs() < 1e-12,
-            "the refreshed continuity slew should restart from the unresolved carried seam instead of the tiny prior target delta"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_extends_continuity_focus_while_streaming_tail_is_unresolved() {
-        let fft_size = 1024;
-        let hop = 256;
-        let sample_rate = 44_100u32;
-        let input: Vec<f32> = (0..fft_size * 5)
-            .map(|i| {
-                let t = i as f32 / sample_rate as f32;
-                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
-            })
-            .collect();
-
-        let mut pv = PhaseVocoder::new(fft_size, hop, 1.04, sample_rate, 120.0);
-        let first_chunk_len = fft_size * 2;
-        let first = pv.process_streaming(&input[..first_chunk_len]).unwrap();
-        assert!(!first.is_empty(), "first streaming chunk should emit audio");
-        assert!(
-            !pv.streaming_tail.is_empty(),
-            "first streaming chunk should retain unresolved overlap tail"
-        );
-
-        pv.transient_focus_frames = 0;
-        let expected = continuity_focus_frames_for_ratio_change(
-            RATIO_CHANGE_FOCUS_FRAMES,
-            pv.streaming_tail.len(),
-            hop,
-        );
-
-        pv.set_stretch_ratio(0.96);
-
-        assert_eq!(
-            pv.transient_focus_frames, expected,
-            "ratio changes with unresolved streaming overlap should keep continuity focus active until the seam has more time to drain"
-        );
-        assert!(
-            pv.transient_focus_frames > RATIO_CHANGE_FOCUS_FRAMES,
-            "streaming seam carry should extend continuity focus beyond the fixed minimum window"
-        );
     }
 
     #[test]
@@ -3065,135 +2364,6 @@ mod tests {
         assert!(
             (pv.streaming_tail_ratio - 0.82).abs() < 1e-12,
             "flush should clear carried overlap history and re-arm the current ratio"
-        );
-    }
-
-    #[test]
-    fn test_streaming_tail_phase_ratio_tracks_inflight_seam_after_prior_tail_drains() {
-        let fft_size = 1024;
-        let hop = 256;
-        let sample_rate = 44100u32;
-        let num_samples = fft_size * 6;
-        let input: Vec<f32> = (0..num_samples)
-            .map(|i| {
-                let t = i as f32 / sample_rate as f32;
-                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
-            })
-            .collect();
-
-        let mut pv = PhaseVocoder::new(fft_size, hop, 1.18, sample_rate, 120.0);
-        let first_chunk_len = fft_size * 2;
-        let first = pv.process_streaming(&input[..first_chunk_len]).unwrap();
-        assert!(!first.is_empty(), "first streaming chunk should emit audio");
-        assert!(
-            !pv.streaming_tail.is_empty(),
-            "first streaming chunk should retain overlap tail"
-        );
-
-        let consumed = ((first_chunk_len - fft_size) / hop + 1) * hop;
-        let second_chunk_len = fft_size + hop * 3;
-        pv.set_stretch_ratio(0.82);
-        assert_eq!(
-            pv.ratio_change_phase_total_frames,
-            RATIO_CHANGE_FOCUS_FRAMES + RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES,
-            "test setup should keep the reversed seam active across the short follow-up chunk"
-        );
-        let second = pv
-            .process_streaming(&input[consumed..consumed + second_chunk_len])
-            .unwrap();
-        assert!(
-            !second.is_empty(),
-            "second streaming chunk should emit audio"
-        );
-        assert!(
-            !pv.streaming_tail.is_empty(),
-            "second streaming chunk should keep a newly generated overlap tail"
-        );
-        assert!(
-            (pv.streaming_tail_ratio - 0.82).abs() < 1e-12,
-            "once the older overlap has drained, normalization should re-arm to the new target ratio"
-        );
-        assert!(
-            pv.streaming_tail_phase_ratio.is_finite(),
-            "the carried phase seam ratio should remain finite"
-        );
-        assert!(
-            pv.streaming_tail_phase_ratio <= pv.ratio_change_phase_from.max(pv.stretch_ratio)
-                && pv.streaming_tail_phase_ratio
-                    >= pv.ratio_change_phase_from.min(pv.stretch_ratio),
-            "the carried phase seam ratio should stay within the active slew span"
-        );
-    }
-
-    #[test]
-    fn test_streaming_tail_phase_ratio_uses_first_overlap_crossing_callback_boundary() {
-        let fft_size = 1024;
-        let hop = 256;
-        let sample_rate = 44_100u32;
-        let num_frames = 6usize;
-        let input_len = fft_size + hop * (num_frames - 1);
-        let input: Vec<f32> = (0..input_len)
-            .map(|i| {
-                let t = i as f32 / sample_rate as f32;
-                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
-            })
-            .collect();
-
-        let mut expected = PhaseVocoder::new(fft_size, hop, 1.12, sample_rate, 120.0);
-        expected.set_stretch_ratio(0.82);
-        assert_eq!(
-            expected.ratio_change_phase_total_frames, RATIO_CHANGE_FOCUS_FRAMES,
-            "test setup should leave the base continuity glide active across the callback"
-        );
-        let frame_advance = expected.hop_analysis as f64 * expected.stretch_ratio;
-        let mut synthesis_frame_pos = 0.0f64;
-        for _ in 0..num_frames {
-            let synthesis_pos = snap_near_integer(synthesis_frame_pos);
-            expected.decay_transient_focus();
-            synthesis_frame_pos = synthesis_pos + frame_advance;
-        }
-        let emit_len = snap_near_integer(synthesis_frame_pos).floor() as usize;
-        synthesis_frame_pos = 0.0;
-        expected = PhaseVocoder::new(fft_size, hop, 1.12, sample_rate, 120.0);
-        expected.set_stretch_ratio(0.82);
-        let mut expected_carried_tail_phase_ratio = None;
-        for _ in 0..num_frames {
-            let synthesis_pos = snap_near_integer(synthesis_frame_pos);
-            let synthesis_floor = synthesis_pos.floor() as usize;
-            let frac = synthesis_pos - synthesis_floor as f64;
-            let frame_end = synthesis_floor.saturating_add(
-                fft_size
-                    .saturating_sub(1)
-                    .saturating_add(usize::from(frac > SYNTH_POS_EPSILON)),
-            );
-            let phase_ratio = expected.continuity_focus_phase_ratio(expected.stretch_ratio);
-            if expected_carried_tail_phase_ratio.is_none() && frame_end >= emit_len {
-                expected_carried_tail_phase_ratio = Some(phase_ratio);
-            }
-            expected.decay_transient_focus();
-            synthesis_frame_pos = synthesis_pos + frame_advance;
-        }
-        let expected_carried_tail_phase_ratio = expected_carried_tail_phase_ratio
-            .expect("expected an unresolved overlap past the callback boundary");
-
-        let mut pv = PhaseVocoder::new(fft_size, hop, 1.12, sample_rate, 120.0);
-        pv.set_stretch_ratio(0.82);
-        let output = pv.process_streaming(&input).unwrap();
-        assert!(
-            !output.is_empty(),
-            "streaming pass should emit finalized samples"
-        );
-        assert!(
-            !pv.streaming_tail.is_empty(),
-            "streaming pass should retain unresolved overlap beyond the callback boundary"
-        );
-        assert!(
-            (pv.streaming_tail_phase_ratio - expected_carried_tail_phase_ratio).abs() < 1e-12,
-            "the carried tail should preserve the phase ratio from the first overlap crossing the callback boundary, not the newest frame in the callback"
-        );
-        assert!(
-            pv.streaming_tail_phase_ratio > pv.stretch_ratio + 1e-3,
-            "the earliest unresolved seam should stay meaningfully above the settled target during the in-flight glide"
         );
     }
 
@@ -3370,516 +2540,6 @@ mod tests {
         assert!(
             (pv.streaming_tail_ratio - 0.98).abs() < 1e-12,
             "flush should preserve the re-armed current ratio after repeated short-interval modulation"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_keeps_carried_expansion_seam_when_rebounding_toward_unity() {
-        let fft_size = 1024;
-        let hop = 256;
-        let sample_rate = 44100u32;
-        let num_samples = fft_size * 8;
-        let input: Vec<f32> = (0..num_samples)
-            .map(|i| {
-                let t = i as f32 / sample_rate as f32;
-                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
-            })
-            .collect();
-
-        let mut pv = PhaseVocoder::new(fft_size, hop, 1.04, sample_rate, 120.0);
-        let first_chunk_len = fft_size * 2;
-        let first = pv.process_streaming(&input[..first_chunk_len]).unwrap();
-        assert!(!first.is_empty(), "first streaming chunk should emit audio");
-        assert!(
-            !pv.streaming_tail.is_empty(),
-            "first streaming chunk should retain overlap tail"
-        );
-
-        let mut consumed = ((first_chunk_len - fft_size) / hop + 1) * hop;
-        let short_chunk_len = fft_size + hop;
-
-        pv.set_stretch_ratio(0.96);
-        let second = pv
-            .process_streaming(&input[consumed..consumed + short_chunk_len])
-            .unwrap();
-        assert!(
-            !second.is_empty(),
-            "short follow-up chunk should still emit audio"
-        );
-        assert!(
-            (pv.streaming_tail_ratio - 1.04).abs() < 1e-12,
-            "the prior expansion seam should still be carried after the short cross-unity step"
-        );
-
-        consumed += ((short_chunk_len - fft_size) / hop + 1) * hop;
-        assert!(
-            ratio_is_meaningfully_below_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
-            "test setup should decay the in-flight compression seam below unity before the rebound"
-        );
-
-        pv.set_stretch_ratio(1.02);
-        assert!(
-            (pv.ratio_change_phase_from - 1.04).abs() < 1e-12,
-            "rebounding toward unity should restart from the carried expansion seam while that overlap tail is still unresolved"
-        );
-
-        let third = pv
-            .process_streaming(&input[consumed..consumed + short_chunk_len])
-            .unwrap();
-        assert!(
-            !third.is_empty(),
-            "the rebound chunk should still emit audio after re-anchoring the seam"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_keeps_carried_compression_seam_when_rebounding_toward_unity() {
-        let fft_size = 1024;
-        let hop = 256;
-        let sample_rate = 44100u32;
-        let num_samples = fft_size * 8;
-        let input: Vec<f32> = (0..num_samples)
-            .map(|i| {
-                let t = i as f32 / sample_rate as f32;
-                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
-            })
-            .collect();
-
-        let mut pv = PhaseVocoder::new(fft_size, hop, 0.96, sample_rate, 120.0);
-        let first_chunk_len = fft_size * 2;
-        let first = pv.process_streaming(&input[..first_chunk_len]).unwrap();
-        assert!(!first.is_empty(), "first streaming chunk should emit audio");
-        assert!(
-            !pv.streaming_tail.is_empty(),
-            "first streaming chunk should retain overlap tail"
-        );
-
-        let mut consumed = ((first_chunk_len - fft_size) / hop + 1) * hop;
-        let short_chunk_len = fft_size + hop;
-
-        pv.set_stretch_ratio(1.12);
-        let second = pv
-            .process_streaming(&input[consumed..consumed + short_chunk_len])
-            .unwrap();
-        assert!(
-            !second.is_empty(),
-            "short follow-up chunk should still emit audio"
-        );
-        assert!(
-            (pv.streaming_tail_phase_ratio - 0.96).abs() < 1e-12,
-            "the prior compression seam should still be carried after the short cross-unity step"
-        );
-
-        consumed += ((short_chunk_len - fft_size) / hop + 1) * hop;
-        let hold = pv
-            .process_streaming(&input[consumed..consumed + short_chunk_len])
-            .unwrap();
-        assert!(
-            !hold.is_empty(),
-            "a second short chunk at the rebound ratio should still emit audio"
-        );
-        assert!(
-            (pv.streaming_tail_phase_ratio - 0.96).abs() < 1e-12,
-            "the carried compression seam should persist until the older overlap fully drains"
-        );
-
-        consumed += ((short_chunk_len - fft_size) / hop + 1) * hop;
-        assert!(
-            ratio_is_meaningfully_above_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
-            "test setup should decay the in-flight expansion seam above unity before the rebound"
-        );
-
-        pv.set_stretch_ratio(0.98);
-        assert!(
-            (pv.ratio_change_phase_from - 0.96).abs() < 1e-12,
-            "rebounding toward unity should restart from the carried compression seam while that overlap tail is still unresolved"
-        );
-
-        let third = pv
-            .process_streaming(&input[consumed..consumed + short_chunk_len])
-            .unwrap();
-        assert!(
-            !third.is_empty(),
-            "the rebound chunk should still emit audio after re-anchoring the compression seam"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_keeps_same_side_carried_expansion_seam_when_rebounding_toward_unity()
-    {
-        let fft_size = 1024;
-        let hop = 256;
-        let sample_rate = 44100u32;
-        let num_samples = fft_size * 8;
-        let input: Vec<f32> = (0..num_samples)
-            .map(|i| {
-                let t = i as f32 / sample_rate as f32;
-                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
-            })
-            .collect();
-
-        let mut pv = PhaseVocoder::new(fft_size, hop, 1.12, sample_rate, 120.0);
-        let first_chunk_len = fft_size * 2;
-        let first = pv.process_streaming(&input[..first_chunk_len]).unwrap();
-        assert!(!first.is_empty(), "first streaming chunk should emit audio");
-        assert!(
-            !pv.streaming_tail.is_empty(),
-            "first streaming chunk should retain overlap tail"
-        );
-
-        let mut consumed = ((first_chunk_len - fft_size) / hop + 1) * hop;
-        let short_chunk_len = fft_size;
-
-        pv.set_stretch_ratio(1.04);
-        let second = pv
-            .process_streaming(&input[consumed..consumed + short_chunk_len])
-            .unwrap();
-        assert!(
-            !second.is_empty(),
-            "short follow-up chunk should still emit audio"
-        );
-        assert!(
-            (pv.streaming_tail_phase_ratio - 1.12).abs() < 1e-12,
-            "the prior expansion seam should still be carried after the short same-side step"
-        );
-
-        consumed += ((short_chunk_len - fft_size) / hop + 1) * hop;
-        let hold = pv
-            .process_streaming(&input[consumed..consumed + short_chunk_len])
-            .unwrap();
-        assert!(
-            !hold.is_empty(),
-            "a second short chunk at the reduced expansion ratio should still emit audio"
-        );
-        assert!(
-            (pv.streaming_tail_phase_ratio - 1.12).abs() < 1e-12,
-            "the carried expansion seam should persist until the older overlap fully drains"
-        );
-        assert!(
-            ratio_is_meaningfully_above_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
-            "test setup should leave the in-flight expansion seam above unity before the rebound"
-        );
-
-        pv.set_stretch_ratio(1.02);
-        assert!(
-            (pv.ratio_change_phase_from - 1.12).abs() < 1e-12,
-            "same-side rebound toward unity should restart from the carried expansion seam while that overlap tail is still unresolved"
-        );
-        assert_eq!(
-            pv.ratio_change_phase_total_frames,
-            continuity_focus_frames_for_ratio_change(
-                RATIO_CHANGE_FOCUS_FRAMES,
-                pv.streaming_tail.len(),
-                hop,
-            ) + RATIO_CHANGE_CARRIED_SEAM_FOCUS_EXTRA_FRAMES,
-            "re-anchoring to an older carried expansion seam should hold continuity focus one extra frame so the overlap does not relax before that seam drains"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_keeps_same_side_carried_compression_seam_when_rebounding_toward_unity()
-     {
-        let fft_size = 1024;
-        let hop = 256;
-        let sample_rate = 44100u32;
-        let num_samples = fft_size * 8;
-        let input: Vec<f32> = (0..num_samples)
-            .map(|i| {
-                let t = i as f32 / sample_rate as f32;
-                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
-            })
-            .collect();
-
-        let mut pv = PhaseVocoder::new(fft_size, hop, 0.88, sample_rate, 120.0);
-        let first_chunk_len = fft_size * 2;
-        let first = pv.process_streaming(&input[..first_chunk_len]).unwrap();
-        assert!(!first.is_empty(), "first streaming chunk should emit audio");
-        assert!(
-            !pv.streaming_tail.is_empty(),
-            "first streaming chunk should retain overlap tail"
-        );
-
-        let mut consumed = ((first_chunk_len - fft_size) / hop + 1) * hop;
-        let short_chunk_len = fft_size;
-
-        pv.set_stretch_ratio(0.96);
-        let second = pv
-            .process_streaming(&input[consumed..consumed + short_chunk_len])
-            .unwrap();
-        assert!(
-            !second.is_empty(),
-            "short follow-up chunk should still emit audio"
-        );
-        assert!(
-            (pv.streaming_tail_phase_ratio - 0.88).abs() < 1e-12,
-            "the prior compression seam should still be carried after the short same-side step"
-        );
-
-        consumed += ((short_chunk_len - fft_size) / hop + 1) * hop;
-        let hold = pv
-            .process_streaming(&input[consumed..consumed + short_chunk_len])
-            .unwrap();
-        assert!(
-            !hold.is_empty(),
-            "a second short chunk at the relaxed compression ratio should still emit audio"
-        );
-        assert!(
-            (pv.streaming_tail_phase_ratio - 0.88).abs() < 1e-12,
-            "the carried compression seam should persist until the older overlap fully drains"
-        );
-        assert!(
-            ratio_is_meaningfully_below_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
-            "test setup should leave the in-flight compression seam below unity before the rebound"
-        );
-
-        pv.set_stretch_ratio(0.98);
-        assert!(
-            (pv.ratio_change_phase_from - 0.88).abs() < 1e-12,
-            "same-side rebound toward unity should restart from the carried compression seam while that overlap tail is still unresolved"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_keeps_same_side_carried_expansion_seam_when_stepping_away_from_unity()
-    {
-        let fft_size = 1024;
-        let hop = 256;
-        let sample_rate = 44100u32;
-        let num_samples = fft_size * 8;
-        let input: Vec<f32> = (0..num_samples)
-            .map(|i| {
-                let t = i as f32 / sample_rate as f32;
-                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
-            })
-            .collect();
-
-        let mut pv = PhaseVocoder::new(fft_size, hop, 1.04, sample_rate, 120.0);
-        let first_chunk_len = fft_size * 2;
-        let first = pv.process_streaming(&input[..first_chunk_len]).unwrap();
-        assert!(!first.is_empty(), "first streaming chunk should emit audio");
-        assert!(
-            !pv.streaming_tail.is_empty(),
-            "first streaming chunk should retain overlap tail"
-        );
-
-        let consumed = ((first_chunk_len - fft_size) / hop + 1) * hop;
-        let short_chunk_len = fft_size + hop;
-
-        pv.set_stretch_ratio(1.02);
-        let second = pv
-            .process_streaming(&input[consumed..consumed + short_chunk_len])
-            .unwrap();
-        assert!(
-            !second.is_empty(),
-            "short follow-up chunk should still emit audio"
-        );
-        assert!(
-            (pv.streaming_tail_phase_ratio - 1.04).abs() < 1e-12,
-            "the prior expansion seam should still be carried after the short same-side relaxation"
-        );
-        assert!(
-            ratio_is_meaningfully_above_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
-            "test setup should leave the in-flight expansion seam above unity before the stronger same-side step"
-        );
-
-        pv.set_stretch_ratio(1.08);
-        assert!(
-            (pv.ratio_change_phase_from - 1.04).abs() < 1e-12,
-            "same-side step away from unity should restart from the carried expansion seam while that overlap tail is still unresolved"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_reanchors_to_same_side_carried_seam_for_subthreshold_nudge() {
-        let mut pv = PhaseVocoder::new(1024, 256, 1.02, 44_100, 120.0);
-        pv.streaming_tail = vec![0.0; 64];
-        pv.streaming_tail_phase_ratio = 1.12;
-        pv.ratio_change_phase_from = 1.12;
-        pv.ratio_change_phase_total_frames = 4;
-        pv.ratio_change_phase_frames = 1;
-        pv.transient_focus_frames = 1;
-        assert!(
-            ratio_is_meaningfully_above_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
-            "test setup should leave the in-flight seam on the same side of unity before the tiny follow-up step"
-        );
-
-        pv.set_stretch_ratio(1.0205);
-        assert!(
-            (pv.ratio_change_phase_from - 1.12).abs() < 1e-12,
-            "a sub-threshold same-side follow-up nudge should restart from the older carried expansion seam while that overlap tail is still unresolved"
-        );
-        assert!(
-            (pv.continuity_focus_phase_ratio(pv.stretch_ratio) - 1.12).abs() < 1e-12,
-            "a far carried-seam re-anchor should hold the first continuity-focus frame on the older seam before gliding toward the new target"
-        );
-        pv.decay_transient_focus();
-        assert!(
-            pv.continuity_focus_phase_ratio(pv.stretch_ratio) < 1.12,
-            "after the initial seam hold, the restarted continuity slew should resume gliding toward the new target"
-        );
-        assert_eq!(
-            pv.ratio_change_phase_total_frames,
-            continuity_focus_frames_for_ratio_change(
-                RATIO_CHANGE_FOCUS_FRAMES,
-                pv.streaming_tail.len(),
-                pv.hop_analysis,
-            ) + RATIO_CHANGE_CARRIED_SEAM_FOCUS_EXTRA_FRAMES,
-            "re-anchoring a tiny same-side nudge to an older carried seam should refresh continuity focus so the overlap does not relax mid-tail"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_reanchors_to_opposite_side_carried_seam_for_subthreshold_deeper_step()
-    {
-        let mut pv = PhaseVocoder::new(1024, 256, 0.92, 44_100, 120.0);
-        pv.streaming_tail = vec![0.0; 64];
-        pv.streaming_tail_phase_ratio = 1.12;
-        pv.ratio_change_phase_from = 1.12;
-        pv.ratio_change_phase_total_frames = 4;
-        pv.ratio_change_phase_frames = 1;
-        pv.transient_focus_frames = 1;
-        assert!(
-            ratio_is_meaningfully_below_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
-            "test setup should leave the in-flight seam on the compression side before the tiny deeper step"
-        );
-
-        pv.set_stretch_ratio(0.9195);
-        assert!(
-            (pv.ratio_change_phase_from - 1.12).abs() < 1e-12,
-            "a sub-threshold deeper compression nudge should restart from the older carried expansion seam while that overlap tail is still unresolved"
-        );
-        assert_eq!(
-            pv.ratio_change_phase_total_frames,
-            continuity_focus_frames_for_ratio_change(
-                RATIO_CHANGE_FOCUS_FRAMES,
-                pv.streaming_tail.len(),
-                pv.hop_analysis,
-            ) + RATIO_CHANGE_CARRIED_SEAM_FOCUS_EXTRA_FRAMES,
-            "re-anchoring a tiny opposite-side follow-up step should refresh continuity focus so the older seam does not snap mid-tail"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_stacks_reversal_and_carried_seam_focus_extensions() {
-        let mut pv = PhaseVocoder::new(1024, 256, 1.12, 44_100, 120.0);
-        pv.streaming_tail = vec![0.0; 64];
-        pv.streaming_tail_phase_ratio = 0.92;
-        pv.ratio_change_phase_from = 0.92;
-        pv.ratio_change_phase_total_frames = 4;
-        pv.ratio_change_phase_frames = 2;
-        pv.transient_focus_frames = 2;
-
-        assert!(
-            ratio_is_meaningfully_above_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
-            "test setup should leave the in-flight seam above unity before reversing back toward the carried compression seam"
-        );
-
-        pv.set_stretch_ratio(0.86);
-        assert!(
-            (pv.ratio_change_phase_from - 0.92).abs() < 1e-12,
-            "the restarted continuity slew should re-anchor to the older carried compression seam"
-        );
-        assert_eq!(
-            pv.ratio_change_phase_total_frames,
-            continuity_focus_frames_for_ratio_change(
-                RATIO_CHANGE_FOCUS_FRAMES,
-                pv.streaming_tail.len(),
-                pv.hop_analysis,
-            ) + RATIO_CHANGE_REVERSAL_FOCUS_EXTRA_FRAMES
-                + RATIO_CHANGE_CARRIED_SEAM_FOCUS_EXTRA_FRAMES,
-            "when a new step both reverses direction and re-anchors to a far carried seam, both continuity-focus extensions should stack"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_keeps_same_side_carried_compression_seam_when_stepping_away_from_unity()
-     {
-        let fft_size = 1024;
-        let hop = 256;
-        let sample_rate = 44100u32;
-        let num_samples = fft_size * 8;
-        let input: Vec<f32> = (0..num_samples)
-            .map(|i| {
-                let t = i as f32 / sample_rate as f32;
-                (2.0 * PI * 220.0 * t).sin() * 0.55 + (2.0 * PI * 660.0 * t).sin() * 0.20
-            })
-            .collect();
-
-        let mut pv = PhaseVocoder::new(fft_size, hop, 0.96, sample_rate, 120.0);
-        let first_chunk_len = fft_size * 2;
-        let first = pv.process_streaming(&input[..first_chunk_len]).unwrap();
-        assert!(!first.is_empty(), "first streaming chunk should emit audio");
-        assert!(
-            !pv.streaming_tail.is_empty(),
-            "first streaming chunk should retain overlap tail"
-        );
-
-        let consumed = ((first_chunk_len - fft_size) / hop + 1) * hop;
-        let short_chunk_len = fft_size;
-
-        pv.set_stretch_ratio(0.98);
-        let second = pv
-            .process_streaming(&input[consumed..consumed + short_chunk_len])
-            .unwrap();
-        assert!(
-            !second.is_empty(),
-            "short follow-up chunk should still emit audio"
-        );
-        assert!(
-            (pv.streaming_tail_phase_ratio - 0.96).abs() < 1e-12,
-            "the prior compression seam should still be carried after the short same-side relaxation"
-        );
-        assert!(
-            ratio_is_meaningfully_below_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
-            "test setup should leave the in-flight compression seam below unity before the stronger same-side step"
-        );
-
-        pv.set_stretch_ratio(0.92);
-        assert!(
-            (pv.ratio_change_phase_from - 0.96).abs() < 1e-12,
-            "same-side step away from unity should restart from the carried compression seam while that overlap tail is still unresolved"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_keeps_carried_expansion_seam_when_crossing_unity_and_stepping_deeper_into_compression()
-     {
-        let mut pv = PhaseVocoder::new(1024, 256, 0.98, 44_100, 120.0);
-        pv.streaming_tail = vec![0.0; 64];
-        pv.streaming_tail_phase_ratio = 1.04;
-        pv.ratio_change_phase_from = 1.04;
-        pv.ratio_change_phase_total_frames = RATIO_CHANGE_FOCUS_FRAMES;
-        pv.ratio_change_phase_frames = 1;
-        assert!(
-            ratio_is_meaningfully_below_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
-            "test setup should leave the in-flight seam on the compression side before stepping deeper"
-        );
-
-        pv.set_stretch_ratio(0.92);
-        assert!(
-            (pv.ratio_change_phase_from - 1.04).abs() < 1e-12,
-            "cross-unity step away from unity should restart from the older carried expansion seam while that overlap tail is still unresolved"
-        );
-    }
-
-    #[test]
-    fn test_set_stretch_ratio_keeps_carried_compression_seam_when_crossing_unity_and_stepping_deeper_into_expansion()
-     {
-        let mut pv = PhaseVocoder::new(1024, 256, 1.02, 44_100, 120.0);
-        pv.streaming_tail = vec![0.0; 64];
-        pv.streaming_tail_phase_ratio = 0.96;
-        pv.ratio_change_phase_from = 0.96;
-        pv.ratio_change_phase_total_frames = RATIO_CHANGE_FOCUS_FRAMES;
-        pv.ratio_change_phase_frames = 1;
-        assert!(
-            ratio_is_meaningfully_above_unity(pv.continuity_focus_phase_ratio(pv.stretch_ratio)),
-            "test setup should leave the in-flight seam on the expansion side before stepping deeper"
-        );
-
-        pv.set_stretch_ratio(1.08);
-        assert!(
-            (pv.ratio_change_phase_from - 0.96).abs() < 1e-12,
-            "cross-unity step away from unity should restart from the older carried compression seam while that overlap tail is still unresolved"
         );
     }
 

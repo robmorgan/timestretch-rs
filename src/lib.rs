@@ -490,8 +490,10 @@ pub fn stretch(input: &[f32], params: &StretchParams) -> Result<Vec<f32>, Stretc
 
     // Batch rendering runs on the engine graph (ROADMAP Stage 8):
     // whole-file pre-analysis, exact output length by construction, and
-    // channels processed in lockstep (stereo phase preserved natively —
-    // the old per-channel hybrid needed a mid/side mode for this).
+    // channels processed in lockstep. Ratios inside the engine's rate
+    // range preserve stereo phase natively; wide ratios run the shipped
+    // wide stage, which processes stereo in mid/side so the center image
+    // cannot wander (ROADMAP Stage 14).
     let num_channels = params.channels.count();
     let mut output = engine::offline::stretch_offline(
         input,

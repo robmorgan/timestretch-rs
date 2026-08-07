@@ -16,7 +16,7 @@
 //! Splice decisions are made once per block on the channel mix and applied
 //! to every channel identically, keeping the stereo image intact.
 
-use crate::core::resample::{dot_f32_f64, fill_row_lerp, polyphase_rows};
+use crate::core::resample::{bessel_i0, dot_f32_f64, fill_row_lerp, polyphase_rows};
 use crate::engine::stage::{BLOCK_FRAMES, OnsetEvent};
 
 /// Half-width of the SOLA read kernel in zero-crossings (64-tap kernel).
@@ -45,19 +45,6 @@ struct ReadInterpTable {
 
 impl ReadInterpTable {
     fn new() -> Self {
-        fn bessel_i0(x: f64) -> f64 {
-            let mut sum = 1.0f64;
-            let mut term = 1.0f64;
-            let half_x = x * 0.5;
-            for k in 1..=25 {
-                term *= (half_x / k as f64) * (half_x / k as f64);
-                sum += term;
-                if term < sum * 1e-16 {
-                    break;
-                }
-            }
-            sum
-        }
         let entries = READ_HALF_TAPS * READ_PHASES;
         let mut taps = vec![0.0f32; entries + 2];
         let bessel_beta = bessel_i0(READ_KAISER_BETA);
