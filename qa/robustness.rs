@@ -37,6 +37,18 @@ use timestretch::{
 
 const SR: u32 = 44_100;
 
+/// Campaign widening: XORs an optional `TIMESTRETCH_FUZZ_SEED` (decimal
+/// u64, set by the scheduled CI campaign to its run id) into the fixed
+/// per-test seed. Unset, every run is byte-deterministic from the
+/// constants; set, each campaign is an independent — but reproducible,
+/// the workflow logs the value — random exploration.
+fn campaign_seed(base: u64) -> u64 {
+    match std::env::var("TIMESTRETCH_FUZZ_SEED") {
+        Ok(v) => base ^ v.trim().parse::<u64>().unwrap_or(0),
+        Err(_) => base,
+    }
+}
+
 /// xorshift64* — deterministic, dependency-free. Seeds are fixed constants
 /// so every run fuzzes the identical corpus.
 struct Rng(u64);
@@ -149,7 +161,7 @@ fn tsa_truncation_at_every_length() {
 #[test]
 fn tsa_random_byte_flips_never_panic() {
     let (bytes, sr, len, hash) = small_container();
-    let mut rng = Rng::new(0x7541_F1E5);
+    let mut rng = Rng::new(campaign_seed(0x7541_F1E5));
     for _ in 0..3_000 {
         let mut mutated = bytes.clone();
         for _ in 0..1 + rng.below(8) {
@@ -166,7 +178,7 @@ fn tsa_random_byte_flips_never_panic() {
 
 #[test]
 fn tsa_random_garbage_never_panics() {
-    let mut rng = Rng::new(0x7541_6A2B);
+    let mut rng = Rng::new(campaign_seed(0x7541_6A2B));
     for _ in 0..3_000 {
         let len = rng.below(600);
         let mut garbage = rng.bytes(len);
@@ -183,7 +195,7 @@ fn tsa_random_garbage_never_panics() {
 #[test]
 fn tsa_huge_declared_sizes_rejected() {
     let (bytes, sr, len, hash) = small_container();
-    let mut rng = Rng::new(0x7541_D00D);
+    let mut rng = Rng::new(campaign_seed(0x7541_D00D));
     // Chunk payload lengths and PEAK bucket counts stamped with huge
     // values at random plausible offsets: must Err (or skip), never panic
     // and never allocate anywhere near the declared size.
@@ -242,7 +254,7 @@ fn preanalysis_json_adversarial_never_panics() {
     }
 
     // Random byte flips (printable and raw).
-    let mut rng = Rng::new(0x1502_7350);
+    let mut rng = Rng::new(campaign_seed(0x1502_7350));
     for _ in 0..1_500 {
         let mut mutated = valid.clone();
         for _ in 0..1 + rng.below(6) {
@@ -358,7 +370,7 @@ fn wav_truncation_at_every_length() {
 #[test]
 fn wav_random_byte_flips_never_panic() {
     let seeds = seed_wavs();
-    let mut rng = Rng::new(0x3A4E_F11B);
+    let mut rng = Rng::new(campaign_seed(0x3A4E_F11B));
     for _ in 0..3_000 {
         let mut wav = seeds[rng.below(seeds.len())].clone();
         for _ in 0..1 + rng.below(8) {
@@ -371,7 +383,7 @@ fn wav_random_byte_flips_never_panic() {
 
 #[test]
 fn wav_random_garbage_and_huge_chunks_never_panic() {
-    let mut rng = Rng::new(0x3A4E_600D);
+    let mut rng = Rng::new(campaign_seed(0x3A4E_600D));
     for _ in 0..2_000 {
         let len = 44 + rng.below(300);
         let mut garbage = rng.bytes(len);
@@ -582,7 +594,7 @@ fn batch_api_hostile_pre_analysis_never_panics() {
 
 #[test]
 fn batch_api_seeded_random_params_never_panic() {
-    let mut rng = Rng::new(0xBA7C_4A11);
+    let mut rng = Rng::new(campaign_seed(0xBA7C_4A11));
     for iter in 0..120 {
         // Log-uniform ratio across the full valid range, occasionally
         // stepping just outside it.
@@ -733,7 +745,7 @@ fn engine_config_boundary_matrix() {
 
 #[test]
 fn engine_process_with_extreme_configs_stays_finite() {
-    let mut rng = Rng::new(0xE9C1_EE7A);
+    let mut rng = Rng::new(campaign_seed(0xE9C1_EE7A));
     for (profile, channels, sample_rate) in [
         (EngineProfile::Tape, 8usize, 192_000u32),
         (EngineProfile::Keylock, 1, 8_000),

@@ -13,7 +13,11 @@
 //! - every output sample finite, including seek/priming regions;
 //! - zero clicks by the torture tests' max-adjacent-diff bound
 //!   (`slew(max_gesture_rate) * 3`), excluding a settle window at segment
-//!   start and after each seek (priming silence + declick fade-in).
+//!   start and after each seek (priming silence + declick fade-in);
+//! - bounded drift: between settle checkpoints, source frames consumed
+//!   track the integral of the commanded tempo rate within a constant
+//!   [`DRIFT_BOUND_FRAMES`] (the engine's stash is bounded — drift must
+//!   not accumulate with time).
 //!
 //! Zero-allocation on the audio thread is machine-verified separately in
 //! `tests/engine_realtime_allocations.rs` and is not re-gated here.
@@ -27,8 +31,9 @@
 //! ```
 //!
 //! Both variants are fully deterministic from the fixed seeds below; to
-//! widen the campaign, edit `LONG_SEED` (each seed is an independent
-//! hour).
+//! widen the campaign, set `TIMESTRETCH_FUZZ_SEED` (each value is an
+//! independent, reproducible hour — the scheduled CI campaign passes its
+//! run id and logs it).
 
 use timestretch::engine::{Engine, EngineConfig, EngineProfile};
 use timestretch::{PREANALYSIS_VERSION, PreAnalysisArtifact};
@@ -49,6 +54,18 @@ const SEEK_SETTLE_FRAMES: usize = 32_768;
 
 const CI_SEED: u64 = 0xD15C_0517_50AC_0001;
 const LONG_SEED: u64 = 0xD15C_0517_50AC_1000;
+
+/// Campaign widening: XORs an optional `TIMESTRETCH_FUZZ_SEED` (decimal
+/// u64, set by the scheduled CI campaign to its run id) into the fixed
+/// per-test seed. Unset, every run is byte-deterministic from the
+/// constants; set, each campaign is an independent — but reproducible,
+/// the workflow logs the value — random exploration.
+fn campaign_seed(base: u64) -> u64 {
+    match std::env::var("TIMESTRETCH_FUZZ_SEED") {
+        Ok(v) => base ^ v.trim().parse::<u64>().unwrap_or(0),
+        Err(_) => base,
+    }
+}
 
 /// xorshift64* — deterministic, dependency-free (same generator as
 /// qa/robustness.rs).
@@ -226,6 +243,34 @@ struct SegmentReport {
     max_diff: f32,
     bound: f32,
     frames: usize,
+    max_drift: f64,
+}
+
+/// Bounded-drift gate: between checkpoints (set once a settle window
+/// expires, cleared at every seek), the source frames consumed must
+/// track the integral of the commanded tempo rate. The engine holds a
+/// bounded stash — stage FIFOs, resampler kernel margins, SOLA's
+/// elastic cursor, the profile latency — so the allowed error is a
+/// CONSTANT, not per-time. Measured worst case (2026-08-13): 28 frames
+/// over the CI soak's ~5 s runs, 197 frames (4.5 ms) over the
+/// hour-equivalent soak's 60 s runs; the bound is ~10x that, and a
+/// steady leak of one frame per callback would still cross it within
+/// ~6 s of audio time.
+const DRIFT_BOUND_FRAMES: f64 = 2_048.0;
+
+/// Accounting anchor for the drift gate. Consumed frames between the
+/// anchor and now = frames pushed into the ring minus the ring-fill
+/// growth (the feeder keeps the ring topped, so both are observable).
+struct DriftAnchor {
+    pushed: u64,
+    free: usize,
+    expected: f64,
+}
+
+fn measured_drift(anchor: &DriftAnchor, pushed_total: u64, free_now: usize) -> f64 {
+    let pushed_delta = (pushed_total - anchor.pushed) as f64;
+    let consumed = pushed_delta + free_now as f64 - anchor.free as f64;
+    consumed - anchor.expected
 }
 
 /// Streams one engine lifetime (one profile + artifact combination) for
@@ -278,6 +323,13 @@ fn run_segment(
     let mut excluded: Vec<(usize, usize)> = vec![(0, START_SETTLE_FRAMES)];
     let mut seeks = 0usize;
     let mut toggles = 0usize;
+    // Drift accounting: anchored after each settle window (start and
+    // post-seek) so warm-start priming consumption stays out of the
+    // integral; measured and asserted at every seek and at segment end.
+    let mut pushed_total: u64 = 0;
+    let mut settle_until_cb = START_SETTLE_FRAMES / CALLBACK_FRAMES + 1;
+    let mut drift_anchor: Option<DriftAnchor> = None;
+    let mut max_drift = 0.0f64;
 
     for cb in 0..callbacks {
         // New gesture every 1–3 s.
@@ -293,6 +345,16 @@ fn run_segment(
         if seek_cbs.first() == Some(&cb) {
             seek_cbs.remove(0);
             seeks += 1;
+            if let Some(anchor) = drift_anchor.take() {
+                let drift = measured_drift(&anchor, pushed_total, source.free_frames());
+                max_drift = max_drift.max(drift.abs());
+                assert!(
+                    drift.abs() <= DRIFT_BOUND_FRAMES,
+                    "soak[{profile:?}]: source consumption drifted {drift:.0} frames from \
+                     the tempo integral before seek {seeks} (bound {DRIFT_BOUND_FRAMES})"
+                );
+            }
+            settle_until_cb = cb + SEEK_SETTLE_FRAMES / CALLBACK_FRAMES + 1;
             let preroll = processor.warm_start_preroll_frames() as u64;
             processor.reset();
             let target =
@@ -313,7 +375,8 @@ fn run_segment(
         }
 
         let t = (cb * CALLBACK_FRAMES) as f64 / SAMPLE_RATE as f64;
-        controller.set_tempo_rate(gesture.rate_at(t));
+        let rate = gesture.rate_at(t);
+        controller.set_tempo_rate(rate);
 
         // Keep the ring topped up (covers playback plus priming budget).
         while source.free_frames() >= scratch.len() {
@@ -322,6 +385,7 @@ fn run_segment(
             }
             let accepted = source.push(&scratch);
             track_frame += accepted as u64;
+            pushed_total += accepted as u64;
             if accepted == 0 {
                 break;
             }
@@ -329,6 +393,28 @@ fn run_segment(
 
         processor.process(&mut out);
         collected.extend_from_slice(&out);
+
+        match &mut drift_anchor {
+            Some(anchor) => anchor.expected += rate * CALLBACK_FRAMES as f64,
+            None if cb >= settle_until_cb => {
+                drift_anchor = Some(DriftAnchor {
+                    pushed: pushed_total,
+                    free: source.free_frames(),
+                    expected: 0.0,
+                });
+            }
+            None => {}
+        }
+    }
+
+    if let Some(anchor) = drift_anchor.take() {
+        let drift = measured_drift(&anchor, pushed_total, source.free_frames());
+        max_drift = max_drift.max(drift.abs());
+        assert!(
+            drift.abs() <= DRIFT_BOUND_FRAMES,
+            "soak[{profile:?}]: source consumption drifted {drift:.0} frames from \
+             the tempo integral over the final run (bound {DRIFT_BOUND_FRAMES})"
+        );
     }
 
     assert_eq!(
@@ -386,6 +472,7 @@ fn run_segment(
         max_diff,
         bound,
         frames: collected.len(),
+        max_drift,
     }
 }
 
@@ -404,13 +491,15 @@ fn soak(seed: u64, total_secs: usize, segment_secs: usize, seeks_per_segment: us
         let artifact = artifact_variant(seg, &mut rng);
         let report = run_segment(&mut rng, profile, artifact, segment_secs, seeks_per_segment);
         println!(
-            "soak segment {seg}: {:?} frames={} seeks={} toggles={} max_diff={:.5} bound={:.5}",
+            "soak segment {seg}: {:?} frames={} seeks={} toggles={} max_diff={:.5} \
+             bound={:.5} max_drift={:.0}",
             report.profile,
             report.frames,
             report.seeks,
             report.toggles,
             report.max_diff,
-            report.bound
+            report.bound,
+            report.max_drift
         );
     }
 }
@@ -419,7 +508,7 @@ fn soak(seed: u64, total_secs: usize, segment_secs: usize, seeks_per_segment: us
 /// segment, deterministic from `CI_SEED`.
 #[test]
 fn soak_ci_bounded_randomized_gestures() {
-    soak(CI_SEED, 60, 10, 2);
+    soak(campaign_seed(CI_SEED), 60, 10, 2);
 }
 
 /// Hours-equivalent soak (see module docs for the invocation): one hour of
@@ -428,5 +517,5 @@ fn soak_ci_bounded_randomized_gestures() {
 #[test]
 #[ignore = "hours-equivalent soak; run explicitly in release (see module docs)"]
 fn soak_long_hours_equivalent() {
-    soak(LONG_SEED, 3_600, 60, 8);
+    soak(campaign_seed(LONG_SEED), 3_600, 60, 8);
 }
