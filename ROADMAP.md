@@ -311,6 +311,21 @@ broken `LR8Crossover` kept only for baselines that no longer exist.
 
 Automation: manual
 
+> **Status (2026-08-07): audition prep complete** (branch
+> `feat/stage16-audition-prep`) — the listening session is ready to run.
+> `examples/stage16_audition.rs` renders the full blind set:
+> 3 corpus excerpts (hot_stuff strings, msbwy filtered strings,
+> cold_heart vocal) × ±4/±8% × 4 arms (shipped SOLA path, PV-512 and
+> PV-1024 prototypes behind the 120 Hz split for the corrected-range
+> re-audition, Rubber Band reference), RMS-matched, in
+> `target/stage16_audition/`. Characterization pinned in
+> `tests/tonal_purity_characterization.rs` with a finding the sine probe
+> missed: the granulation floor is strongly ASYMMETRIC — harmonic-15
+> purity 52 dB at +8% tempo but 22 dB at −8% (slowdowns re-cross
+> material, so splices recur through sustained content), with two-tone
+> beating well preserved both ways (47/42 dB). Focus the listening on
+> SLOWDOWNS. Remaining: the blind listen and the verdict recorded here.
+
 ### Why
 
 The review's headline measurement: a 3.3 kHz tone through the DJ keylock
