@@ -80,7 +80,11 @@ const DEFAULT_SINC_LOBES: usize = 8;
 /// `lobes` controls the quality: more lobes = sharper cutoff but slower.
 /// Typical values: 4 (fast), 8 (balanced), 16 (high quality).
 ///
-/// Falls back to cubic interpolation for very short inputs (< 2 * lobes).
+/// Falls back to cubic interpolation — which has no anti-aliasing — for
+/// inputs shorter than one full kernel span (`2 * lobes / cutoff`, so the
+/// threshold grows with the downsampling ratio: at 2:1 an input under
+/// ~38 samples takes the cubic path). A conscious edge: a signal shorter
+/// than the kernel cannot be band-limited by it anyway.
 pub fn resample_sinc(input: &[f32], output_len: usize, lobes: usize) -> Vec<f32> {
     if input.is_empty() || output_len == 0 {
         return vec![];

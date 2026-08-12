@@ -163,20 +163,20 @@ fn test_pitch_shift_up_octave() {
     let rms_out = rms(&output);
     assert!(rms_out > 0.01, "Output is too quiet: rms={}", rms_out);
 
-    // Check that the 880Hz content (target frequency) is stronger than
-    // several off-target frequencies in the output. The pitch shift
-    // algorithm may spread energy, so we compare relative strengths.
+    // The target frequency must DOMINATE both the source frequency and
+    // the inverted-direction frequency. The previous assertion here was
+    // an OR that inverted output (220 Hz, whose 4th harmonic is 880 Hz)
+    // satisfied trivially — it masked a direction inversion in
+    // `pitch_shift` for months (factor 2.0 rendered an octave DOWN).
     let e_880 = energy_at_freq(&output, 880.0, 44100);
+    let e_440 = energy_at_freq(&output, 440.0, 44100);
     let e_220 = energy_at_freq(&output, 220.0, 44100);
-    let e_1760 = energy_at_freq(&output, 1760.0, 44100);
-
-    // 880Hz should have more energy than unrelated frequencies
     assert!(
-        e_880 > e_220 || e_880 > e_1760,
-        "Pitch shift to 880Hz didn't concentrate energy: 880Hz={}, 220Hz={}, 1760Hz={}",
+        e_880 > e_440 * 10.0 && e_880 > e_220 * 10.0,
+        "factor 2.0 on 440 Hz must land at 880 Hz: 880Hz={}, 440Hz={}, 220Hz={}",
         e_880,
-        e_220,
-        e_1760
+        e_440,
+        e_220
     );
 }
 
@@ -195,14 +195,18 @@ fn test_pitch_shift_down_octave() {
     let rms_out = rms(&output);
     assert!(rms_out > 0.01, "Output is too quiet: rms={}", rms_out);
 
-    // The original 880Hz energy should be reduced compared to input
-    let e_880_in = energy_at_freq(&input, 880.0, 44100);
-    let e_880_out = energy_at_freq(&output, 880.0, 44100);
+    // The target frequency must DOMINATE both the source frequency and
+    // the inverted-direction frequency (1760 Hz — where the pre-fix
+    // inverted implementation actually landed).
+    let e_440 = energy_at_freq(&output, 440.0, 44100);
+    let e_880 = energy_at_freq(&output, 880.0, 44100);
+    let e_1760 = energy_at_freq(&output, 1760.0, 44100);
     assert!(
-        e_880_out < e_880_in * 0.5,
-        "880Hz energy not reduced enough: in={}, out={}",
-        e_880_in,
-        e_880_out
+        e_440 > e_880 * 10.0 && e_440 > e_1760 * 10.0,
+        "factor 0.5 on 880 Hz must land at 440 Hz: 440Hz={}, 880Hz={}, 1760Hz={}",
+        e_440,
+        e_880,
+        e_1760
     );
 }
 

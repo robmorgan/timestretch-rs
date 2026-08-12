@@ -2603,6 +2603,44 @@ mod tests {
         );
     }
 
+    /// ROADMAP Stage 17: the promised 44.1 <-> 48 kHz round-trip SNR gate.
+    /// A broadband-but-band-limited program signal (multi-tone up to
+    /// ~15 kHz) through 44.1 -> 48 -> 44.1 must come back with high SNR —
+    /// this catches passband droop, ripple, and gain errors the one-way
+    /// fold-rejection test cannot see.
+    #[test]
+    fn test_resample_44k_48k_round_trip_snr() {
+        let sr = 44_100.0f64;
+        let n = 44_100usize;
+        let tones = [220.0, 997.0, 3_301.0, 7_499.0, 14_895.0];
+        let data: Vec<f32> = (0..n)
+            .map(|i| {
+                tones
+                    .iter()
+                    .map(|f| (2.0 * std::f64::consts::PI * f * i as f64 / sr).sin() * 0.15)
+                    .sum::<f64>() as f32
+            })
+            .collect();
+        let buf = AudioBuffer::new(data.clone(), 44_100, Channels::Mono);
+        let round = buf.resample(48_000).resample(44_100);
+        assert_eq!(round.sample_rate, 44_100);
+        // Compare away from the kernel-span edges.
+        let margin = 512usize;
+        let len = data.len().min(round.data.len()) - margin;
+        let (mut sig, mut err) = (0.0f64, 0.0f64);
+        for (&s, &r) in data[margin..len].iter().zip(&round.data[margin..len]) {
+            let s = s as f64;
+            let e = s - r as f64;
+            sig += s * s;
+            err += e * e;
+        }
+        let snr_db = 10.0 * (sig / err.max(1e-30)).log10();
+        assert!(
+            snr_db > 40.0,
+            "44.1->48->44.1 round-trip SNR {snr_db:.1} dB below 40 dB floor"
+        );
+    }
+
     #[test]
     fn test_resample_same_rate() {
         let buf = AudioBuffer::from_mono(vec![1.0, 2.0, 3.0], 44100);

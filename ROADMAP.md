@@ -394,18 +394,32 @@ dependency) is complete — the fixed PV is available to audition.
 
 Automation: auto
 
-> **Status (2026-08-07): implementation landed** (branch
-> `fix/batch-resampler-antialiasing`): `resample_sinc` cutoff-scales when
-> downsampling with the streaming path's stopband margin, and the Kaiser
-> window moved to a per-call lookup table (Bessel out of the tap loop);
-> `AudioBuffer::resample` switched from unfiltered cubic to the
-> band-limited sinc. Measured: 2:1 downsample alias rejection 1.9 →
-> 89.8 dB; 48→44.1 ultrasonic fold gated. Honest scope note: pitch_shift
-> itself measured 69.3 dB SFDR before AND after on in-band content — its
-> pipeline only downsamples on pitch-up, where foldable content maps out
-> of band anyway, so the audible beneficiaries are the public resample
-> APIs, not the shifter. Remaining: none (gates in CI via the standard
-> suite); the stage closes on merge.
+> **Status (2026-08-07): anti-aliasing landed** (PR #42):
+> `resample_sinc` cutoff-scales when downsampling with the streaming
+> path's stopband margin, and the Kaiser window moved to a per-call
+> lookup table (Bessel out of the tap loop); `AudioBuffer::resample`
+> switched from unfiltered cubic to the band-limited sinc. Measured:
+> 2:1 downsample alias rejection 1.9 → 89.8 dB; 48→44.1 ultrasonic fold
+> gated.
+>
+> **Correction (2026-08-12, independent review of PR #42):** the
+> 2026-08-07 note's "the shifter is not a beneficiary" conclusion was
+> backwards, because `pitch_shift` itself INVERTED its documented
+> direction — `lib.rs` set `stretch_ratio = 1.0 / pitch_factor` (a
+> length ratio), so factor 2.0 rendered an octave DOWN (probe: 440 Hz →
+> 220 Hz on main). The probe behind the old note tested "pitch-up" as
+> factor > 1, which (being inverted) never downsampled. The actual
+> pitch-raising path (factor < 1 pre-fix) aliased in-band at −1.2 dB
+> rejection on main and gets the full ~62 dB from PR #42. Fixed
+> (branch `fix/pitch-shift-direction`): direction corrected, the
+> vacuous OR-assertion octave test replaced with dominance assertions
+> both ways (the old test was satisfiable by inverted output — it
+> masked this in CI), and the promised 44.1↔48 round-trip SNR gate
+> (> 40 dB, multi-tone) added. All 15 pitch tests pass post-fix — the
+> formant path was written to the documented semantics and needed no
+> change. Remaining: the exit-criterion bright-mix pitch-up A/B listen,
+> now meaningful for the first time (pre-fix it audited the wrong
+> direction).
 
 ### Why
 
