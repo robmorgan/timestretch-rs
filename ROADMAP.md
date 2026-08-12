@@ -156,8 +156,18 @@ intervals draws instead).
 
 - **Corpus evidence half**: non-EDM entries with annotated grids (hip-hop
   ~90, DnB ~174, at least one live-drummer recording); explicit
-  acc2/F-measure floors on the non-EDM subset in CI; the QM Vamp baseline
-  column (output-only — qm-dsp is GPL, never source). The synthetic
+  acc2/F-measure floors on the non-EDM subset in CI; ~~the QM Vamp
+  baseline column~~ **done 2026-08-12** (output-only — qm-dsp is GPL,
+  never source: `benchmarks/generate_qm_baseline.py` stores
+  qm-barbeattracker beat times as JSON baselines, and the harness
+  reports per-row `qm_beat_f` plus a worst-row margin with an optional
+  `TIMESTRETCH_BPM_QM_MARGIN` floor; on the four locally-present EDM
+  rows our tracker wins every confidently-gridded row by 4.4–5.0pp,
+  and QM edges us +6.2pp only on Somebody To Love (beat F 0.37 vs
+  0.31 — the annotated-phase-indecisive track where both estimators
+  disagree with the annotation, consistent with its honest
+  low-confidence handling). QM baselines for the non-EDM entries
+  generate with the same script when that audio lands. The synthetic
   tempo-ramp fixture is ~~done~~ (2026-08-07, in-harness, no committed
   audio).
 - ~~Offbeat-bass disambiguation~~ **done 2026-08-07** (branch
