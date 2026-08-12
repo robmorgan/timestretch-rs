@@ -113,8 +113,10 @@ pub fn analyze_for_dj_with_report(
         0
     };
 
-    let confidence =
-        estimate_confidence(&beat_positions, &transients.onsets, sample_rate).max(grid.confidence);
+    let confidence = artifact_confidence(
+        estimate_confidence(&beat_positions, &transients.onsets, sample_rate),
+        &grid,
+    );
 
     let transient_strengths = if transients.strengths.len() == transients.onsets.len() {
         transients.strengths.clone()
@@ -194,6 +196,22 @@ fn mad_of(values: &[f32]) -> f32 {
     median_of(&deviations)
 }
 
+/// Combines the interval-regularity estimate with the grid's own
+/// confidence into the value stored in the artifact — the number hosts
+/// display. Normally the max of the two, but a phase-untrusted grid
+/// (both rigid adoption gates declined on plausibly quantized material)
+/// keeps its cap: interval regularity scores internal consistency, not
+/// ground truth, and must not reinstate confidence the estimator
+/// disagreement just revoked.
+fn artifact_confidence(estimated: f32, grid: &crate::BeatGrid) -> f32 {
+    let combined = estimated.max(grid.confidence);
+    if grid.phase_untrusted {
+        combined.min(crate::analysis::rigid_grid::PHASE_UNTRUSTED_CONFIDENCE_CAP)
+    } else {
+        combined
+    }
+}
+
 /// Estimates confidence from beat regularity and onset support.
 fn estimate_confidence(beats: &[usize], onsets: &[usize], sample_rate: u32) -> f32 {
     if beats.len() < 3 {
@@ -241,6 +259,24 @@ fn estimate_confidence(beats: &[usize], onsets: &[usize], sample_rate: u32) -> f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase_untrusted_grid_caps_artifact_confidence() {
+        // The value hosts display is the ARTIFACT confidence. Interval
+        // regularity must not reinstate confidence over the cap on a
+        // phase-untrusted grid (Somebody To Love: regularity estimates
+        // ~0.85 while the grid's phase is wrong).
+        let mut grid = crate::BeatGrid::empty(44100);
+        grid.confidence = 0.5;
+        grid.phase_untrusted = true;
+        assert_eq!(artifact_confidence(0.85, &grid), 0.5);
+        // A trusted grid keeps the max-of-both behavior in both
+        // directions.
+        grid.phase_untrusted = false;
+        assert_eq!(artifact_confidence(0.85, &grid), 0.85);
+        grid.confidence = 0.9;
+        assert_eq!(artifact_confidence(0.3, &grid), 0.9);
+    }
 
     #[test]
     fn test_analyze_for_dj_click_train_has_confidence() {

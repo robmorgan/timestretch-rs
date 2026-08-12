@@ -62,6 +62,12 @@ const CORROBORATION_MIN_AGREEMENT: f64 = 0.6;
 /// Tolerance for a tracked beat to count as landing on the rigid grid.
 /// Same figure as the smear radius: one vinyl-tight beat placement.
 const CORROBORATION_TOL_SECS: f64 = SMEAR_RADIUS_SECS;
+/// Confidence ceiling reported when BOTH adoption gates decline a fit
+/// (indecisive phase and no tracked-beat corroboration): estimator
+/// disagreement on quantized material means the tracked grid's phase is
+/// suspect no matter how internally consistent it looks. Below the
+/// desktop's low-confidence display threshold (0.6) by design.
+pub(crate) const PHASE_UNTRUSTED_CONFIDENCE_CAP: f32 = 0.5;
 /// Sanity floor: under a timing-tolerant (smeared) objective the rigid
 /// grid must reach at least this fraction of the tracked beats' score,
 /// so a decisive-but-wrong fit (e.g. seeded off an octave-wrong tempo on
@@ -232,6 +238,27 @@ pub fn refine_grid_rigid(samples: &[f32], sample_rate: u32, grid: BeatGrid) -> (
             .count();
         let agreement = hits as f64 / grid.beats.len() as f64;
         if agreement < CORROBORATION_MIN_AGREEMENT {
+            // Both adoption gates failed: the kick-band fit found the
+            // exact tempo but its phase is indecisive AND the tracked
+            // beats do not corroborate it — the two independent
+            // estimators genuinely disagree, which is positive evidence
+            // the surviving tracked grid's PHASE is untrustworthy on
+            // quantized material (corpus: Somebody To Love, beat F 0.31
+            // yet raw confidence 0.845 — the confidence metric scores
+            // internal consistency, not ground truth). Cap the reported
+            // confidence so hosts can show an honest low-confidence
+            // grid — but only when the rigid fit also explains the kicks
+            // about as well as the tracked beats (the material is
+            // plausibly quantized). A tempo ramp or live take also fails
+            // both gates, but its constant-grid fit scores far below its
+            // tracked beats under the smeared objective, and its honestly
+            // wandering grid must keep its honest tracked confidence.
+            let (tracked_score, rigid_score, _) = smeared_scores(samples, sr, &grid, &fit);
+            let mut grid = grid;
+            if rigid_score >= tracked_score * ADOPT_MIN_SMEARED_RATIO {
+                grid.confidence = grid.confidence.min(PHASE_UNTRUSTED_CONFIDENCE_CAP);
+                grid.phase_untrusted = true;
+            }
             return (grid, false);
         }
     }
@@ -240,17 +267,13 @@ pub fn refine_grid_rigid(samples: &[f32], sample_rate: u32, grid: BeatGrid) -> (
     // envelope so honest ±few-ms placements score alike, then require the
     // rigid grid to reach a fraction of the tracked beats' score.
     let sr = sample_rate as f64;
-    let KickEnvelope {
-        onset, frame_secs, ..
-    } = kick_onset_envelope(samples, sr);
-    let radius = (SMEAR_RADIUS_SECS / frame_secs).round().max(1.0) as usize;
-    let smeared = triangular_smear(&onset, radius);
-    let tracked_secs: Vec<f64> = grid.beats.iter().map(|&b| b / sr).collect();
-    let tracked_score = mean_env_at(&smeared, frame_secs, &tracked_secs);
-    let rigid_score = mean_env_at(&smeared, frame_secs, &fit.beats_secs);
+    let (tracked_score, rigid_score, env) = smeared_scores(samples, sr, &grid, &fit);
     if rigid_score < tracked_score * ADOPT_MIN_SMEARED_RATIO {
         return (grid, false);
     }
+    let KickEnvelope {
+        onset, frame_secs, ..
+    } = env;
 
     // Downbeat rotation by kick-band accent (mod 4), as in the annotator.
     let mut rotation_scores = [0.0f64; 4];
@@ -299,9 +322,30 @@ pub fn refine_grid_rigid(samples: &[f32], sample_rate: u32, grid: BeatGrid) -> (
             downbeat_confidence,
             sample_rate,
             tempo_candidates,
+            phase_untrusted: false,
         },
         true,
     )
+}
+
+/// Mean smeared-onset score of the tracked beats vs the rigid fit's
+/// beats, plus the kick envelope for reuse: how well each grid explains
+/// the kicks under a timing-tolerant (±[`SMEAR_RADIUS_SECS`]) objective.
+/// Shared by the adoption sanity floor and the phase-untrusted gate so
+/// "the material is plausibly quantized" means the same thing in both.
+fn smeared_scores(
+    samples: &[f32],
+    sr: f64,
+    grid: &BeatGrid,
+    fit: &RigidGridFit,
+) -> (f64, f64, KickEnvelope) {
+    let env = kick_onset_envelope(samples, sr);
+    let radius = (SMEAR_RADIUS_SECS / env.frame_secs).round().max(1.0) as usize;
+    let smeared = triangular_smear(&env.onset, radius);
+    let tracked_secs: Vec<f64> = grid.beats.iter().map(|&b| b / sr).collect();
+    let tracked_score = mean_env_at(&smeared, env.frame_secs, &tracked_secs);
+    let rigid_score = mean_env_at(&smeared, env.frame_secs, &fit.beats_secs);
+    (tracked_score, rigid_score, env)
 }
 
 /// Kick-band envelopes at the analysis hop.
@@ -593,10 +637,19 @@ mod tests {
             // the tracked beats visit every phase of the rigid grid.
             *b += period * i as f64 / n;
         }
-        let (_grid, adopted) = refine_grid_rigid(&samples, SR, drifting);
+        let (grid, adopted) = refine_grid_rigid(&samples, SR, drifting);
         assert!(
             !adopted,
             "drifting tracked beats must not corroborate a rigid fit"
+        );
+        assert!(
+            grid.confidence <= PHASE_UNTRUSTED_CONFIDENCE_CAP,
+            "estimator disagreement must cap reported confidence, got {}",
+            grid.confidence
+        );
+        assert!(
+            grid.phase_untrusted,
+            "estimator disagreement on quantized material must flag the grid"
         );
     }
 
@@ -622,9 +675,21 @@ mod tests {
         let tracked = detect_beats(&samples, SR);
         assert!(tracked.bpm > 0.0);
         let tracked_beats = tracked.beats.clone();
+        let tracked_confidence = tracked.confidence;
         let (grid, adopted) = refine_grid_rigid(&samples, SR, tracked);
         assert!(!adopted, "a tempo ramp must not adopt a rigid grid");
         assert_eq!(grid.beats, tracked_beats);
+        // A ramp fails both adoption gates too, but its constant-grid fit
+        // does not explain the kicks — the tracked grid is honestly right,
+        // so its confidence must survive uncapped and unflagged.
+        assert!(
+            !grid.phase_untrusted,
+            "a well-tracked ramp must not be flagged phase-untrusted"
+        );
+        assert_eq!(
+            grid.confidence, tracked_confidence,
+            "a well-tracked ramp must keep its tracked confidence"
+        );
     }
 
     #[test]

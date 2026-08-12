@@ -107,7 +107,16 @@ pub fn paint_overview(ui: &mut egui::Ui, params: OverviewParams<'_>) -> Option<f
 
     // Bar ticks along the bottom edge, phrase starts emphasized. Density
     // thins by bar-number stride so surviving ticks stay phrase-aligned.
+    // Low-confidence grids draw dimmed, matching the zoomed view.
     if params.marks.is_usable() && params.total_frames > 0 {
+        let (bar_color, phrase_color) = if params.marks.low_confidence() {
+            (
+                palette::TICK_BEAT.gamma_multiply(super::LOW_CONFIDENCE_TICK_DIM),
+                palette::TICK_PHRASE.gamma_multiply(super::LOW_CONFIDENCE_TICK_DIM),
+            )
+        } else {
+            (palette::TICK_BEAT, palette::TICK_PHRASE)
+        };
         let plan = overlay_plan(
             rect.width(),
             params.marks.len(),
@@ -128,12 +137,9 @@ pub fn paint_overview(ui: &mut egui::Ui, params: OverviewParams<'_>) -> Option<f
             let x = rect.left()
                 + rect.width() * ((params.marks.frame(i) * inv_total) as f32).clamp(0.0, 1.0);
             let (height, stroke) = if phrase {
-                (
-                    TICK_PHRASE_PX,
-                    egui::Stroke::new(2.0_f32, palette::TICK_PHRASE),
-                )
+                (TICK_PHRASE_PX, egui::Stroke::new(2.0_f32, phrase_color))
             } else {
-                (TICK_BAR_PX, egui::Stroke::new(1.0_f32, palette::TICK_BEAT))
+                (TICK_BAR_PX, egui::Stroke::new(1.0_f32, bar_color))
             };
             painter.line_segment(
                 [
