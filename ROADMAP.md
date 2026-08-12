@@ -193,8 +193,18 @@ intervals draws instead).
   no row where the QM baseline wins by more than noise.
 - ~~The three known non-adopters~~ two of three adopt with sub-ms offsets
   (2026-08-07); Somebody To Love is measured as genuine estimator
-  disagreement — remaining: annotate it as phase-indecisive and verify
-  the desktop shows an honest low-confidence grid for it.
+  disagreement — ~~annotate it as phase-indecisive and verify the
+  desktop shows an honest low-confidence grid for it~~ **done
+  2026-08-12** (PR #44 + review fixes): annotation marked
+  `phase_indecisive`, estimator disagreement on plausibly quantized
+  material caps stored confidence at 0.5 via an explicit
+  `BeatGrid::phase_untrusted` verdict (artifact-level measured 0.845 →
+  0.500, beat F 0.306; confident rows hold 0.88–0.91; ramps stay
+  uncapped — gated on the adoption sanity ratio), and the desktop dims
+  the grid and says "grid: low confidence" below 0.6. Versions bumped
+  9 → 10 so cached wrongly-confident sidecars regenerate. Owner visual
+  check on the real track pends the next desktop load (sidecars
+  regenerate on open).
 - Version-bump policy documented and applied on the next analysis change.
 
 ## [ ] Stage 12: Robustness Hardening — No-Panic Surface, Fuzzing, Soak
