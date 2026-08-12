@@ -75,6 +75,41 @@ acc2 = % allowing octave errors) are printed, and a JSON report is written to
 `target/bpm_accuracy_report.json` for diffing between detector changes. See
 `qa/README.md` for the harness's environment variables.
 
+## QM Vamp Baseline Column (external beat-tracker reference)
+
+Annotated tracks can carry a committed baseline from the QM bar/beat
+tracker (`qm-vamp-plugins`, the Queen Mary reference implementation) so
+the harness reports how an established external tracker scores against
+the same hand-corrected annotations. This is the ROADMAP Stage 10 exit
+criterion "no row where the QM baseline wins by more than noise".
+
+Only the plugin's **output** (beat/downbeat times, JSON under
+`benchmarks/baselines/qm/<track-id>.json`) is committed — qm-dsp is GPL
+and its source never enters this repository.
+
+Generate or refresh baselines for whatever corpus audio is present
+locally:
+
+```bash
+python3 benchmarks/generate_qm_baseline.py            # all present tracks
+python3 benchmarks/generate_qm_baseline.py <track-id> # one track
+```
+
+Requirements (macOS):
+
+- `sonic-annotator` on PATH (or `$SONIC_ANNOTATOR`) — universal binary
+  from <https://github.com/sonic-visualiser/sonic-annotator/releases>
+- `qm-vamp-plugins.dylib` in `~/Library/Audio/Plug-Ins/Vamp/` — build
+  from <https://github.com/c4dm/qm-vamp-plugins> (with `qm-dsp` and
+  `vamp-plugin-sdk` cloned into `lib/`, `make -f build/osx/Makefile.osx`)
+
+The harness picks baselines up automatically: each annotated track with
+a baseline gains a `qm_beat_f` / `qm_downbeat_f` / `qm_beat_f_margin`
+METRIC line and the summary reports `qm_baselined`, mean `qm_beat_f`,
+and `max_qm_beat_f_margin` (the worst row's QM-minus-ours beat F, in
+percentage points — negative means our tracker wins every row). Setting
+`TIMESTRETCH_BPM_QM_MARGIN=<pp>` turns the margin into a hard floor.
+
 ## Running Benchmarks
 
 ```bash
