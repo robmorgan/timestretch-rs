@@ -624,11 +624,15 @@ impl AudioBuffer {
             };
         }
 
-        // Resample each channel independently using cubic interpolation
+        // Resample each channel independently with the band-limited
+        // windowed-sinc converter (ROADMAP Stage 17): cubic had no
+        // anti-aliasing at all, so 48 -> 44.1 kHz conversions folded
+        // ultrasonic content into the audible band.
         let mut output = Vec::with_capacity(target_frames * nc);
         for ch in 0..nc {
             let channel_data: Vec<f32> = self.data.iter().skip(ch).step_by(nc).copied().collect();
-            let resampled = crate::core::resample::resample_cubic(&channel_data, target_frames);
+            let resampled =
+                crate::core::resample::resample_sinc_default(&channel_data, target_frames);
             // Interleave: store in scratch, will interleave below
             if ch == 0 {
                 output.resize(target_frames * nc, 0.0);
@@ -2568,6 +2572,36 @@ mod tests {
     }
 
     // --- resample tests ---
+
+    /// ROADMAP Stage 17: 48 -> 44.1 kHz conversion must reject content
+    /// above the target Nyquist instead of folding it (cubic folded it at
+    /// full level). A 23 kHz tone at 48 kHz folds to ~21.1 kHz at 44.1.
+    #[test]
+    fn test_resample_rejects_above_target_nyquist() {
+        let sr_in = 48_000.0f64;
+        let n = 48_000usize;
+        let data: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f64::consts::PI * 23_000.0 * i as f64 / sr_in).sin() as f32)
+            .collect();
+        let buf = AudioBuffer::new(data, 48_000, Channels::Mono);
+        let out = buf.resample(44_100);
+        let seg = &out.data[2_000..out.data.len() - 2_000];
+        let fold_hz = 44_100.0 - 23_000.0; // 21.1 kHz image
+        let w = 2.0 * std::f64::consts::PI * fold_hz / 44_100.0;
+        let coeff = 2.0 * w.cos();
+        let (mut s1, mut s2) = (0.0f64, 0.0f64);
+        for &x in seg {
+            let s0 = x as f64 + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        let alias =
+            ((s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0)).sqrt() / (seg.len() as f64 / 2.0);
+        assert!(
+            alias < 0.03,
+            "48->44.1 folds ultrasonic content into the audible band: image level {alias:.4}"
+        );
+    }
 
     #[test]
     fn test_resample_same_rate() {

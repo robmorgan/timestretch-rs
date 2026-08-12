@@ -86,17 +86,54 @@ pub fn resample_sinc(input: &[f32], output_len: usize, lobes: usize) -> Vec<f32>
         return vec![];
     }
     let lobes = lobes.max(1);
-    if input.len() < 2 * lobes {
-        return resample_cubic(input, output_len);
-    }
 
     let ratio = (input.len() - 1) as f64 / (output_len.max(1) - 1).max(1) as f64;
+    // Anti-aliasing (ROADMAP Stage 17): when downsampling, scale the
+    // kernel cutoff so the stopband lands at the OUTPUT Nyquist instead
+    // of the input's, and widen the tap span to keep the same number of
+    // zero crossings under the dilated kernel. Without this the kernel
+    // passed the full input band and downsampling folded everything
+    // above the output Nyquist back into the audible range — the
+    // pitch-shift-up path aliased on bright material.
+    // Same margin policy as the streaming kernel (`cutoff_for_step`):
+    // shrink the passband a further [`STREAM_SINC_CUTOFF_SCALE`] (ramped
+    // in just past unity) so the finite kernel's STOPBAND — not its
+    // -6 dB point — lands at the fold frequency; a cutoff exactly at the
+    // fold leaves near-Nyquist content in the transition band at ~-10 dB.
+    let cutoff = if ratio > 1.0 {
+        let t = ((ratio - 1.0) / (STREAM_SINC_CUTOFF_RAMP_END - 1.0)).min(1.0);
+        let margin = 1.0 - (1.0 - STREAM_SINC_CUTOFF_SCALE) * t;
+        margin / ratio
+    } else {
+        1.0
+    };
+    let half_span = (lobes as f64 / cutoff).ceil() as isize;
+    if input.len() < 2 * half_span as usize {
+        return resample_cubic(input, output_len);
+    }
     let mut output = Vec::with_capacity(output_len);
 
-    // Pre-compute Kaiser window for the sinc kernel.
-    // Beta = 6.0 gives ~60 dB stopband attenuation, good for audio.
+    // Kaiser window (beta = 6.0, ~60 dB stopband), sampled into a lookup
+    // table once per call so `bessel_i0` stays out of the per-tap loop.
     let beta = 6.0f64;
     let bessel_beta = bessel_i0(beta);
+    const WINDOW_TABLE: usize = 2_048;
+    let window_table: Vec<f64> = (0..=WINDOW_TABLE)
+        .map(|k| {
+            let t = k as f64 / WINDOW_TABLE as f64;
+            bessel_i0(beta * (1.0 - t * t).max(0.0).sqrt()) / bessel_beta
+        })
+        .collect();
+    let window_at = |t: f64| -> f64 {
+        let t = t.abs();
+        if t >= 1.0 {
+            return 0.0;
+        }
+        let pos = t * WINDOW_TABLE as f64;
+        let k = pos as usize;
+        let frac = pos - k as f64;
+        window_table[k] * (1.0 - frac) + window_table[k + 1] * frac
+    };
 
     for i in 0..output_len {
         let pos = i as f64 * ratio;
@@ -106,37 +143,31 @@ pub fn resample_sinc(input: &[f32], output_len: usize, lobes: usize) -> Vec<f32>
         let mut sample = 0.0f64;
         let mut weight_sum = 0.0f64;
 
-        // Convolve with the windowed sinc kernel
-        let start = -(lobes as isize) + 1;
-        let end = lobes as isize + 1;
+        // Convolve with the (cutoff-scaled) windowed sinc kernel.
+        let start = -half_span + 1;
+        let end = half_span + 1;
         for j in start..end {
             let idx = center + j;
             if idx < 0 || idx >= input.len() as isize {
                 continue;
             }
 
-            let x = frac - j as f64;
+            let x = (frac - j as f64) * cutoff;
             let sinc_val = if x.abs() < 1e-10 {
                 1.0
             } else {
                 let pi_x = std::f64::consts::PI * x;
                 pi_x.sin() / pi_x
             };
-
-            // Kaiser window
-            let t = (j as f64 - frac) / lobes as f64;
-            let window = if t.abs() <= 1.0 {
-                bessel_i0(beta * (1.0 - t * t).max(0.0).sqrt()) / bessel_beta
-            } else {
-                0.0
-            };
+            let window = window_at((j as f64 - frac) * cutoff / lobes as f64);
 
             let w = sinc_val * window;
             sample += input[idx as usize] as f64 * w;
             weight_sum += w;
         }
 
-        // Normalize to preserve DC gain
+        // Normalize to preserve DC gain (also absorbs the cutoff's
+        // kernel-gain factor).
         if weight_sum.abs() > 1e-10 {
             sample /= weight_sum;
         }
@@ -1154,6 +1185,47 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// ROADMAP Stage 17: downsampling must band-limit. An 18 kHz tone
+    /// downsampled 2:1 folds to 4050 Hz at the output rate; before the
+    /// cutoff scaling it arrived at essentially full level (1.9 dB
+    /// rejection), after it measures ~90 dB down.
+    #[test]
+    fn test_resample_sinc_antialiases_downsampling() {
+        let sr = 44_100.0f64;
+        let n = 44_100usize;
+        let goertzel = |seg: &[f32], rate: f64, freq: f64| -> f64 {
+            let w = 2.0 * std::f64::consts::PI * freq / rate;
+            let coeff = 2.0 * w.cos();
+            let (mut s1, mut s2) = (0.0f64, 0.0f64);
+            for &x in seg {
+                let s0 = x as f64 + coeff * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            ((s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0)).sqrt() / (seg.len() as f64 / 2.0)
+        };
+        let tone: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f64::consts::PI * 18_000.0 * i as f64 / sr).sin() as f32)
+            .collect();
+        let down = resample_sinc_default(&tone, n / 2);
+        let alias = goertzel(&down[2_000..down.len() - 2_000], sr / 2.0, 4_050.0);
+        let reference: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f64::consts::PI * 5_000.0 * i as f64 / sr).sin() as f32)
+            .collect();
+        let ref_down = resample_sinc_default(&reference, n / 2);
+        let passband = goertzel(&ref_down[2_000..ref_down.len() - 2_000], sr / 2.0, 5_000.0);
+        let rejection_db = 20.0 * (passband / alias.max(1e-12)).log10();
+        assert!(
+            rejection_db > 60.0,
+            "downsample alias rejection {rejection_db:.1} dB (measured ~90 dB \
+             with cutoff scaling, 1.9 dB without)"
+        );
+        assert!(
+            passband > 0.9,
+            "passband level dropped through the downsample: {passband:.3}"
+        );
     }
 
     #[test]

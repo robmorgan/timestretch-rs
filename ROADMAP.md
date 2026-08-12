@@ -384,6 +384,19 @@ dependency) is complete — the fixed PV is available to audition.
 
 Automation: auto
 
+> **Status (2026-08-07): implementation landed** (branch
+> `fix/batch-resampler-antialiasing`): `resample_sinc` cutoff-scales when
+> downsampling with the streaming path's stopband margin, and the Kaiser
+> window moved to a per-call lookup table (Bessel out of the tap loop);
+> `AudioBuffer::resample` switched from unfiltered cubic to the
+> band-limited sinc. Measured: 2:1 downsample alias rejection 1.9 →
+> 89.8 dB; 48→44.1 ultrasonic fold gated. Honest scope note: pitch_shift
+> itself measured 69.3 dB SFDR before AND after on in-band content — its
+> pipeline only downsamples on pitch-up, where foldable content maps out
+> of band anyway, so the audible beneficiaries are the public resample
+> APIs, not the shifter. Remaining: none (gates in CI via the standard
+> suite); the stage closes on merge.
+
 ### Why
 
 `pitch_shift()` downsamples through `resample_sinc`, whose cutoff never
