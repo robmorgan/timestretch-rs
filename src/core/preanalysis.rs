@@ -31,17 +31,26 @@ use std::path::Path;
 /// (rigid grids now ship where wandering DP grids did), so v8 artifacts
 /// for that class are stale.
 ///
+/// v10: no schema change — estimator-disagreement confidence capping
+/// (ROADMAP Stage 10 honest low-confidence display): when both rigid
+/// adoption gates decline a fit on plausibly quantized material, the
+/// stored artifact confidence is capped at 0.5 so hosts can flag the
+/// grid. v9 artifacts for that class (e.g. Somebody To Love) carry the
+/// old wrongly-confident values and would never trigger the display.
+///
 /// The bump-when policy for these two constants lives in CLAUDE.md
 /// ("Analysis Version Policy") and is checked at release time via
 /// RELEASE_CHECKLIST.md.
-pub const PREANALYSIS_VERSION: u32 = 9;
+pub const PREANALYSIS_VERSION: u32 = 10;
 
 /// Oldest schema version whose *analysis results* match the current
 /// detector. Artifacts below this fail
 /// [`PreAnalysisArtifact::matches_source`], so cached sidecars regenerate:
 /// pre-v4 carried the window-start bias; v4–v7 predate (or are ambiguous
-/// about) the rigid-grid beat fit; v8 predates corroborated adoption.
-const MIN_COMPATIBLE_VERSION: u32 = 9;
+/// about) the rigid-grid beat fit; v8 predates corroborated adoption;
+/// v9 predates estimator-disagreement confidence capping, so cached
+/// confidence for phase-indecisive tracks is wrongly high.
+const MIN_COMPATIBLE_VERSION: u32 = 10;
 
 fn default_artifact_version() -> u32 {
     1

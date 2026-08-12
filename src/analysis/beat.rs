@@ -84,6 +84,12 @@ pub struct BeatGrid {
     /// [`bpm`](Self::bpm) plus its in-range half/double alternatives.
     /// Empty when no tempo was detected.
     pub tempo_candidates: Vec<TempoCandidate>,
+    /// True when two independent estimators (kick-band rigid fit and the
+    /// DP tracker) genuinely disagreed about beat phase on plausibly
+    /// quantized material — the grid's phase should not be trusted for
+    /// display or quantization even if it looks internally consistent.
+    /// [`confidence`](Self::confidence) is capped alongside this flag.
+    pub phase_untrusted: bool,
 }
 
 impl BeatGrid {
@@ -98,6 +104,7 @@ impl BeatGrid {
             downbeat_confidence: 0.0,
             sample_rate,
             tempo_candidates: Vec::new(),
+            phase_untrusted: false,
         }
     }
 
@@ -276,6 +283,7 @@ pub(crate) fn detect_beats_from_transients_with_options(
         downbeat_confidence,
         sample_rate,
         tempo_candidates,
+        phase_untrusted: false,
     }
 }
 
@@ -749,6 +757,7 @@ mod tests {
             downbeat_confidence: 1.0,
             sample_rate,
             tempo_candidates: Vec::new(),
+            phase_untrusted: false,
         }
     }
 
@@ -1159,6 +1168,7 @@ mod tests {
             downbeat_confidence: 1.0,
             sample_rate: 44100,
             tempo_candidates: Vec::new(),
+            phase_untrusted: false,
         };
         assert!((grid.bpm_at(10000.0) - 120.0).abs() < 1e-9);
         assert!((grid.bpm_at(70000.0) - 132.0).abs() < 1e-9);
