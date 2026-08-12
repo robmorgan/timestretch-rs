@@ -211,6 +211,24 @@ intervals draws instead).
 
 Automation: auto
 
+> **Status (2026-08-12): core landed** (PR #46): seeded adversarial
+> harness over every parsing/validation surface (`qa/robustness.rs`,
+> cargo-fuzz stand-in — deterministic xorshift, no nightly), bounded
+> deck-gesture soak (`qa/soak.rs`), no-panic contract documented in
+> `lib.rs`, and three real fixes with minimized regression tests
+> (`.tsa` bucket-count multiply overflow → `Err`; `stretch_offline`
+> release-build infinite loop on partial interleave + missing
+> channel/ratio validation; varispeed `MAX_OUT_PER_FEED` missing the
+> kernel-release term — retargets from dilated kernels silently
+> truncated output in release). Both harnesses wired into the CI
+> quality-gates job 2026-08-12 (they are feature-gated, so the plain
+> test jobs never build them — the wiring is what makes the coverage
+> real). Remaining: a bounded-drift assertion in the soak (the stated
+> gate list claims it; the harness doesn't assert it yet), the
+> longer cron soak with corpus persistence, and the no-panic audit of
+> `unwrap`/`expect` outside construction paths before this stage's
+> exit criteria are met.
+
 ### Why
 
 The RT contract is machine-verified, but the input surface has never been

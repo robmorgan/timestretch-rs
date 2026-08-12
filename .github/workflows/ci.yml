@@ -66,6 +66,14 @@ jobs:
       # local-only.
       - run: cargo test --features qa-harnesses --release --test engine_keylock -- --nocapture
       - run: cargo test --features qa-harnesses --release --test engine_transients -- --nocapture
+      # Stage 12 robustness gates: seeded adversarial input against every
+      # parsing/validation surface, plus the bounded deck-gesture soak
+      # (~1 s each in release; the full-length soak recipe stays local,
+      # see qa/soak.rs docs). These are feature-gated targets, so the
+      # plain test jobs never build them — without these lines they have
+      # zero CI coverage.
+      - run: cargo test --features qa-harnesses --release --test robustness -- --nocapture
+      - run: cargo test --features qa-harnesses --release --test soak -- --nocapture
       - uses: actions/upload-artifact@v4
         with:
           name: quality-dashboard-${{ github.run_id }}
