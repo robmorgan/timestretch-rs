@@ -691,9 +691,13 @@ pub fn pitch_shift(
         0.0
     };
 
-    // Step 1: Time-stretch by 1/pitch_factor to compensate for the resampling
+    // Step 1: time-stretch by pitch_factor (pitch preserved, length scaled),
+    // so that resampling the result back to the original length compresses
+    // or dilates time by exactly pitch_factor — multiplying every frequency
+    // by pitch_factor. (Historically this was 1.0 / pitch_factor, which
+    // inverted the documented direction: factor 2.0 shifted DOWN an octave.)
     // Disable normalization for the inner stretch — we normalize the final result.
-    let stretch_ratio = 1.0 / pitch_factor;
+    let stretch_ratio = pitch_factor;
     let mut stretch_params = params.clone();
     stretch_params.stretch_ratio = stretch_ratio;
     stretch_params.normalize = false;
