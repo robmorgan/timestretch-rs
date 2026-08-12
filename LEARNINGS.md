@@ -314,3 +314,36 @@ PREANALYSIS_VERSION → 9/9 (first application of the CLAUDE.md policy).
 Lessons: two agreeing independent estimators beat one reshaped metric —
 and when a fixture needs a beater click before the tracker behaves like
 it does on real kicks, the fixture was the problem, not the tracker.
+
+**Honest low-confidence display follow-up (2026-08-12, PR #44 +
+review fixes).** Estimator disagreement on plausibly quantized material
+now caps the stored artifact confidence at 0.5 via an explicit
+`BeatGrid::phase_untrusted` verdict, and the desktop dims the grid below
+0.6. Somebody To Love: artifact confidence 0.845 → 0.500 (its grid
+measures beat F 0.31 — the old 0.845 was internal consistency, not
+ground truth). Versions bumped 9 → 10 (second application of the
+CLAUDE.md policy — the first cut of the PR shipped without the bump).
+Two lessons the review caught before merge:
+
+- **Verify a verdict at the layer its consumer reads.** The first cut
+  capped `BeatGrid.confidence`, but the artifact stored
+  `estimate_confidence(...).max(grid.confidence)` and the desktop
+  displays the artifact value — interval regularity alone scores ~0.85
+  on a smoothly wrong grid, so the max silently reinstated the
+  confidence the cap had just revoked, and the feature was inert on the
+  exact track it existed for. The commit's own verification number
+  (0.772 → 0.500) was measured at the wrong layer. Verdicts that must
+  survive downstream aggregation need to travel as explicit state
+  (the flag), not be smuggled through a value other code maxes over.
+- **A shared gate should be one expression.** The cap's "ramps never
+  reach here" comment was wrong (the capped branch returned before the
+  sanity floor ran) — a tempo ramp fails both adoption gates too and
+  was wrongly capped. Fixed by gating the cap on the same smeared-score
+  ratio the adoption floor uses, extracted so "plausibly quantized"
+  means one thing in both places; ramp and drifting-tracker controls
+  now pin confidence and flag from both sides.
+
+Independent corroboration (QM baseline column, same day): QM's
+bar/beat tracker also fails on Somebody To Love (beat F 0.37 vs our
+0.31, both far below the ≥ 0.95 it and we score on confidently-gridded
+rows) — the honest-uncertainty verdict, not a tracker deficiency.
