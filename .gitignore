@@ -10,3 +10,4 @@ benchmarks/audio/
 *.tsanalysis.json
 *.tspeaks
 *.tsa
+.claude/worktrees/

@@ -59,10 +59,33 @@ pub fn stretch_offline(
     ratio: f64,
     pre_analysis: Option<Arc<PreAnalysisArtifact>>,
 ) -> Result<Vec<f32>, StretchError> {
+    // Validate before any arithmetic: `channels == 0` would divide by
+    // zero, and an interleave mismatch (input length not a whole number of
+    // frames) would leave a partial frame the source ring can never accept
+    // — in release builds the feed loop would spin forever on it.
+    if !(1..=8).contains(&channels) {
+        return Err(StretchError::InvalidFormat(format!(
+            "channel count {channels} outside 1..=8"
+        )));
+    }
+    if input.len() % channels != 0 {
+        return Err(StretchError::InvalidFormat(format!(
+            "input length {} is not a whole number of {}-channel frames",
+            input.len(),
+            channels
+        )));
+    }
+    if !(crate::stretch::params::RATIO_MIN..=crate::stretch::params::RATIO_MAX).contains(&ratio) {
+        return Err(StretchError::InvalidRatio(format!(
+            "Stretch ratio must be between {} and {}, got {}",
+            crate::stretch::params::RATIO_MIN,
+            crate::stretch::params::RATIO_MAX,
+            ratio
+        )));
+    }
     if input.is_empty() {
         return Ok(vec![]);
     }
-    debug_assert_eq!(input.len() % channels.max(1), 0);
     let rate = 1.0 / ratio;
     if (1.0 - rate).abs() <= OFFLINE_GRAPH_MAX_DEV {
         stretch_via_graph(
@@ -243,6 +266,36 @@ mod tests {
         (0..len)
             .map(|i| 0.5 * (2.0 * std::f64::consts::PI * freq * i as f64 / 44_100.0).sin() as f32)
             .collect()
+    }
+
+    #[test]
+    fn regression_zero_channels_errs_not_panics() {
+        // Found by the Stage 12 robustness harness: `channels == 0`
+        // reached `input.len() / channels` — divide-by-zero panic.
+        assert!(stretch_offline(&[0.0; 16], 0, 44_100, 1.5, None).is_err());
+        assert!(stretch_offline(&[0.0; 16], 9, 44_100, 1.5, None).is_err());
+    }
+
+    #[test]
+    fn regression_interleave_mismatch_errs_not_hangs() {
+        // Found by the Stage 12 robustness harness: an input length that
+        // is not a whole number of frames left a partial frame the source
+        // ring could never accept — a debug assert in `SourceProducer::
+        // push`, and in release an infinite feed loop. Must be an error.
+        assert!(stretch_offline(&[0.0; 3], 2, 44_100, 1.05, None).is_err());
+        assert!(stretch_offline(&[0.0; 4097], 2, 44_100, 0.5, None).is_err());
+    }
+
+    #[test]
+    fn regression_non_finite_and_out_of_range_ratio_errs() {
+        // stretch_offline is itself public: it cannot rely on callers
+        // running validate_params. NaN / 0 / out-of-range ratios must Err.
+        for ratio in [f64::NAN, f64::INFINITY, 0.0, -1.0, 0.009, 100.1] {
+            assert!(
+                stretch_offline(&[0.0; 64], 1, 44_100, ratio, None).is_err(),
+                "ratio {ratio} must be rejected"
+            );
+        }
     }
 
     #[test]

@@ -49,6 +49,32 @@
 //! processor.process(&mut out);
 //! ```
 //!
+//! # Robustness: the no-panic contract
+//!
+//! Public entry points return [`StretchError`] on invalid input — they do
+//! not panic (ROADMAP Stage 12):
+//!
+//! - **Batch API** ([`stretch()`], [`stretch_into()`], [`pitch_shift()`],
+//!   the BPM helpers): out-of-range ratios and sample rates, non-finite
+//!   samples, and interleave mismatches (input length not a whole number
+//!   of frames) are all `Err`.
+//! - **Loaders** ([`read_analysis_file`], [`AnalysisFile::from_bytes`],
+//!   [`io::wav::read_wav`], the deprecated JSON artifact reader): arbitrary
+//!   or truncated bytes produce `Err` (or `None` on the validated `.tsa`
+//!   path), never a panic and never an unbounded allocation.
+//! - **Engine construction** ([`engine::Engine::build`]): every invalid
+//!   [`engine::EngineConfig`] is `Err`; nothing can fail later on the
+//!   audio thread.
+//!
+//! The audio thread is the deliberate exception, per the real-time
+//! contract: [`engine::EngineProcessor::process`] is infallible and
+//! allocation-free, its invariants are enforced at construction, hot-path
+//! validation is debug-only (`debug_assert!`), and out-of-range control
+//! values ([`engine::EngineController`]) are clamped, never rejected.
+//! This surface is exercised continuously by the seeded adversarial
+//! harness (`qa/robustness.rs`) and the randomized deck-gesture soak
+//! (`qa/soak.rs`).
+//!
 use rustfft::{FftPlanner, num_complex::Complex};
 
 pub mod analysis;
@@ -453,7 +479,10 @@ fn validate_bpm(bpm: f64, label: &str) -> Result<(), StretchError> {
 /// # Errors
 ///
 /// Returns [`StretchError::InvalidRatio`] if the stretch ratio is out of range
-/// (must be between 0.01 and 100.0).
+/// (must be between 0.01 and 100.0), [`StretchError::NonFiniteInput`] if any
+/// sample is NaN or infinite, and [`StretchError::InvalidFormat`] if the
+/// input length is not a whole number of frames for the configured channel
+/// count.
 ///
 /// # Example
 ///

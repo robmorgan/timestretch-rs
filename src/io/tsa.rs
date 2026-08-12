@@ -273,7 +273,13 @@ fn decode_peaks(
     let crossover_high_bits = u64_at(16);
     let num_buckets = usize::try_from(u64_at(24))
         .map_err(|_| invalid("PEAK bucket count exceeds addressable memory"))?;
-    if payload.len() != PEAKS_PARAMS_LEN + 6 * num_buckets {
+    // Checked arithmetic: a hostile bucket count near usize::MAX would
+    // overflow `6 * num_buckets` (debug panic / release wrap-around that
+    // could pass the length check and index out of bounds).
+    let expected_len = num_buckets
+        .checked_mul(6)
+        .and_then(|n| n.checked_add(PEAKS_PARAMS_LEN));
+    if expected_len != Some(payload.len()) {
         return Err(invalid("PEAK payload length disagrees with bucket count"));
     }
 
@@ -525,6 +531,31 @@ mod tests {
         corrupt_and_check(|b| {
             b[FILE_HEADER_LEN + 8..FILE_HEADER_LEN + 16].copy_from_slice(&u64::MAX.to_le_bytes());
         });
+    }
+
+    #[test]
+    fn regression_peak_bucket_count_mul_overflow_rejected() {
+        // Found by the Stage 12 robustness harness: a PEAK chunk declaring
+        // a bucket count near usize::MAX overflowed `6 * num_buckets` —
+        // an arithmetic-overflow panic in debug builds, and in release a
+        // wrap-around that could pass the length check and slice out of
+        // bounds. Minimized: header + one PEAK chunk whose bucket count
+        // wraps `PEAKS_PARAMS_LEN + 6 * n` back to the actual payload len.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&TSA_CONTAINER_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&SR.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // source_len
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // content_hash
+        for count in [u64::MAX, u64::MAX / 6 + 1, u64::MAX / 6 * 6] {
+            let mut b = bytes.clone();
+            push_chunk_header(&mut b, TAG_PEAKS, PEAKS_CHUNK_VERSION, PEAKS_PARAMS_LEN);
+            let payload_start = b.len();
+            b.resize(payload_start + PEAKS_PARAMS_LEN, 0);
+            b[payload_start + 24..payload_start + 32].copy_from_slice(&count.to_le_bytes());
+            assert!(AnalysisFile::from_bytes(&b).is_err(), "count {count:#x}");
+            assert!(AnalysisFile::from_bytes_validated(&b, SR, 0, 0).is_none());
+        }
     }
 
     #[test]
