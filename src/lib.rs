@@ -75,6 +75,18 @@
 //! harness (`qa/robustness.rs`) and the randomized deck-gesture soak
 //! (`qa/soak.rs`).
 //!
+//! Audited 2026-08-13 (Stage 12 exit): every explicit panic site in
+//! `src/` outside `#[cfg(test)]` — 13 total (`unwrap`/`expect`/
+//! `unreachable!`) — is invariant-local: `last().unwrap()` on
+//! collections seeded non-empty in the same function, `try_into()` on
+//! fixed-size slices bounds-checked immediately above, one JSON
+//! serialization of an owned struct, and one `unreachable!` on a match
+//! arm excluded three lines earlier. None is reachable from public-API
+//! input; new code should keep panics out of input-dependent paths and
+//! prefer `Err`. Implicit panics (indexing, slicing) on the input
+//! surfaces are covered by the adversarial harness rather than static
+//! audit.
+//!
 use rustfft::{FftPlanner, num_complex::Complex};
 
 pub mod analysis;

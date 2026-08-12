@@ -17,7 +17,8 @@ full-code review against Rubber Band (findings recorded in LEARNINGS.md)
 identified confirmed defects in the wide-ratio phase vocoder, a
 mischaracterized offline wide path, ride-polish gaps in the DJ chain, and a
 measured tonal-HF granulation floor that needs a listening verdict — plus
-the still-open analysis-trust (Stage 10) and robustness (Stage 12) tracks.
+the still-open analysis-trust track (Stage 10); the robustness track
+(Stage 12) completed 2026-08-13.
 
 ## Status (2026-08-05)
 
@@ -38,17 +39,23 @@ mild-motion bounded recenter, ride-quality harnesses in CI, owner mix-in
 listen passed; archived in LEARNINGS.md. Its optional items (correlation
 reference, strength gating, modulation_hold wiring) remain evidence-gated
 ideas, not scheduled work.
+Stage 12 (robustness hardening) completed 2026-08-13 (PRs #46/#48 + the
+completion PR) — adversarial harness and deck-gesture soak in the CI
+quality gates, bounded-drift gate (worst measured 4.5 ms over an
+hour-equivalent), no-panic audit clean, weekly re-seeded fuzz campaign;
+three real fixes landed on the way; archived in LEARNINGS.md.
 
 Open, in priority order for the DJ app:
 
-- **Stage 10** — beat-grid trust on everything a DJ loads (evidence half +
-  the offbeat-bass non-adopters).
-- **Stage 14** — wide-path consolidation (offline uses the shipped stage,
-  stereo coupling, dead-code removal).
-- **Stage 16** — tonal-HF granulation: measure audibility on real material,
-  then decide accept/document vs pursue.
-- **Stage 17** — pitch-shift/batch-resampler correctness.
-- **Stage 12** — robustness hardening (fuzzing, no-panic, soak).
+- **Stage 10** — beat-grid trust on everything a DJ loads (non-EDM
+  corpus evidence half; the non-adopter class is closed).
+- **Stage 14** — wide-path consolidation: behavior landed, owner ±30/±50
+  listen remaining.
+- **Stage 16** — tonal-HF granulation: audition set rendered and
+  validity-fixed, blind listen remaining.
+- **Stage 17** — pitch-shift/batch-resampler correctness: implementation
+  and gates landed (incl. the direction-inversion fix), bright-mix
+  pitch-up listen remaining (`target/stage17_audition/`).
 
 ## Architecture (settled — decisions, not open questions)
 
@@ -122,8 +129,8 @@ corrected bass can win when latency permits.
 ## Stage Sequence
 
 Stages are independent tracks except: 16's verdict gates any future
-DJ-band tonal-quality stage. (Stages 13 and 15 are complete.) Suggested
-order: 10, then 14, 16, 17, 12.
+DJ-band tonal-quality stage. (Stages 12, 13, and 15 are complete.)
+Suggested order: 10, then 14, 16, 17.
 
 ## [ ] Stage 10: General-Purpose Beat Tracking and BPM Detection
 
@@ -216,59 +223,6 @@ intervals draws instead).
   check on the real track pends the next desktop load (sidecars
   regenerate on open).
 - Version-bump policy documented and applied on the next analysis change.
-
-## [ ] Stage 12: Robustness Hardening — No-Panic Surface, Fuzzing, Soak
-
-Automation: auto
-
-> **Status (2026-08-12): core landed** (PR #46): seeded adversarial
-> harness over every parsing/validation surface (`qa/robustness.rs`,
-> cargo-fuzz stand-in — deterministic xorshift, no nightly), bounded
-> deck-gesture soak (`qa/soak.rs`), no-panic contract documented in
-> `lib.rs`, and three real fixes with minimized regression tests
-> (`.tsa` bucket-count multiply overflow → `Err`; `stretch_offline`
-> release-build infinite loop on partial interleave + missing
-> channel/ratio validation; varispeed `MAX_OUT_PER_FEED` missing the
-> kernel-release term — retargets from dilated kernels silently
-> truncated output in release). Both harnesses wired into the CI
-> quality-gates job 2026-08-12 (they are feature-gated, so the plain
-> test jobs never build them — the wiring is what makes the coverage
-> real). Remaining: a bounded-drift assertion in the soak (the stated
-> gate list claims it; the harness doesn't assert it yet), the
-> longer cron soak with corpus persistence, and the no-panic audit of
-> `unwrap`/`expect` outside construction paths before this stage's
-> exit criteria are met.
-
-### Why
-
-The RT contract is machine-verified, but the input surface has never been
-hardened: the `.tsa` container loader (`src/io/tsa.rs`), the deprecated
-JSON artifact loader, the WAV reader, and the batch API have no fuzz
-coverage, and "arbitrary input produces `Err`, never a panic" is an
-intention, not a tested property. Prerequisite for any 1.0; the DJ app
-benefits regardless. Touches no DSP.
-
-### Work
-
-- Fuzz targets: `.tsa` from arbitrary bytes; deprecated JSON artifact; WAV
-  parsing; `stretch()` driven by arbitrary params × degenerate audio
-  (NaN/Inf/denormals, zero-length, one sample, extreme rates).
-- No-panic policy documented in `src/lib.rs`; audit of
-  `unwrap`/`expect`/`panic!` outside construction and tests.
-- Long-run soak: hours-equivalent randomized deck gestures (rides, seeks,
-  loop wraps, profile/keylock toggles, artifact swaps) gated on zero
-  clicks, zero allocation, bounded drift — composes the existing torture
-  generators.
-- CI: bounded fuzz per PR, longer cron run with corpus persistence;
-  crashes minimize into regression tests.
-
-### Exit Criteria
-
-- All fuzz targets clean for the CI budget; every campaign crash lands as
-  a minimized regression test.
-- Machine-checked: no panic reachable from the public API on arbitrary
-  input.
-- Soak harness green in CI (bounded), full-length recipe documented.
 
 ## [ ] Stage 14: Wide-Path Consolidation and Stereo Coherence
 
@@ -520,7 +474,7 @@ the owner decides the crate should take external customers:
   checklist; baselines sanity-checked on a second machine class.
 - MSRV and platform policy stated in the README.
 
-Stage 12 is a prerequisite for this path but is scheduled regardless.
+Stage 12, a prerequisite for this path, completed 2026-08-13.
 
 ## Definition of Success
 
@@ -540,4 +494,5 @@ in addition:
 - The tonal-HF granulation floor has a recorded listening verdict — fixed,
   or documented as scope (Stage 16).
 - No public path resamples without anti-aliasing (Stage 17).
-- No panic is reachable from the public API on arbitrary input (Stage 12).
+- No panic is reachable from the public API on arbitrary input (Stage 12,
+  done 2026-08-13 — adversarial harness in CI + audit).

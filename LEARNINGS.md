@@ -347,3 +347,51 @@ Independent corroboration (QM baseline column, same day): QM's
 bar/beat tracker also fails on Somebody To Love (beat F 0.37 vs our
 0.31, both far below the ≥ 0.95 it and we score on confidently-gridded
 rows) — the honest-uncertainty verdict, not a tracker deficiency.
+
+## Stage 12 — Robustness Hardening (2026-08-13)
+
+Adversarial input, no-panic, and soak coverage for every non-RT surface
+(PRs #46, #48, and the completion PR). Deliberately no DSP changes.
+
+**Landed:**
+
+- `qa/robustness.rs` — seeded adversarial harness (cargo-fuzz stand-in,
+  deterministic xorshift, no nightly) over the `.tsa` loader, deprecated
+  JSON artifact, WAV parsing, and `stretch()`/`stretch_offline` under
+  hostile params × degenerate audio. `qa/soak.rs` — randomized
+  deck-gesture marathon (rides/nudges/snaps, warm-start seeks, keylock
+  toggles, artifact swaps) gating underruns, finiteness, clicks, and
+  **bounded drift**: source consumption tracks the commanded tempo
+  integral within a constant 2048 frames (measured worst 197 frames =
+  4.5 ms over hour-equivalent 60 s runs — the engine's stash is bounded,
+  drift does not accumulate). Both run per-PR in the CI quality gates;
+  a weekly re-seeded campaign (`fuzz-campaign.yml`,
+  `TIMESTRETCH_FUZZ_SEED` = run id, logged for reproduction) runs the
+  hour-equivalent soak plus the full adversarial sweep.
+- Three real fixes found by writing the harnesses, each with a minimized
+  regression test: `.tsa` PEAK bucket-count multiply overflow → checked
+  `Err`; `stretch_offline` release-build infinite loop on a partial
+  trailing frame plus missing channel/ratio validation (the old guard
+  was a `debug_assert!` — release had nothing); varispeed
+  `MAX_OUT_PER_FEED` missing the kernel-release term, silently
+  truncating output on retargets from dilated kernels in release.
+- No-panic contract + audit documented in `lib.rs`: all 13 explicit
+  panic sites in `src/` outside tests are invariant-local; implicit
+  panics on input surfaces are covered by the harness, not static
+  audit.
+
+**Lessons:**
+
+- A feature-gated test target has ZERO CI coverage until a workflow
+  names it — `cargo test --all-targets` skips `required-features`
+  targets silently, and clippy doesn't even build them. PR #46 shipped
+  1,200 lines of harness that CI never compiled; the review caught it.
+  New gates land WITH their CI wiring, not before.
+- The most valuable robustness bug was not in a parser: the varispeed
+  capacity bound was an RT-contract hole (silent truncation swallowed
+  by a `debug_assert!`). Adversarial thinking applies to internal
+  contracts, not just input surfaces.
+- Consumption-vs-tempo-integral is a cheap, strong soak invariant: it
+  needed only the frames-pushed counter and ring occupancy, and its
+  measured headroom (10x) still catches a one-frame-per-callback leak
+  within ~6 s of audio time.

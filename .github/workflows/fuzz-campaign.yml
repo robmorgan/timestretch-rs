@@ -1,0 +1,37 @@
+# Stage 12 long-run campaign: the hours-equivalent soak plus the full
+# adversarial harness, re-seeded per run so every scheduled execution is
+# an independent — but reproducible — exploration. The per-PR bounded
+# variants run in ci.yml's quality-gates job; this is the wide sweep.
+#
+# Reproducing a failure locally: take the "campaign seed" value from the
+# failing run's log and run the same commands with
+# TIMESTRETCH_FUZZ_SEED=<value>.
+name: Fuzz Campaign
+
+on:
+  schedule:
+    # Weekly, Monday 03:17 UTC (off the whole-hour load spikes).
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "Campaign seed (u64; defaults to the run id)"
+        required: false
+
+jobs:
+  campaign:
+    name: Long soak + adversarial sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TIMESTRETCH_FUZZ_SEED: ${{ inputs.seed || github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Log campaign seed
+        run: 'echo "campaign seed: $TIMESTRETCH_FUZZ_SEED"'
+      - name: Adversarial harness (re-seeded)
+        run: cargo test --features qa-harnesses --release --test robustness -- --nocapture
+      - name: Hour-equivalent soak (re-seeded)
+        run: cargo test --features qa-harnesses --release --test soak -- --ignored --nocapture
