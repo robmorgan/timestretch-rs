@@ -325,6 +325,21 @@ Automation: manual
 > material, so splices recur through sustained content), with two-tone
 > beating well preserved both ways (47/42 dB). Focus the listening on
 > SLOWDOWNS. Remaining: the blind listen and the verdict recorded here.
+>
+> **Validity fixes (2026-08-12, from the PR #43 review, branch
+> `fix/stage16-audition-validity`)**: the first-cut renderer's PV arms
+> were mono against stereo SOLA/Rubber Band (instantly identifiable and
+> a source-signal confound for the corrected-range re-audition), the
+> Rubber Band arm skipped the RMS match its header claimed, and upward
+> RMS gains could hard-clip 16-bit club masters. Now: all arms stereo
+> with identical channel handling (PV renders per channel), all arms
+> RMS-matched including RB, all files 32-bit float. Recorded deviation
+> from this stage's prototype spec: the PV arms run WITHOUT
+> artifact-driven phase resets (single batch pass) — this biases the PV
+> against SOLA on transient smear, so the corrector comparison should
+> weigh sustained tonal passages, not attacks; if the PV loses ONLY on
+> transients, wire resets before concluding. Filenames name their arms
+> — shuffle before a blind pass per the Stage 11 protocol.
 
 ### Why
 

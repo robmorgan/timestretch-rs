@@ -15,8 +15,24 @@
 //!     `rubberband --fine`) reference, skipped with a warning if the CLI
 //!     is absent
 //!
-//! All arms are RMS-matched to the source excerpt. Output:
-//! `target/stage16_audition/<track>/<rate_tag>/<arm>.wav` plus a
+//! Blind-validity rules (review findings on the first cut of this
+//! renderer): every arm is stereo with the SAME channel handling (the PV
+//! prototype renders per channel — a mono arm in a stereo set is
+//! instantly identifiable and confounds the corrector comparison with a
+//! source-signal difference); every arm INCLUDING Rubber Band is
+//! RMS-matched to the source excerpt and then trimmed by one common
+//! per-condition gain (recorded in summary.txt) so no arm peaks over
+//! full scale — relative arm levels stay matched, and neither the file
+//! (32-bit float) nor the playback DAC ever clips into an
+//! arm-identifying artifact. Known deviation from the ROADMAP prototype
+//! spec, recorded here and in the stage note: the PV arms run without
+//! artifact-driven phase resets (one batch pass, start-of-stream reset
+//! only), which biases them against SOLA on transient smear — weigh
+//! sustained tonal passages, not attacks, when comparing correctors.
+//! The filenames name their arms: shuffle/rename before a blind pass
+//! (the Stage 11 protocol).
+//!
+//! Output: `target/stage16_audition/<track>/<rate_tag>/<arm>.wav` plus a
 //! `summary.txt` of levels. Usage:
 //!   cargo run --release --example stage16_audition [corpus_dir]
 
@@ -26,9 +42,9 @@ use std::process::Command;
 use timestretch::core::crossover::LinkwitzRiley8;
 use timestretch::core::resample::resample_sinc_default;
 use timestretch::core::window::WindowType;
-use timestretch::io::{read_wav_file, write_wav_file_16bit};
+use timestretch::io::{read_wav_file, write_wav_file_float};
 use timestretch::stretch::{PhaseLockingMode, PhaseVocoder};
-use timestretch::{AudioBuffer, Channels, StretchParams};
+use timestretch::{AudioBuffer, StretchParams};
 
 const CROSSOVER_HZ: f64 = 120.0;
 const EXCERPT_SECS: f64 = 20.0;
@@ -152,7 +168,13 @@ fn main() {
             // Source excerpt (for the rubberband CLI and as the anchor).
             let src_wav = dir.join("source.wav");
             let src_buf = AudioBuffer::new(excerpt.to_vec(), sr, buf.channels);
-            write_wav_file_16bit(src_wav.to_str().unwrap(), &src_buf).expect("write");
+            write_wav_file_float(src_wav.to_str().unwrap(), &src_buf).expect("write");
+
+            // All arms are collected first, then written with one common
+            // trim so RELATIVE levels stay matched while no file peaks
+            // over full scale (float WAVs store >1.0 fine, but playback
+            // chains clip it at the DAC — audibly, and per-arm).
+            let mut arms: Vec<(String, Vec<f32>)> = Vec::new();
 
             // Arm 1: shipped keylock path.
             let params = StretchParams::new(ratio)
@@ -160,30 +182,63 @@ fn main() {
                 .with_channels(ch as u32);
             let mut ours = timestretch::stretch(excerpt, &params).expect("stretch");
             match_rms(&mut ours, source_rms);
-            let ours_buf = AudioBuffer::new(ours, sr, buf.channels);
-            write_wav_file_16bit(dir.join("ours_sola.wav").to_str().unwrap(), &ours_buf)
-                .expect("write");
+            arms.push(("ours_sola".to_string(), ours));
 
-            // Arms 2+3: the PV-behind-the-split prototypes (mono mid for
-            // the corrected path comparison; stereo nuance is not what
-            // this audition decides).
-            let mid = timestretch::downmix_to_mid(excerpt, ch);
+            // Arms 2+3: the PV-behind-the-split prototypes, rendered per
+            // channel like every other arm — a mono arm in a stereo set
+            // unblinds itself by image width and turns the corrector
+            // comparison into a source-signal comparison.
             for fft in [512usize, 1024] {
-                let mut rendered = render_pv_prototype(&mid, sr, ratio, fft);
-                match_rms(&mut rendered, rms(&mid));
-                let pv_buf = AudioBuffer::new(rendered, sr, Channels::Mono);
-                write_wav_file_16bit(dir.join(format!("pv{fft}.wav")).to_str().unwrap(), &pv_buf)
-                    .expect("write");
+                let mut channels_out: Vec<Vec<f32>> = Vec::with_capacity(ch);
+                for c in 0..ch {
+                    let chan: Vec<f32> = excerpt.iter().skip(c).step_by(ch).copied().collect();
+                    channels_out.push(render_pv_prototype(&chan, sr, ratio, fft));
+                }
+                let frames = channels_out.iter().map(Vec::len).min().unwrap_or(0);
+                let mut rendered = Vec::with_capacity(frames * ch);
+                for f in 0..frames {
+                    for chan in &channels_out {
+                        rendered.push(chan[f]);
+                    }
+                }
+                match_rms(&mut rendered, source_rms);
+                arms.push((format!("pv{fft}"), rendered));
             }
 
-            // Arm 4: Rubber Band reference.
-            let rb_ok = render_rubberband(&src_wav, &dir.join("rubberband.wav"), ratio);
+            // Arm 4: Rubber Band reference — RMS-matched like every other
+            // arm (a loudness delta is a classic unblinding cue).
+            let rb_wav = dir.join("rubberband.wav");
+            let mut rb_ok = render_rubberband(&src_wav, &rb_wav, ratio);
+            if rb_ok {
+                match read_wav_file(rb_wav.to_str().unwrap()) {
+                    Ok(mut rb_buf) => {
+                        match_rms(&mut rb_buf.data, source_rms);
+                        arms.push(("rubberband".to_string(), rb_buf.data));
+                    }
+                    Err(_) => rb_ok = false,
+                }
+            }
             if !rb_ok {
                 eprintln!("  rubberband CLI unavailable/failed for {tag}/{rate_tag}");
             }
 
+            // Common trim across every arm in this condition.
+            let peak = arms
+                .iter()
+                .flat_map(|(_, data)| data.iter())
+                .fold(0.0f32, |m, &v| m.max(v.abs()));
+            let trim = if peak > 0.98 { 0.98 / peak } else { 1.0 };
+            for (name, mut data) in arms {
+                for v in &mut data {
+                    *v *= trim;
+                }
+                let arm_buf = AudioBuffer::new(data, sr, buf.channels);
+                write_wav_file_float(dir.join(format!("{name}.wav")).to_str().unwrap(), &arm_buf)
+                    .expect("write");
+            }
+
             summary.push_str(&format!(
-                "{tag}/{rate_tag}: source_rms {source_rms:.4} rb={}\n",
+                "{tag}/{rate_tag}: source_rms {source_rms:.4} trim {trim:.3} rb={}\n",
                 if rb_ok { "ok" } else { "MISSING" }
             ));
             println!("rendered {tag}/{rate_tag}");
