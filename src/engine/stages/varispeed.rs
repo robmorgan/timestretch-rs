@@ -15,7 +15,9 @@
 
 use std::sync::Arc;
 
-use crate::core::resample::{MultiSincResampler, STREAM_SINC_HALF_TAPS, SincInterpTable};
+use crate::core::resample::{
+    MultiSincResampler, STREAM_SINC_HALF_TAPS, STREAM_SINC_MAX_HALF_TAPS, SincInterpTable,
+};
 use crate::engine::control::MIN_TEMPO_RATE;
 
 /// Source frames fed to the resamplers per feed step. Small so that a tempo
@@ -23,9 +25,22 @@ use crate::engine::control::MIN_TEMPO_RATE;
 /// backlog stays inside the control-to-audio budget.
 pub(crate) const FEED_CHUNK_FRAMES: usize = 32;
 
-/// Upper bound on output frames one feed step can emit (at the minimum
-/// supported rate), used to size scratch buffers at construction.
-pub(crate) const MAX_OUT_PER_FEED: usize = (FEED_CHUNK_FRAMES as f64 / MIN_TEMPO_RATE) as usize + 2;
+/// Upper bound on output frames one feed step can emit, used to size
+/// scratch buffers at construction.
+///
+/// Two terms beyond the obvious `chunk / min_rate`: emission is gated by
+/// the widest kernel in flight, so when the step drops from a dilated
+/// kernel (half-span up to [`STREAM_SINC_MAX_HALF_TAPS`]) back toward
+/// unity (half-span [`STREAM_SINC_HALF_TAPS`]), the source frames that
+/// margin was holding back are released *in one feed* on top of the chunk
+/// itself — at the minimum rate that is
+/// `(chunk + max_half_span - min_half_span) / min_rate` outputs (Stage 12
+/// robustness finding; previously sized without the kernel-release term
+/// and overflowing on a 4.0 -> 0.25 retarget).
+pub(crate) const MAX_OUT_PER_FEED: usize = ((FEED_CHUNK_FRAMES + STREAM_SINC_MAX_HALF_TAPS
+    - STREAM_SINC_HALF_TAPS) as f64
+    / MIN_TEMPO_RATE) as usize
+    + 2;
 
 /// Lockstep multi-channel varispeed resampling head.
 #[derive(Debug)]
@@ -163,6 +178,38 @@ mod tests {
             assert_eq!(head.output(1).len(), produced);
             assert!(produced <= MAX_OUT_PER_FEED);
         }
+    }
+
+    #[test]
+    fn regression_step_drop_kernel_release_stays_within_capacity() {
+        // Found by the Stage 12 robustness harness
+        // (qa/robustness.rs::engine_process_with_extreme_configs_stays_finite):
+        // sustained fast rates dilate the kernel (half-span up to 80); a
+        // retarget down to the minimum rate then narrows it back to 16,
+        // releasing the withheld source frames in one feed. With
+        // MAX_OUT_PER_FEED sized only as chunk/min_rate + 2 (130), the
+        // release emitted 131+ frames: a BufferOverflow debug panic and,
+        // in release, silently truncated emission. Minimized: feed at the
+        // max rate until the wide kernel is in steady state, then snap to
+        // the min rate.
+        let mut head = VarispeedHead::new(1);
+        let chunk = vec![0.5f32; FEED_CHUNK_FRAMES];
+        for _ in 0..16 {
+            let produced = head.feed(&chunk, 4.0);
+            assert!(produced <= MAX_OUT_PER_FEED);
+        }
+        let mut max_produced = 0usize;
+        for _ in 0..16 {
+            let produced = head.feed(&chunk, 0.25);
+            max_produced = max_produced.max(produced);
+            assert!(produced <= MAX_OUT_PER_FEED, "{produced}");
+        }
+        // The release burst really happens (this is what overflowed): the
+        // first min-rate feeds emit well beyond the naive 130-frame bound.
+        assert!(
+            max_produced > FEED_CHUNK_FRAMES * 4 + 2,
+            "expected a kernel-release burst, got max {max_produced}"
+        );
     }
 
     #[test]

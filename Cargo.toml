@@ -106,3 +106,13 @@ required-features = ["qa-harnesses"]
 name = "wide_falsification"
 path = "qa/wide_falsification.rs"
 required-features = ["qa-harnesses"]
+
+[[test]]
+name = "robustness"
+path = "qa/robustness.rs"
+required-features = ["qa-harnesses"]
+
+[[test]]
+name = "soak"
+path = "qa/soak.rs"
+required-features = ["qa-harnesses"]

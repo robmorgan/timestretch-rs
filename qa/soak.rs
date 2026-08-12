@@ -1,0 +1,432 @@
+//! Stage 12 soak harness: randomized (seeded, deterministic) deck-gesture
+//! marathon over the pull engine.
+//!
+//! Composes the torture-test gesture generators
+//! (`tests/engine_modulation_torture.rs`) into a random sequence of tempo
+//! rides/nudges/snaps, mid-play seeks (the reset + `warm_start` protocol
+//! from `tests/engine_realtime_allocations.rs`), live keylock toggles, and
+//! per-segment artifact swaps (profile/artifact changes are seek-priced
+//! rebuilds by design — the engine has no live artifact morph).
+//!
+//! Gates, per segment:
+//! - zero source underruns (the feeder keeps the ring topped up);
+//! - every output sample finite, including seek/priming regions;
+//! - zero clicks by the torture tests' max-adjacent-diff bound
+//!   (`slew(max_gesture_rate) * 3`), excluding a settle window at segment
+//!   start and after each seek (priming silence + declick fade-in).
+//!
+//! Zero-allocation on the audio thread is machine-verified separately in
+//! `tests/engine_realtime_allocations.rs` and is not re-gated here.
+//!
+//! The CI-bounded variant streams ~60 s of audio time. The hours-equivalent
+//! recipe is `soak_long_hours_equivalent` (`#[ignore]`): one hour of audio
+//! time across 60 segments with ~8x the seek/toggle count —
+//!
+//! ```text
+//! cargo test --release --features qa-harnesses --test soak -- --ignored --nocapture
+//! ```
+//!
+//! Both variants are fully deterministic from the fixed seeds below; to
+//! widen the campaign, edit `LONG_SEED` (each seed is an independent
+//! hour).
+
+use timestretch::engine::{Engine, EngineConfig, EngineProfile};
+use timestretch::{PREANALYSIS_VERSION, PreAnalysisArtifact};
+
+const SAMPLE_RATE: u32 = 44_100;
+const CALLBACK_FRAMES: usize = 128;
+/// 210 Hz at 44.1 kHz: exactly 210 frames per period, so the infinite
+/// test tone is a pure function of the absolute track frame.
+const TONE_PERIOD_FRAMES: u64 = 210;
+const TONE_FREQ: f64 = SAMPLE_RATE as f64 / TONE_PERIOD_FRAMES as f64;
+const TONE_AMP: f32 = 0.5;
+/// Output frames excluded from the click gate at segment start (pipeline
+/// delay + corrector settle, the torture tests' prefix).
+const START_SETTLE_FRAMES: usize = 16_384;
+/// Output frames excluded after a seek: warm-start priming renders
+/// silence, then a declick fade-in; give it the same settle again.
+const SEEK_SETTLE_FRAMES: usize = 32_768;
+
+const CI_SEED: u64 = 0xD15C_0517_50AC_0001;
+const LONG_SEED: u64 = 0xD15C_0517_50AC_1000;
+
+/// xorshift64* — deterministic, dependency-free (same generator as
+/// qa/robustness.rs).
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Self(seed.max(1))
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next_u64() % n as u64) as usize
+    }
+
+    fn unit_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn range_f64(&mut self, lo: f64, hi: f64) -> f64 {
+        lo + self.unit_f64() * (hi - lo)
+    }
+}
+
+/// The infinite source: a pure tone as a function of absolute track frame.
+#[inline]
+fn tone_at(track_frame: u64) -> f32 {
+    let phase = (track_frame % TONE_PERIOD_FRAMES) as f64 / TONE_PERIOD_FRAMES as f64;
+    TONE_AMP * (std::f64::consts::TAU * phase).sin() as f32
+}
+
+/// Peak adjacent-sample step of the tone at `max_rate` (tape/varispeed
+/// worst case; corrected output stays at the source pitch and sits well
+/// inside the same bound).
+fn tone_max_slew(max_rate: f64) -> f32 {
+    TONE_AMP * (std::f64::consts::TAU * TONE_FREQ * max_rate / SAMPLE_RATE as f64) as f32
+}
+
+/// Randomized deck gestures, parameterized versions of the torture
+/// generators (Nudge / Ride / Snap / Hold).
+#[derive(Debug, Clone, Copy)]
+enum Gesture {
+    Hold {
+        rate: f64,
+    },
+    /// Sinusoidal fader ride around `center`.
+    Ride {
+        center: f64,
+        depth: f64,
+        hz: f64,
+    },
+    /// Instant sync snaps between two rates.
+    Snap {
+        a: f64,
+        b: f64,
+        period_s: f64,
+    },
+    /// Platter nudge: ramp up over 200 ms, hold, ramp back, rest (1 Hz).
+    Nudge {
+        peak: f64,
+    },
+}
+
+impl Gesture {
+    fn random(rng: &mut Rng, lo: f64, hi: f64) -> Self {
+        let span = hi - lo;
+        match rng.below(4) {
+            0 => Gesture::Hold {
+                rate: rng.range_f64(lo, hi),
+            },
+            1 => {
+                let center = (lo + hi) * 0.5;
+                Gesture::Ride {
+                    center,
+                    depth: rng.range_f64(0.2, 0.5) * span * 0.5,
+                    hz: rng.range_f64(0.1, 0.5),
+                }
+            }
+            2 => Gesture::Snap {
+                a: rng.range_f64(lo, hi),
+                b: rng.range_f64(lo, hi),
+                period_s: rng.range_f64(0.3, 0.8),
+            },
+            _ => Gesture::Nudge {
+                peak: rng.range_f64((lo + hi) * 0.5, hi),
+            },
+        }
+    }
+
+    fn rate_at(self, t_secs: f64) -> f64 {
+        match self {
+            Gesture::Hold { rate } => rate,
+            Gesture::Ride { center, depth, hz } => {
+                center + depth * (std::f64::consts::TAU * hz * t_secs).sin()
+            }
+            Gesture::Snap { a, b, period_s } => {
+                if (t_secs / period_s) as u64 % 2 == 0 {
+                    a
+                } else {
+                    b
+                }
+            }
+            Gesture::Nudge { peak } => {
+                let phase = t_secs.fract();
+                if phase < 0.2 {
+                    1.0 + (peak - 1.0) * (phase / 0.2)
+                } else if phase < 0.3 {
+                    peak
+                } else if phase < 0.5 {
+                    peak - (peak - 1.0) * ((phase - 0.3) / 0.2)
+                } else {
+                    1.0
+                }
+            }
+        }
+    }
+}
+
+/// Synthetic artifacts for the swap axis: the engine treats a provided
+/// artifact as authoritative, so segments alternate between none, a dense
+/// 126 BPM grid, and a sparse onset-only variant.
+fn artifact_variant(variant: usize, rng: &mut Rng) -> Option<PreAnalysisArtifact> {
+    // 126 BPM at 44.1 kHz: exactly 21_000 frames per beat (100 periods of
+    // the test tone), covering 20 minutes of track.
+    let beat = 21_000u64;
+    let beats: Vec<u64> = (0..3_600).map(|i| i * beat).collect();
+    match variant % 3 {
+        0 => None,
+        1 => Some(PreAnalysisArtifact {
+            version: PREANALYSIS_VERSION,
+            sample_rate: SAMPLE_RATE,
+            bpm: 126.0,
+            confidence: 0.9,
+            beat_positions: beats.iter().map(|&b| b as usize).collect(),
+            beat_positions_fractional: beats.iter().map(|&b| b as f64).collect(),
+            downbeat_beat_indices: (0..beats.len() / 4).map(|i| i * 4).collect(),
+            transient_onsets: beats.iter().map(|&b| b as usize).collect(),
+            transient_strengths: beats
+                .iter()
+                .map(|_| 0.6 + 0.4 * rng.unit_f64() as f32)
+                .collect(),
+            onset_band_flux: beats.iter().map(|_| [1.0, 0.5, 0.2, 0.1]).collect(),
+            analysis_hop_size: 512,
+            ..Default::default()
+        }),
+        _ => Some(PreAnalysisArtifact {
+            version: PREANALYSIS_VERSION,
+            sample_rate: SAMPLE_RATE,
+            bpm: 126.0,
+            confidence: 0.55,
+            beat_positions: beats.iter().step_by(4).map(|&b| b as usize).collect(),
+            beat_positions_fractional: beats.iter().step_by(4).map(|&b| b as f64).collect(),
+            downbeat_beat_indices: vec![0],
+            transient_onsets: beats.iter().step_by(4).map(|&b| b as usize).collect(),
+            transient_strengths: beats.iter().step_by(4).map(|_| 1.0).collect(),
+            onset_band_flux: Vec::new(), // deliberately not parallel: robustness axis
+            analysis_hop_size: 512,
+            ..Default::default()
+        }),
+    }
+}
+
+struct SegmentReport {
+    profile: EngineProfile,
+    seeks: usize,
+    toggles: usize,
+    max_diff: f32,
+    bound: f32,
+    frames: usize,
+}
+
+/// Streams one engine lifetime (one profile + artifact combination) for
+/// `secs` of audio time, driving random gestures every callback with
+/// random seeks and keylock toggles, and gates the collected output.
+fn run_segment(
+    rng: &mut Rng,
+    profile: EngineProfile,
+    artifact: Option<PreAnalysisArtifact>,
+    secs: usize,
+    seeks_target: usize,
+) -> SegmentReport {
+    // Wide profile exercises the full deck range; the narrow profiles stay
+    // inside the keylock's fully-corrected window like the torture rides.
+    let (rate_lo, rate_hi) = match profile {
+        EngineProfile::WideKeylock => (0.5, 2.0),
+        _ => (0.9, 1.12),
+    };
+
+    let handles = Engine::build(EngineConfig {
+        sample_rate: SAMPLE_RATE,
+        channels: 1,
+        profile,
+        pre_analysis: artifact.map(std::sync::Arc::new),
+        ..EngineConfig::default()
+    })
+    .expect("soak engine builds");
+    let (controller, mut processor, mut source) =
+        (handles.controller, handles.processor, handles.source);
+
+    let callbacks = secs * SAMPLE_RATE as usize / CALLBACK_FRAMES;
+    let mut track_frame: u64 = 0;
+    source.set_track_position(track_frame);
+
+    // Seek schedule: `seeks_target` random callbacks, past the initial
+    // settle and clear of the segment end.
+    let mut seek_cbs: Vec<usize> = (0..seeks_target)
+        .map(|_| 400 + rng.below(callbacks.saturating_sub(800).max(1)))
+        .collect();
+    seek_cbs.sort_unstable();
+    seek_cbs.dedup();
+
+    let mut gesture = Gesture::random(rng, rate_lo, rate_hi);
+    let mut gesture_until = 0usize;
+    let mut scratch = vec![0.0f32; 1_024];
+    let mut out = vec![0.0f32; CALLBACK_FRAMES];
+    let mut collected: Vec<f32> = Vec::with_capacity(callbacks * CALLBACK_FRAMES);
+    // Half-open output-frame ranges excluded from the click gate: the
+    // segment-start settle plus one window per seek.
+    let mut excluded: Vec<(usize, usize)> = vec![(0, START_SETTLE_FRAMES)];
+    let mut seeks = 0usize;
+    let mut toggles = 0usize;
+
+    for cb in 0..callbacks {
+        // New gesture every 1–3 s.
+        if cb >= gesture_until {
+            gesture = Gesture::random(rng, rate_lo, rate_hi);
+            gesture_until = cb
+                + (SAMPLE_RATE as usize / CALLBACK_FRAMES)
+                + rng.below(2 * SAMPLE_RATE as usize / CALLBACK_FRAMES);
+        }
+
+        // Seek: reset + re-anchor + warm-start, feeding the preroll of
+        // audio preceding the period-aligned target.
+        if seek_cbs.first() == Some(&cb) {
+            seek_cbs.remove(0);
+            seeks += 1;
+            let preroll = processor.warm_start_preroll_frames() as u64;
+            processor.reset();
+            let target =
+                (rng.below(10_000) as u64 + 1) * TONE_PERIOD_FRAMES + TONE_PERIOD_FRAMES * 20_000;
+            let start = target.saturating_sub(preroll);
+            source.set_track_position(start);
+            controller.warm_start(preroll as u32);
+            track_frame = start;
+            excluded.push((collected.len(), collected.len() + SEEK_SETTLE_FRAMES));
+        }
+
+        // Keylock toggle: ~every 2 s on average (ignored by profiles
+        // without a keylock stage — that indifference is itself under
+        // test).
+        if rng.below(2 * SAMPLE_RATE as usize / CALLBACK_FRAMES) == 0 {
+            toggles += 1;
+            controller.set_keylock(rng.below(2) == 0);
+        }
+
+        let t = (cb * CALLBACK_FRAMES) as f64 / SAMPLE_RATE as f64;
+        controller.set_tempo_rate(gesture.rate_at(t));
+
+        // Keep the ring topped up (covers playback plus priming budget).
+        while source.free_frames() >= scratch.len() {
+            for (i, s) in scratch.iter_mut().enumerate() {
+                *s = tone_at(track_frame + i as u64);
+            }
+            let accepted = source.push(&scratch);
+            track_frame += accepted as u64;
+            if accepted == 0 {
+                break;
+            }
+        }
+
+        processor.process(&mut out);
+        collected.extend_from_slice(&out);
+    }
+
+    assert_eq!(
+        controller.underrun_frames(),
+        0,
+        "soak[{profile:?}]: fed engine must not underrun"
+    );
+    assert_eq!(
+        controller.dropped_events(),
+        0,
+        "soak[{profile:?}]: mailbox overflow"
+    );
+
+    // Finiteness everywhere, including priming/declick regions.
+    for (i, &s) in collected.iter().enumerate() {
+        assert!(
+            s.is_finite(),
+            "soak[{profile:?}]: non-finite output at frame {i}"
+        );
+    }
+
+    // Click gate outside the settle windows: a pair (i, i+1) is checked
+    // only when it lies past every exclusion range covering it. Ranges
+    // are pushed in ascending start order, so a single forward sweep
+    // suffices.
+    let bound = tone_max_slew(rate_hi) * 3.0;
+    let mut max_diff = 0.0f32;
+    let mut max_at = 0usize;
+    let mut range_idx = 0usize;
+    for (i, pair) in collected.windows(2).enumerate() {
+        while range_idx < excluded.len() && i >= excluded[range_idx].1 {
+            range_idx += 1;
+        }
+        if range_idx < excluded.len() && i + 1 >= excluded[range_idx].0 && i < excluded[range_idx].1
+        {
+            continue;
+        }
+        let d = (pair[1] - pair[0]).abs();
+        if d > max_diff {
+            max_diff = d;
+            max_at = i;
+        }
+    }
+
+    assert!(
+        max_diff <= bound,
+        "soak[{profile:?}]: click at output frame {max_at} — max adjacent diff \
+         {max_diff:.5} > bound {bound:.5}"
+    );
+
+    SegmentReport {
+        profile,
+        seeks,
+        toggles,
+        max_diff,
+        bound,
+        frames: collected.len(),
+    }
+}
+
+/// Drives `total_secs` of audio time split into `segment_secs` segments,
+/// cycling profiles and artifact variants (the artifact-swap axis).
+fn soak(seed: u64, total_secs: usize, segment_secs: usize, seeks_per_segment: usize) {
+    let mut rng = Rng::new(seed);
+    let profiles = [
+        EngineProfile::Keylock,
+        EngineProfile::Tape,
+        EngineProfile::WideKeylock,
+    ];
+    let segments = total_secs.div_ceil(segment_secs);
+    for seg in 0..segments {
+        let profile = profiles[seg % profiles.len()];
+        let artifact = artifact_variant(seg, &mut rng);
+        let report = run_segment(&mut rng, profile, artifact, segment_secs, seeks_per_segment);
+        println!(
+            "soak segment {seg}: {:?} frames={} seeks={} toggles={} max_diff={:.5} bound={:.5}",
+            report.profile,
+            report.frames,
+            report.seeks,
+            report.toggles,
+            report.max_diff,
+            report.bound
+        );
+    }
+}
+
+/// CI-bounded soak: ~60 s of audio time (6 x 10 s segments), 2 seeks per
+/// segment, deterministic from `CI_SEED`.
+#[test]
+fn soak_ci_bounded_randomized_gestures() {
+    soak(CI_SEED, 60, 10, 2);
+}
+
+/// Hours-equivalent soak (see module docs for the invocation): one hour of
+/// audio time, 60 x 60 s segments, 8 seeks per segment. Deterministic from
+/// `LONG_SEED`; change the seed for an independent campaign hour.
+#[test]
+#[ignore = "hours-equivalent soak; run explicitly in release (see module docs)"]
+fn soak_long_hours_equivalent() {
+    soak(LONG_SEED, 3_600, 60, 8);
+}
