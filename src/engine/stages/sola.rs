@@ -299,6 +299,14 @@ pub(crate) struct SolaCorrector {
     energy_avg: f64,
     /// Splices executed since reset (observability for tests/QA).
     splice_count: u64,
+    /// PROTOTYPE — ROADMAP Stage 18 kill-experiment, not shipped
+    /// behavior: scales the elastic drift triggers (normal,
+    /// opportunistic, hard) so splices are rarer and land with larger,
+    /// period-aligned jumps on sustained tonal material. Read once at
+    /// construction from `TIMESTRETCH_PROTO_SOLA_TRIGGER_SCALE`
+    /// (clamped [1, 8]; 1.0 = shipped behavior, bit-identical). The
+    /// mild-motion and rest recenters keep their own bounds untouched.
+    trigger_scale: f64,
     /// Consecutive blocks with the transposition inside [`REST_DEV`].
     rest_blocks: u32,
     /// Premixed base window for the splice search ([`CORR_WINDOW`] frames;
@@ -311,10 +319,32 @@ pub(crate) struct SolaCorrector {
     frac_mix: Vec<f64>,
 }
 
+/// PROTOTYPE telemetry (Stage 18 kill-experiment): when the trigger-scale
+/// env knob is in use, report the splice count so renders can verify the
+/// cadence actually dropped. Silent (and dead) in shipped configurations.
+impl Drop for SolaCorrector {
+    fn drop(&mut self) {
+        if self.trigger_scale != 1.0 {
+            eprintln!(
+                "proto sola: trigger_scale={} splices={}",
+                self.trigger_scale, self.splice_count
+            );
+        }
+    }
+}
+
 impl SolaCorrector {
     pub(crate) fn new(num_channels: usize, nominal_lag_frames: usize) -> Self {
+        let trigger_scale = std::env::var("TIMESTRETCH_PROTO_SOLA_TRIGGER_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .map(|v| v.clamp(1.0, 8.0))
+            .unwrap_or(1.0);
         assert!(
-            nominal_lag_frames as f64 + HARD_TRIGGER + (SEARCH_RANGE as f64) + MIN_READ_MARGIN
+            nominal_lag_frames as f64
+                + HARD_TRIGGER * trigger_scale
+                + (SEARCH_RANGE as f64)
+                + MIN_READ_MARGIN
                 < (RING_LEN - CORR_WINDOW - BLOCK_FRAMES) as f64,
             "SOLA ring too small for nominal lag {nominal_lag_frames}"
         );
@@ -337,6 +367,7 @@ impl SolaCorrector {
             nominal_lag: nominal_lag_frames as f64,
             energy_avg: 0.0,
             splice_count: 0,
+            trigger_scale,
             rest_blocks: 0,
             corr_a: vec![0.0; CORR_WINDOW],
             corr_b: vec![0.0; 2 * SEARCH_RANGE as usize + CORR_WINDOW],
@@ -443,15 +474,17 @@ impl SolaCorrector {
         };
         if self.xfade_remaining == 0 {
             let drift = self.lag_error_frames();
-            if drift.abs() > DRIFT_TRIGGER {
+            if drift.abs() > DRIFT_TRIGGER * self.trigger_scale {
                 // Onset protection applies inside the candidate search; the
                 // HARD trigger forces through it eventually.
                 self.try_splice(drift, onsets);
-            } else if drift.abs() > OPPORTUNISTIC_DRIFT && self.in_masked_window(onsets) {
+            } else if drift.abs() > OPPORTUNISTIC_DRIFT * self.trigger_scale
+                && self.in_masked_window(onsets)
+            {
                 // Beat-synchronous placement: a pending correction hides
                 // best right after a hit.
                 self.try_splice(drift, onsets);
-            } else if drift.abs() > OPPORTUNISTIC_DRIFT
+            } else if drift.abs() > OPPORTUNISTIC_DRIFT * self.trigger_scale
                 && self.energy_avg > 1e-6
                 && self.region_rms(self.read_pos, CORR_WINDOW)
                     < QUIET_SPLICE_RATIO * self.energy_avg
@@ -552,7 +585,7 @@ impl SolaCorrector {
     /// Drift-triggered splice: onset protection and the transient postpone
     /// apply until the drift is critical.
     fn try_splice(&mut self, drift: f64, onsets: &[OnsetEvent]) {
-        let force = drift.abs() >= HARD_TRIGGER;
+        let force = drift.abs() >= HARD_TRIGGER * self.trigger_scale;
         let _ = self.plan_splice(drift, force, f64::INFINITY, onsets);
     }
 
