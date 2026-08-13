@@ -49,9 +49,19 @@ Open, in priority order for the DJ app:
 
 - **Stage 10** — beat-grid trust on everything a DJ loads (non-EDM
   corpus evidence half; the non-adopter class is closed).
-- **Stage 14** — wide-path consolidation: behavior landed, owner ±30/±50
-  listen remaining.
+- **Stage 19** — direct-ratio wide path (the Stage 14 attribution's
+  fix; falsification-gated on live dynamics).
 
+Stage 14 (wide-path consolidation) closed 2026-08-13 — the durable
+deliverables stand (dead-code/doc sweep, wide determinism harness,
+sub-bass fix, M/S machinery), but the owner ±30/±50 blind listen FAILED
+against the pre-consolidation batch PV (~7/8), and the three-session
+attribution chain that followed cleared resets, M/S, shared code, and
+chunking — the live topology itself (varispeed prepass + PV +
+post-resampler, the Stage 11 design) is the roboty floor. The
+"offline = live" goal is superseded by Stage 19, which unifies both on
+the direct-ratio configuration that auditioned clean; archived in
+LEARNINGS.md.
 Stage 18 (steady-rate splice-cadence stretch) completed 2026-08-13
 (PR #56) — SOLA's elastic drift triggers double at steady transposition
 inside the primary DJ window (asymmetric band: slowdown force capped at
@@ -158,8 +168,8 @@ corrector was never falsified.
 
 ## Stage Sequence
 
-Stages are independent tracks. (Stages 12, 13, 15, 16, 17, and 18 are
-complete.) Remaining: 10, then 14.
+Stages are independent tracks. (Stages 12, 13, 14, 15, 16, 17, and 18
+are complete or closed.) Remaining: 10, then 19.
 
 ## [ ] Stage 10: General-Purpose Beat Tracking and BPM Detection
 
@@ -253,114 +263,63 @@ intervals draws instead).
   regenerate on open).
 - Version-bump policy documented and applied on the next analysis change.
 
-## [ ] Stage 14: Wide-Path Consolidation and Stereo Coherence
+## [ ] Stage 19: Direct-Ratio Wide Path — Remove the Live Topology Floor
 
 Automation: auto
 
-> **Status (2026-08-07): behavior half landed** (branch
-> `feat/wide-path-consolidation`): offline wide ratios inside the engine
-> range now render through the shipped `WideKeylockStage` (the batch PV
-> survives only beyond 4× either way); streaming-vs-offline determinism
-> extended to wide rates (sample-identical at 0.5×/1.5×); the two-tone
-> sub-bass attenuation pinned at Stage 13 is GONE through the live stage
-> (balance at the ideal at every wide ratio — the live PV runs at unity
-> with the resampler transposing); the corrected stereo path runs in
-> mid/side (identical channels stay bit-identical, center cannot leak
-> into side by construction — honest measurement: the per-channel leak
-> was modest, 64.6 → 70.9 dB rejection, so the audible width verdict
-> belongs to the owner listen); peak-magnitude floor unified across the
-> vocoder and locking passes. Remaining: the dead-code/doc sweep
-> (separate PR) and the owner ±30/±50 listen (note: M/S touches exactly
-> the "a bit crowded vs R3" quality heard at Stage 11).
->
-> **Status (2026-08-13): owner ±30/±50 listen FAILED the exit
-> criterion — stage reopened.** Blind, 8 conditions (msbwy +
-> cold_heart × ±30/±50, renders: pre-consolidation `887d854` vs main
-> `340a5d1` vs Rubber Band, sealed key, level-matched): the
-> pre-consolidation per-channel batch PV beat the consolidated
-> live-stage render in ~7 of 8 conditions. Two distinct findings:
->
-> 1. **Width (measured, then judged)**: the consolidated M/S path is
->    FAITHFUL — side/mid within 0.1 dB of the source (−16.3 vs
->    −16.2 dB on msbwy) — while the old per-channel PV MANUFACTURES
->    width by decorrelation (side/mid balloons to ~0 dB, +16 dB of
->    fake side energy; R3 adds a moderate ~5 dB). The owner blind
->    preference went to the wider renders ("full/wide" vs
->    "closed/narrow"). This is a design decision, not a bug: faithful
->    vs flattering. Candidate middle path if flattering wins: a
->    bounded, deliberate side treatment — not decorrelation as an
->    accident of uncoupled processing.
-> 2. **Quality regression (a bug until attributed)**: "roboty /
->    pulsing background artifacts" on the consolidated arm,
->    worst on slowdowns ("pulsing roboty bass" at −30%, "awful,
->    roboty" msbwy −50%) — the batch PV arm shows "metallic" at worst.
->    Attribution needed before any fix: candidates are the
->    artifact-driven per-band phase resets pulsing (offline renders
->    run the online-detection fallback), the unity-PV + post-resampler
->    topology vs the batch PV's direct-ratio synthesis, and the
->    peak-set unification. Ablation renders on the same excerpts,
->    then re-listen.
->
-> Note the acceptance-context shift: Stage 11 accepted the live wide
-> stage against RUBBER BAND; this is the first blind comparison of the
-> live stage against the batch PV configuration, and the batch config
-> won — the "offline must equal live" consolidation goal now cuts the
-> other way (perhaps live should adopt what the batch path did right).
-
 ### Why
 
-Offline wide ratios run a *different algorithm configuration* than the
-shipped live wide stage — independent per-channel batch PVs with no stereo
-coupling, no streaming resampler, and (until Stage 13) the rejected hop.
-`lib.rs:493-494` claims batch stereo phase is preserved "natively"; for
-this path it is not. Meanwhile the wide PV carries dead weight the review
-inventoried: a provably-no-op envelope block, ~200 lines of
-production-dead seam re-anchoring pinned by ~25 tests, a DSP-dead
-`hop_synthesis` field, divergent peak-detection passes, and the legacy
-broken `LR8Crossover` kept only for baselines that no longer exist.
+The Stage 14 listen chain attributed the wide path's "roboty background
+noise" to the live topology itself, with every alternative eliminated
+(2026-08-13, three blind sessions + probes, prototype branch
+`proto/stage14-ablation`):
 
-### Primary Files
+- Phase resets: innocent (disabling them changed nothing blind).
+- M/S coupling: innocent for the noise (owns only the width difference —
+  measured: M/S is source-faithful, per-channel manufactures ~16 dB of
+  side energy by decorrelation).
+- Shared PV code / peak unification: innocent (current-code batch render
+  is bit-identical to the pre-consolidation one, SER ≈ 293 dB).
+- Streaming chunking: innocent (chunked direct-ratio holds batch-level
+  harmonic purity, 60.7–70.5 dB, and auditioned clean/BEST blind in all
+  3 conditions).
+- **Guilty: the varispeed-tempo-prepass + PV-stretch + post-resampler
+  arrangement** — the Stage 11 live design. Its floor was accepted then
+  against Rubber Band; the batch/direct-ratio comparison shows it is a
+  self-inflicted floor, not a PV limitation.
 
-- `src/engine/offline.rs` (route wide ratios through `WideKeylockStage`),
-  `src/stretch/phase_vocoder.rs` + `src/stretch/phase_locking.rs`
-  (peak-set unification, dead-code removal), `src/stretch/envelope.rs`
-  (delete or wire for real), `src/core/crossover.rs` (`LR8Crossover`
-  removal), stale docs (`Makefile`, `qa/README.md`, `RESEARCH.md:309`,
-  `benchmarks/README.md`)
+A direct-ratio wide PV removes the roboty floor from BOTH live playback
+and offline renders, and re-unifies the two paths at the better quality
+(the consolidation goal, pointed the right way this time).
 
-### Work
+### Falsification first (the risk is dynamics, not quality)
 
-- **Offline wide = live wide**: drive `stretch_offline`'s wide branch
-  through the actual `WideKeylockStage` graph (host-emulation loop already
-  exists for the keylock branch), giving the shipped corrector batch/QA
-  coverage and making live and offline wide renders match. Supersedes the
-  per-channel batch PV loop.
-- **Stereo coupling in the wide PV**: shared peak selection and shared
-  per-peak rotations across channels (rotation from the channel-summed
-  spectrum, applied to both; magnitudes stay per-channel). Gate with a
-  correlated-stereo-noise inter-channel phase test.
-- **Unify the peak sets**: one thresholded peak pass feeding gradient
-  integration, locking, and the IF-blend loop (`MIN_PEAK_MAGNITUDE` floor
-  in `fill_spectral_peaks`); document last-write-wins region arbitration or
-  fix it by magnitude.
-- **Dead-code removal**: `hop_synthesis` field + stale doc comments; the
-  envelope-preservation block (identity by construction — delete, with the
-  cepstral machinery, unless a real synthesis-envelope source is wired);
-  the `set_stretch_ratio` seam-case chain and its tests (production always
-  uses `set_smooth_ratio_updates(true)`); `LR8Crossover`; two of the three
-  `bessel_i0` copies.
-- Doc truth pass: fix `Makefile` `TEST_CMD`, `qa/README.md` /
-  `benchmarks/README.md` stale harness names, `RESEARCH.md` dormant-reset
-  claim, `lib.rs` stereo claim.
+Constant-rate quality is proven. What is NOT proven is deck feel: the
+current design does tempo in the varispeed head precisely for
+sample-accurate retargets, and instant PV-ratio steps tear OLA seams
+(Stage 11, measured — hence the log-slew). Before build-out, prototype
+the direct-ratio chunked PV under DYNAMIC rate: ratio steps, ±ride
+glides, and seek/warm-start, offline-driven. Kill criteria: rate
+transitions cannot be made click-free within the 48.6 ms contract, or
+output-rate-varies-with-ratio demand inversion cannot be bounded for
+the pull graph (WCET or buffer growth). Fallback if killed: revert
+offline wide to the direct-ratio batch PV (the quality is free there)
+and keep the live stage as Stage 11 accepted it, divergence documented.
 
-### Exit Criteria
+### Work (only if the kill-experiment survives)
 
-- `stretch()` beyond ±20% renders through `WideKeylockStage`;
-  streaming-vs-offline determinism extended to a wide-rate fixture.
-- Inter-channel phase gate green on stereo material at wide ratios.
-- Net LOC down in `src/stretch/`; no production behavior change on the DJ
-  chain (A/B matrix re-run green).
-- Owner listen at ±30/±50% vs pre-consolidation renders.
+- WideKeylockStage rework: PV at the (slewed) direct ratio on the
+  source-side audio; the varispeed head runs unity for this profile (or
+  is bypassed); demand inversion accounts for ratio-dependent PV output
+  rate; latency contract re-derived and re-gated.
+- Stereo: decide faithful M/S vs per-channel width DELIBERATELY (the
+  owner blind preference leaned wide; if wide wins, implement it as a
+  bounded side treatment, not decorrelation-by-accident).
+- Offline wide renders through the same reworked stage — determinism
+  gate restored with teeth.
+- Gates: wide purity probes pinned at direct-ratio levels; rate-step /
+  ride torture on the wide profile; WCET; A/B matrix; the Stage 14
+  blind conditions re-rendered and re-auditioned as the exit listen.
 
 ## Not a Priority Yet
 

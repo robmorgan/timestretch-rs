@@ -566,3 +566,49 @@ test). Full suite, A/B matrix, ride/seam, WCET, robustness, soak green.
   the force cap, and the construction asserts all derive from the same
   560-frame lag geometry, which is why the mechanism ships with no
   tuning knobs.
+
+## Stage 14 — Wide-Path Consolidation (closed 2026-08-13, superseded by Stage 19)
+
+The consolidation (PRs #40/#41, 2026-08-07) delivered its mechanical
+goals — offline wide ratios through the shipped `WideKeylockStage`,
+wide-rate streaming/offline determinism, the Stage 13 sub-bass
+attenuation gone, M/S corrected-path stereo, dead-code/doc sweep — and
+then FAILED its owner listen: blind ±30/±50 (8 conditions, sealed key,
+pre-consolidation `887d854` vs main vs Rubber Band), the old per-channel
+batch PV beat the consolidated render ~7/8.
+
+**The attribution chain that followed (three blind sessions + probes,
+prototype `proto/stage14-ablation`) is the stage's real yield:**
+
+- **Width**: measured before judged — the M/S path reproduces the source
+  image within 0.1 dB side/mid; the batch PV MANUFACTURES ~16 dB of side
+  energy by per-channel decorrelation (R3 adds ~5 dB). The owner blind
+  preference went to the wider renders. Faithful-vs-flattering is now an
+  explicit design decision parked in Stage 19.
+- **"Roboty/pulsing background noise"**: resets innocent (ablated, no
+  change blind); M/S innocent (ablated); shared PV code innocent
+  (current-code batch bit-identical to 887d854's, SER 293 dB); chunking
+  innocent (streaming direct-ratio holds 60.7–70.5 dB purity and
+  auditioned clean/BEST in all 3 blind conditions). **Guilty: the live
+  topology** — varispeed tempo prepass + PV stretch + post-resampler
+  transpose, i.e. the Stage 11 design itself. Its floor was accepted
+  against Rubber Band; the direct-ratio comparison shows it was
+  self-inflicted, not a PV limitation.
+
+Lessons:
+
+- **"Offline must equal live" begs the question of which one is
+  right.** The consolidation dragged offline down to the live floor in
+  the name of consistency; the first blind live-config-vs-batch-config
+  comparison (never run before — Stage 11 only ever compared against
+  Rubber Band) inverted the goal. Unify on the better configuration,
+  not the incumbent one.
+- **An acceptance verdict is scoped to its comparison.** Stage 11's
+  "gap vs R3, shippable" was read for a year as "the wide path is as
+  good as we can make it"; it never tested the in-house alternative.
+- **PV renders cannot be null-tested across configurations** (different
+  startup phase states never cancel — SER ≈ 0 dB between renders that
+  sound alike); purity probes and blind ears are the discriminators.
+- Manufactured width (decorrelation) reads as "full/wide" and wins
+  blind preference over a faithful image — flattering beats faithful
+  until it is made a deliberate choice.
