@@ -299,6 +299,13 @@ pub(crate) struct SolaCorrector {
     energy_avg: f64,
     /// Splices executed since reset (observability for tests/QA).
     splice_count: u64,
+    /// Unforced splice attempts that failed since the last splice. A
+    /// forced splice (which tears through onset protection) is honored
+    /// only when this is nonzero, so a regime change that shrinks the
+    /// force threshold under already-parked drift (a ride starting while
+    /// the cadence stretch had the band widened) cannot skip protection
+    /// on its very first block.
+    failed_attempts: u32,
     /// Consecutive blocks with the transposition inside [`REST_DEV`].
     rest_blocks: u32,
     /// Premixed base window for the splice search ([`CORR_WINDOW`] frames;
@@ -311,12 +318,68 @@ pub(crate) struct SolaCorrector {
     frac_mix: Vec<f64>,
 }
 
+/// Splice-cadence stretch (ROADMAP Stage 18): at full stretch the elastic
+/// drift triggers double, so splices fire half as often and land with
+/// larger, better period-aligned jumps — the fix for the Stage 16 blind
+/// verdict, where the ~20-splices/s cadence granulated sustained tonal
+/// material ("roboty"; harmonic-15 purity 22 dB at −8% tempo, 63 dB at
+/// half cadence; blind owner A/B: half cadence won or tied all 6
+/// conditions, every "robot" rating on the shipped cadence).
+const CADENCE_SCALE_MAX: f64 = 2.0;
+/// Slowdowns read faster than the ring writes (T > 1), so the elastic
+/// drift bound eats the nominal-lag headroom toward the write head — the
+/// binding constraint the Stage 18 prototype hit: full stretch is green
+/// through the primary DJ window but stalls the cursor near the ±20–25%
+/// edge (measured: sine pitch −16 cents at T = 1.25). The stretch
+/// therefore tapers off past the primary window and is fully released
+/// well before the measured failure. Speed-ups (T < 1) drift toward the
+/// ring's old side, where headroom is ~6x the hard trigger — no taper.
+const CADENCE_TAPER_START: f64 = 1.09;
+const CADENCE_TAPER_END: f64 = 1.15;
+/// Write-head-side cap on the FORCED splice threshold (negative/slowdown
+/// drift). The elastic band is asymmetric by physics: speed-up drift
+/// parks toward the ring's old side (~6x the hard trigger of headroom),
+/// but slowdown drift eats the nominal-lag gap to the write head — the
+/// stretched hard trigger (640) sits PAST the head (lag 560), so under
+/// blocked-splice pressure (dense onset protection, loud landings) the
+/// backstop could never fire before the read margin was violated. The
+/// cap keeps the force reachable with real margin:
+/// `560 − MIN_READ_MARGIN − 2·BLOCK_FRAMES` of runway, leaving 64 frames
+/// of unforced attempts between the stretched normal trigger (384) and
+/// the force. Asserted against the nominal lag at construction.
+const SLOWDOWN_FORCE_CAP: f64 = 448.0;
+
+/// Cadence stretch for the current transposition: [`CADENCE_SCALE_MAX`]
+/// through the primary DJ window, linearly released to 1 across the
+/// taper band on slowdowns.
+fn cadence_scale(transposition: f64) -> f64 {
+    if transposition <= CADENCE_TAPER_START {
+        return CADENCE_SCALE_MAX;
+    }
+    if transposition >= CADENCE_TAPER_END {
+        return 1.0;
+    }
+    let t = (transposition - CADENCE_TAPER_START) / (CADENCE_TAPER_END - CADENCE_TAPER_START);
+    CADENCE_SCALE_MAX + (1.0 - CADENCE_SCALE_MAX) * t
+}
+
 impl SolaCorrector {
     pub(crate) fn new(num_channels: usize, nominal_lag_frames: usize) -> Self {
+        // Ring / old-audio side (binds speed-up drift, +HARD·scale).
         assert!(
-            nominal_lag_frames as f64 + HARD_TRIGGER + (SEARCH_RANGE as f64) + MIN_READ_MARGIN
+            nominal_lag_frames as f64
+                + HARD_TRIGGER * CADENCE_SCALE_MAX
+                + (SEARCH_RANGE as f64)
+                + MIN_READ_MARGIN
                 < (RING_LEN - CORR_WINDOW - BLOCK_FRAMES) as f64,
             "SOLA ring too small for nominal lag {nominal_lag_frames}"
+        );
+        // Write-head side (binds slowdown drift): the forced splice must
+        // fire while the read cursor still has margin.
+        assert!(
+            SLOWDOWN_FORCE_CAP + MIN_READ_MARGIN + 2.0 * BLOCK_FRAMES as f64
+                <= nominal_lag_frames as f64,
+            "SOLA nominal lag {nominal_lag_frames} cannot cover the slowdown force cap"
         );
         Self {
             channels: (0..num_channels)
@@ -337,6 +400,7 @@ impl SolaCorrector {
             nominal_lag: nominal_lag_frames as f64,
             energy_avg: 0.0,
             splice_count: 0,
+            failed_attempts: 0,
             rest_blocks: 0,
             corr_a: vec![0.0; CORR_WINDOW],
             corr_b: vec![0.0; 2 * SEARCH_RANGE as usize + CORR_WINDOW],
@@ -354,6 +418,22 @@ impl SolaCorrector {
 
     pub(crate) fn set_rate_slope(&mut self, slope: f64) {
         self.rate_slope = if slope.is_finite() { slope } else { 0.0 };
+    }
+
+    /// Stage 18 cadence stretch, gated on STEADY transposition: sustained
+    /// tonal content — where splice granulation is audible (Stage 16
+    /// blind verdict) — is a parked-fader regime, while rides need small
+    /// drift for pitch accuracy: the slope-tracked synthesis correction
+    /// is proportional to the parked drift and clamps, so a doubled
+    /// drift band doubled ride cents p95 straight past its A/B-matrix
+    /// gate (measured 5.65 vs bound 1.5 before this gate was added).
+    /// A per-block scalar from existing state — no allocation.
+    fn cadence(&self) -> f64 {
+        if self.rate_slope == 0.0 {
+            cadence_scale(self.transposition)
+        } else {
+            1.0
+        }
     }
 
     pub(crate) fn latency_frames(&self) -> usize {
@@ -382,6 +462,7 @@ impl SolaCorrector {
         self.xfade_remaining = 0;
         self.energy_avg = 0.0;
         self.splice_count = 0;
+        self.failed_attempts = 0;
         self.rest_blocks = 0;
         self.rate_slope = 0.0;
     }
@@ -442,16 +523,17 @@ impl SolaCorrector {
             false
         };
         if self.xfade_remaining == 0 {
+            let cadence = self.cadence();
             let drift = self.lag_error_frames();
-            if drift.abs() > DRIFT_TRIGGER {
+            if drift.abs() > DRIFT_TRIGGER * cadence {
                 // Onset protection applies inside the candidate search; the
                 // HARD trigger forces through it eventually.
                 self.try_splice(drift, onsets);
-            } else if drift.abs() > OPPORTUNISTIC_DRIFT && self.in_masked_window(onsets) {
+            } else if drift.abs() > OPPORTUNISTIC_DRIFT * cadence && self.in_masked_window(onsets) {
                 // Beat-synchronous placement: a pending correction hides
                 // best right after a hit.
                 self.try_splice(drift, onsets);
-            } else if drift.abs() > OPPORTUNISTIC_DRIFT
+            } else if drift.abs() > OPPORTUNISTIC_DRIFT * cadence
                 && self.energy_avg > 1e-6
                 && self.region_rms(self.read_pos, CORR_WINDOW)
                     < QUIET_SPLICE_RATIO * self.energy_avg
@@ -552,8 +634,22 @@ impl SolaCorrector {
     /// Drift-triggered splice: onset protection and the transient postpone
     /// apply until the drift is critical.
     fn try_splice(&mut self, drift: f64, onsets: &[OnsetEvent]) {
-        let force = drift.abs() >= HARD_TRIGGER;
-        let _ = self.plan_splice(drift, force, f64::INFINITY, onsets);
+        // Asymmetric force threshold: slowdown (negative) drift is capped
+        // by the write-head headroom ([`SLOWDOWN_FORCE_CAP`] — the
+        // stretched hard trigger does not fit that side); speed-up keeps
+        // the full stretched band against the ring's old-audio headroom.
+        let stretched = HARD_TRIGGER * self.cadence();
+        let threshold = if drift < 0.0 {
+            stretched.min(SLOWDOWN_FORCE_CAP)
+        } else {
+            stretched
+        };
+        let force = drift.abs() >= threshold && self.failed_attempts > 0;
+        if self.plan_splice(drift, force, f64::INFINITY, onsets) {
+            self.failed_attempts = 0;
+        } else {
+            self.failed_attempts = self.failed_attempts.saturating_add(1);
+        }
     }
 
     /// Rest-recenter splice: only candidates that actually bring the lag
@@ -566,7 +662,9 @@ impl SolaCorrector {
     /// When no candidate qualifies the splice is skipped and the trim
     /// converges the drift unimpeded.
     fn try_rest_splice(&mut self, drift: f64, onsets: &[OnsetEvent]) {
-        let _ = self.plan_splice(drift, false, REST_SPLICE_DRIFT, onsets);
+        if self.plan_splice(drift, false, REST_SPLICE_DRIFT, onsets) {
+            self.failed_attempts = 0;
+        }
     }
 
     /// Plans and starts a correlation-matched splice toward the nominal
@@ -855,9 +953,79 @@ mod tests {
         let input = sine(500.0, 44_100 * 20, 0.4);
         let _ = run(&mut corrector, &input, 1.05);
         let error = corrector.lag_error_frames().abs();
+        // The elastic band is the cadence-stretched hard trigger inside
+        // the primary window (Stage 18).
         assert!(
-            error <= HARD_TRIGGER + BLOCK_FRAMES as f64,
+            error <= HARD_TRIGGER * CADENCE_SCALE_MAX + BLOCK_FRAMES as f64,
             "lag error {error:.0} frames escaped the elastic band"
+        );
+    }
+
+    #[test]
+    fn cadence_scale_tapers_with_transposition() {
+        // Full stretch through the primary DJ window (both directions)…
+        assert_eq!(cadence_scale(0.9), CADENCE_SCALE_MAX);
+        assert_eq!(cadence_scale(1.0), CADENCE_SCALE_MAX);
+        assert_eq!(cadence_scale(CADENCE_TAPER_START), CADENCE_SCALE_MAX);
+        // …released to shipped cadence before the slowdown range edge
+        // (the measured T=1.25 cursor stall must run at scale 1)…
+        assert_eq!(cadence_scale(CADENCE_TAPER_END), 1.0);
+        assert_eq!(cadence_scale(1.25), 1.0);
+        // …monotone in between.
+        let mid = cadence_scale((CADENCE_TAPER_START + CADENCE_TAPER_END) * 0.5);
+        assert!(mid > 1.0 && mid < CADENCE_SCALE_MAX);
+    }
+
+    #[test]
+    fn cadence_stretch_halves_splice_rate_in_window() {
+        // At T=1.05 (inside the primary window) drift accrues at
+        // |T−1| frames per output frame; with the stretched trigger the
+        // splice count must sit near accrual / (DRIFT_TRIGGER * 2) —
+        // meaningfully below the shipped-cadence rate, but still actively
+        // correcting.
+        let secs = 20;
+        let frames = 44_100 * secs;
+        let mut corrector = SolaCorrector::new(1, LAG);
+        let input = sine(500.0, frames, 0.4);
+        let _ = run(&mut corrector, &input, 1.05);
+        let accrual = frames as f64 * 0.05;
+        let scale1_rate = accrual / DRIFT_TRIGGER;
+        let count = corrector.splice_count() as f64;
+        assert!(
+            count < 0.7 * scale1_rate,
+            "cadence stretch inactive: {count} splices vs ~{scale1_rate:.0} at shipped cadence"
+        );
+        assert!(
+            count > 0.3 * scale1_rate,
+            "implausibly few splices ({count}) — corrector may be stalling"
+        );
+    }
+
+    #[test]
+    fn ride_slope_restores_shipped_cadence() {
+        // With a nonzero rate slope (a ride in progress) the cadence
+        // stretch must be inert: the slope-tracked pitch correction is
+        // proportional to parked drift and clamps, so the widened band
+        // measurably detunes rides (A/B matrix: cents p95 5.65 vs bound
+        // 1.5 before this gate). Splice rate must sit near the shipped
+        // cadence, not the halved one.
+        let secs = 20;
+        let frames = 44_100 * secs;
+        let mut corrector = SolaCorrector::new(1, LAG);
+        corrector.set_rate_slope(1e-4);
+        let input = sine(500.0, frames, 0.4);
+        corrector.set_transposition(1.05);
+        let mut block = [[0.0f32; BLOCK_FRAMES]; 1];
+        for chunk in input.chunks_exact(BLOCK_FRAMES) {
+            block[0].copy_from_slice(chunk);
+            corrector.process_block(&mut block, &[]);
+        }
+        let scale1_rate = frames as f64 * 0.05 / DRIFT_TRIGGER;
+        let count = corrector.splice_count() as f64;
+        assert!(
+            count > 0.7 * scale1_rate,
+            "cadence stretch active during a ride: {count} splices vs \
+             ~{scale1_rate:.0} expected at shipped cadence"
         );
     }
 

@@ -24,11 +24,14 @@ use crate::engine::stages::sola::SolaCorrector;
 
 /// The keylock chain's constant delay, in frames (12.7 ms at 44.1 kHz,
 /// inside the ≤ 15 ms pipeline budget). This is SOLA's nominal elastic
-/// lag: it must cover the hard drift trigger plus the splice search range
-/// and sinc margins (320 + 160 + 36, with headroom). Historically equal to
-/// the deleted PV corrector's latency so the two were interchangeable;
-/// kept at that figure — the deck integration and every latency gate are
-/// anchored on it, and SOLA needs the headroom regardless.
+/// lag: it must cover the slowdown-side FORCE trigger (the write-head-side
+/// cap `SLOWDOWN_FORCE_CAP`, since Stage 18 the binding figure — the
+/// stretched hard trigger no longer fits this side) plus the splice search
+/// range and sinc margins, asserted at SOLA construction. Historically
+/// equal to the deleted PV corrector's latency so the two were
+/// interchangeable; kept at that figure — the deck integration and every
+/// latency gate are anchored on it, and SOLA needs the headroom
+/// regardless.
 pub(crate) const KEYLOCK_LATENCY_FRAMES: usize = 560;
 
 /// Beyond this rate deviation the corrector starts fading out toward
