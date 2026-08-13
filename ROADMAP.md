@@ -292,6 +292,24 @@ A direct-ratio wide PV removes the roboty floor from BOTH live playback
 and offline renders, and re-unifies the two paths at the better quality
 (the consolidation goal, pointed the right way this time).
 
+> **Status (2026-08-13): dynamics kill-experiment SURVIVED — build-out
+> is on.** Probe (branch `proto/stage19-dynamics`,
+> `examples/__stage19_dynamics.rs`): the chunked direct-ratio PV under
+> INSTANT 1.43↔2.0 ratio steps, live-style log-slewed steps, and a
+> continuous ±10% ride is click-free in all three (max adjacent diff
+> 0.0251 vs the 0.0752 soak bound — even instant full-range steps),
+> with pitch constant at 440.0 Hz through every transition (the PV owns
+> tempo; there is no pitch axis to tear — Stage 11's step-tearing was a
+> transposition-axis + resampler-anchor property) and 46.5–48.8 dB
+> purity in transition-straddling windows. Music ear-check renders in
+> `target/stage19_dynamics/`. One build-out design item discovered (not
+> a kill): the FFT window spans 2048 INPUT frames, so pipeline delay in
+> OUTPUT frames varies with ratio (1024–4096 across the 0.5–2.0
+> clamp) — the honest-latency contract needs a deliberate answer
+> (compensating delay, max-latency reporting, or rate-dependent
+> reporting with deck-side handling). Demand inversion is bounded
+> (≤ HOP × T_MAX per hop).
+
 ### Falsification first (the risk is dynamics, not quality)
 
 Constant-rate quality is proven. What is NOT proven is deck feel: the
