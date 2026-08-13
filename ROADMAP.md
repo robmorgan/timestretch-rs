@@ -51,9 +51,17 @@ Open, in priority order for the DJ app:
   corpus evidence half; the non-adopter class is closed).
 - **Stage 14** — wide-path consolidation: behavior landed, owner ±30/±50
   listen remaining.
-- **Stage 16** — tonal-HF granulation: audition set rendered and
-  validity-fixed, blind listen remaining.
+- **Stage 18** — tonality-adaptive splice cadence (the Stage 16 verdict's
+  follow-up; falsification-gated).
 
+Stage 16 (tonal-HF granulation: measure, then decide) completed
+2026-08-13 — blind session on the validity-fixed set (12 conditions,
+renders from `7f49a50`): granulation IS audible in context (Rubber Band
+cleanest 9/12; ours degraded to "roboty" on the worst sustained-tonal
+slowdowns, competitive elsewhere), and the corrected-range re-audition
+RE-CONFIRMED Stage 7 — the phase-fixed PV was still the
+"robotic/underwater/vocoder" arm blind. Verdict recorded, follow-up
+scoped as Stage 18; archived in LEARNINGS.md.
 Stage 17 (pitch-shift/batch-resampler correctness) completed 2026-08-13
 (PRs #42/#47) — batch anti-aliasing (2:1 alias rejection 1.9 → 89.8 dB),
 the `pitch_shift` direction inversion found by review and fixed, gates in
@@ -98,8 +106,11 @@ Both verdicts stand as shipped behavior. The second was re-baselined at
 Stage 13's exit listen (2026-08-06, commit `fb7dcfa`+sidecar rerun): the
 fixed PV sounds "significantly better" at ±50% and the gap to R3
 narrowed, though R3 remains ahead — the acceptance holds with fresher,
-smaller evidence. The first still awaits the Stage 16 re-audition on the
-fixed PV. The un-keylocked low band is **not**
+smaller evidence. The first was RE-CONFIRMED on clean evidence at the
+Stage 16 blind re-audition (2026-08-13): the phase-fixed small/medium-FFT
+PV behind the split was still the "robotic/underwater/vocoder" arm —
+"SOLA carries the corrected range" now rests on an uncontaminated
+verdict. The un-keylocked low band is **not**
 similarly contaminated — its load-bearing justification at DJ ratios is
 the ≤ 15 ms latency budget (a bass-resolving FFT cannot fit), which no
 review finding touches; Stage 11's full-spectrum result already shows
@@ -131,9 +142,9 @@ corrected bass can win when latency permits.
 
 ## Stage Sequence
 
-Stages are independent tracks except: 16's verdict gates any future
-DJ-band tonal-quality stage. (Stages 12, 13, 15, and 17 are complete.)
-Suggested order: 10, then 14, 16.
+Stages are independent tracks. (Stages 12, 13, 15, 16, and 17 are
+complete; Stage 16's verdict spawned and gates Stage 18.) Suggested
+order: 10, then 14, 18.
 
 ## [ ] Stage 10: General-Purpose Beat Tracking and BPM Detection
 
@@ -302,93 +313,53 @@ broken `LR8Crossover` kept only for baselines that no longer exist.
   chain (A/B matrix re-run green).
 - Owner listen at ±30/±50% vs pre-consolidation renders.
 
-## [ ] Stage 16: Tonal-HF Granulation — Measure, Then Decide
+## [ ] Stage 18: Tonality-Adaptive Splice Cadence
 
-Automation: manual
-
-> **Status (2026-08-07): audition prep complete** (branch
-> `feat/stage16-audition-prep`) — the listening session is ready to run.
-> `examples/stage16_audition.rs` renders the full blind set:
-> 3 corpus excerpts (hot_stuff strings, msbwy filtered strings,
-> cold_heart vocal) × ±4/±8% × 4 arms (shipped SOLA path, PV-512 and
-> PV-1024 prototypes behind the 120 Hz split for the corrected-range
-> re-audition, Rubber Band reference), RMS-matched, in
-> `target/stage16_audition/`. Characterization pinned in
-> `tests/tonal_purity_characterization.rs` with a finding the sine probe
-> missed: the granulation floor is strongly ASYMMETRIC — harmonic-15
-> purity 52 dB at +8% tempo but 22 dB at −8% (slowdowns re-cross
-> material, so splices recur through sustained content), with two-tone
-> beating well preserved both ways (47/42 dB). Focus the listening on
-> SLOWDOWNS. Remaining: the blind listen and the verdict recorded here.
->
-> **Validity fixes (2026-08-12, from the PR #43 review, branch
-> `fix/stage16-audition-validity`)**: the first-cut renderer's PV arms
-> were mono against stereo SOLA/Rubber Band (instantly identifiable and
-> a source-signal confound for the corrected-range re-audition), the
-> Rubber Band arm skipped the RMS match its header claimed, and upward
-> RMS gains could hard-clip 16-bit club masters. Now: all arms stereo
-> with identical channel handling (PV renders per channel), all arms
-> RMS-matched including RB, all files 32-bit float. Recorded deviation
-> from this stage's prototype spec: the PV arms run WITHOUT
-> artifact-driven phase resets (single batch pass) — this biases the PV
-> against SOLA on transient smear, so the corrector comparison should
-> weigh sustained tonal passages, not attacks; if the PV loses ONLY on
-> transients, wire resets before concluding. Filenames name their arms
-> — shuffle before a blind pass per the Stage 11 protocol.
+Automation: auto
 
 ### Why
 
-The review's headline measurement: a 3.3 kHz tone through the DJ keylock
-path drops from 71.6 dB to 24–33 dB spectral purity at ±8% — SOLA splicing
-~20×/s granulates sustained tonal content above the crossover. This is the
-mechanism working as designed, and Rubber Band's PV does not have this
-artifact class. But a sine overstates audibility on dense mixes, the DJ
-path passed the Rubber Band reference gate (spectral 0.965/0.970), and
-the structural-fix risk assessment is stale: the Stage 7 listening that
-killed the small-FFT PV — and settled "SOLA owns the corrected range" —
-was run against a PV carrying the Stage 13 defects, whose unwrapped-phase
-blends manufacture exactly the phasiness that condemned it (see the
-Architecture evidence caveat). So: falsification-style listening first,
-on fixed implementations, build-out only on evidence. Stage 13 (the
-dependency) is complete — the fixed PV is available to audition.
+The Stage 16 blind verdict (2026-08-13): SOLA's tonal-HF granulation IS
+audible in context — Rubber Band was the cleanest arm in 9/12 blind
+conditions, and the shipped path degraded to "roboty, bad quality" on
+the worst sustained-tonal slowdowns (msbwy ±8%) while staying
+competitive on brighter material (cleanest on 2 conditions). The same
+session re-confirmed Stage 7 on clean evidence: the phase-FIXED
+small/medium-FFT PV behind the split was still the "robotic /
+underwater / vocoder" arm blind, so replacing SOLA with a PV in the
+corrected range stays dead. The stage-16 decision tree therefore lands
+here: keep SOLA, make its splice cadence tonality-aware — sustained
+tonal material is exactly where splices recur through the same content
+(~20/s, the measured 22 dB floor at −8%) and where the artifact's band
+flux says "nothing is happening, don't splice".
 
-### Work
+### Falsification first (cheap kill-experiment before build-out)
 
-- Extend the sine measurement to music-like probes (harmonic stacks, two
-  nearby tones) and pin the purity numbers as characterization tests (not
-  gates).
-- Curate a pad/string/vocal-heavy excerpt set (sustained tonal HF over a
-  beat); render ours vs Rubber Band R3 at ±4% and ±8% (the comparison
-  harness exists: `qa/rubberband_comparison.rs`); blind owner listening
-  with the same protocol as Stage 11.
-- **Re-audition the corrected-range decision on the post-Stage-13 PV.**
-  Prototype a small/medium-FFT PV corrector (512 and 1024, identity
-  locking, artifact resets) behind the 120 Hz split at DJ transpositions —
-  the Stage 7 experiment, re-run with the phase-hygiene fixes in. Render
-  the same excerpt set through SOLA vs the fixed PV vs Rubber Band; blind
-  A/B. This is evidence gathering, not build-out: no engine plumbing, the
-  batch graph + `qa/ab` fixtures suffice. Record whether the July
-  phasiness verdict survives the bug fixes.
-- **Verdict recorded here.** If the granulation is inaudible-in-context:
-  document the floor as a characterized scope line (like the −75% wide
-  edge), record the re-audition result alongside it, and close. If
-  audible: scope the smallest structural response as a new stage —
-  candidate order now depends on the re-audition: if the fixed PV
-  auditions clean, an HF small-PV band (120 Hz–~1.5 kHz SOLA / HF PV)
-  becomes the front-runner; if it still sounds phasey, the SOLA decision
-  is re-confirmed on clean evidence and tonality-adaptive splice cadence
-  (stretch the drift triggers on tonal material via the artifact's band
-  flux) leads, with acceptance-at-DJ-ratios (wide profile as the escape
-  hatch) as the fallback.
+Offline prototype only, batch graph + the stage-16 excerpt set: scale
+SOLA's drift trigger by a tonality factor derived from the artifact's
+band flux (high sustained-band energy, low flux → stretch the trigger;
+transient-dense → unchanged). Render the msbwy/cold_heart slowdown
+conditions and A/B against the stage-16 renders. Kill criteria: if
+halving the splice rate on tonal passages does not move the ear verdict
+(or trades it for seam drift/pitch wobble — the Stage 15 lesson says
+the landing bound, not the trigger level, is load-bearing), record the
+negative result in LEARNINGS.md and fall back to
+acceptance-at-DJ-ratios with the wide profile as the documented escape
+hatch.
 
-### Exit Criteria
+### Work (only if the kill-experiment survives)
 
-- Purity characterization tests landed; blind listening verdict recorded
-  with renders archived; either a documented scope line or a scoped
-  follow-up stage with a falsification plan.
-- The corrected-range re-audition result recorded — the Stage 7 "SOLA
-  owns the corrected range" decision either re-confirmed on clean
-  evidence or reopened with the fixed-PV renders as the case.
+- Tonality factor from the artifact band flux (pre-analysis first,
+  online fallback), plumbed to SOLA as a drift-trigger scale; the
+  mild-motion bounded recenter (Stage 15) keeps its own bound.
+- Live-path wiring with the RT contract untouched (the factor is a
+  per-block scalar read, no allocation).
+- Gates: stage-16 purity characterization numbers must improve on
+  sustained-tonal fixtures with the ride/seam/A-B-matrix suite staying
+  green; splice-rate telemetry on the corpus recorded before/after.
+- Exit: blind owner re-listen on the stage-16 protocol — the msbwy/
+  cold_heart slowdown verdicts move toward Rubber Band, no new
+  artifacts elsewhere.
 
 ## Not a Priority Yet
 
@@ -433,8 +404,9 @@ in addition:
   coherence is gated (Stage 14).
 - Riding the fader degrades nothing that holding it steady doesn't
   (Stage 15, done — seam and fade gates hold in CI).
-- The tonal-HF granulation floor has a recorded listening verdict — fixed,
-  or documented as scope (Stage 16).
+- The tonal-HF granulation floor has a recorded listening verdict
+  (Stage 16, done 2026-08-13 — audible in context; structural response
+  scoped as Stage 18, falsification-gated).
 - No public path resamples without anti-aliasing (Stage 17, done
   2026-08-13 — gates in CI, owner A/B passed).
 - No panic is reachable from the public API on arbitrary input (Stage 12,
