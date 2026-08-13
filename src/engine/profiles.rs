@@ -5,7 +5,6 @@
 
 use crate::engine::stage::Stage;
 use crate::engine::stages::keylock::KeylockStage;
-use crate::engine::stages::wide_keylock::WideKeylockStage;
 
 /// Which fixed stage chain the engine runs after the varispeed head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -43,7 +42,12 @@ pub(crate) fn build_stages(
         EngineProfile::Tape => Vec::new(),
         EngineProfile::Keylock => vec![Box::new(KeylockStage::new(sample_rate, channels))],
         EngineProfile::WideKeylock => {
-            vec![Box::new(WideKeylockStage::new(sample_rate, channels))]
+            // Stage 19: the direct-ratio wide PV is the graph HEAD for
+            // this profile (it owns the tempo axis), so the stage chain
+            // is empty like Tape's. The superseded `WideKeylockStage`
+            // (Stage 11 topology) lives in git history.
+            let _ = (sample_rate, channels);
+            Vec::new()
         }
     }
 }

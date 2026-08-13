@@ -185,6 +185,7 @@ impl Engine {
             initial_rate,
             config.max_block_frames,
             config.pre_analysis.clone(),
+            config.profile,
         );
         let source = SourceProducer::new(ring);
         Ok(EngineHandles {

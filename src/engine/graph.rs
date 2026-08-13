@@ -12,10 +12,12 @@ use std::sync::Arc;
 use crate::core::preanalysis::PreAnalysisArtifact;
 use crate::core::ring_buffer::RingBuffer;
 use crate::engine::control::{EngineShared, Param, clamp_tempo_rate};
+use crate::engine::profiles::EngineProfile;
 use crate::engine::source::{SourceRing, TimelineMap};
 use crate::engine::stage::{BLOCK_FRAMES, BlockBuf, OnsetEvent, Stage, StageCtx};
 use crate::engine::stages::transient::{MAX_EVENTS, TransientCursor};
 use crate::engine::stages::varispeed::{FEED_CHUNK_FRAMES, MAX_OUT_PER_FEED, VarispeedHead};
+use crate::engine::stages::wide_pv_head::WidePvHead;
 
 /// Blocks a fast tempo gesture holds off disruptive stage maintenance
 /// (~46 ms at 44.1 kHz) — the graph-level modulation-hold policy.
@@ -54,10 +56,66 @@ const TRANSIENT_LOOKBEHIND_MARGIN: usize = (crate::engine::stages::transient::KE
 ///
 /// Single consumer: exactly one thread (the audio callback) may call
 /// [`process`](Self::process).
+/// The graph's demand-inverting head: consumes source-ring frames and
+/// emits output-rate frames. Varispeed (tempo axis by resampling — Tape
+/// and Keylock profiles) or the direct-ratio wide PV (ROADMAP Stage 19 —
+/// the WideKeylock profile, where the PV owns the tempo axis and the
+/// stage chain is empty).
+enum Head {
+    Varispeed(VarispeedHead),
+    WidePv(Box<WidePvHead>),
+}
+
+impl Head {
+    fn feed_capped(&mut self, interleaved: &[f32], rate: f64, max_out: usize) -> usize {
+        match self {
+            Head::Varispeed(h) => h.feed_capped(interleaved, rate, max_out),
+            Head::WidePv(h) => h.feed_capped(interleaved, rate, max_out),
+        }
+    }
+
+    fn output(&self, ch: usize) -> &[f32] {
+        match self {
+            Head::Varispeed(h) => h.output(ch),
+            Head::WidePv(h) => h.output(ch),
+        }
+    }
+
+    fn source_pos(&self) -> f64 {
+        match self {
+            Head::Varispeed(h) => h.source_pos(),
+            Head::WidePv(h) => h.source_pos(),
+        }
+    }
+
+    fn lookahead_frames(&self) -> usize {
+        match self {
+            Head::Varispeed(h) => h.lookahead_frames(),
+            Head::WidePv(h) => h.lookahead_frames(),
+        }
+    }
+
+    /// Rendered-but-unemitted frames held inside the head (varispeed
+    /// holds none: its emission is its production).
+    fn pending_frames(&self) -> usize {
+        match self {
+            Head::Varispeed(_) => 0,
+            Head::WidePv(h) => h.pending_frames(),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Head::Varispeed(h) => h.reset(),
+            Head::WidePv(h) => h.reset(),
+        }
+    }
+}
+
 pub struct EngineProcessor {
     shared: Arc<EngineShared>,
     ring: Arc<SourceRing>,
-    varispeed: VarispeedHead,
+    head: Head,
     stages: Vec<Box<dyn Stage>>,
     block: BlockBuf,
     /// Interleaved varispeed output awaiting fixed-block stage processing.
@@ -139,6 +197,7 @@ impl EngineProcessor {
         initial_rate: f64,
         max_block_frames: usize,
         artifact: Option<Arc<PreAnalysisArtifact>>,
+        profile: EngineProfile,
     ) -> Self {
         let out_fifo_frames = max_block_frames + 2 * MAX_OUT_PER_FEED + BLOCK_FRAMES;
         let pipeline_latency_frames: usize = stages.iter().map(|s| s.latency_frames()).sum();
@@ -156,7 +215,12 @@ impl EngineProcessor {
         Self {
             shared,
             ring,
-            varispeed: VarispeedHead::new(channels),
+            head: match profile {
+                EngineProfile::WideKeylock => {
+                    Head::WidePv(Box::new(WidePvHead::new(sample_rate, channels)))
+                }
+                _ => Head::Varispeed(VarispeedHead::new(channels)),
+            },
             block: BlockBuf::new(channels),
             stage_fifo: RingBuffer::with_capacity((BLOCK_FRAMES + 2 * MAX_OUT_PER_FEED) * channels),
             out_fifo: RingBuffer::with_capacity(out_fifo_frames * channels),
@@ -218,6 +282,9 @@ impl EngineProcessor {
             }
         }
 
+        if let Head::WidePv(head) = &mut self.head {
+            head.set_keylock(self.keylock_target);
+        }
         let max_chunk = self.max_block_frames * self.channels;
         let mut offset = 0;
         while offset < whole {
@@ -269,7 +336,7 @@ impl EngineProcessor {
     /// This is source-side buffering, not pipeline delay — the first
     /// delivered frame is still source frame 0.
     pub fn varispeed_lookahead_frames(&self) -> usize {
-        self.varispeed.lookahead_frames()
+        self.head.lookahead_frames()
     }
 
     /// Cold reset back to stream start: clears the resamplers, stage chain,
@@ -278,7 +345,7 @@ impl EngineProcessor {
     /// should pause feeding while a reset is pending. (Warm-start priming
     /// arrives in Stage 5.)
     pub fn reset(&mut self) {
-        self.varispeed.reset();
+        self.head.reset();
         for stage in &mut self.stages {
             stage.reset();
         }
@@ -345,6 +412,11 @@ impl EngineProcessor {
     /// default; the wide keylock's big FFT asks for more). Tape chains only
     /// need the resampler margin.
     pub fn warm_start_preroll_frames(&self) -> usize {
+        if let Head::WidePv(_) = &self.head {
+            // A full analysis window of history plus one more to settle
+            // the OLA overlap before real output is kept.
+            return 2 * crate::engine::stages::wide_pv_head::WIDE_FFT;
+        }
         if self.stages.is_empty() {
             64
         } else {
@@ -704,15 +776,22 @@ impl EngineProcessor {
         let cap = self.due_retargets_and_cap();
         let popped = self.ring.pop_slice(&mut self.feed_scratch);
         if popped == 0 {
-            return None;
+            // A dry ring is only an underrun if the head holds nothing:
+            // the wide PV head renders in hop bursts and may still owe
+            // emitted frames from the last render.
+            if self.head.pending_frames() == 0 {
+                return None;
+            }
         }
         debug_assert_eq!(popped % self.channels, 0);
-        let produced = self
-            .varispeed
-            .feed_capped(&self.feed_scratch[..popped], self.rate, cap);
+        let produced = self.head.feed_capped(
+            &self.feed_scratch[..popped],
+            self.rate,
+            cap.min(MAX_OUT_PER_FEED),
+        );
         self.emitted_frames += produced as u64;
         self.timeline
-            .push(self.emitted_frames, self.varispeed.source_pos(), self.rate);
+            .push(self.emitted_frames, self.head.source_pos(), self.rate);
         Some(produced)
     }
 
@@ -723,7 +802,7 @@ impl EngineProcessor {
         }
         let samples = produced * self.channels;
         for ch in 0..self.channels {
-            let src = self.varispeed.output(ch);
+            let src = self.head.output(ch);
             for (f, &sample) in src.iter().enumerate().take(produced) {
                 self.interleave_scratch[f * self.channels + ch] = sample;
             }
@@ -1104,10 +1183,12 @@ mod tests {
 
     #[test]
     fn wide_keylock_pipeline_latency_within_budget_and_reported_exactly() {
-        // The wide profile's own contract (ROADMAP Stage 11): ≤ 55 ms,
-        // never folded into the keylock chain's 15 ms gate above. Onset
-        // smear tolerance is one PV hop — the corrector renders on a
-        // 256-frame grid.
+        // Stage 19: the direct-ratio PV is the graph HEAD, so like tape
+        // the first delivered frame is source frame 0 and the reported
+        // pipeline latency is zero — the analysis window is source-side
+        // LOOKAHEAD, not output delay. A silence-then-tone onset must
+        // appear content-aligned, smeared by no more than the PV's OLA
+        // window taper.
         let handles = Engine::build(EngineConfig {
             channels: 1,
             profile: EngineProfile::WideKeylock,
@@ -1117,15 +1198,7 @@ mod tests {
         let (mut processor, mut source) = (handles.processor, handles.source);
 
         let latency = processor.pipeline_latency_frames();
-        assert_eq!(
-            latency,
-            crate::engine::stages::wide_keylock::WIDE_KEYLOCK_LATENCY_FRAMES,
-            "wide chain latency must be the stage's constant"
-        );
-        assert!(
-            latency as f64 / 44_100.0 <= 0.055,
-            "wide keylock pipeline latency {latency} frames exceeds 55 ms"
-        );
+        assert_eq!(latency, 0, "the wide head reports zero pipeline delay");
 
         let mut input = vec![0.0f32; 32_768];
         for (i, s) in input.iter_mut().enumerate().skip(4_096) {
@@ -1139,11 +1212,10 @@ mod tests {
             .iter()
             .position(|s| s.abs() > 1e-3)
             .expect("onset must appear");
-        let expected = 4_096 + latency;
+        let expected = 4_096i64;
         assert!(
-            (onset as i64 - expected as i64).abs()
-                <= crate::engine::stages::wide_keylock::WIDE_HOP as i64,
-            "onset at {onset}, expected {expected} (reported latency {latency})"
+            (onset as i64 - expected).abs() <= crate::engine::stages::wide_pv_head::WIDE_FFT as i64,
+            "onset at {onset}, expected ~{expected}"
         );
     }
 
@@ -1156,9 +1228,9 @@ mod tests {
 
     #[test]
     fn wide_keylock_warm_start_resumes_at_steady_level() {
-        // The wide chain's preroll (latency 2144 + settle 2304) spans
-        // several priming callbacks under the 2×-callback budget; the
-        // bound scales with the preroll it must discard.
+        // The wide head's preroll (two analysis windows, 4096 source
+        // frames) spans several priming callbacks under the 2x-callback
+        // budget; the bound scales with the preroll it must discard.
         warm_start_steady_level_for(EngineProfile::WideKeylock, 256 * 24);
     }
 

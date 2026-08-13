@@ -161,7 +161,14 @@ fn stretch_via_graph(
     // deliver without an underrun, or the tail would depend on the
     // caller's demand pattern (underrun silence pads at the delivery
     // layer, bypassing the stage chain mid-fade).
-    let flush_frames = (latency as f64 * rate).ceil() as usize + 4 * STREAM_SINC_HALF_TAPS;
+    // The head's source-side lookahead (the wide PV's analysis window;
+    // the varispeed's sinc kernel) must also be fed past the last real
+    // frame, or the final windows starve into a mode-dependent terminal
+    // underrun (Stage 19: reported pipeline latency is 0 for the wide
+    // head — its window is lookahead, not delay).
+    let flush_frames = (latency as f64 * rate).ceil() as usize
+        + processor.varispeed_lookahead_frames()
+        + 4 * STREAM_SINC_HALF_TAPS;
     let flush: Vec<f32> = vec![0.0; flush_frames * channels];
 
     let mut feed = 0usize;

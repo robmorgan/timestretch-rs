@@ -37,6 +37,8 @@
 //! — it does not come back as an accident of uncoupled processing.
 
 use crate::core::window::WindowType;
+use crate::engine::stages::keylock::KEYLOCK_TOGGLE_FADE_FRAMES;
+use crate::engine::stages::varispeed::{FEED_CHUNK_FRAMES, VarispeedHead};
 use crate::stretch::{PhaseLockingMode, PhaseVocoder};
 
 /// FFT and hop mirror the wide stage (FFT 2048, hop FFT/8 — the
@@ -82,8 +84,40 @@ pub(crate) struct WidePvHead {
     out: Vec<Vec<f32>>,
     /// Source frames ingested since reset.
     ingested: u64,
-    sample_rate: u32,
+    /// False until the first hop renders: the first render snaps the
+    /// ratio (no slew from unity) and runs the mirror-padded OLA warmup
+    /// so emission starts fully overlapped at source frame 0 (the same
+    /// start contract as the batch `process()` path).
+    started: bool,
+    /// Warmup scratch: one mirrored analysis window.
+    warm_window: Vec<f32>,
+    /// Raw (pitch-follows) arm for the live keylock toggle: a plain
+    /// varispeed fed the same source at the same rate. Content-aligned
+    /// with the corrected arm by construction (both start at source
+    /// frame 0); emission is lockstep on the min pending.
+    raw: VarispeedHead,
+    /// Per-audio-channel pending raw-arm output.
+    raw_pending: Vec<Vec<f32>>,
+    /// Interleaved source-side delay ahead of the raw arm: the PV renders
+    /// source frame `p` only once `p + WIDE_FFT` is ingested, so the raw
+    /// varispeed is fed [`Self::raw_input_delay_frames`] behind ingest.
+    /// This keeps the two arms' PRODUCTION contemporaneous (near-zero raw
+    /// backlog — a rate change reaches the audible arm within a block)
+    /// while their CONTENT stays aligned at emission.
+    raw_delay: Vec<f32>,
+    /// Keylock target (0.0 = raw varispeed, 1.0 = corrected).
+    keylock_target: f64,
+    /// Smoothed toggle weight (NaN = snap to target on next emission).
+    keylock_weight: f32,
 }
+
+/// Pending-surplus bound before the inaudible arm is resynced (dropped
+/// forward) to the audible one: the two arms' cumulative production can
+/// drift a bounded amount per retarget (the PV slews hop-quantized, the
+/// varispeed ramps per feed), and unchecked the surplus would grow over
+/// hours of gestures. Resync only ever drops frames from an arm whose
+/// toggle weight makes it inaudible.
+const ARM_SURPLUS_MAX: usize = 8_192;
 
 impl WidePvHead {
     pub(crate) fn new(sample_rate: u32, num_channels: usize) -> Self {
@@ -109,8 +143,40 @@ impl WidePvHead {
                 .map(|_| Vec::with_capacity(8 * MAX_OUT_PER_HOP))
                 .collect(),
             ingested: 0,
-            sample_rate,
+            started: false,
+            warm_window: vec![0.0; WIDE_FFT],
+            raw: VarispeedHead::new(num_channels),
+            raw_delay: Vec::with_capacity((WIDE_FFT + 4 * FEED_CHUNK_FRAMES) * num_channels),
+            raw_pending: (0..num_channels)
+                .map(|_| Vec::with_capacity(2 * ARM_SURPLUS_MAX))
+                .collect(),
+            keylock_target: 1.0,
+            keylock_weight: f32::NAN,
         }
+    }
+
+    /// Source frames the raw arm's input runs behind ingest (the PV's
+    /// analysis-window lead minus the varispeed's own kernel lookahead).
+    fn raw_input_delay_frames(&self) -> usize {
+        WIDE_FFT.saturating_sub(self.raw.lookahead_frames())
+    }
+
+    /// Keylock (pitch-correction) toggle target; smoothed at emission.
+    pub(crate) fn set_keylock(&mut self, target: f64) {
+        self.keylock_target = target.clamp(0.0, 1.0);
+    }
+
+    /// Frames rendered but not yet emitted (the graph keeps feeding while
+    /// this can still satisfy demand even if the source ring is dry).
+    pub(crate) fn pending_frames(&self) -> usize {
+        let pv = self
+            .channels
+            .iter()
+            .map(|c| c.pending.len())
+            .min()
+            .unwrap_or(0);
+        let raw = self.raw_pending.iter().map(Vec::len).min().unwrap_or(0);
+        pv.min(raw)
     }
 
     /// Ingests interleaved source frames at `rate` (tempo rate; ratio is
@@ -142,8 +208,76 @@ impl WidePvHead {
             }
         }
 
+        // Raw arm: the same source at the same rate through a plain
+        // varispeed; content-aligned with the corrected arm from source
+        // frame 0. Its production is buffered and emitted lockstep.
+        self.raw_delay.extend_from_slice(interleaved);
+        let delay_samples = self.raw_input_delay_frames() * self.num_channels.max(1);
+        while self.raw_delay.len() > delay_samples {
+            let take = (self.raw_delay.len() - delay_samples)
+                .min(FEED_CHUNK_FRAMES * self.num_channels.max(1));
+            let raw_produced = self
+                .raw
+                .feed_capped(&self.raw_delay[..take], rate, usize::MAX);
+            self.raw_delay.copy_within(take.., 0);
+            let rest = self.raw_delay.len() - take;
+            self.raw_delay.truncate(rest);
+            for ch in 0..self.num_channels {
+                let out = self.raw.output(ch);
+                self.raw_pending[ch].extend_from_slice(&out[..raw_produced]);
+            }
+        }
+
         // Render every full hop, slewing the ratio once per hop.
         while self.channels[0].window.len() >= WIDE_FFT {
+            if !self.started {
+                self.started = true;
+                // Stream start: snap to the commanded ratio (slew is for
+                // CHANGES, not cold start) and run the mirror-padded OLA
+                // warmup — render the windows that would precede source
+                // frame 0 under mirror extension, discarding their
+                // output, so the first kept hop is fully overlapped.
+                self.ratio = target_ratio;
+                let warmup_hops = WIDE_FFT / WIDE_HOP - 1;
+                for k in (1..=warmup_hops).rev() {
+                    let shift = k * WIDE_HOP;
+                    if k == 1 {
+                        // The earlier warmup hops exist only to converge
+                        // the OLA weights; their phase state is seeded
+                        // from MIRRORED content, whose per-bin offsets
+                        // would persist in the accumulators and partially
+                        // cancel low bins forever (the pre-Stage-14
+                        // batch path's sub-bass imbalance — measured
+                        // 2.47 vs ideal 0.54 two-tone balance at rate
+                        // 2.0). Re-seed at the LAST warmup window, which
+                        // is mostly real content: the dominant overlap
+                        // into the kept stream is then phase-coherent.
+                        for ch in &mut self.channels {
+                            ch.pv.reset_phase_state();
+                        }
+                    }
+                    for ch in &mut self.channels {
+                        for (i, w) in self.warm_window.iter_mut().enumerate() {
+                            // Window position i maps to source i - shift;
+                            // negative indices mirror around frame 0.
+                            let src = i as isize - shift as isize;
+                            let idx = if src < 0 {
+                                (-src) as usize
+                            } else {
+                                src as usize
+                            };
+                            *w = ch.window[idx.min(WIDE_FFT - 1)];
+                        }
+                        ch.pv.set_stretch_ratio(self.ratio);
+                        let result = ch
+                            .pv
+                            .process_streaming_into(&self.warm_window, &mut ch.chunk);
+                        debug_assert!(result.is_ok(), "wide head warmup failed: {result:?}");
+                        // Warmup output is discarded: it belongs to the
+                        // mirrored pre-roll, not the stream.
+                    }
+                }
+            }
             let step = (target_ratio.ln() - self.ratio.ln())
                 .clamp(-RATIO_SLEW_LN_PER_HOP, RATIO_SLEW_LN_PER_HOP);
             self.ratio = (self.ratio.ln() + step).exp();
@@ -162,14 +296,46 @@ impl WidePvHead {
             }
         }
 
-        // Emit up to the cap (channels are lockstep by construction).
-        let available = self
+        // Inaudible-arm resync: bounded per-retarget production drift
+        // between the arms must not accumulate; drop surplus only from
+        // an arm the toggle weight silences.
+        let pv_avail = self
             .channels
             .iter()
             .map(|c| c.pending.len())
             .min()
             .unwrap_or(0);
-        let emit = available.min(max_out);
+        let raw_avail = self.raw_pending.iter().map(Vec::len).min().unwrap_or(0);
+        let w = if self.keylock_weight.is_nan() {
+            self.keylock_target as f32
+        } else {
+            self.keylock_weight
+        };
+        if w >= 0.999 && raw_avail > pv_avail + ARM_SURPLUS_MAX {
+            let drop = raw_avail - pv_avail;
+            for pending in &mut self.raw_pending {
+                pending.copy_within(drop.., 0);
+                let rest = pending.len() - drop;
+                pending.truncate(rest);
+            }
+        } else if w <= 0.001 && pv_avail > raw_avail + ARM_SURPLUS_MAX {
+            let drop = pv_avail - raw_avail;
+            for chn in &mut self.channels {
+                chn.pending.copy_within(drop.., 0);
+                let rest = chn.pending.len() - drop;
+                chn.pending.truncate(rest);
+            }
+        }
+
+        // Emit up to the cap, lockstep across both arms and all channels.
+        let pv_avail = self
+            .channels
+            .iter()
+            .map(|c| c.pending.len())
+            .min()
+            .unwrap_or(0);
+        let raw_avail = self.raw_pending.iter().map(Vec::len).min().unwrap_or(0);
+        let emit = pv_avail.min(raw_avail).min(max_out);
         for (ch, state) in self.channels.iter_mut().enumerate() {
             self.out[ch].clear();
             self.out[ch].extend_from_slice(&state.pending[..emit]);
@@ -177,13 +343,37 @@ impl WidePvHead {
             let rest = state.pending.len() - emit;
             state.pending.truncate(rest);
         }
-        // Decode M/S back to L/R at the emission boundary.
+        // Decode M/S back to L/R before the toggle blend (the raw arm is
+        // L/R throughout).
         if stereo && emit > 0 {
             for i in 0..emit {
                 let (m, s) = (self.out[0][i], self.out[1][i]);
                 self.out[0][i] = m + s;
                 self.out[1][i] = m - s;
             }
+        }
+        // Toggle crossfade, per frame, weights shared across channels.
+        let target = self.keylock_target as f32;
+        let mut weight = if self.keylock_weight.is_nan() {
+            target
+        } else {
+            self.keylock_weight
+        };
+        let step = 1.0 / KEYLOCK_TOGGLE_FADE_FRAMES as f32;
+        for i in 0..emit {
+            weight += (target - weight).clamp(-step, step);
+            for ch in 0..self.num_channels {
+                let raw = self.raw_pending[ch][i];
+                self.out[ch][i] = weight * self.out[ch][i] + (1.0 - weight) * raw;
+            }
+        }
+        if emit > 0 {
+            self.keylock_weight = weight;
+        }
+        for pending in &mut self.raw_pending {
+            pending.copy_within(emit.., 0);
+            let rest = pending.len() - emit;
+            pending.truncate(rest);
         }
         emit
     }
@@ -205,10 +395,6 @@ impl WidePvHead {
         WIDE_FFT
     }
 
-    pub(crate) fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
     pub(crate) fn reset(&mut self) {
         for ch in &mut self.channels {
             ch.pv.reset_phase_state();
@@ -222,6 +408,13 @@ impl WidePvHead {
         }
         self.ratio = 1.0;
         self.ingested = 0;
+        self.started = false;
+        self.raw.reset();
+        self.raw_delay.clear();
+        for pending in &mut self.raw_pending {
+            pending.clear();
+        }
+        self.keylock_weight = f32::NAN;
     }
 }
 
@@ -230,6 +423,49 @@ mod tests {
     use super::*;
 
     const SR: u32 = 44_100;
+
+    fn goertzel(seg: &[f32], freq: f64) -> f64 {
+        let w = 2.0 * std::f64::consts::PI * freq / SR as f64;
+        let c = 2.0 * w.cos();
+        let (mut s1, mut s2) = (0.0f64, 0.0f64);
+        for &x in seg {
+            let s0 = x as f64 + c * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        ((s1 * s1 + s2 * s2 - c * s1 * s2).max(0.0)).sqrt() / (seg.len() as f64 / 2.0)
+    }
+
+    #[test]
+    fn two_tone_balance_survives_all_wide_ratios() {
+        // The pre-Stage-14 batch path's sub-bass imbalance came from
+        // mirror-pad phase seeding; the head's warmup re-seeds from real
+        // content, so the 100/1000 Hz balance must sit at the ideal
+        // (~0.54) at every wide rate, mid-stream.
+        for rate in [2.0f64, 0.8, 1.5, 0.5] {
+            let mut head = WidePvHead::new(SR, 1);
+            let n = SR as usize * 6;
+            let input: Vec<f32> = (0..n)
+                .map(|i| {
+                    let t = i as f64 / SR as f64;
+                    (0.65 * (2.0 * std::f64::consts::PI * 100.0 * t).sin()
+                        + 0.35 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin())
+                        as f32
+                })
+                .collect();
+            let mut out = Vec::new();
+            for chunk in input.chunks(32) {
+                let emitted = head.feed_capped(chunk, rate, 386);
+                out.extend_from_slice(&head.output(0)[..emitted]);
+            }
+            let mid = &out[out.len() / 2 - 16_384..out.len() / 2 + 16_384];
+            let balance = goertzel(mid, 1_000.0) / goertzel(mid, 100.0);
+            assert!(
+                (0.4..0.7).contains(&balance),
+                "rate {rate}: two-tone balance {balance:.3} off the ideal (~0.54)"
+            );
+        }
+    }
 
     fn drive(head: &mut WidePvHead, input: &[f32], rate: f64, chunk_frames: usize) -> Vec<f32> {
         let mut out = Vec::new();
