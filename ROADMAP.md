@@ -317,6 +317,22 @@ broken `LR8Crossover` kept only for baselines that no longer exist.
 
 Automation: auto
 
+> **Status (2026-08-13, later): build-out LANDED** (branch
+> `feat/stage18-buildout`) — the cadence stretch ships as derived
+> behavior, no knobs: scale 2 on the elastic triggers at STEADY
+> transposition through the primary window (taper 1.09 → 1.15 releases
+> it before the measured T=1.25 stall), shipped cadence during rides —
+> the A/B matrix caught the ride interaction exactly as designed
+> (cents p95 5.65 vs bound 1.5 with the stretch active on slopes: the
+> slope-tracked synthesis correction is proportional to parked drift
+> and clamps), and gating on `rate_slope == 0` restored it to green.
+> Purity floors re-pinned (harmonic-15 > 45 dB both directions,
+> tone-pair > 32 dB); full suite + A/B matrix + ride/seam + WCET +
+> soak green; cadence-halving pinned by a unit test. Remaining: the
+> blind exit listen (`target/stage18_exit_listen/blind/` — ours vs
+> Rubber Band, 6 conditions, new renders) including the msbwy bass-hum
+> check.
+>
 > **Status (2026-08-13): kill-experiment SURVIVED — build-out is on.**
 > Prototype (branch `proto/stage18-splice-cadence`, env-gated trigger
 > scale, bit-identical when off): halving the splice cadence (scale 2 on
