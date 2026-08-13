@@ -493,3 +493,76 @@ Lessons:
   verdict survived the re-audition, but only the re-audition made it
   citable — before it, every SOLA-vs-PV decision cited contaminated
   evidence.
+
+## Stage 18 — Steady-Rate Splice-Cadence Stretch (2026-08-13)
+
+The Stage 16 verdict's structural response, falsification-first
+throughout (kill-experiment branch `proto/stage18-splice-cadence`;
+build-out PR #56).
+
+**Mechanism shipped**: SOLA's elastic drift triggers (normal /
+opportunistic / hard) double at STEADY transposition inside the primary
+DJ window — splices on sustained tonal material fire half as often and
+land with larger, better period-aligned jumps. Three guards, each pinned
+by the gate that motivated it:
+
+- **Transposition taper (T 1.09 → 1.15)**: slowdown drift eats the
+  560-frame nominal-lag gap to the write head; the prototype measured a
+  cursor stall (sine −16 cents) at T=1.25. Ratio 1.25 in the quality
+  sweep is the regression pin.
+- **Steady-rate gate (`rate_slope == 0`)**: with the stretch active on
+  rides the A/B matrix measured cents p95 5.65 vs the 1.5 bound — the
+  slope-tracked pitch correction is drift-proportional and clamps.
+  Rides keep shipped cadence; `ride_slope_restores_shipped_cadence`
+  pins it.
+- **Asymmetric force band (review-caught, HIGH)**: the stretched hard
+  trigger (640) sits PAST the write head (lag 560) on slowdowns — under
+  blocked-splice pressure the forced backstop could never fire before
+  the read margin was violated. `SLOWDOWN_FORCE_CAP = 448` caps the
+  force on negative drift (speed-ups keep the full band against ~6x
+  ring headroom), with a write-head-side construction assert. The same
+  review added the failed-attempt guard: a forced splice (which tears
+  through onset protection) is honored only after an unforced attempt
+  failed, so a ride starting under parked stretched-band drift cannot
+  skip protection on its first block.
+
+**Measured**: harmonic-15 purity −8% 22.1 → 62.8 dB, +8% 52.0 →
+59.5 dB (asymmetry gone; floors re-pinned 12 → 45 dB); tone-pair +8%
+47.3 → 62.1 dB, −8% unchanged. Splice cadence halved (pinned by unit
+test). Full suite, A/B matrix, ride/seam, WCET, robustness, soak green.
+
+**Blind owner listens** (sealed keys, same excerpts as Stage 16):
+
+- Old vs new (6 conditions): new won or tied ALL — every "robot" rating
+  landed on the old cadence.
+- Exit listen, new vs Rubber Band (6 conditions): RB still cleanest on
+  all six, but the granulation vocabulary collapsed (one "very subtle
+  robot" across the set, vs Stage 16's "roboty bad quality/awful").
+  The residual complaints are a DIFFERENT artifact class: "bass
+  sometimes out of key" on 3/6 (±8%, bass-forward msbwy) — the
+  sub-120 Hz pitch-follow scope line (±1.3 semitones against the
+  corrected highs), audible now that granulation no longer masks it.
+  Owner decision: stage closed as achieved; the bass finding is
+  recorded against the scope line (ROADMAP Architecture note +
+  Not a Priority Yet) for any future re-litigation — a time-domain
+  low-band corrector was never falsified. Watch items recorded: msbwy
+  "drums bitcrushed/smear a tiny bit" (transient gates green; may be
+  relative-to-RB judgment) and an ours-narrow/RB-wide stereo note on
+  cold_heart −4% that reverses Stage 16's reading — recheck during the
+  Stage 14 listen.
+
+**Lessons**:
+
+- Fixing the loudest artifact re-litigates the ones it masked: the
+  bass-detune scope line was inaudible under granulation and surfaced
+  blind the moment the splices got clean. Budget for the next layer
+  when closing a masking artifact.
+- The A/B matrix caught the ride-pitch interaction and the independent
+  review caught the write-head collision — neither appeared in the
+  prototype's evidence because sines without onsets never block a
+  splice and never ride. Synthetic evidence validates the mechanism;
+  gates and adversarial review validate the envelope.
+- A physical headroom bound beats a behavioral heuristic: the taper,
+  the force cap, and the construction asserts all derive from the same
+  560-frame lag geometry, which is why the mechanism ships with no
+  tuning knobs.

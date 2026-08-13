@@ -51,9 +51,17 @@ Open, in priority order for the DJ app:
   corpus evidence half; the non-adopter class is closed).
 - **Stage 14** — wide-path consolidation: behavior landed, owner ±30/±50
   listen remaining.
-- **Stage 18** — tonality-adaptive splice cadence (the Stage 16 verdict's
-  follow-up; falsification-gated).
 
+Stage 18 (steady-rate splice-cadence stretch) completed 2026-08-13
+(PR #56) — SOLA's elastic drift triggers double at steady transposition
+inside the primary DJ window (asymmetric band: slowdown force capped at
+the write-head headroom; taper released by T=1.15; shipped cadence on
+rides). Harmonic-15 purity at −8%: 22.1 → 62.8 dB, asymmetry gone;
+blind owner A/Bs: half cadence beat the old build 6/6, and the exit
+listen's "robot" vocabulary collapsed to one "very subtle" mention
+across 6 conditions. Rubber Band stays ahead on these excerpts — the
+residual gap is dominated by the sub-120 Hz pitch-follow scope line
+(see Not a Priority Yet), not granulation. Archived in LEARNINGS.md.
 Stage 16 (tonal-HF granulation: measure, then decide) completed
 2026-08-13 — blind session on the validity-fixed set (12 conditions,
 renders from `7f49a50`): granulation IS audible in context (Rubber Band
@@ -114,7 +122,15 @@ verdict. The un-keylocked low band is **not**
 similarly contaminated — its load-bearing justification at DJ ratios is
 the ≤ 15 ms latency budget (a bass-resolving FFT cannot fit), which no
 review finding touches; Stage 11's full-spectrum result already shows
-corrected bass can win when latency permits.
+corrected bass can win when latency permits. **New evidence on file
+(2026-08-13, Stage 18 exit listen, blind)**: with the splice granulation
+fixed, "bass sometimes sounds out of key" surfaced on 3 of 6 conditions
+at ±8% on bass-forward material (msbwy) — the ±1.3-semitone low-band
+detune against the corrected highs is audible once it is no longer
+masked. The scope line STANDS (the Stage 2 falsification rejected a
+vocoder bass; the latency argument is untouched), but any future
+re-litigation starts from this evidence — and a time-domain low-band
+corrector was never falsified.
 
 ## Binding Policies
 
@@ -142,9 +158,8 @@ corrected bass can win when latency permits.
 
 ## Stage Sequence
 
-Stages are independent tracks. (Stages 12, 13, 15, 16, and 17 are
-complete; Stage 16's verdict spawned and gates Stage 18.) Suggested
-order: 10, then 14, 18.
+Stages are independent tracks. (Stages 12, 13, 15, 16, 17, and 18 are
+complete.) Remaining: 10, then 14.
 
 ## [ ] Stage 10: General-Purpose Beat Tracking and BPM Detection
 
@@ -313,106 +328,15 @@ broken `LR8Crossover` kept only for baselines that no longer exist.
   chain (A/B matrix re-run green).
 - Owner listen at ±30/±50% vs pre-consolidation renders.
 
-## [ ] Stage 18: Tonality-Adaptive Splice Cadence
-
-Automation: auto
-
-> **Status (2026-08-13, later): build-out LANDED** (branch
-> `feat/stage18-buildout`) — the cadence stretch ships as derived
-> behavior, no knobs: scale 2 on the elastic triggers at STEADY
-> transposition through the primary window (taper 1.09 → 1.15 releases
-> it before the measured T=1.25 stall), shipped cadence during rides —
-> the A/B matrix caught the ride interaction exactly as designed
-> (cents p95 5.65 vs bound 1.5 with the stretch active on slopes: the
-> slope-tracked synthesis correction is proportional to parked drift
-> and clamps), and gating on `rate_slope == 0` restored it to green.
-> Purity floors re-pinned (harmonic-15 > 45 dB both directions,
-> tone-pair > 32 dB); full suite + A/B matrix + ride/seam + WCET +
-> soak green; cadence-halving pinned by a unit test. Remaining: the
-> blind exit listen (`target/stage18_exit_listen/blind/` — ours vs
-> Rubber Band, 6 conditions, new renders) including the msbwy bass-hum
-> check.
->
-> **Status (2026-08-13): kill-experiment SURVIVED — build-out is on.**
-> Prototype (branch `proto/stage18-splice-cadence`, env-gated trigger
-> scale, bit-identical when off): halving the splice cadence (scale 2 on
-> the elastic drift triggers) lifted harmonic-15 purity at −8% tempo
-> from 22.1 → **62.8 dB** (and +8%: 52.0 → 59.5 dB) — the asymmetric
-> floor is gone, splice counts confirm the cadence halved. **Blind owner
-> A/B (2026-08-13, msbwy + cold_heart × −8/−4/+8%, sealed key): the
-> half-cadence arm won or tied all 6 conditions**, and every "robot"
-> rating landed on the shipped cadence — the Stage 16 artifact
-> attenuates exactly as the numbers predicted. One watch item: a
-> background bass hum on msbwy ±8% in BOTH arms (likely the
-> pitch-following low band on that track, not cadence-caused), slightly
-> more exposed at half cadence on +8% — a build-out gate concern, not a
-> kill. Two design facts from the prototype: (1) scale 4+ REGRESSES on
-> slowdowns and scale 2 breaks at the ±20–25% range edge (sine pitch
-> 218 vs 220 Hz at ratio 1.25) — both are the drift bound colliding with
-> the 560-frame nominal lag, so the shippable mechanism is a
-> **transposition-aware trigger scale** (full stretch in the primary
-> window, tapering to 1 as headroom shrinks toward the range edge), NOT
-> a fixed scale and NOT more latency; (2) a flat scale already wins on
-> tonal material with ride/keylock gates green, so band-flux tonality
-> detection is deferred unless the A/B matrix or transient gates object
-> — simplest structure first.
-
-### Why
-
-The Stage 16 blind verdict (2026-08-13): SOLA's tonal-HF granulation IS
-audible in context — Rubber Band was the cleanest arm in 9/12 blind
-conditions, and the shipped path degraded to "roboty, bad quality" on
-the worst sustained-tonal slowdowns (msbwy ±8%) while staying
-competitive on brighter material (cleanest on 2 conditions). The same
-session re-confirmed Stage 7 on clean evidence: the phase-FIXED
-small/medium-FFT PV behind the split was still the "robotic /
-underwater / vocoder" arm blind, so replacing SOLA with a PV in the
-corrected range stays dead. The stage-16 decision tree therefore lands
-here: keep SOLA, make its splice cadence tonality-aware — sustained
-tonal material is exactly where splices recur through the same content
-(~20/s, the measured 22 dB floor at −8%) and where the artifact's band
-flux says "nothing is happening, don't splice".
-
-### Falsification first (cheap kill-experiment before build-out)
-
-Offline prototype only, batch graph + the stage-16 excerpt set: scale
-SOLA's drift trigger by a tonality factor derived from the artifact's
-band flux (high sustained-band energy, low flux → stretch the trigger;
-transient-dense → unchanged). Render the msbwy/cold_heart slowdown
-conditions and A/B against the stage-16 renders. Kill criteria: if
-halving the splice rate on tonal passages does not move the ear verdict
-(or trades it for seam drift/pitch wobble — the Stage 15 lesson says
-the landing bound, not the trigger level, is load-bearing), record the
-negative result in LEARNINGS.md and fall back to
-acceptance-at-DJ-ratios with the wide profile as the documented escape
-hatch.
-
-### Work (kill-experiment survived; revised by its evidence)
-
-- **Transposition-aware trigger scale** as shipped behavior (no env
-  knob): scale 2 inside the primary DJ window, derived-from-constants
-  taper to 1 as the drift bound approaches the 560-frame lag headroom
-  toward the range edge (the ratio-1.25 sweep failure is the pin for
-  where the taper must have fully landed). The hard/force trigger must
-  always remain physically reachable — the prototype showed a force
-  threshold beyond the write-head stall point is a latent parking risk.
-  Mild-motion and rest recenters keep their own bounds (Stage 15).
-- Band-flux tonality adaptivity: DEFERRED — only if the A/B matrix or
-  transient gates object to the flat in-window scale.
-- RT contract untouched (the scale is a per-retarget scalar, no
-  allocation).
-- Gates: purity characterization re-pinned at the improved floors
-  (both directions ≥ ~55 dB); ride/seam/A-B-matrix suite green;
-  ratio-sweep quality regressions green through the full range edge
-  (the 1.25 case becomes the taper's regression test); splice-rate
-  telemetry on the corpus recorded before/after; the msbwy bass-hum
-  observation checked (must not worsen vs shipped).
-- Exit: blind owner re-listen on the stage-16 protocol — the msbwy/
-  cold_heart slowdown verdicts move toward Rubber Band, no new
-  artifacts elsewhere.
-
 ## Not a Priority Yet
 
+- Corrected low band at DJ ratios — re-litigating the sub-120 Hz
+  pitch-follow scope line on the Stage 18 exit-listen evidence
+  ("bass out of key" blind at ±8% on bass-forward material, no longer
+  masked by granulation). If ever scheduled, falsification first: a
+  time-domain (SOLA-class, longer-window) low-band corrector inside the
+  15 ms budget was never tried — the Stage 2 rejection was of a vocoder
+  bass. The wide profile remains the documented escape hatch.
 - SIMD / architecture-specific acceleration (WCET gates exist to measure
   any attempt against; current headroom is comfortable).
 - Cross-frame peak tracking / multi-resolution wide path — the RB-class
