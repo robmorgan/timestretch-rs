@@ -442,3 +442,54 @@ Lessons:
   purity numbers): −1.2 dB fold rejection sounds catastrophic on paper
   and was "very small" on a real club master. Characterize with tones,
   decide with ears.
+
+## Stage 16 — Tonal-HF Granulation: Measure, Then Decide (2026-08-13)
+
+The review's headline question answered by blind listening. Audition set:
+PR #43 (renderer + purity characterization) with PR #49's validity fixes
+(stereo PV arms, RB RMS match, no-clip common trim); renders from
+`7f49a50`; 3 excerpts × ±4/±8% × 4 arms, letters shuffled per condition
+(`BLIND_KEY.json` opened after the session).
+
+**Characterization (pinned in `tests/tonal_purity_characterization.rs`):**
+the granulation floor is strongly ASYMMETRIC — harmonic-15 purity 52 dB
+at +8% tempo but 22 dB at −8% (slowdowns re-cross material, so splices
+recur through sustained content); two-tone beating survives well both
+ways (47/42 dB).
+
+**Blind verdict (owner, 2026-08-13, 12 conditions):**
+
+- **Q1 — granulation is audible in context.** Rubber Band was the
+  cleanest arm in 9/12 conditions. The shipped SOLA path won twice
+  (hot_stuff −4%, msbwy +4%), stayed "clean/good quality" on most of
+  hot_stuff and cold_heart, but degraded to "roboty, bad quality" /
+  "awful" on msbwy ±8% — sustained filtered strings, the exact
+  content class the asymmetric floor predicts. Not a documented-scope
+  close: the structural response is scoped as Stage 18
+  (tonality-adaptive splice cadence), falsification-gated.
+- **Q2 — Stage 7 RE-CONFIRMED on clean evidence.** The phase-fixed
+  PV-512/1024 arms behind the 120 Hz split were the "robotic /
+  underwater / vocoder" arms blind — the same artifact vocabulary that
+  condemned the defective PV in July, now heard with the Stage 13
+  fixes in and without knowing which arm was which. pv512 was the
+  worst arm in most conditions; pv1024 followed. "SOLA carries the
+  corrected range" now rests on an uncontaminated verdict, and the
+  HF-small-PV-band candidate is dead. (Recorded bias: the PV arms ran
+  without artifact resets, but the verdicts cite sustained-material
+  phasiness, not transient smear — the deviation does not rescue
+  them.)
+- Side observation for Stage 14's listen: Rubber Band's msbwy wins came
+  with "missing stereo, narrow, muted" notes — R3 trades image width
+  for smoothness on that material; ours keeps the width.
+
+Lessons:
+
+- The blind protocol earned its cost: the letters Rob ranked cleanest
+  were RB in 9/12 without knowing which arm was which, and the PV arms
+  reproduced their July vocabulary exactly — both questions settled
+  with zero suggestion risk.
+- A listening verdict really is evidence about the implementation
+  auditioned (the 2026-08-05 lesson, closed out): the July anti-PV
+  verdict survived the re-audition, but only the re-audition made it
+  citable — before it, every SOLA-vs-PV decision cited contaminated
+  evidence.
