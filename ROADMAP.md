@@ -53,9 +53,12 @@ Open, in priority order for the DJ app:
   listen remaining.
 - **Stage 16** — tonal-HF granulation: audition set rendered and
   validity-fixed, blind listen remaining.
-- **Stage 17** — pitch-shift/batch-resampler correctness: implementation
-  and gates landed (incl. the direction-inversion fix), bright-mix
-  pitch-up listen remaining (`target/stage17_audition/`).
+
+Stage 17 (pitch-shift/batch-resampler correctness) completed 2026-08-13
+(PRs #42/#47) — batch anti-aliasing (2:1 alias rejection 1.9 → 89.8 dB),
+the `pitch_shift` direction inversion found by review and fixed, gates in
+CI, owner bright-mix A/B passed (shipped drums "higher quality", the old
+path's artifact subtle); archived in LEARNINGS.md.
 
 ## Architecture (settled — decisions, not open questions)
 
@@ -129,8 +132,8 @@ corrected bass can win when latency permits.
 ## Stage Sequence
 
 Stages are independent tracks except: 16's verdict gates any future
-DJ-band tonal-quality stage. (Stages 12, 13, and 15 are complete.)
-Suggested order: 10, then 14, 16, 17.
+DJ-band tonal-quality stage. (Stages 12, 13, 15, and 17 are complete.)
+Suggested order: 10, then 14, 16.
 
 ## [ ] Stage 10: General-Purpose Beat Tracking and BPM Detection
 
@@ -387,67 +390,6 @@ dependency) is complete — the fixed PV is available to audition.
   owns the corrected range" decision either re-confirmed on clean
   evidence or reopened with the fixed-PV renders as the case.
 
-## [ ] Stage 17: Pitch-Shift and Batch Resampler Correctness
-
-Automation: auto
-
-> **Status (2026-08-07): anti-aliasing landed** (PR #42):
-> `resample_sinc` cutoff-scales when downsampling with the streaming
-> path's stopband margin, and the Kaiser window moved to a per-call
-> lookup table (Bessel out of the tap loop); `AudioBuffer::resample`
-> switched from unfiltered cubic to the band-limited sinc. Measured:
-> 2:1 downsample alias rejection 1.9 → 89.8 dB; 48→44.1 ultrasonic fold
-> gated.
->
-> **Correction (2026-08-12, independent review of PR #42):** the
-> 2026-08-07 note's "the shifter is not a beneficiary" conclusion was
-> backwards, because `pitch_shift` itself INVERTED its documented
-> direction — `lib.rs` set `stretch_ratio = 1.0 / pitch_factor` (a
-> length ratio), so factor 2.0 rendered an octave DOWN (probe: 440 Hz →
-> 220 Hz on main). The probe behind the old note tested "pitch-up" as
-> factor > 1, which (being inverted) never downsampled. The actual
-> pitch-raising path (factor < 1 pre-fix) aliased in-band at −1.2 dB
-> rejection on main and gets the full ~62 dB from PR #42. Fixed
-> (branch `fix/pitch-shift-direction`): direction corrected, the
-> vacuous OR-assertion octave test replaced with dominance assertions
-> both ways (the old test was satisfiable by inverted output — it
-> masked this in CI), and the promised 44.1↔48 round-trip SNR gate
-> (> 40 dB, multi-tone) added. All 15 pitch tests pass post-fix — the
-> formant path was written to the documented semantics and needed no
-> change. Remaining: the exit-criterion bright-mix pitch-up A/B listen,
-> now meaningful for the first time (pre-fix it audited the wrong
-> direction).
-
-### Why
-
-`pitch_shift()` downsamples through `resample_sinc`, whose cutoff never
-scales with ratio — pitch-up of bright material aliases, and the artifact
-would be blamed on the stretcher. `AudioBuffer::resample` (the public
-44.1↔48 kHz conversion) is unfiltered cubic. The streaming resampler
-already does this correctly (`cutoff_for_step`); the batch paths never got
-the same care. Off the DJ hot path, but it is public API quality.
-
-### Primary Files
-
-- `src/core/resample.rs`, `src/lib.rs` (pitch-shift path),
-  `src/core/types.rs` (`AudioBuffer::resample`)
-
-### Work
-
-- Cutoff-scale the batch sinc kernel for downsampling (mirror
-  `cutoff_for_step`), or route `pitch_shift`/`AudioBuffer::resample`
-  through `MultiSincResampler`; keep the per-tap Bessel out of the inner
-  loop (precompute a table as the streaming path does).
-- Alias-rejection regression tests: bright content pitch-up, Goertzel at
-  the fold frequency, ≥ 60 dB rejection (pattern exists at
-  `resample.rs:957-988`); `AudioBuffer::resample` 44.1↔48 kHz round-trip
-  SNR gate.
-
-### Exit Criteria
-
-- No batch resampling path lacks anti-aliasing; gates green; pitch-shift
-  A/B on a bright mix audibly clean of the pitch-up shimmer.
-
 ## Not a Priority Yet
 
 - SIMD / architecture-specific acceleration (WCET gates exist to measure
@@ -493,6 +435,7 @@ in addition:
   (Stage 15, done — seam and fade gates hold in CI).
 - The tonal-HF granulation floor has a recorded listening verdict — fixed,
   or documented as scope (Stage 16).
-- No public path resamples without anti-aliasing (Stage 17).
+- No public path resamples without anti-aliasing (Stage 17, done
+  2026-08-13 — gates in CI, owner A/B passed).
 - No panic is reachable from the public API on arbitrary input (Stage 12,
   done 2026-08-13 — adversarial harness in CI + audit).
