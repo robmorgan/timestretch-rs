@@ -48,3 +48,26 @@ Environment variables:
 - `TIMESTRETCH_BPM_MAX_SECONDS` — trim each track before analysis
 - `TIMESTRETCH_STRICT_BPM_BENCHMARK=1` — missing files and skips become failures
 - `TIMESTRETCH_BPM_MIN_ACC1` / `TIMESTRETCH_BPM_MIN_ACC2` — accuracy floors (0–100); the test fails below them
+
+
+## Blind A/B listening harness (`scripts/ab.sh`)
+
+Owner listening is the binding quality gate; this makes the loop cheap
+when tweaking the algorithm:
+
+```bash
+# Render current working tree vs a baseline ref (plus optionally Rubber
+# Band), level-matched and blinded with a sealed key:
+scripts/ab.sh render my-tweak --base main --rates 0.92,1.08 --rb \
+    "benchmarks/audio/bpm-corpus/<track>.wav:90"
+
+# Listen to target/ab/my-tweak/blind/<track>/<rate>/arm_*.wav,
+# write verdicts per letter, THEN:
+scripts/ab.sh unblind my-tweak
+```
+
+Every arm gets identical treatment (RMS-matched to source, one common
+no-clip trim per condition, 32-bit float, per-condition shuffled
+letters) — the validity rules learned in the Stage 16 review (mono arms,
+level deltas, and clipping all unblind a set). The baseline builds in a
+temporary git worktree, so any historical ref can be an arm.
