@@ -166,6 +166,14 @@ pub(crate) struct WideKeylockStage {
     enable: f32,
     /// Resets fired since construction (observability for tests/QA).
     resets_fired: u64,
+    /// PROTOTYPE — Stage 14 attribution ablation, not shipped behavior:
+    /// `TIMESTRETCH_PROTO_WIDE_NO_RESETS` disables the artifact-driven
+    /// per-band phase resets; `TIMESTRETCH_PROTO_WIDE_PER_CHANNEL`
+    /// bypasses the M/S encode (stereo processed as independent L/R,
+    /// the pre-consolidation batch-PV configuration). Read once at
+    /// construction; both unset = shipped behavior, bit-identical.
+    proto_no_resets: bool,
+    proto_per_channel: bool,
     /// Band mask of the most recent reset (test observability).
     #[cfg(test)]
     last_reset_mask: [bool; 4],
@@ -231,6 +239,8 @@ impl WideKeylockStage {
             hold_bits: 0,
             enable: f32::NAN,
             resets_fired: 0,
+            proto_no_resets: std::env::var("TIMESTRETCH_PROTO_WIDE_NO_RESETS").is_ok(),
+            proto_per_channel: std::env::var("TIMESTRETCH_PROTO_WIDE_PER_CHANNEL").is_ok(),
             #[cfg(test)]
             last_reset_mask: [false; 4],
         }
@@ -275,7 +285,7 @@ impl WideKeylockStage {
             }
         }
 
-        if fire {
+        if fire && !self.proto_no_resets {
             for ch in &mut self.channels {
                 ch.pv.reset_phase_state_bands(mask, self.sample_rate);
             }
@@ -324,7 +334,7 @@ impl Stage for WideKeylockStage {
 
         // Stereo runs the corrected path in mid/side (see the `ms` field
         // doc); other channel counts pass through per-channel.
-        let stereo = block.channels() == 2;
+        let stereo = block.channels() == 2 && !self.proto_per_channel;
         if stereo {
             let (l, r) = (block.channel(0), block.channel(1));
             for i in 0..BLOCK_FRAMES {
