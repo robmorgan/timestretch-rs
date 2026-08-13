@@ -272,6 +272,40 @@ Automation: auto
 > vocoder and locking passes. Remaining: the dead-code/doc sweep
 > (separate PR) and the owner ±30/±50 listen (note: M/S touches exactly
 > the "a bit crowded vs R3" quality heard at Stage 11).
+>
+> **Status (2026-08-13): owner ±30/±50 listen FAILED the exit
+> criterion — stage reopened.** Blind, 8 conditions (msbwy +
+> cold_heart × ±30/±50, renders: pre-consolidation `887d854` vs main
+> `340a5d1` vs Rubber Band, sealed key, level-matched): the
+> pre-consolidation per-channel batch PV beat the consolidated
+> live-stage render in ~7 of 8 conditions. Two distinct findings:
+>
+> 1. **Width (measured, then judged)**: the consolidated M/S path is
+>    FAITHFUL — side/mid within 0.1 dB of the source (−16.3 vs
+>    −16.2 dB on msbwy) — while the old per-channel PV MANUFACTURES
+>    width by decorrelation (side/mid balloons to ~0 dB, +16 dB of
+>    fake side energy; R3 adds a moderate ~5 dB). The owner blind
+>    preference went to the wider renders ("full/wide" vs
+>    "closed/narrow"). This is a design decision, not a bug: faithful
+>    vs flattering. Candidate middle path if flattering wins: a
+>    bounded, deliberate side treatment — not decorrelation as an
+>    accident of uncoupled processing.
+> 2. **Quality regression (a bug until attributed)**: "roboty /
+>    pulsing background artifacts" on the consolidated arm,
+>    worst on slowdowns ("pulsing roboty bass" at −30%, "awful,
+>    roboty" msbwy −50%) — the batch PV arm shows "metallic" at worst.
+>    Attribution needed before any fix: candidates are the
+>    artifact-driven per-band phase resets pulsing (offline renders
+>    run the online-detection fallback), the unity-PV + post-resampler
+>    topology vs the batch PV's direct-ratio synthesis, and the
+>    peak-set unification. Ablation renders on the same excerpts,
+>    then re-listen.
+>
+> Note the acceptance-context shift: Stage 11 accepted the live wide
+> stage against RUBBER BAND; this is the first blind comparison of the
+> live stage against the batch PV configuration, and the batch config
+> won — the "offline must equal live" consolidation goal now cuts the
+> other way (perhaps live should adopt what the batch path did right).
 
 ### Why
 
