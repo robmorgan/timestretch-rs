@@ -12,6 +12,11 @@
 #       target/ab/<name>/blind/<track>/<rate>/arm_{A,B,...}.wav with a
 #       sealed key. Listen, note verdicts per letter, then:
 #
+#   scripts/ab.sh listen <name>
+#       Opens the blind TUI (tools/ab-tui): step conditions, hot-switch
+#       arms position-synced, note per arm, pick winners, Ctrl-S saves
+#       results.json (auto-unblinded against the sealed key).
+#
 #   scripts/ab.sh unblind <name>
 #       Prints the letter->arm key. (Don't peek before your notes are
 #       written down — the whole point is that you can't.)
@@ -26,6 +31,9 @@ cmd=${1:?usage: ab.sh render|unblind <name> ...}
 name=${2:?a comparison name is required}
 out="target/ab/$name"
 
+if [ "$cmd" = "listen" ]; then
+    exec cargo run --release --manifest-path tools/ab-tui/Cargo.toml -- "$out"
+fi
 if [ "$cmd" = "unblind" ]; then
     python3 - "$out/BLIND_KEY.json" <<'EOF'
 import json, sys
@@ -149,5 +157,6 @@ for cond in sorted(raw.glob("*/*")):
     write_wav(blind/"source.wav", [v*trim for v in src], sr, ch)
 (out/"BLIND_KEY.json").write_text(json.dumps(key, indent=1))
 print(f"blind set: {len(key)} conditions -> {out}/blind")
-print(f"key sealed in {out}/BLIND_KEY.json — run scripts/ab.sh unblind after noting verdicts")
+print(f"key sealed in {out}/BLIND_KEY.json")
+print(f"next: scripts/ab.sh listen {out.name}")
 EOF

@@ -61,10 +61,19 @@ when tweaking the algorithm:
 scripts/ab.sh render my-tweak --base main --rates 0.92,1.08 --rb \
     "benchmarks/audio/bpm-corpus/<track>.wav:90"
 
-# Listen to target/ab/my-tweak/blind/<track>/<rate>/arm_*.wav,
-# write verdicts per letter, THEN:
-scripts/ab.sh unblind my-tweak
+# Listen in the blind TUI (hot-switch arms position-synced with a-e,
+# S = source reference, Enter to note an arm, w to pick a winner,
+# Ctrl-S to save):
+scripts/ab.sh listen my-tweak
 ```
+
+Saving writes `target/ab/my-tweak/results.json` — per condition the
+letter-keyed notes, the winner, and the letter→arm mapping merged from
+the sealed key at save time (pass `--no-unblind` to the `ab-tui` binary
+to keep it sealed). The results path is the TUI's last stdout line, so
+a driving LLM can launch the tool, wait for exit, and parse the file.
+Re-launching with an existing results file resumes the session;
+`scripts/ab.sh unblind` remains for key inspection without the TUI.
 
 Every arm gets identical treatment (RMS-matched to source, one common
 no-clip trim per condition, 32-bit float, per-condition shuffled
