@@ -317,6 +317,30 @@ broken `LR8Crossover` kept only for baselines that no longer exist.
 
 Automation: auto
 
+> **Status (2026-08-13): kill-experiment SURVIVED — build-out is on.**
+> Prototype (branch `proto/stage18-splice-cadence`, env-gated trigger
+> scale, bit-identical when off): halving the splice cadence (scale 2 on
+> the elastic drift triggers) lifted harmonic-15 purity at −8% tempo
+> from 22.1 → **62.8 dB** (and +8%: 52.0 → 59.5 dB) — the asymmetric
+> floor is gone, splice counts confirm the cadence halved. **Blind owner
+> A/B (2026-08-13, msbwy + cold_heart × −8/−4/+8%, sealed key): the
+> half-cadence arm won or tied all 6 conditions**, and every "robot"
+> rating landed on the shipped cadence — the Stage 16 artifact
+> attenuates exactly as the numbers predicted. One watch item: a
+> background bass hum on msbwy ±8% in BOTH arms (likely the
+> pitch-following low band on that track, not cadence-caused), slightly
+> more exposed at half cadence on +8% — a build-out gate concern, not a
+> kill. Two design facts from the prototype: (1) scale 4+ REGRESSES on
+> slowdowns and scale 2 breaks at the ±20–25% range edge (sine pitch
+> 218 vs 220 Hz at ratio 1.25) — both are the drift bound colliding with
+> the 560-frame nominal lag, so the shippable mechanism is a
+> **transposition-aware trigger scale** (full stretch in the primary
+> window, tapering to 1 as headroom shrinks toward the range edge), NOT
+> a fixed scale and NOT more latency; (2) a flat scale already wins on
+> tonal material with ride/keylock gates green, so band-flux tonality
+> detection is deferred unless the A/B matrix or transient gates object
+> — simplest structure first.
+
 ### Why
 
 The Stage 16 blind verdict (2026-08-13): SOLA's tonal-HF granulation IS
@@ -347,16 +371,26 @@ negative result in LEARNINGS.md and fall back to
 acceptance-at-DJ-ratios with the wide profile as the documented escape
 hatch.
 
-### Work (only if the kill-experiment survives)
+### Work (kill-experiment survived; revised by its evidence)
 
-- Tonality factor from the artifact band flux (pre-analysis first,
-  online fallback), plumbed to SOLA as a drift-trigger scale; the
-  mild-motion bounded recenter (Stage 15) keeps its own bound.
-- Live-path wiring with the RT contract untouched (the factor is a
-  per-block scalar read, no allocation).
-- Gates: stage-16 purity characterization numbers must improve on
-  sustained-tonal fixtures with the ride/seam/A-B-matrix suite staying
-  green; splice-rate telemetry on the corpus recorded before/after.
+- **Transposition-aware trigger scale** as shipped behavior (no env
+  knob): scale 2 inside the primary DJ window, derived-from-constants
+  taper to 1 as the drift bound approaches the 560-frame lag headroom
+  toward the range edge (the ratio-1.25 sweep failure is the pin for
+  where the taper must have fully landed). The hard/force trigger must
+  always remain physically reachable — the prototype showed a force
+  threshold beyond the write-head stall point is a latent parking risk.
+  Mild-motion and rest recenters keep their own bounds (Stage 15).
+- Band-flux tonality adaptivity: DEFERRED — only if the A/B matrix or
+  transient gates object to the flat in-window scale.
+- RT contract untouched (the scale is a per-retarget scalar, no
+  allocation).
+- Gates: purity characterization re-pinned at the improved floors
+  (both directions ≥ ~55 dB); ride/seam/A-B-matrix suite green;
+  ratio-sweep quality regressions green through the full range edge
+  (the 1.25 case becomes the taper's regression test); splice-rate
+  telemetry on the corpus recorded before/after; the msbwy bass-hum
+  observation checked (must not worsen vs shipped).
 - Exit: blind owner re-listen on the stage-16 protocol — the msbwy/
   cold_heart slowdown verdicts move toward Rubber Band, no new
   artifacts elsewhere.
