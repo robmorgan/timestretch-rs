@@ -395,3 +395,50 @@ Adversarial input, no-panic, and soak coverage for every non-RT surface
   needed only the frames-pushed counter and ring occupancy, and its
   measured headroom (10x) still catches a one-frame-per-callback leak
   within ~6 s of audio time.
+
+## Stage 17 — Pitch-Shift and Batch Resampler Correctness (2026-08-13)
+
+Batch anti-aliasing (PR #42) plus the direction-inversion fix its
+independent review surfaced (PR #47). Off the DJ hot path; public API
+quality.
+
+- **Anti-aliasing (PR #42)**: `resample_sinc` cutoff-scales when
+  downsampling with the streaming kernel's stopband margin
+  (`cutoff_for_step` policy), Kaiser window via a per-call lookup table
+  (Bessel out of the tap loop); `AudioBuffer::resample` switched from
+  unfiltered cubic to the band-limited sinc. Measured: 2:1 downsample
+  alias rejection 1.9 → 89.8 dB; 48→44.1 ultrasonic fold gated; the
+  short-input cubic fallback is a documented conscious edge (a signal
+  shorter than the kernel cannot be band-limited by it).
+- **Direction inversion (PR #47)**: `pitch_shift` set
+  `stretch_ratio = 1.0 / pitch_factor` — a length ratio — so factor 2.0
+  rendered an octave DOWN (probe: 440 Hz → 220 Hz), inverting the
+  documented contract, and the real pitch-raising path aliased in-band
+  at −1.2 dB rejection pre-#42. Fix: `stretch_ratio = pitch_factor`;
+  the formant tapers were already written to the documented semantics
+  and needed no change. Gates added: 10x dominance octave tests both
+  ways, 44.1↔48 round-trip SNR > 40 dB (multi-tone).
+- **Owner A/B (2026-08-13, renders from main `0e73acf`,
+  `target/stage17_audition/`: shipped vs pre-fix-equivalent unfiltered
+  cubic, +2/+5 semitones on a bright disco excerpt, RMS-matched,
+  common-trimmed float)**: "the shipped drums sound higher quality, but
+  the difference is still very small and hard to hear without a trained
+  ear." Exit criterion met — the shipped path is audibly clean and the
+  old path's aliasing, while real, was subtle on dense material.
+
+Lessons:
+
+- **An OR-assertion direction test is satisfiable by inverted output**
+  through its own harmonics — `e_880 > e_220 || e_880 > e_1760` passed
+  for months while factor 2.0 rendered 220 Hz. Direction tests must
+  assert the target DOMINATES both the source and the
+  opposite-direction frequency.
+- **Probe the direction you claim**: the original "the shifter is not a
+  beneficiary" scope note tested pitch-up as factor > 1, which — being
+  inverted — never downsampled; the measurement was true and the
+  conclusion backwards. A probe that can't fail the hypothesis both
+  ways isn't evidence.
+- Sine probes overstate audibility on dense mixes again (cf. Stage 16's
+  purity numbers): −1.2 dB fold rejection sounds catastrophic on paper
+  and was "very small" on a real club master. Characterize with tones,
+  decide with ears.
