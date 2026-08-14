@@ -58,8 +58,13 @@ fn render_streaming_with(input: &[f32], rate: f64, profile: EngineProfile) -> Ve
     let ratio = 1.0 / rate;
     let expected = (input.len() as f64 * ratio).round() as usize;
 
-    // Same terminal treatment as the offline driver: latency + kernel pad.
-    let flush = vec![0.0f32; (latency as f64 * rate).ceil() as usize + 64];
+    // Same terminal treatment as the offline driver: latency + head
+    // lookahead + kernel pad.
+    let flush =
+        vec![
+            0.0f32;
+            (latency as f64 * rate).ceil() as usize + processor.varispeed_lookahead_frames() + 64
+        ];
     let (mut feed, mut flush_fed, mut finished) = (0usize, 0usize, false);
     let mut collected = Vec::with_capacity(expected + latency + 4_096);
     // Irregular callback sizes — determinism must not depend on chunking.
