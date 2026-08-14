@@ -133,11 +133,21 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: desktop
+          workspaces: |
+            desktop
+            tools/ab-tui
       - run: cargo test --all-targets
         working-directory: desktop
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: desktop
+      # The blind A/B TUI is likewise a standalone excluded crate
+      # (cpal/ratatui); excluded targets have zero CI coverage unless a
+      # workflow names them (Stage 12 lesson), and macOS builds cpal
+      # without extra system packages.
+      - run: cargo test --all-targets
+        working-directory: tools/ab-tui
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: tools/ab-tui
 
   fmt:
     name: Format
