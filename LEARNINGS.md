@@ -612,3 +612,65 @@ Lessons:
 - Manufactured width (decorrelation) reads as "full/wide" and wins
   blind preference over a faithful image — flattering beats faithful
   until it is made a deliberate choice.
+
+## Stage 19 — Direct-Ratio Wide Path (2026-08-14)
+
+The Stage 14 attribution chain's fix, built falsification-first: the
+phase vocoder OWNS the tempo axis for the WideKeylock profile, as the
+graph's demand-inverting head (`WidePvHead`, PR #60) — no varispeed
+prepass, no post-resampler. The Stage 11 topology is deleted.
+
+**Kill experiment first** (branch `proto/stage19-dynamics`): instant
+full-range ratio steps, log-slewed steps, and continuous rides all
+click-free through the chunked direct-ratio PV (max adjacent diff
+0.0251 vs the 0.0752 soak bound) with pitch constant at 440.0 Hz —
+the PV owns tempo, so a rate gesture has no pitch axis to tear.
+Stage 11's step-tearing was a transposition-axis + resampler-anchor
+property, not a ratio-change property.
+
+**Build-out findings, each caught by an existing gate:**
+
+- Ride control-to-audio: buffering the raw toggle arm ahead of the PV
+  queued 1778 frames of stale audio past the gate; fixed structurally
+  with a source-side delay matching the PV's analysis lead, so both
+  arms' PRODUCTION is contemporaneous while content stays aligned.
+- Tail-flush starvation: both offline and the determinism harness
+  padded by `latency × rate` — now zero, since the analysis window is
+  source-side LOOKAHEAD (tape-like semantics; first delivered frame is
+  source frame 0, and the feared ratio-dependent latency dissolved).
+  The head lookahead joined the flush; wide determinism is
+  sample-identical again.
+- **Mirror-warmup phase corruption**: seeding the OLA warmup from
+  mirrored content leaves per-bin phase offsets that persist in the
+  accumulators and partially cancel sub-bass (two-tone balance 2.47 vs
+  ideal 0.54 at rate 2.0) — and this is the SAME mirror-padding flaw
+  behind the pre-Stage-14 batch path's pinned sub-bass imbalance,
+  latent for a year. Re-seeding phases at the last warmup window
+  (mostly real content) restores the ideal at every rate; pinned by a
+  head-level two-tone test.
+
+**Blind exit listen (2026-08-14, 8 conditions × 4 arms — the first
+session through the new ab-tui, results parsed from its results.json):**
+the roboty floor is GONE from every slowdown ("really nice / good bass
+/ more open" vs the old arm's "roboty / underwater / low quality
+artifacts"); at +50% compression the new head TIES Rubber Band (both
+"slightly roboty") and only the decorrelated batch arm escapes.
+Measured sub-bass balance at compression: the new head sits at the
+ideal 0.537–0.538 across 50–100 Hz fundamentals — better than batch's
+0.58–0.69 — so the +50% residual is the recurring width preference
+(decorrelation masks artifacts), not a defect.
+
+Lessons:
+
+- A demand-inverting head is the right seam for "who owns the tempo
+  axis": the graph's feed loop, timeline, priming, and retarget
+  bookkeeping all carried over by matching the varispeed head's
+  interface.
+- Silent str.replace no-ops are how a "fix" doesn't ship: an anchored
+  patch that missed after rustfmt reformatting printed success and
+  cost a debugging cycle — verify the marker landed, or use exact-match
+  editing that fails loudly.
+- The same defect can hide in two places for different reasons: the
+  mirror-pad phase flaw shipped in the batch path (pinned as a
+  "trait") and nearly shipped again in the head's warmup. When a fix
+  explains an OLD pinned number, re-derive the old pin.

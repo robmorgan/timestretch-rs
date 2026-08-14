@@ -49,9 +49,18 @@ Open, in priority order for the DJ app:
 
 - **Stage 10** — beat-grid trust on everything a DJ loads (non-EDM
   corpus evidence half; the non-adopter class is closed).
-- **Stage 19** — direct-ratio wide path (the Stage 14 attribution's
-  fix; falsification-gated on live dynamics).
-
+Stage 19 (direct-ratio wide path) completed 2026-08-14 (PR #60) — the
+PV owns the tempo axis for the wide profile as the graph's demand
+inverter; the Stage 11 topology is deleted. Blind exit listen (8
+conditions, 4 arms, via the new ab-tui): the roboty floor is GONE from
+every slowdown ("really nice / good bass / more open" vs the old arm's
+"roboty / underwater / artifacts"); at +50% compression the new head
+ties Rubber Band (both "slightly roboty") and only the
+decorrelation-flattered batch arm escapes — measured sub-bass balance
+is at the ideal (0.537 vs batch's 0.58–0.69), so the residual is the
+width preference, not a defect. Zero pipeline latency (the analysis
+window is source-side lookahead), determinism sample-identical, full
+gate suite green; archived in LEARNINGS.md.
 Stage 14 (wide-path consolidation) closed 2026-08-13 — the durable
 deliverables stand (dead-code/doc sweep, wide determinism harness,
 sub-bass fix, M/S machinery), but the owner ±30/±50 blind listen FAILED
@@ -168,8 +177,8 @@ corrector was never falsified.
 
 ## Stage Sequence
 
-Stages are independent tracks. (Stages 12, 13, 14, 15, 16, 17, and 18
-are complete or closed.) Remaining: 10, then 19.
+Stages are independent tracks. (Stages 12–19 are complete or closed.)
+Remaining: Stage 10's non-EDM corpus half.
 
 ## [ ] Stage 10: General-Purpose Beat Tracking and BPM Detection
 
@@ -263,84 +272,17 @@ intervals draws instead).
   regenerate on open).
 - Version-bump policy documented and applied on the next analysis change.
 
-## [ ] Stage 19: Direct-Ratio Wide Path — Remove the Live Topology Floor
-
-Automation: auto
-
-### Why
-
-The Stage 14 listen chain attributed the wide path's "roboty background
-noise" to the live topology itself, with every alternative eliminated
-(2026-08-13, three blind sessions + probes, prototype branch
-`proto/stage14-ablation`):
-
-- Phase resets: innocent (disabling them changed nothing blind).
-- M/S coupling: innocent for the noise (owns only the width difference —
-  measured: M/S is source-faithful, per-channel manufactures ~16 dB of
-  side energy by decorrelation).
-- Shared PV code / peak unification: innocent (current-code batch render
-  is bit-identical to the pre-consolidation one, SER ≈ 293 dB).
-- Streaming chunking: innocent (chunked direct-ratio holds batch-level
-  harmonic purity, 60.7–70.5 dB, and auditioned clean/BEST blind in all
-  3 conditions).
-- **Guilty: the varispeed-tempo-prepass + PV-stretch + post-resampler
-  arrangement** — the Stage 11 live design. Its floor was accepted then
-  against Rubber Band; the batch/direct-ratio comparison shows it is a
-  self-inflicted floor, not a PV limitation.
-
-A direct-ratio wide PV removes the roboty floor from BOTH live playback
-and offline renders, and re-unifies the two paths at the better quality
-(the consolidation goal, pointed the right way this time).
-
-> **Status (2026-08-13): dynamics kill-experiment SURVIVED — build-out
-> is on.** Probe (branch `proto/stage19-dynamics`,
-> `examples/__stage19_dynamics.rs`): the chunked direct-ratio PV under
-> INSTANT 1.43↔2.0 ratio steps, live-style log-slewed steps, and a
-> continuous ±10% ride is click-free in all three (max adjacent diff
-> 0.0251 vs the 0.0752 soak bound — even instant full-range steps),
-> with pitch constant at 440.0 Hz through every transition (the PV owns
-> tempo; there is no pitch axis to tear — Stage 11's step-tearing was a
-> transposition-axis + resampler-anchor property) and 46.5–48.8 dB
-> purity in transition-straddling windows. Music ear-check renders in
-> `target/stage19_dynamics/`. One build-out design item discovered (not
-> a kill): the FFT window spans 2048 INPUT frames, so pipeline delay in
-> OUTPUT frames varies with ratio (1024–4096 across the 0.5–2.0
-> clamp) — the honest-latency contract needs a deliberate answer
-> (compensating delay, max-latency reporting, or rate-dependent
-> reporting with deck-side handling). Demand inversion is bounded
-> (≤ HOP × T_MAX per hop).
-
-### Falsification first (the risk is dynamics, not quality)
-
-Constant-rate quality is proven. What is NOT proven is deck feel: the
-current design does tempo in the varispeed head precisely for
-sample-accurate retargets, and instant PV-ratio steps tear OLA seams
-(Stage 11, measured — hence the log-slew). Before build-out, prototype
-the direct-ratio chunked PV under DYNAMIC rate: ratio steps, ±ride
-glides, and seek/warm-start, offline-driven. Kill criteria: rate
-transitions cannot be made click-free within the 48.6 ms contract, or
-output-rate-varies-with-ratio demand inversion cannot be bounded for
-the pull graph (WCET or buffer growth). Fallback if killed: revert
-offline wide to the direct-ratio batch PV (the quality is free there)
-and keep the live stage as Stage 11 accepted it, divergence documented.
-
-### Work (only if the kill-experiment survives)
-
-- WideKeylockStage rework: PV at the (slewed) direct ratio on the
-  source-side audio; the varispeed head runs unity for this profile (or
-  is bypassed); demand inversion accounts for ratio-dependent PV output
-  rate; latency contract re-derived and re-gated.
-- Stereo: decide faithful M/S vs per-channel width DELIBERATELY (the
-  owner blind preference leaned wide; if wide wins, implement it as a
-  bounded side treatment, not decorrelation-by-accident).
-- Offline wide renders through the same reworked stage — determinism
-  gate restored with teeth.
-- Gates: wide purity probes pinned at direct-ratio levels; rate-step /
-  ride torture on the wide profile; WCET; A/B matrix; the Stage 14
-  blind conditions re-rendered and re-auditioned as the exit listen.
-
 ## Not a Priority Yet
 
+- Deliberate stereo-width treatment for the corrected paths. Recurring
+  blind evidence (Stage 16, Stage 14 attribution, Stage 19 exit listen,
+  2026-08-13/14): the owner consistently prefers the WIDER presentation,
+  and decorrelation both flatters and MASKS artifacts (three of four
+  arms "slightly roboty" at +50% — including Rubber Band — with only
+  the decorrelated batch arm escaping). The shipped paths stay faithful
+  (side/mid within 0.1 dB of source, by design); if wideness is ever
+  wanted it should be a bounded, deliberate side treatment — an owner
+  taste decision, not an accident of uncoupled processing.
 - Corrected low band at DJ ratios — re-litigating the sub-120 Hz
   pitch-follow scope line on the Stage 18 exit-listen evidence
   ("bass out of key" blind at ±8% on bass-forward material, no longer
