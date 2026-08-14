@@ -351,6 +351,12 @@ impl Player {
 // App
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    Conditions,
+    Arms,
+}
+
 struct App {
     set_dir: PathBuf,
     set_name: String,
@@ -360,7 +366,9 @@ struct App {
     current: usize,
     player: Option<Player>,
     player_error: Option<String>,
-    /// Arm whose note row is focused (Tab cycles).
+    /// Which pane the ↑/↓ cursor lives in (Tab toggles).
+    pane: Pane,
+    /// Arm whose note row is focused (↑/↓ in the Arms pane).
     focus: usize,
     /// In-progress note edit (arm letter, text).
     editing: Option<(char, String)>,
@@ -451,10 +459,18 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
             ListItem::new(Line::from(format!("{marks} {}", c.id))).style(style)
         })
         .collect();
+    let pane_border = |focused: bool| {
+        if focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        }
+    };
     frame.render_widget(
         List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(pane_border(app.pane == Pane::Conditions))
                 .title(format!(" {} ", app.set_name)),
         ),
         cols[0],
@@ -545,7 +561,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
                     Span::styled("(source) ", Style::default().fg(Color::DarkGray)),
                 );
             }
-            let style = if i == app.focus {
+            let style = if i == app.focus && app.pane == Pane::Arms {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
@@ -554,7 +570,12 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         })
         .collect();
     frame.render_widget(
-        List::new(arm_items).block(Block::default().borders(Borders::ALL).title(" arms ")),
+        List::new(arm_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(pane_border(app.pane == Pane::Arms))
+                .title(" arms "),
+        ),
         rows[1],
     );
 
@@ -565,8 +586,8 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         "editing note — Enter commit, Esc cancel".to_string()
     } else {
         format!(
-            "a-{}/s play arm  space pause  l loop  ←/→ seek  0 restart  ↑/↓ condition  \
-             Tab focus  Enter note  w winner  Ctrl-S save  q quit   {}",
+            "Tab pane  ↑/↓ move  Enter select/note  a-{}/s play arm  space pause  l loop  \
+             ←/→ seek  0 restart  w winner  Ctrl-S save  q quit   {}",
             labels
                 .iter()
                 .rfind(|&&l| l != SOURCE_LABEL)
@@ -658,29 +679,57 @@ fn run_tui(mut app: App) -> Result<(), String> {
                     p.restart();
                 }
             }
-            (KeyCode::Down, _) | (KeyCode::Char('n'), _) => {
+            (KeyCode::Char('n'), _) => {
                 let next = (app.current + 1).min(app.conditions.len() - 1);
                 app.goto(next);
             }
-            (KeyCode::Up, _) | (KeyCode::Char('p'), _) => {
+            (KeyCode::Char('p'), _) => {
                 let prev = app.current.saturating_sub(1);
                 app.goto(prev);
             }
-            (KeyCode::Tab, _) => {
-                app.focus = (app.focus + 1) % labels.len();
-            }
-            (KeyCode::Enter, _) => {
-                let label = labels[app.focus.min(labels.len() - 1)];
-                if label != SOURCE_LABEL {
-                    let existing = app
-                        .condition()
-                        .notes
-                        .get(&label)
-                        .cloned()
-                        .unwrap_or_default();
-                    app.editing = Some((label, existing));
+            (KeyCode::Down, _) => match app.pane {
+                Pane::Conditions => {
+                    let next = (app.current + 1).min(app.conditions.len() - 1);
+                    app.goto(next);
                 }
+                Pane::Arms => {
+                    app.focus = (app.focus + 1).min(labels.len() - 1);
+                }
+            },
+            (KeyCode::Up, _) => match app.pane {
+                Pane::Conditions => {
+                    let prev = app.current.saturating_sub(1);
+                    app.goto(prev);
+                }
+                Pane::Arms => {
+                    app.focus = app.focus.saturating_sub(1);
+                }
+            },
+            (KeyCode::Tab, _) => {
+                app.pane = match app.pane {
+                    Pane::Conditions => Pane::Arms,
+                    Pane::Arms => Pane::Conditions,
+                };
             }
+            (KeyCode::Enter, _) => match app.pane {
+                Pane::Conditions => {
+                    // The condition is already loaded by goto(); Enter
+                    // moves the cursor into it.
+                    app.pane = Pane::Arms;
+                }
+                Pane::Arms => {
+                    let label = labels[app.focus.min(labels.len() - 1)];
+                    if label != SOURCE_LABEL {
+                        let existing = app
+                            .condition()
+                            .notes
+                            .get(&label)
+                            .cloned()
+                            .unwrap_or_default();
+                        app.editing = Some((label, existing));
+                    }
+                }
+            },
             (KeyCode::Char('w'), m) if m.contains(KeyModifiers::SHIFT) => {
                 app.conditions[app.current].winner = None;
                 app.dirty = true;
@@ -702,6 +751,7 @@ fn run_tui(mut app: App) -> Result<(), String> {
                     p.select(target);
                     if let Some(idx) = labels.iter().position(|&l| l == target) {
                         app.focus = idx;
+                        app.pane = Pane::Arms;
                     }
                 }
             }
@@ -769,6 +819,7 @@ fn main() {
         current: 0,
         player: None,
         player_error: None,
+        pane: Pane::Conditions,
         focus: 0,
         editing: None,
         dirty: false,
