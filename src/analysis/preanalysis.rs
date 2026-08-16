@@ -11,10 +11,13 @@ const PREANALYSIS_FFT_SIZE: usize = 2048;
 const PREANALYSIS_HOP_SIZE: usize = 512;
 const PREANALYSIS_SENSITIVITY: f32 = 0.4;
 
-/// Soft tempo hint for the DJ analysis path: candidates in the classic EDM
-/// range get a small salience bonus. A hint, not a fold — a 90 BPM hip-hop
-/// track still comes back as 90.
-const DJ_TEMPO_HINT_RANGE: (f64, f64) = (100.0, 160.0);
+/// Soft tempo hint for the DJ analysis path: candidates in the club range
+/// get a small salience bonus. A hint, not a fold — a 90 BPM hip-hop
+/// track still comes back as 90. The upper end covers drum & bass
+/// (~170–180): with the old 160 ceiling a true 174 earned no bonus while
+/// its 116 sub-level did, so DnB locked the 2/3 metrical level (ROADMAP
+/// Stage 10, measured on the CC corpus rows 2026-08-16).
+const DJ_TEMPO_HINT_RANGE: (f64, f64) = (100.0, 182.0);
 
 /// Downmixes interleaved audio to the mono analysis signal expected by
 /// [`analyze_for_dj`]: the input itself for mono, or the mid channel

@@ -45,6 +45,11 @@ fetch 50aa9a376fe2e84c050da5a7f2c642792e04b91a30b9d012f9e14ac136ebf0bc SICMON012
 fetch dd947b758985479d19728f2fb345ec2a9b5f2c9fb9f4251290c7744cd306f984 mtrnc002 "mtrnc002_01_-_J-Lab_-_Radiophonique.mp3"
 fetch 61de8728f4c780be6ddcd47784cb70894b533795b5a919425abf6d85c0ae52ae unfound53 "unfound53_01_-_raymundo_mendoza_-_wrist_watch.mp3"
 
+# Drum & bass entries (ROADMAP Stage 10 non-EDM evidence half, added
+# 2026-08-16; licenses verified per-item: CC-BY 4.0 / CC-BY-SA 3.0 US):
+fetch 0c04643f1791f695f21e530963abcf1b9257973f606bfcdc467bca38eef1e9c8 flood-encoder-dx-900 "FLOOD ENCODER Dx900.mp3"
+fetch 03c6f49a8409dc6b1076cff30351b9c5333769af5d3d43534fedd17fb864a4a0 pcms007Parallel-TheYellowRoom "pcms007-B-Parallel-Stuck_in_the_Yellow_Room.mp3"
+
 # Rhythmically ambiguous entries (swung UK garage, broken techno):
 # tempos owner-ear-verified 2026-07-14 (126 / 125), scored like the rest.
 fetch cb3a303bd35bc92c27ddfec44db8666c0323913e67e2f8050282f6349651b23a yarn015 "01-Interplanetary_Criminal-Saucers.mp3"

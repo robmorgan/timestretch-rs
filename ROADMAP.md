@@ -211,8 +211,17 @@ Automation: auto
 > the hip-hop annotations are UNVERIFIED until the owner ear-checks the
 > grids; the class is the tracker's genuine open frontier, exactly what
 > this evidence half was meant to expose. i-got-you stays bpm-only (live,
-> non-rigid, capped — correct honest behavior). DnB ~174: absent from the
-> owner library; a CC candidate hunt for the public corpus is underway.
+> non-rigid, capped — correct honest behavior). DnB: two CC rows added to
+> the PUBLIC corpus (CI-visible) — flood-encoder-dx900 (CC-BY, true 174)
+> and parallel-stuck-in-the-yellow-room (CC-BY-SA, rock-steady 170) —
+> and they exposed a real detector gap: **DnB locks the 2/3 metrical
+> level** (115.98/113.33), and widening the DJ tempo hint to 182
+> (landed, v11, no corpus regressions) does NOT flip it — the sub-level
+> wins on raw tempogram salience. Remaining engineering for this stage:
+> metrical-level disambiguation in the tempogram (measure-first; the two
+> DnB rows are the gate, currently classifying WRONG at acc1 80%), plus
+> the owner ear-verification session (hip-hop annotation grids, the
+> teen-spirit rigid adoption, Somebody To Love's dimmed grid).
 
 ### Why
 

@@ -298,3 +298,33 @@ original = "bpm-corpus/i-got-you.aiff"
 original_sha256 = "0b31edffcf84e68bbd559fbf37722bc5b6fe324e7628189d3d30b7229e13973c"
 bpm = 145.0 # TODO: confirm tempo (detector reads 144.94; live — nominal only)
 bpm_only = true
+
+[[track]]
+id = "flood-encoder-dx900"
+description = "FLOOD ENCODER - Dx 900, drum & bass ~174, stereo"
+original = "public-corpus/FLOOD ENCODER Dx900.mp3"
+original_sha256 = "0c04643f1791f695f21e530963abcf1b9257973f606bfcdc467bca38eef1e9c8"
+# True tempo 174 (Goertzel scan over four 60 s windows; mild live-ish
+# wobble 172-174.5). The detector currently reads the 2/3 metrical
+# level (115.98 = 173.97 * 2/3). Widening DJ_TEMPO_HINT_RANGE to 182
+# (2026-08-16) did NOT flip it -- the 2/3 level wins on raw tempogram
+# salience, so the fix is metrical-level disambiguation in the
+# tempogram, not a hint constant. This row classifies WRONG until that
+# lands; that is the row's job (Stage 10 evidence half).
+bpm = 174.0
+bpm_only = true
+license = "CC-BY 4.0"
+source_url = "https://archive.org/details/flood-encoder-dx-900"
+
+[[track]]
+id = "parallel-stuck-in-the-yellow-room"
+description = "Parallel - Stuck in the Yellow Room [pcms007], drum & bass 170, stereo"
+original = "public-corpus/pcms007-B-Parallel-Stuck_in_the_Yellow_Room.mp3"
+original_sha256 = "03c6f49a8409dc6b1076cff30351b9c5333769af5d3d43534fedd17fb864a4a0"
+# True tempo 170.00, rock-steady in all four Goertzel windows. Detector
+# reads the 2/3 level (113.33) with a single confident segment -- the
+# same DnB metrical-level gap as flood-encoder-dx900.
+bpm = 170.0
+bpm_only = true
+license = "CC-BY-SA 3.0 US"
+source_url = "https://archive.org/details/pcms007Parallel-TheYellowRoom"
