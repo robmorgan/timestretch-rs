@@ -29,8 +29,11 @@ fetch() {
     fi
     echo "fetching $file"
     # URL-encode spaces (raw spaces make archive.org's front end 500);
-    # 5 retries with a delay ride out its routine 503 throttling.
-    curl -fsSL --retry 5 --retry-delay 15 -o "$dest" "https://archive.org/download/$item/${file// /%20}"
+    # retry any 5xx with a delay (routine throttling), and pause between
+    # files so a full refetch does not trip the rate limiter.
+    curl -fsSL --retry 5 --retry-delay 15 --retry-all-errors \
+        -o "$dest" "https://archive.org/download/$item/${file// /%20}"
+    sleep 2
     echo "$sha  $dest" | shasum -a 256 -c - >/dev/null || {
         echo "CHECKSUM MISMATCH: $file" >&2
         rm -f "$dest"
