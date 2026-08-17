@@ -217,11 +217,22 @@ Automation: auto
 > and they exposed a real detector gap: **DnB locks the 2/3 metrical
 > level** (115.98/113.33), and widening the DJ tempo hint to 182
 > (landed, v11, no corpus regressions) does NOT flip it — the sub-level
-> wins on raw tempogram salience. Remaining engineering for this stage:
-> metrical-level disambiguation in the tempogram (measure-first; the two
-> DnB rows are the gate, currently classifying WRONG at acc1 80%), plus
-> the owner ear-verification session (hip-hop annotation grids, the
-> teen-spirit rigid adoption, Somebody To Love's dimmed grid).
+> wins on raw tempogram salience.
+>
+> **Metrical-level second pass landed 2026-08-17 (v12)**: the candidate
+> ratios gained 2/3 and 3/2, and when the 3/2 candidate's salience
+> clears a measured threshold (corpus separation: true-higher-level
+> rows 0.76–0.82, everything else ≤ 0.60; threshold 0.70 mid-gap),
+> tracking re-runs with the prior centered at that level and adopts the
+> result only on convergence. Both DnB rows now detect EXACT (174.00 /
+> 170.00), every other corpus row is byte-unchanged, and acc1 is back
+> to 100% — with accuracy floors (acc1/acc2 ≥ 90) now enforced in the
+> public-corpus CI job per this stage's exit criteria. Closing data
+> point: the QM reference tracker reads the same rows at 111.9/113.0 —
+> the exact 2/3-level trap — so the tracker now resolves a class the
+> academic baseline does not. Remaining: the owner ear-verification
+> session (hip-hop annotation grids, the teen-spirit rigid adoption,
+> Somebody To Love's dimmed grid).
 
 ### Why
 

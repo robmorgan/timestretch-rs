@@ -105,7 +105,14 @@ jobs:
       # Regression tests read fixtures from test_audio/ (gitignored, *.wav).
       # The generator is deterministic, so regenerate them before testing.
       - run: cargo run --example generate_test_audio
+      # Accuracy floors on the public corpus (ROADMAP Stage 10 exit
+      # criterion, enabled once the DnB metrical-level fix landed and
+      # the corpus returned to 100% acc1 — the two DnB rows are the
+      # non-EDM gate).
       - run: cargo test --features qa-harnesses --release --test bpm_accuracy -- --nocapture
+        env:
+          TIMESTRETCH_BPM_MIN_ACC1: "90"
+          TIMESTRETCH_BPM_MIN_ACC2: "90"
       # External-reference gate (ROADMAP Stage 7, REQUIRED): the pull
       # engine's keylock render vs a Rubber Band CLI render of the same
       # public-corpus track, gated on spectral similarity and level.

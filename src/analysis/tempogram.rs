@@ -72,10 +72,12 @@ const NOVELTY_MEAN_WINDOW_SECS: f64 = 0.5;
 const NOVELTY_SMOOTH_SECS: f64 = 0.03;
 
 /// BPM ratios evaluated as metrical alternatives to the chosen path.
-/// Halving/doubling covers the canonical octave failure mode; ⅓×/3× lags
-/// mostly fall outside the analyzed range and earn near-zero salience, so
-/// they are not offered.
-const CANDIDATE_BPM_RATIOS: [f64; 2] = [0.5, 2.0];
+/// Halving/doubling covers the canonical octave failure mode; 2/3 and 3/2
+/// cover the compound/half-time-feel relation (drum & bass tracks the
+/// 2/3 sub-level of their true ~174 tempo — ROADMAP Stage 10, measured on
+/// the CC corpus rows 2026-08-17). ⅓×/3× lags mostly fall outside the
+/// analyzed range and earn near-zero salience, so they are not offered.
+const CANDIDATE_BPM_RATIOS: [f64; 4] = [0.5, 2.0 / 3.0, 1.5, 2.0];
 
 /// A time-varying tempo estimate over a novelty curve.
 #[derive(Debug, Clone)]

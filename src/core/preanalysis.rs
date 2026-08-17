@@ -45,10 +45,17 @@ use std::path::Path;
 /// `MIN_COMPATIBLE_VERSION` stays at 10 — v10 artifacts are not worse
 /// than re-analysis.
 ///
+/// v12: no schema change — metrical-level second pass (ROADMAP Stage
+/// 10): when the 3/2 tempo candidate's salience clears a measured
+/// threshold, tracking re-runs with the prior centered at that level.
+/// Drum & bass now detects its true ~174 tempo instead of the 2/3
+/// sub-level; v11 artifacts for that class carry wrong-tempo grids and
+/// are worse than re-analysis, so `MIN_COMPATIBLE_VERSION` rises too.
+///
 /// The bump-when policy for these two constants lives in CLAUDE.md
 /// ("Analysis Version Policy") and is checked at release time via
 /// RELEASE_CHECKLIST.md.
-pub const PREANALYSIS_VERSION: u32 = 11;
+pub const PREANALYSIS_VERSION: u32 = 12;
 
 /// Oldest schema version whose *analysis results* match the current
 /// detector. Artifacts below this fail
@@ -56,8 +63,10 @@ pub const PREANALYSIS_VERSION: u32 = 11;
 /// pre-v4 carried the window-start bias; v4–v7 predate (or are ambiguous
 /// about) the rigid-grid beat fit; v8 predates corroborated adoption;
 /// v9 predates estimator-disagreement confidence capping, so cached
-/// confidence for phase-indecisive tracks is wrongly high.
-const MIN_COMPATIBLE_VERSION: u32 = 10;
+/// confidence for phase-indecisive tracks is wrongly high; v10/v11
+/// predate the metrical-level second pass, so cached DnB-class grids
+/// sit at the wrong tempo level entirely.
+const MIN_COMPATIBLE_VERSION: u32 = 12;
 
 fn default_artifact_version() -> u32 {
     1
