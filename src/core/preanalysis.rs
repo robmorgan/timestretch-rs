@@ -38,10 +38,17 @@ use std::path::Path;
 /// grid. v9 artifacts for that class (e.g. Somebody To Love) carry the
 /// old wrongly-confident values and would never trigger the display.
 ///
+/// v11: no schema change — DJ tempo hint range widened 160 → 182 BPM
+/// (drum & bass earns the club bonus; ROADMAP Stage 10). Measured
+/// corpus impact is marginal (one row's tempo moved 0.04%; the DnB
+/// 2/3-metrical-level lock is NOT yet fixed by this), so
+/// `MIN_COMPATIBLE_VERSION` stays at 10 — v10 artifacts are not worse
+/// than re-analysis.
+///
 /// The bump-when policy for these two constants lives in CLAUDE.md
 /// ("Analysis Version Policy") and is checked at release time via
 /// RELEASE_CHECKLIST.md.
-pub const PREANALYSIS_VERSION: u32 = 10;
+pub const PREANALYSIS_VERSION: u32 = 11;
 
 /// Oldest schema version whose *analysis results* match the current
 /// detector. Artifacts below this fail

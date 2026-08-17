@@ -197,6 +197,32 @@ Automation: auto
 > the beat-F gain is partly self-confirming — annotations share the
 > rigid-fit method; ear verification stays the honest check.
 
+> **Status (2026-08-16): non-EDM corpus staged** (4 owner-library rows,
+> AIFF, hash-locked): hip-hop ~90/92 (in-da-club, california-love), a
+> tempo-conformed rock pool edit at 116 (smells-like-teen-spirit), and a
+> genuine live-band recording at ~145 (i-got-you). Tempo detection is
+> already clean — acc1 100% on all four (errors ≤ 0.04%). The beat-grid
+> half splits: teen-spirit ADOPTS rigid and scores beat F 1.000 with
+> sub-ms offsets (rigid adoption generalizes beyond four-on-floor,
+> pending the owner ear check), while BOTH hip-hop rows land in the
+> honest phase-untrusted bucket (confidence capped at 0.5, tracker
+> wandering 56–61 ms) — and the QM baseline scores 0.000 on them too,
+> with the rigid annotator itself phase-indecisive (lock 0.07–0.15), so
+> the hip-hop annotations are UNVERIFIED until the owner ear-checks the
+> grids; the class is the tracker's genuine open frontier, exactly what
+> this evidence half was meant to expose. i-got-you stays bpm-only (live,
+> non-rigid, capped — correct honest behavior). DnB: two CC rows added to
+> the PUBLIC corpus (CI-visible) — flood-encoder-dx900 (CC-BY, true 174)
+> and parallel-stuck-in-the-yellow-room (CC-BY-SA, rock-steady 170) —
+> and they exposed a real detector gap: **DnB locks the 2/3 metrical
+> level** (115.98/113.33), and widening the DJ tempo hint to 182
+> (landed, v11, no corpus regressions) does NOT flip it — the sub-level
+> wins on raw tempogram salience. Remaining engineering for this stage:
+> metrical-level disambiguation in the tempogram (measure-first; the two
+> DnB rows are the gate, currently classifying WRONG at acc1 80%), plus
+> the owner ear-verification session (hip-hop annotation grids, the
+> teen-spirit rigid adoption, Somebody To Love's dimmed grid).
+
 ### Why
 
 The DJ app needs trustworthy grids on everything a DJ loads. The corpus is

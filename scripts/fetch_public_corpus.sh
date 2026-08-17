@@ -28,7 +28,12 @@ fetch() {
         return
     fi
     echo "fetching $file"
-    curl -fsSL --retry 3 -o "$dest" "https://archive.org/download/$item/$file"
+    # URL-encode spaces (raw spaces make archive.org's front end 500);
+    # retry any 5xx with a delay (routine throttling), and pause between
+    # files so a full refetch does not trip the rate limiter.
+    curl -fsSL --retry 5 --retry-delay 15 --retry-all-errors \
+        -o "$dest" "https://archive.org/download/$item/${file// /%20}"
+    sleep 2
     echo "$sha  $dest" | shasum -a 256 -c - >/dev/null || {
         echo "CHECKSUM MISMATCH: $file" >&2
         rm -f "$dest"
@@ -44,6 +49,11 @@ fetch e9ffaf3e93107b336023bcdbc8e0be2328378791a7728b041e0ef0b747aee643 SICMON010
 fetch 50aa9a376fe2e84c050da5a7f2c642792e04b91a30b9d012f9e14ac136ebf0bc SICMON012 "33RD_RATE_REVS_-_Group_Therapy_sicmon012.mp3"
 fetch dd947b758985479d19728f2fb345ec2a9b5f2c9fb9f4251290c7744cd306f984 mtrnc002 "mtrnc002_01_-_J-Lab_-_Radiophonique.mp3"
 fetch 61de8728f4c780be6ddcd47784cb70894b533795b5a919425abf6d85c0ae52ae unfound53 "unfound53_01_-_raymundo_mendoza_-_wrist_watch.mp3"
+
+# Drum & bass entries (ROADMAP Stage 10 non-EDM evidence half, added
+# 2026-08-16; licenses verified per-item: CC-BY 4.0 / CC-BY-SA 3.0 US):
+fetch 0c04643f1791f695f21e530963abcf1b9257973f606bfcdc467bca38eef1e9c8 flood-encoder-dx-900 "FLOOD ENCODER Dx900.mp3"
+fetch 03c6f49a8409dc6b1076cff30351b9c5333769af5d3d43534fedd17fb864a4a0 pcms007Parallel-TheYellowRoom "pcms007-B-Parallel-Stuck_in_the_Yellow_Room.mp3"
 
 # Rhythmically ambiguous entries (swung UK garage, broken techno):
 # tempos owner-ear-verified 2026-07-14 (126 / 125), scored like the rest.

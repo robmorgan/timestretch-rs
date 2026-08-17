@@ -253,3 +253,78 @@ bpm_only = true
 beats = "annotations/raptom-snig-arf.json"
 license = "CC-BY 4.0"
 source_url = "https://archive.org/details/yarn022"
+
+# --- Non-EDM corpus (ROADMAP Stage 10 evidence half, added 2026-08-16) ---
+#
+# Sourced from the owner's library (converted to AIFF — the pool mp3s'
+# ID3v2.4 tags trip this symphonia configuration). The two hip-hop rows
+# are the tracker's current WANDERING class (phase-untrusted cap fires,
+# interval sd 56–61 ms on programmed beats): they gate the fix, not the
+# status quo. smells-like-teen-spirit is a tempo-conformed DJ edit —
+# a non-EDM RIGID case (guitar rock, no four-on-floor). i-got-you is
+# the genuine live-drummer case (capped, 7 segments, wandering).
+
+[[track]]
+id = "in-da-club"
+description = "50 Cent - In Da Club (Refresh Break Edit), hip-hop, stereo"
+original = "bpm-corpus/in-da-club.aiff"
+original_sha256 = "f09c355a23363dfba67f9c23048f6c829a1d41b02b2f78feb34513ed587e3cfb"
+bpm = 90.0 # TODO: confirm tempo (detector reads 90.03; published 90)
+beats = "annotations/in-da-club.json"
+bpm_only = true
+
+[[track]]
+id = "california-love"
+description = "2Pac - California Love (Remix), hip-hop, stereo"
+original = "bpm-corpus/california-love.aiff"
+original_sha256 = "77812e2b0baabad295d744ebf76a00519e686d350920c58aabdbb3d30e00d89d"
+bpm = 92.0 # TODO: confirm tempo (detector reads 91.99)
+beats = "annotations/california-love.json"
+bpm_only = true
+
+[[track]]
+id = "smells-like-teen-spirit"
+description = "Nirvana - Smells Like Teen Spirit (pool edit, tempo-conformed), rock, stereo"
+original = "bpm-corpus/smells-like-teen-spirit.aiff"
+original_sha256 = "183e1eb04c7505ae394bc3237a99575fa764318596267513068213c560a45350"
+bpm = 116.0 # TODO: confirm tempo (detector reads 116.00 rigid; original ~117)
+beats = "annotations/smells-like-teen-spirit.json"
+bpm_only = true
+
+[[track]]
+id = "i-got-you"
+description = "James Brown - I Got You (I Feel Good), live band, stereo"
+original = "bpm-corpus/i-got-you.aiff"
+original_sha256 = "0b31edffcf84e68bbd559fbf37722bc5b6fe324e7628189d3d30b7229e13973c"
+bpm = 145.0 # TODO: confirm tempo (detector reads 144.94; live — nominal only)
+bpm_only = true
+
+[[track]]
+id = "flood-encoder-dx900"
+description = "FLOOD ENCODER - Dx 900, drum & bass ~174, stereo"
+original = "public-corpus/FLOOD ENCODER Dx900.mp3"
+original_sha256 = "0c04643f1791f695f21e530963abcf1b9257973f606bfcdc467bca38eef1e9c8"
+# True tempo 174 (Goertzel scan over four 60 s windows; mild live-ish
+# wobble 172-174.5). The detector currently reads the 2/3 metrical
+# level (115.98 = 173.97 * 2/3). Widening DJ_TEMPO_HINT_RANGE to 182
+# (2026-08-16) did NOT flip it -- the 2/3 level wins on raw tempogram
+# salience, so the fix is metrical-level disambiguation in the
+# tempogram, not a hint constant. This row classifies WRONG until that
+# lands; that is the row's job (Stage 10 evidence half).
+bpm = 174.0
+bpm_only = true
+license = "CC-BY 4.0"
+source_url = "https://archive.org/details/flood-encoder-dx-900"
+
+[[track]]
+id = "parallel-stuck-in-the-yellow-room"
+description = "Parallel - Stuck in the Yellow Room [pcms007], drum & bass 170, stereo"
+original = "public-corpus/pcms007-B-Parallel-Stuck_in_the_Yellow_Room.mp3"
+original_sha256 = "03c6f49a8409dc6b1076cff30351b9c5333769af5d3d43534fedd17fb864a4a0"
+# True tempo 170.00, rock-steady in all four Goertzel windows. Detector
+# reads the 2/3 level (113.33) with a single confident segment -- the
+# same DnB metrical-level gap as flood-encoder-dx900.
+bpm = 170.0
+bpm_only = true
+license = "CC-BY-SA 3.0 US"
+source_url = "https://archive.org/details/pcms007Parallel-TheYellowRoom"

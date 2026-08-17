@@ -94,6 +94,13 @@ jobs:
         with:
           path: benchmarks/audio/public-corpus
           key: public-corpus-${{ hashFiles('scripts/fetch_public_corpus.sh') }}
+          # Seed from the previous corpus on a key miss: the fetch script
+          # sha-verifies and skips files already present, so a script
+          # change only downloads the DELTA — which keeps CI alive through
+          # archive.org's outages (2026-08-17: a nine-file refetch flapped
+          # for hours on their degraded CDN; the delta was two files).
+          restore-keys: |
+            public-corpus-
       - run: bash scripts/fetch_public_corpus.sh
       # Regression tests read fixtures from test_audio/ (gitignored, *.wav).
       # The generator is deterministic, so regenerate them before testing.
