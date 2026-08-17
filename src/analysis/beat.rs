@@ -244,6 +244,20 @@ pub(crate) fn detect_beats_from_transients_with_options(
         Some(track) => track,
         None => return BeatGrid::empty(sample_rate),
     };
+    // Metrical-level check (ROADMAP Stage 10): drum & bass tracks the 2/3
+    // sub-level of its true ~174 tempo — the half-time feel puts real
+    // autocorrelation mass at the 3/2-of-chosen lag while the 120-BPM
+    // prior systematically favors the sub-level. Measured separation on
+    // the full corpus (2026-08-17): the 3/2 candidate's salience is
+    // 0.76–0.82 when the higher level is the true tempo (both DnB rows)
+    // and ≤ 0.60 everywhere else (EDM ≤ 0.38). When the 3/2 alternative
+    // clears the mid-gap threshold, re-track with the prior centered at
+    // that level and adopt the result if it converges there — a second
+    // evidence pass, not a fold.
+    let track = match metrical_level_check(&transients.flux, frame_rate, options, track) {
+        Some(track) => track,
+        None => return BeatGrid::empty(sample_rate),
+    };
     let novelty = condition_novelty(&transients.flux, frame_rate);
 
     let beat_frames = track_beats_dp(&novelty, &track);
@@ -284,6 +298,73 @@ pub(crate) fn detect_beats_from_transients_with_options(
         sample_rate,
         tempo_candidates,
         phase_untrusted: false,
+    }
+}
+
+/// Threshold on the 3/2 metrical candidate's salience above which the
+/// higher level is re-evaluated. Measured corpus separation
+/// (2026-08-17): true-higher-level rows sit at 0.76–0.82, everything
+/// else at or below 0.60 — the threshold is the mid-gap.
+const METRICAL_32_SALIENCE_MIN: f32 = 0.70;
+/// The re-tracked tempo must land within this relative tolerance of
+/// 1.5× the first pass to be adopted (convergence guard: the second
+/// pass must confirm the intended level, not wander elsewhere).
+const METRICAL_32_CONVERGE_TOL: f64 = 0.05;
+
+/// Second-pass metrical-level check: when the 3/2 candidate's salience
+/// clears the measured threshold, re-track with the prior centered at
+/// that level and adopt the result only if it converges there.
+fn metrical_level_check(
+    flux: &[f32],
+    frame_rate: f64,
+    options: &TempoTrackingOptions,
+    track: TempoTrack,
+) -> Option<TempoTrack> {
+    let s32 = track
+        .octave_saliences
+        .iter()
+        .find(|(ratio, _)| (*ratio - 1.5).abs() < 1e-6)
+        .map(|&(_, s)| s)
+        .unwrap_or(0.0);
+    if s32 < METRICAL_32_SALIENCE_MIN {
+        return Some(track);
+    }
+    let bpm = track_representative_bpm(&track, frame_rate);
+    if bpm <= 0.0 {
+        return Some(track);
+    }
+    let retrack_opts = TempoTrackingOptions {
+        prior_center_bpm: bpm * 1.5,
+        ..*options
+    };
+    let Some(retracked) = estimate_tempo_track(flux, frame_rate, &retrack_opts) else {
+        return Some(track);
+    };
+    let re_bpm = track_representative_bpm(&retracked, frame_rate);
+    if re_bpm > 0.0 && ((re_bpm / (bpm * 1.5)) - 1.0).abs() <= METRICAL_32_CONVERGE_TOL {
+        Some(retracked)
+    } else {
+        Some(track)
+    }
+}
+
+/// Median-period representative tempo of a track, in BPM (0.0 = none).
+fn track_representative_bpm(track: &TempoTrack, frame_rate: f64) -> f64 {
+    let mut periods: Vec<f32> = track
+        .period_frames
+        .iter()
+        .copied()
+        .filter(|p| *p > 0.0)
+        .collect();
+    if periods.is_empty() {
+        return 0.0;
+    }
+    periods.sort_by(|a, b| a.total_cmp(b));
+    let median = periods[periods.len() / 2] as f64;
+    if median > 0.0 {
+        60.0 * frame_rate / median
+    } else {
+        0.0
     }
 }
 
@@ -1019,13 +1100,28 @@ mod tests {
             .find(|c| (c.bpm - grid.bpm * 0.5).abs() < 1e-9)
             .expect("half-tempo candidate");
         assert!(half.salience > 0.0 && half.salience < first.salience);
+        // The double (240) exceeds max_bpm and must not be offered; the
+        // 3/2 metrical alternative (180) IS in range and may appear, but
+        // on a clean click train its salience must sit far below the
+        // metrical-level re-check threshold (no false second pass).
         assert!(
             grid.tempo_candidates
                 .iter()
-                .all(|c| c.bpm <= grid.bpm + 1e-9),
+                .all(|c| (c.bpm - grid.bpm * 2.0).abs() > 1e-6),
             "240 BPM double is outside the default range: {:?}",
             grid.tempo_candidates
         );
+        if let Some(three_halves) = grid
+            .tempo_candidates
+            .iter()
+            .find(|c| (c.bpm - grid.bpm * 1.5).abs() < 1e-6)
+        {
+            assert!(
+                three_halves.salience < METRICAL_32_SALIENCE_MIN,
+                "click train must not tempt the metrical re-check: {:?}",
+                three_halves
+            );
+        }
     }
 
     #[test]
