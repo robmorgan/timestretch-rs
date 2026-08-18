@@ -12,13 +12,12 @@ The engine rebuild that was this roadmap's original subject is **complete**
 stages and their evidence live in [LEARNINGS.md](LEARNINGS.md); full stage
 texts are in git history (tag `v0.10.0` has the last pre-rewrite version).
 
-What remains is quality closure, not architecture: an August 2026
-full-code review against Rubber Band (findings recorded in LEARNINGS.md)
-identified confirmed defects in the wide-ratio phase vocoder, a
-mischaracterized offline wide path, ride-polish gaps in the DJ chain, and a
-measured tonal-HF granulation floor that needs a listening verdict — plus
-the still-open analysis-trust track (Stage 10); the robustness track
-(Stage 12) completed 2026-08-13.
+The quality-closure phase that followed (Stages 10 and 12–19, spawned
+by the August 2026 full-code review against Rubber Band) **completed
+2026-08-18**: every stage closed with a recorded owner verdict and its
+evidence archived in LEARNINGS.md. What remains in this file is the
+settled architecture, the binding policies, the deliberately-parked
+ideas (Not a Priority Yet), and the un-scheduled 1.0 path.
 
 ## Status (2026-08-05)
 
@@ -45,10 +44,13 @@ quality gates, bounded-drift gate (worst measured 4.5 ms over an
 hour-equivalent), no-panic audit clean, weekly re-seeded fuzz campaign;
 three real fixes landed on the way; archived in LEARNINGS.md.
 
-Open, in priority order for the DJ app:
+**No stages are open. The quality-closure roadmap completed
+2026-08-18** with the Stage 10 owner ear session: annotation click
+renders confirmed on the beat for the hip-hop rows and teen-spirit
+("everything seems pretty spot on"), and the desktop honest
+low-confidence display verified on real material. Stage 10 archived in
+LEARNINGS.md with the rest.
 
-- **Stage 10** — beat-grid trust on everything a DJ loads (non-EDM
-  corpus evidence half; the non-adopter class is closed).
 Stage 19 (direct-ratio wide path) completed 2026-08-14 (PR #60) — the
 PV owns the tempo axis for the wide profile as the graph's demand
 inverter; the Stage 11 topology is deleted. Blind exit listen (8
@@ -177,137 +179,8 @@ corrector was never falsified.
 
 ## Stage Sequence
 
-Stages are independent tracks. (Stages 12–19 are complete or closed.)
-Remaining: Stage 10's non-EDM corpus half.
-
-## [ ] Stage 10: General-Purpose Beat Tracking and BPM Detection
-
-Automation: auto
-
-> **Status (2026-08-05): algorithm side landed and extended; evidence half
-> and the non-adopter class remain.** Landed since the original stage text:
-> tempogram + DP tracker (`src/analysis/tempogram.rs`,
-> `src/analysis/beat.rs`), tempo segments + downbeats in the artifact,
-> beat-level metrics (F-measure ±70 ms, continuity) in `qa/bpm_accuracy.rs`
-> in CI, desktop grid overlay with grid-accurate jumps/loops, **rigid
-> kick-band grid fitting for quantized material** (v0.10.0: beat F
-> 71.5%→93.8%, downbeat F 20.7%→76.4%; adoption gated on
-> `phase_lock ≥ 0.3`), and hand-corrected annotations wired into
-> `benchmarks/manifest.toml` (13+ tracks). Caveat recorded in LEARNINGS.md:
-> the beat-F gain is partly self-confirming — annotations share the
-> rigid-fit method; ear verification stays the honest check.
-
-> **Status (2026-08-16): non-EDM corpus staged** (4 owner-library rows,
-> AIFF, hash-locked): hip-hop ~90/92 (in-da-club, california-love), a
-> tempo-conformed rock pool edit at 116 (smells-like-teen-spirit), and a
-> genuine live-band recording at ~145 (i-got-you). Tempo detection is
-> already clean — acc1 100% on all four (errors ≤ 0.04%). The beat-grid
-> half splits: teen-spirit ADOPTS rigid and scores beat F 1.000 with
-> sub-ms offsets (rigid adoption generalizes beyond four-on-floor,
-> pending the owner ear check), while BOTH hip-hop rows land in the
-> honest phase-untrusted bucket (confidence capped at 0.5, tracker
-> wandering 56–61 ms) — and the QM baseline scores 0.000 on them too,
-> with the rigid annotator itself phase-indecisive (lock 0.07–0.15), so
-> the hip-hop annotations are UNVERIFIED until the owner ear-checks the
-> grids; the class is the tracker's genuine open frontier, exactly what
-> this evidence half was meant to expose. i-got-you stays bpm-only (live,
-> non-rigid, capped — correct honest behavior). DnB: two CC rows added to
-> the PUBLIC corpus (CI-visible) — flood-encoder-dx900 (CC-BY, true 174)
-> and parallel-stuck-in-the-yellow-room (CC-BY-SA, rock-steady 170) —
-> and they exposed a real detector gap: **DnB locks the 2/3 metrical
-> level** (115.98/113.33), and widening the DJ tempo hint to 182
-> (landed, v11, no corpus regressions) does NOT flip it — the sub-level
-> wins on raw tempogram salience.
->
-> **Metrical-level second pass landed 2026-08-17 (v12)**: the candidate
-> ratios gained 2/3 and 3/2, and when the 3/2 candidate's salience
-> clears a measured threshold (corpus separation: true-higher-level
-> rows 0.76–0.82, everything else ≤ 0.60; threshold 0.70 mid-gap),
-> tracking re-runs with the prior centered at that level and adopts the
-> result only on convergence. Both DnB rows now detect EXACT (174.00 /
-> 170.00), every other corpus row is byte-unchanged, and acc1 is back
-> to 100% — with accuracy floors (acc1/acc2 ≥ 90) now enforced in the
-> public-corpus CI job per this stage's exit criteria. Closing data
-> point: the QM reference tracker reads the same rows at 111.9/113.0 —
-> the exact 2/3-level trap — so the tracker now resolves a class the
-> academic baseline does not. Remaining: the owner ear-verification
-> session (hip-hop annotation grids, the teen-spirit rigid adoption,
-> Somebody To Love's dimmed grid).
-
-### Why
-
-The DJ app needs trustworthy grids on everything a DJ loads. The corpus is
-still all-EDM (115–140 BPM club tracks), so the generalization claims are
-unproven, and the known rigid-fit non-adopters (MSBWY, Hot Stuff, Somebody
-To Love — offbeat disco bass competing with the kick phase) ship visibly
-wandering grids on quantized material (diagnosed 2026-08-03: Hot Stuff fits
-120.000 BPM exactly but phase_lock = 0.109, so the DP grid with 475–569 ms
-intervals draws instead).
-
-### Work
-
-- **Corpus evidence half**: non-EDM entries with annotated grids (hip-hop
-  ~90, DnB ~174, at least one live-drummer recording); explicit
-  acc2/F-measure floors on the non-EDM subset in CI; ~~the QM Vamp
-  baseline column~~ **done 2026-08-12** (output-only — qm-dsp is GPL,
-  never source: `benchmarks/generate_qm_baseline.py` stores
-  qm-barbeattracker beat times as JSON baselines, and the harness
-  reports per-row `qm_beat_f` plus a worst-row margin with an optional
-  `TIMESTRETCH_BPM_QM_MARGIN` floor; on the four locally-present EDM
-  rows our tracker wins every confidently-gridded row by 4.4–5.0pp,
-  and QM edges us +6.2pp only on Somebody To Love (beat F 0.37 vs
-  0.31 — the annotated-phase-indecisive track where both estimators
-  disagree with the annotation, consistent with its honest
-  low-confidence handling). QM baselines for the non-EDM entries
-  generate with the same script when that audio lands. The synthetic
-  tempo-ramp fixture is ~~done~~ (2026-08-07, in-harness, no committed
-  audio).
-- ~~Offbeat-bass disambiguation~~ **done 2026-08-07** (branch
-  `feat/rigid-grid-offbeat-disambiguation`): both roadmap candidates
-  (slot exclusion, onset-sharpness weighting) were prototyped and failed
-  on the class — swung rivals sit at scattered subdivision phases.
-  Landed instead: **tracked-beat corroboration** — a below-threshold fit
-  adopts when ≥ 60% of the DP tracker's beats (an independent estimator)
-  land on the rigid grid within 25 ms. Corpus: MSBWY and Hot Stuff now
-  adopt (beat F 0.95/0.93 → 1.00, downbeat F → 1.0, offsets sub-ms);
-  33rd Rate Revs X downbeat F 0 → 1.0; Somebody To Love honestly stays
-  out (agreement 0.28 — genuine estimator disagreement, the "annotated
-  phase-indecisive" bucket); a tempo-ramp control that phase_lock alone
-  would wrongly trust at 0.77 is rejected at 0.25. The 0.3 gate itself
-  is untouched. PREANALYSIS_VERSION → 9/9 per the CLAUDE.md policy.
-  **Desktop owner check passed 2026-08-07** ("the grids are spot on" —
-  Hot Stuff/MSBWY markers dead-on after sidecar regeneration). The
-  synthetic tempo-ramp fixture also landed (merged with PR #39): 120→132
-  BPM ramp with exact ground truth, scored through the shipping path in
-  the CI harness — beat F 0.956 vs the 0.85 floor, continuity 1.000,
-  tempo-trend asserted.
-- ~~Artifact invalidation policy~~ **done 2026-08-06**: versions bumped
-  to 8/8 so ambiguous v4–v7 sidecars regenerate; policy written into the
-  `src/core/preanalysis.rs` constant docs and RELEASE_CHECKLIST.md (which
-  was also rebuilt — it still referenced the pre-cutover engine).
-- Desktop owner check: grids visually aligned on real non-EDM tracks.
-
-### Exit Criteria
-
-- acc1/acc2 on the widened corpus ≥ current EDM-subset scores; non-EDM
-  floors enforced in CI (proposed acc2 ≥ 90%, beat F ≥ 0.85).
-- Tempo-ramp fixture and live-drummer recording tracked within tolerance;
-  no row where the QM baseline wins by more than noise.
-- ~~The three known non-adopters~~ two of three adopt with sub-ms offsets
-  (2026-08-07); Somebody To Love is measured as genuine estimator
-  disagreement — ~~annotate it as phase-indecisive and verify the
-  desktop shows an honest low-confidence grid for it~~ **done
-  2026-08-12** (PR #44 + review fixes): annotation marked
-  `phase_indecisive`, estimator disagreement on plausibly quantized
-  material caps stored confidence at 0.5 via an explicit
-  `BeatGrid::phase_untrusted` verdict (artifact-level measured 0.845 →
-  0.500, beat F 0.306; confident rows hold 0.88–0.91; ramps stay
-  uncapped — gated on the adoption sanity ratio), and the desktop dims
-  the grid and says "grid: low confidence" below 0.6. Versions bumped
-  9 → 10 so cached wrongly-confident sidecars regenerate. Owner visual
-  check on the real track pends the next desktop load (sidecars
-  regenerate on open).
-- Version-bump policy documented and applied on the next analysis change.
+All stages (10, 12–19) are complete or closed; evidence in
+LEARNINGS.md.
 
 ## Not a Priority Yet
 
@@ -362,7 +235,11 @@ cutover (2026-07-15)** and must keep holding. This roadmap is done when,
 in addition:
 
 - Trustworthy beat grids on everything a DJ loads, gated on an annotated
-  corpus that includes non-EDM and variable-tempo material (Stage 10).
+  corpus that includes non-EDM and variable-tempo material (Stage 10,
+  done 2026-08-18 — hip-hop/rock/live/DnB rows, CI floors, owner
+  ear-verified annotations; the hip-hop beat-PHASE class is a documented
+  open frontier where the QM reference also scores zero, gated by the
+  corpus for whenever it is re-attacked).
 - The wide-ratio path is free of known correctness defects (Stage 13,
   done), its offline and live renders are the same algorithm, and stereo
   coherence is gated (Stage 14).
