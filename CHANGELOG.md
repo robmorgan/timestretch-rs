@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.12.0
+
+The quality-closure roadmap release: every open stage from the 2026-08-05
+review (Stages 10, 12–19) closed with a recorded blind-listening verdict.
+
+### Breaking changes
+
+- `EngineProfile::WideKeylock` has a new head: a direct-ratio
+  phase-vocoder demand inverter (`WidePvHead`) owns the tempo axis
+  instead of a varispeed-then-correct chain. Its latency contract
+  changed from a 48.6 ms pipeline delay to **0 ms** — the analysis
+  window is source-side lookahead, so like tape the first delivered
+  frame is source frame 0. Hosts that compensated the old wide delay
+  externally must drop that offset (position queries were and remain
+  self-compensating). Retarget landing in the wide profile is
+  hop-quantized (≈5.8 ms); emission counts stay frame-exact.
+- Cached analysis artifacts regenerate: `PREANALYSIS_VERSION` is now 12
+  and `MIN_COMPATIBLE_VERSION` rose to 12 (from 7/4 at v0.11.0), because
+  beat grids and tempo estimates changed materially across this span
+  (phase hygiene, rigid-grid adoption, metrical-level second pass).
+  `.tsa` sidecars from earlier versions are re-analyzed on load.
+
+### Added
+
+- `EngineController::retargets_degraded()`: counts timestamped
+  retargets degraded to immediate latest-wins because more than
+  `MAX_PENDING_RETARGETS` were in flight (#45 — previously silent;
+  `dropped_events()` only covers mailbox overflow). The constant is now
+  public, and `set_tempo_rate_at` documents the cap and the
+  ≤8-in-flight scheduling pattern for long tempo curves.
+- Metrical-level second pass in beat tracking: when the 3/2 tempo
+  candidate's salience clears a measured threshold, tracking re-runs
+  with the prior centered at that level and adopts on convergence —
+  drum & bass now detects its true ~174 BPM instead of the 2/3
+  sub-level. DJ tempo hint range widened 100–160 → 100–182 BPM.
+- Stereo in the wide profile runs mid/side: source-faithful width
+  (per-channel processing manufactured ~16 dB of side energy by
+  decorrelation).
+
+### Changed
+
+- Keylock chain: steady-rate cadence stretch for SOLA splices — at
+  sustained slowdowns the corrector splices at twice the steady cadence
+  with a tapered stretch budget, removing the audible splice-rate
+  artifact (gated off during tempo ramps to protect ride cymbals).
+- Phase-vocoder phase hygiene (Stage 13): per-sample fade ramps and a
+  modulation-hold contract fix batch-path phase artifacts.
+- Rigid-grid beat corroboration adopts rigid grids on syncopated
+  material, and estimator disagreement caps stored artifact confidence
+  at 0.5 so hosts can flag uncertain grids.
+- Keylock seam: mild-motion bounded recenter — the SOLA seam survives
+  sustained ride cymbals (Stage 15).
+
+### QA
+
+- Blind A/B harness: `scripts/ab.sh` renders level-matched, blinded,
+  sealed-key arm sets (current tree, any git ref, rubberband reference);
+  `tools/ab-tui` is an interactive two-pane listening TUI writing
+  machine-readable verdicts (`results.json`).
+- Non-EDM benchmark corpus rows (hip-hop, rock, funk/live) plus two
+  CC-licensed drum & bass public-corpus rows; CI now enforces ≥90%
+  tempo-accuracy floors on the public corpus.
+- Engine soak hardening (Stage 12): position-drift gate, no-panic
+  audit, weekly re-seeded fuzz campaign; the soak also gates
+  `retargets_degraded() == 0`.
+
 ## 0.11.0
 
 ### Breaking changes
