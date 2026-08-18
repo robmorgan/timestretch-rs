@@ -101,6 +101,9 @@ pub(crate) struct EngineShared {
     tail: AtomicUsize,
     /// Events dropped because the mailbox was full.
     dropped_events: AtomicU64,
+    /// Timestamped retargets degraded to ASAP because the pending queue
+    /// was full (the value applied, the timestamp was lost).
+    retargets_degraded: AtomicU64,
     /// Latest tempo target (f64 bits): convergence backstop if events drop.
     tempo_latest_bits: AtomicU64,
     /// Latest keylock target (f64 bits): convergence backstop if events drop.
@@ -121,6 +124,7 @@ impl EngineShared {
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
             dropped_events: AtomicU64::new(0),
+            retargets_degraded: AtomicU64::new(0),
             tempo_latest_bits: AtomicU64::new(initial_tempo_rate.to_bits()),
             keylock_latest_bits: AtomicU64::new(1.0f64.to_bits()),
             underrun_frames: AtomicU64::new(0),
@@ -175,6 +179,10 @@ impl EngineShared {
     pub(crate) fn store_tempo_latest(&self, rate: f64) {
         self.tempo_latest_bits
             .store(rate.to_bits(), Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_retarget_degraded(&self) {
+        self.retargets_degraded.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn add_underrun_frames(&self, frames: u64) {
@@ -239,6 +247,14 @@ impl EngineController {
     /// rate's first output sample is exactly `at_output_frame`. Timestamps
     /// in the past apply immediately; multiple pending retargets apply in
     /// timestamp order.
+    ///
+    /// At most [`MAX_PENDING_RETARGETS`](crate::engine::MAX_PENDING_RETARGETS)
+    /// retargets may be in flight. Overflow degrades to an IMMEDIATE
+    /// latest-wins rate change (the value survives, the timestamp does
+    /// not) and is counted by
+    /// [`retargets_degraded`](Self::retargets_degraded) — bulk-scheduling
+    /// a long tempo curve should feed at most that many events ahead of
+    /// the delivered position.
     pub fn set_tempo_rate_at(&self, rate: f64, at_output_frame: u64) {
         // Scheduled retargets do not touch the latest-value register — it
         // backs ASAP semantics only.
@@ -313,6 +329,17 @@ impl EngineController {
     /// Control events dropped due to mailbox overflow (should stay 0).
     pub fn dropped_events(&self) -> u64 {
         self.shared.dropped_events.load(Ordering::Relaxed)
+    }
+
+    /// Timestamped retargets degraded to ASAP because more than
+    /// [`MAX_PENDING_RETARGETS`](crate::engine::MAX_PENDING_RETARGETS)
+    /// were in flight (issue #45). The rate VALUE still applies
+    /// (latest-wins, immediately), but its timestamp is lost — a
+    /// bulk-scheduled tempo curve that trips this will drift. Keep at
+    /// most that many retargets pending (schedule event k+N once
+    /// delivered output passes event k) and this stays 0.
+    pub fn retargets_degraded(&self) -> u64 {
+        self.shared.retargets_degraded.load(Ordering::Relaxed)
     }
 
     /// Engine sample rate in Hz.

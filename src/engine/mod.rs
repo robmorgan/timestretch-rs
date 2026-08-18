@@ -53,7 +53,7 @@ pub mod stage;
 pub mod stages;
 
 pub use control::{EngineController, MAX_TEMPO_RATE, MIN_TEMPO_RATE};
-pub use graph::EngineProcessor;
+pub use graph::{EngineProcessor, MAX_PENDING_RETARGETS};
 pub use profiles::EngineProfile;
 pub use source::SourceProducer;
 pub use stage::{BLOCK_FRAMES, BlockBuf, Stage, StageCtx};

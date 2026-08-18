@@ -366,3 +366,43 @@ fn retarget_before_first_process_applies_from_frame_zero() {
         );
     }
 }
+
+/// Issue #45: bulk-scheduling more than `MAX_PENDING_RETARGETS`
+/// timestamped retargets degraded the overflow to ASAP latest-wins
+/// SILENTLY — `dropped_events()` stayed 0 while a 92-event tempo curve
+/// froze at the 8th event's rate with seconds of position drift. The
+/// degradation is now counted.
+#[test]
+fn retarget_overflow_is_counted_not_silent() {
+    use timestretch::engine::MAX_PENDING_RETARGETS;
+    let handles = Engine::build(EngineConfig {
+        sample_rate: SAMPLE_RATE,
+        channels: 1,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let (controller, mut processor, mut source) =
+        (handles.controller, handles.processor, handles.source);
+
+    // Within the cap: nothing degrades.
+    for k in 0..MAX_PENDING_RETARGETS {
+        controller.set_tempo_rate_at(1.0 + 0.001 * k as f64, 10_000 + 1_000 * k as u64);
+    }
+    source.push(&vec![0.0f32; 8_192]);
+    let mut out = vec![0.0f32; 512];
+    processor.process(&mut out);
+    assert_eq!(controller.retargets_degraded(), 0);
+    assert_eq!(controller.dropped_events(), 0);
+
+    // Four past the cap: each degradation is counted, none silently.
+    for k in 0..4u64 {
+        controller.set_tempo_rate_at(1.05, 200_000 + 1_000 * k);
+    }
+    processor.process(&mut out);
+    assert_eq!(
+        controller.retargets_degraded(),
+        4,
+        "every overflow degradation must be counted"
+    );
+    assert_eq!(controller.dropped_events(), 0);
+}

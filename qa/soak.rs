@@ -427,6 +427,11 @@ fn run_segment(
         0,
         "soak[{profile:?}]: mailbox overflow"
     );
+    assert_eq!(
+        controller.retargets_degraded(),
+        0,
+        "soak[{profile:?}]: timestamped retargets silently degraded (issue #45 class)"
+    );
 
     // Finiteness everywhere, including priming/declick regions.
     for (i, &s) in collected.iter().enumerate() {

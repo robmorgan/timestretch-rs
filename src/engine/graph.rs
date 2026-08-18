@@ -37,7 +37,11 @@ const PRIME_BUDGET_MAX_FRAMES: u64 = 2_048;
 /// Declick fade-in length after priming completes, in frames.
 const DECLICK_FRAMES: u32 = 64;
 /// Maximum timestamped retargets held in flight.
-const MAX_PENDING_RETARGETS: usize = 8;
+/// Maximum timestamped retargets in flight (see
+/// [`EngineController::set_tempo_rate_at`](crate::engine::EngineController::set_tempo_rate_at)):
+/// scheduling more before earlier ones apply degrades the overflow to
+/// ASAP latest-wins and counts it in `retargets_degraded()`.
+pub const MAX_PENDING_RETARGETS: usize = 8;
 /// Extra output frames of rate history retained behind the stages'
 /// consumption position (the SLOPE_WINDOW of the StageCtx build, rounded
 /// up), so the delay-matched rate and its slope never fall off the map.
@@ -510,8 +514,15 @@ impl EngineProcessor {
                         self.pending_retargets[i] = (event.at_frame, event.value);
                         self.pending_retarget_len += 1;
                     } else {
-                        // Queue full: degrade to ASAP rather than lose it.
+                        // Queue full: degrade to ASAP rather than lose the
+                        // VALUE — but the timestamped semantic IS lost, and
+                        // silently collapsing it produced multi-second
+                        // position drift invisible to telemetry (issue
+                        // #45: 92 bulk-scheduled retargets froze the rate
+                        // at the 8th event with dropped_events() == 0).
+                        // Count every degradation so callers can detect it.
                         saw_asap_tempo = true;
+                        self.shared.add_retarget_degraded();
                         self.shared
                             .store_tempo_latest(clamp_tempo_rate(event.value));
                     }
