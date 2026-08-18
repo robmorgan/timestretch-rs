@@ -674,3 +674,56 @@ Lessons:
   mirror-pad phase flaw shipped in the batch path (pinned as a
   "trait") and nearly shipped again in the head's warmup. When a fix
   explains an OLD pinned number, re-derive the old pin.
+
+## Stage 10 — General-Purpose Beat Tracking and BPM Detection (2026-08-18)
+
+The longest-running stage (opened before the engine rebuild finished;
+closed as the roadmap's final act). What shipped, in order:
+
+- Tempogram + DP tracker, tempo segments and downbeats in the artifact,
+  beat-level metrics in CI, desktop grid overlay (pre-review).
+- Rigid kick-band grids for quantized material (v0.10.0: beat F 71.5% →
+  93.8%), then tracked-beat corroboration for the syncopated
+  non-adopters (2026-08-07: two of three adopt with sub-ms offsets;
+  Somebody To Love measured as genuine estimator disagreement).
+- Honest low-confidence display (PR #44 + review fixes): estimator
+  disagreement caps the ARTIFACT confidence via an explicit
+  `phase_untrusted` verdict; desktop dims below 0.6. Owner-verified on
+  real material 2026-08-18.
+- QM Vamp baseline column (PR #50): output-only external reference —
+  we beat QM on every confidently-gridded EDM row.
+- Non-EDM corpus (PRs #63/#64): hip-hop ×2, tempo-conformed rock, live
+  James Brown (owner library, hash-locked), plus two CC drum & bass
+  rows in the PUBLIC corpus with acc1/acc2 ≥ 90 floors enforced in CI.
+- **Metrical-level second pass (v12)**: the corpus exposed DnB locking
+  the 2/3 tempo level. Measured separation (3/2-candidate salience
+  0.76–0.82 on true-higher-level rows vs ≤ 0.60 elsewhere) drove a
+  threshold + re-track-with-shifted-prior + convergence-guard design.
+  Both DnB rows EXACT (174.00/170.00), zero changes elsewhere — and
+  the QM reference reads the same rows at 111.9/113.0, so the tracker
+  now resolves a class the academic baseline does not.
+
+**Owner ear session (2026-08-18, the roadmap's final gate)**:
+annotation click renders on the beat for in-da-club, california-love,
+and smells-like-teen-spirit ("everything seems pretty spot on"); the
+desktop honest low-confidence display confirmed. With verified
+annotations, the hip-hop beat-PHASE class (our tracker AND QM both
+score ~0 against ground truth) is a documented open frontier, gated by
+the corpus rows for whenever it is re-attacked.
+
+Lessons:
+
+- An evidence half is not bureaucracy: within days of landing, the
+  non-EDM corpus surfaced two real detector classes (DnB metrical
+  level, hip-hop phase) that two years of EDM-only evidence never
+  could.
+- Measure the separation before picking the threshold: the 0.70
+  metrical gate was read off a measured 0.60→0.76 gap across the whole
+  corpus, not tuned until the failing rows passed.
+- A genre folder label is not ground truth: the "live drummer" rock
+  pick turned out to be a tempo-conformed pool edit — which made it a
+  BETTER corpus row (non-EDM rigid case) than the one it was picked
+  to be.
+- External references cut both ways: the QM column first corroborated
+  our honest-uncertainty verdicts, then certified a genuine win when
+  we out-resolved it on DnB.
