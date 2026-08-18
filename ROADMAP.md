@@ -179,20 +179,43 @@ corrector was never falsified.
 
 ## Stage Sequence
 
-All stages (10, 12–19) are complete or closed; evidence in
-LEARNINGS.md.
+Stages 10 and 12–19 are complete or closed; evidence in LEARNINGS.md.
+
+### Stage 20 — Bounded Width Treatment (kill experiment first)
+
+Promoted from Not-a-Priority-Yet 2026-08-18 by owner request. The
+recurring blind evidence (Stage 16, Stage 14 attribution, Stage 19 exit
+listen): the owner consistently prefers the WIDER presentation, and
+decorrelation both flatters and masks artifacts. The shipped paths stay
+faithful (side/mid within 0.1 dB of source, by design) — so wideness
+becomes a deliberate, bounded, owner-taste side treatment, never an
+accident of uncoupled processing.
+
+**Kill question:** does a bounded, mono-safe side injection — fixed
+decorrelator on the corrected mid, high-passed, mixed into the side at
+the M/S decode seam — reproduce the blind width preference at matched
+side energy, without the batch path's defects (pinned sub-bass, phase
+mush)? Or is the preference specific to full per-channel decorrelation
+in a way an injected side cannot fake?
+
+**Measured targets (Stage 14):** source-faithful = +0 dB side/mid;
+Rubber Band ≈ +5 dB; the preferred batch arm ≈ +16 dB.
+
+**Falsifier:** blind listen on the conditions where the preference
+showed (msbwy / cold heart, ±30/±50), arms calibrated by measurement to
++0 / ≈+5 / ≈+16 dB added side, plus the actual pre-consolidation batch
+arm (`887d854`) and Rubber Band. If the bounded treatment at
+batch-matched energy neither wins nor ties the batch arm, the mechanism
+dies and the finding is recorded (the preference is about decorrelation
+character, not side level).
+
+**Prototype:** env-gated `TIMESTRETCH_PROTO_WIDTH=<gain>` in
+`WidePvHead`'s decode (mono-exact by construction: the injection
+cancels in L+R). Survival buys the build-out: a public width parameter,
+mono-sum and side/mid gates, WCET check, blind exit listen.
 
 ## Not a Priority Yet
 
-- Deliberate stereo-width treatment for the corrected paths. Recurring
-  blind evidence (Stage 16, Stage 14 attribution, Stage 19 exit listen,
-  2026-08-13/14): the owner consistently prefers the WIDER presentation,
-  and decorrelation both flatters and MASKS artifacts (three of four
-  arms "slightly roboty" at +50% — including Rubber Band — with only
-  the decorrelated batch arm escaping). The shipped paths stay faithful
-  (side/mid within 0.1 dB of source, by design); if wideness is ever
-  wanted it should be a bounded, deliberate side treatment — an owner
-  taste decision, not an accident of uncoupled processing.
 - Corrected low band at DJ ratios — re-litigating the sub-120 Hz
   pitch-follow scope line on the Stage 18 exit-listen evidence
   ("bass out of key" blind at ±8% on bass-forward material, no longer
