@@ -24,10 +24,11 @@ pub enum EngineProfile {
     /// Wide-range Master Tempo (CDJ "WIDE" range setting): a big-FFT
     /// identity-locked phase-vocoder corrector keylocks the FULL spectrum
     /// across the engine's whole tempo range (rates 0.25–2.0) with no
-    /// correction fade. Pipeline delay ≈ 48.6 ms at 44.1 kHz — a
-    /// deliberately different latency contract from [`Self::Keylock`],
-    /// reported honestly via the graph; switching profiles is a
-    /// seek-priced rebuild, not a live morph (ROADMAP Stage 11).
+    /// correction fade. The direct-ratio PV head buffers source-side
+    /// LOOKAHEAD rather than delaying output, so like tape the reported
+    /// pipeline delay is 0 ms and the first delivered frame is source
+    /// frame 0 (ROADMAP Stage 19); switching profiles is a seek-priced
+    /// rebuild, not a live morph.
     WideKeylock,
 }
 

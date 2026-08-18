@@ -23,7 +23,7 @@ beat-grid overlay, beat jumps, looping, and live keylock tempo control.*
 - **Real-time engine** — the audio callback gets exactly the
   frames it needs (`EngineProcessor::process`): infallible, allocation-free,
   lock-free on the audio thread, at a constant per-profile pipeline delay
-  (12.7 ms keylock, 48.6 ms wide-range Master Tempo, 0 ms tape)
+  (12.7 ms keylock, 0 ms wide-range Master Tempo and tape)
 - **Varispeed-first keylock** — a sinc-resampled tempo axis with a two-band
   keylock chain: the low band's pitch follows tempo (the club-correct
   choice), the high band is corrected by a time-domain SOLA corrector with
@@ -64,7 +64,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-timestretch = "0.11.0"
+timestretch = "0.12.0"
 ```
 
 ### One-Shot Stretching
@@ -128,11 +128,12 @@ processor.process(&mut out);
 ```
 
 Each profile has one honest constant latency figure: the keylock chain's
-**12.7 ms** pipeline delay, the wide-range Master Tempo chain's
-**48.6 ms** (`EngineProfile::WideKeylock` — CDJ-style full-spectrum
-keylock across tempo rates 0.25–2.0, a deliberately different contract),
-and tape's **0 ms** — with tempo control-to-audio bounded at one
-resampler feed chunk in every profile. Warm-start
+**12.7 ms** pipeline delay, and **0 ms** for both tape and the
+wide-range Master Tempo chain (`EngineProfile::WideKeylock` — CDJ-style
+full-spectrum keylock across tempo rates 0.25–2.0; its direct-ratio
+phase-vocoder head buffers source-side lookahead rather than delaying
+output, so the first delivered frame is source frame 0) — with tempo
+control-to-audio bounded at one resampler feed chunk in every profile. Warm-start
 seek/cue (`controller.warm_start`), gapless loop wraps
 (`set_track_position`), and pre-analysis artifacts
 (`EngineConfig::pre_analysis`) are first-class deck operations — the
@@ -260,9 +261,9 @@ The engine is a fixed stage graph driven from the audio callback:
    (deck-stop/spinback territory).
 
 4. **Exact timeline** — each profile's constant pipeline delay (12.7 ms
-   keylock, 48.6 ms wide) is reported, compensated in position queries,
-   and structurally trimmed in offline renders; output length is exact by
-   construction.
+   keylock, 0 ms wide and tape) is reported, compensated in position
+   queries, and structurally trimmed in offline renders; output length is
+   exact by construction.
 
 ## Parameters
 
