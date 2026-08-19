@@ -245,6 +245,28 @@ the corrected bass reads worse than the detuned one (wobble, lost
 punch, seam artifacts), the scope line stands re-validated against the
 stronger falsifier and the finding is recorded.
 
+**Kill-experiment verdict (2026-08-19, blind, 4 conditions × 3 arms,
+sealed key, `target/ab/stage21-bass/results.json`): SURVIVED.** The
+corrected bass beat pitch-follow in ALL FOUR conditions — the shipped
+detuned bass read as the artifact ("dirty, distorted bass", "bassline
+sucks, distorted, hum noise", "strange bass hums") while the proto read
+"bass hitting well / open, clean, bass ok / good drums". Measured: the
+proto's low band lands within ~20 cents of Rubber Band's in-key
+reference on the stable-bass track; shipped sits ~130 cents off (the
+±8% detune). One residual on msbwy −8%: "kicks smearing a bit" — the
+predicted failure mode of the un-wired onset protection, and still
+preferred over the detuned arm.
+
+**Build-out (bought by survival):** onset-protected splicing (wire
+`ctx.onsets`, protect kick windows like the high-band corrector); an
+RT-safe period estimator (budgeted/incremental NCC — the proto's full
+sweep is not WCET-viable); extreme-rate fade and live keylock-toggle
+wiring (bass must follow the same fades as the high band); A/B matrix
+and WCET gates; blind exit listen. The Stage 2 scope line
+("un-keylocked low band won") is superseded: that verdict rejected a
+VOCODER bass, and the time-domain corrector wins where the vocoder
+lost.
+
 ## Not a Priority Yet
 
 - SIMD / architecture-specific acceleration (WCET gates exist to measure
