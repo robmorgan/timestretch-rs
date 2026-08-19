@@ -97,10 +97,12 @@ impl KeylockStage {
     pub(crate) fn new(sample_rate: u32, channels: usize) -> Self {
         let sola = SolaCorrector::new(channels, KEYLOCK_LATENCY_FRAMES);
         debug_assert_eq!(sola.latency_frames(), KEYLOCK_LATENCY_FRAMES);
+        let bass_sola = BassSola::new(channels, KEYLOCK_LATENCY_FRAMES);
+        debug_assert_eq!(bass_sola.latency_frames(), KEYLOCK_LATENCY_FRAMES);
         Self {
             split: TwoBandSplit::new(KEYLOCK_CROSSOVER_HZ, sample_rate, channels),
             low_delay: FixedDelay::new(KEYLOCK_LATENCY_FRAMES, channels),
-            bass_sola: BassSola::new(channels, KEYLOCK_LATENCY_FRAMES),
+            bass_sola,
             raw_high_delay: FixedDelay::new(KEYLOCK_LATENCY_FRAMES, channels),
             sola,
             low: vec![[0.0; BLOCK_FRAMES]; channels],

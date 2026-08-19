@@ -35,9 +35,12 @@
 //!   by the fade) or trimmed continuously at an inaudible micro-detune.
 //!
 //! Holds the chain's nominal lag ([`super::keylock::KEYLOCK_LATENCY_FRAMES`])
-//! so the band re-sum stays aligned; the read cursor wobbles elastically
-//! by up to ± one bass period around it, like the high-band corrector at
-//! larger scale.
+//! so the band re-sum stays aligned; while correcting, the read cursor
+//! rides a period-quantized sawtooth ABOVE it (the hard floor sits only
+//! ~120 frames below nominal, so the corridor mean — the low band's
+//! group-delay bias against the high band — is ~+0.4 period, ~5-7 ms of
+//! constant sub delay during a sustained offset; irreducible without
+//! breaking the latency contract, and pinned by a regression test).
 
 use crate::engine::stage::{BLOCK_FRAMES, OnsetEvent};
 
@@ -54,8 +57,10 @@ const CORR_WIN: usize = 768;
 /// Coarse sweep lag step; a fine pass refines around the coarse peak.
 const SWEEP_STEP: usize = 4;
 /// Sweep lags evaluated per block: bounds the estimator's per-callback
-/// cost (this × CORR_WIN mults) and completes a full sweep in ~33 blocks
-/// (~24 ms) — faster than bass periods move.
+/// cost (this × CORR_WIN mults; the publishing block additionally runs
+/// the ±(SWEEP_STEP−1) fine pass, ~2× that bound worst-case) and
+/// completes a full sweep in ~33 blocks (~24 ms) — faster than bass
+/// periods move.
 const SWEEP_LAGS_PER_BLOCK: usize = 8;
 /// Minimum NCC peak for the band to count as periodic at all.
 const PERIODICITY_MIN: f64 = 0.5;
@@ -72,7 +77,14 @@ const RETRY_COOLDOWN: usize = 64;
 /// masked window after a hit) once this fraction of a period drained.
 const OPPORTUNISTIC_DRIFT_FRAC: f64 = 0.25;
 /// "Quiet" = short-term energy below this fraction of the rolling mean.
+/// The FAST envelope must average over at least one full bass period —
+/// mean-square ripples at 2·f0, and a shorter constant tracks the
+/// waveform's own troughs, declaring loud sustained bass "quiet" twice
+/// per period (review F1: measured 10-30% false duty on steady tones).
 const QUIET_RATIO: f32 = 0.5;
+/// Fast envelope: τ ≈ 1_250 frames (≥ PERIOD_MAX). Slow: τ ≈ 20_000.
+const ENV_FAST_COEFF: f32 = 0.000_8;
+const ENV_SLOW_COEFF: f32 = 0.000_05;
 /// Onset protection window (frames around the event a fade must not
 /// touch): a kick's sub-bass body rings long past its attack.
 const ONSET_PROTECT_PRE: f64 = 128.0;
@@ -81,7 +93,9 @@ const ONSET_PROTECT_POST: f64 = 1_536.0;
 /// (beats and flux-less artifacts publish 1.0 and always qualify).
 const ONSET_FLUX_MIN: f32 = 0.25;
 /// Masked window after a qualifying hit: the best splice hiding place.
-const MASKED_WINDOW_START: f64 = 1_024.0;
+/// Starts past ONSET_PROTECT_POST (+ margin) so a "hidden" candidate is
+/// not immediately vetoed by the protection check (review F8).
+const MASKED_WINDOW_START: f64 = 1_700.0;
 const MASKED_WINDOW_END: f64 = 3_072.0;
 /// Transposition clamp, matching the high-band corrector's soft limit:
 /// beyond it the extreme-rate fade owns the output anyway.
@@ -96,10 +110,8 @@ const TRANSPOSITION_CLAMP: f64 = 1.35;
 /// drift tight enough — so mild rides do not correct at all.
 const CORRECT_RAMP_START: f64 = 0.010;
 const CORRECT_RAMP_END: f64 = 0.020;
-/// Rest detection (|1 - transposition| below this) and the micro-trim
-/// slew used to repay sub-period drift at rest: ~3.5 cents on the sub
-/// band, inaudible, converging a worst-case half-period park in ~4 s.
-const REST_DEV: f64 = 0.003;
+/// Micro-trim slew used to repay sub-period drift while correction is
+/// disengaged: ~3.5 cents on the sub band, inaudible.
 const REST_TRIM_MAX: f64 = 0.002;
 /// At rest, drift below this is close enough (seam phase error at the
 /// 120 Hz band edge stays under ~4°).
@@ -300,6 +312,9 @@ impl BassSola {
     /// Processes one fixed block for every channel in lockstep: ingests,
     /// advances the period sweep, emits at the transposition rate, and
     /// splices when the elastic lag calls for it.
+    // The frame loop indexes io[ch][i] for every channel in lockstep;
+    // clippy's iterator suggestion fits only the single-array case.
+    #[allow(clippy::needless_range_loop)]
     pub(crate) fn process_block(&mut self, io: &mut [[f32; BLOCK_FRAMES]], onsets: &[OnsetEvent]) {
         debug_assert_eq!(io.len(), self.rings.len());
         // Correction engagement: below the ramp the effective
@@ -326,8 +341,8 @@ impl BassSola {
             mean /= channels as f32;
             self.mono[widx] = mean;
             self.write += 1;
-            self.env_fast += 0.02 * (mean * mean - self.env_fast);
-            self.env_slow += 0.0005 * (mean * mean - self.env_slow);
+            self.env_fast += ENV_FAST_COEFF * (mean * mean - self.env_fast);
+            self.env_slow += ENV_SLOW_COEFF * (mean * mean - self.env_slow);
 
             // Rest micro-trim: while correction is disengaged, repay
             // residual sub-period drift by a bounded read-rate detune —
@@ -361,12 +376,12 @@ impl BassSola {
             if self.fade_left > 0 {
                 continue; // one splice in flight at a time
             }
-            self.splice_decision(t, nominal, onsets);
+            self.splice_decision(t, nominal, c == 0.0, onsets);
         }
     }
 
     /// Considers one splice at the current cursor state.
-    fn splice_decision(&mut self, t: f64, nominal: f64, onsets: &[OnsetEvent]) {
+    fn splice_decision(&mut self, t: f64, nominal: f64, disengaged: bool, onsets: &[OnsetEvent]) {
         // Positive drift = read is late (lag grew, transposing down);
         // negative = read is catching the write head (transposing up).
         // The lag change per frame is `v = 1 - t`; repayment jumps must
@@ -383,9 +398,12 @@ impl BassSola {
         let hard_low = MARGIN + fade_travel + 16.0;
         let hard_high = (RING_LEN - CORR_WIN) as f64 - fade_travel - 16.0;
         let forced = lag < hard_low || lag > hard_high;
-        let at_rest = v.abs() < REST_DEV;
+        // Rest = correction disengaged (c == 0), NOT small effective |v|:
+        // a partially-engaged ride compresses v below any fixed epsilon
+        // (review F2 — dev ≈ 1.2% gave |v| ≈ 0.0024) and must keep the
+        // directional due path, or drift walks to the forced bound.
+        let at_rest = disengaged;
         let quiet = self.env_fast < QUIET_RATIO * self.env_slow;
-        debug_assert!(REST_DEV < CORRECT_RAMP_START); // rest ⊂ disengaged
         if !forced {
             if self.retry_cooldown > 0 {
                 self.retry_cooldown -= 1;
@@ -395,21 +413,36 @@ impl BassSola {
                 // Rest recentering: sub-period residue is the trim's job;
                 // a QUIET gap lets the whole residual go at once (the
                 // fade hides an unaligned jump only when nothing rings).
-                if quiet && drift.abs() > SLACK && !self.span_hits_onset(onsets, self.read, t) {
+                let target = (self.read + drift)
+                    .clamp(self.write as f64 - hard_high, self.write as f64 - hard_low);
+                if quiet
+                    && drift.abs() > SLACK
+                    && !self.span_hits_onset(onsets, self.read, t)
+                    && !self.span_hits_onset(onsets, target, t)
+                {
                     self.recenter_splice(drift, hard_low, hard_high);
                 }
                 return;
             }
             let p = self.period.unwrap_or(PERIOD_MIN) as f64;
+            // Start-of-stream polish (review F10): the first discretionary
+            // jump back would land in the silent prefill; wait until a
+            // period of real history exists (forced still allowed).
+            if (self.write as f64) < nominal + p {
+                return;
+            }
             let hidden = quiet || self.in_masked_window(onsets);
             // Directional thresholds. Draining DOWN (v < 0) the hard
             // floor sits only ~120 frames below nominal, so the splice
-            // must come EARLY — still ~p/4 above nominal — or every
-            // splice arrives forced (and forced splices skip onset
-            // protection). Draining UP there are thousands of frames of
-            // room, so waiting half a period keeps splices sparse.
+            // must come EARLY — or every splice arrives forced (and
+            // forced splices skip onset protection). The thresholds sit
+            // as close to the floor as the retry budget allows (review
+            // F3): the corridor mean is the low band's group-delay bias
+            // against the high band, irreducible below ~+0.4·p given the
+            // 560-frame contract and period-quantized jumps — keep it at
+            // that geometric floor, not above it.
             let due = if v < 0.0 {
-                drift < p * 0.25 || (hidden && drift < p * 0.5)
+                drift < p * 0.1 || (hidden && drift < p * 0.25)
             } else {
                 drift > p * 0.5 || (hidden && drift > p * OPPORTUNISTIC_DRIFT_FRAC)
             };
@@ -574,18 +607,27 @@ mod tests {
     }
 
     #[test]
-    fn stereo_channels_stay_identical_through_splices() {
-        // Lockstep contract: identical inputs must produce bit-identical
-        // outputs on both channels — one splice decision for the pair.
+    fn stereo_channels_splice_in_lockstep() {
+        // Lockstep contract: with R = -0.8·L, per-channel decisions would
+        // splice the two channels at different times (identical inputs
+        // could not catch that). The scale relation must survive exactly.
         let mut bass = BassSola::new(2, LAG);
         bass.set_transposition(1.08);
         let input = sine(60.0, 4 * 44_100);
         for chunk in input.chunks(BLOCK_FRAMES) {
             let mut block = [[0.0f32; BLOCK_FRAMES]; 2];
             block[0][..chunk.len()].copy_from_slice(chunk);
-            block[1][..chunk.len()].copy_from_slice(chunk);
+            let (l_half, r_half) = block.split_at_mut(1);
+            for (r, &l) in r_half[0].iter_mut().zip(l_half[0].iter()) {
+                *r = -0.8 * l;
+            }
             bass.process_block(&mut block, &[]);
-            assert_eq!(block[0], block[1], "channels diverged");
+            for (l, r) in block[0].iter().zip(block[1].iter()) {
+                assert!(
+                    (r - (-0.8 * l)).abs() < 1e-5,
+                    "channels spliced independently: L={l} R={r}"
+                );
+            }
         }
         assert!(
             !bass.splice_log.is_empty(),
@@ -632,17 +674,75 @@ mod tests {
     }
 
     #[test]
-    fn rest_recenters_parked_drift() {
-        // Ride at +8% long enough to park drift, then rest: the parked
-        // lag must converge back toward nominal (the seam contract).
+    fn rest_quiet_gap_recenters_parked_drift() {
+        // Park drift with a ride, then rest through tone → SILENCE → tone:
+        // the quiet-gap recenter must repay the park in one hidden splice.
         let mut bass = BassSola::new(1, LAG);
         let _ = run(&mut bass, &sine(60.0, 4 * 44_100), 1.08, &[]);
         let parked = (bass.write as f64 - bass.read - LAG as f64).abs();
+        assert!(parked > SLACK, "ride must park drift (got {parked:.1})");
+        let mut rest = sine(60.0, 44_100);
+        rest.extend(std::iter::repeat_n(0.0f32, 44_100));
+        rest.extend(sine(60.0, 44_100));
+        let _ = run(&mut bass, &rest, 1.0, &[]);
+        let settled = (bass.write as f64 - bass.read - LAG as f64).abs();
+        assert!(
+            settled < SLACK + REST_DRIFT_DONE,
+            "quiet gap did not recenter: {settled:.1} (parked {parked:.1})"
+        );
+    }
+
+    #[test]
+    fn rest_trim_converges_without_any_quiet_gap() {
+        // A LOUD unbroken tone at rest: only the micro-trim may act (the
+        // quiet detector must not fire on sustained bass — its envelope
+        // averages over full periods). Park a sub-trim-budget drift
+        // directly and verify convergence within the trim's own budget.
+        let mut bass = BassSola::new(1, LAG);
+        let _ = run(&mut bass, &sine(60.0, 44_100), 1.0, &[]);
+        bass.read -= 300.0; // park +300 frames of drift artificially
+        let splices_before = bass.splice_log.len();
         let _ = run(&mut bass, &sine(60.0, 8 * 44_100), 1.0, &[]);
         let settled = (bass.write as f64 - bass.read - LAG as f64).abs();
         assert!(
             settled < REST_DRIFT_DONE + 1.0,
-            "rest drift {settled:.1} (parked {parked:.1}) did not recenter"
+            "trim did not converge: {settled:.1}"
         );
+        assert_eq!(
+            bass.splice_log.len(),
+            splices_before,
+            "loud sustained bass must not trip the quiet recenter"
+        );
+    }
+
+    #[test]
+    fn correction_corridor_mean_stays_near_nominal() {
+        // Review F3: the sawtooth's mean is the low band's group-delay
+        // bias against the high band. Pin it at the geometric floor
+        // (~+0.4·p) rather than letting thresholds inflate it.
+        for t in [1.087, 0.926] {
+            let mut bass = BassSola::new(1, LAG);
+            bass.set_transposition(t);
+            let input = sine(55.0, 20 * 44_100);
+            let mut drift_sum = 0.0f64;
+            let mut drift_n = 0u64;
+            let mut warm = 0usize;
+            for chunk in input.chunks(BLOCK_FRAMES) {
+                let mut block = [[0.0f32; BLOCK_FRAMES]];
+                block[0][..chunk.len()].copy_from_slice(chunk);
+                bass.process_block(&mut block, &[]);
+                warm += chunk.len();
+                if warm > 2 * 44_100 {
+                    drift_sum += bass.write as f64 - bass.read - LAG as f64;
+                    drift_n += 1;
+                }
+            }
+            let mean = drift_sum / drift_n as f64;
+            let p = 802.0; // 55 Hz period
+            assert!(
+                mean.abs() < 0.65 * p,
+                "t={t}: corridor mean drift {mean:.0} frames exceeds 0.65·p"
+            );
+        }
     }
 }
