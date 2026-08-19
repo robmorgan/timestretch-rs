@@ -19,6 +19,7 @@
 
 use crate::engine::stage::{BLOCK_FRAMES, BlockBuf, Stage, StageCtx};
 use crate::engine::stages::band_split::{KEYLOCK_CROSSOVER_HZ, TwoBandSplit};
+use crate::engine::stages::bass_sola::BassSola;
 use crate::engine::stages::delay::FixedDelay;
 use crate::engine::stages::sola::SolaCorrector;
 
@@ -61,6 +62,12 @@ pub const KEYLOCK_TOGGLE_FADE_FRAMES: usize = 512;
 pub(crate) struct KeylockStage {
     split: TwoBandSplit,
     low_delay: FixedDelay,
+    /// PROTO Stage 21 (env-gated, None = shipped behavior): time-domain
+    /// low-band corrector replacing the pitch-follow delay. Holds the
+    /// same nominal lag, so band alignment and the latency contract are
+    /// unchanged. Not wired to the extreme-rate fade or the live keylock
+    /// toggle — the kill experiment runs offline at fixed DJ rates.
+    bass_sola: Option<BassSola>,
     /// Delayed copy of the RAW high band, kept warm for the extreme-rate
     /// fade-out (aligned with the corrector's constant nominal lag).
     raw_high_delay: FixedDelay,
@@ -90,6 +97,7 @@ impl KeylockStage {
         Self {
             split: TwoBandSplit::new(KEYLOCK_CROSSOVER_HZ, sample_rate, channels),
             low_delay: FixedDelay::new(KEYLOCK_LATENCY_FRAMES, channels),
+            bass_sola: BassSola::from_env(channels, KEYLOCK_LATENCY_FRAMES),
             raw_high_delay: FixedDelay::new(KEYLOCK_LATENCY_FRAMES, channels),
             sola,
             low: vec![[0.0; BLOCK_FRAMES]; channels],
@@ -119,13 +127,19 @@ impl Stage for KeylockStage {
 
         // Split every channel; keep the delayed low band and a delayed raw
         // copy of the high band for the extreme-rate fade-out.
+        if let Some(bass) = self.bass_sola.as_mut() {
+            bass.set_transposition(transposition);
+        }
         for ch in 0..block.channels() {
             let (low, high) = (&mut self.low[ch], &mut self.high[ch]);
             self.split.process_channel(ch, block.channel(ch), low, high);
             self.high_raw[ch].copy_from_slice(high);
             self.raw_high_delay
                 .process_channel(ch, &mut self.high_raw[ch]);
-            self.low_delay.process_channel(ch, low);
+            match self.bass_sola.as_mut() {
+                Some(bass) => bass.process_channel(ch, low),
+                None => self.low_delay.process_channel(ch, low),
+            }
         }
         self.sola.process_block(&mut self.high, ctx.onsets);
 
@@ -182,6 +196,9 @@ impl Stage for KeylockStage {
     fn reset(&mut self) {
         self.split.reset();
         self.low_delay.reset();
+        if let Some(bass) = self.bass_sola.as_mut() {
+            bass.reset();
+        }
         self.raw_high_delay.reset();
         self.sola.reset();
         self.enable = f32::NAN;

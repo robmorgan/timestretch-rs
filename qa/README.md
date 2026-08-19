@@ -61,9 +61,10 @@ when tweaking the algorithm:
 scripts/ab.sh render my-tweak --base main --rates 0.92,1.08 --rb \
     "benchmarks/audio/bpm-corpus/<track>.wav:90"
 
-# Listen in the blind TUI (hot-switch arms position-synced with a-e,
-# S = source reference, Enter to note an arm, w to pick a winner,
-# Ctrl-S to save):
+# Listen in the blind TUI (hot-switch arms position-synced with a-e or
+# space on the hovered arm, S = source reference, looping is on by
+# default — l turns it off, Enter to note an arm (←/→ edit the note),
+# w to pick a winner, Ctrl-S to save):
 scripts/ab.sh listen my-tweak
 ```
 
