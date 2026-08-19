@@ -2,9 +2,13 @@
 //! high: SOLA corrector) → re-sum, fading to plain varispeed at extreme
 //! rates.
 //!
-//! The low band is deliberately **not** keylocked — its pitch follows tempo
-//! (validated by the Stage 2 falsification listen) — so it only needs a
-//! pure delay matched to the corrector's constant nominal lag.
+//! The low band is corrected by its own time-domain SOLA-class corrector
+//! (`BassSola`, ROADMAP Stage 21 — the Stage 2 "un-keylocked low band won"
+//! verdict rejected a VOCODER bass; the time-domain corrector won the
+//! blind re-match in all four ±8% conditions). It blends against the
+//! pitch-follow delayed copy with the SAME per-frame weight as the high
+//! band, so the live keylock toggle and the extreme-rate fade move both
+//! bands together.
 //!
 //! The high band is corrected by the time-domain `SolaCorrector` across
 //! the ENTIRE corrected range. The chain originally carried a small-FFT
@@ -62,18 +66,17 @@ pub const KEYLOCK_TOGGLE_FADE_FRAMES: usize = 512;
 pub(crate) struct KeylockStage {
     split: TwoBandSplit,
     low_delay: FixedDelay,
-    /// PROTO Stage 21 (env-gated, None = shipped behavior): time-domain
-    /// low-band corrector replacing the pitch-follow delay. Holds the
-    /// same nominal lag, so band alignment and the latency contract are
-    /// unchanged. Not wired to the extreme-rate fade or the live keylock
-    /// toggle — the kill experiment runs offline at fixed DJ rates.
-    bass_sola: Option<BassSola>,
+    /// Low-band corrector (Stage 21). Holds the same nominal lag as the
+    /// delay, so band alignment and the latency contract are unchanged.
+    bass_sola: BassSola,
     /// Delayed copy of the RAW high band, kept warm for the extreme-rate
     /// fade-out (aligned with the corrector's constant nominal lag).
     raw_high_delay: FixedDelay,
     sola: SolaCorrector,
-    /// Per-channel low-band scratch.
+    /// Per-channel low band feeding the corrector (in/out in place).
     low: Vec<[f32; BLOCK_FRAMES]>,
+    /// Per-channel raw (pitch-follow) low band, delayed to alignment.
+    low_raw: Vec<[f32; BLOCK_FRAMES]>,
     /// Per-channel high band feeding the corrector (in/out in place).
     high: Vec<[f32; BLOCK_FRAMES]>,
     /// Per-channel raw (uncorrected) high band, delayed to alignment.
@@ -97,10 +100,11 @@ impl KeylockStage {
         Self {
             split: TwoBandSplit::new(KEYLOCK_CROSSOVER_HZ, sample_rate, channels),
             low_delay: FixedDelay::new(KEYLOCK_LATENCY_FRAMES, channels),
-            bass_sola: BassSola::from_env(channels, KEYLOCK_LATENCY_FRAMES),
+            bass_sola: BassSola::new(channels, KEYLOCK_LATENCY_FRAMES),
             raw_high_delay: FixedDelay::new(KEYLOCK_LATENCY_FRAMES, channels),
             sola,
             low: vec![[0.0; BLOCK_FRAMES]; channels],
+            low_raw: vec![[0.0; BLOCK_FRAMES]; channels],
             high: vec![[0.0; BLOCK_FRAMES]; channels],
             high_raw: vec![[0.0; BLOCK_FRAMES]; channels],
             enable: f32::NAN,
@@ -127,20 +131,17 @@ impl Stage for KeylockStage {
 
         // Split every channel; keep the delayed low band and a delayed raw
         // copy of the high band for the extreme-rate fade-out.
-        if let Some(bass) = self.bass_sola.as_mut() {
-            bass.set_transposition(transposition);
-        }
+        self.bass_sola.set_transposition(transposition);
         for ch in 0..block.channels() {
             let (low, high) = (&mut self.low[ch], &mut self.high[ch]);
             self.split.process_channel(ch, block.channel(ch), low, high);
             self.high_raw[ch].copy_from_slice(high);
             self.raw_high_delay
                 .process_channel(ch, &mut self.high_raw[ch]);
-            match self.bass_sola.as_mut() {
-                Some(bass) => bass.process_channel(ch, low),
-                None => self.low_delay.process_channel(ch, low),
-            }
+            self.low_raw[ch].copy_from_slice(low);
+            self.low_delay.process_channel(ch, &mut self.low_raw[ch]);
         }
+        self.bass_sola.process_block(&mut self.low, ctx.onsets);
         self.sola.process_block(&mut self.high, ctx.onsets);
 
         // Extreme-rate correction weight: 1 inside the DJ range, fading to
@@ -181,7 +182,8 @@ impl Stage for KeylockStage {
             for (i, sample) in out.iter_mut().enumerate() {
                 let weight = weight_w[i];
                 let high = weight * self.high[ch][i] + (1.0 - weight) * self.high_raw[ch][i];
-                *sample = self.low[ch][i] + high;
+                let low = weight * self.low[ch][i] + (1.0 - weight) * self.low_raw[ch][i];
+                *sample = low + high;
             }
         }
     }
@@ -196,9 +198,7 @@ impl Stage for KeylockStage {
     fn reset(&mut self) {
         self.split.reset();
         self.low_delay.reset();
-        if let Some(bass) = self.bass_sola.as_mut() {
-            bass.reset();
-        }
+        self.bass_sola.reset();
         self.raw_high_delay.reset();
         self.sola.reset();
         self.enable = f32::NAN;
@@ -665,6 +665,52 @@ mod tests {
         assert!(
             cents(recorrected, 440.0).abs() < 12.0,
             "re-enabled phase off: {recorrected:.2} Hz"
+        );
+    }
+
+    fn zero_crossing_hz(x: &[f32]) -> f64 {
+        let mut crossings = 0u32;
+        for i in 1..x.len() {
+            if x[i - 1] < 0.0 && x[i] >= 0.0 {
+                crossings += 1;
+            }
+        }
+        crossings as f64 * SR as f64 / x.len() as f64
+    }
+
+    #[test]
+    fn low_band_is_keylocked_at_dj_rates() {
+        // ROADMAP Stage 21: a 60 Hz fundamental at ±8% must come out at
+        // ~60 Hz with keylock on (the varispeed's embedded pitch shift
+        // cancelled), where the shipped pre-Stage-21 chain followed
+        // pitch (64.8 / 55.2 Hz).
+        for rate in [1.08, 0.92] {
+            let mut stage = KeylockStage::new(SR, 1);
+            // The stage receives varispeed OUTPUT: the source's 60 Hz
+            // arrives already pitch-scaled by the embedded rate.
+            let input = sine(60.0 * rate, 8 * SR as usize, 0.5);
+            let out = run_blocks(&mut stage, &input, rate);
+            let f = zero_crossing_hz(&out[2 * SR as usize..]);
+            assert!(
+                (f - 60.0).abs() / 60.0 < 0.01,
+                "rate {rate}: low band at {f:.2} Hz, expected ~60 (keylocked)"
+            );
+        }
+    }
+
+    #[test]
+    fn low_band_follows_pitch_with_keylock_off() {
+        // Toggle off: the low band blends to the delayed raw copy and its
+        // pitch follows tempo, exactly the pre-Stage-21 contract.
+        let rate = 1.08;
+        let mut stage = KeylockStage::new(SR, 1);
+        let input = sine(60.0 * rate, 8 * SR as usize, 0.5);
+        let out = run_blocks_keylock(&mut stage, &input, rate, 0.0);
+        let f = zero_crossing_hz(&out[2 * SR as usize..]);
+        let expect = 60.0 * rate;
+        assert!(
+            (f - expect).abs() / expect < 0.01,
+            "keylock off: low band at {f:.2} Hz, expected ~{expect:.2} (pitch follows)"
         );
     }
 }

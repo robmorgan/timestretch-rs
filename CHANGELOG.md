@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The keylock profile's low band (sub-120 Hz) is now pitch-corrected by
+  a period-aligned SOLA-class bass corrector (ROADMAP Stage 21): splices
+  jump whole bass periods, correlation-aligned, hidden in quiet moments
+  away from kick onsets, with one lockstep splice decision across
+  channels. Correction engages beyond ~±1–2% tempo deviation — mild
+  nudges keep the traditional pitch-follow bass and a rigid crossover
+  seam, while sustained DJ offsets (±8%) play in key. Latency contract
+  unchanged (12.7 ms). Supersedes the Stage 2 scope line, whose blind
+  verdict rejected a vocoder bass: the time-domain corrector won the
+  Stage 21 blind re-match in all four ±8% conditions.
+
 ## 0.12.0
 
 The quality-closure roadmap release: every open stage from the 2026-08-05
