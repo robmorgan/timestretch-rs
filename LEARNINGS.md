@@ -727,3 +727,47 @@ Lessons:
 - External references cut both ways: the QM column first corroborated
   our honest-uncertainty verdicts, then certified a genuine win when
   we out-resolved it on DnB.
+
+## Stage 20 — Bounded Width Treatment (2026-08-19, killed)
+
+The one-day stage: promoted from Not-a-Priority-Yet by owner request,
+killed by its own kill experiment before any build-out. The question —
+can a bounded, mono-safe side injection (velvet-decorrelated,
+high-passed corrected mid, mixed in at the M/S decode seam) reproduce
+the recurring blind preference for the decorrelated batch render at
+matched side energy?
+
+Prototype `cf34fad`: env-gated `TIMESTRETCH_PROTO_WIDTH`, mono-exact
+(cancels in L+R), calibrated by measurement — gain 0.4 ≈ +5 dB side/mid
+(Rubber Band's measured level), 1.6 ≈ +15 dB (the batch arm's). The
+blind set matched injection arms to reference side levels, isolating
+decorrelation CHARACTER as the only variable. `ab.sh` gained
+`--env-arm` for env-parameterized current-tree arms (kept; the proto
+DSP is removed).
+
+**Blind verdict (8 conditions × 5 arms, sealed key):** at batch-matched
++15 dB the injection reads "underwater, smearing, robotic" in 7/8
+conditions; at +5 dB it only trades minor flaws with the shipped
+faithful path. Meanwhile the shipped Stage 19 head tied or beat the
+`887d854` batch arm in most conditions — including winning MSBWY +50%
+outright, previously the batch arm's showcase — and Rubber Band was the
+session's most consistent arm.
+
+Lessons:
+
+- **Side level is not width character.** Per-channel PV decorrelation
+  yields two independently COHERENT renders; a diffuse mid-derived
+  injection at the same side energy smears transients and reads
+  underwater. Energy-matching falsified the cheap mechanism cleanly —
+  exactly what the kill-first pattern is for (cost: one day, ~90 lines,
+  zero shipped surface).
+- **Re-establish the preference before treating it.** The width
+  preference was measured against the pre-Stage-19 head; the Stage 19
+  quality gains removed most of the masking advantage that drove it.
+  An owner-taste finding is scoped to the quality floor it was heard
+  against — like acceptance verdicts, preferences expire when the
+  comparison changes.
+- If width is ever re-attacked: start from coherent-channel processing
+  (true per-channel blend at double PV cost), and only after a fresh
+  blind session shows the preference still exists against the current
+  head.

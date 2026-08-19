@@ -181,38 +181,36 @@ corrector was never falsified.
 
 Stages 10 and 12–19 are complete or closed; evidence in LEARNINGS.md.
 
-### Stage 20 — Bounded Width Treatment (kill experiment first)
+### Stage 20 — Bounded Width Treatment (CLOSED 2026-08-19: killed)
 
-Promoted from Not-a-Priority-Yet 2026-08-18 by owner request. The
-recurring blind evidence (Stage 16, Stage 14 attribution, Stage 19 exit
-listen): the owner consistently prefers the WIDER presentation, and
-decorrelation both flatters and masks artifacts. The shipped paths stay
-faithful (side/mid within 0.1 dB of source, by design) — so wideness
-becomes a deliberate, bounded, owner-taste side treatment, never an
-accident of uncoupled processing.
+Promoted from Not-a-Priority-Yet 2026-08-18 by owner request; killed by
+its own kill experiment the next day. Prototype `cf34fad` (env-gated
+`TIMESTRETCH_PROTO_WIDTH`, velvet-decorrelated high-passed mid injected
+into the side at the M/S decode seam, mono-exact), calibrated by
+measurement to the Stage 14 reference levels (+5 dB ≈ Rubber Band,
++15 dB ≈ the preferred batch arm) and blind-listened 2026-08-19
+(8 conditions × 5 arms, sealed key, results in
+`target/ab/stage20-width/results.json`).
 
-**Kill question:** does a bounded, mono-safe side injection — fixed
-decorrelator on the corrected mid, high-passed, mixed into the side at
-the M/S decode seam — reproduce the blind width preference at matched
-side energy, without the batch path's defects (pinned sub-bass, phase
-mush)? Or is the preference specific to full per-channel decorrelation
-in a way an injected side cannot fake?
+**Verdict — the mechanism dies, and the motivation has faded:**
 
-**Measured targets (Stage 14):** source-faithful = +0 dB side/mid;
-Rubber Band ≈ +5 dB; the preferred batch arm ≈ +16 dB.
+- At batch-matched +15 dB the injection reads "underwater, smearing,
+  robotic" in 7 of 8 conditions. Side LEVEL is not the preference
+  driver: per-channel PV decorrelation is two independently COHERENT
+  renders, and a diffuse mid-derived injection cannot fake that
+  character at any gain.
+- At +5 dB it only trades minor flaws with the shipped faithful path —
+  one clear win, no consistent gain.
+- The recurring width preference itself did not reproduce post-Stage-19:
+  the shipped head now ties or beats the `887d854` batch arm in most
+  conditions (winning MSBWY +50% outright, previously the batch arm's
+  showcase), so the masking advantage that drove the old preference is
+  largely gone. Rubber Band was the session's most consistent arm.
 
-**Falsifier:** blind listen on the conditions where the preference
-showed (msbwy / cold heart, ±30/±50), arms calibrated by measurement to
-+0 / ≈+5 / ≈+16 dB added side, plus the actual pre-consolidation batch
-arm (`887d854`) and Rubber Band. If the bounded treatment at
-batch-matched energy neither wins nor ties the batch arm, the mechanism
-dies and the finding is recorded (the preference is about decorrelation
-character, not side level).
-
-**Prototype:** env-gated `TIMESTRETCH_PROTO_WIDTH=<gain>` in
-`WidePvHead`'s decode (mono-exact by construction: the injection
-cancels in L+R). Survival buys the build-out: a public width parameter,
-mono-sum and side/mid gates, WCET check, blind exit listen.
+The proto code is removed; the shipped paths stay faithful. Any future
+width attempt must start from coherent-channel processing (e.g. a true
+per-channel blend, at double PV cost), not side injection — and first
+re-establish that a preference still exists. Archived in LEARNINGS.md.
 
 ## Not a Priority Yet
 

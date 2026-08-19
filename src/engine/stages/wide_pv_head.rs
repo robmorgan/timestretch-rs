@@ -109,90 +109,6 @@ pub(crate) struct WidePvHead {
     keylock_target: f64,
     /// Smoothed toggle weight (NaN = snap to target on next emission).
     keylock_weight: f32,
-    /// PROTO Stage 20: env-gated bounded width injection (None = off).
-    proto_width: Option<Box<ProtoWidth>>,
-}
-
-/// PROTO (ROADMAP Stage 20 kill experiment, env-gated off by default):
-/// bounded mono-safe width injection at the M/S decode seam. A fixed
-/// velvet-noise FIR decorrelates the CORRECTED MID, a one-pole high-pass
-/// keeps sub-bass out of the injection, and the result is mixed into the
-/// side at `TIMESTRETCH_PROTO_WIDTH=<gain>`. Mono-exact by construction:
-/// the injection cancels in L+R. Not a shipping feature — the knob
-/// exists so blind arms can be rendered at measured side/mid targets
-/// (+5 dB Rubber-Band-like, +16 dB batch-like; Stage 14 measurements).
-struct ProtoWidth {
-    gain: f32,
-    /// Corrected-mid history ring feeding the velvet FIR (power of two).
-    ring: [f32; 2_048],
-    pos: usize,
-    /// One-pole low-pass state; the injected component is `d - lp` (HPF).
-    lp: f32,
-    /// HPF coefficient for ~120 Hz at the engine sample rate.
-    hp_a: f32,
-}
-
-/// Velvet-noise taps (offset in samples, sign): fixed sparse ±1 impulses
-/// across ~35 ms at 44.1 kHz. Hand-rolled irregular spacing — no runtime
-/// randomness (determinism harness). Normalized at use by 1/sqrt(len).
-const VELVET_TAPS: [(usize, f32); 16] = [
-    (13, 1.0),
-    (89, -1.0),
-    (161, 1.0),
-    (293, 1.0),
-    (379, -1.0),
-    (487, -1.0),
-    (599, 1.0),
-    (709, -1.0),
-    (823, 1.0),
-    (941, -1.0),
-    (1_061, -1.0),
-    (1_181, 1.0),
-    (1_277, -1.0),
-    (1_367, 1.0),
-    (1_453, -1.0),
-    (1_531, 1.0),
-];
-
-impl ProtoWidth {
-    fn from_env(sample_rate: u32) -> Option<Self> {
-        let gain: f32 = std::env::var("TIMESTRETCH_PROTO_WIDTH")
-            .ok()?
-            .parse()
-            .ok()?;
-        if !gain.is_finite() || gain <= 0.0 {
-            return None;
-        }
-        let hp_a = 1.0 - (-2.0 * std::f32::consts::PI * 120.0 / sample_rate as f32).exp();
-        Some(Self {
-            gain,
-            ring: [0.0; 2_048],
-            pos: 0,
-            lp: 0.0,
-            hp_a,
-        })
-    }
-
-    /// Pushes one corrected-mid sample; returns the side injection.
-    #[inline]
-    fn process(&mut self, m: f32) -> f32 {
-        self.ring[self.pos] = m;
-        let mask = self.ring.len() - 1;
-        let mut d = 0.0f32;
-        for (off, sign) in VELVET_TAPS {
-            d += sign * self.ring[(self.pos + self.ring.len() - off) & mask];
-        }
-        self.pos = (self.pos + 1) & mask;
-        d *= 0.25; // 1/sqrt(16): unit-energy velvet kernel
-        self.lp += self.hp_a * (d - self.lp);
-        self.gain * (d - self.lp)
-    }
-
-    fn reset(&mut self) {
-        self.ring = [0.0; 2_048];
-        self.pos = 0;
-        self.lp = 0.0;
-    }
 }
 
 /// Pending-surplus bound before the inaudible arm is resynced (dropped
@@ -236,11 +152,6 @@ impl WidePvHead {
                 .collect(),
             keylock_target: 1.0,
             keylock_weight: f32::NAN,
-            proto_width: if num_channels == 2 {
-                ProtoWidth::from_env(sample_rate).map(Box::new)
-            } else {
-                None
-            },
         }
     }
 
@@ -436,10 +347,7 @@ impl WidePvHead {
         // L/R throughout).
         if stereo && emit > 0 {
             for i in 0..emit {
-                let (m, mut s) = (self.out[0][i], self.out[1][i]);
-                if let Some(w) = self.proto_width.as_deref_mut() {
-                    s += w.process(m);
-                }
+                let (m, s) = (self.out[0][i], self.out[1][i]);
                 self.out[0][i] = m + s;
                 self.out[1][i] = m - s;
             }
@@ -507,9 +415,6 @@ impl WidePvHead {
             pending.clear();
         }
         self.keylock_weight = f32::NAN;
-        if let Some(w) = self.proto_width.as_deref_mut() {
-            w.reset();
-        }
     }
 }
 
