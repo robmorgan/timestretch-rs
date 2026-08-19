@@ -179,20 +179,41 @@ corrector was never falsified.
 
 ## Stage Sequence
 
-All stages (10, 12–19) are complete or closed; evidence in
-LEARNINGS.md.
+Stages 10 and 12–19 are complete or closed; evidence in LEARNINGS.md.
+
+### Stage 20 — Bounded Width Treatment (CLOSED 2026-08-19: killed)
+
+Promoted from Not-a-Priority-Yet 2026-08-18 by owner request; killed by
+its own kill experiment the next day. Prototype `cf34fad` (env-gated
+`TIMESTRETCH_PROTO_WIDTH`, velvet-decorrelated high-passed mid injected
+into the side at the M/S decode seam, mono-exact), calibrated by
+measurement to the Stage 14 reference levels (+5 dB ≈ Rubber Band,
++15 dB ≈ the preferred batch arm) and blind-listened 2026-08-19
+(8 conditions × 5 arms, sealed key, results in
+`target/ab/stage20-width/results.json`).
+
+**Verdict — the mechanism dies, and the motivation has faded:**
+
+- At batch-matched +15 dB the injection reads "underwater, smearing,
+  robotic" in 7 of 8 conditions. Side LEVEL is not the preference
+  driver: per-channel PV decorrelation is two independently COHERENT
+  renders, and a diffuse mid-derived injection cannot fake that
+  character at any gain.
+- At +5 dB it only trades minor flaws with the shipped faithful path —
+  one clear win, no consistent gain.
+- The recurring width preference itself did not reproduce post-Stage-19:
+  the shipped head now ties or beats the `887d854` batch arm in most
+  conditions (winning MSBWY +50% outright, previously the batch arm's
+  showcase), so the masking advantage that drove the old preference is
+  largely gone. Rubber Band was the session's most consistent arm.
+
+The proto code is removed; the shipped paths stay faithful. Any future
+width attempt must start from coherent-channel processing (e.g. a true
+per-channel blend, at double PV cost), not side injection — and first
+re-establish that a preference still exists. Archived in LEARNINGS.md.
 
 ## Not a Priority Yet
 
-- Deliberate stereo-width treatment for the corrected paths. Recurring
-  blind evidence (Stage 16, Stage 14 attribution, Stage 19 exit listen,
-  2026-08-13/14): the owner consistently prefers the WIDER presentation,
-  and decorrelation both flatters and MASKS artifacts (three of four
-  arms "slightly roboty" at +50% — including Rubber Band — with only
-  the decorrelated batch arm escaping). The shipped paths stay faithful
-  (side/mid within 0.1 dB of source, by design); if wideness is ever
-  wanted it should be a bounded, deliberate side treatment — an owner
-  taste decision, not an accident of uncoupled processing.
 - Corrected low band at DJ ratios — re-litigating the sub-120 Hz
   pitch-follow scope line on the Stage 18 exit-listen evidence
   ("bass out of key" blind at ±8% on bass-forward material, no longer

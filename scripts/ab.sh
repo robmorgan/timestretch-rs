@@ -49,12 +49,14 @@ shift 2
 base_ref=""
 rates="0.92,1.08"
 want_rb=0
+env_arms=()
 tracks=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --base) base_ref=$2; shift 2 ;;
         --rates) rates=$2; shift 2 ;;
         --rb) want_rb=1; shift ;;
+        --env-arm) env_arms+=("$2"); shift 2 ;;
         *) tracks+=("$1"); shift ;;
     esac
 done
@@ -65,6 +67,15 @@ mkdir -p "$out/raw"
 
 echo "== rendering arm 'current' (working tree) =="
 cargo run --release --example ab_render -- current "$out/raw" "$rates" "${tracks[@]}"
+
+# Extra current-tree arms under env settings, e.g. for env-gated
+# prototypes:  --env-arm "w5:TIMESTRETCH_PROTO_WIDTH=0.2"
+for spec in ${env_arms[@]+"${env_arms[@]}"}; do
+    label=${spec%%:*}
+    kv=${spec#*:}
+    echo "== rendering arm '$label' ($kv) =="
+    env "$kv" cargo run --release --example ab_render -- "$label" "$out/raw" "$rates" "${tracks[@]}"
+done
 
 if [ -n "$base_ref" ]; then
     echo "== rendering arm 'base' ($base_ref) =="
