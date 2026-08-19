@@ -2,8 +2,9 @@
 //!
 //! Steps through the conditions of a rendered blind set
 //! (`target/ab/<name>/blind/<track>/<rate>/arm_{A..}.wav`), plays arms with
-//! POSITION-SYNCED hot-switching (press another letter mid-play and hear
-//! the same passage through the other arm, gapless), takes free-text notes
+//! POSITION-SYNCED hot-switching (press another letter — or space on the
+//! hovered arm — mid-play and hear the same passage through the other arm,
+//! gapless), loops by default (`l` toggles), takes free-text notes
 //! per arm plus an optional winner pick, and saves everything to a
 //! machine-readable `results.json` — unblinded against `BLIND_KEY.json`
 //! at save time, never before.
@@ -194,7 +195,7 @@ struct Player {
 }
 
 impl Player {
-    fn load(condition: &Condition) -> Result<Self, String> {
+    fn load(condition: &Condition, looping: bool) -> Result<Self, String> {
         let mut labels: Vec<char> = condition.letters.clone();
         let mut paths: Vec<PathBuf> = labels
             .iter()
@@ -233,7 +234,7 @@ impl Player {
             cursor: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
             playing: AtomicBool::new(false),
-            looping: AtomicBool::new(false),
+            looping: AtomicBool::new(looping),
         });
 
         let host = cpal::default_host();
@@ -325,9 +326,8 @@ impl Player {
         self.shared.cursor.store(0, Ordering::Release);
     }
 
-    fn toggle_loop(&self) {
-        let looping = self.shared.looping.load(Ordering::Acquire);
-        self.shared.looping.store(!looping, Ordering::Release);
+    fn set_loop(&self, on: bool) {
+        self.shared.looping.store(on, Ordering::Release);
     }
 
     fn position_secs(&self) -> f64 {
@@ -357,6 +357,90 @@ enum Pane {
     Arms,
 }
 
+/// What space does, given where the cursor is versus what is playing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpaceAction {
+    /// Hot-switch to a different arm (and play it).
+    Switch(char),
+    /// Pause/resume whatever is already active.
+    Toggle,
+}
+
+/// Space auditions the hovered arm; on the arm already playing it pauses.
+fn space_action(pane: Pane, focused: Option<char>, active: char) -> SpaceAction {
+    match focused {
+        Some(label) if pane == Pane::Arms && label != active => SpaceAction::Switch(label),
+        _ => SpaceAction::Toggle,
+    }
+}
+
+/// An in-progress note edit: the arm being annotated, the text, and a
+/// cursor held as a byte index that always sits on a char boundary.
+#[derive(Debug, Clone)]
+struct NoteEdit {
+    label: char,
+    text: String,
+    cursor: usize,
+}
+
+impl NoteEdit {
+    fn new(label: char, text: String) -> Self {
+        let cursor = text.len();
+        Self {
+            label,
+            text,
+            cursor,
+        }
+    }
+
+    fn insert(&mut self, c: char) {
+        self.text.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    fn backspace(&mut self) {
+        if let Some(c) = self.text[..self.cursor].chars().next_back() {
+            self.cursor -= c.len_utf8();
+            self.text.remove(self.cursor);
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.cursor < self.text.len() {
+            self.text.remove(self.cursor);
+        }
+    }
+
+    fn left(&mut self) {
+        if let Some(c) = self.text[..self.cursor].chars().next_back() {
+            self.cursor -= c.len_utf8();
+        }
+    }
+
+    fn right(&mut self) {
+        if let Some(c) = self.text[self.cursor..].chars().next() {
+            self.cursor += c.len_utf8();
+        }
+    }
+
+    fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn end(&mut self) {
+        self.cursor = self.text.len();
+    }
+
+    /// The text with the caret glyph drawn at the cursor.
+    fn rendered(&self) -> String {
+        format!(
+            "{}\u{258f}{}",
+            &self.text[..self.cursor],
+            &self.text[self.cursor..]
+        )
+    }
+}
+
 struct App {
     set_dir: PathBuf,
     set_name: String,
@@ -370,8 +454,11 @@ struct App {
     pane: Pane,
     /// Arm whose note row is focused (↑/↓ in the Arms pane).
     focus: usize,
-    /// In-progress note edit (arm letter, text).
-    editing: Option<(char, String)>,
+    /// In-progress note edit.
+    editing: Option<NoteEdit>,
+    /// Loop preference, owned by the app so it survives condition changes
+    /// (the per-condition `Player` mirrors it).
+    looping: bool,
     dirty: bool,
     confirm_quit: bool,
     status: String,
@@ -394,7 +481,7 @@ impl App {
     }
 
     fn load_player(&mut self) {
-        match Player::load(self.condition()) {
+        match Player::load(self.condition(), self.looping) {
             Ok(p) => {
                 self.player = Some(p);
                 self.player_error = None;
@@ -523,9 +610,9 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
                 .map(|p| p.is_playing() && p.active_label() == label)
                 .unwrap_or(false);
             let winner = app.condition().winner == Some(label);
-            let note = if let Some((l, text)) = &app.editing {
-                if *l == label {
-                    format!("{text}▏")
+            let note = if let Some(edit) = &app.editing {
+                if edit.label == label {
+                    edit.rendered()
                 } else {
                     app.condition()
                         .notes
@@ -583,11 +670,11 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     let footer = if app.confirm_quit {
         "unsaved notes — press q again to discard, Ctrl-S to save first".to_string()
     } else if app.editing.is_some() {
-        "editing note — Enter commit, Esc cancel".to_string()
+        "editing note — ←/→ move  Home/End  Enter commit  Esc cancel".to_string()
     } else {
         format!(
-            "Tab pane  ↑/↓ move  Enter select/note  a-{}/s play arm  space pause  l loop  \
-             ←/→ seek  0 restart  w winner  Ctrl-S save  q quit   {}",
+            "Tab pane  ↑/↓ move  Enter note  a-{}/s play arm  space play/switch  l loop  \
+             ←/→ seek  0 restart  w winner  W clear  Ctrl-S save  q quit   {}",
             labels
                 .iter()
                 .rfind(|&&l| l != SOURCE_LABEL)
@@ -620,10 +707,10 @@ fn run_tui(mut app: App) -> Result<(), String> {
         }
 
         // Note-edit mode swallows everything.
-        if let Some((label, text)) = &mut app.editing {
+        if let Some(edit) = &mut app.editing {
             match key.code {
                 KeyCode::Enter => {
-                    let (label, text) = (*label, text.clone());
+                    let (label, text) = (edit.label, edit.text.clone());
                     if text.is_empty() {
                         app.conditions[app.current].notes.remove(&label);
                     } else {
@@ -633,10 +720,20 @@ fn run_tui(mut app: App) -> Result<(), String> {
                     app.dirty = true;
                 }
                 KeyCode::Esc => app.editing = None,
-                KeyCode::Backspace => {
-                    text.pop();
+                KeyCode::Backspace => edit.backspace(),
+                KeyCode::Delete => edit.delete(),
+                KeyCode::Left => edit.left(),
+                KeyCode::Right => edit.right(),
+                KeyCode::Home => edit.home(),
+                KeyCode::End => edit.end(),
+                // Modified chords (Ctrl-S and friends) are not note text.
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    edit.insert(c)
                 }
-                KeyCode::Char(c) => text.push(c),
                 _ => {}
             }
             continue;
@@ -656,12 +753,17 @@ fn run_tui(mut app: App) -> Result<(), String> {
             }
             (KeyCode::Char(' '), _) => {
                 if let Some(p) = &app.player {
-                    p.toggle_play();
+                    let focused = labels.get(app.focus.min(labels.len() - 1)).copied();
+                    match space_action(app.pane, focused, p.active_label()) {
+                        SpaceAction::Switch(label) => p.select(label),
+                        SpaceAction::Toggle => p.toggle_play(),
+                    }
                 }
             }
             (KeyCode::Char('l'), _) => {
+                app.looping = !app.looping;
                 if let Some(p) = &app.player {
-                    p.toggle_loop();
+                    p.set_loop(app.looping);
                 }
             }
             (KeyCode::Left, _) => {
@@ -726,7 +828,7 @@ fn run_tui(mut app: App) -> Result<(), String> {
                             .get(&label)
                             .cloned()
                             .unwrap_or_default();
-                        app.editing = Some((label, existing));
+                        app.editing = Some(NoteEdit::new(label, existing));
                     }
                 }
             },
@@ -822,6 +924,7 @@ fn main() {
         pane: Pane::Conditions,
         focus: 0,
         editing: None,
+        looping: true,
         dirty: false,
         confirm_quit: false,
         status: String::new(),
@@ -919,6 +1022,73 @@ mod tests {
         assert_eq!(fresh[0].notes[&'B'], "roboty");
         assert_eq!(fresh[0].winner, Some('A'));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn note_edit_cursor_moves_and_edits_mid_string() {
+        let mut e = NoteEdit::new('A', "abcd".into());
+        assert_eq!(e.cursor, 4);
+        e.left();
+        e.left();
+        e.insert('X');
+        assert_eq!(e.text, "abXcd");
+        assert_eq!(e.rendered(), "abX\u{258f}cd");
+        e.backspace();
+        assert_eq!(e.text, "abcd");
+        e.delete();
+        assert_eq!(e.text, "abd");
+        e.home();
+        assert_eq!(e.cursor, 0);
+        e.end();
+        assert_eq!(e.cursor, e.text.len());
+    }
+
+    #[test]
+    fn note_edit_clamps_at_both_ends() {
+        let mut e = NoteEdit::new('A', "ab".into());
+        e.right();
+        assert_eq!(e.cursor, 2);
+        e.backspace();
+        e.backspace();
+        e.backspace();
+        assert_eq!(e.text, "");
+        assert_eq!(e.cursor, 0);
+        e.left();
+        assert_eq!(e.cursor, 0);
+        e.delete();
+        assert_eq!(e.text, "");
+    }
+
+    #[test]
+    fn note_edit_is_char_boundary_safe() {
+        let mut e = NoteEdit::new('A', "café".into());
+        e.left();
+        assert_eq!(e.cursor, 3);
+        e.insert('é');
+        assert_eq!(e.text, "caféé");
+        assert_eq!(e.rendered(), "café\u{258f}é");
+        e.backspace();
+        assert_eq!(e.text, "café");
+        e.left();
+        e.delete();
+        assert_eq!(e.text, "caé");
+    }
+
+    #[test]
+    fn space_switches_to_hovered_arm_else_toggles() {
+        assert_eq!(
+            space_action(Pane::Arms, Some('B'), 'A'),
+            SpaceAction::Switch('B')
+        );
+        assert_eq!(
+            space_action(Pane::Arms, Some('A'), 'A'),
+            SpaceAction::Toggle
+        );
+        assert_eq!(
+            space_action(Pane::Conditions, Some('B'), 'A'),
+            SpaceAction::Toggle
+        );
+        assert_eq!(space_action(Pane::Arms, None, 'A'), SpaceAction::Toggle);
     }
 
     #[test]

@@ -212,15 +212,63 @@ width attempt must start from coherent-channel processing (e.g. a true
 per-channel blend, at double PV cost), not side injection — and first
 re-establish that a preference still exists. Archived in LEARNINGS.md.
 
+### Stage 21 — Corrected Low Band (kill experiment first)
+
+Promoted from Not-a-Priority-Yet 2026-08-19 by owner request:
+re-litigating the sub-120 Hz pitch-follow scope line on the Stage 18
+exit-listen evidence ("bass out of key" blind at ±8% on bass-forward
+material, no longer masked by granulation). The Stage 2 rejection that
+set the scope line was of a VOCODER bass; a time-domain corrector was
+never tried.
+
+**Kill question:** does a SOLA-class low-band corrector — ring reader
+at the transposition rate, drift repaid in NCC-aligned PERIOD-length
+jumps under long raised-cosine crossfades, quiet-moment opportunistic
+splicing — put the bass in key at ±8% while keeping the kick's punch
+and phase? Or does any correction of the sub band lose to the honest
+pitch-follow bass, vocoder or not?
+
+**Prototype:** env-gated `TIMESTRETCH_PROTO_BASSLOCK=1`
+(`bass_sola.rs`), replacing the low branch's pitch-follow delay at the
+same nominal lag — band alignment and the 12.7 ms latency contract
+unchanged; the read cursor wobbles elastically by up to ± one bass
+period, the high-band corrector's contract at larger scale. Mechanism
+pinned by unit tests (unity = pure delay; ±8% transposition moves a
+bass fundamental within 1% with splice steps bounded by the tone's own
+slope). Not RT-vetted (full NCC sweep per splice) and not wired to the
+extreme-rate fade — those are build-out work, bought only by survival.
+
+**Falsifier:** blind ±8% on bass-forward material (msbwy, cold heart) —
+shipped pitch-follow vs bass-locked proto vs Rubber Band (which
+corrects its full spectrum, so it is the "bass in key" reference). If
+the corrected bass reads worse than the detuned one (wobble, lost
+punch, seam artifacts), the scope line stands re-validated against the
+stronger falsifier and the finding is recorded.
+
+**Kill-experiment verdict (2026-08-19, blind, 4 conditions × 3 arms,
+sealed key, `target/ab/stage21-bass/results.json`): SURVIVED.** The
+corrected bass beat pitch-follow in ALL FOUR conditions — the shipped
+detuned bass read as the artifact ("dirty, distorted bass", "bassline
+sucks, distorted, hum noise", "strange bass hums") while the proto read
+"bass hitting well / open, clean, bass ok / good drums". Measured: the
+proto's low band lands within ~20 cents of Rubber Band's in-key
+reference on the stable-bass track; shipped sits ~130 cents off (the
+±8% detune). One residual on msbwy −8%: "kicks smearing a bit" — the
+predicted failure mode of the un-wired onset protection, and still
+preferred over the detuned arm.
+
+**Build-out (bought by survival):** onset-protected splicing (wire
+`ctx.onsets`, protect kick windows like the high-band corrector); an
+RT-safe period estimator (budgeted/incremental NCC — the proto's full
+sweep is not WCET-viable); extreme-rate fade and live keylock-toggle
+wiring (bass must follow the same fades as the high band); A/B matrix
+and WCET gates; blind exit listen. The Stage 2 scope line
+("un-keylocked low band won") is superseded: that verdict rejected a
+VOCODER bass, and the time-domain corrector wins where the vocoder
+lost.
+
 ## Not a Priority Yet
 
-- Corrected low band at DJ ratios — re-litigating the sub-120 Hz
-  pitch-follow scope line on the Stage 18 exit-listen evidence
-  ("bass out of key" blind at ±8% on bass-forward material, no longer
-  masked by granulation). If ever scheduled, falsification first: a
-  time-domain (SOLA-class, longer-window) low-band corrector inside the
-  15 ms budget was never tried — the Stage 2 rejection was of a vocoder
-  bass. The wide profile remains the documented escape hatch.
 - SIMD / architecture-specific acceleration (WCET gates exist to measure
   any attempt against; current headroom is comfortable).
 - Cross-frame peak tracking / multi-resolution wide path — the RB-class

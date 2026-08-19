@@ -14,7 +14,8 @@
 #
 #   scripts/ab.sh listen <name>
 #       Opens the blind TUI (tools/ab-tui): step conditions, hot-switch
-#       arms position-synced, note per arm, pick winners, Ctrl-S saves
+#       arms position-synced (letter keys, or space on the hovered arm),
+#       looping on by default, note per arm, pick winners, Ctrl-S saves
 #       results.json (auto-unblinded against the sealed key).
 #
 #   scripts/ab.sh unblind <name>
