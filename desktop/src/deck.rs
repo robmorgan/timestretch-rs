@@ -108,12 +108,13 @@ pub fn start_deck_thread(
         let mut prerolled = false;
         let mut last_underruns = 0u64;
 
-        // Publish the chain's constant pipeline delay (the keylock chain's
-        // constant — the same in both deck modes) for the UI latency chip;
-        // control-to-audio stays at resampler lookahead either way.
+        // Publish the chain's constant pipeline delay (per active range:
+        // 12.7 ms Standard, 0 ms Wide — the same in tape vs keylock MODE
+        // within a range) for the UI latency chip; control-to-audio stays
+        // at resampler lookahead either way.
         {
             let mut st = state.lock().unwrap();
-            st.reported_latency_secs = pipeline_latency_secs;
+            st.reported_latency_secs = Some(pipeline_latency_secs);
             st.reported_control_latency_secs = 0.0;
         }
 

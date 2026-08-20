@@ -1350,9 +1350,10 @@ impl TimeStretchApp {
                         (DeckEngine::Keylock, DeckRange::Standard) => {
                             ui.label(egui::RichText::new("keylock: two-band").weak())
                                 .on_hover_text(
-                                    "Keylock mode: low band follows tempo, high band \
-                                     pitch-corrected at the delay-matched transposition \
-                                     (~13 ms pipeline delay).",
+                                    "Keylock mode: both bands pitch-corrected at the \
+                                     delay-matched transposition — the bass corrector \
+                                     engages beyond ~±1–2% deviation; mild nudges keep \
+                                     pitch-follow bass (~13 ms pipeline delay).",
                                 );
                         }
                         (DeckEngine::Keylock, DeckRange::Wide) => {
@@ -1360,7 +1361,8 @@ impl TimeStretchApp {
                                 .on_hover_text(
                                     "Wide-range Master Tempo: the full spectrum is \
                                      pitch-corrected across the whole tempo range \
-                                     (~49 ms pipeline delay).",
+                                     (0 ms pipeline delay — the analysis window is \
+                                     source-side lookahead).",
                                 );
                         }
                     }
@@ -1369,8 +1371,9 @@ impl TimeStretchApp {
 
                 // Tempo range: Standard (primary keylock chain, ±20% full
                 // keylock, ~13 ms) vs Wide (CDJ-style wide-range Master
-                // Tempo, ~49 ms). A range change rebuilds the engine and
-                // restores the playhead via warm-start seek.
+                // Tempo, 0 ms — source-side lookahead). A range change
+                // rebuilds the engine and restores the playhead via
+                // warm-start seek.
                 ui.label("Range:");
                 ui.horizontal(|ui| {
                     let old_range = self.deck_range;
@@ -1399,9 +1402,13 @@ impl TimeStretchApp {
                     }
                     let latency_ms = {
                         let st = self.state.lock().unwrap();
-                        st.reported_latency_secs * 1_000.0
+                        st.reported_latency_secs.map(|secs| secs * 1_000.0)
                     };
-                    if latency_ms > 0.0 {
+                    // Show whatever the engine has reported — 0.0 ms is the
+                    // Wide range's honest number (source-side lookahead),
+                    // not "no info"; before the first build there is no
+                    // figure to show.
+                    if let Some(latency_ms) = latency_ms {
                         ui.label(egui::RichText::new(format!("{latency_ms:.1} ms")).weak())
                             .on_hover_text(
                                 "Constant pipeline delay reported by the active engine \
