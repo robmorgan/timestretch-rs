@@ -212,7 +212,7 @@ width attempt must start from coherent-channel processing (e.g. a true
 per-channel blend, at double PV cost), not side injection — and first
 re-establish that a preference still exists. Archived in LEARNINGS.md.
 
-### Stage 21 — Corrected Low Band (kill experiment first)
+### Stage 21 — Corrected Low Band (CLOSED 2026-08-20: achieved)
 
 Promoted from Not-a-Priority-Yet 2026-08-19 by owner request:
 re-litigating the sub-120 Hz pitch-follow scope line on the Stage 18
@@ -266,6 +266,31 @@ and WCET gates; blind exit listen. The Stage 2 scope line
 ("un-keylocked low band won") is superseded: that verdict rejected a
 VOCODER bass, and the time-domain corrector wins where the vocoder
 lost.
+
+**Built out and shipped** (`dd8ca34` + review follow-ups `41f7ae7`):
+lockstep splicing on the channel mean, flux-gated onset protection with
+directional due-thresholds (early splices on the floor-draining side so
+protection is never bypassed by forced splices), budgeted incremental
+period sweep (WCET gate unchanged), correction engagement ramp
+(pitch-follow below ~±1% keeps the crossover seam rigid — the Stage 15
+contract at bass scale; full correction by ±2%), rest recentering
+(quiet-gap splice + micro-trim), toggle/fade blend shared with the high
+band. Independent adversarial review caught three interlocking HIGH
+findings pre-listen (quiet-detector envelope tracking the waveform's
+own ripple; an engagement-ramp dead zone classified as rest; corridor
+mean riding up to a full period above nominal) — fixed as one unit,
+each pinned by a regression test.
+
+**Exit listen (2026-08-20, blind, 8 conditions × 3 arms, ±8/±4 on
+msbwy + cold heart, `target/ab/stage21-exit/results.json`): PASSED.**
+The detune vocabulary is gone from the corrected arm everywhere; at
+±8% on the bass-forward evidence track the old chain read "bassline
+hum, bad" while the new chain read "good, clean". Rubber Band remains
+the overall reference. Watch items recorded: a very subtle "fuzz /
+bitcrush" on the msbwy bassline (quieter than the hum it replaced), a
+possible "minor bass wobble" on cold heart +4%, and kick smear on cold
+heart −8% present in BOTH our arms (pre-existing, not the bass
+corrector — likely high-band or material).
 
 ## Not a Priority Yet
 

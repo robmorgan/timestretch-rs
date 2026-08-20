@@ -14,12 +14,14 @@ pub enum EngineProfile {
     /// (and the walking skeleton for everything else).
     #[default]
     Tape,
-    /// Keylock: band split at 120 Hz; the low band passes un-corrected
-    /// through a matching delay (pitch follows tempo — inaudible at DJ
-    /// ratios), the high band is pitch-corrected by the time-domain SOLA
-    /// corrector at the delay-matched transposition. Full keylock through
-    /// ±20%, fading to plain varispeed beyond ±35%. Pipeline delay
-    /// ≈ 12.7 ms at 44.1 kHz (the primary deck contract).
+    /// Keylock: band split at 120 Hz; each band is pitch-corrected by its
+    /// own time-domain corrector at the delay-matched transposition — the
+    /// high band by the SOLA corrector, the low band by a period-aligned
+    /// SOLA-class bass corrector (ROADMAP Stage 21) that engages beyond
+    /// ~±1–2% deviation (mild nudges keep the seam-rigid pitch-follow
+    /// bass). Full keylock through ±20%, fading to plain varispeed beyond
+    /// ±35%. Pipeline delay ≈ 12.7 ms at 44.1 kHz (the primary deck
+    /// contract).
     Keylock,
     /// Wide-range Master Tempo (CDJ "WIDE" range setting): a big-FFT
     /// identity-locked phase-vocoder corrector keylocks the FULL spectrum

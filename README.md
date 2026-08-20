@@ -25,11 +25,12 @@ beat-grid overlay, beat jumps, looping, and live keylock tempo control.*
   lock-free on the audio thread, at a constant per-profile pipeline delay
   (12.7 ms keylock, 0 ms wide-range Master Tempo and tape)
 - **Varispeed-first keylock** — a sinc-resampled tempo axis with a two-band
-  keylock chain: the low band's pitch follows tempo (the club-correct
-  choice), the high band is corrected by a time-domain SOLA corrector with
-  correlation-matched, sub-sample-aligned splices; full single-pitch
-  keylock through the entire ±20% DJ fader, graceful varispeed release at
-  true extremes (deck-stop / spinback)
+  keylock chain: the high band is corrected by a time-domain SOLA corrector
+  with correlation-matched, sub-sample-aligned splices, and the low band by
+  its own period-aligned SOLA-class corrector (engaging beyond ~±1–2%
+  deviation; mild nudges keep the seam-rigid pitch-follow bass); full
+  single-pitch keylock through the entire ±20% DJ fader, graceful
+  varispeed release at true extremes (deck-stop / spinback)
 - **Deck semantics built in** — lock-free tempo control (immediate or
   timestamped to an exact output frame), warm-start seek/cue with preroll
   priming, gapless loop wraps, and a source-position query aligned to what
@@ -249,9 +250,12 @@ The engine is a fixed stage graph driven from the audio callback:
    timeline mapping is exact (`TimelineMap`).
 
 2. **Two-band split (keylock profile)** — Linkwitz-Riley 8th-order at
-   150 Hz. The low band is deliberately NOT pitch-corrected — its pitch
-   follows tempo, which is what club sound systems and DJs expect from a
-   ±8% nudge — so it needs only a delay matched to the corrector.
+   120 Hz. The low band is corrected by a period-aligned SOLA-class
+   corrector of its own: splices jump whole bass periods, aligned by
+   correlation and hidden in quiet moments away from kicks. Correction
+   engages beyond ~±1–2% tempo deviation — a mild nudge keeps the
+   traditional pitch-follow bass (inaudible cents at sub frequencies,
+   crossover seam held rigid), while a sustained ±8% plays in key.
 
 3. **Time-domain SOLA correction** — the high band is pitch-corrected by
    an elastic ring reader with correlation-matched, sub-sample-aligned
@@ -281,7 +285,7 @@ and the optional pre-analysis artifact are the knobs that matter. The
 FFT/window/envelope fields on `StretchParams` configure the
 phase-vocoder-based `pitch_shift` formant-correction path only.
 
-**Defaults:** 44100 Hz, stereo, keylock crossover at 150 Hz, constant
+**Defaults:** 44100 Hz, stereo, keylock crossover at 120 Hz, constant
 12.7 ms keylock pipeline delay (0 ms in tape mode).
 
 ## Performance

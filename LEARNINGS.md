@@ -771,3 +771,48 @@ Lessons:
   (true per-channel blend at double PV cost), and only after a fresh
   blind session shows the preference still exists against the current
   head.
+
+## Stage 21 — Corrected Low Band (2026-08-19/20, achieved)
+
+The scope line that fell: since Stage 2, the keylock chain's sub-120 Hz
+band deliberately pitch-followed tempo — but that verdict rejected a
+VOCODER bass, and the Stage 18 exit listen heard the detuned bass blind
+("bass out of key" at ±8%) once splice granulation stopped masking it.
+A time-domain SOLA-class corrector was the never-run falsifier.
+
+**Kill experiment** (proto `cf34fad`, one day): env-gated ring reader
+at the transposition rate, period-length NCC-aligned jumps, long
+raised-cosine fades. Blind ±8% (4 conditions × 3 arms): corrected bass
+won ALL FOUR — the detuned bass read as the artifact ("bassline sucks,
+distorted, hum noise"), the corrected read "bass hitting well".
+
+**Build-out** (`dd8ca34` + `41f7ae7`): lockstep channel splicing,
+flux-gated onset protection, budgeted incremental period sweep,
+engagement ramp (pitch-follow below ~±1%, full correction by ±2%),
+rest recentering, shared toggle/fade blend. Exit listen (8 conditions,
+±8/±4): PASSED — detune vocabulary gone; at ±8% old read "bassline
+hum, bad" vs new "good, clean".
+
+Lessons:
+
+- **A scope line is scoped to the mechanism that set it.** "Bass
+  correction sounds worse" meant "VOCODER bass correction sounds
+  worse" for four years. When re-litigating a closed decision, falsify
+  with the mechanism class the original verdict never tried.
+- **The corridor geometry IS the design.** Period-quantized jumps
+  inside an asymmetric corridor (~120 frames below nominal, thousands
+  above) drove every hard bug: magnitude triggers ping-ponged, clamped
+  jumps broke alignment, forced splices bypassed onset protection, and
+  the corridor mean is an honest group-delay bias (~+0.4 period) that
+  no threshold tuning can remove under the latency contract.
+- **Interlocking bugs mask each other; the review earns its keep on
+  exactly those.** The quiet detector's ripple bug (envelope τ shorter
+  than a bass period) was the only thing rescuing the engagement
+  ramp's dead zone, while inflating the corridor bias — three HIGH
+  findings, none visible in the passing test suite, found by tracing
+  arithmetic with concrete numbers before the exit listen.
+- **Scale time constants to the band.** An envelope, correlation
+  window, protection window, or masked window tuned for the high band
+  is wrong by an order of magnitude for bass; every constant that
+  worked here was the high-band corrector's constant re-derived from
+  the period range, not copied.

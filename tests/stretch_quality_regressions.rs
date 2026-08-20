@@ -177,10 +177,11 @@ fn test_ratio_sweep_sine_length_and_pitch() {
 // Offline renders share the live engine graph by construction (owner
 // decision 2026-07-16: batch copies the real-time path). Within the
 // keylock's corrected range (rate deviation ≤ 0.20, i.e. ratios
-// ~0.833–1.25) content below the 150 Hz crossover is deliberately NOT
-// pitch-corrected — its pitch follows tempo, exactly as on a deck — so
-// the 100 Hz partial lands at 100/ratio Hz on that path and at 100 Hz on
-// the wide-ratio path. Balance bounds are engine-measured baselines
+// ~0.833–1.25) content below the 120 Hz crossover is pitch-corrected by
+// the Stage 21 bass corrector (engaged at this deviation), so the 100 Hz
+// partial lands at 100 Hz on EVERY path — keylock and wide alike. (Until
+// Stage 21 the keylock low band pitch-followed and this case expected
+// 100/ratio Hz.) Balance bounds are engine-measured baselines
 // (ideal amplitude ratio 0.35/0.65 ≈ 0.538). History: the batch wide-PV
 // lost low-band level at heavy ratios (0.5-band once 1.5–4.0; 2.0-band
 // pinned a rigid sub-bass attenuation at 1.3–3.4 after Stage 13). The
@@ -195,7 +196,7 @@ fn test_ratio_sweep_two_tone_peak_bins() {
         (0.5, 100.0, 0.45..0.65),
         (0.75, 100.0, 0.45..0.65),
         (1.0, 100.0, 0.49..0.59),
-        (1.25, 80.0, 0.40..0.75),
+        (1.25, 100.0, 0.40..0.75),
         (2.0, 100.0, 0.45..0.65),
     ];
     for (ratio, f_low, balance_range) in cases {
