@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.0
 
 ### Changed
 
@@ -14,6 +14,17 @@
   unchanged (12.7 ms). Supersedes the Stage 2 scope line, whose blind
   verdict rejected a vocoder bass: the time-domain corrector won the
   Stage 21 blind re-match in all four ±8% conditions.
+
+### QA
+
+- `scripts/ab.sh` gains `--env-arm label:VAR=val`: extra blind arms
+  rendered from the current tree under env settings, for env-gated
+  prototypes (used by both Stage 20 and Stage 21 kill experiments).
+- Stage 20 (bounded stereo-width treatment) was falsified blind and
+  closed without shipping: side-level-matched mid-derived injection
+  reads underwater at any gain, and the width preference itself did
+  not reproduce against the current wide head. Faithful stereo stays
+  the shipped behavior; evidence archived in LEARNINGS.
 
 ## 0.12.0
 
