@@ -15,7 +15,8 @@ use std::time::Duration;
 use timestretch::engine::{EngineController, SourceProducer};
 
 use crate::state::{
-    AtomicPosition, DeckEngine, ScrubPhase, ScrubState, SharedStateHandle, StopFlag, Transport,
+    AtomicPosition, AtomicRate, DeckEngine, ScrubPhase, ScrubState, SharedStateHandle, StopFlag,
+    Transport,
 };
 
 const CHANNELS: usize = 2;
@@ -94,6 +95,7 @@ pub fn start_deck_thread(
     scrub: Arc<ScrubState>,
     pipeline_latency_secs: f64,
     warm_start_preroll: usize,
+    brake: Arc<AtomicRate>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let total_frames = source_audio.len() / CHANNELS;
@@ -213,7 +215,11 @@ pub fn start_deck_thread(
 
             // End of stream: flush the resampler lookahead once, then stop
             // the transport when the buffered tail has drained.
-            if cursor >= source_audio.len() && loop_region.is_none() {
+            // While the wide-fader brake is engaged the callback consumes
+            // the ring at a fraction of normal speed (or not at all when
+            // frozen) — a drained ring then means "braked on the tail",
+            // not "track over", so hold the transport.
+            if cursor >= source_audio.len() && loop_region.is_none() && brake.load() >= 1.0 {
                 if !finished {
                     finished = source.finish();
                 } else if source.occupied_frames() == 0 {

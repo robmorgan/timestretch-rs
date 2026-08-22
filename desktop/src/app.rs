@@ -21,6 +21,10 @@ const MIN_STRETCH_RATIO: f64 = 0.25;
 const MAX_VARISPEED_RATIO: f64 = 4.0;
 /// Tempo fader reaches double the track BPM (+100%).
 const MAX_TEMPO_FACTOR: f64 = 2.0;
+/// The Wide chain's true tempo-rate floor: its PV head clamps the ratio
+/// to [0.5, 2.0] (`wide_pv_head.rs`), so requests below rate 0.5 pin
+/// silently at -50%. The wide-fader brake takes over from here down.
+const WIDE_MIN_TEMPO_RATE: f64 = 0.5;
 /// Tempo fader width in points (3x egui's ~100pt default) for fine control.
 const TEMPO_SLIDER_WIDTH: f32 = 300.0;
 /// Auto-loop length ladder: `2^exp` beats. 1/8 beat is still thousands of
@@ -28,6 +32,47 @@ const TEMPO_SLIDER_WIDTH: f32 = 300.0;
 const LOOP_EXP_MIN: i32 = -3;
 /// Ladder ceiling: 32 beats (8 bars).
 const LOOP_EXP_MAX: i32 = 5;
+
+/// How a fader target maps onto the engine and the wide-fader brake.
+struct TempoMapping {
+    /// Engine stretch ratio (output/input length), clamped to the active
+    /// range's honest span — sub-floor targets pin at the ceiling.
+    ratio: f64,
+    /// Post-engine brake factor `b` in `[0, 1]`; 1.0 above the Wide
+    /// chain's -50% floor.
+    brake: f64,
+    /// BPM that actually plays: `detected · (1/ratio) · brake`. Equals the
+    /// fader value throughout the braked zone, so the fader never snaps.
+    effective_bpm: f64,
+}
+
+/// Splits a target BPM into the engine's stretch ratio and the Wide
+/// range's sub-floor brake factor. The wide chain can't stretch below
+/// rate 0.5 (-50%, its PV head's ratio clamp); a CDJ-3000's WIDE fader
+/// reaches -100% by stopping the platter, which the deck reproduces by
+/// pinning the engine at that floor and braking its output (see
+/// `brake.rs`). Standard range never brakes.
+fn tempo_mapping(range: DeckRange, detected_bpm: f64, target_bpm: f64) -> TempoMapping {
+    let max_ratio = match range {
+        DeckRange::Standard => MAX_VARISPEED_RATIO,
+        // Requests past the wide floor would pin silently inside the
+        // chain — cap the ratio where the chain's honesty ends and let
+        // the brake carry the rest.
+        DeckRange::Wide => 1.0 / WIDE_MIN_TEMPO_RATE,
+    };
+    let ratio = (detected_bpm / target_bpm.max(1e-6)).clamp(MIN_STRETCH_RATIO, max_ratio);
+    let brake = if range == DeckRange::Wide {
+        let desired_rate = target_bpm.max(0.0) / detected_bpm.max(1e-6);
+        (desired_rate / WIDE_MIN_TEMPO_RATE).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    TempoMapping {
+        ratio,
+        brake,
+        effective_bpm: detected_bpm * (1.0 / ratio) * brake,
+    }
+}
 
 /// Auto-loop button label for a `2^exp`-beat length: `1/8` … `1/2`, `1` … `32`.
 fn loop_len_label(exp: i32) -> String {
@@ -309,8 +354,16 @@ pub struct TimeStretchApp {
     /// Frame-based grid cache for the waveform painters and beat counter.
     grid_marks: GridMarks,
 
+    /// Wide-fader brake factor `b` in `[0, 1]` (1.0 = no brake), shared
+    /// lock-free with the audio callback and the deck thread. Below the
+    /// engine's -75% floor the Wide range's fader drives this instead of
+    /// the stretch ratio; see `brake.rs`.
+    brake_shared: Arc<AtomicRate>,
+
     // UI state
     stretch_ratio: f64,
+    /// UI-side copy of the published brake factor.
+    brake: f64,
     /// Target playback BPM the tempo fader binds to (0.0 until a BPM is
     /// detected). Derived view of `stretch_ratio`, kept in sync.
     target_bpm: f64,
@@ -334,24 +387,21 @@ impl TimeStretchApp {
         MAX_VARISPEED_RATIO
     }
 
-    #[inline]
-    fn clamp_stretch_ratio(&self, ratio: f64) -> f64 {
-        ratio.clamp(MIN_STRETCH_RATIO, self.max_stretch_ratio())
-    }
-
     /// Sets the playback tempo to `target_bpm` (for a track at `detected_bpm`)
-    /// and syncs every derived view — stretch ratio, the fader's `target_bpm`,
-    /// and the BPM text box — to the value that actually plays after the
-    /// engine's ratio clamp. Single write point for the tempo control.
+    /// and syncs every derived view — stretch ratio, brake factor, the fader's
+    /// `target_bpm`, and the BPM text box — to the value that actually plays
+    /// after the engine's ratio clamp. Single write point for the tempo
+    /// control.
     fn apply_target_bpm(&mut self, detected_bpm: f64, target_bpm: f64) {
-        let ratio = self.clamp_stretch_ratio(detected_bpm / target_bpm.max(1e-6));
-        let effective_bpm = detected_bpm / ratio;
-        self.stretch_ratio = ratio;
-        self.target_bpm = effective_bpm;
-        self.target_bpm_text = format!("{effective_bpm:.1}");
+        let m = tempo_mapping(self.deck_range, detected_bpm, target_bpm);
+        self.stretch_ratio = m.ratio;
+        self.brake = m.brake;
+        self.brake_shared.store(m.brake);
+        self.target_bpm = m.effective_bpm;
+        self.target_bpm_text = format!("{:.1}", m.effective_bpm);
         let mut st = self.state.lock().unwrap();
-        st.stretch_ratio = ratio;
-        st.target_bpm = effective_bpm;
+        st.stretch_ratio = m.ratio;
+        st.target_bpm = m.effective_bpm;
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
@@ -395,7 +445,9 @@ impl TimeStretchApp {
             zoom_tiles: ZoomedTiles::default(),
             beat_grid: None,
             grid_marks: GridMarks::empty(),
+            brake_shared: Arc::new(AtomicRate::new(1.0)),
             stretch_ratio: 1.0,
+            brake: 1.0,
             target_bpm: 0.0,
             volume: 0.8,
             preset: PresetChoice::DjBeatmatch,
@@ -439,6 +491,8 @@ impl TimeStretchApp {
         // A fresh track starts at its own tempo (fader centered) and
         // unity ratio, regardless of any prior track's settings.
         self.stretch_ratio = 1.0;
+        self.brake = 1.0;
+        self.brake_shared.store(1.0);
         self.target_bpm = 0.0;
         self.target_bpm_text.clear();
         self.position.store(0);
@@ -637,6 +691,7 @@ impl TimeStretchApp {
             reset_request.clone(),
             self.scrub.clone(),
             source.clone(),
+            self.brake_shared.clone(),
         ) {
             Ok(e) => e,
             Err(e) => {
@@ -667,6 +722,7 @@ impl TimeStretchApp {
             self.scrub.clone(),
             pipeline_latency_secs,
             warm_start_preroll,
+            self.brake_shared.clone(),
         );
 
         self.processing_handle = Some(handle);
@@ -762,7 +818,9 @@ impl eframe::App for TimeStretchApp {
                 if transport == Transport::Playing
                     && self.stream_active.load(Ordering::Relaxed) =>
             {
-                Some(sample_rate as f64 / self.stretch_ratio.max(MIN_STRETCH_RATIO))
+                // The brake scales the audible rate below the Wide floor;
+                // at a full stop the rate is 0 and the display pins.
+                Some(sample_rate as f64 / self.stretch_ratio.max(MIN_STRETCH_RATIO) * self.brake)
             }
             ScrubPhase::Settling => Some(self.scrub.voice_rate() * self.output_sample_rate as f64),
             _ => None,
@@ -938,7 +996,17 @@ impl TimeStretchApp {
                         // and the landing consumer below warm-starts the
                         // engine there in parallel.
                         let playing = self.state.lock().unwrap().transport == Transport::Playing;
-                        self.scrub.release(if playing { 1.0 } else { 0.0 });
+                        // While the wide-fader brake is engaged the deck's
+                        // audible rate is floor·b (= b/ratio), not 1.0 —
+                        // ease the glide into the braked speed so the
+                        // crossfade back to the (braked) engine doesn't
+                        // lurch.
+                        let play_rate = if self.brake < 1.0 {
+                            self.brake / self.stretch_ratio.max(MIN_STRETCH_RATIO)
+                        } else {
+                            1.0
+                        };
+                        self.scrub.release(if playing { play_rate } else { 0.0 });
                     } else {
                         // No audio stream to render a glide — land instantly.
                         self.scrub.cancel();
@@ -1231,10 +1299,21 @@ impl TimeStretchApp {
                 ui.label("Tempo:");
                 ui.horizontal(|ui| {
                     if detected > 0.0 {
-                        if self.target_bpm <= 0.0 {
+                        // 0.0 means "uninitialized" only while no brake is
+                        // engaged — at a full WIDE stop the fader honestly
+                        // reads 0.0 BPM and must not snap back.
+                        if self.target_bpm <= 0.0 && self.brake >= 1.0 {
                             self.target_bpm = detected;
                         }
-                        let min_bpm = detected / self.max_stretch_ratio();
+                        // The WIDE range reaches a CDJ-style full stop:
+                        // below the wide chain's -50% floor the engine
+                        // pins and the brake resampler takes the rest
+                        // (see brake.rs).
+                        let min_bpm = if self.deck_range == DeckRange::Wide {
+                            0.0
+                        } else {
+                            detected / self.max_stretch_ratio()
+                        };
                         let max_bpm = detected * MAX_TEMPO_FACTOR;
                         let old_bpm = self.target_bpm;
                         // Widen the fader (3x the default) so 0.1-BPM steps
@@ -1249,7 +1328,7 @@ impl TimeStretchApp {
                         if (self.target_bpm - old_bpm).abs() > 0.001 {
                             self.apply_target_bpm(detected, self.target_bpm);
                         }
-                        let pct = (1.0 / self.stretch_ratio - 1.0) * 100.0;
+                        let pct = ((1.0 / self.stretch_ratio) * self.brake - 1.0) * 100.0;
                         ui.label(egui::RichText::new(format!("{pct:+.1}%")).weak());
                         if ui.button("Reset").clicked() {
                             self.apply_target_bpm(detected, detected);
@@ -1385,6 +1464,22 @@ impl TimeStretchApp {
                             }
                         });
                     if old_range.rebuild_needed(self.deck_range) {
+                        // Leaving Wide while braked below the floor: the
+                        // brake zone doesn't exist in Standard, so release
+                        // it and let the ratio clamp snap the fader to the
+                        // -75% floor before the rebuild.
+                        if self.brake < 1.0 {
+                            let detected = self.state.lock().unwrap().detected_bpm;
+                            if detected > 0.0 {
+                                self.apply_target_bpm(
+                                    detected,
+                                    self.target_bpm.max(detected / MAX_VARISPEED_RATIO),
+                                );
+                            } else {
+                                self.brake = 1.0;
+                                self.brake_shared.store(1.0);
+                            }
+                        }
                         let (transport, latency_secs) = {
                             let mut st = self.state.lock().unwrap();
                             st.deck_range = self.deck_range;
@@ -1976,6 +2071,42 @@ mod tests {
         );
         assert_eq!(DeckRange::Standard.label(), "Standard");
         assert_eq!(DeckRange::Wide.label(), "Wide");
+    }
+
+    #[test]
+    fn tempo_mapping_is_continuous_at_the_wide_floor() {
+        // Exactly at the wide chain's -50% floor: ratio pinned, brake
+        // exactly 1.0 — the brake resampler engages with zero effect, so
+        // the handoff between the direct and braked paths is seamless.
+        let m = tempo_mapping(DeckRange::Wide, 128.0, 64.0);
+        assert_eq!(m.ratio, 2.0);
+        assert_eq!(m.brake, 1.0);
+        assert!((m.effective_bpm - 64.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tempo_mapping_brakes_below_the_wide_floor() {
+        // Halfway between -50% and -100%: engine stays pinned at the
+        // floor, the brake takes the rest, and the effective BPM equals
+        // the fader value (no snap).
+        let m = tempo_mapping(DeckRange::Wide, 128.0, 32.0);
+        assert_eq!(m.ratio, 2.0);
+        assert!((m.brake - 0.5).abs() < 1e-9);
+        assert!((m.effective_bpm - 32.0).abs() < 1e-9);
+
+        let stop = tempo_mapping(DeckRange::Wide, 128.0, 0.0);
+        assert_eq!(stop.ratio, 2.0);
+        assert_eq!(stop.brake, 0.0);
+        assert_eq!(stop.effective_bpm, 0.0);
+    }
+
+    #[test]
+    fn tempo_mapping_never_brakes_in_standard_range() {
+        for target in [0.0, 16.0, 32.0, 128.0, 256.0] {
+            let m = tempo_mapping(DeckRange::Standard, 128.0, target);
+            assert_eq!(m.brake, 1.0);
+            assert!((0.25..=4.0).contains(&m.ratio));
+        }
     }
 
     #[test]
