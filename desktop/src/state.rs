@@ -130,8 +130,10 @@ pub struct SharedState {
 
     /// Constant pipeline (content) delay reported by the active processor,
     /// in seconds. Published by the processing thread at every build; read
-    /// by the UI next to the profile selector.
-    pub reported_latency_secs: f64,
+    /// by the UI next to the profile selector. `None` until an engine has
+    /// reported — 0.0 is the Wide range's honest figure (source-side
+    /// lookahead), so absence must be distinguishable from zero.
+    pub reported_latency_secs: Option<f64>,
     /// Tempo control-to-audio latency reported by the active processor, in
     /// seconds (excludes the callback size). Near-zero on the varispeed-
     /// first path; equals the pipeline delay on the vocoder path.
@@ -170,7 +172,7 @@ impl SharedState {
             detected_bpm: 0.0,
             target_bpm: 0.0,
             seek_request: None,
-            reported_latency_secs: 0.0,
+            reported_latency_secs: None,
             reported_control_latency_secs: 0.0,
             pre_analysis: None,
             analysis_generation: 0,
