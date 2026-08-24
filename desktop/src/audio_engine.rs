@@ -3,8 +3,9 @@ use cpal::{SampleRate, Stream, StreamConfig};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::brake::BrakeResampler;
 use crate::scrub::ScrubVoice;
-use crate::state::{AtomicVolume, ScrubPhase, ScrubState};
+use crate::state::{AtomicRate, AtomicVolume, ScrubPhase, ScrubState};
 
 /// Scrub voice crossfade time in seconds (engage and release).
 const SCRUB_MIX_SECS: f32 = 0.005;
@@ -33,6 +34,12 @@ impl AudioEngine {
     /// While `scrub` is active the callback crossfades to a raw varispeed
     /// read of `source_audio` chasing the published pointer position — the
     /// audible CDJ-style scrub — and back to the engine on release.
+    ///
+    /// `brake` is the Wide range's sub-floor fader factor (1.0 = none):
+    /// below 1.0 the callback reads the engine through a
+    /// [`BrakeResampler`], slowing and pitch-dropping the keylocked output
+    /// down to a frozen stop at 0.0.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         volume: Arc<AtomicVolume>,
         stream_active: Arc<AtomicBool>,
@@ -41,6 +48,7 @@ impl AudioEngine {
         reset_request: Arc<AtomicBool>,
         scrub: Arc<ScrubState>,
         source_audio: Arc<Vec<f32>>,
+        brake: Arc<AtomicRate>,
     ) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = host
@@ -59,6 +67,7 @@ impl AudioEngine {
         };
 
         let mut voice = ScrubVoice::new(sample_rate);
+        let mut brake_resampler = BrakeResampler::new(sample_rate);
         let mix_alpha = 1.0 - (-1.0 / (SCRUB_MIX_SECS * sample_rate as f32)).exp();
         let mut scrub_mix: f32 = 0.0;
         let mut prev_phase = ScrubPhase::Idle;
@@ -72,6 +81,9 @@ impl AudioEngine {
                     // else so seeks work even while output is inactive.
                     if reset_request.load(Ordering::Acquire) {
                         processor.reset();
+                        // A warm-start seek must not replay pre-seek
+                        // frames buffered in the brake FIFO.
+                        brake_resampler.reset();
                         reset_request.store(false, Ordering::Release);
                     }
 
@@ -101,7 +113,12 @@ impl AudioEngine {
                     // output, the engine is left unconsumed (frozen) — its
                     // state is discarded by the release-time warm-start seek.
                     if engine_live && scrub_mix < 1.0 {
-                        processor.process(data);
+                        let b = brake.load();
+                        if b < 1.0 || brake_resampler.engaged() {
+                            brake_resampler.render(b, data, |buf| processor.process(buf));
+                        } else {
+                            processor.process(data);
+                        }
                     } else {
                         data.fill(0.0);
                     }

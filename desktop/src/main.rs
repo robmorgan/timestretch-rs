@@ -1,5 +1,6 @@
 mod app;
 mod audio_engine;
+mod brake;
 mod deck;
 mod decoder;
 mod scrub;

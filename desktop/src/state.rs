@@ -66,7 +66,9 @@ impl DeckEngine {
 ///
 /// `Standard` runs the primary keylock chain (full keylock through ±20%,
 /// ~13 ms pipeline delay); `Wide` runs the wide-range Master Tempo chain
-/// (full-spectrum keylock across the whole 0.25–2.0 rate range, ~49 ms).
+/// (full-spectrum keylock across its 0.5–2.0 rate range — the PV head's
+/// ratio clamp; below rate 0.5 the deck's brake resampler carries the
+/// fader to a full stop).
 /// Unlike the Tape/Keylock deck mode — a live parameter inside either
 /// profile — changing the range REBUILDS the engine: a seek-priced event,
 /// never a live morph.
@@ -203,6 +205,31 @@ impl AtomicVolume {
 
     pub fn load(&self) -> f32 {
         f32::from_bits(self.bits.load(Ordering::Relaxed))
+    }
+}
+
+/// Lock-free rate factor (f64 bits), same pattern as [`AtomicVolume`].
+///
+/// Carries the wide-fader brake factor `b` in `[0, 1]`: 1.0 = no brake
+/// (engine output passes through untouched), 0.0 = full stop. Written by
+/// the UI's tempo write point, read by the audio callback every block.
+pub struct AtomicRate {
+    bits: AtomicU64,
+}
+
+impl AtomicRate {
+    pub fn new(rate: f64) -> Self {
+        Self {
+            bits: AtomicU64::new(rate.to_bits()),
+        }
+    }
+
+    pub fn store(&self, rate: f64) {
+        self.bits.store(rate.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn load(&self) -> f64 {
+        f64::from_bits(self.bits.load(Ordering::Relaxed))
     }
 }
 
