@@ -14,10 +14,15 @@
 //! - zero clicks by the torture tests' max-adjacent-diff bound
 //!   (`slew(max_gesture_rate) * 3`), excluding a settle window at segment
 //!   start and after each seek (priming silence + declick fade-in);
-//! - bounded drift: between settle checkpoints, source frames consumed
-//!   track the integral of the commanded tempo rate within a constant
-//!   [`DRIFT_BOUND_FRAMES`] (the engine's stash is bounded — drift must
-//!   not accumulate with time).
+//! - bounded drift, in two parts (the engine's stash is bounded — drift
+//!   must not accumulate with time). Mid-gesture, between settle
+//!   checkpoints, source frames consumed track the integral of the
+//!   commanded tempo rate within [`drift_bound_frames`] — a constant,
+//!   but a per-profile one, since the elastic reservoir a head may hold
+//!   is a property of its topology. Then every segment ends with a
+//!   quiescent unity-rate tail, where the same accounting must land
+//!   within the far tighter [`SETTLED_DRIFT_BOUND_FRAMES`]: buffering
+//!   swings settle out, a leak does not.
 //!
 //! Zero-allocation on the audio thread is machine-verified separately in
 //! `tests/engine_realtime_allocations.rs` and is not re-gated here.
@@ -244,19 +249,72 @@ struct SegmentReport {
     bound: f32,
     frames: usize,
     max_drift: f64,
+    settled_drift: f64,
 }
 
-/// Bounded-drift gate: between checkpoints (set once a settle window
-/// expires, cleared at every seek), the source frames consumed must
-/// track the integral of the commanded tempo rate. The engine holds a
-/// bounded stash — stage FIFOs, resampler kernel margins, SOLA's
-/// elastic cursor, the profile latency — so the allowed error is a
-/// CONSTANT, not per-time. Measured worst case (2026-08-13): 28 frames
-/// over the CI soak's ~5 s runs, 197 frames (4.5 ms) over the
-/// hour-equivalent soak's 60 s runs; the bound is ~10x that, and a
-/// steady leak of one frame per callback would still cross it within
-/// ~6 s of audio time.
-const DRIFT_BOUND_FRAMES: f64 = 2_048.0;
+/// Bounded-drift gate, part 1 — the PEAK bound, sampled mid-gesture at
+/// every seek and at the end of the ride. Between checkpoints (set once
+/// a settle window expires, cleared at every seek), the source frames
+/// consumed must track the integral of the commanded tempo rate. The
+/// engine holds a bounded stash — stage FIFOs, resampler kernel
+/// margins, SOLA's elastic cursor, the profile latency — so the allowed
+/// error is a CONSTANT, not per-time. It is NOT the same constant for
+/// every profile: the stash a head is entitled to hold is a property of
+/// its topology, so the bound is derived per profile below.
+///
+/// Sampled mid-gesture this is a coarse gate — a head is free to swing
+/// its whole reservoir under a rate step and swing it back. The tight
+/// leak detector is part 2, [`SETTLED_DRIFT_BOUND_FRAMES`].
+fn drift_bound_frames(profile: EngineProfile) -> f64 {
+    match profile {
+        // The direct-ratio wide head (`engine/stages/wide_pv_head.rs`)
+        // runs two arms and is entitled to a large elastic reservoir of
+        // rendered-but-unemitted OUTPUT: `ARM_SURPLUS_MAX` (8_192) of
+        // inaudible-arm surplus plus the per-arm pending cap
+        // (8 * MAX_OUT_PER_HOP = 4_096). A rate step revalues that
+        // backlog in SOURCE frames by up to the profile's rate ceiling
+        // (2.0), and the swing shows up here in full.
+        //
+        // Learned 2026-08-24: the flat 2_048 below was calibrated on
+        // 2026-08-13 against the wide path's PREVIOUS topology
+        // (varispeed prepass -> PV -> resampler) hours before
+        // `WidePvHead` was wired in as the wide head, and was never
+        // re-derived. The re-seeded campaign eventually drew a seed
+        // whose seek landed on a -2_926 frame excursion (run
+        // 32688905856). The excursion returned to ~0 on its own — no
+        // frames were lost.
+        EngineProfile::WideKeylock => (8_192.0 + 8.0 * 512.0) * 2.0,
+        // Narrow profiles: measured worst case (2026-08-13) 28 frames
+        // over the CI soak's ~5 s runs, 197 frames (4.5 ms) over the
+        // hour-equivalent soak's 60 s runs. ~10x that, and a steady
+        // leak of one frame per callback would still cross it within
+        // ~6 s of audio time.
+        _ => 2_048.0,
+    }
+}
+
+/// Bounded-drift gate, part 2 — the SETTLED bound, and the real leak
+/// detector. After the ride, every segment holds unity rate for
+/// [`TAIL_DRAIN_FRAMES`] so the elastic reservoirs reach steady state,
+/// then re-anchors and measures over [`TAIL_MEASURE_FRAMES`]. With
+/// nothing swinging, a head that merely BUFFERS lands within a few
+/// dozen frames; a head that LEAKS cannot. This gate is roughly two
+/// orders of magnitude tighter than the peak bound on the wide profile,
+/// which is what makes an hour of gesturing worth soaking.
+///
+/// Measured 2026-08-24 over four independent campaign hours (240
+/// segments): the narrow profiles land on exactly 0 every time, the wide
+/// head within ±128 frames. The bound is 4x the wide worst case.
+const SETTLED_DRIFT_BOUND_FRAMES: f64 = 512.0;
+
+/// Unity-rate tail after the ride: drain to steady state, then measure.
+///
+/// The measurement window is deliberately long (5 s). A head's settled
+/// error is a QUANTIZATION offset — hop and feed-chunk granularity, a
+/// constant — while a leak accumulates with the window, so the window
+/// length is the gate's sensitivity dial, not the bound.
+const TAIL_DRAIN_FRAMES: usize = 32_768;
+const TAIL_MEASURE_FRAMES: usize = 5 * 44_100;
 
 /// Accounting anchor for the drift gate. Consumed frames between the
 /// anchor and now = frames pushed into the ring minus the ring-fill
@@ -289,6 +347,8 @@ fn run_segment(
         EngineProfile::WideKeylock => (0.5, 2.0),
         _ => (0.9, 1.12),
     };
+
+    let peak_bound = drift_bound_frames(profile);
 
     let handles = Engine::build(EngineConfig {
         sample_rate: SAMPLE_RATE,
@@ -349,9 +409,9 @@ fn run_segment(
                 let drift = measured_drift(&anchor, pushed_total, source.free_frames());
                 max_drift = max_drift.max(drift.abs());
                 assert!(
-                    drift.abs() <= DRIFT_BOUND_FRAMES,
+                    drift.abs() <= peak_bound,
                     "soak[{profile:?}]: source consumption drifted {drift:.0} frames from \
-                     the tempo integral before seek {seeks} (bound {DRIFT_BOUND_FRAMES})"
+                     the tempo integral before seek {seeks} (bound {peak_bound})"
                 );
             }
             settle_until_cb = cb + SEEK_SETTLE_FRAMES / CALLBACK_FRAMES + 1;
@@ -411,11 +471,59 @@ fn run_segment(
         let drift = measured_drift(&anchor, pushed_total, source.free_frames());
         max_drift = max_drift.max(drift.abs());
         assert!(
-            drift.abs() <= DRIFT_BOUND_FRAMES,
+            drift.abs() <= peak_bound,
             "soak[{profile:?}]: source consumption drifted {drift:.0} frames from \
-             the tempo integral over the final run (bound {DRIFT_BOUND_FRAMES})"
+             the tempo integral over the final run (bound {peak_bound})"
         );
     }
+
+    // Quiescent tail: hold unity rate so every elastic reservoir reaches
+    // steady state, then re-anchor and measure. Buffering swings settle
+    // out here; a leak does not. The tail is excluded from the click
+    // gate: the ride's own Snap gestures already put instant full-range
+    // rate steps under that scrutiny, so the tail's step to unity earns
+    // no exemption.
+    controller.set_tempo_rate(1.0);
+    let tail_cbs = (TAIL_DRAIN_FRAMES + TAIL_MEASURE_FRAMES) / CALLBACK_FRAMES;
+    let drain_cbs = TAIL_DRAIN_FRAMES / CALLBACK_FRAMES;
+    let mut tail_anchor: Option<DriftAnchor> = None;
+    for cb in 0..tail_cbs {
+        while source.free_frames() >= scratch.len() {
+            for (i, s) in scratch.iter_mut().enumerate() {
+                *s = tone_at(track_frame + i as u64);
+            }
+            let accepted = source.push(&scratch);
+            track_frame += accepted as u64;
+            pushed_total += accepted as u64;
+            if accepted == 0 {
+                break;
+            }
+        }
+
+        processor.process(&mut out);
+        collected.extend_from_slice(&out);
+
+        match &mut tail_anchor {
+            Some(anchor) => anchor.expected += CALLBACK_FRAMES as f64,
+            None if cb >= drain_cbs => {
+                tail_anchor = Some(DriftAnchor {
+                    pushed: pushed_total,
+                    free: source.free_frames(),
+                    expected: 0.0,
+                });
+            }
+            None => {}
+        }
+    }
+
+    let anchor = tail_anchor.expect("quiescent tail anchors");
+    let settled_drift = measured_drift(&anchor, pushed_total, source.free_frames());
+    assert!(
+        settled_drift.abs() <= SETTLED_DRIFT_BOUND_FRAMES,
+        "soak[{profile:?}]: source consumption leaked {settled_drift:.0} frames over the \
+         quiescent unity-rate tail (bound {SETTLED_DRIFT_BOUND_FRAMES}) — the engine's \
+         stash is bounded, so a settled run must not drift"
+    );
 
     assert_eq!(
         controller.underrun_frames(),
@@ -478,6 +586,7 @@ fn run_segment(
         bound,
         frames: collected.len(),
         max_drift,
+        settled_drift,
     }
 }
 
@@ -497,14 +606,15 @@ fn soak(seed: u64, total_secs: usize, segment_secs: usize, seeks_per_segment: us
         let report = run_segment(&mut rng, profile, artifact, segment_secs, seeks_per_segment);
         println!(
             "soak segment {seg}: {:?} frames={} seeks={} toggles={} max_diff={:.5} \
-             bound={:.5} max_drift={:.0}",
+             bound={:.5} max_drift={:.0} settled_drift={:.0}",
             report.profile,
             report.frames,
             report.seeks,
             report.toggles,
             report.max_diff,
             report.bound,
-            report.max_drift
+            report.max_drift,
+            report.settled_drift
         );
     }
 }

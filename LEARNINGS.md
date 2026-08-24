@@ -395,6 +395,26 @@ Adversarial input, no-panic, and soak coverage for every non-RT surface
   needed only the frames-pushed counter and ring occupancy, and its
   measured headroom (10x) still catches a one-frame-per-callback leak
   within ~6 s of audio time.
+- **Correction (2026-08-24, campaign run 32688905856).** Sampled
+  mid-gesture, that invariant measures the elastic reservoir, not the
+  leak. The flat 2_048-frame bound was calibrated hours before
+  `WidePvHead` became the wide head (`fb2fe81` 06:41 vs `408c734`
+  14:00, both 2026-08-13) and was never re-derived: the direct-ratio
+  head legitimately holds `ARM_SURPLUS_MAX` (8_192) plus its pending
+  cap in rendered-but-unemitted output, and a rate step revalues that
+  backlog in source frames by up to the profile's rate ceiling. Tracing
+  showed −1_902-frame excursions that returned to ~0 on their own; the
+  campaign simply drew a seed whose seek landed on one. Two lessons.
+  A gate constant derived from ONE topology's measurement is not a
+  property of the invariant — the bound is now per-profile and derived
+  from the head's declared stash. And a peak bound is the wrong shape
+  for a leak gate: every segment now ends with a quiescent unity-rate
+  tail, where the same accounting lands on exactly 0 (narrow) or within
+  ±128 frames (wide) across four campaign hours. Window length, not the
+  bound, is that gate's sensitivity dial — a leak grows with the window,
+  a quantization offset does not. Verified by injecting a one-frame-per-
+  feed leak: invisible to the old gate over an hour, caught by the new
+  one in 0.9 s of CI-bounded soak.
 
 ## Stage 17 — Pitch-Shift and Batch Resampler Correctness (2026-08-13)
 
