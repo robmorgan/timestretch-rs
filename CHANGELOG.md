@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Performance
+
+- `AudioBuffer::resample` / `resample_sinc` precompute the windowed-sinc
+  kernel as a polyphase row table (the streaming kernel's machinery)
+  instead of evaluating `sin` per tap per output sample: a 5-minute
+  stereo 44.1→96 kHz conversion drops from ~6.7 s to ~0.9 s (7.5x),
+  with the same anti-aliasing cutoff policy and edge renormalization.
+
 ### Fixed
 
 - The keylock chain's frame-domain tuning was fixed at 44.1 kHz values;
