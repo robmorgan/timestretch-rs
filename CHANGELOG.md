@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The Stage 21 bass corrector's frame-domain tuning (period search
+  range, correlation window, crossfade, envelopes, onset windows) was
+  fixed at 44.1 kHz values; on builds at other sample rates the numbers
+  described the wrong times and frequencies. At 96 kHz the period
+  search bottomed out at ~74 Hz, so a real bass fundamental was
+  unsearchable and the corrector flapped between correction and its
+  pitch-follow fallback as the band's content moved — the low end
+  audibly lurching in and out of key under a sustained DJ offset
+  (found via Halo running its engines at a 96 kHz device rate). The
+  constants are now scaled to the build rate at construction —
+  bit-identical at 44.1 kHz — and regression tests pin sub-band
+  correction at 48/96/192 kHz. The chain's frame-based latency
+  contract is unchanged.
+
 ## 0.13.0
 
 ### Changed

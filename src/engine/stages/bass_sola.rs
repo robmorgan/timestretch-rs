@@ -44,10 +44,17 @@
 
 use crate::engine::stage::{BLOCK_FRAMES, OnsetEvent};
 
+// Every frame-domain constant below is a 44.1 kHz REFERENCE value;
+// [`Tuning::for_sample_rate`] scales them to the build rate (bit-identical
+// at 44.1 kHz). The period range is the load-bearing case: unscaled at
+// 96 kHz it reached only down to ~74 Hz, so a real bass fundamental was
+// unsearchable and the corrector flapped between correction and
+// pitch-follow as the band's content moved — the whole low end lurching
+// in and out of key at sustained DJ offsets.
+
 /// Ring capacity: nominal lag + one max period + correlation window +
 /// margins, with headroom (power of two).
 const RING_LEN: usize = 8_192;
-const RING_MASK: usize = RING_LEN - 1;
 /// Bass period search range, frames at 44.1 kHz: ~34–176 Hz.
 const PERIOD_MIN: usize = 250;
 const PERIOD_MAX: usize = 1_300;
@@ -117,6 +124,67 @@ const REST_TRIM_MAX: f64 = 0.002;
 /// 120 Hz band edge stays under ~4°).
 const REST_DRIFT_DONE: f64 = 4.0;
 
+/// Frame-domain tuning: the 44.1 kHz reference constants scaled to the
+/// build sample rate, so the corrector's period range, windows, fades,
+/// and envelopes describe the same TIME (and the same frequencies) at
+/// every rate. At 44.1 kHz each value equals its reference constant.
+///
+/// Deliberately NOT scaled: the nominal lag (the chain's frame-based
+/// latency contract), `MARGIN` and the fixed 16-frame hard-bound pads
+/// (interpolation/numerical safety), and every dimensionless ratio.
+/// The elastic sawtooth rides ABOVE nominal, so a scaled fade span
+/// larger than the down-corridor costs only the one cold-start forced
+/// jump — steady-state geometry is unchanged.
+#[derive(Debug)]
+struct Tuning {
+    ring_len: usize,
+    ring_mask: u64,
+    period_min: usize,
+    period_max: usize,
+    corr_win: usize,
+    sweep_step: usize,
+    xfade: usize,
+    slack: f64,
+    retry_cooldown: usize,
+    env_fast_coeff: f32,
+    env_slow_coeff: f32,
+    onset_protect_pre: f64,
+    onset_protect_post: f64,
+    masked_window_start: f64,
+    masked_window_end: f64,
+    rest_drift_done: f64,
+    /// Per-frame drift-repayment slew at rest (reference 0.001; the gain
+    /// scales inversely so the repayment TIME constant is rate-invariant).
+    rest_trim_slew: f64,
+}
+
+impl Tuning {
+    fn for_sample_rate(sample_rate: u32) -> Self {
+        let s = f64::from(sample_rate.max(1)) / 44_100.0;
+        let frames = |reference: usize| ((reference as f64 * s).round() as usize).max(1);
+        let ring_len = ((RING_LEN as f64 * s).ceil() as usize).next_power_of_two();
+        Self {
+            ring_len,
+            ring_mask: ring_len as u64 - 1,
+            period_min: frames(PERIOD_MIN),
+            period_max: frames(PERIOD_MAX),
+            corr_win: frames(CORR_WIN),
+            sweep_step: frames(SWEEP_STEP),
+            xfade: frames(XFADE),
+            slack: SLACK * s,
+            retry_cooldown: frames(RETRY_COOLDOWN),
+            env_fast_coeff: (f64::from(ENV_FAST_COEFF) / s) as f32,
+            env_slow_coeff: (f64::from(ENV_SLOW_COEFF) / s) as f32,
+            onset_protect_pre: ONSET_PROTECT_PRE * s,
+            onset_protect_post: ONSET_PROTECT_POST * s,
+            masked_window_start: MASKED_WINDOW_START * s,
+            masked_window_end: MASKED_WINDOW_END * s,
+            rest_drift_done: REST_DRIFT_DONE * s,
+            rest_trim_slew: 0.001 / s,
+        }
+    }
+}
+
 /// Incremental period-sweep state.
 #[derive(Debug)]
 struct Sweep {
@@ -152,16 +220,21 @@ pub(crate) struct BassSola {
     period: Option<usize>,
     nominal_lag: usize,
     transposition: f64,
+    /// Reference constants scaled to the build sample rate.
+    tune: Tuning,
     /// Splice audit trail for tests: (read stage frame, jump size).
     #[cfg(test)]
     splice_log: Vec<(f64, f64)>,
 }
 
 impl BassSola {
-    pub(crate) fn new(num_channels: usize, nominal_lag: usize) -> Self {
+    pub(crate) fn new(num_channels: usize, nominal_lag: usize, sample_rate: u32) -> Self {
+        let tune = Tuning::for_sample_rate(sample_rate);
         Self {
-            rings: (0..num_channels).map(|_| vec![0.0; RING_LEN]).collect(),
-            mono: vec![0.0; RING_LEN],
+            rings: (0..num_channels)
+                .map(|_| vec![0.0; tune.ring_len])
+                .collect(),
+            mono: vec![0.0; tune.ring_len],
             // Pre-fill the nominal lag with silence so read starts at 0;
             // ingested frame k sits at ring position nominal_lag + k, so
             // stage frame = ring position - nominal_lag.
@@ -173,13 +246,14 @@ impl BassSola {
             env_slow: 0.0,
             retry_cooldown: 0,
             sweep: Sweep {
-                next_lag: PERIOD_MIN,
+                next_lag: tune.period_min,
                 best_lag: 0,
                 best_corr: -1.0,
             },
             period: None,
             nominal_lag,
             transposition: 1.0,
+            tune,
             #[cfg(test)]
             splice_log: Vec::new(),
         }
@@ -210,7 +284,7 @@ impl BassSola {
         self.env_slow = 0.0;
         self.retry_cooldown = 0;
         self.sweep = Sweep {
-            next_lag: PERIOD_MIN,
+            next_lag: self.tune.period_min,
             best_lag: 0,
             best_corr: -1.0,
         };
@@ -224,10 +298,11 @@ impl BassSola {
     /// oversampled at 44.1 kHz so interpolation error is negligible.
     #[inline]
     fn sample(ring: &[f32], pos: f64) -> f32 {
+        let mask = ring.len() as u64 - 1;
         let i = pos.floor();
         let frac = (pos - i) as f32;
         let i = i as i64;
-        let at = |k: i64| ring[((i + k) as u64 & RING_MASK as u64) as usize];
+        let at = |k: i64| ring[((i + k) as u64 & mask) as usize];
         let (p0, p1, p2, p3) = (at(-1), at(0), at(1), at(2));
         let a = 0.5 * (3.0 * (p1 - p2) + p3 - p0);
         let b = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
@@ -240,9 +315,9 @@ impl BassSola {
     /// behind them is guaranteed written.
     fn ncc(&self, a: u64, b: u64) -> f64 {
         let (mut dot, mut ea, mut eb) = (0.0f64, 0.0f64, 0.0f64);
-        for k in 1..=CORR_WIN as u64 {
-            let x = self.mono[((a.wrapping_sub(k)) & RING_MASK as u64) as usize] as f64;
-            let y = self.mono[((b.wrapping_sub(k)) & RING_MASK as u64) as usize] as f64;
+        for k in 1..=self.tune.corr_win as u64 {
+            let x = self.mono[((a.wrapping_sub(k)) & self.tune.ring_mask) as usize] as f64;
+            let y = self.mono[((b.wrapping_sub(k)) & self.tune.ring_mask) as usize] as f64;
             dot += x * y;
             ea += x * x;
             eb += y * y;
@@ -262,13 +337,15 @@ impl BassSola {
                 self.sweep.best_corr = c;
                 self.sweep.best_lag = lag;
             }
-            self.sweep.next_lag += SWEEP_STEP;
-            if self.sweep.next_lag > PERIOD_MAX {
+            self.sweep.next_lag += self.tune.sweep_step;
+            if self.sweep.next_lag > self.tune.period_max {
                 // Fine pass around the coarse peak, then publish.
                 let coarse = self.sweep.best_lag;
                 let mut best = (coarse, self.sweep.best_corr);
-                let lo = coarse.saturating_sub(SWEEP_STEP - 1).max(PERIOD_MIN);
-                for lag in lo..=(coarse + SWEEP_STEP - 1).min(PERIOD_MAX) {
+                let lo = coarse
+                    .saturating_sub(self.tune.sweep_step - 1)
+                    .max(self.tune.period_min);
+                for lag in lo..=(coarse + self.tune.sweep_step - 1).min(self.tune.period_max) {
                     let c = self.ncc(anchor, anchor.wrapping_sub(lag as u64));
                     if c > best.1 {
                         best = (lag, c);
@@ -276,7 +353,7 @@ impl BassSola {
                 }
                 self.period = (best.1 > PERIODICITY_MIN).then_some(best.0);
                 self.sweep = Sweep {
-                    next_lag: PERIOD_MIN,
+                    next_lag: self.tune.period_min,
                     best_lag: 0,
                     best_corr: -1.0,
                 };
@@ -290,11 +367,11 @@ impl BassSola {
     /// minus the silent prefill).
     fn span_hits_onset(&self, onsets: &[OnsetEvent], start: f64, t: f64) -> bool {
         let base = self.nominal_lag as f64;
-        let span = XFADE as f64 * t.max(1.0);
+        let span = self.tune.xfade as f64 * t.max(1.0);
         onsets.iter().any(|event| {
             (event.band_flux[0].max(event.band_flux[1]) >= ONSET_FLUX_MIN)
-                && start - base < event.stage_frame + ONSET_PROTECT_POST
-                && start - base + span > event.stage_frame - ONSET_PROTECT_PRE
+                && start - base < event.stage_frame + self.tune.onset_protect_post
+                && start - base + span > event.stage_frame - self.tune.onset_protect_pre
         })
     }
 
@@ -304,7 +381,7 @@ impl BassSola {
         let read_stage = self.read - self.nominal_lag as f64;
         onsets.iter().any(|event| {
             (event.band_flux[0].max(event.band_flux[1]) >= ONSET_FLUX_MIN)
-                && (MASKED_WINDOW_START..MASKED_WINDOW_END)
+                && (self.tune.masked_window_start..self.tune.masked_window_end)
                     .contains(&(read_stage - event.stage_frame))
         })
     }
@@ -331,7 +408,7 @@ impl BassSola {
 
         for i in 0..BLOCK_FRAMES {
             // Ingest every channel and the decision mean.
-            let widx = (self.write & RING_MASK as u64) as usize;
+            let widx = (self.write & self.tune.ring_mask) as usize;
             let mut mean = 0.0f32;
             for (ch, ring) in self.rings.iter_mut().enumerate() {
                 let x = io[ch][i];
@@ -341,8 +418,8 @@ impl BassSola {
             mean /= channels as f32;
             self.mono[widx] = mean;
             self.write += 1;
-            self.env_fast += ENV_FAST_COEFF * (mean * mean - self.env_fast);
-            self.env_slow += ENV_SLOW_COEFF * (mean * mean - self.env_slow);
+            self.env_fast += self.tune.env_fast_coeff * (mean * mean - self.env_fast);
+            self.env_slow += self.tune.env_slow_coeff * (mean * mean - self.env_slow);
 
             // Rest micro-trim: while correction is disengaged, repay
             // residual sub-period drift by a bounded read-rate detune —
@@ -350,14 +427,15 @@ impl BassSola {
             let mut advance = t;
             if c == 0.0 {
                 let drift = self.write as f64 - self.read - nominal;
-                if drift.abs() > REST_DRIFT_DONE {
-                    advance += (drift * 0.001).clamp(-REST_TRIM_MAX, REST_TRIM_MAX);
+                if drift.abs() > self.tune.rest_drift_done {
+                    advance +=
+                        (drift * self.tune.rest_trim_slew).clamp(-REST_TRIM_MAX, REST_TRIM_MAX);
                 }
             }
 
             // Emit (all channels share the cursor and fade weights).
             if self.fade_left > 0 {
-                let k = self.fade_left as f32 / XFADE as f32;
+                let k = self.fade_left as f32 / self.tune.xfade as f32;
                 let w_old = 0.5 - 0.5 * (core::f32::consts::PI * k).cos();
                 for (ch, ring) in self.rings.iter().enumerate() {
                     let a = Self::sample(ring, self.old_read);
@@ -394,9 +472,9 @@ impl BassSola {
         let v = 1.0 - t;
         // Hard bounds keep the cursor (and a full fade + corr window)
         // inside valid history regardless of periodicity.
-        let fade_travel = XFADE as f64 * t.max(1.0);
+        let fade_travel = self.tune.xfade as f64 * t.max(1.0);
         let hard_low = MARGIN + fade_travel + 16.0;
-        let hard_high = (RING_LEN - CORR_WIN) as f64 - fade_travel - 16.0;
+        let hard_high = (self.tune.ring_len - self.tune.corr_win) as f64 - fade_travel - 16.0;
         let forced = lag < hard_low || lag > hard_high;
         // Rest = correction disengaged (c == 0), NOT small effective |v|:
         // a partially-engaged ride compresses v below any fixed epsilon
@@ -416,7 +494,7 @@ impl BassSola {
                 let target = (self.read + drift)
                     .clamp(self.write as f64 - hard_high, self.write as f64 - hard_low);
                 if quiet
-                    && drift.abs() > SLACK
+                    && drift.abs() > self.tune.slack
                     && !self.span_hits_onset(onsets, self.read, t)
                     && !self.span_hits_onset(onsets, target, t)
                 {
@@ -424,7 +502,7 @@ impl BassSola {
                 }
                 return;
             }
-            let p = self.period.unwrap_or(PERIOD_MIN) as f64;
+            let p = self.period.unwrap_or(self.tune.period_min) as f64;
             // Start-of-stream polish (review F10): the first discretionary
             // jump back would land in the silent prefill; wait until a
             // period of real history exists (forced still allowed).
@@ -460,16 +538,16 @@ impl BassSola {
             Some(p) => {
                 let p = p as f64;
                 let n = if v > 0.0 {
-                    ((lag - (hard_low + SLACK)) / p).floor()
+                    ((lag - (hard_low + self.tune.slack)) / p).floor()
                 } else {
-                    let n_max = ((hard_high - SLACK - lag) / p).floor();
+                    let n_max = ((hard_high - self.tune.slack - lag) / p).floor();
                     (-drift / p).round().max(1.0).min(n_max)
                 };
                 if n < 1.0 {
                     if forced {
                         drift // no aligned jump fits: recenter outright
                     } else {
-                        self.retry_cooldown = RETRY_COOLDOWN;
+                        self.retry_cooldown = self.tune.retry_cooldown;
                         return;
                     }
                 } else if v > 0.0 {
@@ -486,7 +564,7 @@ impl BassSola {
                 if forced {
                     drift
                 } else {
-                    self.retry_cooldown = RETRY_COOLDOWN;
+                    self.retry_cooldown = self.tune.retry_cooldown;
                     return;
                 }
             }
@@ -501,7 +579,7 @@ impl BassSola {
             && (self.span_hits_onset(onsets, self.read, t)
                 || self.span_hits_onset(onsets, target, t))
         {
-            self.retry_cooldown = RETRY_COOLDOWN / 2;
+            self.retry_cooldown = self.tune.retry_cooldown / 2;
             return;
         }
         if (target - self.read).abs() < 1.0 {
@@ -512,7 +590,7 @@ impl BassSola {
             .push((self.read - self.nominal_lag as f64, target - self.read));
         self.old_read = self.read;
         self.read = target;
-        self.fade_left = XFADE;
+        self.fade_left = self.tune.xfade;
     }
 
     /// Unconditional recenter splice (rest path): jump the whole drift.
@@ -527,7 +605,7 @@ impl BassSola {
             .push((self.read - self.nominal_lag as f64, target - self.read));
         self.old_read = self.read;
         self.read = target;
-        self.fade_left = XFADE;
+        self.fade_left = self.tune.xfade;
     }
 }
 
@@ -567,7 +645,7 @@ mod tests {
 
     #[test]
     fn unity_transposition_is_a_pure_delay() {
-        let mut bass = BassSola::new(1, LAG);
+        let mut bass = BassSola::new(1, LAG, 44_100);
         let input = sine(60.0, 44_100);
         let out = run(&mut bass, &input, 1.0, &[]);
         for i in 20_000..40_000 {
@@ -581,7 +659,7 @@ mod tests {
     #[test]
     fn transposition_moves_the_fundamental_and_stays_smooth() {
         for (t, f_in) in [(1.087, 55.0), (0.926, 55.0), (1.087, 110.0)] {
-            let mut bass = BassSola::new(1, LAG);
+            let mut bass = BassSola::new(1, LAG, 44_100);
             let input = sine(f_in, 6 * 44_100);
             let out = run(&mut bass, &input, t, &[]);
             let settled = &out[44_100..];
@@ -607,11 +685,45 @@ mod tests {
     }
 
     #[test]
+    fn sub_bass_corrects_at_every_build_rate() {
+        // Regression (2026-08-25, found via Halo at a 96 kHz device):
+        // with the frame constants unscaled, a 96 kHz build's period
+        // search bottomed out at ~74 Hz — a real bass fundamental was
+        // unsearchable, so the corrector flapped between correction and
+        // pitch-follow as the band's content moved. A 55 Hz fundamental
+        // under a sustained DJ offset must correct at every rate.
+        for sr in [44_100u32, 48_000, 96_000, 192_000] {
+            let mut bass = BassSola::new(1, LAG, sr);
+            let t = 1.144; // sustained −12.6% tempo
+            let frames = 6 * sr as usize;
+            let input: Vec<f32> = (0..frames)
+                .map(|i| {
+                    (2.0 * std::f64::consts::PI * 55.0 * i as f64 / sr as f64).sin() as f32 * 0.5
+                })
+                .collect();
+            let out = run(&mut bass, &input, t, &[]);
+            let settled = &out[2 * sr as usize..];
+            let mut crossings = 0u32;
+            for w in settled.windows(2) {
+                if w[0] < 0.0 && w[1] >= 0.0 {
+                    crossings += 1;
+                }
+            }
+            let f_out = f64::from(crossings) * f64::from(sr) / settled.len() as f64;
+            let expect = 55.0 * t;
+            assert!(
+                (f_out - expect).abs() / expect < 0.02,
+                "{sr} Hz build: fundamental {f_out:.2} Hz, expected {expect:.2} (pitch-follow would be 55.00)"
+            );
+        }
+    }
+
+    #[test]
     fn stereo_channels_splice_in_lockstep() {
         // Lockstep contract: with R = -0.8·L, per-channel decisions would
         // splice the two channels at different times (identical inputs
         // could not catch that). The scale relation must survive exactly.
-        let mut bass = BassSola::new(2, LAG);
+        let mut bass = BassSola::new(2, LAG, 44_100);
         bass.set_transposition(1.08);
         let input = sine(60.0, 4 * 44_100);
         for chunk in input.chunks(BLOCK_FRAMES) {
@@ -640,7 +752,7 @@ mod tests {
         // Kicks every ~0.47 s (128 BPM) with sub-bass flux; at ±8% the
         // drift budget between kicks is ample, so no discretionary fade
         // may overlap a protection window.
-        let mut bass = BassSola::new(1, LAG);
+        let mut bass = BassSola::new(1, LAG, 44_100);
         let input = sine(55.0, 6 * 44_100);
         let kick_spacing = 20_672.0;
         // k starts at 1: a kick at stage frame 0 collides with the one
@@ -677,7 +789,7 @@ mod tests {
     fn rest_quiet_gap_recenters_parked_drift() {
         // Park drift with a ride, then rest through tone → SILENCE → tone:
         // the quiet-gap recenter must repay the park in one hidden splice.
-        let mut bass = BassSola::new(1, LAG);
+        let mut bass = BassSola::new(1, LAG, 44_100);
         let _ = run(&mut bass, &sine(60.0, 4 * 44_100), 1.08, &[]);
         let parked = (bass.write as f64 - bass.read - LAG as f64).abs();
         assert!(parked > SLACK, "ride must park drift (got {parked:.1})");
@@ -698,7 +810,7 @@ mod tests {
         // quiet detector must not fire on sustained bass — its envelope
         // averages over full periods). Park a sub-trim-budget drift
         // directly and verify convergence within the trim's own budget.
-        let mut bass = BassSola::new(1, LAG);
+        let mut bass = BassSola::new(1, LAG, 44_100);
         let _ = run(&mut bass, &sine(60.0, 44_100), 1.0, &[]);
         bass.read -= 300.0; // park +300 frames of drift artificially
         let splices_before = bass.splice_log.len();
@@ -721,7 +833,7 @@ mod tests {
         // bias against the high band. Pin it at the geometric floor
         // (~+0.4·p) rather than letting thresholds inflate it.
         for t in [1.087, 0.926] {
-            let mut bass = BassSola::new(1, LAG);
+            let mut bass = BassSola::new(1, LAG, 44_100);
             bass.set_transposition(t);
             let input = sine(55.0, 20 * 44_100);
             let mut drift_sum = 0.0f64;
