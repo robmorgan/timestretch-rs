@@ -275,33 +275,101 @@ pub(crate) fn overlay_plan(width_px: f32, beat_count: usize, downbeat_count: usi
 }
 
 /// Rasterizes a range of a peak level's buckets into a transparent-
-/// background image, one column per bucket. Bands paint in high → mid →
-/// low order — low on top — so kick-heavy passages read blue and highs
-/// surface only where the lows drop out (CDJ RGB semantics; in a dense
-/// master the high band's *peak* is near full scale everywhere and would
-/// bury the image if on top).
-pub(crate) fn render_columns(
+/// background image at `supersample` columns per bucket, linearly
+/// interpolating the envelope between bucket centers with coverage
+/// anti-aliasing on the top and bottom edge pixels. Bands paint in
+/// high → mid → low order — low on top — so kick-heavy passages read
+/// blue and highs surface only where the lows drop out (CDJ RGB
+/// semantics; in a dense master the high band's *peak* is near full
+/// scale everywhere and would bury the image if on top).
+///
+/// Interpolation samples the *full* level by global bucket index while
+/// `buckets` restricts only the output range, so a tile's edge columns
+/// read their true neighbors and adjacent tiles stay pixel-exact at the
+/// seam (with a power-of-two `supersample`, the column→bucket mapping is
+/// bit-identical between a subrange render and the same columns of a
+/// full render).
+pub(crate) fn render_envelope(
     level: &peaks::PeakLevel,
     buckets: std::ops::Range<usize>,
+    supersample: usize,
     height: usize,
 ) -> egui::ColorImage {
-    let width = buckets.len().max(1);
+    let n = level.num_buckets();
+    let supersample = supersample.max(1);
+    let width = buckets.len().max(1) * supersample;
     let mut image = egui::ColorImage::new([width, height], egui::Color32::TRANSPARENT);
+    if n == 0 {
+        return image;
+    }
     let center = height as f32 / 2.0;
     let half_height = height as f32 * 0.45;
     let band_colors = [palette::BAND_LOW, palette::BAND_MID, palette::BAND_HIGH];
-    for (x, b) in buckets.enumerate() {
+    let inv_ss = 1.0 / supersample as f64;
+    for x in 0..width {
+        // Global bucket-space position of this column's center; the outer
+        // half-bucket at range/track edges clamps flat rather than
+        // extrapolating.
+        let u = buckets.start as f64 + (x as f64 + 0.5) * inv_ss - 0.5;
+        let uf = u.floor();
+        let t = (u - uf) as f32;
+        let i0 = (uf.max(0.0) as usize).min(n - 1);
+        let i1 = (i0 + 1).min(n - 1);
         for (band, &color) in band_colors.iter().enumerate().rev() {
-            let pos = level.pos[band][b].clamp(0.0, 1.0);
-            let neg = level.neg[band][b].clamp(-1.0, 0.0);
-            let top = (center - pos * half_height).floor().max(0.0) as usize;
-            let bottom = ((center - neg * half_height).ceil() as usize).min(height);
-            for y in top..bottom {
-                image.pixels[y * width + x] = color;
+            let pos = (level.pos[band][i0] * (1.0 - t) + level.pos[band][i1] * t).clamp(0.0, 1.0);
+            let neg = (level.neg[band][i0] * (1.0 - t) + level.neg[band][i1] * t).clamp(-1.0, 0.0);
+            let top = (center - pos * half_height).clamp(0.0, height as f32);
+            let bottom = (center - neg * half_height).clamp(0.0, height as f32);
+            if bottom > top {
+                fill_span(&mut image.pixels, width, height, x, top, bottom, color);
             }
         }
     }
     image
+}
+
+/// Fills rows `top..bottom` (fractional pixels) of column `x` with `color`,
+/// alpha-blending the partial pixel at each end over what's already there.
+fn fill_span(
+    pixels: &mut [egui::Color32],
+    width: usize,
+    height: usize,
+    x: usize,
+    top: f32,
+    bottom: f32,
+    color: egui::Color32,
+) {
+    let y_top = (top.floor() as usize).min(height - 1);
+    let y_bot = (bottom.floor() as usize).min(height - 1);
+    if y_top == y_bot {
+        blend_over(&mut pixels[y_top * width + x], color, bottom - top);
+        return;
+    }
+    blend_over(
+        &mut pixels[y_top * width + x],
+        color,
+        (y_top + 1) as f32 - top,
+    );
+    for y in (y_top + 1)..y_bot {
+        pixels[y * width + x] = color;
+    }
+    blend_over(&mut pixels[y_bot * width + x], color, bottom - y_bot as f32);
+}
+
+/// Composites opaque `src` over `dst` at `coverage` (source-over).
+fn blend_over(dst: &mut egui::Color32, src: egui::Color32, coverage: f32) {
+    let cov = coverage.clamp(0.0, 1.0);
+    if cov >= 1.0 {
+        *dst = src;
+        return;
+    }
+    let inv = 1.0 - cov;
+    *dst = egui::Color32::from_rgba_premultiplied(
+        (src.r() as f32 * cov + dst.r() as f32 * inv).round() as u8,
+        (src.g() as f32 * cov + dst.g() as f32 * inv).round() as u8,
+        (src.b() as f32 * cov + dst.b() as f32 * inv).round() as u8,
+        (255.0 * cov + dst.a() as f32 * inv).round() as u8,
+    );
 }
 
 /// Paint the "load a file" placeholder shared by both waveform panels.
@@ -320,10 +388,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_columns_subrange_matches_full_render() {
+    fn render_envelope_subrange_matches_full_render() {
         let buckets = 64;
         let level = peaks::PeakLevel {
-            buckets_per_sec: 150.0,
+            buckets_per_sec: 1500.0,
             pos: std::array::from_fn(|band| {
                 (0..buckets)
                     .map(|b| ((b + band) % 7) as f32 / 7.0)
@@ -335,15 +403,16 @@ mod tests {
                     .collect()
             }),
         };
-        let height = 32;
-        let full = render_columns(&level, 0..buckets, height);
+        let (height, ss) = (32, 2);
+        let full = render_envelope(&level, 0..buckets, ss, height);
         let (lo, hi) = (10, 20);
-        let sub = render_columns(&level, lo..hi, height);
+        let sub = render_envelope(&level, lo..hi, ss, height);
+        let sub_width = (hi - lo) * ss;
         for y in 0..height {
-            for x in 0..(hi - lo) {
+            for x in 0..sub_width {
                 assert_eq!(
-                    sub.pixels[y * (hi - lo) + x],
-                    full.pixels[y * buckets + lo + x],
+                    sub.pixels[y * sub_width + x],
+                    full.pixels[y * buckets * ss + lo * ss + x],
                     "pixel mismatch at ({x}, {y})"
                 );
             }

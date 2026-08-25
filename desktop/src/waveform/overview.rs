@@ -5,12 +5,15 @@
 use eframe::egui;
 
 use super::peaks::BandPeaks;
-use super::{GridMarks, overlay_plan, paint_placeholder, palette, render_columns};
+use super::{GridMarks, overlay_plan, paint_placeholder, palette, render_envelope};
 
 /// Strip height in points.
 const STRIP_HEIGHT: f32 = 48.0;
 /// Texture height in pixels (2x the strip for retina crispness).
 const TEX_HEIGHT: usize = 96;
+/// Texture columns per coarsest-level bucket, so the interpolated
+/// envelope — not per-bucket columns — defines the strip's shape.
+const TEX_SUPERSAMPLE: usize = 2;
 /// Bottom-edge tick heights in points.
 const TICK_BAR_PX: f32 = 6.0;
 const TICK_PHRASE_PX: f32 = 12.0;
@@ -29,7 +32,7 @@ impl OverviewTexture {
         Self {
             tex: ctx.load_texture(
                 "waveform_overview",
-                render_columns(level, 0..level.num_buckets(), TEX_HEIGHT),
+                render_envelope(level, 0..level.num_buckets(), TEX_SUPERSAMPLE, TEX_HEIGHT),
                 egui::TextureOptions::LINEAR,
             ),
         }
