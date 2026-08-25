@@ -52,10 +52,19 @@ use std::path::Path;
 /// sub-level; v11 artifacts for that class carry wrong-tempo grids and
 /// are worse than re-analysis, so `MIN_COMPATIBLE_VERSION` rises too.
 ///
+/// v13: no schema change — sustained low-band ENERGY joins the downbeat
+/// accent (both electors). Flux/onset features tie on four-on-floor
+/// material (every beat carries an equal kick) and the log-difference
+/// onset actively favors the snare, so cached downbeats for that class
+/// sit on beats 2/4 — a DJ host's auto-cue lands on a snare instead of
+/// the one. Elections changed on 2 of 5 sampled house tracks, both
+/// toward the measured bass phase; worse than re-analysis, so
+/// `MIN_COMPATIBLE_VERSION` rises too.
+///
 /// The bump-when policy for these two constants lives in CLAUDE.md
 /// ("Analysis Version Policy") and is checked at release time via
 /// RELEASE_CHECKLIST.md.
-pub const PREANALYSIS_VERSION: u32 = 12;
+pub const PREANALYSIS_VERSION: u32 = 13;
 
 /// Oldest schema version whose *analysis results* match the current
 /// detector. Artifacts below this fail
@@ -65,8 +74,10 @@ pub const PREANALYSIS_VERSION: u32 = 12;
 /// v9 predates estimator-disagreement confidence capping, so cached
 /// confidence for phase-indecisive tracks is wrongly high; v10/v11
 /// predate the metrical-level second pass, so cached DnB-class grids
-/// sit at the wrong tempo level entirely.
-const MIN_COMPATIBLE_VERSION: u32 = 12;
+/// sit at the wrong tempo level entirely; v12 predates the energy term
+/// in downbeat election, so cached four-on-floor downbeats sit on the
+/// snare phase.
+const MIN_COMPATIBLE_VERSION: u32 = 13;
 
 fn default_artifact_version() -> u32 {
     1

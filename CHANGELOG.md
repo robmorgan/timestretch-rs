@@ -10,6 +10,22 @@
   stereo 44.1→96 kHz conversion drops from ~6.7 s to ~0.9 s (7.5x),
   with the same anti-aliasing cutoff policy and edge renormalization.
 
+### Changed
+
+- Downbeat election (both the accent scorer and the rigid grid's
+  rotation) gains a sustained low-band ENERGY feature, self-gated by its
+  own cross-beat contrast. Flux/onset features tie on four-on-floor
+  material — every beat carries an equal kick — and the log-difference
+  onset actively favors the snare (a bass fill before the kick
+  suppresses its jump), so beat one landed on beats 2/4 and a DJ host's
+  auto-cue parked on a snare. The bassline's emphasis on the true one
+  is sustained energy (measured 30–280 ms after the beat, past the
+  shared kick attack), which difference features cannot see. Cached
+  artifacts regenerate: `PREANALYSIS_VERSION` and
+  `MIN_COMPATIBLE_VERSION` rise to 13 — sampled house-corpus elections
+  changed on 2 of 5 tracks, both toward the measured bass phase, with
+  backbeat and accent-driven material unchanged.
+
 ### Fixed
 
 - The keylock chain's frame-domain tuning was fixed at 44.1 kHz values;

@@ -46,7 +46,20 @@ const SEGMENT_DEVIATION_RUN: usize = 4;
 /// marks bar starts across most popular genres).
 const DOWNBEAT_LOW_FLUX_WEIGHT: f32 = 0.6;
 /// Weight of overall novelty in the downbeat accent feature.
+/// Weight of sustained sub-bass ENERGY in the downbeat accent, with the
+/// measurement window in analysis frames: skip ~3 frames (past the kick's
+/// attack, which every beat shares), then average ~21 (≈ 250 ms at the
+/// 2048/512 configuration — a bass note's sustained body). Flux features
+/// tie on four-on-floor material (every beat carries an equal kick) and
+/// the log-difference onset feature actively favors the snare (a bass
+/// fill before the kick suppresses its jump), electing the snare as beat
+/// one; the bassline's emphasis on the true one is carried by sustained
+/// ENERGY, which difference features cannot see. Weighted above the flux
+/// terms because where they disagree, energy is the trustworthy one.
 const DOWNBEAT_NOVELTY_WEIGHT: f32 = 0.4;
+const DOWNBEAT_ENERGY_WEIGHT: f32 = 1.5;
+const DOWNBEAT_ENERGY_SKIP_FRAMES: usize = 3;
+const DOWNBEAT_ENERGY_FRAMES: usize = 21;
 
 /// Maximum distance, in novelty frames, for snapping a tracked beat to a
 /// detected transient onset (sub-hop precision from the phase-refined
@@ -614,6 +627,24 @@ fn segment_tempo(beats: &[f64], sample_rate: u32) -> Vec<TempoSegment> {
         .collect()
 }
 
+/// Quartile contrast of a per-beat feature in [0, 1]: `1 - q25/q75`.
+/// ~0 for flat or noisy-flat profiles, high when the top quarter of
+/// beats genuinely stands out.
+fn quartile_contrast_f32(values: &[f32]) -> f32 {
+    if values.len() < 4 {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let q25 = sorted[sorted.len() / 4];
+    let q75 = sorted[(sorted.len() * 3) / 4];
+    if q75 > 1e-12 {
+        (1.0 - q25 / q75).max(0.0)
+    } else {
+        0.0
+    }
+}
+
 /// Estimates the downbeat phase from beat-synchronous accent features:
 /// low-band flux (bass emphasis) plus overall novelty, scored across the
 /// [`BEATS_PER_BAR`] phase hypotheses. Returns downbeat indices into the
@@ -643,12 +674,40 @@ fn estimate_downbeats(
     let max_low = low_flux.iter().copied().fold(0.0f32, f32::max);
     let low_norm = if max_low > 1e-12 { max_low } else { 1.0 };
 
+    // Sustained sub-bass energy over the frames just after each beat.
+    let low_energy: Vec<f32> = beat_frames
+        .iter()
+        .map(|&frame| {
+            let e = &transients.per_frame_low_energy;
+            let start = frame + DOWNBEAT_ENERGY_SKIP_FRAMES;
+            let end = (start + DOWNBEAT_ENERGY_FRAMES).min(e.len());
+            let span = &e[start.min(end)..end];
+            if span.is_empty() {
+                0.0
+            } else {
+                span.iter().sum::<f32>() / span.len() as f32
+            }
+        })
+        .collect();
+    let max_energy = low_energy.iter().copied().fold(0.0f32, f32::max);
+    let energy_norm = if max_energy > 1e-12 { max_energy } else { 1.0 };
+    // Self-gating: an uninformative energy profile — flat, or noise
+    // around silence (post-attack windows of a pure percussion track) —
+    // carries no phase information, and an un-gated term would only
+    // dilute the confidence margin (or inject normalized noise). The
+    // weight scales with the profile's quartile contrast, which reads
+    // ~0 for both flat and noisy-flat profiles but stays high when a
+    // bassline lifts the top quarter of beats.
+    let energy_weight = DOWNBEAT_ENERGY_WEIGHT * quartile_contrast_f32(&low_energy);
+
     let accents: Vec<f32> = beat_frames
         .iter()
-        .zip(low_flux.iter())
-        .map(|(&frame, &low)| {
+        .zip(low_flux.iter().zip(low_energy.iter()))
+        .map(|(&frame, (&low, &energy))| {
             let nov = novelty.get(frame).copied().unwrap_or(0.0);
-            DOWNBEAT_NOVELTY_WEIGHT * nov + DOWNBEAT_LOW_FLUX_WEIGHT * (low / low_norm)
+            DOWNBEAT_NOVELTY_WEIGHT * nov
+                + DOWNBEAT_LOW_FLUX_WEIGHT * (low / low_norm)
+                + energy_weight * (energy / energy_norm)
         })
         .collect();
 

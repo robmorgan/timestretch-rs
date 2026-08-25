@@ -28,6 +28,18 @@ use crate::core::preanalysis::TempoSegment;
 const HOP_SECS: f64 = 0.005;
 /// Low-pass corner for the kick band, Hz (two cascaded biquads).
 const KICK_BAND_HZ: f64 = 150.0;
+/// Weight of sustained kick-band ENERGY in the downbeat rotation accent,
+/// with its measurement window: skip past the kick's attack (which every
+/// four-on-floor beat shares), then average the bass note's sustained
+/// body. The onset envelope ties on four-on-floor material — and its
+/// log-difference actively favors the snare rotation (a bass fill before
+/// the kick suppresses the kick's jump; measured +20% for the snare on
+/// corpus material whose post-attack energy favors the true one by
+/// +16%) — so energy carries the larger weight: where the features
+/// disagree, energy is the trustworthy one.
+const DOWNBEAT_ENERGY_WEIGHT: f64 = 1.5;
+const DOWNBEAT_ENERGY_SKIP_SECS: f64 = 0.03;
+const DOWNBEAT_ENERGY_WINDOW_SECS: f64 = 0.25;
 /// BPM search half-width around the seed tempo, as a fraction. The seed
 /// comes from the tracker (exact on the whole corpus), so the window only
 /// absorbs residual median bias.
@@ -272,13 +284,53 @@ pub fn refine_grid_rigid(samples: &[f32], sample_rate: u32, grid: BeatGrid) -> (
         return (grid, false);
     }
     let KickEnvelope {
-        onset, frame_secs, ..
+        ref onset,
+        frame_secs,
+        ..
     } = env;
 
-    // Downbeat rotation by kick-band accent (mod 4), as in the annotator.
+    // Downbeat rotation by kick-band accent (mod 4), as in the annotator —
+    // onset strength plus sustained kick-band energy just after the beat,
+    // each max-normalized across beats so the weights compare like scales.
+    let per_beat_onset: Vec<f64> = fit
+        .beats_secs
+        .iter()
+        .map(|&b| sample_env(onset, frame_secs, b))
+        .collect();
+    let per_beat_energy: Vec<f64> = fit
+        .beats_secs
+        .iter()
+        .map(|&b| {
+            mean_env_window(
+                &env.energy,
+                frame_secs,
+                b + DOWNBEAT_ENERGY_SKIP_SECS,
+                DOWNBEAT_ENERGY_WINDOW_SECS,
+            )
+        })
+        .collect();
+    let onset_norm = per_beat_onset
+        .iter()
+        .copied()
+        .fold(0.0f64, f64::max)
+        .max(1e-12);
+    let energy_norm = per_beat_energy
+        .iter()
+        .copied()
+        .fold(0.0f64, f64::max)
+        .max(1e-12);
+    // Self-gating: an uninformative energy profile — flat, or noise
+    // around silence — carries no phase information and would only
+    // dilute the rotation confidence (or inject normalized noise), so
+    // the weight scales with the profile's quartile contrast.
+    let energy_weight = DOWNBEAT_ENERGY_WEIGHT * quartile_contrast(&per_beat_energy);
     let mut rotation_scores = [0.0f64; 4];
-    for (i, &b) in fit.beats_secs.iter().enumerate() {
-        rotation_scores[i % 4] += sample_env(&onset, frame_secs, b);
+    for (i, (&o, &e)) in per_beat_onset
+        .iter()
+        .zip(per_beat_energy.iter())
+        .enumerate()
+    {
+        rotation_scores[i % 4] += o / onset_norm + energy_weight * (e / energy_norm);
     }
     for (r, s) in rotation_scores.iter_mut().enumerate() {
         let n = (fit.beats_secs.len() + 3 - r) / 4;
@@ -420,6 +472,33 @@ fn triangular_smear(env: &[f32], radius: usize) -> Vec<f32> {
 }
 
 /// Linear interpolation of the envelope at time `t`.
+/// Quartile contrast of a per-beat feature in [0, 1]: `1 - q25/q75`.
+/// ~0 for flat or noisy-flat profiles, high when the top quarter of
+/// beats genuinely stands out.
+fn quartile_contrast(values: &[f64]) -> f64 {
+    if values.len() < 4 {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let q25 = sorted[sorted.len() / 4];
+    let q75 = sorted[(sorted.len() * 3) / 4];
+    if q75 > 1e-12 {
+        (1.0 - q25 / q75).max(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// Mean envelope value over `[t, t + window_secs)`.
+fn mean_env_window(env: &[f32], frame_secs: f64, t: f64, window_secs: f64) -> f64 {
+    let frames = (window_secs / frame_secs).round().max(1.0) as usize;
+    (0..frames)
+        .map(|k| sample_env(env, frame_secs, t + k as f64 * frame_secs))
+        .sum::<f64>()
+        / frames as f64
+}
+
 fn sample_env(env: &[f32], frame_secs: f64, t: f64) -> f64 {
     let pos = t / frame_secs;
     let i = pos.floor() as usize;
