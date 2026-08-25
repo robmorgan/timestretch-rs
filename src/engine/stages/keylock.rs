@@ -39,6 +39,17 @@ use crate::engine::stages::sola::SolaCorrector;
 /// regardless.
 pub(crate) const KEYLOCK_LATENCY_FRAMES: usize = 560;
 
+/// The chain's constant delay for a build sample rate: the 12.7 ms
+/// contract is a TIME figure, so above 44.1 kHz the frame count scales
+/// with the rate (a 96 kHz build gets 1219 frames — the same 12.7 ms of
+/// corridor headroom the correctors' scaled triggers require). At and
+/// below 44.1 kHz it is exactly [`KEYLOCK_LATENCY_FRAMES`], keeping the
+/// blind-validated builds bit-identical.
+pub(crate) fn keylock_latency_frames(sample_rate: u32) -> usize {
+    let s = (f64::from(sample_rate) / 44_100.0).max(1.0);
+    (KEYLOCK_LATENCY_FRAMES as f64 * s).round() as usize
+}
+
 /// Beyond this rate deviation the corrector starts fading out toward
 /// plain varispeed (pitch follows tempo). Inside the fade the output
 /// carries BOTH pitches at complementary weights — audibly doubled/
@@ -91,19 +102,24 @@ pub(crate) struct KeylockStage {
     /// per-block step here is a click source under fast tempo gestures
     /// (Stage 13 review, finding D6). NaN = snap, as `enable`.
     correction: f32,
+    /// Per-frame slew of `enable`/`correction`: 1 / the toggle fade in
+    /// frames ([`KEYLOCK_TOGGLE_FADE_FRAMES`] scaled with the build rate
+    /// above 44.1 kHz, so the fade keeps its ~11.6 ms).
+    toggle_step: f32,
 }
 
 impl KeylockStage {
     pub(crate) fn new(sample_rate: u32, channels: usize) -> Self {
-        let sola = SolaCorrector::new(channels, KEYLOCK_LATENCY_FRAMES);
-        debug_assert_eq!(sola.latency_frames(), KEYLOCK_LATENCY_FRAMES);
-        let bass_sola = BassSola::new(channels, KEYLOCK_LATENCY_FRAMES, sample_rate);
-        debug_assert_eq!(bass_sola.latency_frames(), KEYLOCK_LATENCY_FRAMES);
+        let latency = keylock_latency_frames(sample_rate);
+        let sola = SolaCorrector::new(channels, latency, sample_rate);
+        debug_assert_eq!(sola.latency_frames(), latency);
+        let bass_sola = BassSola::new(channels, latency, sample_rate);
+        debug_assert_eq!(bass_sola.latency_frames(), latency);
         Self {
             split: TwoBandSplit::new(KEYLOCK_CROSSOVER_HZ, sample_rate, channels),
-            low_delay: FixedDelay::new(KEYLOCK_LATENCY_FRAMES, channels),
+            low_delay: FixedDelay::new(latency, channels),
             bass_sola,
-            raw_high_delay: FixedDelay::new(KEYLOCK_LATENCY_FRAMES, channels),
+            raw_high_delay: FixedDelay::new(latency, channels),
             sola,
             low: vec![[0.0; BLOCK_FRAMES]; channels],
             low_raw: vec![[0.0; BLOCK_FRAMES]; channels],
@@ -111,6 +127,9 @@ impl KeylockStage {
             high_raw: vec![[0.0; BLOCK_FRAMES]; channels],
             enable: f32::NAN,
             correction: f32::NAN,
+            toggle_step: 1.0
+                / (KEYLOCK_TOGGLE_FADE_FRAMES as f32 * latency as f32
+                    / KEYLOCK_LATENCY_FRAMES as f32),
         }
     }
 }
@@ -167,7 +186,7 @@ impl Stage for KeylockStage {
         if self.correction.is_nan() {
             self.correction = correction_target;
         }
-        let step = 1.0 / KEYLOCK_TOGGLE_FADE_FRAMES as f32;
+        let step = self.toggle_step;
         let mut weight_w = [0.0f32; BLOCK_FRAMES];
         let mut enable = self.enable;
         let mut correction = self.correction;
@@ -193,8 +212,8 @@ impl Stage for KeylockStage {
     fn latency_frames(&self) -> usize {
         // The low band's delay is constructed equal to the corrector's
         // constant nominal lag; either is the chain's delay.
-        debug_assert_eq!(self.low_delay.latency_frames(), KEYLOCK_LATENCY_FRAMES);
-        KEYLOCK_LATENCY_FRAMES
+        debug_assert_eq!(self.low_delay.latency_frames(), self.sola.latency_frames());
+        self.low_delay.latency_frames()
     }
 
     fn reset(&mut self) {

@@ -97,3 +97,54 @@ fn sub_band_stays_corrected_at_96k() {
         );
     }
 }
+
+/// High-band regression: the SOLA corrector's correlation window and
+/// search range were also 44.1 kHz frame counts — at 96 kHz they covered
+/// half their designed time, so alignment failed below ~300 Hz and
+/// low-mid splices landed at random phase (measured: a 150 Hz tone
+/// corrected at purity 1.000 at 44.1 kHz vs 0.005 at 96 kHz — heard as
+/// muddled, wobbly, "underwater" mids while vocals and highs survived).
+#[test]
+fn low_mids_stay_pure_at_96k() {
+    for sample_rate in [44_100u32, 96_000] {
+        let handles = Engine::build(EngineConfig {
+            sample_rate,
+            channels: 1,
+            profile: EngineProfile::Keylock,
+            initial_tempo_rate: 1.08,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let (mut processor, mut source, _controller) =
+            (handles.processor, handles.source, handles.controller);
+        let sr = sample_rate as usize;
+        let mut phase = 0.0f64;
+        let mut next_source = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    phase += 2.0 * std::f64::consts::PI * 150.0 / f64::from(sample_rate);
+                    0.6 * phase.sin() as f32
+                })
+                .collect()
+        };
+        let total_frames = 10 * sr;
+        let mut out = Vec::with_capacity(total_frames);
+        let mut chunk = vec![0.0f32; 1024];
+        while out.len() < total_frames {
+            while source.occupied_frames() < 8192 {
+                let feed = next_source(2048);
+                assert_eq!(source.push(&feed), feed.len(), "source ring saturated");
+            }
+            processor.process(&mut chunk);
+            out.extend_from_slice(&chunk);
+        }
+        let scan = &out[4 * sr..];
+        let energy: f64 = scan.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
+        let at_150 = power_at(scan, 150.0, f64::from(sample_rate));
+        let purity = at_150 / (energy / scan.len() as f64 * 2.0).max(1e-12);
+        assert!(
+            purity > 0.9,
+            "{sample_rate} Hz build: 150 Hz corrected at purity {purity:.3} (want > 0.9)"
+        );
+    }
+}

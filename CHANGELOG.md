@@ -4,19 +4,26 @@
 
 ### Fixed
 
-- The Stage 21 bass corrector's frame-domain tuning (period search
-  range, correlation window, crossfade, envelopes, onset windows) was
-  fixed at 44.1 kHz values; on builds at other sample rates the numbers
-  described the wrong times and frequencies. At 96 kHz the period
+- The keylock chain's frame-domain tuning was fixed at 44.1 kHz values;
+  on builds at higher sample rates every window, trigger, and fade
+  described half (96 kHz) or a quarter (192 kHz) of its designed time.
+  Two audible failures at 96 kHz, both found via Halo running its deck
+  engines at the device rate: the Stage 21 bass corrector's period
   search bottomed out at ~74 Hz, so a real bass fundamental was
-  unsearchable and the corrector flapped between correction and its
-  pitch-follow fallback as the band's content moved — the low end
-  audibly lurching in and out of key under a sustained DJ offset
-  (found via Halo running its engines at a 96 kHz device rate). The
-  constants are now scaled to the build rate at construction —
-  bit-identical at 44.1 kHz — and regression tests pin sub-band
-  correction at 48/96/192 kHz. The chain's frame-based latency
-  contract is unchanged.
+  unsearchable and the low end flapped between corrected and
+  pitch-follow under a sustained DJ offset; and the high-band SOLA
+  corrector's correlation window and search range could not align
+  content below ~300 Hz, so low-mid splices landed at random phase
+  (measured: a 150 Hz tone corrected at purity 1.000 at 44.1 kHz vs
+  0.005 at 96 kHz — muddled, wobbly, "underwater" mids). Both
+  correctors now scale their reference constants to the build rate at
+  construction, and the chain's nominal lag scales above 44.1 kHz so
+  the 12.7 ms latency contract — and the trigger corridor it anchors —
+  is time-true at every rate (`pipeline_latency_frames` reports the
+  scaled figure; hosts that DISPLAY it in milliseconds see 12.7 ms at
+  every rate now). At and below 44.1 kHz everything is bit-identical
+  to the blind-validated behavior. Regression tests pin sub-band
+  correction at 48/96/192 kHz and 96 kHz low-mid purity.
 
 ## 0.13.0
 
