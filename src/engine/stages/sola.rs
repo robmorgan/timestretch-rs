@@ -122,12 +122,13 @@ impl SincReadKernel {
 /// split into at most two contiguous runs at the wrap point.
 #[inline]
 fn ring_dot(ring: &[f32], start: isize, weights: &[f32]) -> f64 {
-    let s = (start as usize) & RING_MASK;
+    let len = ring.len();
+    let s = (start as usize) & (len - 1);
     let n = weights.len();
-    if s + n <= RING_LEN {
+    if s + n <= len {
         dot_f32_f64(&ring[s..s + n], weights)
     } else {
-        let first = RING_LEN - s;
+        let first = len - s;
         dot_f32_f64(&ring[s..], &weights[..first])
             + dot_f32_f64(&ring[..n - first], &weights[first..])
     }
@@ -178,15 +179,23 @@ fn dot_f64_f32(samples: &[f64], weights: &[f32]) -> f64 {
 fn mix_channels(channels: &[SolaChannel], start: isize, out: &mut [f64]) {
     out.fill(0.0);
     for ch in channels {
+        let mask = ch.ring.len() - 1;
         for (k, m) in out.iter_mut().enumerate() {
-            *m += ch.ring[(start as usize).wrapping_add(k) & RING_MASK] as f64;
+            *m += ch.ring[(start as usize).wrapping_add(k) & mask] as f64;
         }
     }
 }
 
+// Every frame-domain constant below is a 44.1 kHz REFERENCE value;
+// [`Tuning::for_sample_rate`] scales them to the build rate for rates
+// ABOVE 44.1 kHz (bit-identical at and below it). Unscaled at 96 kHz the
+// correlation window and search range covered half their designed time:
+// alignment failed below ~300 Hz, so low-mid splices landed at random
+// phase — measured as a 150 Hz tone correcting at purity 1.000 (44.1 kHz)
+// vs 0.005 (96 kHz), heard as muddled, wobbly, underwater mids.
+
 /// Ring capacity per channel (power of two), in frames.
 const RING_LEN: usize = 4_096;
-const RING_MASK: usize = RING_LEN - 1;
 
 /// Drift from the nominal lag that triggers a splice, in frames.
 const DRIFT_TRIGGER: f64 = 192.0;
@@ -269,6 +278,73 @@ const REST_SPLICE_DRIFT: f64 = 48.0;
 /// the trim only polishes the sub-[`REST_SPLICE_DRIFT`] residue.
 const REST_TRIM_MAX: f64 = 0.0008;
 
+/// Frame-domain tuning: the 44.1 kHz reference constants scaled to the
+/// build sample rate — for rates above 44.1 kHz only, so every value
+/// describes at least its designed TIME (and the correlation window
+/// reaches at least as low in frequency). At and below 44.1 kHz each
+/// value equals its reference constant, keeping the blind-validated
+/// behavior bit-identical.
+///
+/// Deliberately NOT scaled: `MIN_READ_MARGIN` (sinc taps), the
+/// sub-sample fine search, `BLOCK_FRAMES` couplings, and every
+/// dimensionless ratio (cadence, rest deviation, trim bound, transient
+/// ratio). The nominal lag scales at the keylock stage so the two-sided
+/// trigger corridor (`SLOWDOWN_FORCE_CAP` toward the write head, the
+/// stretched hard trigger toward the ring's old side) keeps its
+/// designed time geometry — the construction asserts below hold by the
+/// same scale factor.
+#[derive(Debug)]
+struct Tuning {
+    ring_len: usize,
+    drift_trigger: f64,
+    mild_drift_trigger: f64,
+    hard_trigger: f64,
+    search_range: isize,
+    corr_window: usize,
+    xfade_frames: usize,
+    onset_protect_pre: f64,
+    onset_protect_post: f64,
+    opportunistic_drift: f64,
+    masked_window_start: f64,
+    masked_window_end: f64,
+    rest_dwell_blocks: u32,
+    rest_splice_drift: f64,
+    slowdown_force_cap: f64,
+    /// Per-frame drift-repayment slew at rest (reference 0.001; scales
+    /// inversely so the repayment TIME constant is rate-invariant).
+    rest_trim_slew: f64,
+    /// Block-RMS smoothing weight for the transient gate (reference
+    /// 0.02 per block; blocks are fixed frames, so it scales inversely
+    /// to keep the averaging TIME constant).
+    energy_smooth: f64,
+}
+
+impl Tuning {
+    fn for_sample_rate(sample_rate: u32) -> Self {
+        let s = (f64::from(sample_rate) / 44_100.0).max(1.0);
+        let frames = |reference: usize| ((reference as f64 * s).round() as usize).max(1);
+        Self {
+            ring_len: ((RING_LEN as f64 * s).ceil() as usize).next_power_of_two(),
+            drift_trigger: DRIFT_TRIGGER * s,
+            mild_drift_trigger: MILD_DRIFT_TRIGGER * s,
+            hard_trigger: HARD_TRIGGER * s,
+            search_range: (SEARCH_RANGE as f64 * s).round() as isize,
+            corr_window: frames(CORR_WINDOW),
+            xfade_frames: frames(XFADE_FRAMES),
+            onset_protect_pre: ONSET_PROTECT_PRE * s,
+            onset_protect_post: ONSET_PROTECT_POST * s,
+            opportunistic_drift: OPPORTUNISTIC_DRIFT * s,
+            masked_window_start: MASKED_WINDOW_START * s,
+            masked_window_end: MASKED_WINDOW_END * s,
+            rest_dwell_blocks: (f64::from(REST_DWELL_BLOCKS) * s).round() as u32,
+            rest_splice_drift: REST_SPLICE_DRIFT * s,
+            slowdown_force_cap: SLOWDOWN_FORCE_CAP * s,
+            rest_trim_slew: 0.001 / s,
+            energy_smooth: 0.02 / s,
+        }
+    }
+}
+
 /// One channel's ring state.
 #[derive(Debug)]
 struct SolaChannel {
@@ -308,7 +384,7 @@ pub(crate) struct SolaCorrector {
     failed_attempts: u32,
     /// Consecutive blocks with the transposition inside [`REST_DEV`].
     rest_blocks: u32,
-    /// Premixed base window for the splice search ([`CORR_WINDOW`] frames;
+    /// Premixed base window for the splice search (scaled [`CORR_WINDOW`] frames;
     /// preallocated: `plan_splice` runs on the audio thread).
     corr_a: Vec<f64>,
     /// Premixed candidate span for the coarse search (every candidate's
@@ -316,6 +392,8 @@ pub(crate) struct SolaCorrector {
     corr_b: Vec<f64>,
     /// Premixed span for the sub-sample refinement's sinc reads.
     frac_mix: Vec<f64>,
+    /// Reference constants scaled to the build sample rate.
+    tune: Tuning,
 }
 
 /// Splice-cadence stretch (ROADMAP Stage 18): at full stretch the elastic
@@ -364,27 +442,28 @@ fn cadence_scale(transposition: f64) -> f64 {
 }
 
 impl SolaCorrector {
-    pub(crate) fn new(num_channels: usize, nominal_lag_frames: usize) -> Self {
+    pub(crate) fn new(num_channels: usize, nominal_lag_frames: usize, sample_rate: u32) -> Self {
+        let tune = Tuning::for_sample_rate(sample_rate);
         // Ring / old-audio side (binds speed-up drift, +HARD·scale).
         assert!(
             nominal_lag_frames as f64
-                + HARD_TRIGGER * CADENCE_SCALE_MAX
-                + (SEARCH_RANGE as f64)
+                + tune.hard_trigger * CADENCE_SCALE_MAX
+                + (tune.search_range as f64)
                 + MIN_READ_MARGIN
-                < (RING_LEN - CORR_WINDOW - BLOCK_FRAMES) as f64,
+                < (tune.ring_len - tune.corr_window - BLOCK_FRAMES) as f64,
             "SOLA ring too small for nominal lag {nominal_lag_frames}"
         );
         // Write-head side (binds slowdown drift): the forced splice must
         // fire while the read cursor still has margin.
         assert!(
-            SLOWDOWN_FORCE_CAP + MIN_READ_MARGIN + 2.0 * BLOCK_FRAMES as f64
+            tune.slowdown_force_cap + MIN_READ_MARGIN + 2.0 * BLOCK_FRAMES as f64
                 <= nominal_lag_frames as f64,
             "SOLA nominal lag {nominal_lag_frames} cannot cover the slowdown force cap"
         );
         Self {
             channels: (0..num_channels)
                 .map(|_| SolaChannel {
-                    ring: vec![0.0; RING_LEN],
+                    ring: vec![0.0; tune.ring_len],
                 })
                 .collect(),
             table: ReadInterpTable::new(),
@@ -402,9 +481,10 @@ impl SolaCorrector {
             splice_count: 0,
             failed_attempts: 0,
             rest_blocks: 0,
-            corr_a: vec![0.0; CORR_WINDOW],
-            corr_b: vec![0.0; 2 * SEARCH_RANGE as usize + CORR_WINDOW],
-            frac_mix: vec![0.0; XFADE_FRAMES + 2 * READ_TAPS],
+            corr_a: vec![0.0; tune.corr_window],
+            corr_b: vec![0.0; 2 * tune.search_range as usize + tune.corr_window],
+            frac_mix: vec![0.0; tune.xfade_frames + 2 * READ_TAPS],
+            tune,
         }
     }
 
@@ -472,10 +552,11 @@ impl SolaCorrector {
     fn span_hits_onset(&self, onsets: &[OnsetEvent], start: f64) -> bool {
         // Padded by the sub-sample refinement radius: the fine search may
         // move a vetted candidate by up to half a frame either way.
-        let span = XFADE_FRAMES as f64 * self.transposition.max(1.0);
+        let span = self.tune.xfade_frames as f64 * self.transposition.max(1.0);
         onsets.iter().any(|event| {
-            start - FINE_SEARCH_RADIUS < event.stage_frame + ONSET_PROTECT_POST
-                && start + span + FINE_SEARCH_RADIUS > event.stage_frame - ONSET_PROTECT_PRE
+            start - FINE_SEARCH_RADIUS < event.stage_frame + self.tune.onset_protect_post
+                && start + span + FINE_SEARCH_RADIUS
+                    > event.stage_frame - self.tune.onset_protect_pre
         })
     }
 
@@ -484,7 +565,7 @@ impl SolaCorrector {
     fn in_masked_window(&self, onsets: &[OnsetEvent]) -> bool {
         onsets.iter().any(|event| {
             let since = self.read_pos - event.stage_frame;
-            (MASKED_WINDOW_START..MASKED_WINDOW_END).contains(&since)
+            (self.tune.masked_window_start..self.tune.masked_window_end).contains(&since)
         })
     }
 
@@ -498,16 +579,18 @@ impl SolaCorrector {
         debug_assert_eq!(io.len(), self.channels.len());
 
         // 1) Ingest.
+        let mask = self.tune.ring_len - 1;
         let mut block_energy = 0.0f64;
         for (ch, input) in self.channels.iter_mut().zip(io.iter()) {
             for (i, &sample) in input.iter().enumerate() {
-                ch.ring[(self.write_abs as usize + i) & RING_MASK] = sample;
+                ch.ring[(self.write_abs as usize + i) & mask] = sample;
                 block_energy += (sample as f64) * (sample as f64);
             }
         }
         self.write_abs += BLOCK_FRAMES as u64;
         let block_rms = (block_energy / (BLOCK_FRAMES * io.len()) as f64).sqrt();
-        self.energy_avg = 0.98 * self.energy_avg + 0.02 * block_rms;
+        self.energy_avg =
+            (1.0 - self.tune.energy_smooth) * self.energy_avg + self.tune.energy_smooth * block_rms;
 
         // 2) Splice management (block-granular: drift accrues < 2 frames
         //    per block at the clamp bounds). `lag_error_frames` here — after
@@ -517,7 +600,7 @@ impl SolaCorrector {
         let settled_drift = self.lag_error_frames() - BLOCK_FRAMES as f64;
         let at_rest = if deviation < REST_DEV {
             self.rest_blocks = self.rest_blocks.saturating_add(1);
-            self.rest_blocks >= REST_DWELL_BLOCKS
+            self.rest_blocks >= self.tune.rest_dwell_blocks
         } else {
             self.rest_blocks = 0;
             false
@@ -525,19 +608,21 @@ impl SolaCorrector {
         if self.xfade_remaining == 0 {
             let cadence = self.cadence();
             let drift = self.lag_error_frames();
-            if drift.abs() > DRIFT_TRIGGER * cadence {
+            if drift.abs() > self.tune.drift_trigger * cadence {
                 // Onset protection applies inside the candidate search; the
                 // HARD trigger forces through it eventually.
                 self.try_splice(drift, onsets);
-            } else if drift.abs() > OPPORTUNISTIC_DRIFT * cadence && self.in_masked_window(onsets) {
+            } else if drift.abs() > self.tune.opportunistic_drift * cadence
+                && self.in_masked_window(onsets)
+            {
                 // Beat-synchronous placement: a pending correction hides
                 // best right after a hit.
                 self.try_splice(drift, onsets);
-            } else if drift.abs() > OPPORTUNISTIC_DRIFT * cadence
+            } else if drift.abs() > self.tune.opportunistic_drift * cadence
                 && self.energy_avg > 1e-6
-                && self.region_rms(self.read_pos, CORR_WINDOW)
+                && self.region_rms(self.read_pos, self.tune.corr_window)
                     < QUIET_SPLICE_RATIO * self.energy_avg
-                && self.region_rms(self.read_pos + drift, CORR_WINDOW)
+                && self.region_rms(self.read_pos + drift, self.tune.corr_window)
                     < QUIET_SPLICE_RATIO * self.energy_avg
             {
                 // Quiet-gap placement: correct early where nothing is
@@ -547,7 +632,7 @@ impl SolaCorrector {
                 // gate is simpler and at least as good; see autoresearch
                 // log #43/#51.)
                 self.try_splice(drift, onsets);
-            } else if deviation < MILD_DEV && settled_drift.abs() > MILD_DRIFT_TRIGGER {
+            } else if deviation < MILD_DEV && settled_drift.abs() > self.tune.mild_drift_trigger {
                 // Mild-motion bounded recenter (ROADMAP Stage 15): during
                 // sustained gentle rides the seam combs for the whole ride
                 // unless drift is kept small; the bounded landing (must
@@ -555,7 +640,7 @@ impl SolaCorrector {
                 // normal trigger) avoids the periodic-content parking that
                 // an unbounded early splice causes.
                 self.try_rest_splice(drift, onsets);
-            } else if at_rest && settled_drift.abs() > REST_SPLICE_DRIFT {
+            } else if at_rest && settled_drift.abs() > self.tune.rest_splice_drift {
                 // At sustained rest a parked drift comb-filters the
                 // crossover overlap against the low band's fixed delay;
                 // recenter cleanly (bounded: the landing must actually
@@ -570,7 +655,7 @@ impl SolaCorrector {
         // d(drift)/dframe = −trim: positive parked drift needs a faster
         // read (positive trim) to converge.
         let trim = if at_rest {
-            (settled_drift * 0.001).clamp(-REST_TRIM_MAX, REST_TRIM_MAX)
+            (settled_drift * self.tune.rest_trim_slew).clamp(-REST_TRIM_MAX, REST_TRIM_MAX)
         } else {
             0.0
         };
@@ -598,8 +683,8 @@ impl SolaCorrector {
                 // splice is correlation-matched: the two signals are nearly
                 // identical, and an equal-power fade would bulge to ~1.41x
                 // mid-fade on correlated content (same choice as `Wsola`).
-                let progress =
-                    1.0 - (self.xfade_remaining as f64 - 1.0) / (XFADE_FRAMES as f64 - 1.0);
+                let progress = 1.0
+                    - (self.xfade_remaining as f64 - 1.0) / (self.tune.xfade_frames as f64 - 1.0);
                 let g_in = (0.5 - 0.5 * (std::f64::consts::PI * progress).cos()) as f32;
                 let g_out = 1.0 - g_in;
                 let out_kernel = SincReadKernel::at(&self.table, self.xfade_from);
@@ -635,12 +720,12 @@ impl SolaCorrector {
     /// apply until the drift is critical.
     fn try_splice(&mut self, drift: f64, onsets: &[OnsetEvent]) {
         // Asymmetric force threshold: slowdown (negative) drift is capped
-        // by the write-head headroom ([`SLOWDOWN_FORCE_CAP`] — the
+        // by the write-head headroom ([`SLOWDOWN_FORCE_CAP`], scaled — the
         // stretched hard trigger does not fit that side); speed-up keeps
         // the full stretched band against the ring's old-audio headroom.
-        let stretched = HARD_TRIGGER * self.cadence();
+        let stretched = self.tune.hard_trigger * self.cadence();
         let threshold = if drift < 0.0 {
-            stretched.min(SLOWDOWN_FORCE_CAP)
+            stretched.min(self.tune.slowdown_force_cap)
         } else {
             stretched
         };
@@ -662,7 +747,7 @@ impl SolaCorrector {
     /// When no candidate qualifies the splice is skipped and the trim
     /// converges the drift unimpeded.
     fn try_rest_splice(&mut self, drift: f64, onsets: &[OnsetEvent]) {
-        if self.plan_splice(drift, false, REST_SPLICE_DRIFT, onsets) {
+        if self.plan_splice(drift, false, self.tune.rest_splice_drift, onsets) {
             self.failed_attempts = 0;
         }
     }
@@ -691,8 +776,8 @@ impl SolaCorrector {
         // normalized correlation is then two flat dot products.
         let (mut best_jump, mut best_score) = (nominal_jump, f64::MIN);
         let base = self.read_pos;
-        let lo = nominal_jump as isize - SEARCH_RANGE;
-        let hi = nominal_jump as isize + SEARCH_RANGE;
+        let lo = nominal_jump as isize - self.tune.search_range;
+        let hi = nominal_jump as isize + self.tune.search_range;
         let a0 = base.floor() as isize;
         mix_channels(&self.channels, a0, &mut self.corr_a);
         let a_sq = dot_f64(&self.corr_a, &self.corr_a);
@@ -705,14 +790,14 @@ impl SolaCorrector {
                 continue;
             }
             let candidate = base + jump as f64;
-            if !self.readable_span(candidate, CORR_WINDOW + XFADE_FRAMES) {
+            if !self.readable_span(candidate, self.tune.corr_window + self.tune.xfade_frames) {
                 continue;
             }
             if !force && self.span_hits_onset(onsets, candidate) {
                 continue;
             }
             let off = (jump - lo) as usize;
-            let b_win = &self.corr_b[off..off + CORR_WINDOW];
+            let b_win = &self.corr_b[off..off + self.tune.corr_window];
             let b_sq = dot_f64(b_win, b_win);
             let norm = (a_sq * b_sq).sqrt();
             let corr = if norm < 1e-12 {
@@ -724,7 +809,7 @@ impl SolaCorrector {
             // period-grid candidate identically, and un-penalized ties
             // resolve to the search edge — parking the elastic drift ~a
             // full search range off nominal instead of converging to it.
-            let distance = (jump as f64 - nominal_jump).abs() / SEARCH_RANGE as f64;
+            let distance = (jump as f64 - nominal_jump).abs() / self.tune.search_range as f64;
             let score = corr - 0.02 * distance;
             if score > best_score {
                 best_score = score;
@@ -742,16 +827,20 @@ impl SolaCorrector {
         // fractional candidates, so a short window (the fade span, where
         // the two copies actually interfere) suffices; the read cursor is
         // fractional anyway, so the refined jump costs nothing downstream.
-        if self.readable_span(base + best_jump - 1.0, CORR_WINDOW + XFADE_FRAMES)
-            && self.readable_span(base + best_jump + 1.0, CORR_WINDOW + XFADE_FRAMES)
-        {
+        if self.readable_span(
+            base + best_jump - 1.0,
+            self.tune.corr_window + self.tune.xfade_frames,
+        ) && self.readable_span(
+            base + best_jump + 1.0,
+            self.tune.corr_window + self.tune.xfade_frames,
+        ) {
             const GRID: usize = 2 * FINE_SEARCH_STEPS as usize + 1;
             let step = FINE_SEARCH_RADIUS / FINE_SEARCH_STEPS as f64;
             // The base window is a prefix of the coarse search's premix; the
             // candidates' sinc reads all draw from one premixed span, and
             // each candidate's fractional phase is constant across its
             // window, so one kernel row serves all its reads.
-            let a_win = &self.corr_a[..XFADE_FRAMES];
+            let a_win = &self.corr_a[..self.tune.xfade_frames];
             let a_sq = dot_f64(a_win, a_win);
             let span_lo = (base + best_jump - FINE_SEARCH_RADIUS).floor() as isize + 1
                 - READ_HALF_TAPS as isize;
@@ -799,7 +888,7 @@ impl SolaCorrector {
             best_jump += best_frac;
         }
         let target = base + best_jump;
-        if !self.readable_span(target, CORR_WINDOW + XFADE_FRAMES) {
+        if !self.readable_span(target, self.tune.corr_window + self.tune.xfade_frames) {
             return false; // nothing readable yet; retried next block
         }
 
@@ -807,14 +896,15 @@ impl SolaCorrector {
         // (an onset we would smear), wait — unless forced.
         if !force
             && self.energy_avg > 1e-6
-            && self.region_rms(target, CORR_WINDOW) > TRANSIENT_POSTPONE_RATIO * self.energy_avg
+            && self.region_rms(target, self.tune.corr_window)
+                > TRANSIENT_POSTPONE_RATIO * self.energy_avg
         {
             return false;
         }
 
         self.xfade_from = self.read_pos;
         self.read_pos = target;
-        self.xfade_remaining = XFADE_FRAMES;
+        self.xfade_remaining = self.tune.xfade_frames;
         self.splice_count += 1;
         true
     }
@@ -825,19 +915,22 @@ impl SolaCorrector {
         let end = pos + span as f64 * self.transposition.max(1.0);
         let newest_ok = end <= self.write_abs as f64 - MIN_READ_MARGIN;
         let oldest_ok = pos
-            >= (self.write_abs as f64 - RING_LEN as f64) + MIN_READ_MARGIN + BLOCK_FRAMES as f64;
+            >= (self.write_abs as f64 - self.tune.ring_len as f64)
+                + MIN_READ_MARGIN
+                + BLOCK_FRAMES as f64;
         let started = pos >= MIN_READ_MARGIN;
         newest_ok && oldest_ok && started
     }
 
     /// RMS of the channel mix over `len` frames starting at `pos`.
     fn region_rms(&self, pos: f64, len: usize) -> f64 {
+        let mask = self.tune.ring_len - 1;
         let p0 = pos.floor() as usize;
         let mut acc = 0.0f64;
         for i in 0..len {
             let mut mix = 0.0f64;
             for ch in &self.channels {
-                mix += ch.ring[(p0 + i) & RING_MASK] as f64;
+                mix += ch.ring[(p0 + i) & mask] as f64;
             }
             let mix = mix / self.channels.len() as f64;
             acc += mix * mix;
@@ -892,7 +985,7 @@ mod tests {
 
     #[test]
     fn unity_is_pure_delay_with_no_splices() {
-        let mut corrector = SolaCorrector::new(1, LAG);
+        let mut corrector = SolaCorrector::new(1, LAG, 44_100);
         let input = sine(700.0, 44_100, 0.5);
         let out = run(&mut corrector, &input, 1.0);
         assert_eq!(corrector.splice_count(), 0, "unity must never splice");
@@ -906,7 +999,7 @@ mod tests {
 
     #[test]
     fn shifts_pitch_by_transposition() {
-        let mut corrector = SolaCorrector::new(1, LAG);
+        let mut corrector = SolaCorrector::new(1, LAG, 44_100);
         let input = sine(600.0, 44_100 * 4, 0.5);
         let out = run(&mut corrector, &input, 1.04);
         let f = measure_freq(&out[44_100..88_200]);
@@ -921,7 +1014,7 @@ mod tests {
     fn splices_are_click_free_on_tone() {
         let freq = 330.0;
         let amp = 0.5;
-        let mut corrector = SolaCorrector::new(1, LAG);
+        let mut corrector = SolaCorrector::new(1, LAG, 44_100);
         let input = sine(freq, 44_100 * 6, amp);
         let out = run(&mut corrector, &input, 1.05);
         // Pitch shifts to freq * 1.05; correlation-matched splices on a
@@ -949,7 +1042,7 @@ mod tests {
 
     #[test]
     fn lag_stays_bounded_over_long_runs() {
-        let mut corrector = SolaCorrector::new(1, LAG);
+        let mut corrector = SolaCorrector::new(1, LAG, 44_100);
         let input = sine(500.0, 44_100 * 20, 0.4);
         let _ = run(&mut corrector, &input, 1.05);
         let error = corrector.lag_error_frames().abs();
@@ -985,7 +1078,7 @@ mod tests {
         // correcting.
         let secs = 20;
         let frames = 44_100 * secs;
-        let mut corrector = SolaCorrector::new(1, LAG);
+        let mut corrector = SolaCorrector::new(1, LAG, 44_100);
         let input = sine(500.0, frames, 0.4);
         let _ = run(&mut corrector, &input, 1.05);
         let accrual = frames as f64 * 0.05;
@@ -1011,7 +1104,7 @@ mod tests {
         // cadence, not the halved one.
         let secs = 20;
         let frames = 44_100 * secs;
-        let mut corrector = SolaCorrector::new(1, LAG);
+        let mut corrector = SolaCorrector::new(1, LAG, 44_100);
         corrector.set_rate_slope(1e-4);
         let input = sine(500.0, frames, 0.4);
         corrector.set_transposition(1.05);
@@ -1034,7 +1127,7 @@ mod tests {
         // Feed a tone with onsets declared every 4410 frames; at T=1.05 the
         // corrector must splice regularly, and no fade span may overlap an
         // onset's protection window.
-        let mut corrector = SolaCorrector::new(1, LAG);
+        let mut corrector = SolaCorrector::new(1, LAG, 44_100);
         corrector.set_transposition(1.05);
         let input = sine(500.0, 44_100 * 8, 0.4);
         let mut block = [[0.0f32; BLOCK_FRAMES]; 1];
@@ -1092,7 +1185,7 @@ mod tests {
 
     #[test]
     fn stereo_channels_splice_in_lockstep() {
-        let mut corrector = SolaCorrector::new(2, LAG);
+        let mut corrector = SolaCorrector::new(2, LAG, 44_100);
         corrector.set_transposition(1.05);
         let mono = sine(440.0, 44_100 * 4, 0.5);
         let mut left = Vec::new();

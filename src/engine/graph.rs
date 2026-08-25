@@ -53,8 +53,10 @@ const RATE_HISTORY_MARGIN: usize = 256;
 /// mapped position would depend on when eviction last ran — i.e. on the
 /// caller's callback sizes (found by the streaming-vs-offline determinism
 /// gate: a boundary onset mapped differently and moved a splice).
-const TRANSIENT_LOOKBEHIND_MARGIN: usize = (crate::engine::stages::transient::KEEP_BEHIND_FRAMES
-    / crate::engine::control::MIN_TEMPO_RATE) as usize;
+fn transient_lookbehind_margin(sample_rate: u32) -> usize {
+    (crate::engine::stages::transient::keep_behind_frames(sample_rate)
+        / crate::engine::control::MIN_TEMPO_RATE) as usize
+}
 
 /// Audio-thread half of the engine.
 ///
@@ -213,7 +215,7 @@ impl EngineProcessor {
         let timeline_capacity = (out_fifo_frames
             + pipeline_latency_frames
             + RATE_HISTORY_MARGIN
-            + TRANSIENT_LOOKBEHIND_MARGIN)
+            + transient_lookbehind_margin(sample_rate))
             / (FEED_CHUNK_FRAMES / 4)
             + 16;
         Self {
@@ -242,7 +244,7 @@ impl EngineProcessor {
             block_scratch: vec![0.0; BLOCK_FRAMES * channels],
             stages,
             pipeline_latency_frames,
-            transient: artifact.map(TransientCursor::new),
+            transient: artifact.map(|artifact| TransientCursor::new(artifact, sample_rate)),
             anchor: (0, 0),
             ring_frames_at_reset: 0,
             modulation_hold_blocks: 0,
@@ -304,8 +306,9 @@ impl EngineProcessor {
         // transient cursor maps onsets up to its look-behind window back.
         self.timeline
             .evict_before(self.media_delivered_frames().saturating_sub(
-                (self.pipeline_latency_frames + RATE_HISTORY_MARGIN + TRANSIENT_LOOKBEHIND_MARGIN)
-                    as u64,
+                (self.pipeline_latency_frames
+                    + RATE_HISTORY_MARGIN
+                    + transient_lookbehind_margin(self.sample_rate)) as u64,
             ));
         let position = self
             .timeline
