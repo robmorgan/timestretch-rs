@@ -98,6 +98,11 @@ pub struct TransientMap {
     /// Each element is `[sub_bass, low, mid, high]` flux for that analysis frame.
     /// Band boundaries: sub-bass <100Hz, low 100-500Hz, mid 500-4000Hz, high >4000Hz.
     pub per_frame_band_flux: Vec<[f32; 4]>,
+    /// Per-frame sub-bass (<100 Hz) spectral ENERGY (linear magnitude², not
+    /// flux): sustained low-band content — a bassline note — that flux, being
+    /// a difference, cannot see. Downbeat election uses it to break the
+    /// four-on-floor tie where every beat carries equal kick flux.
+    pub per_frame_low_energy: Vec<f32>,
 }
 
 /// Constant detection latency of the analysis frame grid, in samples.
@@ -157,15 +162,16 @@ const BAND_FLUX_HIGH_LIMIT: f32 = 4000.0;
 
 /// Computes the spectral flux for each frame of a mono audio signal.
 ///
-/// Returns `(flux_values, band_flux)` where:
+/// Returns `(flux_values, band_flux, low_energy)` where:
 /// - `flux_values` is a vector of total weighted flux, one per analysis frame
 /// - `band_flux` is per-frame `[sub_bass, low, mid, high]` flux values
+/// - `low_energy` is per-frame sub-bass (<100 Hz) spectral energy
 fn compute_spectral_flux(
     samples: &[f32],
     sample_rate: u32,
     fft_size: usize,
     hop_size: usize,
-) -> (Vec<f32>, Vec<[f32; 4]>) {
+) -> (Vec<f32>, Vec<[f32; 4]>, Vec<f32>) {
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(fft_size);
 
@@ -179,6 +185,7 @@ fn compute_spectral_flux(
     let mut prev_magnitude = vec![0.0f32; num_bins];
     let mut flux_values = Vec::with_capacity(num_frames);
     let mut band_flux_values = Vec::with_capacity(num_frames);
+    let mut low_energy_values = Vec::with_capacity(num_frames);
     let mut fft_buffer = vec![COMPLEX_ZERO; fft_size];
 
     for frame_idx in 0..num_frames {
@@ -195,6 +202,7 @@ fn compute_spectral_flux(
 
         let mut flux = 0.0f32;
         let mut band_flux = [0.0f32; 4]; // [sub_bass, low, mid, high]
+        let mut low_energy = 0.0f32;
         for (bin, ((&c, prev), &weight)) in fft_buffer[..num_bins]
             .iter()
             .zip(prev_magnitude.iter_mut())
@@ -204,6 +212,9 @@ fn compute_spectral_flux(
             // Log-compressed magnitude: keeps onsets separable from a
             // continuously loud broadband floor (see GAMMA_FLUX).
             let mag = (1.0 + GAMMA_FLUX * c.norm()).ln();
+            if (bin as f32 * bin_freq) < BAND_FLUX_LOW_LIMIT {
+                low_energy += c.norm_sqr();
+            }
             let diff = mag - *prev;
             if diff > 0.0 {
                 flux += diff * weight;
@@ -225,6 +236,7 @@ fn compute_spectral_flux(
 
         flux_values.push(flux);
         band_flux_values.push(band_flux);
+        low_energy_values.push(low_energy);
     }
 
     // Frame 0 has no prior spectrum (it differences against a zero history),
@@ -238,7 +250,7 @@ fn compute_spectral_flux(
         *first = [0.0; 4];
     }
 
-    (flux_values, band_flux_values)
+    (flux_values, band_flux_values, low_energy_values)
 }
 
 /// Computes the onset energy envelope for each analysis frame.
@@ -553,10 +565,12 @@ pub fn detect_transients_with_options(
             hop_size,
             latency_samples,
             per_frame_band_flux: vec![],
+            per_frame_low_energy: vec![],
         };
     }
 
-    let (flux_values, band_flux) = compute_spectral_flux(samples, sample_rate, fft_size, hop_size);
+    let (flux_values, band_flux, low_energy) =
+        compute_spectral_flux(samples, sample_rate, fft_size, hop_size);
     let energy_envelope = compute_onset_energy(samples, fft_size, hop_size);
     let (phase_deviation, deviation_info) =
         compute_phase_deviation(samples, sample_rate, fft_size, hop_size);
@@ -605,6 +619,7 @@ pub fn detect_transients_with_options(
         hop_size,
         latency_samples,
         per_frame_band_flux: band_flux,
+        per_frame_low_energy: low_energy,
     }
 }
 
@@ -1150,7 +1165,7 @@ mod tests {
     fn test_spectral_flux_silence_is_zero() {
         // Silence should produce zero (or near-zero) flux for all frames
         let samples = vec![0.0f32; 44100];
-        let (flux, band_flux) = compute_spectral_flux(&samples, 44100, 2048, 512);
+        let (flux, band_flux, _low_energy) = compute_spectral_flux(&samples, 44100, 2048, 512);
         assert!(!flux.is_empty());
         for &f in &flux {
             assert!(f.abs() < 1e-6, "Flux for silence should be ~0, got {}", f);
@@ -1174,7 +1189,7 @@ mod tests {
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin())
             .collect();
 
-        let (flux, _band_flux) = compute_spectral_flux(&input, sample_rate, 2048, 512);
+        let (flux, _band_flux, _low_energy) = compute_spectral_flux(&input, sample_rate, 2048, 512);
         assert!(flux.len() > 2);
 
         // Frame 0 is deliberately zeroed: it differences against a zero
@@ -1210,7 +1225,8 @@ mod tests {
             }
         }
 
-        let (flux, _band_flux) = compute_spectral_flux(&input, sample_rate, fft_size, hop_size);
+        let (flux, _band_flux, _low_energy) =
+            compute_spectral_flux(&input, sample_rate, fft_size, hop_size);
 
         // Find frame containing the impulse
         let impulse_frame = impulse_pos / hop_size;

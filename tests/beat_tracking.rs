@@ -291,3 +291,94 @@ fn analysis_speed_is_offline_friendly() {
         "analysis speed {realtime_factor:.1}x realtime below {floor}x floor"
     );
 }
+
+/// Four-on-floor regression (2026-08-25, found via a Halo auto-cue landing
+/// on a snare): with a kick on EVERY beat, per-beat flux ties across all
+/// four phase hypotheses and the broadband clap on 2 and 4 — the loudest
+/// transient — decided the downbeat. The bassline's emphasis on beat one
+/// is sustained ENERGY, which the flux/onset features cannot see; the
+/// election now weighs it. Every downbeat must land on the kick+bass
+/// phase, not the clap phase.
+#[test]
+fn four_on_floor_downbeats_land_on_the_bass_phase() {
+    let sr = 44_100u32;
+    let beat = 0.5f64; // 120 BPM
+    let secs = 32.0;
+    let n = (secs * sr as f64) as usize;
+    let mut x = vec![0.0f32; n];
+    let mut rng = 0x2545F491u32; // deterministic xorshift for the clap noise
+    let mut noise = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        (rng as f64 / u32::MAX as f64) * 2.0 - 1.0
+    };
+    let mut k = 0usize;
+    loop {
+        let t0 = k as f64 * beat;
+        let start = (t0 * sr as f64) as usize;
+        if start >= n {
+            break;
+        }
+        // Kick on every beat: decaying 55 Hz sine.
+        for i in 0..((0.15 * sr as f64) as usize).min(n - start) {
+            let t = i as f64 / sr as f64;
+            x[start + i] +=
+                (0.8 * (-t / 0.045).exp() * (std::f64::consts::TAU * 55.0 * t).sin()) as f32;
+        }
+        // Louder broadband clap on beats 2 and 4: first-difference
+        // high-passed noise, so — like a real clap — it carries no
+        // sub-bass and cannot masquerade as a kick in the low-flux
+        // feature.
+        if k % 4 == 1 || k % 4 == 3 {
+            let mut prev = noise();
+            for i in 0..((0.06 * sr as f64) as usize).min(n - start) {
+                let t = i as f64 / sr as f64;
+                let cur = noise();
+                x[start + i] += (0.9 * (-t / 0.02).exp() * (cur - prev)) as f32;
+                prev = cur;
+            }
+        }
+        // Sustained bass note on beat one.
+        if k % 4 == 0 {
+            for i in 0..((0.35 * sr as f64) as usize).min(n - start) {
+                let t = i as f64 / sr as f64;
+                let attack = (t / 0.01).min(1.0);
+                x[start + i] +=
+                    (0.5 * attack * (-t / 0.4).exp() * (std::f64::consts::TAU * 82.0 * t).sin())
+                        as f32;
+            }
+        }
+        k += 1;
+    }
+
+    for (label, grid) in [
+        ("detect_beat_grid", detect_beat_grid(&x, sr)),
+        ("analyze_for_dj", {
+            let artifact = timestretch::analyze_for_dj(&x, sr);
+            let mut grid = BeatGrid::empty(sr);
+            grid.beats = artifact.beat_positions.iter().map(|&p| p as f64).collect();
+            grid.downbeats = artifact.downbeat_beat_indices.clone();
+            grid.bpm = artifact.bpm;
+            grid
+        }),
+    ] {
+        assert!(
+            !grid.downbeats.is_empty(),
+            "{label}: fixture must yield downbeats"
+        );
+        let bar = 4.0 * beat * sr as f64;
+        let tol = 0.07 * sr as f64;
+        for &d in &grid.downbeats {
+            let pos = grid.beats[d];
+            let off = (pos / bar - (pos / bar).round()).abs() * bar;
+            assert!(
+                off < tol,
+                "{label}: downbeat at {:.3}s is {:.0} samples off a bar start \
+                 (clap phase would sit half a bar out)",
+                pos / sr as f64,
+                off
+            );
+        }
+    }
+}

@@ -117,65 +117,72 @@ pub fn resample_sinc(input: &[f32], output_len: usize, lobes: usize) -> Vec<f32>
     }
     let mut output = Vec::with_capacity(output_len);
 
-    // Kaiser window (beta = 6.0, ~60 dB stopband), sampled into a lookup
-    // table once per call so `bessel_i0` stays out of the per-tap loop.
+    // The cutoff is constant for the whole call, so the kernel is one
+    // fixed shape — precompute it as a polyphase row table (the same
+    // machinery as the streaming kernel) instead of evaluating `sin`
+    // per tap per output sample, which made a full-track upsample take
+    // seconds. Kaiser window beta = 6.0 (~60 dB stopband), matching the
+    // previous per-sample evaluation.
     let beta = 6.0f64;
     let bessel_beta = bessel_i0(beta);
-    const WINDOW_TABLE: usize = 2_048;
-    let window_table: Vec<f64> = (0..=WINDOW_TABLE)
-        .map(|k| {
-            let t = k as f64 / WINDOW_TABLE as f64;
-            bessel_i0(beta * (1.0 - t * t).max(0.0).sqrt()) / bessel_beta
-        })
-        .collect();
-    let window_at = |t: f64| -> f64 {
-        let t = t.abs();
-        if t >= 1.0 {
-            return 0.0;
-        }
-        let pos = t * WINDOW_TABLE as f64;
-        let k = pos as usize;
-        let frac = pos - k as f64;
-        window_table[k] * (1.0 - frac) + window_table[k + 1] * frac
-    };
-
-    for i in 0..output_len {
-        let pos = i as f64 * ratio;
-        let center = pos as isize;
-        let frac = pos - center as f64;
-
-        let mut sample = 0.0f64;
-        let mut weight_sum = 0.0f64;
-
-        // Convolve with the (cutoff-scaled) windowed sinc kernel.
-        let start = -half_span + 1;
-        let end = half_span + 1;
-        for j in start..end {
-            let idx = center + j;
-            if idx < 0 || idx >= input.len() as isize {
-                continue;
-            }
-
-            let x = (frac - j as f64) * cutoff;
+    let half = half_span as usize;
+    let width = 2 * half;
+    const PHASES: usize = 512;
+    // Kernel sampled at distance d = i / PHASES input samples from the
+    // center: sinc(d·cutoff) windowed over `lobes` zero-crossings of the
+    // scaled kernel.
+    let taps: Vec<f32> = (0..=half * PHASES + 1)
+        .map(|i| {
+            let d = i as f64 / PHASES as f64;
+            let x = d * cutoff;
             let sinc_val = if x.abs() < 1e-10 {
                 1.0
             } else {
                 let pi_x = std::f64::consts::PI * x;
                 pi_x.sin() / pi_x
             };
-            let window = window_at((j as f64 - frac) * cutoff / lobes as f64);
+            let t = x / lobes as f64;
+            let window = if t >= 1.0 {
+                0.0
+            } else {
+                bessel_i0(beta * (1.0 - t * t).max(0.0).sqrt()) / bessel_beta
+            };
+            (sinc_val * window) as f32
+        })
+        .collect();
+    let rows = polyphase_rows(&taps, half, PHASES);
+    let mut row = vec![0.0f32; width];
 
-            let w = sinc_val * window;
-            sample += input[idx as usize] as f64 * w;
-            weight_sum += w;
-        }
+    for i in 0..output_len {
+        let pos = i as f64 * ratio;
+        let center = pos as isize;
+        let frac = pos - center as f64;
+        let weight_sum = fill_row_lerp(&rows, width, PHASES, frac, &mut row);
+
+        // Tap offsets j = k + 1 - half relative to `center`; clamp the
+        // dot to in-range taps and renormalize over exactly those (same
+        // edge behavior as the previous skip-and-renormalize loop).
+        let start = center + 1 - half as isize;
+        let lo = (-start).max(0) as usize;
+        let hi = width.min((input.len() as isize - start).max(0) as usize);
+        let (sample, weight_sum) = if lo == 0 && hi == width {
+            let s = start as usize;
+            (dot_f32_f64(&input[s..s + width], &row), weight_sum)
+        } else if lo < hi {
+            let s = (start + lo as isize) as usize;
+            let w: f64 = row[lo..hi].iter().map(|&v| f64::from(v)).sum();
+            (dot_f32_f64(&input[s..s + (hi - lo)], &row[lo..hi]), w)
+        } else {
+            (0.0, 0.0)
+        };
 
         // Normalize to preserve DC gain (also absorbs the cutoff's
         // kernel-gain factor).
-        if weight_sum.abs() > 1e-10 {
-            sample /= weight_sum;
-        }
-
+        let sample = if weight_sum.abs() > 1e-10 {
+            sample / weight_sum
+        } else {
+            sample
+        };
         output.push(sample as f32);
     }
 
