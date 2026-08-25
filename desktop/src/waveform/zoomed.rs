@@ -1,9 +1,10 @@
 //! Zoomed scrolling waveform: playhead fixed at horizontal center, the
-//! track scrolls underneath. 3-band bars are rasterized into track-space
-//! texture tiles from the pyramid level closest to one bucket per pixel,
-//! cached per (level, tile), so a frame of scrolling is just a few textured
-//! quads at subpixel offsets — cheap enough to repaint at full display
-//! rate. Beat/downbeat edge ticks, loop overlay, and drag-to-scrub stay
+//! track scrolls underneath. 3-band envelopes are rasterized into
+//! track-space texture tiles (interpolated and anti-aliased, supersampled
+//! 2x) from the pyramid level closest to one bucket per pixel, cached per
+//! (level, tile), so a frame of scrolling is just a few textured quads at
+//! subpixel offsets — cheap enough to repaint at full display rate.
+//! Beat/downbeat edge ticks, loop overlay, and drag-to-scrub stay
 //! immediate-mode on top.
 
 use std::collections::HashMap;
@@ -11,7 +12,7 @@ use std::collections::HashMap;
 use eframe::egui;
 
 use super::peaks::{BandPeaks, PeakLevel};
-use super::{GridMarks, overlay_plan, paint_placeholder, palette, render_columns};
+use super::{GridMarks, overlay_plan, paint_placeholder, palette, render_envelope};
 
 /// View height in points.
 const VIEW_HEIGHT: f32 = 160.0;
@@ -90,13 +91,20 @@ impl ZoomSpan {
     }
 }
 
-/// Buckets per cached tile.
+/// Buckets per cached tile. `level_index_for` keeps buckets at least one
+/// pixel wide, so visible buckets — and therefore visible tiles (~4) — are
+/// bounded by the viewport's pixel width at every pyramid density.
 const TILE_BUCKETS: usize = 512;
+/// Texture columns per bucket: keeps LINEAR magnification mild at the
+/// worst case (~1.33 px/bucket) so the interpolated envelope, not texel
+/// blur, defines the shape.
+const TILE_SUPERSAMPLE: usize = 2;
 /// Tile texture height in pixels (2x the 160pt view for retina crispness).
 const TILE_TEX_HEIGHT: usize = 320;
-/// Tile cache cap. A viewport spans ~4 tiles, so this comfortably holds
-/// the active zoom level plus a few recently visited ones.
-const TILE_CACHE_CAP: usize = 32;
+/// Tile cache cap. A viewport spans ~4 tiles and flicking through the five
+/// zoom presets touches ~5 levels, so this holds roughly two viewports'
+/// worth of recently visited tiles.
+const TILE_CACHE_CAP: usize = 48;
 
 /// Cache of rasterized waveform tiles for the zoomed view, keyed by
 /// (pyramid level, tile index). Tiles live in track space, so scrolling
@@ -137,7 +145,7 @@ impl ZoomedTiles {
             CachedTile {
                 tex: ctx.load_texture(
                     format!("wave_tile_{level_idx}_{tile_idx}"),
-                    render_columns(level, b0..b1, TILE_TEX_HEIGHT),
+                    render_envelope(level, b0..b1, TILE_SUPERSAMPLE, TILE_TEX_HEIGHT),
                     egui::TextureOptions::LINEAR,
                 ),
                 last_used: clock,
@@ -354,7 +362,7 @@ mod tests {
     /// A level with per-bucket variation so rendered tiles are non-trivial.
     fn synthetic_level(buckets: usize) -> PeakLevel {
         PeakLevel {
-            buckets_per_sec: 150.0,
+            buckets_per_sec: 1500.0,
             pos: std::array::from_fn(|band| {
                 (0..buckets)
                     .map(|b| ((b + band) % 7) as f32 / 7.0)

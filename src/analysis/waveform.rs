@@ -2,7 +2,7 @@
 //!
 //! The mono mix is split into low/mid/high bands (two 2nd-order Butterworth
 //! crossovers at 200 Hz and 2 kHz) and reduced to per-bucket min/max peaks
-//! at a base resolution of 150 buckets/s, with a halving pyramid down to
+//! at a base resolution of 1500 buckets/s, with a halving pyramid down to
 //! ~1024 buckets so every zoom level can paint at roughly one bucket per
 //! pixel without rescanning samples.
 
@@ -10,7 +10,7 @@
 pub const NUM_BANDS: usize = 3;
 
 /// Base peak resolution in buckets per second of audio.
-pub(crate) const BASE_BUCKETS_PER_SEC: f64 = 150.0;
+pub(crate) const BASE_BUCKETS_PER_SEC: f64 = 1500.0;
 
 /// The pyramid stops halving once a level has at most this many buckets;
 /// the coarsest level is what the full-track overview texture rasterizes.
@@ -38,7 +38,7 @@ impl PeakLevel {
     }
 }
 
-/// The full pyramid: `levels[0]` is the finest (150 buckets/s), each
+/// The full pyramid: `levels[0]` is the finest (1500 buckets/s), each
 /// following level halves the bucket count.
 #[derive(Clone)]
 pub struct BandPeaks {
@@ -250,18 +250,21 @@ mod tests {
     }
 
     #[test]
-    fn base_resolution_is_150_per_sec() {
+    fn base_resolution_is_1500_per_sec() {
         let peaks = BandPeaks::compute(&test_signal(10.0), 2, 44_100);
-        assert_eq!(peaks.levels[0].num_buckets(), 1500);
-        assert_eq!(peaks.levels[0].buckets_per_sec, 150.0);
+        assert_eq!(peaks.levels[0].num_buckets(), 15000);
+        assert_eq!(peaks.levels[0].buckets_per_sec, 1500.0);
     }
 
     #[test]
     fn pyramid_halves_down_to_coarsest_target() {
-        // 60 s -> 9000 base buckets -> 4500 -> 2250 -> 1125 -> 563.
+        // 60 s -> 90000 base buckets, halving until <= 1024.
         let peaks = BandPeaks::compute(&test_signal(60.0), 2, 44_100);
         let counts: Vec<usize> = peaks.levels.iter().map(|l| l.num_buckets()).collect();
-        assert_eq!(counts, vec![9000, 4500, 2250, 1125, 563]);
+        assert_eq!(
+            counts,
+            vec![90000, 45000, 22500, 11250, 5625, 2813, 1407, 704]
+        );
         assert!(peaks.coarsest().num_buckets() <= COARSEST_TARGET_BUCKETS);
     }
 
@@ -282,11 +285,18 @@ mod tests {
     fn bands_separate_low_and_high_content() {
         let peaks = BandPeaks::compute(&test_signal(5.0), 2, 44_100);
         let level = &peaks.levels[0];
-        // Skip the first buckets (filter settling).
+        // Peak over a mid-track window spanning at least one 60 Hz cycle
+        // (a single base bucket is shorter than the cycle and can land on
+        // a zero crossing); mid-track also skips the filter settling.
         let mid_bucket = level.num_buckets() / 2;
-        let low = level.pos[0][mid_bucket];
-        let mid = level.pos[1][mid_bucket];
-        let high = level.pos[2][mid_bucket];
+        let window = mid_bucket..mid_bucket + 32;
+        let band_peak = |band: usize| {
+            level.pos[band][window.clone()]
+                .iter()
+                .copied()
+                .fold(f32::MIN, f32::max)
+        };
+        let (low, mid, high) = (band_peak(0), band_peak(1), band_peak(2));
         assert!(low > 0.6, "60 Hz should land in the low band, got {low}");
         assert!(high > 0.2, "8 kHz should land in the high band, got {high}");
         assert!(
@@ -299,13 +309,13 @@ mod tests {
     fn level_for_picks_finest_level_with_pixel_wide_buckets() {
         let peaks = BandPeaks::compute(&test_signal(60.0), 2, 44_100);
         let density = |px: f32| peaks.level(peaks.level_index_for(px)).buckets_per_sec;
-        // Levels: 150, 75, 37.5, 18.75, ~9.4 buckets/s.
-        assert_eq!(density(200.0), 150.0);
-        assert_eq!(density(150.0), 150.0);
-        assert_eq!(density(100.0), 75.0);
-        assert_eq!(density(40.0), 37.5);
+        // Levels: 1500, 750, 375, 187.5, 93.75, 46.875, 23.4375, ~11.7 buckets/s.
+        assert_eq!(density(2000.0), 1500.0);
+        assert_eq!(density(1500.0), 1500.0);
+        assert_eq!(density(1000.0), 750.0);
+        assert_eq!(density(400.0), 375.0);
         // Below the coarsest density: the coarsest level is the closest fit.
-        assert_eq!(density(1.0), 9.375);
+        assert_eq!(density(1.0), 11.71875);
     }
 
     #[test]
