@@ -24,6 +24,12 @@
   every rate now). At and below 44.1 kHz everything is bit-identical
   to the blind-validated behavior. Regression tests pin sub-band
   correction at 48/96/192 kHz and 96 kHz low-mid purity.
+- The transient cursor's retention and lookahead windows
+  (`KEEP_BEHIND_FRAMES`, `HORIZON_FRAMES`) scale with the build rate
+  the same way (with the graph's timeline-eviction margin following):
+  unscaled, a 96 kHz build dropped onsets while the correctors' scaled
+  masked windows still addressed them, silently weakening
+  masked-window splice placement.
 
 ## 0.13.0
 

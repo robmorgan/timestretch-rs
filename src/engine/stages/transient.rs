@@ -18,14 +18,26 @@ use crate::core::preanalysis::PreAnalysisArtifact;
 use crate::engine::stage::OnsetEvent;
 
 /// How far behind the current stage position events are retained, in
-/// frames: covers the corrector latency plus splice-fade spans so a
-/// protection window around a just-passed onset is still visible. Sized
-/// for the deepest-lag corrector — the wide keylock chain's 2112-frame
-/// delay plus hop/fade span (SOLA's 560 needs far less).
+/// frames AT 44.1 kHz: covers the corrector latency plus splice-fade
+/// and masked-window spans so a protection window around a just-passed
+/// onset is still visible. Sized for the deepest-lag corrector — the
+/// wide keylock chain's 2112-frame delay plus hop/fade span (SOLA's
+/// 560 needs far less). Scaled with the build rate above 44.1 kHz (see
+/// [`keep_behind_frames`]), matching the correctors' scaled windows:
+/// unscaled, a 96 kHz build dropped onsets while the correctors'
+/// masked windows still addressed them.
 pub(crate) const KEEP_BEHIND_FRAMES: f64 = 3_072.0;
 
-/// Scheduling lookahead, in stage frames.
+/// Scheduling lookahead, in stage frames at 44.1 kHz.
 const HORIZON_FRAMES: f64 = 2_048.0;
+
+/// [`KEEP_BEHIND_FRAMES`] scaled to the build rate — 1× at and below
+/// 44.1 kHz (bit-identical to the validated behavior), proportional
+/// above. The graph's timeline-eviction margin derives from the same
+/// figure so a retained onset is always still mappable.
+pub(crate) fn keep_behind_frames(sample_rate: u32) -> f64 {
+    KEEP_BEHIND_FRAMES * (f64::from(sample_rate) / 44_100.0).max(1.0)
+}
 
 /// Maximum events published per block (fixed storage, no allocation).
 pub(crate) const MAX_EVENTS: usize = 16;
@@ -38,17 +50,24 @@ pub(crate) struct TransientCursor {
     onset_cursor: usize,
     /// Index of the first beat not yet behind the keep window.
     beat_cursor: usize,
+    /// [`KEEP_BEHIND_FRAMES`] / [`HORIZON_FRAMES`] scaled to the build
+    /// rate.
+    keep_behind: f64,
+    horizon: f64,
     /// Fixed event storage republished every block.
     events: [OnsetEvent; MAX_EVENTS],
     len: usize,
 }
 
 impl TransientCursor {
-    pub(crate) fn new(artifact: Arc<PreAnalysisArtifact>) -> Self {
+    pub(crate) fn new(artifact: Arc<PreAnalysisArtifact>, sample_rate: u32) -> Self {
+        let scale = (f64::from(sample_rate) / 44_100.0).max(1.0);
         Self {
             artifact,
             onset_cursor: 0,
             beat_cursor: 0,
+            keep_behind: keep_behind_frames(sample_rate),
+            horizon: HORIZON_FRAMES * scale,
             events: [OnsetEvent::default(); MAX_EVENTS],
             len: 0,
         }
@@ -79,7 +98,7 @@ impl TransientCursor {
         let onsets = &self.artifact.transient_onsets;
         while self.onset_cursor < onsets.len() {
             match map_track_to_stage(onsets[self.onset_cursor] as u64) {
-                Some(stage_frame) if stage_frame < stage_now - KEEP_BEHIND_FRAMES => {
+                Some(stage_frame) if stage_frame < stage_now - self.keep_behind => {
                     self.onset_cursor += 1;
                 }
                 _ => break,
@@ -88,7 +107,7 @@ impl TransientCursor {
         let beats = &self.artifact.beat_positions;
         while self.beat_cursor < beats.len() {
             match map_track_to_stage(beats[self.beat_cursor] as u64) {
-                Some(stage_frame) if stage_frame < stage_now - KEEP_BEHIND_FRAMES => {
+                Some(stage_frame) if stage_frame < stage_now - self.keep_behind => {
                     self.beat_cursor += 1;
                 }
                 _ => break,
@@ -101,7 +120,7 @@ impl TransientCursor {
             let Some(stage_frame) = map_track_to_stage(onsets[idx] as u64) else {
                 break;
             };
-            if stage_frame > stage_now + HORIZON_FRAMES {
+            if stage_frame > stage_now + self.horizon {
                 break;
             }
             self.events[self.len] = OnsetEvent {
@@ -130,7 +149,7 @@ impl TransientCursor {
             let Some(stage_frame) = map_track_to_stage(beats[idx] as u64) else {
                 break;
             };
-            if stage_frame > stage_now + HORIZON_FRAMES {
+            if stage_frame > stage_now + self.horizon {
                 break;
             }
             self.events[self.len] = OnsetEvent {
@@ -165,7 +184,7 @@ mod tests {
 
     #[test]
     fn publishes_events_in_window_and_drops_passed_ones() {
-        let mut cursor = TransientCursor::new(artifact(vec![1_000, 3_000, 50_000], vec![]));
+        let mut cursor = TransientCursor::new(artifact(vec![1_000, 3_000, 50_000], vec![]), 44_100);
         // Identity mapping (track == stage). Keep window is 1_024 behind,
         // horizon 2_048 ahead.
         let events = cursor.advance(1_500.0, |track| Some(track as f64));
@@ -185,7 +204,7 @@ mod tests {
         // Onsets fire exactly once at MAPPED positions: the same onset's
         // stage position shifts as the (rate-dependent) map changes, and
         // consumers keyed to `stage_frame <= now` still see one event.
-        let mut cursor = TransientCursor::new(artifact(vec![10_000], vec![]));
+        let mut cursor = TransientCursor::new(artifact(vec![10_000], vec![]), 44_100);
         let events = cursor.advance(8_000.0, |track| Some(track as f64 / 1.05));
         assert_eq!(events.len(), 1);
         let first = events[0].stage_frame;
@@ -198,7 +217,7 @@ mod tests {
 
     #[test]
     fn beats_are_flagged_and_unmappable_positions_hold_the_cursor() {
-        let mut cursor = TransientCursor::new(artifact(vec![2_000], vec![3_000]));
+        let mut cursor = TransientCursor::new(artifact(vec![2_000], vec![3_000]), 44_100);
         let events = cursor.advance(1_000.0, |track| {
             if track <= 2_500 {
                 Some(track as f64)
@@ -219,7 +238,7 @@ mod tests {
     fn seek_skips_permanently_passed_events() {
         // After a forward seek the anchor maps earlier onsets to -inf;
         // the cursor must skip them and go on publishing later ones.
-        let mut cursor = TransientCursor::new(artifact(vec![1_000, 90_000], vec![]));
+        let mut cursor = TransientCursor::new(artifact(vec![1_000, 90_000], vec![]), 44_100);
         let events = cursor.advance(100.0, |track| {
             if track < 88_000 {
                 Some(f64::NEG_INFINITY)
