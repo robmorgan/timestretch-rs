@@ -72,14 +72,38 @@ details (coordinates, drag gotchas, transport-state reading).
    1000×632 pt (with titlebar). At (256, 92): Play button ≈ (279, 452),
    overview strip ≈ y 407 spanning x 264–1248. If the origin differs, offset
    the click targets accordingly.
-4. Stage in ONE bash command so tool-call gaps don't drift the transport:
-   seek ~40% in via the overview strip (past the intro, into the busy part),
-   play, and let the playhead settle mid-view:
+4. Stage for an **engaging** shot: tempo offset at ±8% and the playhead in a
+   transient-rich section so the zoomed waveform shows all three colors
+   (blue body + orange/white transient bursts) — never the intro.
+
+   a. **Tempo ±8% via the Target BPM field**, not the slider — the slider
+      spans far more than ±20%, so a click lands wildly off (observed:
+      +36.6%). Click the field, select-all, type `detected BPM × 1.08`
+      (one decimal), Enter. **Gotcha: committing the field restarts the
+      transport at 0:00**, so always set tempo BEFORE navigating.
+   b. **Play**, then navigate with the `+16` bar beat-jump button, which
+      keeps playback running (overview-strip seek clicks PAUSE playback —
+      don't use them mid-staging). Pick the destination from the overview
+      colors: orange/white patches = transient-heavy. For Saucers
+      (127 BPM) that's ~bar 100–125 (≈3:10–3:55).
+   c. **Gotcha: instantaneous synthetic clicks sometimes vanish** — the UI
+      samples held state per frame, so a plain `click` on Jump buttons
+      drops ~half the presses. Use press-and-hold clicks and verify the
+      bar counter from a probe screenshot between batches:
 
    ```bash
-   "$SCRATCH/uidrive" click 650 407 && sleep 0.5 && \
-   "$SCRATCH/uidrive" click 279 452 && sleep 4
+   # window-relative pt + window origin from winid; targets below assume (256, 92)
+   "$SCRATCH/uidrive" click 520 533 && sleep 0.3 && \
+   osascript -e 'tell application "System Events" to keystroke "a" using command down' && \
+   osascript -e 'tell application "System Events" to keystroke "137.2"' && \
+   osascript -e 'tell application "System Events" to key code 36' && sleep 0.5 && \
+   "$SCRATCH/uidrive" click 279 452 && sleep 1     # Play
+   # then, per batch of jumps (press-and-hold click = drag in place):
+   "$SCRATCH/uidrive" drag 411 473 411 473 30 120 120   # +16 bars
    ```
+
+   Let it play a couple of seconds after the last jump so the playhead
+   sits mid-view before capturing.
 
 ## Phase 3 — Capture
 
@@ -98,8 +122,10 @@ details (coordinates, drag gotchas, transport-state reading).
 ## Phase 4 — Review gate (Rob approves before any repo change)
 
 1. Read `$SCRATCH/readme-shot.png` so it renders in-chat and sanity-check it:
-   transport shows Pause (i.e. playing) with a nonzero time readout, beat
-   grid overlay visible on the zoomed waveform, keylock deck selected (the
+   transport shows Pause (i.e. playing) with a time readout well past the
+   intro, tempo readout shows **±8.0%** with the target BPM, beat grid
+   overlay visible on the zoomed waveform with **orange/white transient
+   coloring** (not a flat all-blue stretch), keylock deck selected (the
    README alt text mentions both), track name row shows the mp3, sane BPM,
    no dialogs or debug overlays.
 2. Ask Rob to approve or request restaging (different track position, loop
