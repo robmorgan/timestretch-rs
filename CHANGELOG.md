@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.14.0
 
 ### Performance
 
@@ -25,6 +25,14 @@
   `MIN_COMPATIBLE_VERSION` rise to 13 — sampled house-corpus elections
   changed on 2 of 5 tracks, both toward the measured bass phase, with
   backbeat and accent-driven material unchanged.
+- Waveform peaks are 10x denser: `BASE_BUCKETS_PER_SEC` rises from 150
+  to 1500, so zoomed deck views (~1000 px/s at 1-bar zoom) get
+  near-per-pixel peak data instead of 6–7 px flat-topped buckets.
+  Compute cost is unchanged (the crossover biquads dominate); the costs
+  are RAM (~26 MB pyramid per 6-min track) and a ~10x larger `.tsa`
+  PEAK chunk. No `.tsa` format bump: stale cached peaks fail
+  `decode_peaks` validation and recompute on next load, while the
+  beat-grid artifact survives.
 
 ### Fixed
 
