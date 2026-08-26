@@ -21,11 +21,13 @@ steps, and remember Play/Pause is one toggle button (two clicks = pause).
 ## Driving the UI (TCC is unblocked for this)
 
 No cliclick or python-Quartz on this machine. Compile the CGEvent helper
-(source kept in the session scratchpad as `uidrive.swift`; recreate it if
-gone — winid/click/drag subcommands posting CGEvents):
+from the copy kept in the repo-root readme-screenshot skill
+(`.claude/skills/readme-screenshot/uidrive.swift` — winid/click/drag
+subcommands posting CGEvents):
 
 ```bash
-swiftc -O -o uidrive uidrive.swift   # swift JIT is too slow for timing-sensitive drags
+# from the repo root; swift JIT is too slow for timing-sensitive drags
+swiftc -O -o uidrive .claude/skills/readme-screenshot/uidrive.swift
 ./uidrive winid timestretch          # -> "windowID x y w h" (screen points)
 ./uidrive click <x> <y>
 ./uidrive drag <x1> <y1> <x2> <y2> <ms> [holdBeforeMs] [holdAfterMs]
