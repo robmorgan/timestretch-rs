@@ -677,7 +677,7 @@ fn score_file(
     let duration_secs = frames as f64 / audio.sample_rate as f64;
 
     let mid = timestretch::downmix_to_mid(&data, audio.channels);
-    let (artifact, report) = timestretch::analyze_for_dj_with_report(&mid, audio.sample_rate);
+    let (artifact, report) = timestretch::analyze_with_report(&mid, audio.sample_rate);
 
     let class = classify(artifact.bpm, expected_bpm, tolerance);
     let err_pct = match class {

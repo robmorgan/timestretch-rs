@@ -39,7 +39,7 @@ beat-grid overlay, beat jumps, looping, and live keylock tempo control.*
   whole-file pre-analysis and exact output length by construction;
   streaming and offline renders are sample-identical at equal rate and
   artifact (a CI gate, not an aspiration)
-- **Artifact-first analysis** — analyze a track once (`analyze_for_dj`),
+- **Artifact-first analysis** — analyze a track once (`analyze`),
   persist the artifact (BPM, beat grid, transient onsets with strengths),
   and the engine schedules transient protection from it, with online
   fallbacks when no artifact is attached
@@ -192,7 +192,7 @@ let output = timestretch::stretch_to_bpm(&input, &params, 126.0, 128.0).unwrap()
 
 ```rust
 use timestretch::{
-    analyze_for_dj, read_analysis_file, write_analysis_file, stretch,
+    analyze, read_analysis_file, write_analysis_file, stretch,
     AnalysisFile, BandPeaks, StretchParams,
 };
 use std::path::Path;
@@ -200,7 +200,7 @@ use std::path::Path;
 // Build the `.tsa` analysis container once (offline): the beat/onset
 // artifact plus the 3-band waveform peaks a player UI needs at load.
 let mut analysis = AnalysisFile::for_source(&input, 44100);
-analysis.artifact = Some(analyze_for_dj(&input, 44100));
+analysis.artifact = Some(analyze(&input, 44100));
 analysis.peaks = Some(BandPeaks::compute(&input, 1, 44100));
 write_analysis_file(Path::new("track.wav.tsa"), &analysis).unwrap();
 
@@ -371,7 +371,7 @@ See `benchmarks/README.md` for corpus setup and manifest/checksum requirements.
 - `bpm_ratio(source_bpm, target_bpm)` — compute stretch ratio for BPM change
 
 **Pre-analysis pipeline (`.tsa` analysis container):**
-- `analyze_for_dj(&[f32], sample_rate)` — generate offline beat/onset artifact
+- `analyze(&[f32], sample_rate)` — generate offline beat/onset artifact
 - `AnalysisFile` — one container per track: identity header + artifact + waveform peaks; `to_bytes`/`from_bytes`/`from_bytes_validated` for database-backed storage
 - `write_analysis_file(path, &AnalysisFile)` / `read_analysis_file(path)` / `read_analysis_file_validated(path, rate, len, hash)` — sidecar I/O (atomic writes)
 - `analysis_file_path(audio_path)` — sidecar convention: `<audio>.tsa`

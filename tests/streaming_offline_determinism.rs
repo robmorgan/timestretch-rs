@@ -41,7 +41,7 @@ fn render_streaming(input: &[f32], rate: f64) -> Vec<f32> {
 }
 
 fn render_streaming_with(input: &[f32], rate: f64, profile: EngineProfile) -> Vec<f32> {
-    let artifact = Arc::new(timestretch::analyze_for_dj(input, SR));
+    let artifact = Arc::new(timestretch::analyze(input, SR));
     let handles = Engine::build(EngineConfig {
         sample_rate: SR,
         channels: 1,

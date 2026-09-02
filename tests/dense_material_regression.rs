@@ -2,7 +2,7 @@
 //!
 //! Before the robust-detection front end (log-compressed ODF + median+MAD
 //! thresholding), `detect_transients` returned ZERO onsets on continuously
-//! loud broadband audio, so `analyze_for_dj` produced empty artifacts (BPM 0,
+//! loud broadband audio, so `analyze` produced empty artifacts (BPM 0,
 //! confidence 0) and analyze-on-load silently no-opped. Every prior test used
 //! sparse clicks-over-silence, which never exercised that regime.
 //!
@@ -55,7 +55,7 @@ fn dense_material_produces_onsets_at_all_sensitivities() {
 #[test]
 fn dense_material_analyze_produces_usable_artifact() {
     let mid = load_dense_mid();
-    let artifact = timestretch::analyze_for_dj(&mid, SR);
+    let artifact = timestretch::analyze(&mid, SR);
 
     assert!(
         artifact.bpm > 0.0,

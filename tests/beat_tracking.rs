@@ -354,8 +354,8 @@ fn four_on_floor_downbeats_land_on_the_bass_phase() {
 
     for (label, grid) in [
         ("detect_beat_grid", detect_beat_grid(&x, sr)),
-        ("analyze_for_dj", {
-            let artifact = timestretch::analyze_for_dj(&x, sr);
+        ("analyze", {
+            let artifact = timestretch::analyze(&x, sr);
             let mut grid = BeatGrid::empty(sr);
             grid.beats = artifact.beat_positions.iter().map(|&p| p as f64).collect();
             grid.downbeats = artifact.downbeat_beat_indices.clone();

@@ -98,7 +98,7 @@ fn track_analysis_qa() {
             }
         };
         let mid = timestretch::downmix_to_mid(&buffer.data, buffer.channels.count());
-        let (artifact, report) = timestretch::analyze_for_dj_with_report(&mid, buffer.sample_rate);
+        let (artifact, report) = timestretch::analyze_with_report(&mid, buffer.sample_rate);
 
         let duration = buffer.duration_secs();
         println!(

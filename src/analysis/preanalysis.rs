@@ -20,7 +20,7 @@ const PREANALYSIS_SENSITIVITY: f32 = 0.4;
 const DJ_TEMPO_HINT_RANGE: (f64, f64) = (100.0, 182.0);
 
 /// Downmixes interleaved audio to the mono analysis signal expected by
-/// [`analyze_for_dj`]: the input itself for mono, or the mid channel
+/// [`analyze`]: the input itself for mono, or the mid channel
 /// `(L + R) * 0.5` for stereo (matching mid/side encoding). Extra channels
 /// beyond the first two are ignored.
 pub fn downmix_to_mid(interleaved: &[f32], channels: usize) -> Vec<f32> {
@@ -39,7 +39,7 @@ pub fn downmix_to_mid(interleaved: &[f32], channels: usize) -> Vec<f32> {
 
 /// Diagnostic telemetry from an offline analysis run.
 ///
-/// Produced by [`analyze_for_dj_with_report`] alongside the artifact and
+/// Produced by [`analyze_with_report`] alongside the artifact and
 /// never serialized — it exists so analysis mistakes can be inspected
 /// during tuning (onset detection function statistics, onset rate, timing).
 #[derive(Debug, Clone, Default)]
@@ -68,12 +68,27 @@ pub struct AnalysisReport {
 /// The returned artifact carries content binding (length + hash) so stale
 /// artifacts can be rejected via
 /// [`PreAnalysisArtifact::matches_source`].
-pub fn analyze_for_dj(samples: &[f32], sample_rate: u32) -> PreAnalysisArtifact {
-    analyze_for_dj_with_report(samples, sample_rate).0
+pub fn analyze(samples: &[f32], sample_rate: u32) -> PreAnalysisArtifact {
+    analyze_with_report(samples, sample_rate).0
 }
 
-/// [`analyze_for_dj`] plus an [`AnalysisReport`] for tuning/diagnostics.
+/// Deprecated alias for [`analyze`].
+#[deprecated(since = "0.15.0", note = "renamed to `analyze`")]
+pub fn analyze_for_dj(samples: &[f32], sample_rate: u32) -> PreAnalysisArtifact {
+    analyze(samples, sample_rate)
+}
+
+/// Deprecated alias for [`analyze_with_report`].
+#[deprecated(since = "0.15.0", note = "renamed to `analyze_with_report`")]
 pub fn analyze_for_dj_with_report(
+    samples: &[f32],
+    sample_rate: u32,
+) -> (PreAnalysisArtifact, AnalysisReport) {
+    analyze_with_report(samples, sample_rate)
+}
+
+/// [`analyze`] plus an [`AnalysisReport`] for tuning/diagnostics.
+pub fn analyze_with_report(
     samples: &[f32],
     sample_rate: u32,
 ) -> (PreAnalysisArtifact, AnalysisReport) {
@@ -282,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn test_analyze_for_dj_click_train_has_confidence() {
+    fn test_analyze_click_train_has_confidence() {
         let sample_rate = 44100u32;
         let bpm = 120.0;
         let beat_interval = (60.0 * sample_rate as f64 / bpm) as usize;
@@ -295,14 +310,14 @@ mod tests {
             }
         }
 
-        let artifact = analyze_for_dj(&signal, sample_rate);
+        let artifact = analyze(&signal, sample_rate);
         assert!(artifact.bpm > 0.0);
         assert!(artifact.confidence > 0.2);
         assert!(!artifact.beat_positions.is_empty());
     }
 
     #[test]
-    fn test_analyze_for_dj_fills_v2_fields() {
+    fn test_analyze_fills_v2_fields() {
         let sample_rate = 44100u32;
         let beat_interval = (60.0 * sample_rate as f64 / 120.0) as usize;
         let len = sample_rate as usize * 4;
@@ -313,7 +328,7 @@ mod tests {
             }
         }
 
-        let artifact = analyze_for_dj(&signal, sample_rate);
+        let artifact = analyze(&signal, sample_rate);
         assert_eq!(artifact.version, PREANALYSIS_VERSION);
         assert_eq!(artifact.source_len_samples, len);
         assert_eq!(artifact.content_hash, hash_samples(&signal));

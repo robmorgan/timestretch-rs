@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `analyze_for_dj` / `analyze_for_dj_with_report` are renamed to `analyze`
+  / `analyze_with_report`. The `_for_dj` suffix dated from when the
+  offline pass was framed as a DJ-specific feature; it is now simply
+  *the* analysis entry point, used by the CLI, the desktop app, the
+  offline engine, and the QA harnesses. The old names remain as
+  `#[deprecated]` aliases, so downstream code keeps compiling.
+
 ## 0.14.0
 
 ### Performance

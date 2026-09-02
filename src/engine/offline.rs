@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 
-use crate::analysis::preanalysis::analyze_for_dj;
+use crate::analysis::preanalysis::analyze;
 use crate::core::preanalysis::PreAnalysisArtifact;
 use crate::core::resample::STREAM_SINC_HALF_TAPS;
 use crate::core::window::WindowType;
@@ -138,7 +138,7 @@ fn stretch_via_graph(
             } else {
                 crate::downmix_to_mid(input, channels)
             };
-            Arc::new(analyze_for_dj(&mid, sample_rate))
+            Arc::new(analyze(&mid, sample_rate))
         }
     };
 
