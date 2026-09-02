@@ -182,6 +182,8 @@ Date: 2026-02-28
 4. Event-aligned recombination with adaptive crossfades.
 5. Dynamic quality/latency mode controls and robust realtime buffering.
 6. Pitch shift path includes envelope/formant protection and transient-aware event handling.
+7. Stereo is one instance with linked analysis, not two mono instances — the V3 SDK documentation states this outright, for both quality ("the content of both channels is taken into account for the analysis, and the stereo processing is linked between both channels") and performance. An explicit M/S input mode exists (`kMSMode`).
+8. Output blocks are capped at 1024 frames, and a DirectAPI exists whose stated purpose is spreading each block's cost across small audio callbacks ("performance peaks ... at low latencies"). Pro is documented as about 2× the CPU of Efficient; Efficient about 2× the mobile mode. (SDK docs read 2026-09-02; see Sources.)
 
 ---
 
@@ -238,6 +240,51 @@ Implementation constraints:
 - bounded per-block loops,
 - preplanned FFT/resampler allocations,
 - SIMD or vectorized hot paths for OLA/windowing/magnitude/phase loops.
+
+### 9.1 Latency budgets in shipping DJ products (2026-09-02)
+
+Three budgets, only one of which DJ software exposes to the user:
+
+1. **Audio interface buffer** — the number DJs tune. Traktor and
+   rekordbox guidance is 128–256 samples; Ableton performers run 64–128
+   for instruments. At 44.1 kHz: ~3–6 ms per buffer, ~10–15 ms round
+   trip through driver input and output stages.
+2. **Gesture-to-audio** — jog nudge, pitch bend, hot-cue jump, scratch.
+   Buffer plus whatever the stretcher delays. Pioneer publishes no
+   master-tempo delay for the CDJ-3000; what it advertises is jog touch
+   latency halved versus the NXS2.
+3. **Stretcher-internal delay** — hidden on the timeline by every DJ
+   app (playhead, waveform, cues, sync all read ahead). Only budget 2
+   exposes it.
+
+Reported stretcher delays:
+
+| Engine | Delay at 44.1 kHz | Source |
+|---|---|---|
+| Rubber Band R2 short / default / long window | 512 / 1024 / 2048 frames (12 / 23 / 46 ms) | breakfastquay integration guide |
+| Rubber Band R3 short / default | 1280 / 2048 frames (29 / 46 ms) | same |
+| Elastique Pro / Efficient V3 | no fixed figure; dynamic via `GetFramesNeeded`, initial unused frames discarded; output block ≤ 1024 frames | zplane SDK docs |
+| Elastique Pitch plugin (Pro engine + resampler + formant path) | 163 ms at 44.1 kHz, 150 ms at 48 kHz | zplane product page |
+| timestretch-rs Keylock / WideKeylock | 560 frames (12.7 ms) / 0 ms (source-side lookahead) | README |
+
+Reading: the 560-frame (12.7 ms) Keylock contract is stricter than
+anything shipping and equal to R2's short window. 2048 frames is the
+class R3 and, by its block sizes, Elastique operate in — and at 44.1
+or 48 kHz it is the FFT size that resolves bass (46 ms window, 21.5 Hz
+bins). ROADMAP's two-budget policy follows from this table: gestures on
+the 12.7 ms profile, corrected steady playback on a 46 ms profile,
+timeline-compensated exactly as DJ apps do.
+
+Sample rate caveat. The table is in frames because the vendors quote
+frames, and their window sizes do not scale with rate: Rubber Band's
+2048-frame default is 21 ms at 96 kHz, with 47 Hz bins. Our budgets
+are stated in time instead. Keylock already scales its lag with the
+rate (`keylock_latency_frames`: 560 frames at 44.1 kHz, ≈1219 at
+96 kHz, 12.7 ms either way); the wide PV head does not (`WIDE_FFT` is a
+fixed 2048), so at Halo's 96 kHz it runs half the frequency resolution
+the bass argument above assumes. The Stage 26 profile therefore sizes
+its FFT from the rate — 2048 at 44.1/48 kHz, 4096 at 88.2/96 kHz — and
+is deliberately stricter than the vendors at high rates.
 
 ---
 
@@ -352,3 +399,15 @@ offline wide-ratio fallback, `src/engine/offline.rs`) in August 2026.
 - [SoundTouch](https://codeberg.org/soundtouch/soundtouch)
 - [Paulstretch](https://github.com/paulnasca/paulstretch_cpp)
 - [librosa](https://github.com/librosa/librosa)
+
+### Product Documentation (latency budgets, §9.1)
+- [Rubber Band integration guide (start delay table)](https://breakfastquay.com/rubberband/integration.html)
+- [Elastique Pro V3 SDK documentation](https://licensing.zplane.de/uploads/SDK/ELASTIQUE-PRO/V3/manual/elastique_pro_v3_sdk_documentation.pdf)
+- [Elastique Pro V3 DirectAPI documentation](https://licensing.zplane.de/uploads/SDK/ELASTIQUE-PRO/V3/manual/elastique_pro_v3_sdk_directapi_documentation.pdf)
+- [Elastique Efficient V3 SDK documentation](https://licensing.zplane.de/uploads/SDK/ELASTIQUE-EFF/V3/manual/elastique_efficient_v3_sdk_documentation.pdf)
+- [zplane Elastique Pitch (plugin latency figure)](https://products.zplane.de/products/elastiquepitch)
+- [zplane technology overview](https://licensing.zplane.de/technology)
+- [DJ TechTools — This is Pioneer DJ's CDJ-3000](https://djtechtools.com/2020/09/09/this-is-pioneer-djs-cdj-3000/)
+- [DJ TechTools — Latency, a brief guide](https://djtechtools.com/2011/05/03/latency-a-brief-guide/)
+- [Rekordbox latency adjust thread (buffer guidance)](https://forums.pioneerdj.com/hc/en-us/community/posts/4406806265881-Rekordbox-Latency-adjust)
+- [Ableton audio setup guide (buffer sizes)](https://www.audeobox.com/learn/ableton/ableton-audio-setup-guide/)
