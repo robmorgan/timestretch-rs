@@ -158,6 +158,85 @@ Outputs are written to `target/rubberband_benchmark/`:
 - `rubberband_comparison_report.csv`
 - `timestretch_vs_rubberband_output.wav`
 
+### Elastique reference renders (Parity Track, Stage 23)
+
+Elastique has no CLI, so its renders come from an Elastique host and are
+kept as prebaked assets. Two hosts ship the same zplane engine: REAPER
+(pitch-shift mode "élastique 3.3.3 Pro") and Ableton Live ("Complex Pro"
+warp mode). REAPER is scriptable headlessly, so it is the route the
+scripts use; the Ableton recipe below is the manual fallback.
+
+**Automated (REAPER).** With REAPER installed at `/Applications/REAPER.app`:
+
+```bash
+scripts/render_elastique.py                       # whole manifest, all rates
+scripts/render_elastique.py --tracks music-sounds-better-with-you,cold-heart --rates -8,-4,4,8
+scripts/render_elastique.py --dry-run             # list what would render
+```
+
+The wrapper writes a job list, launches REAPER with
+`scripts/reaper_elastique.lua` (`-nosplash -ignoreerrors`, no window
+interaction), and waits for the script's done marker. Each job is one
+media item at take playrate = tempo rate with preserve-pitch on and the
+élastique Pro mode selected by name, rendered as the master mix from 0 to
+`source_length / rate` at the source sample rate and channel count,
+32-bit float, no dither, no tail. A render of a 6-minute track takes
+about ten seconds. Outputs land in
+`benchmarks/audio/references/elastique/<track_stem>/<rate_tag>.wav`;
+existing files are skipped unless `--force`. MP3 sources (the public
+corpus) also get a `+0pct.wav` decode at unity because the harness and
+`ab_render` read WAV only. When the run finishes the wrapper prints the
+`[[track.reference]]` rows with SHA-256 hashes (`--manifest-out` writes
+them to a file) — paste the rows for WAV-source tracks into the manifest.
+
+Alignment check (2026-09-03, msbwy): the unity render is sample-exact
+against the source, so REAPER compensates the engine's delay. At ±8 % the
+render sits 12–33 ms from our engine's timeline at a given point, the
+same order as the Rubber Band arm; the position-synced A/B tolerates it
+and the harness's cross-correlation absorbs it.
+
+**Manual (Ableton Live Complex Pro).** Per track and rate (DJ window
+−8/−4/+4/+8 %, wide −50/−30/+30/+50 %):
+
+1. New Live set at the track's sample rate (44.1 kHz for the corpus MP3s
+   and the bpm-corpus WAVs; check with `soxi`/`afinfo`). Drop the track on
+   an audio clip, Warp on, mode **Complex Pro**, formants 0, envelope
+   default. Make the warp a single straight-line fit: one warp marker at
+   the start, **Seg. BPM** set to the manifest `bpm` so the clip is
+   unwarped at the set tempo equal to that BPM.
+2. Set the set tempo to `bpm × rate` (e.g. 124 × 1.08 = 133.92). Live
+   accepts two decimals; the residual error is below 0.01 % and is
+   absorbed by the harness's ratio computed from `target_bpm`.
+3. Export Audio: Selected track, no normalise, no dither, **32-bit float
+   WAV**, sample rate as the source, from clip start to clip end.
+4. Name it by the `ab_render` convention and drop it under
+   `benchmarks/audio/references/elastique/<track_stem>/<rate_tag>.wav`,
+   where `<track_stem>` is the source file stem with everything but
+   `[A-Za-z0-9_-]` removed and truncated to 24 characters (e.g.
+   `12247392_MusicSoundsBett`) and `<rate_tag>` is `+8pct`, `-4pct`, …
+5. Add a `[[track.reference]]` row per file with `software = "Ableton Live
+   12"`, `algorithm = "Complex Pro"`, `target_bpm = bpm × rate`, and the
+   file's SHA-256, so `reference_quality` scores it. The summary's
+   `per_engine` block reports each engine separately; the track-level
+   averages mix every engine in the manifest.
+
+Only the public corpus renders are redistributable (all its licences allow
+derivatives with attribution); bpm-corpus renders stay local like their
+sources.
+
+To put the render into a blind session beside the live arms:
+
+```bash
+scripts/ab.sh render stage23-baseline --rates 0.92,0.96,1.04,1.08 --rb \
+    --ref-arm elastique:benchmarks/audio/references/elastique \
+    "benchmarks/audio/bpm-corpus/12247392_Music Sounds Better With You_(Original Mix).wav:90"
+```
+
+`--ref-arm` cuts the excerpt matching the other arms out of the full-track
+render (start and length scaled by the rate) and then level-matches and
+blinds it like any other arm. Conditions with no render for that stem and
+rate are reported and simply lack the arm.
+
 ## CI Quality Gate Subset
 
 CI enforces corpus-independent quality gates via the engine harnesses:

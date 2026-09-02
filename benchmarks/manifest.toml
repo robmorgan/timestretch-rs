@@ -70,6 +70,63 @@ key = "3A" # Bb minor (Mixed In Key)
   software = "Ableton Live 11"
   algorithm = "Complex Pro"
 
+  # élastique 3.3.3 Pro via REAPER (scripts/render_elastique.py, 2026-09-03)
+  [[track.reference]]
+  file = "references/elastique/12247392_MusicSoundsBett/-50pct.wav"
+  file_sha256 = "cd7a355301e5a5d740269f9028f5560b0bb78ae61e1e19f9f11f736b1028ad14"
+  target_bpm = 62.0000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/12247392_MusicSoundsBett/-30pct.wav"
+  file_sha256 = "d92dfd91cb997ec8ac2c2c6970535f189208e95e55c2c14b67e9bd561cc6a598"
+  target_bpm = 86.8000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/12247392_MusicSoundsBett/-8pct.wav"
+  file_sha256 = "c359a6ac7222ab18c3cb1ec7dca73c59e3a29de2748ee22709d41297d3caf816"
+  target_bpm = 114.0800
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/12247392_MusicSoundsBett/-4pct.wav"
+  file_sha256 = "1b38d8e510b1898ccd6713af26f95418647a45b89c1ebef4c5fe054599c6dd3e"
+  target_bpm = 119.0400
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/12247392_MusicSoundsBett/+4pct.wav"
+  file_sha256 = "9fe3d8d47fc75f8980a4561c63457be245927767cb33704f597bd426a315b61b"
+  target_bpm = 128.9600
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/12247392_MusicSoundsBett/+8pct.wav"
+  file_sha256 = "7c3d0b4014edccfe9b7a9ee1e782c75d97b2a9c65a946a2a4a4362e2b0a7c799"
+  target_bpm = 133.9200
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/12247392_MusicSoundsBett/+30pct.wav"
+  file_sha256 = "cf387e87722b68d2aac952fae37767832359ed2de1cb7b119058a0a4063d8305"
+  target_bpm = 161.2000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/12247392_MusicSoundsBett/+50pct.wav"
+  file_sha256 = "89301fa1f835e2563f2f6d7e8aab01793fc193b8c8bbe9e01e78338460e68b73"
+  target_bpm = 186.0000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
 # --- BPM corpus (BPM accuracy harness only) ---
 #
 # bpm = 0.0 is a placeholder: fill in the published/confirmed tempo and the
@@ -93,9 +150,65 @@ description = "Hot Stuff (Original Mix), stereo"
 original = "bpm-corpus/14220825_Hot Stuff_(Original Mix).wav"
 original_sha256 = "aaa3a686a73f6793ca59b50cf8f1331a2022bd5d841c5db174fdce1e3543520f"
 bpm = 120.0 # TODO: confirm tempo (detector reads 120.2)
-bpm_only = true
 beats = "annotations/hot-stuff-original-mix.json"
 key = "6A" # G minor (Mixed In Key)
+
+  # élastique 3.3.3 Pro via REAPER (scripts/render_elastique.py, 2026-09-03)
+  [[track.reference]]
+  file = "references/elastique/14220825_HotStuff_Origin/-50pct.wav"
+  file_sha256 = "e4e30fdc68a9a57a04d17bafe9e159d28aca58702e5e05ffe2d9b3181be9e9f1"
+  target_bpm = 60.0000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/14220825_HotStuff_Origin/-30pct.wav"
+  file_sha256 = "5f5e5559cd60697ec61e0d8e98cdf6ab003422b57f815b508066569f1d87fa08"
+  target_bpm = 84.0000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/14220825_HotStuff_Origin/-8pct.wav"
+  file_sha256 = "5823a5d42788c85a8206c358b6d4dc67b9b30ec6b156a510ec3e9075826b9c64"
+  target_bpm = 110.4000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/14220825_HotStuff_Origin/-4pct.wav"
+  file_sha256 = "796cdd9dfb81f603b6fab7ba408545c6f16e8d012501c83fb45460e037e67d41"
+  target_bpm = 115.2000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/14220825_HotStuff_Origin/+4pct.wav"
+  file_sha256 = "87b29d8c4107c4c35bf716e0661486380a8634da671018871c1d79c70e72ddf3"
+  target_bpm = 124.8000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/14220825_HotStuff_Origin/+8pct.wav"
+  file_sha256 = "85f8dc3f5a34be25cf234398adfa6fe652ecb5b650ca89fe0a9f721a8bcbe996"
+  target_bpm = 129.6000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/14220825_HotStuff_Origin/+30pct.wav"
+  file_sha256 = "7ce4d9a3f3d4380b81d0ae40cdb14b07fd12326cb85238f4224967cd5eb53cae"
+  target_bpm = 156.0000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/14220825_HotStuff_Origin/+50pct.wav"
+  file_sha256 = "231e47d285fd5f9e241697a6fbb35b716919f73dc39ac536cd8102b99980cad3"
+  target_bpm = 180.0000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
 
 [[track]]
 id = "somebody-to-love-extended-mix"
@@ -103,9 +216,65 @@ description = "Somebody To Love (Extended Mix), stereo"
 original = "bpm-corpus/15650709_Somebody To Love_(Extended Mix).wav"
 original_sha256 = "e15eff5b8b0cbbfd69a0da39789fa9326827d61e39b04f0e63bb7d093edef613"
 bpm = 128.0 # TODO: confirm tempo (detector reads 128.7)
-bpm_only = true
 beats = "annotations/somebody-to-love-extended-mix.json"
 key = "11A" # F# minor (Mixed In Key)
+
+  # élastique 3.3.3 Pro via REAPER (scripts/render_elastique.py, 2026-09-03)
+  [[track.reference]]
+  file = "references/elastique/15650709_SomebodyToLove_/-50pct.wav"
+  file_sha256 = "b9f3bed2ef8f18cd8059df424a27cb60330ad792b7d7a3361c7eb954fcc6822a"
+  target_bpm = 64.0000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/15650709_SomebodyToLove_/-30pct.wav"
+  file_sha256 = "0f4319aff94627338884c6ebf12664546ad9661652bc74124ce52a4de337e1be"
+  target_bpm = 89.6000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/15650709_SomebodyToLove_/-8pct.wav"
+  file_sha256 = "fd4fc525c9e6bdbbb53b3c8e96d5ecd20d29b746becdc92874635a071db7bbf9"
+  target_bpm = 117.7600
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/15650709_SomebodyToLove_/-4pct.wav"
+  file_sha256 = "1771cb39c5987b8e5042ded50b0de6ba89968b4cca480de2216583b9c90baa8a"
+  target_bpm = 122.8800
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/15650709_SomebodyToLove_/+4pct.wav"
+  file_sha256 = "a6c7ad1bdfcce5ef4b8d71f0e88447fc76e47338afae19991d01d3f5c3a5d4b2"
+  target_bpm = 133.1200
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/15650709_SomebodyToLove_/+8pct.wav"
+  file_sha256 = "81e32674633b0307f31ea4211ef9dfbaa53144cec6dfd3b83aa8bdb2fbbed86d"
+  target_bpm = 138.2400
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/15650709_SomebodyToLove_/+30pct.wav"
+  file_sha256 = "1e28d4190825f66d331ead6746c25b66cf303c50d13924e0b34d1380d567dcdb"
+  target_bpm = 166.4000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/15650709_SomebodyToLove_/+50pct.wav"
+  file_sha256 = "b19737f0a083a7e9f8cb7c311ba6e680b8cb66ed720d867b20be627765f1fde1"
+  target_bpm = 192.0000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
 
 [[track]]
 id = "cold-heart-pnau-extended-mix"
@@ -113,9 +282,65 @@ description = "Cold Heart (PNAU Extended Mix), stereo"
 original = "bpm-corpus/15836669_Cold Heart_(PNAU Extended Mix).wav"
 original_sha256 = "d3e2129136d1d3ddcf42d778f910e6d808d2c739eaaea7f08ac3d779ae2843b3"
 bpm = 116.0 # TODO: confirm tempo (detector reads 115.8; commonly listed 116)
-bpm_only = true
 beats = "annotations/cold-heart-pnau-extended-mix.json"
 key = "3A" # Bb minor (Mixed In Key)
+
+  # élastique 3.3.3 Pro via REAPER (scripts/render_elastique.py, 2026-09-03)
+  [[track.reference]]
+  file = "references/elastique/15836669_ColdHeart_PNAUE/-50pct.wav"
+  file_sha256 = "b61bbc074ff1bfc0e6cdc85bb74a74083712c82a0a6a8c89e1dd419d0aec8a76"
+  target_bpm = 58.0000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/15836669_ColdHeart_PNAUE/-30pct.wav"
+  file_sha256 = "98053ac671f0bff69c67c9a8f24158a290fea69edca7b71b06d22a1e6882f05b"
+  target_bpm = 81.2000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/15836669_ColdHeart_PNAUE/-8pct.wav"
+  file_sha256 = "5779eb7ef9e6acf2c97684c615a5b753779111968108c3285c0638fdc69cabea"
+  target_bpm = 106.7200
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/15836669_ColdHeart_PNAUE/-4pct.wav"
+  file_sha256 = "f17e779bfaf004a288e0f3b6874200ed0b4875a6bdae198d0156c9b1ef101f8c"
+  target_bpm = 111.3600
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/15836669_ColdHeart_PNAUE/+4pct.wav"
+  file_sha256 = "04a2ccc0a0c524197b7ad1627485be03957a0d1cb7c5ca1fd03bf8b2d49f61ca"
+  target_bpm = 120.6400
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/15836669_ColdHeart_PNAUE/+8pct.wav"
+  file_sha256 = "c0366578f67d2961aad01f14c87ca8dc679b8b7c226f96eb54000aa430a5cc11"
+  target_bpm = 125.2800
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/15836669_ColdHeart_PNAUE/+30pct.wav"
+  file_sha256 = "c794bbb45c456e4da01ebb45bf30cdca9925fc69546c72c4542baa27ebbe5f5f"
+  target_bpm = 150.8000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
+
+  [[track.reference]]
+  file = "references/elastique/15836669_ColdHeart_PNAUE/+50pct.wav"
+  file_sha256 = "5007bbd649ac5dc3fd11e39d0260535cfdc57641668384115ee38b71fe0fec02"
+  target_bpm = 174.0000
+  software = "REAPER"
+  algorithm = "élastique 3.3.3 Pro (Normal)"
 
 [[track]]
 id = "good-to-you-original-mix"
