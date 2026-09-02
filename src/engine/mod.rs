@@ -46,6 +46,7 @@
 
 pub mod control;
 pub mod graph;
+pub mod hybrid;
 pub mod offline;
 pub mod profiles;
 pub mod source;

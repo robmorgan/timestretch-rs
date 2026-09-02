@@ -142,6 +142,18 @@ fn stretch_via_graph(
         }
     };
 
+    // PROTO (ROADMAP Stage 25, env-gated off by default): hybrid
+    // transient/tonal decomposition replaces the Keylock graph render.
+    // Inert unless TIMESTRETCH_PROTO_HYBRID is set — the determinism gate
+    // runs without it.
+    if profile == EngineProfile::Keylock {
+        if let Some(proto) = super::hybrid::ProtoHybrid::from_env(sample_rate) {
+            let out = proto.render(input, channels, sample_rate, ratio, &artifact);
+            debug_assert_eq!(out.len(), expected_frames * channels);
+            return Ok(out);
+        }
+    }
+
     let handles = Engine::build(EngineConfig {
         sample_rate,
         channels,
