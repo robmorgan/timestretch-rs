@@ -74,7 +74,12 @@ sound and the Keylock chain becomes its gesture lane (Stage 26); the
 decomposition kill experiment (Stage 25) runs before the PV coherence
 upgrade (Stage 24) because it is the untried mechanism class; and the
 offline-throughput stage (Stage 22, issue #78) is removed from the
-roadmap and handled by the owner outside it.
+roadmap and handled by the owner outside it. **Stage 23 closed
+2026-09-03** (PR #81 + session): Elastique Pro renders scripted
+through REAPER, 32 references in the manifest, criterion finalised;
+baseline blind session has ours below Elastique 9/12 (DJ window) and
+8/12 (wide), "robotic" still present at DJ ratios — archived in
+LEARNINGS.md. Stage 25 is next.
 
 Stage 19 (direct-ratio wide path) completed 2026-08-14 (PR #60) — the
 PV owns the tempo axis for the wide profile as the graph's demand
@@ -230,10 +235,11 @@ corrector was never falsified.
   corrected low band); the wide-rate Rubber Band gap stands,
   re-baselined smaller at Stage 13 and tied at +50% by Stage 19 — it is
   now the Parity Track's subject, not an accepted line.
-- **Parity is measured against Elastique renders in the corpus.** Until
-  Stage 23 lands those renders and the written criterion, no stage may
-  claim parity, and "Rubber Band is the reference" remains the only
-  citable external comparison.
+- **Parity is measured against Elastique renders in the corpus.**
+  Stage 23 landed the renders (scripted through REAPER's élastique
+  3.3.3 Pro) and the written criterion on 2026-09-03; every parity
+  claim cites a sealed-key session against that arm. Rubber Band stays
+  in every set as the cleanest-arm ceiling, but it is not the bar.
 - **No design verdict by ear against a component that has not passed
   its own null and purity probes.** Two architecture decisions were
   settled in July 2026 by listening against a PV carrying the defects
@@ -406,7 +412,17 @@ Each stage follows the Stage 21 template: kill question, prototype,
 falsifier, named fallback, build-out bought by survival, gates landing
 with the stage, sealed-key exit listen.
 
-### Stage 23 — Elastique Reference Corpus and Parity Criterion (OPEN)
+### Stage 23 — Elastique Reference Corpus and Parity Criterion (CLOSED 2026-09-03: achieved)
+
+**Verdict.** Renders in the corpus (REAPER's élastique 3.3.3 Pro,
+scripted; 167/167), 32 references in the manifest, harness per-engine
+block live, and the baseline sealed-key session listened blind
+(2026-09-03, two sets × 12 conditions, three arms). Ours ranked below
+Elastique in 9/12 DJ-window and 8/12 wide conditions, with "robotic"
+on our arm in 3 DJ-window conditions; level or ahead only at ±50 %.
+Ranked artifact classes and the finalised criterion are archived in
+LEARNINGS.md; the criterion is in Definition of Success. Stage 25
+opens next.
 
 **Why.** Everything to date is measured against Rubber Band. The
 Elastique gap is inferred from architecture, never observed.
@@ -679,9 +695,15 @@ in addition:
 - No panic is reachable from the public API on arbitrary input (Stage 12,
   done 2026-08-13 — adversarial harness in CI + audit).
 - The quality lane is the deck's default steady-state sound and meets
-  the Stage 23 parity criterion against Elastique Pro in a sealed-key
-  session with two listeners (Stage 29), or the residual gap is
-  recorded the way the Stage 11 gap was.
+  the **Stage 23 parity criterion** (finalised 2026-09-03): two
+  sealed-key sets of 12 conditions — the DJ window (±4/±8 %) and the
+  wide range (±30/±50 %) on the Stage 16 excerpts, three arms (ours /
+  Rubber Band / Elastique Pro) — with two listeners, in which ours is
+  ranked below Elastique in no more than 3 of 12 conditions per set
+  and never with the "robotic / underwater / vocoder" vocabulary;
+  ties count as parity (Stage 29). Baseline 2026-09-03: 9/12 and 8/12
+  below, "robotic" present — recorded in LEARNINGS.md. Or the
+  residual gap is recorded the way the Stage 11 gap was.
 - The gesture lane keeps the 12.7 ms Keylock contract, and the lane
   crossfade is inaudible on the ride harnesses and in a blind nudge
   test (Stage 26).

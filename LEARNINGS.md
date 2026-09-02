@@ -836,3 +836,101 @@ Lessons:
   is wrong by an order of magnitude for bass; every constant that
   worked here was the high-band corrector's constant re-derived from
   the period range, not copied.
+
+## Stage 23 — Elastique Reference Corpus and Parity Criterion (2026-09-03, achieved)
+
+The first stage of the Parity Track: put Elastique Pro in the corpus
+so the gap is observed instead of inferred, and write the parity
+criterion down. No DSP changes.
+
+**Corpus.** Elastique has no CLI, but REAPER licenses the same zplane
+engine as "élastique 3.3.3 Pro" and runs ReaScripts headlessly.
+`scripts/render_elastique.py` + `scripts/reaper_elastique.lua` (PR
+#81, `f95c70f`) render the whole manifest at ±4/±8/±30/±50 % with no
+window interaction: 19 tracks, 167/167 renders, ~10–30 s each, 32-bit
+float at the source rate. The unity render is sample-exact against
+the source; at ±8 % Elastique's timeline sits 12–33 ms from ours at a
+given point (inherent transient relocation, same order as Rubber
+Band). 32 references for the four WAV-source bpm-corpus tracks are in
+`benchmarks/manifest.toml`; `reference_quality` gained a `per_engine`
+summary (60 s window: spectral 0.917, flux 0.818 vs élastique Pro) and
+`scripts/ab.sh --ref-arm` imports the full-track renders into blind
+sets. Ableton Complex Pro (same engine) is the documented manual
+fallback.
+
+**Baseline session** (blind, sealed keys, owner, 2026-09-03; renders
+from `f95c70f`; `target/ab/stage23-dj/results.json` and
+`target/ab/stage23-wide/results.json`): Stage 16 excerpts (hot_stuff
+60 s, msbwy 90 s, cold_heart 45 s) × 4 rates × 3 arms (ours / Rubber
+Band R3 / Elastique Pro) per set, 24 conditions total. Rankings read
+from the per-arm notes (no winner key was recorded):
+
+- **DJ window (±4/±8 %).** Ours ranked below Elastique in 9 of 12
+  conditions; level with it in 3 (hot_stuff +4 "great" ×3; msbwy +8
+  "drums attacking harder, still clean" vs Elastique "tiny bit
+  fuzzy"; hot_stuff +8 mild). Rubber Band was the cleanest arm in 7,
+  Elastique in 3, tied in 2. Elastique was never described below both
+  others.
+- **Wide (±30/±50 %).** Ours below Elastique in 8 of 12; level or
+  ahead in 4 — all at +50 % or −50 %: msbwy +50 (ours "good, clean";
+  Elastique "bassline a bit out of key"), cold_heart +50 (ours "nice,
+  clean"; Elastique "slightly wobbly"; Rubber Band "a bit narrow"),
+  msbwy −50 and hot_stuff −50 (three-way trade of metallic / crushed).
+  Rubber Band cleanest in 8, Elastique in 3, tie in 1. Consistent with
+  Stage 19: the direct-ratio head competes at large compression.
+
+**Ranked artifact classes on our arm, owner's vocabulary:**
+
+1. **Drums smearing / inconsistent / attack altered** — cold_heart −4
+   and −8 ("drums are smearing and inconsistent, something is
+   wobbly"), msbwy −4/+8 ("drums seem to hit harder"), hot_stuff +8
+   ("kicks feel a tiny bit reduced"), hot_stuff −50 ("drums are
+   spraying"). The splice class; the Keylock chain's signature.
+2. **Bass out of key / robotic bassline** — msbwy −4/−8 in the DJ
+   window (the Stage 21 corrector is engaged at these rates and the
+   verdict is still "out of key"); msbwy ±30, cold_heart −30/−50 on
+   the wide path ("wobbly bass, out of key, not pleasant"; "out of
+   key, robotic bassline"). On the wide path this is PV low-band
+   coherence, Stage 24's subject.
+3. **Robotic / wobbly tonal elements** — cold_heart +4/+8 ("slightly
+   robotic", "a bit robotic or wobbly"), hot_stuff +30/+50/−30
+   ("vocal … wobbly / robotic"). The "robotic" word appeared on our
+   arm in 3 DJ-window conditions: the criterion's automatic fail.
+4. **Fuzzy / micro artifacts / bitcrushed texture** — msbwy +4,
+   hot_stuff −4, msbwy −30.
+5. **Metallic** — msbwy −50, hot_stuff −50.
+6. **Narrow / closed image** — cold_heart −4, hot_stuff −8.
+
+Elastique's own classes, for the record: drums "bitcrushed / crushed"
+at wide slowdowns (msbwy −50, hot_stuff −30/−50, cold_heart −30),
+"tiny bit fuzzy" at msbwy +8, bass "a bit out of key" at msbwy +50,
+kicks "smearing a tiny bit" at cold_heart −50. Rubber Band's: "a bit
+narrow / closed" (cold_heart +50/−8, hot_stuff −30), "drums a bit off"
+(msbwy −4), "vocal a bit metallic" (cold_heart −50).
+
+**Parity criterion (finalised, in ROADMAP Definition of Success):**
+two sealed-key sets of 12 conditions (DJ window and wide, the Stage 16
+excerpts, three arms), two listeners; ours ranked below Elastique in
+no more than 3 of 12 per set, never with "robotic / underwater /
+vocoder" vocabulary; ties count as parity. Baseline against that bar:
+DJ window 9/12 below with "robotic" present (fail); wide 8/12 below
+(fail). The bar is Elastique, not Rubber Band, even though Rubber Band
+was the cleanest arm overall: Rubber Band is a 2048-frame offline-class
+render in these sets and remains the citable ceiling.
+
+Lessons:
+
+- **The reference you cannot script is the reference you never
+  measure.** The Elastique gap was "inferred from architecture" for a
+  year because the only host in mind was a DAW export. A second host
+  with the same licensed engine turned a manual chore into a
+  ten-minute batch.
+- **Sample-exact at unity is the alignment test that matters for a
+  reference render.** Rate-dependent offsets at ±8 % looked like an
+  import bug until unity showed 0 samples; the offset is the engine's
+  transient relocation and no import step should "fix" it.
+- **Our +50 % competitiveness is real and repeatable** (Stage 19, now
+  three-arm): the direct-ratio head is not the problem at large
+  compression. Slowdowns and the DJ window are, and those are the
+  decomposition's (Stage 25) and the low-band coherence's (Stage 24)
+  targets in that order.
