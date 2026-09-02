@@ -267,12 +267,24 @@ Reported stretcher delays:
 | Elastique Pitch plugin (Pro engine + resampler + formant path) | 163 ms at 44.1 kHz, 150 ms at 48 kHz | zplane product page |
 | timestretch-rs Keylock / WideKeylock | 560 frames (12.7 ms) / 0 ms (source-side lookahead) | README |
 
-Reading: the 560-frame Keylock contract is stricter than anything
-shipping and equal to R2's short window. 2048 frames is the class R3
-and, by its block sizes, Elastique operate in — and it is the FFT size
-that resolves bass. ROADMAP's two-budget policy follows from this
-table: gestures on the 560-frame profile, corrected steady playback on
-a 2048-frame profile, timeline-compensated exactly as DJ apps do.
+Reading: the 560-frame (12.7 ms) Keylock contract is stricter than
+anything shipping and equal to R2's short window. 2048 frames is the
+class R3 and, by its block sizes, Elastique operate in — and at 44.1
+or 48 kHz it is the FFT size that resolves bass (46 ms window, 21.5 Hz
+bins). ROADMAP's two-budget policy follows from this table: gestures on
+the 12.7 ms profile, corrected steady playback on a 46 ms profile,
+timeline-compensated exactly as DJ apps do.
+
+Sample rate caveat. The table is in frames because the vendors quote
+frames, and their window sizes do not scale with rate: Rubber Band's
+2048-frame default is 21 ms at 96 kHz, with 47 Hz bins. Our budgets
+are stated in time instead. Keylock already scales its lag with the
+rate (`keylock_latency_frames`: 560 frames at 44.1 kHz, ≈1219 at
+96 kHz, 12.7 ms either way); the wide PV head does not (`WIDE_FFT` is a
+fixed 2048), so at Halo's 96 kHz it runs half the frequency resolution
+the bass argument above assumes. The Stage 26 profile therefore sizes
+its FFT from the rate — 2048 at 44.1/48 kHz, 4096 at 88.2/96 kHz — and
+is deliberately stricter than the vendors at high rates.
 
 ---
 

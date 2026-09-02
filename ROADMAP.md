@@ -22,8 +22,9 @@ ideas (Not a Priority Yet), and the un-scheduled 1.0 path.
 The **Parity Track** (Stages 22–29, opened 2026-09-02) extends the goal:
 blind parity with Elastique Pro on DJ material, under two latency
 budgets instead of one — the 12.7 ms gesture budget the deck already
-has, and a 2048-frame corrected-playback budget in the class that
-Rubber Band R3 and Elastique ship in. The offline render path is part
+has, and a 46 ms corrected-playback budget in the class that Rubber
+Band R3 and Elastique ship in. Both budgets are stated in time; Halo
+runs the engine at 96 kHz, so the frame counts scale with the rate. The offline render path is part
 of the parity bar: issue #78 measured it behind the threaded
 `rubberband` CLI.
 
@@ -146,16 +147,22 @@ path's artifact subtle); archived in LEARNINGS.md.
   determinism property.
 - **RT contract**: pull API, no `Result` and no allocation in the audio
   path, WCET-gated, honest per-profile latency reporting.
-- **Two latency budgets.** Gestures (nudge, pitch bend, scratch, the
-  release-to-varispeed region) live on the 560-frame Keylock contract —
-  no shipping DJ software beats it. Corrected steady playback may take
-  a 2048-frame (46 ms at 44.1 kHz) budget: Rubber Band R3's default
-  start delay is 2048 frames, Elastique caps its output blocks at 1024
-  frames behind a DirectAPI whose stated purpose is spreading that
-  block's cost across small callbacks, and every DJ app hides the
+- **Two latency budgets, stated in time.** Gestures (nudge, pitch
+  bend, scratch, the release-to-varispeed region) live on the 12.7 ms
+  Keylock contract — 560 frames at 44.1 kHz, scaled with the rate by
+  `keylock_latency_frames` (≈1219 frames at 96 kHz) — no shipping DJ
+  software beats it. Corrected steady playback may take a 46 ms budget —
+  2048 frames at 44.1/48 kHz, 4096 at 88.2/96 kHz: Rubber Band R3's
+  default start delay is 2048 frames, Elastique caps its output blocks
+  at 1024 frames behind a DirectAPI whose stated purpose is spreading
+  that block's cost across small callbacks, and every DJ app hides the
   stretcher's delay on the timeline exactly as our compensated position
   queries do (RESEARCH.md §9.1). The larger budget is where the Quality
   profile (Stage 26) lives; it never replaces the gesture budget.
+  Frame counts alone are not the contract: the wide PV head's fixed
+  FFT-2048 is a 46 ms / 21.5 Hz-bin window at 44.1 kHz but a 21 ms /
+  47 Hz-bin window at 96 kHz, and Halo — the primary consumer — runs
+  at 96 kHz. Time-domain budgets are what the bass argument rests on.
 - **Numeric policy.** Signal buffers are `f32`; phase accumulators,
   cursors, and any state that integrates over time are `f64`, and
   accumulators are wrapped. The never-wrapped `f64` accumulator downcast
@@ -510,7 +517,7 @@ stretch the residual spectrally (RESEARCH.md §§1, 5, 7) — has never
 been built here. Stage 16 killed a *small* PV behind the 120 Hz split;
 it did not test a full-resolution tonal path with transients removed.
 
-**Kill question.** At a 2048-frame budget, does a hybrid — artifact
+**Kill question.** At a 46 ms budget, does a hybrid — artifact
 timeline drives event segmentation; transient regions cut and
 reinserted at their mapped timeline positions with Röbel-style
 window-center alignment; residual through the Stage 24 PV; raised-cosine
@@ -522,7 +529,9 @@ without losing the drums?
 the Keylock ratios. The `hpss` module is the candidate for the residual
 split if the event timeline alone leaves too much attack in the tonal
 path. Tonal path at FFT ≥ 2048 — a smaller PV re-runs Stage 16 and is
-out of scope by construction.
+out of scope by construction. FFT ≥ 2048 is the 44.1 kHz figure; the
+prototype sizes its FFT and hop from the sample rate so the window
+stays ≈46 ms (4096 at 96 kHz).
 
 **Falsifier.** Blind on the Stage 16/18 excerpts (msbwy, cold_heart,
 hot_stuff) at ±4/±8%, four arms: shipped Keylock / hybrid / Rubber Band
@@ -538,13 +547,21 @@ never tried. Falsified the same way.
 
 ### Stage 26 — Quality Profile Build-Out (bought by Stage 25 survival)
 
-A third `EngineProfile` on the 2048-frame budget hosting the hybrid.
-Keylock at 560 frames is untouched; Halo picks per deck or per mode,
+A third `EngineProfile` on the 46 ms budget hosting the hybrid.
+Keylock at 12.7 ms is untouched; Halo picks per deck or per mode,
 the way zplane ships Efficient beside Pro.
 
 **Build-out.**
 - RT-safe implementation under the zero-alloc contract; WCET gate;
   artifact-first with the online detector as fallback.
+- FFT, hop, and latency derived from the sample rate the way Keylock
+  derives its lag — 2048/256 at 44.1 and 48 kHz, 4096/512 at 88.2 and
+  96 kHz — not inherited from the wide head's fixed `WIDE_FFT`. The
+  WCET gate runs at 96 kHz as well as 44.1: twice the hops per second,
+  and each hop twice the FFT, is the budget Halo actually pays.
+- 96 kHz in the benchmark and pin matrix from the first commit, not
+  only in the robustness fuzz. Halo runs the engine at 96 kHz; a
+  profile pinned at 44.1 kHz alone is pinned for the wrong consumer.
 - Stereo as a shared-analysis instance from the start — linked
   channels on the M/S machinery, one event timeline for both — not two
   mono paths (the zplane SDK documents the same recommendation).
