@@ -412,12 +412,14 @@ with the stage, sealed-key exit listen.
 Elastique gap is inferred from architecture, never observed.
 
 **Deliverables.**
-- Elastique renders of the CC corpus at the standard ratios (DJ window
-  ±4/±8%, wide ±30/±50%) from an Elastique host — Ableton Live's
-  Complex Pro warp mode is élastique and exports at a fixed tempo
-  ratio — stored beside the Rubber Band references, level-matched by
-  the Stage 16 RMS protocol, and wired into the reference-quality
-  harness.
+- Elastique renders of the corpus at the standard ratios (DJ window
+  ±4/±8%, wide ±30/±50%) from an Elastique host. REAPER ships the
+  engine as "élastique 3.3.3 Pro" and runs ReaScripts headlessly, so
+  the renders are reproducible from the shell
+  (`scripts/render_elastique.py`, 2026-09-03; Ableton's Complex Pro is
+  the same engine and the manual fallback). Stored beside the Rubber
+  Band references, level-matched by the Stage 16 RMS protocol, and
+  wired into the reference-quality harness (per-engine summary).
 - One baseline sealed-key session, three arms (ours / Rubber Band /
   Elastique) across the full matrix, via ab-tui. Output: the ranked
   artifact classes in the owner's vocabulary, archived in LEARNINGS.md.

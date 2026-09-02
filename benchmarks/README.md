@@ -160,13 +160,43 @@ Outputs are written to `target/rubberband_benchmark/`:
 
 ### Elastique reference renders (Parity Track, Stage 23)
 
-Elastique has no CLI, so its renders are exported once from an Elastique
-host and kept as prebaked assets. Ableton Live's **Complex Pro** warp mode
-is élastique Pro; this protocol makes the export a fixed tempo ratio of
-the whole track so one file serves both the reference-quality harness and
-the blind A/B sets.
+Elastique has no CLI, so its renders come from an Elastique host and are
+kept as prebaked assets. Two hosts ship the same zplane engine: REAPER
+(pitch-shift mode "élastique 3.3.3 Pro") and Ableton Live ("Complex Pro"
+warp mode). REAPER is scriptable headlessly, so it is the route the
+scripts use; the Ableton recipe below is the manual fallback.
 
-Per track and rate (DJ window −8/−4/+4/+8 %, wide −50/−30/+30/+50 %):
+**Automated (REAPER).** With REAPER installed at `/Applications/REAPER.app`:
+
+```bash
+scripts/render_elastique.py                       # whole manifest, all rates
+scripts/render_elastique.py --tracks music-sounds-better-with-you,cold-heart --rates -8,-4,4,8
+scripts/render_elastique.py --dry-run             # list what would render
+```
+
+The wrapper writes a job list, launches REAPER with
+`scripts/reaper_elastique.lua` (`-nosplash -ignoreerrors`, no window
+interaction), and waits for the script's done marker. Each job is one
+media item at take playrate = tempo rate with preserve-pitch on and the
+élastique Pro mode selected by name, rendered as the master mix from 0 to
+`source_length / rate` at the source sample rate and channel count,
+32-bit float, no dither, no tail. A render of a 6-minute track takes
+about ten seconds. Outputs land in
+`benchmarks/audio/references/elastique/<track_stem>/<rate_tag>.wav`;
+existing files are skipped unless `--force`. MP3 sources (the public
+corpus) also get a `+0pct.wav` decode at unity because the harness and
+`ab_render` read WAV only. When the run finishes the wrapper prints the
+`[[track.reference]]` rows with SHA-256 hashes (`--manifest-out` writes
+them to a file) — paste the rows for WAV-source tracks into the manifest.
+
+Alignment check (2026-09-03, msbwy): the unity render is sample-exact
+against the source, so REAPER compensates the engine's delay. At ±8 % the
+render sits 12–33 ms from our engine's timeline at a given point, the
+same order as the Rubber Band arm; the position-synced A/B tolerates it
+and the harness's cross-correlation absorbs it.
+
+**Manual (Ableton Live Complex Pro).** Per track and rate (DJ window
+−8/−4/+4/+8 %, wide −50/−30/+30/+50 %):
 
 1. New Live set at the track's sample rate (44.1 kHz for the corpus MP3s
    and the bpm-corpus WAVs; check with `soxi`/`afinfo`). Drop the track on
