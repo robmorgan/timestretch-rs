@@ -1,6 +1,6 @@
 use std::f32::consts::PI;
 use std::path::PathBuf;
-use timestretch::{PreAnalysisArtifact, StretchParams, analyze_for_dj, stretch};
+use timestretch::{PreAnalysisArtifact, StretchParams, analyze, stretch};
 // Deprecated JSON pair, still round-trip-tested until removal.
 #[allow(deprecated)]
 use timestretch::{read_preanalysis_json, write_preanalysis_json};
@@ -48,7 +48,7 @@ fn detect_peaks(signal: &[f32], threshold: f32, min_distance: usize) -> Vec<usiz
 fn test_preanalysis_roundtrip_json() {
     let sample_rate = 44100u32;
     let input = click_train(sample_rate, 128.0, 4.0);
-    let artifact = analyze_for_dj(&input, sample_rate);
+    let artifact = analyze(&input, sample_rate);
 
     let path = PathBuf::from("target/test_preanalysis_roundtrip.json");
     write_preanalysis_json(&path, &artifact).expect("write should succeed");
@@ -75,7 +75,7 @@ fn test_preanalysis_roundtrip_json() {
 fn test_analysis_file_roundtrip_tsa() {
     let sample_rate = 44100u32;
     let input = click_train(sample_rate, 128.0, 4.0);
-    let artifact = analyze_for_dj(&input, sample_rate);
+    let artifact = analyze(&input, sample_rate);
 
     let mut analysis = timestretch::AnalysisFile::for_source(&input, sample_rate);
     analysis.artifact = Some(artifact.clone());
@@ -101,7 +101,7 @@ fn test_analysis_file_roundtrip_tsa() {
 fn test_runtime_uses_confident_preanalysis_when_bpm_missing() {
     let sample_rate = 44100u32;
     let input = click_train(sample_rate, 128.0, 4.0);
-    let artifact = analyze_for_dj(&input, sample_rate);
+    let artifact = analyze(&input, sample_rate);
 
     let ratio = 1.1;
     let params_with_artifact = StretchParams::new(ratio)
@@ -175,7 +175,7 @@ fn test_batch_artifact_transient_parity_with_online_detection() {
     let sample_rate = 44100u32;
     let bpm = 128.0;
     let input = click_train(sample_rate, bpm, 4.0);
-    let artifact = analyze_for_dj(&input, sample_rate);
+    let artifact = analyze(&input, sample_rate);
     assert!(
         !artifact.transient_onsets.is_empty(),
         "click train should yield transient onsets"
@@ -235,7 +235,7 @@ fn test_batch_artifact_skips_online_detection() {
     // different regions than freshly detected events would). If online
     // detection still ran, both outputs would be identical because
     // stretching is deterministic.
-    let mut no_transient_artifact = analyze_for_dj(&input, sample_rate);
+    let mut no_transient_artifact = analyze(&input, sample_rate);
     no_transient_artifact.transient_onsets.clear();
     no_transient_artifact.transient_strengths.clear();
     no_transient_artifact.onset_band_flux.clear();
@@ -286,7 +286,7 @@ fn test_stereo_artifact_parity_with_online_detection() {
 
     // Analysis runs on the mid downmix, exactly as a loader would produce it.
     let analysis_signal = timestretch::downmix_to_mid(&interleaved, 2);
-    let artifact = analyze_for_dj(&analysis_signal, sample_rate);
+    let artifact = analyze(&analysis_signal, sample_rate);
     assert!(artifact.matches_source(&analysis_signal, sample_rate));
 
     let ratio = 1.1;
@@ -334,4 +334,23 @@ fn test_stereo_artifact_parity_with_online_detection() {
             peaks_online.len()
         );
     }
+}
+
+/// The pre-0.15 names are public API; downstream code must keep compiling
+/// and get the same artifact until the aliases are removed.
+#[test]
+#[allow(deprecated)]
+fn deprecated_aliases_match_the_renamed_functions() {
+    let sample_rate = 44100;
+    let input = click_train(sample_rate, 120.0, 4.0);
+
+    let renamed = analyze(&input, sample_rate);
+    let aliased = timestretch::analyze_for_dj(&input, sample_rate);
+    assert_eq!(renamed.bpm, aliased.bpm);
+    assert_eq!(renamed.beat_positions, aliased.beat_positions);
+    assert_eq!(renamed.transient_onsets, aliased.transient_onsets);
+
+    let (with_report, report) = timestretch::analyze_for_dj_with_report(&input, sample_rate);
+    assert_eq!(with_report.bpm, renamed.bpm);
+    assert_eq!(report.onset_count, renamed.transient_onsets.len());
 }

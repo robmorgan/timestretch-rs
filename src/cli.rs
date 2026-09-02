@@ -317,7 +317,7 @@ fn run_analyze(args: &[String]) {
 
     let analysis_signal = timestretch::downmix_to_mid(&buffer.data, buffer.channels.count());
     let (mut artifact, report) =
-        timestretch::analyze_for_dj_with_report(&analysis_signal, buffer.sample_rate);
+        timestretch::analyze_with_report(&analysis_signal, buffer.sample_rate);
     // Loudness is measured on the original interleaved channels, not the
     // mono analysis downmix (BS.1770 sums per-channel energies).
     artifact.loudness =

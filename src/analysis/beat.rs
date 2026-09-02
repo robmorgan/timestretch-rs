@@ -234,7 +234,7 @@ pub fn detect_beats_with_options(
 
 /// Beat tracking from an already-computed transient map with explicit
 /// tempo options. The map's detection function drives tracking, so callers
-/// with a detection pass in hand (`analyze_for_dj`) don't run a second one.
+/// with a detection pass in hand (`analyze`) don't run a second one.
 pub(crate) fn detect_beats_from_transients_with_options(
     transients: &TransientMap,
     sample_rate: u32,

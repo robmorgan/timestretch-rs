@@ -72,7 +72,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use timestretch::analysis::comparison;
-use timestretch::analysis::preanalysis::{analyze_for_dj, downmix_to_mid};
+use timestretch::analysis::preanalysis::{analyze, downmix_to_mid};
 use timestretch::core::crossover::LinkwitzRiley8;
 use timestretch::core::resample::resample_sinc_default;
 use timestretch::io::wav::read_wav_file;
@@ -729,7 +729,7 @@ fn falsification_render_wide_listening_matrix() {
         write_wav(&source_wav, interleaved, channels, sample_rate);
 
         let mono = downmix_to_mid(interleaved, channels);
-        let artifact = analyze_for_dj(&mono, sample_rate);
+        let artifact = analyze(&mono, sample_rate);
         let src_lufs = integrated_lufs(interleaved, channels, sample_rate);
         let src_low = low_band_fraction(&mono, sample_rate);
         println!(
@@ -1169,7 +1169,7 @@ fn band_split_resums_to_allpass() {
 #[test]
 fn artifact_resets_fire_and_change_the_render() {
     let input = bass_fixture(6);
-    let artifact = analyze_for_dj(&input, SAMPLE_RATE);
+    let artifact = analyze(&input, SAMPLE_RATE);
     assert!(
         artifact.transient_onsets.len() >= 4,
         "kick fixture should yield onsets, got {}",

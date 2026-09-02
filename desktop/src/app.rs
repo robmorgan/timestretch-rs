@@ -1672,7 +1672,7 @@ fn run_load_worker(req: LoadRequest) {
         Some(cached) => cached,
         None => {
             let start = std::time::Instant::now();
-            let fresh = timestretch::analyze_for_dj(&mono, sample_rate);
+            let fresh = timestretch::analyze(&mono, sample_rate);
             log::info!(
                 "Pre-analysis: {:.1} BPM, confidence {:.2}, {} beats, {} onsets ({:.2}s)",
                 fresh.bpm,
@@ -1919,7 +1919,7 @@ mod tests {
         let decoded = decoder::decode_file(wav).unwrap();
         let mono =
             timestretch::downmix_to_mid(&decoded.samples, (decoded.channels as usize).max(1));
-        timestretch::analyze_for_dj(&mono, decoded.sample_rate)
+        timestretch::analyze(&mono, decoded.sample_rate)
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::error::StretchError;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Current schema version written by [`crate::analyze_for_dj`].
+/// Current schema version written by [`crate::analyze`].
 ///
 /// v4: beat/onset positions are latency-compensated (centered on the
 /// audible attack instead of the analysis-window start; ~29 ms later at
@@ -263,7 +263,7 @@ pub struct PreAnalysisArtifact {
     #[serde(default)]
     pub key: Option<KeyEstimate>,
     /// BS.1770-4 loudness measurement. Not filled by
-    /// [`crate::analyze_for_dj`] (which only sees the mono analysis
+    /// [`crate::analyze`] (which only sees the mono analysis
     /// signal): callers measure the original interleaved audio with
     /// [`crate::measure_loudness`] and store the result here. `None` when
     /// never measured or the artifact predates schema v6.
