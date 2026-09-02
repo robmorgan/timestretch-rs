@@ -156,6 +156,24 @@ struct Summary {
     skipped: usize,
     average_spectral_similarity: f64,
     best_preset_per_track: Vec<BestPreset>,
+    /// Per reference-engine aggregates (Stage 23). The track-level
+    /// averages above mix every engine in the manifest; once Elastique
+    /// renders sit beside the Rubber Band / Ableton ones, the gap to each
+    /// engine is only readable here. `default` keeps historical baselines
+    /// deserializable.
+    #[serde(default)]
+    per_engine: Vec<EngineSummary>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EngineSummary {
+    software: String,
+    algorithm: String,
+    references: usize,
+    average_spectral_similarity: f64,
+    average_perceptual_similarity: f64,
+    average_spectral_flux_similarity: f64,
+    average_transient_match_rate: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -218,6 +236,7 @@ fn reference_quality_benchmark() {
             skipped: 0,
             average_spectral_similarity: 0.0,
             best_preset_per_track: Vec::new(),
+            per_engine: Vec::new(),
         },
     };
 
@@ -636,8 +655,24 @@ fn reference_quality_benchmark() {
         0.0
     };
     report.summary.average_spectral_similarity = avg_spectral;
+    report.summary.per_engine = summarize_per_engine(&report.tracks);
 
     println!("=== Summary ===");
+    if !report.summary.per_engine.is_empty() {
+        println!("Per reference engine (best preset per reference):");
+        for e in &report.summary.per_engine {
+            println!(
+                "  {} / {}: {} refs, spectral {:.3}, perceptual {:.3}, flux {:.3}, transients {:.3}",
+                e.software,
+                e.algorithm,
+                e.references,
+                e.average_spectral_similarity,
+                e.average_perceptual_similarity,
+                e.average_spectral_flux_similarity,
+                e.average_transient_match_rate
+            );
+        }
+    }
     println!("Best preset per track:");
     for bp in &report.summary.best_preset_per_track {
         println!(
@@ -836,6 +871,143 @@ fn assert_not_worse_than_m0_baseline(report: &Report) {
             M0_SPECTRAL_REGRESSION_TOLERANCE
         );
     }
+}
+
+/// Groups every scored reference by (software, algorithm) and averages the
+/// best-preset metrics per group, so a manifest carrying more than one
+/// reference engine reports the gap to each one separately.
+fn summarize_per_engine(tracks: &[TrackReport]) -> Vec<EngineSummary> {
+    let mut groups: Vec<EngineSummary> = Vec::new();
+    for reference in tracks.iter().flat_map(|t| t.references.iter()) {
+        let Some(best) = reference
+            .presets
+            .iter()
+            .max_by(|a, b| a.spectral_similarity.total_cmp(&b.spectral_similarity))
+        else {
+            continue;
+        };
+        let entry = match groups
+            .iter_mut()
+            .find(|g| g.software == reference.software && g.algorithm == reference.algorithm)
+        {
+            Some(g) => g,
+            None => {
+                groups.push(EngineSummary {
+                    software: reference.software.clone(),
+                    algorithm: reference.algorithm.clone(),
+                    references: 0,
+                    average_spectral_similarity: 0.0,
+                    average_perceptual_similarity: 0.0,
+                    average_spectral_flux_similarity: 0.0,
+                    average_transient_match_rate: 0.0,
+                });
+                groups.last_mut().expect("just pushed")
+            }
+        };
+        entry.references += 1;
+        entry.average_spectral_similarity += best.spectral_similarity;
+        entry.average_perceptual_similarity += best.perceptual_spectral_similarity;
+        entry.average_spectral_flux_similarity += best.spectral_flux_similarity;
+        entry.average_transient_match_rate += best.transient_match_rate;
+    }
+    for g in &mut groups {
+        let n = g.references as f64;
+        g.average_spectral_similarity /= n;
+        g.average_perceptual_similarity /= n;
+        g.average_spectral_flux_similarity /= n;
+        g.average_transient_match_rate /= n;
+    }
+    groups
+}
+
+#[test]
+fn per_engine_summary_groups_by_engine_and_takes_best_preset() {
+    fn preset(name: &str, spectral: f64, flux: f64) -> PresetReport {
+        PresetReport {
+            preset: name.to_string(),
+            length_diff_samples: 0,
+            length_diff_pct: 0.0,
+            rms_diff_db: 0.0,
+            spectral_similarity: spectral,
+            perceptual_spectral_similarity: spectral - 0.1,
+            band_similarity: BandSimilarityReport {
+                sub_bass: 0.0,
+                low: 0.0,
+                mid: 0.0,
+                high: 0.0,
+            },
+            bark_band_similarity: BarkBandSimilarityReport {
+                sub_bass: 0.0,
+                bass: 0.0,
+                low_mid: 0.0,
+                mid: 0.0,
+                upper_mid: 0.0,
+                presence: 0.0,
+                brilliance: 0.0,
+                air: 0.0,
+                overall: 0.0,
+            },
+            transient_match_rate: 0.5,
+            transient_matched: 0,
+            transient_total: 0,
+            onset_timing: OnsetTimingReport {
+                mean_error_ms: 0.0,
+                median_error_ms: 0.0,
+                std_dev_ms: 0.0,
+                max_error_ms: 0.0,
+                within_5ms: 0,
+                within_10ms: 0,
+                within_20ms: 0,
+                total_onsets: 0,
+            },
+            cross_correlation_peak: 0.0,
+            cross_correlation_offset: 0,
+            lufs_difference: 0.0,
+            spectral_flux_similarity: flux,
+            overall_grade: "A".to_string(),
+        }
+    }
+    fn reference(software: &str, presets: Vec<PresetReport>) -> ReferenceReport {
+        ReferenceReport {
+            software: software.to_string(),
+            algorithm: "x".to_string(),
+            target_bpm: 120.0,
+            ratio: 1.0,
+            presets,
+        }
+    }
+    let tracks = vec![
+        TrackReport {
+            id: "a".into(),
+            description: String::new(),
+            bpm: 120.0,
+            references: vec![
+                reference("RB", vec![preset("p", 0.8, 0.6), preset("q", 0.9, 0.5)]),
+                reference("EL", vec![preset("p", 0.7, 0.7)]),
+            ],
+        },
+        TrackReport {
+            id: "b".into(),
+            description: String::new(),
+            bpm: 120.0,
+            references: vec![
+                reference("RB", vec![preset("p", 0.7, 0.4)]),
+                reference("NONE", vec![]),
+            ],
+        },
+    ];
+    let groups = summarize_per_engine(&tracks);
+    assert_eq!(groups.len(), 2, "empty reference contributes no group");
+    let rb = groups.iter().find(|g| g.software == "RB").unwrap();
+    assert_eq!(rb.references, 2);
+    assert!((rb.average_spectral_similarity - 0.8).abs() < 1e-12);
+    assert!(
+        (rb.average_spectral_flux_similarity - 0.45).abs() < 1e-12,
+        "best is by spectral, not flux"
+    );
+    let el = groups.iter().find(|g| g.software == "EL").unwrap();
+    assert_eq!(el.references, 1);
+    assert!((el.average_perceptual_similarity - 0.6).abs() < 1e-12);
 }
 
 /// Ensures strict reference runs satisfy absolute quality floors.

@@ -80,4 +80,8 @@ Every arm gets identical treatment (RMS-matched to source, one common
 no-clip trim per condition, 32-bit float, per-condition shuffled
 letters) — the validity rules learned in the Stage 16 review (mono arms,
 level deltas, and clipping all unblind a set). The baseline builds in a
-temporary git worktree, so any historical ref can be an arm.
+temporary git worktree, so any historical ref can be an arm. Prerendered
+full-track references (Elastique exports from an Ableton host) join a
+set with `--ref-arm <label>:<dir>`; the export protocol and directory
+layout are in `benchmarks/README.md` under "Elastique reference
+renders".

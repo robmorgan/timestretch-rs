@@ -158,6 +158,55 @@ Outputs are written to `target/rubberband_benchmark/`:
 - `rubberband_comparison_report.csv`
 - `timestretch_vs_rubberband_output.wav`
 
+### Elastique reference renders (Parity Track, Stage 23)
+
+Elastique has no CLI, so its renders are exported once from an Elastique
+host and kept as prebaked assets. Ableton Live's **Complex Pro** warp mode
+is élastique Pro; this protocol makes the export a fixed tempo ratio of
+the whole track so one file serves both the reference-quality harness and
+the blind A/B sets.
+
+Per track and rate (DJ window −8/−4/+4/+8 %, wide −50/−30/+30/+50 %):
+
+1. New Live set at the track's sample rate (44.1 kHz for the corpus MP3s
+   and the bpm-corpus WAVs; check with `soxi`/`afinfo`). Drop the track on
+   an audio clip, Warp on, mode **Complex Pro**, formants 0, envelope
+   default. Make the warp a single straight-line fit: one warp marker at
+   the start, **Seg. BPM** set to the manifest `bpm` so the clip is
+   unwarped at the set tempo equal to that BPM.
+2. Set the set tempo to `bpm × rate` (e.g. 124 × 1.08 = 133.92). Live
+   accepts two decimals; the residual error is below 0.01 % and is
+   absorbed by the harness's ratio computed from `target_bpm`.
+3. Export Audio: Selected track, no normalise, no dither, **32-bit float
+   WAV**, sample rate as the source, from clip start to clip end.
+4. Name it by the `ab_render` convention and drop it under
+   `benchmarks/audio/references/elastique/<track_stem>/<rate_tag>.wav`,
+   where `<track_stem>` is the source file stem with everything but
+   `[A-Za-z0-9_-]` removed and truncated to 24 characters (e.g.
+   `12247392_MusicSoundsBett`) and `<rate_tag>` is `+8pct`, `-4pct`, …
+5. Add a `[[track.reference]]` row per file with `software = "Ableton Live
+   12"`, `algorithm = "Complex Pro"`, `target_bpm = bpm × rate`, and the
+   file's SHA-256, so `reference_quality` scores it. The summary's
+   `per_engine` block reports each engine separately; the track-level
+   averages mix every engine in the manifest.
+
+Only the public corpus renders are redistributable (all its licences allow
+derivatives with attribution); bpm-corpus renders stay local like their
+sources.
+
+To put the render into a blind session beside the live arms:
+
+```bash
+scripts/ab.sh render stage23-baseline --rates 0.92,0.96,1.04,1.08 --rb \
+    --ref-arm elastique:benchmarks/audio/references/elastique \
+    "benchmarks/audio/bpm-corpus/12247392_Music Sounds Better With You_(Original Mix).wav:90"
+```
+
+`--ref-arm` cuts the excerpt matching the other arms out of the full-track
+render (start and length scaled by the rate) and then level-matches and
+blinds it like any other arm. Conditions with no render for that stem and
+rate are reported and simply lack the arm.
+
 ## CI Quality Gate Subset
 
 CI enforces corpus-independent quality gates via the engine harnesses:

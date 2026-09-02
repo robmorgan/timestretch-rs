@@ -4,11 +4,14 @@
 # The house quality gate is the owner's ears; this makes the loop cheap:
 #
 #   scripts/ab.sh render <name> --base <git-ref> \
-#       --rates 0.92,1.08 [--rb] <wav[:start_secs]>...
+#       --rates 0.92,1.08 [--rb] [--ref-arm <label>:<dir>] <wav[:start_secs]>...
 #       Renders <wav> excerpts through the CURRENT working tree and
 #       through <git-ref> (built in a temporary worktree), optionally a
-#       Rubber Band reference arm, level-matches all arms per condition
-#       (RMS to source + common no-clip trim), and shuffles them into
+#       Rubber Band reference arm, optionally prerendered full-track
+#       reference arms (--ref-arm, e.g. Elastique exports from an
+#       Ableton host; see benchmarks/README.md "Elastique reference
+#       renders"), level-matches all arms per condition (RMS to source
+#       + common no-clip trim), and shuffles them into
 #       target/ab/<name>/blind/<track>/<rate>/arm_{A,B,...}.wav with a
 #       sealed key. Listen, note verdicts per letter, then:
 #
@@ -51,6 +54,7 @@ base_ref=""
 rates="0.92,1.08"
 want_rb=0
 env_arms=()
+ref_arms=()
 tracks=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -58,6 +62,7 @@ while [ $# -gt 0 ]; do
         --rates) rates=$2; shift 2 ;;
         --rb) want_rb=1; shift ;;
         --env-arm) env_arms+=("$2"); shift 2 ;;
+        --ref-arm) ref_arms+=("$2"); shift 2 ;;
         *) tracks+=("$1"); shift ;;
     esac
 done
@@ -109,6 +114,86 @@ if [ "$want_rb" = 1 ]; then
         "$cli" $fine --time "$ratio" "$src" "$dir/rubberband.wav" >/dev/null 2>&1
     done
 fi
+
+# Prerendered full-track reference arms, e.g. Elastique exports:
+#   --ref-arm "elastique:benchmarks/audio/references/elastique"
+# expects <dir>/<track_stem>/<rate_tag>.wav — the WHOLE track rendered at
+# that tempo rate (stem/tag as ab_render names them). The excerpt that
+# matches the other arms is cut at start_secs / rate for 20 s / rate, so
+# every arm covers the same source material; level-matching below then
+# treats it like any other arm.
+for spec in ${ref_arms[@]+"${ref_arms[@]}"}; do
+    label=${spec%%:*}
+    dir=${spec#*:}
+    echo "== importing arm '$label' ($dir) =="
+    python3 - "$out/raw" "$label" "$dir" "${tracks[@]}" <<'EOF'
+import struct, pathlib, sys
+
+def read_wav(p):
+    d = pathlib.Path(p).read_bytes()
+    fmt = d.find(b'fmt '); ch = struct.unpack('<H', d[fmt+10:fmt+12])[0]
+    sr = struct.unpack('<I', d[fmt+12:fmt+16])[0]
+    bits = struct.unpack('<H', d[fmt+22:fmt+24])[0]
+    afmt = struct.unpack('<H', d[fmt+8:fmt+10])[0]
+    i = d.find(b'data'); n = struct.unpack('<I', d[i+4:i+8])[0]
+    raw = d[i+8:i+8+n]
+    if afmt == 3 or bits == 32:
+        x = list(struct.unpack(f'<{n//4}f', raw))
+    elif bits == 24:
+        x = [int.from_bytes(raw[j:j+3], 'little', signed=True)/8388608.0 for j in range(0, n - n % 3, 3)]
+    elif bits == 16:
+        x = [v/32768.0 for v in struct.unpack(f'<{n//2}h', raw)]
+    else:
+        raise ValueError(f"unsupported wav: fmt {afmt} bits {bits}")
+    return x, sr, ch
+
+def write_wav(p, x, sr, ch):
+    data = struct.pack(f'<{len(x)}f', *x)
+    hdr = (b'RIFF' + struct.pack('<I', 36+len(data)) + b'WAVEfmt '
+           + struct.pack('<IHHIIHH', 16, 3, ch, sr, sr*ch*4, ch*4, 32)
+           + b'data' + struct.pack('<I', len(data)))
+    pathlib.Path(p).write_bytes(hdr + data)
+
+def stem_of(path):
+    s = pathlib.Path(path).stem
+    return "".join(c for c in s if c.isalnum() or c in "_-")[:24]
+
+EXCERPT_SECS = 20.0
+raw, label, refdir = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])
+missing = 0
+for spec in sys.argv[4:]:
+    path, start = spec, 0.0
+    if ":" in spec:
+        p, s = spec.rsplit(":", 1)
+        try:
+            start = float(s); path = p
+        except ValueError:
+            pass
+    stem = stem_of(path)
+    for cond in sorted(raw.glob(f"{stem}/*")):
+        if not cond.is_dir(): continue
+        rate_tag = cond.name
+        rate = 1.0 + float(rate_tag.replace("pct", "")) / 100.0
+        ref = refdir / stem / f"{rate_tag}.wav"
+        if not ref.exists():
+            print(f"  missing {ref} — condition {stem}/{rate_tag} gets no '{label}' arm")
+            missing += 1
+            continue
+        x, sr, ch = read_wav(ref)
+        src_sr = read_wav(cond / "source.wav")[1]
+        if sr != src_sr:
+            raise SystemExit(f"{ref}: sample rate {sr} != source {src_sr}; export at the source rate")
+        a = int(start / rate * sr) * ch
+        n = int(EXCERPT_SECS / rate * sr) * ch
+        seg = x[a:a + n]
+        if len(seg) < n:
+            print(f"  {ref}: only {len(seg)//ch} frames from {a//ch}, excerpt truncated")
+        write_wav(cond / f"{label}.wav", seg, sr, ch)
+        print(f"imported {stem}/{rate_tag} [{label}]")
+if missing:
+    print(f"  {missing} condition(s) without a '{label}' render")
+EOF
+done
 
 echo "== level-matching and blinding =="
 python3 - "$out" <<'EOF'
