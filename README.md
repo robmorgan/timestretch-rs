@@ -65,7 +65,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-timestretch = "0.14.0"
+timestretch = "0.15.0"
 ```
 
 ### One-Shot Stretching
