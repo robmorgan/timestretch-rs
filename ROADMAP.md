@@ -15,28 +15,32 @@ texts are in git history (tag `v0.10.0` has the last pre-rewrite version).
 The quality-closure phase that followed (Stages 10 and 12–19, spawned
 by the August 2026 full-code review against Rubber Band) **completed
 2026-08-18**: every stage closed with a recorded owner verdict and its
-evidence archived in LEARNINGS.md. What remains in this file is the
-settled architecture, the binding policies, the deliberately-parked
-ideas (Not a Priority Yet), and the un-scheduled 1.0 path.
+evidence archived in LEARNINGS.md. This file covers the current
+architecture and constraints, binding policies, parity experiments,
+deferred ideas (Not a Priority Yet), and the un-scheduled 1.0 path.
 
-The **Parity Track** (Stages 23–29, opened 2026-09-02, reworked the
-same day) extends the goal: blind parity with Elastique Pro on DJ
-material. The deck gets one steady-state sound on a 46 ms
-corrected-playback budget — the class Rubber Band R3 and Elastique ship
-in, and the only class in which a splice engine can be replaced by a
-transient/tonal decomposition — and a gesture lane on the 12.7 ms
-budget it already has, which the engine crossfades to on nudge, bend,
-and scratch. Both budgets are stated in time; Halo runs the engine at
-96 kHz, so the frame counts scale with the rate. Offline render
+The **Parity Track** (Stages 23–29, opened 2026-09-02, audited
+2026-09-11 — Stages 23a/23b added) extends the goal: blind parity
+with Elastique Pro on DJ material. The deck gets one steady-state
+sound on a corrected-playback budget — the class Rubber Band R3 and
+Elastique ship in, and the only class in which a splice engine can be
+replaced by a transient/tonal decomposition — and a gesture lane on
+the 12.7 ms budget it already has, which the engine crossfades to on
+nudge, bend, and scratch. The ≈46 ms analysis window is the starting
+experiment, not a proven delay figure: source lookahead, output delay,
+and control response are measured separately for every candidate.
+Halo runs at 96 kHz, so sample-rate-aware analysis and explicit 96 kHz
+quality/callback gates travel with every stage. Offline render
 throughput (issue #78) is handled outside this roadmap.
 
-## Status (2026-08-05)
+## Status (2026-09-11)
 
 Shipped and settled: pull-based stage-graph engine (Tape / Keylock /
 WideKeylock profiles), SOLA keylock through ±20% at 12.7 ms, wide-range
-Master Tempo at 48.6 ms, batch `stretch()` on the same graph with
-sample-exact duration and streaming/offline determinism, artifact-first
-transient control, `.tsa` analysis container (v0.11.0), musical key
+Master Tempo with source-side lookahead and 0 ms reported output delay,
+batch `stretch()` on the same graph with sample-exact duration and
+streaming/offline determinism, artifact-first Keylock transient
+control, `.tsa` analysis container (v0.11.0), musical key
 detection, rigid beat grids for quantized material, machine-verified RT
 contract (zero-alloc, WCET-gated), Rubber Band reference gate in CI.
 
@@ -62,24 +66,43 @@ renders confirmed on the beat for the hip-hop rows and teen-spirit
 low-confidence display verified on real material. Stage 10 archived in
 LEARNINGS.md with the rest.
 
-**Parity track opened 2026-09-02.** Every quality-closure exit listen
-ended with Rubber Band still the cleanest arm (Stage 18: 6/6; Stage 19:
-a tie at +50%; Stage 21: "Rubber Band remains the overall reference"),
-and the gap to Elastique Pro has never been measured because no
-Elastique render exists in the corpus. Stages 23–29 (Parity Track,
-below) are the response; nothing in the shipped architecture is
-reopened without a kill experiment. **Reworked 2026-09-02, same day:**
-the corrected-playback chain becomes the deck's only steady-state
-sound and the Keylock chain becomes its gesture lane (Stage 26); the
-decomposition kill experiment (Stage 25) runs before the PV coherence
-upgrade (Stage 24) because it is the untried mechanism class; and the
-offline-throughput stage (Stage 22, issue #78) is removed from the
-roadmap and handled by the owner outside it. **Stage 23 closed
-2026-09-03** (PR #81 + session): Elastique Pro renders scripted
-through REAPER, 32 references in the manifest, criterion finalised;
-baseline blind session has ours below Elastique 9/12 (DJ window) and
-8/12 (wide), "robotic" still present at DJ ratios — archived in
-LEARNINGS.md. Stage 25 is next.
+**Parity track opened 2026-09-02. Stage 23 closed 2026-09-03** (PR #81
+and the owner session): Elastique Pro renders scripted through REAPER,
+32 references in the manifest, criterion finalised. The baseline blind
+session has ours below Elastique 9/12 (DJ window) and 8/12 (wide), with altered drum
+attacks, unstable bass, and robotic tonal textures — archived in
+LEARNINGS.md. Rubber Band remains the overall reference in those sets.
+
+**Code/measurement review, 2026-09-11, main `2628090`.** The wide head
+does not receive transient events: the graph sends them to its empty
+downstream stage chain. A six-second mono fixture (61/220/1733 Hz tones,
+decaying kick chirps, and clicks) rendered with accurate onsets versus
+an empty artifact was bit-identical at tempo rates 0.5/0.7/1.3/1.5;
+Keylock output changed at 0.92/1.08 as a positive control. All 23 tests
+in `engine_ab_matrix`, `pitch_shift`, `pv_null`,
+`tonal_purity_characterization`, and `wide_stereo_coherence` passed in
+release mode. The listening evidence remains the archived Stage 23
+session; its reference renders were absent from that checkout. The
+missing guidance dates to Stage 19 part 2 (`408c734`, 2026-08-13): the
+deleted `WideKeylockStage` carried the per-band onset resets, and the
+commit deferred routing them into the new head to a part 3 that never
+landed — so the Architecture bullet describing them as shipped was
+stale from that day. Stage 23a restores the routing; Stage 23b fixes
+the best-of reference gate. Neither gates Stage 25: at ±4/±8 %
+`stretch()` and the deck run Keylock, which does receive onsets, so the
+DJ-window baseline is not explained by the wide head's missing events,
+and the Stage 14 ablation found those resets audibly innocent.
+
+**Work in flight (2026-09-11).** Stage 25's hybrid prototype
+(`stage25/hybrid-proto`, `75b98ed`) and its 12-condition × 5-arm blind
+set, Stage 24's peak-track prototype (`stage24/peaktrack-proto`) and
+its ±30/±50 blind set, and Stage 27's pitch baseline set
+(`stage27/pitch-refs`, 8 conditions × 5 arms) are rendered and await
+the owner's sealed-key listens. Stage 28's material rows
+(`stage28/corpus-generality`) are on their branch with Elastique
+references re-rendered after the decoder-alignment fix. The remaining
+order is 25 → 23a → 24 → 26 → 27 → 28 → 29; lane integration follows
+the DSP verdicts.
 
 Stage 19 (direct-ratio wide path) completed 2026-08-14 (PR #60) — the
 PV owns the tempo axis for the wide profile as the graph's demand
@@ -110,9 +133,10 @@ the write-head headroom; taper released by T=1.15; shipped cadence on
 rides). Harmonic-15 purity at −8%: 22.1 → 62.8 dB, asymmetry gone;
 blind owner A/Bs: half cadence beat the old build 6/6, and the exit
 listen's "robot" vocabulary collapsed to one "very subtle" mention
-across 6 conditions. Rubber Band stays ahead on these excerpts — the
-residual gap is dominated by the sub-120 Hz pitch-follow scope line
-(see Not a Priority Yet), not granulation. Archived in LEARNINGS.md.
+across 6 conditions. Rubber Band stayed ahead on these excerpts; the
+newly exposed bass detune motivated Stage 21's corrected low band.
+Stage 23 records the remaining attack/bass/tonal gap after that change.
+Archived in LEARNINGS.md.
 Stage 16 (tonal-HF granulation: measure, then decide) completed
 2026-08-13 — blind session on the validity-fixed set (12 conditions,
 renders from `7f49a50`): granulation IS audible in context (Rubber Band
@@ -127,11 +151,11 @@ the `pitch_shift` direction inversion found by review and fixed, gates in
 CI, owner bright-mix A/B passed (shipped drums "higher quality", the old
 path's artifact subtle); archived in LEARNINGS.md.
 
-## Architecture (settled — decisions, not open questions)
+## Architecture and Integration Constraints
 
 - **Stage-graph engine** in `src/engine/`: fixed-block stages
   (`process`, `latency_frames()`, `reset()`, `prime()`), fixed per-profile
-  chains, varispeed head owning demand inversion.
+  chains, and a profile-specific head owning demand inversion.
 - **Tempo-axis ownership is per profile.** Keylock: source → sinc
   varispeed (tempo axis, sample-accurate retargets, no control glide) →
   correction. WideKeylock: the direct-ratio PV head owns the tempo axis
@@ -147,40 +171,42 @@ path's artifact subtle); archived in LEARNINGS.md.
   20.5%→35%, 560-frame (12.7 ms) contract. Becomes the gesture lane
   under Stage 26; the chain itself is unchanged.
 - **WideKeylock profile** (opt-in range setting): full-spectrum FFT-2048 /
-  hop-256 identity-locked direct-ratio PV head, artifact-driven per-band
-  phase resets, source-side lookahead (0 ms reported delay — the first
-  delivered frame is source frame 0). Profile switch is a seek-priced
-  rebuild, never a live morph. Stage 26 replaces the seek-priced switch
-  with a lane crossfade for the Keylock / quality-lane pair only;
+  hop-256 identity-locked direct-ratio PV head, with source-side
+  lookahead (0 ms reported delay — the first delivered frame is source
+  frame 0). Artifact-driven phase resets are currently disconnected;
+  Stage 23a repairs the event path. Profile switch is a seek-priced
+  rebuild. Stage 26 tests a lane crossfade for the Keylock / quality pair;
   WideKeylock's switch behavior is unchanged until it is re-asked.
-- **Artifact-first analysis**: the `PreAnalysisArtifact` drives splice
-  protection and phase resets; online detection is the fallback.
+- **Artifact-first analysis**: the `PreAnalysisArtifact` drives Keylock
+  splice protection; online detection is its fallback. Stage 23a must
+  establish this contract for the direct-ratio wide head as well.
+- **Stereo baseline**: the wide head encodes M/S, runs an independent PV
+  per component, and decodes to L/R. This protects centered material
+  but does not establish shared peak tracking or preservation of
+  arbitrary interchannel phase relationships; Stage 24 extends it.
 - **Single engine, both modes**: offline is the same graph with unlimited
   lookahead and a guaranteed artifact; streaming-vs-offline agreement is a
   determinism property.
 - **RT contract**: pull API, no `Result` and no allocation in the audio
   path, WCET-gated, honest per-profile latency reporting.
-- **Two latency budgets, stated in time.** Gestures (nudge, pitch
-  bend, scratch, the release-to-varispeed region) live on the 12.7 ms
-  Keylock contract — 560 frames at 44.1 kHz, scaled with the rate by
-  `keylock_latency_frames` (≈1219 frames at 96 kHz) — no shipping DJ
-  software beats it. Corrected steady playback lives on a 46 ms budget —
-  2048 frames at 44.1/48 kHz, 4096 at 88.2/96 kHz: Rubber Band R3's
-  default start delay is 2048 frames, Elastique caps its output blocks
-  at 1024 frames behind a DirectAPI whose stated purpose is spreading
-  that block's cost across small callbacks, and every DJ app hides the
-  stretcher's delay on the timeline exactly as our compensated position
-  queries do (RESEARCH.md §9.1). The 46 ms chain is the deck's only
-  steady-state sound (the quality lane, Stage 26); the 12.7 ms Keylock
-  chain is the gesture lane the engine crossfades to when a control
-  write exceeds a rate-slope or seek threshold, and back once the rate
-  settles. Moving between the lanes is a timeline-offset problem on the
-  shared source ring and timeline map, not a DSP one. The gesture
-  budget is never given up; the quality budget is never opt-in.
-  Frame counts alone are not the contract: the wide PV head's fixed
-  FFT-2048 is a 46 ms / 21.5 Hz-bin window at 44.1 kHz but a 21 ms /
-  47 Hz-bin window at 96 kHz, and Halo — the primary consumer — runs
-  at 96 kHz. Time-domain budgets are what the bass argument rests on.
+- **Latency and analysis are separate contracts.** The Keylock gesture
+  target stays at 12.7 ms — 560 frames at 44.1 kHz, scaled by
+  `keylock_latency_frames` (≈1219 at 96 kHz). Quality prototypes start
+  with FFT/hop 2048/256 at 44.1/48 kHz and 4096/512 at 88.2/96 kHz:
+  analysis spans about 43–46 ms. The shipped fixed FFT-2048 instead
+  spans 46.4 ms at 44.1 kHz and 21.3 ms at 96 kHz, with bin spacing
+  worsening from 21.5 to 46.9 Hz. Longer bass analysis is an experiment
+  with its own lookahead/cost, not a free extension of that budget.
+  Measure source lookahead, output delay, control-to-audio response,
+  startup, and seek recovery separately for every candidate. Elastique's
+  internal architecture is inferred in RESEARCH.md §5; its output block
+  cap does not establish a fixed delay or a minimum quality budget.
+  Stage 26 must prove transitions between the quality and gesture
+  paths: delay matching alone neither proves an inaudible crossfade nor
+  preserves the shorter control response. The design goal stands as
+  decided 2026-09-02: the gesture budget is never given up, and the
+  quality budget is never opt-in. The opt-in profile is Stage 26's
+  named fallback, recorded as a miss if it is what ships.
 - **Numeric policy.** Signal buffers are `f32`; phase accumulators,
   cursors, and any state that integrates over time are `f64`, and
   accumulators are wrapped. The never-wrapped `f64` accumulator downcast
@@ -205,19 +231,13 @@ smaller evidence. The first was RE-CONFIRMED on clean evidence at the
 Stage 16 blind re-audition (2026-08-13): the phase-fixed small/medium-FFT
 PV behind the split was still the "robotic/underwater/vocoder" arm —
 "SOLA carries the corrected range" now rests on an uncontaminated
-verdict. The un-keylocked low band is **not**
-similarly contaminated — its load-bearing justification at DJ ratios is
-the ≤ 15 ms latency budget (a bass-resolving FFT cannot fit), which no
-review finding touches; Stage 11's full-spectrum result already shows
-corrected bass can win when latency permits. **New evidence on file
-(2026-08-13, Stage 18 exit listen, blind)**: with the splice granulation
-fixed, "bass sometimes sounds out of key" surfaced on 3 of 6 conditions
-at ±8% on bass-forward material (msbwy) — the ±1.3-semitone low-band
-detune against the corrected highs is audible once it is no longer
-masked. The scope line STANDS (the Stage 2 falsification rejected a
-vocoder bass; the latency argument is untouched), but any future
-re-litigation starts from this evidence — and a time-domain low-band
-corrector was never falsified.
+verdict. The low-band scope line was subsequently reopened by Stage
+18's blind "bass sometimes sounds out of key" reports and superseded
+by the Stage 21 time-domain bass corrector. Stage 23 still heard
+unstable/out-of-key bass in both DJ and wide conditions, even with
+correction engaged. Those reports motivate new coherence experiments;
+neither the old scope line nor single-tone pitch accuracy establishes
+polyphonic bass parity.
 
 ## Binding Policies
 
@@ -240,6 +260,12 @@ corrector was never falsified.
   3.3.3 Pro) and the written criterion on 2026-09-03; every parity
   claim cites a sealed-key session against that arm. Rubber Band stays
   in every set as the cleanest-arm ceiling, but it is not the bar.
+- **Every reference condition is accountable.** Stage 23b gates each
+  required track × tempo rate × reference engine × candidate profile at
+  the declared sample rate. A best result across references, presets,
+  or ratios cannot substitute for a failing condition. Diagnostic
+  averages remain useful, but do not decide acceptance. Development
+  excerpts and held-out listening material are identified separately.
 - **No design verdict by ear against a component that has not passed
   its own null and purity probes.** Two architecture decisions were
   settled in July 2026 by listening against a PV carrying the defects
@@ -375,256 +401,431 @@ possible "minor bass wobble" on cold heart +4%, and kick smear on cold
 heart −8% present in BOTH our arms (pre-existing, not the bass
 corrector — likely high-band or material).
 
-## Parity Track (opened 2026-09-02, reworked 2026-09-02)
+## Parity Track (opened 2026-09-02, updated 2026-09-11)
 
-The quality-closure phase ended with every scope line either achieved
-or re-litigated, and Rubber Band still cleanest on every exit listen.
-The gap is structural, not tuning: the 12.7 ms budget forces a splice
-engine, and no splice engine reaches Elastique Pro or Rubber Band R3
-on sustained tonal material — both ship at ~2048 frames of delay
-(RESEARCH.md §9.1). The Parity Track is the next road: measure the gap
-to Elastique Pro directly, then close it with the mechanism class the
-closure phase never tried — a transient/tonal decomposition on a
-corrected-playback budget — and make that chain the deck's default
-sound, with the existing Keylock chain kept as the gesture lane that
-makes the deck feel like hardware.
+The Stage 23 blind baseline establishes a gap on drum attacks, bass,
+and tonal texture. The mechanism behind each artifact remains an
+experimental question. The shipped Keylock path pays for time-domain
+splices; the wide path has disconnected transient guidance and a
+single-resolution, frame-local peak-locking policy. Decomposition,
+phase tracking, and separate noise treatment are candidates supported
+by the research, not verified descriptions of Elastique's internals or
+guarantees of parity.
 
-Ordering is deliberate, and the stages below are listed in execution
-order rather than numeric order. Stage 23 must precede any DSP stage
-because the wide path already ties Rubber Band at +50% and the
-Elastique ordering may differ. Stage 25 runs next because
-decomposition is the one mechanism class never built here and its
-prototype is cheap on the shipped PV — it answers the biggest question
-first. Stage 26 follows because the lane architecture is what lets a
-46 ms chain be the default sound without giving up the gesture budget.
-Stage 24 comes after: it upgrades the tonal engine the quality lane by
-then hosts, and lands first on the wide path where the determinism,
-WCET, and ±50% gates already exist. Everything after Stage 25 is
-bought by its survival; its fallback is named.
+Execution order is **23 (done) → 25 → 23a → 24 → 26 → 27 → 28 → 29**,
+with Stage 23b's gate fix landing alongside whatever is in progress.
+Stage 25 stays first because its prototype and blind set are already
+rendered and decomposition is the untried mechanism class; Stage 23a
+precedes Stage 24 because both work on the wide head and the peak-track
+verdict should be read against a head with its guidance connected.
+Stage 28's material selection and listener recruitment start before
+candidate selection. A simpler full-PV path can win Stage 25; the
+hybrid is not a prerequisite for progress.
 
-Two constraints bind every stage. The live audio path keeps the RT
-contract — no threads, no synchronization, no allocation in the
-callback. And the streaming-vs-offline determinism gate stays
-sample-identical, so a first tier of any change must be bit-identical
-by construction.
-
-Each stage follows the Stage 21 template: kill question, prototype,
-falsifier, named fallback, build-out bought by survival, gates landing
-with the stage, sealed-key exit listen.
+Every live implementation keeps the RT contract: no allocation,
+synchronization, or worker-thread dependency in the callback. Offline
+and streaming output remain sample-identical for equal source, rate
+schedule, profile, and artifact. Each experiment records its source
+revision, parameters, sample rate, reference configuration, and metric
+and listening results. Null/purity checks precede blind selection.
 
 ### Stage 23 — Elastique Reference Corpus and Parity Criterion (CLOSED 2026-09-03: achieved)
 
-**Verdict.** Renders in the corpus (REAPER's élastique 3.3.3 Pro,
-scripted; 167/167), 32 references in the manifest, harness per-engine
-block live, and the baseline sealed-key session listened blind
+**Verdict.** REAPER's élastique 3.3.3 Pro renders were generated
+(167/167), 32 references entered the manifest, and the harness gained
+per-engine summaries. The baseline sealed-key session was heard blind
 (2026-09-03, two sets × 12 conditions, three arms). Ours ranked below
 Elastique in 9/12 DJ-window and 8/12 wide conditions, with "robotic"
-on our arm in 3 DJ-window conditions; level or ahead only at ±50 %.
-Ranked artifact classes and the finalised criterion are archived in
-LEARNINGS.md; the criterion is in Definition of Success. Stage 25
-opens next.
+on our arm in three DJ-window conditions. Ranked artifact classes and
+the finalised criterion are archived in LEARNINGS.md.
 
-**Why.** Everything to date is measured against Rubber Band. The
-Elastique gap is inferred from architecture, never observed.
+**Delivered.** `scripts/render_elastique.py` scripts REAPER renders at
+±4/±8% and ±30/±50%; `scripts/ab.sh --ref-arm` assembles the references
+with the Stage 16 RMS level-matching protocol. The owner baseline used
+the Stage 16 excerpts and ours / Rubber Band R3 / Elastique Pro arms.
+The final criterion is two sets of 12 conditions, two listeners, ours
+below Elastique in no more than three conditions per set and never
+with "robotic / underwater / vocoder" vocabulary; ties count as parity.
+This criterion stays unchanged in Definition of Success.
 
-**Deliverables.**
-- Elastique renders of the corpus at the standard ratios (DJ window
-  ±4/±8%, wide ±30/±50%) from an Elastique host. REAPER ships the
-  engine as "élastique 3.3.3 Pro" and runs ReaScripts headlessly, so
-  the renders are reproducible from the shell
-  (`scripts/render_elastique.py`, 2026-09-03; Ableton's Complex Pro is
-  the same engine and the manual fallback). Stored beside the Rubber
-  Band references, level-matched by the Stage 16 RMS protocol, and
-  wired into the reference-quality harness (per-engine summary).
-- One baseline sealed-key session, three arms (ours / Rubber Band /
-  Elastique) across the full matrix, via ab-tui. Output: the ranked
-  artifact classes in the owner's vocabulary, archived in LEARNINGS.md.
-- The written parity criterion. Draft, owner finalizes at stage open:
-  a sealed-key session of at least 12 conditions spanning steady
-  playback on the quality lane and gesture transitions through the
-  gesture lane, two listeners, in which ours is ranked below Elastique
-  in no more than a quarter of conditions and never with the "robotic
-  / underwater / vocoder" vocabulary. Ties count as parity.
+**Boundary.** This stage established reference renders and a listening
+baseline. It did not establish per-condition CI acceptance: the strict
+harness currently chooses a best result across references/presets for
+each track. Stages 23a/23b address the September review findings without
+reopening the archived baseline verdict.
 
-**Exit.** Renders committed, harness green, session archived, criterion
-written into Definition of Success. No DSP changes in this stage.
+### Stage 23a — Wide-Path Transient Guidance (OPEN — after Stage 25's verdict, before Stage 24)
 
-### Stage 25 — Hybrid Decomposition Kill Experiment (OPEN)
+**Scope.** This is wide-path (±30/±50 %) and architecture work. It is
+not the DJ-window fix: at ±4/±8 % the shipped path is Keylock, whose
+splice protection does receive onsets, and the Stage 14 ablation found
+the wide head's resets audibly innocent on the old topology. The
+expected yield is an honest artifact-first contract and measurably
+cleaner attacks at wide ratios; a DJ-window improvement would be a
+surprise to record, not a prediction.
 
-**Why.** The residual DJ-window gap is sustained tonal material paying
-for splices (Stage 16: granulation audible in context; Stage 18: cadence
-halved, Rubber Band still cleanest 6/6). The mechanism class Elastique
-uses — detect transient events, reinsert them in the time domain,
-stretch the residual spectrally (RESEARCH.md §§1, 5, 7) — has never
-been built here. Stage 16 killed a *small* PV behind the 120 Hz split;
-it did not test a full-resolution tonal path with transients removed.
-The tonal engine in this prototype is the *shipped* identity-locked
-wide head, deliberately: the verdict must isolate decomposition from
-the PV upgrades Stage 24 brings later.
+**Evidence.** [graph.rs](src/engine/graph.rs) publishes artifact events to
+`StageCtx`; [profiles.rs](src/engine/profiles.rs) gives WideKeylock an
+empty stage chain. [wide_pv_head.rs](src/engine/stages/wide_pv_head.rs)
+accepts audio/rate/emission limits but no events. Its phase resets
+occur at startup/reset, not at track onsets. The 2026-09-11
+accurate-versus-empty-artifact probe was
+bit-identical at four wide rates despite passing the existing gates.
 
-**Kill question.** At a 46 ms budget, does a hybrid — artifact
-timeline drives event segmentation; transient regions cut and
-reinserted at their mapped timeline positions with Röbel-style
-window-center alignment; residual through the shipped wide-head PV;
-raised-cosine recombination keeping the sample-exact timeline — beat
-the shipped Keylock chain on the sustained-tonal excerpts where Rubber
-Band wins, without losing the drums?
+**Work.** Route events on the source timeline into the direct-ratio
+head before the affected analysis windows are synthesized. Account for
+window-center alignment, strength/band selection, lookahead, seeks,
+loop wraps, and rate changes. Establish an online detector fallback
+when no artifact is attached; an explicitly empty artifact remains
+authoritative. Keep the direct-ratio topology that survived Stage 19.
 
-**Prototype.** Env-gated `TIMESTRETCH_PROTO_HYBRID`, offline-only, on
-the Keylock ratios. The `hpss` module is the candidate for the residual
-split if the event timeline alone leaves too much attack in the tonal
-path. Tonal path at FFT ≥ 2048 — a smaller PV re-runs Stage 16 and is
-out of scope by construction. FFT ≥ 2048 is the 44.1 kHz figure; the
-prototype sizes its FFT and hop from the sample rate so the window
-stays ≈46 ms (4096 at 96 kHz). Two configurations are rendered:
-- **Two-path**: transient events + tonal residual.
-- **Three-path**: transient events + tonal peaks + a noise/residual
-  path — the non-peak bins (or the `hpss` percussive component minus
-  the cut events) stretched with relaxed or randomized phase instead
-  of locked phase, recombined with the other two. Hats, reverb tails,
-  and air through a locked PV are the classic "underwater" source, and
-  RESEARCH.md §5 lists a relaxed-locking residual path as a probable
-  Elastique component.
+**Gates and falsifier.** Land a discriminating regression for accurate,
+empty, and deliberately shifted onset timelines on a controlled
+kick/click-plus-tonal fixture. Verify the mapped event timing and a
+measurable effect around qualifying attacks; equality between accurate
+and empty guidance must not silently pass. Measure pre-echo energy,
+attack spread, onset-position error, peak/energy retention, and tonal
+continuity through attacks, at 44.1/48/96 kHz. Blind the guidance-only
+candidate against the shipped wide head and both references at wide
+ratios on the Stage 16 excerpts. A connected reset is necessary evidence
+of wiring, but improved attacks without new tonal artifacts decide
+whether its policy ships.
 
-**Falsifier.** Blind on the Stage 16/18 excerpts (msbwy, cold_heart,
-hot_stuff) at ±4/±8%, arms: shipped Keylock / two-path hybrid /
-three-path hybrid / Rubber Band / Elastique. Kill if neither hybrid
+**Fallback.** If broad phase resets damage sustained content, test
+selective/strength-gated resets before promotion (the deleted
+`WideKeylockStage` gated low-band resets on onset strength and per-band
+flux; start from that policy). Retain the shipped head as the explicit
+control for Stage 24; do not reinstate the old varispeed-prepass
+topology or describe disconnected resets as shipped.
+
+**Exit.** Event routing and its regressions verified, guidance policy
+and listening verdict archived, determinism/RT gates green for any
+promoted implementation, and engine/API/test documentation corrected
+to describe the policy actually running.
+
+### Stage 23b — Reference Gates per Condition (OPEN — gate fix now, matrix before Stage 29)
+
+**Evidence.** `assert_absolute_quality_floors` in
+[reference_quality.rs](qa/reference_quality.rs)
+selects one best result across a track's references and presets. A good
+ratio or another reference engine can hide a failure. Required CI's
+`rubberband_reference_gate` covers a 25-second mono excerpt from one
+track at two DJ rates; per-engine summaries are diagnostic averages.
+
+**Part 1 — the gate fix (small, lands now; does not block Stage 25).**
+
+- Give each required track × tempo rate × reference engine × candidate
+  profile its own result and acceptance bounds. Fix the candidate preset
+  for an acceptance run; report exploratory presets separately. Keep
+  aggregates for trends, without using a best result or average to
+  overrule a failing condition.
+- Fail strict runs on missing required rows, unavailable references,
+  invalid metrics, or checksum/configuration mismatches. Add a harness
+  regression showing that one strong condition cannot conceal a weak
+  one.
+
+**Part 2 — the matrix (required by Stage 29, not by Stage 25).**
+
+- Extend required public-corpus CI beyond one mono track: include stereo,
+  exposed attacks, sustained bass/tones, and the DJ/wide ratio matrix.
+  Run relevant quality and callback-budget gates at 44.1/48/96 kHz.
+- Require the complete Elastique matrix on a configured reference runner
+  or as an archived local sign-off run; missing licensed-host renders
+  cannot count as a pass. Record engine/host mode, source and render
+  hashes, window, level matching, sample rate, and code revision.
+- Track attack spread/pre-echo/timing, bass pitch and envelope stability,
+  tonal sidebands, HF retention, and stereo relationships alongside
+  spectral similarity. Derive artifact-specific bounds from measured and
+  heard fixtures; record why each bound detects the intended failure.
+  Keep blind listening as the perceptual gate.
+
+**Fallback.** Unavailable conditions remain explicitly unvalidated and
+block the corresponding parity claim. They are not replaced by an
+easier ratio or by another engine's score.
+
+### Stage 25 — Hybrid Decomposition Kill Experiment (OPEN — prototype rendered, awaiting the owner's listen)
+
+**Why.** Stage 16 rejected a small PV behind the 120 Hz split; it did
+not establish how the current direct-ratio, full-resolution wide head
+compares at DJ rates. Stage 23 heard both altered attacks and unstable
+tonality. Establish the full-PV baseline before attributing an
+improvement to transient/tonal/noise separation.
+
+**Kill question.** Does separating attacks and sustained material beat
+both shipped Keylock and a matched full-PV control on the failing DJ
+excerpts, without weakening the drums? Does separate noise treatment
+improve hats, breath, and reverb beyond the two-path hybrid?
+
+**Prototype (built 2026-09-03, `stage25/hybrid-proto` `75b98ed`).**
+`src/engine/hybrid.rs` behind `TIMESTRETCH_PROTO_HYBRID=2|3` in
+`offline.rs`, Keylock ratios only: artifact timeline drives event
+segmentation, transient regions are cut and reinserted at their mapped
+timeline positions with window-center alignment, the residual runs
+through the shipped identity-locked wide head at FFT ≥ 2048 (sized from
+the sample rate so the window stays ≈46 ms), raised-cosine
+recombination keeps the sample-exact timeline. Two-path = events +
+tonal residual; three-path adds a noise/residual path with relaxed
+phase. The blind set `target/ab/stage25-hybrid` is 12 conditions × 5
+arms (shipped Keylock / two-path / three-path / Rubber Band /
+Elastique) on msbwy, cold_heart, hot_stuff at ±4/±8 %.
+
+**Control the hybrid must also beat before promotion.** `stretch()`
+chooses Keylock in the DJ range, so no rendered arm shows what the
+full-resolution direct-ratio PV alone does at ±4/±8 %. Stage 16 killed
+a *small* PV behind the 120 Hz split, not this head. If either hybrid
+survives the first listen, render a second set adding the shipped
+WideKeylock head forced at DJ rates (matched FFT/hop, guidance, stereo
+policy, and gain) so decomposition is the only variable between it and
+the hybrid — a hybrid that only ties the plain PV is a PV win, not a
+decomposition win, and the simpler candidate carries forward.
+
+Record actual lookahead and output delay for every arm; include 96 kHz
+in the confirmation set. `analysis::hpss` is an offline separation
+candidate, not an RT-ready stage: it stores the whole spectrogram and
+its centered time median needs future frames. Count separation
+lookahead separately.
+
+Evaluate relaxed locking or noise resynthesis on the residual. Any
+random phase decisions must be deterministic from source position and
+seed, respect stereo coherence, and preserve streaming/offline
+agreement. A globally locked noise bed and independently randomized
+channels are both hypotheses to test, not defaults to assume safe.
+
+**Falsifier.** The rendered set, blind, with separate notes for
+attacks, bass, sustained tones, and hats/tails. Kill if neither hybrid
 beats shipped Keylock on the sustained-tonal conditions, or if the
-surviving hybrid reads "robotic / underwater / vocoder" on any, or
-smears the kicks the transient gates protect. Record separately
-whether three-path beats two-path on the hat / reverb-tail excerpts;
-the surviving configuration is what Stage 26 builds.
+surviving hybrid reads robotic/underwater/vocoder on any, or smears the
+kicks the transient gates protect. Record whether three paths improve
+on two; additional complexity must earn an audible benefit. Then the
+full-PV control set above. Include the Stage 23b metrics and Stage
+28's development excerpts before selecting the quality candidate; keep
+its held-out set for final evaluation.
 
-**Fallback.** Tonality-adaptive SOLA — a third band or a
-tonality-gated splice cadence — the Stage 16 alternative that was
-never tried. Falsified the same way.
+**Fallback.** If the full PV wins without decomposition, carry that
+simpler candidate forward. If no spectral candidate improves on
+Keylock, test tonality-adaptive SOLA (band/cadence policy) under the same
+protocol. Keep Keylock as the shipped default until a candidate wins.
 
-**Exit.** Verdict archived; on survival Stage 26 opens.
+**Exit.** Archive the controlled comparison, chosen mechanism or failed
+bet, and its latency/lookahead/cost. Stage 24 develops the surviving PV
+candidate, or independently evaluates the shipped wide head when no
+PV candidate survives; Stage 26 requires a winning steady-state path.
 
-### Stage 26 — Quality Lane and Gesture Lane (bought by Stage 25 survival)
+### Stage 24 — Tonal, Bass, and Stereo Coherence (OPEN — prototype rendered, awaiting the owner's listen; before lane integration)
 
-The surviving hybrid becomes the deck's steady-state chain on the
-46 ms budget — the quality lane. The existing Keylock chain becomes the
-gesture lane. Both run behind one varispeed head, one source ring, and
-one timeline map. The engine crossfades to the gesture lane when a
-control write exceeds a rate-slope or seek threshold (nudge, pitch
-bend, scratch, hot-cue jump) and crossfades back once the rate has
-settled for a fixed hold. Slow pitch-fader moves stay on the quality
-lane. This replaces the earlier design of an opt-in third profile with
-a seek-priced switch: the quality budget is never opt-in, and the
-gesture budget is never given up.
+**Prototype state (built 2026-09-07, `stage24/peaktrack-proto`).**
+`TIMESTRETCH_PROTO_PEAKTRACK` (`1`/`all`, or a list of `track`, `band`,
+`multires`) is read only in `offline.rs` and threaded through
+`Engine::build_with_wide_proto` → `WidePvHead::with_proto`; live engines
+never see it. Peak continuation and Bark-partition lock strength live
+in `src/stretch/peak_track.rs`; the two-resolution arm is an LR4 split
+at 1.5 kHz with a short PV above it. Both arms must seed phase from
+frames with the same source centre or the crossover band cancels by
+d·(1−r) samples (caught by a 1.5 kHz level unit test). **Measured
+before the listen** (`examples/stage24_probes.rs`,
+`target/ab/stage24-peaktrack/probes.txt`): the fixed split is
+purity-destructive on dense HF harmonics — the 512 arm drops
+harmonic-15 purity 67.7 → 17.3 dB at −50 % (1024 arm 37.5 dB) because a
+short Hann window cannot resolve 220 Hz-spaced partials. A fixed split
+is the wrong mechanism; content-adaptive resolution (R3-style) is the
+hypothesis that remains. `track` alone is neutral to slightly
+positive; `band` alone costs ~12 dB on pure tones but stays above
+80 dB. The blind set (`target/ab/stage24-peaktrack`, 12 conditions,
+±30/±50 %, arms current / trackband / all1024 / Rubber Band /
+Elastique) dropped the 512 arm on that measurement.
 
-**Kill questions inside the stage** (Stage 21 template, each with the
-named fallback below):
-- Does the lane crossfade read as a seam? Falsified on the Stage 15
-  ride harnesses (seam comb, fade-band clicks) and a blind nudge test:
-  a nudge through the crossfade against the same nudge on the shipped
-  Keylock chain alone.
-- Does the quality lane track a slow fader ride without the crossfade
-  firing? Falsified with the Stage 18 steady-transposition and ride
-  cadence harnesses on the quality lane alone.
+**Evidence.** Peaks are detected afresh each frame in
+`src/stretch/phase_vocoder.rs`; there are no persistent peak identities.
+Trough-bounded locking in `src/stretch/phase_locking.rs` writes shared
+boundary bins in peak order. The wide head configures a 100 Hz cutoff,
+and the lowest bins are excluded from that peak-locking pass. M/S
+components have independent PV analysis/state. These are candidates
+behind the bass/tonal/image reports, not proven causes of every report.
 
-**Fallback.** The original design: a third `EngineProfile` on the 46 ms
-budget, opt-in per deck, switched at seek price. Keylock stays the
-default.
+**Kill question.** Do persistent peak tracking, deliberate low-band
+coherence, multiple analysis resolutions, and linked stereo guidance
+improve the selected PV and shipped wide head without new attack,
+spatial, or modulation artifacts?
 
-**Build-out.**
-- RT-safe implementation under the zero-alloc contract; WCET gate;
-  artifact-first with the online detector as fallback.
-- FFT, hop, and latency derived from the sample rate the way Keylock
-  derives its lag — 2048/256 at 44.1 and 48 kHz, 4096/512 at 88.2 and
-  96 kHz — not inherited from the wide head's fixed `WIDE_FFT`. The
-  WCET gate runs at 96 kHz as well as 44.1: twice the hops per second,
-  and each hop twice the FFT, is the budget Halo actually pays.
-- 96 kHz in the benchmark and pin matrix from the first commit, not
-  only in the robustness fuzz. Halo runs the engine at 96 kHz; a
-  lane pinned at 44.1 kHz alone is pinned for the wrong consumer.
-- Stereo as a shared-analysis instance from the start — linked
-  channels on the M/S machinery, one event timeline for both — not two
-  mono paths (the zplane SDK documents the same recommendation).
-- The lane-crossfade contract: the timeline offset between lanes is
-  the quality lane's latency; the crossfade is delay-matched on the
-  shared timeline map so the source position is continuous through
-  it; the thresholds and hold are constants with harness-derived
-  values, not tunables.
-- Ride and seam behavior against the existing ride harnesses; honest
-  latency reporting (the quality lane's delay is what the deck
-  reports in steady state; the gesture lane's during a gesture);
-  compensated position queries.
-- Desktop toggle so the change is audibly playable, including a
-  gesture-lane-only mode for A/B.
+**Prototype.** `TIMESTRETCH_PROTO_PEAKTRACK`, offline-first, with
+separately switchable changes. The rendered set is judged as-is; once
+Stage 23a lands, the surviving changes are re-rendered on the head with
+its guidance connected before promotion:
 
-**Exit.** Sealed-key session against Elastique across the full matrix,
-and a blind pitch-fader nudge test against a current Traktor or
-rekordbox deck at the same interface buffer — the one place a 46 ms
-chain is felt.
+- Track peak identities across frames with bounded assignment and
+  hysteresis; make bin ownership stable and unambiguous. Evaluate
+  frequency-dependent lock strength and noise confidence.
+- Test low-bin coherence explicitly on exposed bass, polyphonic bass,
+  glides, and kick/bass overlap. Revisit the 100 Hz locking exclusion
+  with evidence; accurate single-tone pitch alone cannot pass this gate.
+- Size analysis windows by sample rate and content. A fixed
+  two-resolution split is already measured out (above); the open
+  question is content-adaptive resolution — longer windows where the
+  spectrum is dense and stationary, shorter around attacks — with
+  matched timing and measured recombination response. Begin at the
+  Stage 25 window sizes; additional bass resolution carries an explicit
+  latency/cost.
+- Share peak/event guidance across stereo where appropriate, preserving
+  the source's interchannel phase and level relationships. M/S remains
+  a useful representation, not proof of complete channel linkage.
 
-### Stage 24 — PV Coherence on the Quality Lane's Tonal Engine (OPEN)
+**Gates and falsifier.** Compare the selected Stage 25 PV before/after
+on DJ excerpts, and the wide head before/after at ±30/±50%, with both
+references. Test each change independently before combining survivors.
+Extend `wide_stereo_coherence` with hard-panned transients, overlapping
+instruments, stereo reverbs, phase-offset tones, and mono fold-down.
+Measure image movement, channel phase/level relationships, bass
+stability, attack timing, and modulation sidebands at 44.1/48/96 kHz.
+Kill changes that fail to improve the targeted blind artifact class or
+introduce new attack/spatial regressions.
 
-**Why.** The wide head's phase locking is recomputed per frame with no
-cross-frame peak continuity (overlapping regions last-write-wins) and
-no multi-resolution analysis — the classic unstable-cymbals source, and
-why +50% compression ties Rubber Band at "slightly roboty" instead of
-beating it. After Stage 26 this PV is also the quality lane's tonal
-engine, so the upgrade lands twice: first on the wide path, which
-already has determinism, WCET, and ±50% gates, then re-pointed into
-the lane.
+**Existing gates to retain.** `tests/pv_null.rs` already exercises the
+PV directly at unity and checks long-render purity (Stage 13); do not
+schedule a duplicate null test as missing work. Extend these checks to
+new resolutions and retain determinism, tonal-purity, stereo, and
+callback-budget gates. Re-derive explained sub-bass/two-tone baselines
+without weakening unrelated bounds.
 
-**Kill question.** Does cross-frame peak tracking with band-dependent
-lock strength on a Bark-style partition, plus a two-resolution analysis
-(long window below ~1.5 kHz, short above), remove the +50% "slightly
-roboty" blind — against Rubber Band and the Stage 23 Elastique arm?
+**Fallback and exit.** Keep the simpler surviving locking/resolution/
+stereo policy if an upgrade loses. Archive per-change ablations and the
+combined blind verdict, then freeze the selected steady-state path for
+Stage 26. Wide-path work remains useful even if the DJ candidate fails.
 
-**Prototype.** Env-gated `TIMESTRETCH_PROTO_PEAKTRACK`, offline-only,
-inside the existing head so the artifact-driven resets and M/S path are
-unchanged. Peak continuity by nearest-peak assignment with a per-band
-hysteresis; lock strength per partition; the two-resolution split as
-two PV arms recombined at a fixed crossover with matched group delay.
+### Stage 26 — Quality Lane and Gesture Lane (after a winning DSP candidate)
 
-**Falsifier.** Blind ±30/±50 on the Stage 14 excerpts, four arms:
-shipped head / proto / Rubber Band / Elastique. Kill if the proto does
-not beat the shipped head, or if any condition regains the "robotic /
-underwater" vocabulary.
+Promote the candidate selected in Stages 25/24 to the deck's steady-state
+quality path only after its sound is established. Retain Keylock as the
+12.7 ms gesture path. Share source identity and timeline accounting;
+do not force the direct-ratio PV behind a varispeed prepass merely to
+share a head. Stage 19's rejected prepass/PV/post-resampler topology
+must not return without its own controlled evidence.
 
-**Fallback.** Identity locking stays; the wide gap is re-baselined
-against Elastique and recorded.
+**Kill questions.**
 
-**Gates landing with the stage.** A null test through the PV itself at
-ratio 1.0 (the 2026-08-05 review's finding 8: the identity suite tests
-the bypass, not the DSP); the purity characterization re-pinned;
-determinism; WCET; `wide_stereo_coherence`.
+- Can the two paths switch without an audible seam, combing, duplicated
+  attacks, dropped content, or a discontinuous audible source position?
+- Can a nudge, bend, scratch, or hot cue retain the existing gesture
+  response while entering/leaving the quality path? Aligning two
+  delayed signals does not by itself prove the shorter response.
+- Can slow fader rides remain on the quality path without pitch/envelope
+  instability or repeated switching?
 
-**Exit.** Sealed-key listen archived; the head's Architecture bullet
-updated; sub-bass balance and two-tone pins re-derived (Stage 19's
-lesson: when a fix explains an old pinned number, re-derive the pin).
-Then the quality lane's tonal path is re-pointed at the upgraded PV
-and the Stage 26 sealed-key session is re-run on the sustained-tonal
-subset.
+**Prototype/build-out.** First prove a switch between the selected
+paths under recorded rate/seek schedules. Derive alignment from both
+paths' measured delays and source positions, not from an assumed
+46 ms offset. Measure control-to-audio response, startup, seek recovery,
+and transition duration separately from steady-state pipeline delay.
+Use the ride/seam harnesses and a blind nudge comparison with Keylock
+alone to choose thresholds, hold times, and fades.
 
-### Stage 27 — Pitch-Shift and Formant Parity
+Then implement the surviving transition under the zero-allocation RT
+contract with bounded working storage and online guidance fallback.
+Gate 44.1/48/96 kHz quality and callback budgets, including the periods
+when both paths run, the smallest supported callbacks, warm starts,
+loop wraps, and rapid retargets. Sample-rate-scaled FFT/hop choices
+change transform cost and hop cadence; measure the resulting cost.
+Require streaming/offline determinism for the combined path, honest
+latency/position reporting through switches, and a desktop A/B mode.
 
-Elastique Pro's formant preservation is part of what its quality means.
-The current formant path is the pre-rebuild PV behind `pitch_shift`.
-Move it onto the Stage 24 PV with transient-aware handling on the shift
-axis; gate vocal excerpts blind against Elastique's Pro and Monophonic
-modes. Kill question: does the shifted vocal read closer to Elastique
-than the current path at ±3 and ±7 semitones?
+**Fallback.** Offer the proven quality path as an opt-in `EngineProfile`
+with a seek-priced switch. Keylock stays the default if automatic
+switching cannot meet both sound and gesture contracts. Record that
+Stage 26's automatic/default integration goal remains unmet.
 
-### Stage 28 — Material Generality and Second Listener
+**Exit.** Sealed-key steady-state and transition sessions against
+Elastique, plus a blind fader-nudge comparison with a current Traktor or
+rekordbox deck at the same interface buffer. Archive the actual
+response/latency/callback measurements; static offline references
+establish sound quality, not the competitor's live gesture response.
 
-The binding policy is EDM at DJ ratios; Elastique's reputation is
-vocals, acoustic, and speech. Expand the corpus with those classes,
-bring the second listener onto the structured checklist (the 1.0 path's
-bus-factor item), and either gate the new classes or write the scope
-boundary down. Never silently variable.
+### Stage 27 — Pitch-Shift and Formant Parity (baseline set rendered 2026-09-10)
+
+**Baseline in hand (`stage27/pitch-refs`).** `render_elastique.py
+--semitones` renders REAPER pitch jobs in three modes (Pro, Pro with
+formant preservation, Soloist Monophonic) to
+`references/elastique-pitch/<mode>/`; `ab.sh --semitones` makes pitch
+conditions with ours = `pitch_shift()` and Rubber Band = `--pitch
+--formant`. Blind set `target/ab/stage27-pitch`: 8 conditions (Anchor
+and Out of It × ±3/±7 st) × 5 arms (current / Rubber Band / Elastique
+Pro / Pro-formant / Soloist), awaiting the owner's listen. No DSP
+touched.
+
+**Evidence.** `pitch_shift` uses the engine-backed stretch plus sinc
+resampling, followed by per-channel cepstral envelope correction in
+`src/lib.rs`. The Vocal preset scales envelope correction to zero at
+factors ≤0.8 (about −3.9 semitones), tapers it toward zero above 1.4,
+and reaches zero at 2.0. HF attenuation also compensates for correction
+artifacts. A preset name does not establish preservation across shifts.
+
+**Kill question.** Can the improved engine and envelope path preserve
+vocal identity at ±3/±7 semitones, including consonants, breath,
+vibrato, and voiced/unvoiced transitions, closer to Elastique than the
+current path? Characterize ±12 semitones as a separate range boundary.
+
+**Work and gates.** Reuse the selected tonal/stereo engine, preserve
+transient correspondence through the shift/resampling axis, and develop
+confidence-aware envelope handling for voiced and unvoiced regions.
+Measure formant position/envelope error, sibilant/HF retention, attack
+timing, and stereo coherence on real vocals as well as synthetic vowels.
+Blind both shift directions against the current path, envelope-off
+control, Elastique Pro, and its Monophonic mode where appropriate;
+record each reference mode separately. Gate 44.1/48/96 kHz conditions.
+
+**Fallback and exit.** Retain the best measured correction policy if an
+experiment loses. Explicitly document any unsupported preservation
+range; disabling correction cannot pass a formant-preservation claim.
+Archive the per-shift blind verdict and range boundary. Independent
+live pitch control, if required, needs its own RT/gesture validation;
+batch pitch-shift results alone do not establish that API capability.
+
+### Stage 28 — Material Generality and Second Listener (corpus rows on branch)
+
+**In hand (`stage28/corpus-generality`).** Four public tracks in the
+new classes — solo piano (Open Goldberg Aria, 96 kHz), speech (LibriVox
+Tell-Tale Heart, 22.05 kHz MP3), acoustic vocal (Josh Woodward
+"Anchor"), rock vocal (Brad Sucks "Out of It") — in the manifest with
+`material = …` and `tempo_rate` references, Elastique renders done. The
+first per-class read put speech far below EDM; that was a
+decoder-alignment artefact (REAPER's MP3 decode sits on a different
+timeline from symphonia's), fixed by decoding compressed sources
+ourselves before REAPER renders. Corrected spectral/flux vs Elastique:
+edm-dj 0.915/0.782, piano 0.942/0.860, vocal 0.933/0.902, speech
+0.895/0.877 — no class out of family.
+
+Select additional exposed-bass and spatial material before DSP
+selection. Development excerpts join the Stage 25
+pilot. Reserve a separate held-out set for the frozen, integrated
+candidate; do not use it to tune thresholds or select the DSP. Add a
+second listener early and use the structured attack/bass/tonal/noise/
+image checklist.
+
+Use sealed keys, the same level-matching protocol, randomized arm
+order, and repeat conditions to check listener consistency. Archive
+individual ratings, disagreements, source/render hashes, and reference
+settings; do not infer agreement from an average. Gate per material
+class and ratio, or state the unvalidated/unsupported scope explicitly.
+BPM-only non-EDM rows do not count as stretch-quality coverage.
+
+**Exit.** Two-listener results on both development and held-out material,
+per-class scope decisions, and baselines checked on a second machine
+class. Keep the original Stage 23 DJ criterion unchanged and report
+broader material quality as additional evidence.
 
 ### Stage 29 — Parity Sign-Off
 
-Re-run the Stage 23 criterion on the shipped quality lane with both
-listeners. Either declare parity with the evidence archived, or record
-the residual gap the way Stage 11's Rubber Band gap was recorded —
-scoped to mechanism and floor, so the next re-litigation starts from
-evidence.
+Re-run the unchanged Stage 23 criterion on the shipped quality path
+with both listeners: two sets of 12 DJ/wide conditions, ours below
+Elastique in no more than three per set, no robotic/underwater/vocoder
+verdicts, ties counting as parity. Require the Stage 23b per-condition
+matrix, Stage 26 transition/response verdict, Stage 27 shift-range
+results, and Stage 28 held-out/material-class decisions alongside it.
+
+Archive code revision, source/reference hashes, engine/host settings,
+sample rates, level matching, metrics, individual blind notes, and
+latency/callback measurements. Either declare parity within that
+explicit scope or record the remaining artifact classes and failed
+conditions. An average score, a winning easy ratio, or an opt-in profile
+cannot silently satisfy a missing condition or the default-lane goal.
 
 ## Not a Priority Yet
 
@@ -682,9 +883,17 @@ in addition:
   ear-verified annotations; the hip-hop beat-PHASE class is a documented
   open frontier where the QM reference also scores zero, gated by the
   corpus for whenever it is re-attacked).
-- The wide-ratio path is free of known correctness defects (Stage 13,
-  done), its offline and live renders are the same algorithm, and stereo
-  coherence is gated (Stage 14).
+- The Stage 13 phase-hygiene fixes and Stage 14 streaming/offline
+  agreement remain gated; the wide head receives and acts on correctly
+  mapped transient guidance (Stage 23a), with attack timing/pre-echo
+  checks that discriminate accurate, empty, and shifted artifacts.
+- Every required reference condition passes its own gate (Stage 23b):
+  a best result across ratios, engines, or presets cannot hide a failed
+  row, and the required matrix covers stereo and 44.1/48/96 kHz
+  quality/callback coverage before Stage 29 signs off.
+- Tonal/bass and stereo coherence are demonstrated on the selected
+  quality path (Stage 24), including exposed bass, spatial material,
+  phase-offset signals, and mono compatibility beyond center leakage.
 - Riding the fader degrades nothing that holding it steady doesn't
   (Stage 15, done — seam and fade gates hold in CI).
 - The tonal-HF granulation floor has a recorded listening verdict
@@ -706,6 +915,12 @@ in addition:
   residual gap is recorded the way the Stage 11 gap was.
 - The gesture lane keeps the 12.7 ms Keylock contract, and the lane
   crossfade is inaudible on the ride harnesses and in a blind nudge
-  test (Stage 26).
+  test (Stage 26). Measured control response, source continuity, startup,
+  seek recovery, and callback cost through transitions meet the declared
+  contracts; output delay and source lookahead are reported separately.
+- Pitch-shift/formant quality has a recorded verdict at ±3/±7 semitones
+  and an explicit wider-range boundary (Stage 27). Material-class and
+  held-out results from both listeners state the scope of any broader
+  commercial-quality claim (Stage 28).
 - The streaming-vs-offline determinism gate still holds
   sample-identical through the lane architecture.
