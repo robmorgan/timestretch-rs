@@ -674,15 +674,22 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     } else {
         format!(
             "Tab pane  ↑/↓ move  Enter note  a-{}/s play arm  space play/switch  l loop  \
-             ←/→ seek  0 restart  w winner  W clear  Ctrl-S save  q quit   {}",
+             ←/→ seek  0 restart  w winner  W clear  Ctrl-S save  q quit",
             labels
                 .iter()
                 .rfind(|&&l| l != SOURCE_LABEL)
                 .map(|l| l.to_ascii_lowercase())
                 .unwrap_or('e'),
-            app.status,
         )
     };
+    // Status gets its own line: appended to the help text it fell off the
+    // right edge of most terminals, so saves looked silent.
+    let status = if app.dirty {
+        "● unsaved changes — Ctrl-S to save".to_string()
+    } else {
+        app.status.clone()
+    };
+    let footer = format!("{footer}\n{status}");
     frame.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::TOP)),
         rows[2],
