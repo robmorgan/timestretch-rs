@@ -934,3 +934,132 @@ Lessons:
   compression. Slowdowns and the DJ window are, and those are the
   decomposition's (Stage 25) and the low-band coherence's (Stage 24)
   targets in that order.
+
+## Stages 25 and 24 — Prototype Kill Listens (2026-10-08, all prototypes killed)
+
+Two sealed-key owner sessions on the Stage 16 excerpts (msbwy 90 s,
+hot_stuff 60 s, cold_heart 45 s), five arms each, notes per arm, no
+winner picks. The "current" arm in both is the shipped engine at main
+`2628090`, DSP-identical to the Stage 23 baseline renders (`f95c70f`;
+no `src/` change between them).
+
+**Stage 25, DJ window ±4/±8 %** (`target/ab/stage25-fullpv/results.json`;
+arms current / fullpv / hy2 / Rubber Band / Elastique):
+
+- **fullpv** (`9dbe45a`, `TIMESTRETCH_PROTO_FULLPV=1`: the shipped
+  direct-ratio wide head forced at DJ ratios) read robotic, underwater
+  or closed in 6 of 12 — "awful, under water, robot" (msbwy +4),
+  "muddly, robotic, under water" (msbwy −4), "closed, roboty"
+  (cold_heart +8). Clean on msbwy −8 and hot_stuff +8/−4. Killed: the
+  criterion forbids robotic vocabulary.
+- **hy2** (`75b98ed`, two-path transient/tonal hybrid) was faulted in
+  8 of 12, and worst where Keylock is cleanest: hot_stuff −4/−8
+  "wobbly, roboty, bad" / "wobbly, underwater, bad", msbwy −8 "awful
+  artifacts in the low end". Killed under the Stage 25 rule.
+- **hy3** (three-path) was never heard: `target/ab/stage25-hybrid` was
+  skipped once hy2 failed this badly, since hy3 adds a noise path to
+  the same transient/residual split. Dropped untested; if
+  decomposition is ever revisited, that set is the first listen.
+- **current** was clean on all four hot_stuff conditions and most of
+  cold_heart. Its faults were msbwy at every rate ("kicks smearing",
+  "tiny bitcrushed on kicks, ultra robot parts" at +4, "bassline sounds
+  out of key" at −4, "bpm seems to speed up at sections" at +8) and
+  cold_heart −8 ("bassline is off or out of key, kicks smearing").
+  Elastique was heard "slight robot, under water" once (hot_stuff +8).
+
+**Stage 24, wide ±30/±50 %** (`target/ab/stage24-peaktrack/results.json`;
+arms current / trackband / all1024 / Rubber Band / Elastique;
+prototype `a9d2680`):
+
+- **trackband** (peak continuation + Bark lock strength) was
+  robotic/underwater/metallic in 5 of 12 — hot_stuff −50 "underwater,
+  awful", cold_heart −30 "pulsing roboty, metallic noise". It beat the
+  shipped head only at msbwy +30. Killed.
+- **all1024** (all changes, 1024 short arm) was robotic/underwater/
+  wobbly in 5 of 12, with the bassline out of key twice. Killed — the
+  pre-listen purity probe (h15 67.7 → 37.5 dB at −50 %) predicted it.
+- **current** was mostly "open, wide, clean". Below Elastique on msbwy
+  +30 and −50 (bassline "a tiny bit out" / "a bit out"), hot_stuff +30
+  (Elastique "the best"), cold_heart −50 ("slightly roboty,
+  baseline"); marginal at hot_stuff +50 (Elastique "cleanest"). Ahead
+  where Elastique turned metallic/bitcrushed (hot_stuff −30,
+  cold_heart −30, msbwy −30).
+
+**Against the parity criterion:** DJ window ~4/12 below Elastique with
+"robot" vocabulary on msbwy +4; wide 4–5/12 below with "roboty" on
+cold_heart −50. Both still fail, but on the same engine the Stage 23
+baseline counted 9/12 and 8/12.
+
+Lessons:
+
+- **A single session's below-Elastique count is noisy.** The same
+  engine scored 9/12 → ~4/12 (DJ) and 8/12 → 4–5/12 (wide) a month
+  apart. Arm count (five vs three), the competing prototypes'
+  failures, and listening context move the bar the shipped arm is
+  heard against. Read counts only within a session; the two-listener
+  rule in the criterion is the guard, and a parity sign-off should
+  re-hear the shipped arm in the same session, never compare to an
+  archived count.
+- **The same wide head is robotic at ±4/±8 % and clean at ±30/±50 %.**
+  fullpv and current-in-the-wide-set are one head; only the ratio
+  differs. Unexplained. The pre-listen probe saw its 10 ms envelope
+  correlate only ~0.65 with Rubber Band at both −4 % and −30 %, so
+  missing onset guidance (Stage 23a) alone does not explain a
+  ratio-dependent verdict. Find the small-ratio mechanism before any
+  "make the DJ path spectral" proposal returns.
+- **Bassline out of key is the recurring complaint on the shipped
+  engine in both windows** (msbwy at nearly every rate, cold_heart
+  −8/−50). On the DJ path the Stage 21 corrector is engaged at these
+  rates and the verdict persists; on the wide path it is PV low-band
+  coherence. It is now the most specific lead the listens give.
+- **Measure-before-listen paid again.** all1024's purity collapse was
+  in `probes.txt` before rendering; the listen confirmed it.
+
+## Stage 27 — Pitch-Shift Baseline Listen (2026-10-08, baseline only)
+
+No DSP change: the first sealed-key session on pitch shifting, to set
+the Stage 27 bar. Set `target/ab/stage27-pitch` (renders from
+`stage27/pitch-refs` `3f843ac`, `src/` identical to main;
+`results.json`, notes only): Josh Woodward "Anchor" (acoustic vocal)
+and Brad Sucks "Out of It" (rock vocal) × ±3/±7 st × five arms — ours
+(`pitch_shift()`, default Balanced envelope preset, so cepstral
+correction at full strength at every shift), Rubber Band `--pitch
+--formant`, and élastique Pro / Pro-formant / Soloist-mono.
+
+- **Ours** was below the best formant-preserving reference in 7 of 8.
+  It was level only at Out of It −7 ("low, clean, slightly closed" vs
+  Pro-formant "a bit fuzzy"). Robotic or underwater wording in 4 of 8:
+  Anchor +3 "tiny bit robotic", Anchor +7 "a tiny bit robot", Anchor −7
+  "slightly robot, metallic vocal", Out of It +7 "under water noises".
+  Downward shifts lost vocal identity even with correction on: "not
+  bad, but pitched down a lot" (Out of It −3), "vocal is a bit off"
+  (Anchor −3).
+- **Rubber Band** was the cleanest arm in about 6 of 8; its one clear
+  miss was "muddled vocal" at Anchor −7.
+- **Élastique Pro-formant** was "clean, open" on every Anchor
+  condition, but "tiny bit bitcrushed" / "a bit bitcrushed, baseline
+  sounds a bit out" / "a bit fuzzy" on Out of It. It is the bar on
+  acoustic material and beatable on dense rock.
+- **Élastique Pro** (no formant) read "chipmunk" / "pitched down a lot"
+  as a formant-off control should. **Soloist-mono** was "awful, 8-bit"
+  or "roboty, metallic" on all 8. It is a monophonic mode, the wrong
+  tool for full mixes, so drop it from future sets.
+
+Against the parity criterion this is a clear fail (7/8 below, robot
+vocabulary in half).
+
+Lessons:
+
+- **The robot sound is not one engine path's problem.** `pitch_shift`
+  stretches by the pitch factor and resamples, so ±3 st runs through
+  Keylock (ratios 0.84/1.19) and ±7 st through the wide head
+  (0.67/1.50). Robot notes landed on both. The step common to both,
+  per-channel cepstral envelope correction after resampling, is the
+  first suspect to isolate with an envelope-off arm.
+- **Full-strength correction did not preserve identity downward.**
+  The Balanced preset applies it at every factor (only the Vocal preset
+  mutes it below 0.8×), and −3 st still read "pitched down". Cepstral
+  correction on a full mix is not yet doing the job Pro-formant and
+  Rubber Band's formant mode do.
+- **Pick reference modes that fit the material.** Soloist-mono cost a
+  fifth of every condition to learn what its name says.
