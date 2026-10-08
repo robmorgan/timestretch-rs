@@ -442,6 +442,28 @@ schedule, profile, and artifact. Each experiment records its source
 revision, parameters, sample rate, reference configuration, and metric
 and listening results. Null/purity checks precede blind selection.
 
+**IP check before decomposition returns (proposed 2026-10-09).** The
+Stage 25 hybrid cuts each transient region out, stretches the residual,
+and reinserts the original transient at its mapped position with
+crossfaded borders. That is the pattern claimed by Fraunhofer's
+US 9,236,062 (priority 2008-03-10; Google Patents lists it active to
+2029-09-29, and the family has litigation on record). The same family
+describes transient-position metadata generated ahead of time for
+storage, which the shipped `.tsa` onset artifacts resemble; whether that
+embodiment survived into the granted US claims is unchecked. Neither
+blocks current work — the hybrid is on an unmerged, killed branch — but
+obtain a freedom-to-operate read of that family before the three-path
+set is heard or any cut-and-reinsert design is promoted, and before a
+commercial release that depends on artifact-driven transient handling.
+Expired and therefore free: Laroche–Dolson peak-region pitch shifting
+(US 6,549,884, expired 2019) and frame-skip transient bypass
+(US 8,489,404, lapsed 2021). No zplane-assigned patents were found
+(Google Patents assignee search was blocked; Espacenet/DPMA not yet
+searched). Time-map anchoring (Stage 23a arm below) bends the ratio
+inside one PV and does not remove or reinsert audio; the
+"stretch more around transients" idea is cited as prior art in the
+Fraunhofer filing itself (Ravelli/Sandler/Bello 2005, Röbel 2003).
+
 ### Stage 23 — Elastique Reference Corpus and Parity Criterion (CLOSED 2026-09-03: achieved)
 
 **Verdict.** REAPER's élastique 3.3.3 Pro renders were generated
@@ -491,6 +513,27 @@ window-center alignment, strength/band selection, lookahead, seeks,
 loop wraps, and rate changes. Establish an online detector fallback
 when no artifact is attached; an explicitly empty artifact remains
 authoritative. Keep the direct-ratio topology that survived Stage 19.
+
+**Time-map anchoring arm (proposed 2026-10-09).** Resets restore
+vertical coherence but not where the attack lands: frames that see an
+onset before their centre each render it at a different output offset,
+spreading pre-echo over roughly half a window × |1/r − 1| (≈4–5 ms for
+FFT 4096 at ±10 %; about half that at the shipped 2048). Because this
+head owns the tempo axis, it can instead hold the local ratio at
+exactly 1 from about half a window before each qualifying onset until
+the attack has passed, and absorb the difference in the surrounding
+sustain (at 128 BPM and −10 % the in-between ratio moves from 0.90 to
+≈0.89). With equal analysis and synthesis hops every frame that sees
+the attack places it at the same output time; sustained partials keep
+integrating, so nothing is reset under them, and onsets land on their
+nominal output times, which beat sync also wants. Treat seeks, loop
+wraps, and direction flips as forced anchors. Render it as a third arm
+beside reset-only and reset + anchoring, on the same fixture and
+metrics; it changes the head's rate schedule, so verify timeline
+accounting, the audible-position query, and determinism under it.
+Hi-hats can stay unanchored if their short-band pre-echo measures
+below ~1 ms; where onsets are too dense to anchor, fall back to the
+reset policy.
 
 **Gates and falsifier.** Land a discriminating regression for accurate,
 empty, and deliberately shifted onset timelines on a controlled
@@ -707,6 +750,58 @@ its guidance connected before promotion:
   the source's interchannel phase and level relationships. M/S remains
   a useful representation, not proof of complete channel linkage.
 
+**Additional candidate arms (proposed 2026-10-09).** Each is a separate
+switch under the existing prototype flag, tested alone before combining,
+and judged under this stage's gates and falsifier. None replaces
+identity locking unless it wins blind.
+
+- **Near-unity dispersion probe (first, cheap).** Stage 25 left open
+  why the same head reads robotic at ±4/±8 % and clean at ±30/±50 %.
+  One hypothesis: away from unity, propagated phase drifts from
+  analysis phase and inter-partial alignment randomizes even when the
+  stretch is tiny, while the wide-ratio references are degraded enough
+  that ours reads relatively clean. Render the wide head at
+  1.00/1.01/1.02/1.04/1.08 and measure vertical-coherence loss
+  (e.g. group-delay spread around partials, attack shape on the
+  kick/click fixture) as a function of |r − 1|. If it appears as soon as
+  the ratio leaves 1, test gradual coherence restoration toward analysis
+  phase near unity (Rubber Band R3 restores vertical coherence gradually
+  on return to 1.0; its changelog records the same change backported to
+  R2) and keeping noise-classified bins at analysis phase in the DJ
+  window. If coherence loss does not track |r − 1|, the hypothesis is
+  falsified and the DJ-window gap lies elsewhere.
+- **Phase-gradient heap integration (PGHI).** Replace frame-local
+  peak locking plus the 0.20 nearest-peak gradient blend with
+  integration of both phase derivatives outward from the strongest bins
+  (Průša & Holighaus, "Phase Vocoder Done Right", 2022; RTPGHI for the
+  causal variant). It needs no peak picking or tracking and claims no
+  classic PV artifacts at extreme ratios. Target the low-band
+  coherence complaint first; include the sub-100 Hz bins currently
+  excluded from locking. A quick search found academic sources only,
+  no patents.
+- **Reassignment-based gradients.** Per frame, take FFTs with the
+  window w, its derivative w′, and t·w to get instantaneous frequency
+  and local group delay per bin with no previous-frame dependency and no
+  phase unwrapping. Feeds PGHI directly, gives per-bin attack timing for
+  Stage 23a, and makes seeks/loop wraps/rate changes stateless for the
+  analysis side. Costs two extra forward FFTs per frame per resolution
+  (only for one channel if paired with the stereo arm below).
+- **Shared-rotation stereo linkage.** Run the phase solution once on
+  mid and express it as a per-bin unit rotation R[k] = output phase −
+  analysis phase; apply Y_c[k] = X_c[k]·R[k] to every channel.
+  Interchannel phase and level relationships survive exactly, mono
+  fold-down is preserved by construction, and the expensive per-bin
+  work runs once. Blend toward independent processing where L/R are
+  uncorrelated (wide reverbs, hard-panned hats). Concrete candidate for
+  the linked-stereo bullet above; the élastique V3 SDK docs describe
+  linked analysis (RESEARCH.md §5 item 7). Extends to stems linearly.
+- **Sample-rate-scaled bass window.** At 96 kHz the fixed FFT 2048 gives
+  47 Hz bins and a 21 ms window in the bass — Halo's operating point.
+  Scale the window by sample rate at minimum; a longer window confined
+  to the lowest band only (not full-band 4096, which LEARNINGS records
+  as smearing real mixes) is the content-adaptive-resolution starting
+  point, with its lookahead and cost recorded.
+
 **Gates and falsifier.** Compare the selected Stage 25 PV before/after
 on DJ excerpts, and the wide head before/after at ±30/±50%, with both
 references. Test each change independently before combining survivors.
@@ -820,6 +915,16 @@ timing, and stereo coherence on real vocals as well as synthetic vowels.
 Blind both shift directions against the current path, envelope-off
 control, Elastique Pro, and its Monophonic mode where appropriate;
 record each reference mode separately. Gate 44.1/48/96 kHz conditions.
+
+**In-STFT shift arm (proposed 2026-10-09).** Alongside the envelope-off
+control, try shifting inside the PV instead of stretch → sinc resample
+→ cepstral correction: scale instantaneous frequencies and move each
+peak's region of influence to its new bin, with the formant envelope
+applied in the same spectrum before synthesis. It removes the separate
+resampling stage and keeps transient correspondence on one timeline.
+Peak-region shifting is Laroche–Dolson (US 6,549,884, expired 2019).
+Depends on the Stage 24 phase policy, so render it on whichever head
+Stage 24 selects.
 
 **Fallback and exit.** Retain the best measured correction policy if an
 experiment loses. Explicitly document any unsupported preservation

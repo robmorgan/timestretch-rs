@@ -383,6 +383,9 @@ offline wide-ratio fallback, `src/engine/offline.rs`) in August 2026.
 - [EP1918911A1](https://patents.google.com/patent/EP1918911A1/en)
 - [US20050010397A1](https://patents.google.com/patent/US20050010397A1/en)
 - [US10283130B2](https://patents.google.com/patent/US10283130B2/en)
+- [US9236062B2](https://patents.google.com/patent/US9236062B2/en) — Fraunhofer transient cut/stretch/reinsert; active to 2029-09-29 per Google Patents (ROADMAP Parity Track IP note)
+- [US6549884B1](https://patents.google.com/patent/US6549884B1/en) — Laroche–Dolson PV pitch shifting by peak-region shift; expired 2019
+- [US8489404B2](https://patents.google.com/patent/US8489404B2/en) — transient frames left unscaled; lapsed 2021
 
 ### Papers / Technical Sources
 - [Laroche & Dolson 1999 (IEEE record)](https://ieeexplore.ieee.org/document/759041)
@@ -393,6 +396,8 @@ offline wide-ratio fallback, `src/engine/offline.rs`) in August 2026.
 - [WSOLA original IEEE record](https://ieeexplore.ieee.org/document/319366)
 - [Enhanced WSOLA w/ transients IEEE record](https://ieeexplore.ieee.org/document/4381234)
 - [PVSOLA DAFx 2011 PDF](https://www.dafx.de/paper-archive/2011/Papers/57_e.pdf)
+- [Průša & Holighaus 2022 — Phase Vocoder Done Right (arXiv)](https://arxiv.org/abs/2202.07382)
+- [Průša & Søndergaard 2016 — Real-Time Spectrogram Inversion Using PGHI (DAFx)](https://dafx.de/paper-archive/details/KyhYU44R13wwkkqNs3bgPw)
 
 ### Open-Source Implementations
 - [Rubber Band](https://github.com/breakfastquay/rubberband)
