@@ -33,7 +33,7 @@ Halo runs at 96 kHz, so sample-rate-aware analysis and explicit 96 kHz
 quality/callback gates travel with every stage. Offline render
 throughput (issue #78) is handled outside this roadmap.
 
-## Status (2026-09-11)
+## Status (2026-10-08)
 
 Shipped and settled: pull-based stage-graph engine (Tape / Keylock /
 WideKeylock profiles), SOLA keylock through ±20% at 12.7 ms, wide-range
@@ -93,16 +93,27 @@ the best-of reference gate. Neither gates Stage 25: at ±4/±8 %
 DJ-window baseline is not explained by the wide head's missing events,
 and the Stage 14 ablation found those resets audibly innocent.
 
-**Work in flight (2026-09-11).** Stage 25's hybrid prototype
-(`stage25/hybrid-proto`, `75b98ed`) and its 12-condition × 5-arm blind
-set, Stage 24's peak-track prototype (`stage24/peaktrack-proto`) and
-its ±30/±50 blind set, and Stage 27's pitch baseline set
-(`stage27/pitch-refs`, 8 conditions × 5 arms) are rendered and await
-the owner's sealed-key listens. Stage 28's material rows
+**Stage 25 closed and Stage 24's prototype killed, 2026-10-08.** Two
+owner listens on the Stage 16 excerpts. At ±4/±8 % the full-PV control
+(`9dbe45a`) and the two-path hybrid (`75b98ed`) both read
+robotic/underwater; the three-path hybrid was dropped unheard. At
+±30/±50 % both peak-track arms (`a9d2680`) regained robotic/underwater
+vocabulary. No steady-state candidate beats the shipped engine, so
+Stage 26 has nothing to promote yet. The shipped arm, DSP-identical to
+the Stage 23 baseline, counted ~4/12 below Elastique (DJ) and 4–5/12
+(wide), still with one "robot" mention per set. The recurring complaint
+on it in both windows is the bassline sounding out of key. Archived in
+LEARNINGS.md.
+
+**Work in flight (2026-10-08).** Stage 27's pitch baseline set
+(`stage27/pitch-refs`, 8 conditions × 5 arms) awaits the owner's
+sealed-key listen. Stage 28's material rows
 (`stage28/corpus-generality`) are on their branch with Elastique
-references re-rendered after the decoder-alignment fix. The remaining
-order is 25 → 23a → 24 → 26 → 27 → 28 → 29; lane integration follows
-the DSP verdicts.
+references re-rendered after the decoder-alignment fix. The prototype
+branches (`stage25/hybrid-proto`, `stage25/fullpv-control`,
+`stage24/peaktrack-proto`) stay unmerged as the record. The remaining
+order is 23a → 24 → 26 → 27 → 28 → 29; lane integration follows the
+DSP verdicts.
 
 Stage 19 (direct-ratio wide path) completed 2026-08-14 (PR #60) — the
 PV owns the tempo axis for the wide profile as the graph's demand
@@ -401,7 +412,7 @@ possible "minor bass wobble" on cold heart +4%, and kick smear on cold
 heart −8% present in BOTH our arms (pre-existing, not the bass
 corrector — likely high-band or material).
 
-## Parity Track (opened 2026-09-02, updated 2026-09-11)
+## Parity Track (opened 2026-09-02, updated 2026-10-08)
 
 The Stage 23 blind baseline establishes a gap on drum attacks, bass,
 and tonal texture. The mechanism behind each artifact remains an
@@ -412,12 +423,13 @@ phase tracking, and separate noise treatment are candidates supported
 by the research, not verified descriptions of Elastique's internals or
 guarantees of parity.
 
-Execution order is **23 (done) → 25 → 23a → 24 → 26 → 27 → 28 → 29**,
-with Stage 23b's gate fix landing alongside whatever is in progress.
-Stage 25 stays first because its prototype and blind set are already
-rendered and decomposition is the untried mechanism class; Stage 23a
-precedes Stage 24 because both work on the wide head and the peak-track
-verdict should be read against a head with its guidance connected.
+Execution order is **23 (done) → 25 (done, killed) → 23a → 24 → 26 →
+27 → 28 → 29**, with Stage 23b's gate fix landing alongside whatever is
+in progress. Stage 23a precedes the rest of Stage 24 because both work
+on the wide head and later Stage 24 candidates should be read against a
+head with its guidance connected. Stage 24's first prototype is already
+killed (below); its remaining hypotheses start with low-band coherence,
+the recurring "bassline out of key" complaint.
 Stage 28's material selection and listener recruitment start before
 candidate selection. A simpler full-PV path can win Stage 25; the
 hybrid is not a prerequisite for progress.
@@ -543,7 +555,22 @@ track at two DJ rates; per-engine summaries are diagnostic averages.
 block the corresponding parity claim. They are not replaced by an
 easier ratio or by another engine's score.
 
-### Stage 25 — Hybrid Decomposition Kill Experiment (OPEN — prototype rendered, awaiting the owner's listen)
+### Stage 25 — Hybrid Decomposition Kill Experiment (CLOSED 2026-10-08: killed)
+
+**Verdict.** Blind set `target/ab/stage25-fullpv` (12 conditions ×
+current / fullpv / hy2 / Rubber Band / Elastique, ±4/±8 %). The full-PV
+control (`stage25/fullpv-control`, `9dbe45a`) read robotic, underwater
+or closed in 6/12; the two-path hybrid (`75b98ed`) was faulted in 8/12,
+worst on hot_stuff where Keylock is clean. Both fail the
+never-robotic bar, so neither the plain PV nor decomposition beats
+shipped Keylock in the DJ window. The three-path hybrid's set
+(`target/ab/stage25-hybrid`) was not heard: it shares hy2's
+transient/residual split, and is the first listen if decomposition is
+revisited. Keylock stays the shipped default. Open question carried
+forward: the same wide head is robotic here and clean at ±30/±50 %
+(Stage 24 set), which missing onset guidance alone does not explain.
+The fallback below (tonality-adaptive SOLA) remains untried. Notes and
+per-condition reads in LEARNINGS.md.
 
 **Why.** Stage 16 rejected a small PV behind the 120 Hz split; it did
 not establish how the current direct-ratio, full-resolution wide head
@@ -611,7 +638,17 @@ bet, and its latency/lookahead/cost. Stage 24 develops the surviving PV
 candidate, or independently evaluates the shipped wide head when no
 PV candidate survives; Stage 26 requires a winning steady-state path.
 
-### Stage 24 — Tonal, Bass, and Stereo Coherence (OPEN — prototype rendered, awaiting the owner's listen; before lane integration)
+### Stage 24 — Tonal, Bass, and Stereo Coherence (OPEN — first prototype killed 2026-10-08; before lane integration)
+
+**Verdict on the first prototype.** Blind set
+`target/ab/stage24-peaktrack` (12 conditions, ±30/±50 %). trackband and
+all1024 (`a9d2680`) were each robotic/underwater/wobbly in 5/12 and beat
+the shipped head only once; both killed. Identity locking stays. The
+shipped head was mostly "open, wide, clean" and ~4–5/12 below
+Elastique, its faults mostly the bassline sounding out of key (msbwy
++30/−50, cold_heart −50). Low-band coherence is therefore the next
+Stage 24 candidate; content-adaptive resolution and stereo linkage
+follow. Per-condition reads in LEARNINGS.md.
 
 **Prototype state (built 2026-09-07, `stage24/peaktrack-proto`).**
 `TIMESTRETCH_PROTO_PEAKTRACK` (`1`/`all`, or a list of `track`, `band`,

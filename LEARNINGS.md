@@ -934,3 +934,83 @@ Lessons:
   compression. Slowdowns and the DJ window are, and those are the
   decomposition's (Stage 25) and the low-band coherence's (Stage 24)
   targets in that order.
+
+## Stages 25 and 24 — Prototype Kill Listens (2026-10-08, all prototypes killed)
+
+Two sealed-key owner sessions on the Stage 16 excerpts (msbwy 90 s,
+hot_stuff 60 s, cold_heart 45 s), five arms each, notes per arm, no
+winner picks. The "current" arm in both is the shipped engine at main
+`2628090`, DSP-identical to the Stage 23 baseline renders (`f95c70f`;
+no `src/` change between them).
+
+**Stage 25, DJ window ±4/±8 %** (`target/ab/stage25-fullpv/results.json`;
+arms current / fullpv / hy2 / Rubber Band / Elastique):
+
+- **fullpv** (`9dbe45a`, `TIMESTRETCH_PROTO_FULLPV=1`: the shipped
+  direct-ratio wide head forced at DJ ratios) read robotic, underwater
+  or closed in 6 of 12 — "awful, under water, robot" (msbwy +4),
+  "muddly, robotic, under water" (msbwy −4), "closed, roboty"
+  (cold_heart +8). Clean on msbwy −8 and hot_stuff +8/−4. Killed: the
+  criterion forbids robotic vocabulary.
+- **hy2** (`75b98ed`, two-path transient/tonal hybrid) was faulted in
+  8 of 12, and worst where Keylock is cleanest: hot_stuff −4/−8
+  "wobbly, roboty, bad" / "wobbly, underwater, bad", msbwy −8 "awful
+  artifacts in the low end". Killed under the Stage 25 rule.
+- **hy3** (three-path) was never heard: `target/ab/stage25-hybrid` was
+  skipped once hy2 failed this badly, since hy3 adds a noise path to
+  the same transient/residual split. Dropped untested; if
+  decomposition is ever revisited, that set is the first listen.
+- **current** was clean on all four hot_stuff conditions and most of
+  cold_heart. Its faults were msbwy at every rate ("kicks smearing",
+  "tiny bitcrushed on kicks, ultra robot parts" at +4, "bassline sounds
+  out of key" at −4, "bpm seems to speed up at sections" at +8) and
+  cold_heart −8 ("bassline is off or out of key, kicks smearing").
+  Elastique was heard "slight robot, under water" once (hot_stuff +8).
+
+**Stage 24, wide ±30/±50 %** (`target/ab/stage24-peaktrack/results.json`;
+arms current / trackband / all1024 / Rubber Band / Elastique;
+prototype `a9d2680`):
+
+- **trackband** (peak continuation + Bark lock strength) was
+  robotic/underwater/metallic in 5 of 12 — hot_stuff −50 "underwater,
+  awful", cold_heart −30 "pulsing roboty, metallic noise". It beat the
+  shipped head only at msbwy +30. Killed.
+- **all1024** (all changes, 1024 short arm) was robotic/underwater/
+  wobbly in 5 of 12, with the bassline out of key twice. Killed — the
+  pre-listen purity probe (h15 67.7 → 37.5 dB at −50 %) predicted it.
+- **current** was mostly "open, wide, clean". Below Elastique on msbwy
+  +30 and −50 (bassline "a tiny bit out" / "a bit out"), hot_stuff +30
+  (Elastique "the best"), cold_heart −50 ("slightly roboty,
+  baseline"); marginal at hot_stuff +50 (Elastique "cleanest"). Ahead
+  where Elastique turned metallic/bitcrushed (hot_stuff −30,
+  cold_heart −30, msbwy −30).
+
+**Against the parity criterion:** DJ window ~4/12 below Elastique with
+"robot" vocabulary on msbwy +4; wide 4–5/12 below with "roboty" on
+cold_heart −50. Both still fail, but on the same engine the Stage 23
+baseline counted 9/12 and 8/12.
+
+Lessons:
+
+- **A single session's below-Elastique count is noisy.** The same
+  engine scored 9/12 → ~4/12 (DJ) and 8/12 → 4–5/12 (wide) a month
+  apart. Arm count (five vs three), the competing prototypes'
+  failures, and listening context move the bar the shipped arm is
+  heard against. Read counts only within a session; the two-listener
+  rule in the criterion is the guard, and a parity sign-off should
+  re-hear the shipped arm in the same session, never compare to an
+  archived count.
+- **The same wide head is robotic at ±4/±8 % and clean at ±30/±50 %.**
+  fullpv and current-in-the-wide-set are one head; only the ratio
+  differs. Unexplained. The pre-listen probe saw its 10 ms envelope
+  correlate only ~0.65 with Rubber Band at both −4 % and −30 %, so
+  missing onset guidance (Stage 23a) alone does not explain a
+  ratio-dependent verdict. Find the small-ratio mechanism before any
+  "make the DJ path spectral" proposal returns.
+- **Bassline out of key is the recurring complaint on the shipped
+  engine in both windows** (msbwy at nearly every rate, cold_heart
+  −8/−50). On the DJ path the Stage 21 corrector is engaged at these
+  rates and the verdict persists; on the wide path it is PV low-band
+  coherence. It is now the most specific lead the listens give.
+- **Measure-before-listen paid again.** all1024's purity collapse was
+  in `probes.txt` before rendering; the listen confirmed it.
