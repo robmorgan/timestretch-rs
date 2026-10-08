@@ -1014,3 +1014,52 @@ Lessons:
   coherence. It is now the most specific lead the listens give.
 - **Measure-before-listen paid again.** all1024's purity collapse was
   in `probes.txt` before rendering; the listen confirmed it.
+
+## Stage 27 — Pitch-Shift Baseline Listen (2026-10-08, baseline only)
+
+No DSP change: the first sealed-key session on pitch shifting, to set
+the Stage 27 bar. Set `target/ab/stage27-pitch` (renders from
+`stage27/pitch-refs` `3f843ac`, `src/` identical to main;
+`results.json`, notes only): Josh Woodward "Anchor" (acoustic vocal)
+and Brad Sucks "Out of It" (rock vocal) × ±3/±7 st × five arms — ours
+(`pitch_shift()`, default Balanced envelope preset, so cepstral
+correction at full strength at every shift), Rubber Band `--pitch
+--formant`, and élastique Pro / Pro-formant / Soloist-mono.
+
+- **Ours** was below the best formant-preserving reference in 7 of 8.
+  It was level only at Out of It −7 ("low, clean, slightly closed" vs
+  Pro-formant "a bit fuzzy"). Robotic or underwater wording in 4 of 8:
+  Anchor +3 "tiny bit robotic", Anchor +7 "a tiny bit robot", Anchor −7
+  "slightly robot, metallic vocal", Out of It +7 "under water noises".
+  Downward shifts lost vocal identity even with correction on: "not
+  bad, but pitched down a lot" (Out of It −3), "vocal is a bit off"
+  (Anchor −3).
+- **Rubber Band** was the cleanest arm in about 6 of 8; its one clear
+  miss was "muddled vocal" at Anchor −7.
+- **Élastique Pro-formant** was "clean, open" on every Anchor
+  condition, but "tiny bit bitcrushed" / "a bit bitcrushed, baseline
+  sounds a bit out" / "a bit fuzzy" on Out of It. It is the bar on
+  acoustic material and beatable on dense rock.
+- **Élastique Pro** (no formant) read "chipmunk" / "pitched down a lot"
+  as a formant-off control should. **Soloist-mono** was "awful, 8-bit"
+  or "roboty, metallic" on all 8. It is a monophonic mode, the wrong
+  tool for full mixes, so drop it from future sets.
+
+Against the parity criterion this is a clear fail (7/8 below, robot
+vocabulary in half).
+
+Lessons:
+
+- **The robot sound is not one engine path's problem.** `pitch_shift`
+  stretches by the pitch factor and resamples, so ±3 st runs through
+  Keylock (ratios 0.84/1.19) and ±7 st through the wide head
+  (0.67/1.50). Robot notes landed on both. The step common to both,
+  per-channel cepstral envelope correction after resampling, is the
+  first suspect to isolate with an envelope-off arm.
+- **Full-strength correction did not preserve identity downward.**
+  The Balanced preset applies it at every factor (only the Vocal preset
+  mutes it below 0.8×), and −3 st still read "pitched down". Cepstral
+  correction on a full mix is not yet doing the job Pro-formant and
+  Rubber Band's formant mode do.
+- **Pick reference modes that fit the material.** Soloist-mono cost a
+  fifth of every condition to learn what its name says.

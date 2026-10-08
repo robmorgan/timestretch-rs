@@ -106,8 +106,9 @@ on it in both windows is the bassline sounding out of key. Archived in
 LEARNINGS.md.
 
 **Work in flight (2026-10-08).** Stage 27's pitch baseline set
-(`stage27/pitch-refs`, 8 conditions × 5 arms) awaits the owner's
-sealed-key listen. Stage 28's material rows
+(`stage27/pitch-refs`, 8 conditions × 5 arms) was heard 2026-10-08:
+ours below the best formant-preserving reference in 7/8, robot
+vocabulary in 4/8 (Stage 27 below). Stage 28's material rows
 (`stage28/corpus-generality`) are on their branch with Elastique
 references re-rendered after the decoder-alignment fix. The prototype
 branches (`stage25/hybrid-proto`, `stage25/fullpv-control`,
@@ -775,7 +776,7 @@ rekordbox deck at the same interface buffer. Archive the actual
 response/latency/callback measurements; static offline references
 establish sound quality, not the competitor's live gesture response.
 
-### Stage 27 — Pitch-Shift and Formant Parity (baseline set rendered 2026-09-10)
+### Stage 27 — Pitch-Shift and Formant Parity (baseline heard 2026-10-08)
 
 **Baseline in hand (`stage27/pitch-refs`).** `render_elastique.py
 --semitones` renders REAPER pitch jobs in three modes (Pro, Pro with
@@ -784,8 +785,20 @@ formant preservation, Soloist Monophonic) to
 conditions with ours = `pitch_shift()` and Rubber Band = `--pitch
 --formant`. Blind set `target/ab/stage27-pitch`: 8 conditions (Anchor
 and Out of It × ±3/±7 st) × 5 arms (current / Rubber Band / Elastique
-Pro / Pro-formant / Soloist), awaiting the owner's listen. No DSP
-touched.
+Pro / Pro-formant / Soloist). No DSP touched.
+
+**Baseline verdict (owner, 2026-10-08).** Ours (`pitch_shift()`,
+Balanced preset, so full-strength envelope correction) was below the
+best formant-preserving reference in 7/8, with robotic/underwater
+wording in 4/8 across both the Keylock (±3 st) and wide (±7 st) paths.
+Downward shifts lost vocal identity ("pitched down a lot", "vocal is a
+bit off" at −3 st). Rubber Band `--formant` was cleanest in ~6/8.
+Elastique Pro-formant was clean on every Anchor condition but
+fuzzy/bitcrushed on Out of It. Soloist-mono failed all 8 and is dropped
+from future sets. Because the robot sound appears on both engine paths,
+the first experiment isolates the shared post-resample envelope
+correction (envelope-off arm) before engine work. Per-condition reads
+in LEARNINGS.md.
 
 **Evidence.** `pitch_shift` uses the engine-backed stretch plus sinc
 resampling, followed by per-channel cepstral envelope correction in
