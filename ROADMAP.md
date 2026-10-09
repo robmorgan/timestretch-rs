@@ -443,26 +443,21 @@ revision, parameters, sample rate, reference configuration, and metric
 and listening results. Null/purity checks precede blind selection.
 
 **IP check before decomposition returns (proposed 2026-10-09).** The
-Stage 25 hybrid cuts each transient region out, stretches the residual,
-and reinserts the original transient at its mapped position with
-crossfaded borders. That is the pattern claimed by Fraunhofer's
-US 9,236,062 (priority 2008-03-10; Google Patents lists it active to
-2029-09-29, and the family has litigation on record). The same family
-describes transient-position metadata generated ahead of time for
-storage, which the shipped `.tsa` onset artifacts resemble; whether that
-embodiment survived into the granted US claims is unchecked. Neither
-blocks current work — the hybrid is on an unmerged, killed branch — but
-obtain a freedom-to-operate read of that family before the three-path
-set is heard or any cut-and-reinsert design is promoted, and before a
-commercial release that depends on artifact-driven transient handling.
-Expired and therefore free: Laroche–Dolson peak-region pitch shifting
-(US 6,549,884, expired 2019) and frame-skip transient bypass
-(US 8,489,404, lapsed 2021). No zplane-assigned patents were found
-(Google Patents assignee search was blocked; Espacenet/DPMA not yet
-searched). Time-map anchoring (Stage 23a arm below) bends the ratio
-inside one PV and does not remove or reinsert audio; the
-"stretch more around transients" idea is cited as prior art in the
-Fraunhofer filing itself (Ravelli/Sandler/Bello 2005, Röbel 2003).
+Stage 25 hybrid cut each transient region out, stretched the residual,
+and reinserted the original transient with crossfaded borders. That is
+the pattern described by Fraunhofer's US 9,236,062 (priority
+2008-03-10; Google Patents lists it active to 2029-09-29, an assumption,
+not a legal conclusion). The same filing describes transient timing
+stored as metadata; whether that is in the granted claims is unread,
+so any resemblance to the `.tsa` onset artifacts is unassessed, not
+established. Nothing shipped depends on cut-and-reinsert (the hybrid is
+on an unmerged, killed branch). Get a freedom-to-operate read of that
+family before any cut-and-reinsert design is revisited or promoted.
+Expired and free: Laroche–Dolson peak-region pitch shifting (US
+6,549,884, 2019) and frame-skip transient bypass (US 8,489,404, 2021).
+Time-map anchoring (Stage 23a arm below) bends the ratio inside one PV
+and neither removes nor reinserts audio. Patent links are in
+RESEARCH.md.
 
 ### Stage 23 — Elastique Reference Corpus and Parity Criterion (CLOSED 2026-09-03: achieved)
 
@@ -516,11 +511,11 @@ authoritative. Keep the direct-ratio topology that survived Stage 19.
 
 **Time-map anchoring arm (proposed 2026-10-09).** Resets restore
 vertical coherence but not where the attack lands: frames that see an
-onset before their centre each render it at a different output offset,
-spreading pre-echo over roughly half a window × |1/r − 1| (≈4–5 ms for
-FFT 4096 at ±10 %; about half that at the shipped 2048). Because this
-head owns the tempo axis, it can instead hold the local ratio at
-exactly 1 from about half a window before each qualifying onset until
+onset each render it at a different output offset, spreading pre-echo
+over up to one analysis window × |1/r − 1| (≈4–5 ms at the shipped FFT
+2048, ±10 %, 44.1 kHz; double at 4096), most of it in the window's
+middle half because of the Hann taper. Because this head owns the
+tempo axis, it can instead hold the local ratio at exactly 1 from about half a window before each qualifying onset until
 the attack has passed, and absorb the difference in the surrounding
 sustain (at 128 BPM and −10 % the in-between ratio moves from 0.90 to
 ≈0.89). With equal analysis and synthesis hops every frame that sees
@@ -533,7 +528,10 @@ metrics; it changes the head's rate schedule, so verify timeline
 accounting, the audible-position query, and determinism under it.
 Hi-hats can stay unanchored if their short-band pre-echo measures
 below ~1 ms; where onsets are too dense to anchor, fall back to the
-reset policy.
+reset policy. Measure that fallback rather than assuming it: at ±50 %
+with dense onsets, holding unity around each attack pushes the
+in-between ratio toward the clamp. In practice this is wide-path work;
+±4/±8 % runs on Keylock.
 
 **Gates and falsifier.** Land a discriminating regression for accurate,
 empty, and deliberately shifted onset timelines on a controlled
@@ -753,7 +751,12 @@ its guidance connected before promotion:
 **Additional candidate arms (proposed 2026-10-09).** Each is a separate
 switch under the existing prototype flag, tested alone before combining,
 and judged under this stage's gates and falsifier. None replaces
-identity locking unless it wins blind.
+identity locking unless it wins blind. Owner listens are the
+bottleneck, so run them in tiers, not as five separate sets: (1) the
+dispersion probe, measurement only, no listen; (2) PGHI fed by
+reassignment gradients, rendered with and without the
+sample-rate-scaled bass window; (3) shared-rotation stereo on the
+winner of (2). Anchoring belongs to Stage 23a.
 
 - **Near-unity dispersion probe (first, cheap).** Stage 25 left open
   why the same head reads robotic at ±4/±8 % and clean at ±30/±50 %.
@@ -777,8 +780,9 @@ identity locking unless it wins blind.
   causal variant). It needs no peak picking or tracking and claims no
   classic PV artifacts at extreme ratios. Target the low-band
   coherence complaint first; include the sub-100 Hz bins currently
-  excluded from locking. A quick search found academic sources only,
-  no patents.
+  excluded from locking. Bin width still limits bass resolution at
+  FFT 2048, so judge PGHI with and without the longer bass window. A
+  quick search found academic sources only, no patents.
 - **Reassignment-based gradients.** Per frame, take FFTs with the
   window w, its derivative w′, and t·w to get instantaneous frequency
   and local group delay per bin with no previous-frame dependency and no
@@ -923,8 +927,11 @@ peak's region of influence to its new bin, with the formant envelope
 applied in the same spectrum before synthesis. It removes the separate
 resampling stage and keeps transient correspondence on one timeline.
 Peak-region shifting is Laroche–Dolson (US 6,549,884, expired 2019).
-Depends on the Stage 24 phase policy, so render it on whichever head
-Stage 24 selects.
+Gate it on the `target/ab/stage27-envoff` verdict: if switching the
+correction off removes the robot vocabulary, the correction is the
+cause and this arm is the natural fix; if not, the robot sound comes
+from the engine, and this arm waits for Stage 24's phase policy and is
+rendered on whichever head Stage 24 selects.
 
 **Fallback and exit.** Retain the best measured correction policy if an
 experiment loses. Explicitly document any unsupported preservation
