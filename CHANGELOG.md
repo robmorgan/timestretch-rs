@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.15.1
+
+### Fixed
+
+- The phase vocoder's spectral peak list is pre-allocated for its true
+  bound (`num_bins / 2`, since a peak is a strict local maximum) instead
+  of a quarter of the bins. Dense material (noise, cymbals, a full mix)
+  presents about a third of its bins as peaks, so the first dense frame
+  reallocated on the audio thread — a host that warmed the engine on
+  silence or started on a quiet intro paid it mid-playback. A new
+  counting-allocator test warms the wide keylock chain on silence then
+  feeds white noise: two reallocs (8192 bytes) before, none after.
+
+### QA
+
+- `scripts/ab.sh --ref-arm <label>:<dir>` imports prerendered full-track
+  references into a blind A/B set, and `scripts/render_elastique.py`
+  renders élastique Pro references headlessly through REAPER.
+- `reference_quality` reports a `per_engine` summary block.
+- The A/B TUI gives its save status its own footer line.
+
 ## 0.15.0
 
 ### Changed
