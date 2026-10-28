@@ -8,8 +8,14 @@ use rustfft::{FftPlanner, num_complex::Complex};
 use std::sync::Arc;
 
 const TWO_PI_F64: f64 = 2.0 * std::f64::consts::PI;
-/// Fraction of bins to pre-allocate for spectral peak detection (1/4 of bins).
-const PEAKS_CAPACITY_DIVISOR: usize = 4;
+/// Fraction of bins to pre-allocate for spectral peak detection (1/2 of bins).
+///
+/// A peak is a strict local maximum, so two peaks are never adjacent and a
+/// spectrum holds at most `num_bins / 2` of them. Sizing for that bound up
+/// front is what keeps `advance_phases` allocation-free on dense material
+/// (noise, cymbals, a full mix): the count depends on the signal, so no
+/// rate-sweep warmup can be relied on to reach it.
+const PEAKS_CAPACITY_DIVISOR: usize = 2;
 /// Blend factor for phase gradient integration (soft vertical coherence).
 const PHASE_GRADIENT_BLEND: f64 = 0.20;
 /// Minimum magnitude to consider a bin as a spectral peak (avoids noise peaks).

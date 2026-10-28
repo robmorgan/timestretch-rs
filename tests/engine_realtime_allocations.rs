@@ -460,6 +460,87 @@ fn engine_wide_keylock_steady_state_no_heap_activity() {
     );
 }
 
+/// Deterministic white noise: about a third of its bins are local maxima,
+/// which is more peaks than a tone or a chord ever presents.
+fn noise_chunk_stereo(frames: usize, seed: u32) -> Vec<f32> {
+    let mut state = seed;
+    (0..frames * 2)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 8_388_608.0 - 1.0) * 0.5
+        })
+        .collect()
+}
+
+#[test]
+fn engine_wide_keylock_dense_spectrum_no_heap_activity() {
+    // The PV's peak list is the one buffer whose high-water mark depends on
+    // the *signal* rather than the rate, so a rate sweep cannot warm it: a
+    // host that warms up on sparse material (or silence) and then plays
+    // dense material — noise, cymbals, a full mix — must still not allocate.
+    let _guard = ALLOC_TEST_MUTEX
+        .lock()
+        .expect("allocation test mutex poisoned");
+    const CALLBACK_FRAMES: usize = 256;
+    const WARMUP_ITERS: usize = 256;
+    const MEASURE_ITERS: usize = 96;
+
+    let handles = Engine::build(EngineConfig {
+        profile: EngineProfile::WideKeylock,
+        ..EngineConfig::default()
+    })
+    .expect("engine builds");
+    let (controller, mut processor, mut source) =
+        (handles.controller, handles.processor, handles.source);
+
+    // Silence has no bin above the peak threshold, so the warmup leaves the
+    // peak list exactly as construction sized it. (A windowed sine already
+    // presents enough sidelobe maxima to grow it, which is why the
+    // steady-state test above never saw this.)
+    let sparse = vec![0.0f32; 4096 * 2];
+    let dense = noise_chunk_stereo(4096, 0x2545_F491);
+    let mut out = vec![0.0f32; CALLBACK_FRAMES * 2];
+
+    // Same full-range rate sweep as the steady-state test, on sparse input.
+    source.push(&sparse);
+    for i in 0..WARMUP_ITERS {
+        let t = i as f64 / WARMUP_ITERS as f64;
+        let rate = if i < WARMUP_ITERS / 8 {
+            0.25
+        } else {
+            1.25 + 0.75 * (2.0 * std::f64::consts::PI * t).sin()
+        };
+        controller.set_tempo_rate(rate);
+        while source.occupied_frames() < source.demand_hint(CALLBACK_FRAMES, 2.2) {
+            source.push(&sparse);
+        }
+        processor.process(&mut out);
+    }
+
+    begin_alloc_tracking();
+    for i in 0..MEASURE_ITERS {
+        let t = i as f64 / MEASURE_ITERS as f64;
+        controller.set_tempo_rate(1.25 + 0.75 * (2.0 * std::f64::consts::PI * t).sin());
+        while source.occupied_frames() < source.demand_hint(CALLBACK_FRAMES, 2.2) {
+            source.push(&dense);
+        }
+        processor.process(&mut out);
+    }
+    let (alloc_calls, realloc_calls, alloc_bytes, realloc_bytes) = end_alloc_tracking();
+
+    assert_eq!(
+        controller.underrun_frames(),
+        0,
+        "wide keylock dense spectrum must not underrun"
+    );
+    assert_eq!(
+        alloc_calls + realloc_calls,
+        0,
+        "wide keylock allocated on a dense spectrum: alloc_calls={alloc_calls}, \
+         realloc_calls={realloc_calls}, alloc_bytes={alloc_bytes}, realloc_bytes={realloc_bytes}"
+    );
+}
+
 #[test]
 fn engine_wide_keylock_warm_start_no_heap_activity() {
     // The wide preroll (latency + settle ≈ 4.4k frames) exceeds the
