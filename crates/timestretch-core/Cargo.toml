@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 description = "timestretch DSP kernel and native scheduling for timestretch"
+exclude = ["tests/"]
 
 [dependencies]
 rustfft = "6"
