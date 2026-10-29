@@ -36,7 +36,7 @@
 //! credits near-misses: exact 1.0, fifth 0.5, relative 0.3, parallel 0.2.
 //!
 //! Run with:
-//! `cargo test --features qa-harnesses --release --test bpm_accuracy -- --nocapture`
+//! `cargo test --features qa --release --test bpm_accuracy -- --nocapture`
 //!
 //! Environment:
 //! - `TIMESTRETCH_BPM_TOLERANCE`: relative tolerance (default 0.02 = +/-2%).
@@ -1040,7 +1040,7 @@ fn maybe_trim_interleaved(
 }
 
 // ---------------------------------------------------------------------------
-// Manifest path/hash helpers (same conventions as qa/reference_quality.rs)
+// Manifest path/hash helpers
 // ---------------------------------------------------------------------------
 
 fn resolve_audio_path(audio_base: &Path, configured: &str) -> Result<PathBuf, String> {
@@ -1372,16 +1372,26 @@ fn bpm_accuracy() {
     }
 }
 
-/// End-to-end smoke test on checked-in fixtures so the pipeline is exercised
-/// even when no benchmark corpus is present locally.
+#[allow(dead_code)]
+#[path = "../test_audio/generate.rs"]
+mod test_signals;
+
+/// End-to-end smoke test with deterministic generated audio; no corpus needed.
 #[test]
 fn bpm_accuracy_self_test() {
-    for (file, expected) in [
-        ("test_audio/click_train_128bpm.wav", 128.0),
-        ("test_audio/kick_pattern_128bpm.wav", 128.0),
+    let directory = std::env::temp_dir().join(format!("timestretch-bpm-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    for (file, samples, expected) in [
+        ("click.wav", test_signals::click_train(128.0, 4.0), 128.0),
+        ("kick.wav", test_signals::kick_pattern(128.0, 4.0), 128.0),
     ] {
-        let path = Path::new(file);
-        assert!(path.exists(), "checked-in fixture {} missing", file);
+        let file_path = directory.join(file);
+        std::fs::write(
+            &file_path,
+            test_signals::build_wav_float(&samples, 44100, 1),
+        )
+        .unwrap();
+        let path = file_path.as_path();
         // Synthetic ground truth: the fixtures are exact 128 BPM grids
         // from sample 0, so annotate beats every 60/128 s for the first
         // few seconds and exercise the beat-metric path end to end.
@@ -1434,7 +1444,9 @@ fn bpm_accuracy_self_test() {
             qm_f
         );
         assert_eq!(result.qm_downbeat_f, None);
+        std::fs::remove_file(path).unwrap();
     }
+    std::fs::remove_dir(directory).unwrap();
 }
 
 /// QM baseline JSONs carry provenance metadata next to the beat arrays;

@@ -1,0 +1,7 @@
+[package]
+name = "timestretch-accelerate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Isolated owned Accelerate FFT and vector adapters for timestretch"

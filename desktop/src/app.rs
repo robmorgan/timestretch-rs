@@ -7,6 +7,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::audio_engine::AudioEngine;
+use crate::backend::BackendChoice;
 use crate::deck;
 use crate::decoder;
 use crate::state::*;
@@ -15,16 +16,6 @@ use crate::waveform::{
     ZoomedParams, ZoomedTiles,
 };
 
-const MIN_STRETCH_RATIO: f64 = 0.25;
-/// Ratio ceiling on the varispeed-first tempo path (the library bounds the
-/// varispeed resampler's step range to `[0.25, 4.0]`).
-const MAX_VARISPEED_RATIO: f64 = 4.0;
-/// Tempo fader reaches double the track BPM (+100%).
-const MAX_TEMPO_FACTOR: f64 = 2.0;
-/// The Wide chain's true tempo-rate floor: its PV head clamps the ratio
-/// to [0.5, 2.0] (`wide_pv_head.rs`), so requests below rate 0.5 pin
-/// silently at -50%. The wide-fader brake takes over from here down.
-const WIDE_MIN_TEMPO_RATE: f64 = 0.5;
 /// Tempo fader width in points (3x egui's ~100pt default) for fine control.
 const TEMPO_SLIDER_WIDTH: f32 = 300.0;
 /// Auto-loop length ladder: `2^exp` beats. 1/8 beat is still thousands of
@@ -33,44 +24,27 @@ const LOOP_EXP_MIN: i32 = -3;
 /// Ladder ceiling: 32 beats (8 bars).
 const LOOP_EXP_MAX: i32 = 5;
 
-/// How a fader target maps onto the engine and the wide-fader brake.
+/// Map BPM to the library's supported domain for the selected pitch behavior.
 struct TempoMapping {
-    /// Engine stretch ratio (output/input length), clamped to the active
-    /// range's honest span — sub-floor targets pin at the ceiling.
     ratio: f64,
-    /// Post-engine brake factor `b` in `[0, 1]`; 1.0 above the Wide
-    /// chain's -50% floor.
-    brake: f64,
-    /// BPM that actually plays: `detected · (1/ratio) · brake`. Equals the
-    /// fader value throughout the braked zone, so the fader never snaps.
     effective_bpm: f64,
 }
-
-/// Splits a target BPM into the engine's stretch ratio and the Wide
-/// range's sub-floor brake factor. The wide chain can't stretch below
-/// rate 0.5 (-50%, its PV head's ratio clamp); a CDJ-3000's WIDE fader
-/// reaches -100% by stopping the platter, which the deck reproduces by
-/// pinning the engine at that floor and braking its output (see
-/// `brake.rs`). Standard range never brakes.
-fn tempo_mapping(range: DeckRange, detected_bpm: f64, target_bpm: f64) -> TempoMapping {
-    let max_ratio = match range {
-        DeckRange::Standard => MAX_VARISPEED_RATIO,
-        // Requests past the wide floor would pin silently inside the
-        // chain — cap the ratio where the chain's honesty ends and let
-        // the brake carry the rest.
-        DeckRange::Wide => 1.0 / WIDE_MIN_TEMPO_RATE,
-    };
-    let ratio = (detected_bpm / target_bpm.max(1e-6)).clamp(MIN_STRETCH_RATIO, max_ratio);
-    let brake = if range == DeckRange::Wide {
-        let desired_rate = target_bpm.max(0.0) / detected_bpm.max(1e-6);
-        (desired_rate / WIDE_MIN_TEMPO_RATE).clamp(0.0, 1.0)
+fn tempo_mapping(
+    detected_bpm: f64,
+    target_bpm: f64,
+    mode: DeckEngine,
+    pitch: timestretch::PitchRatio,
+) -> TempoMapping {
+    let (min, max) = mode.tempo_bounds(pitch);
+    let desired = target_bpm / detected_bpm.max(1e-9);
+    let rate = if desired.is_finite() {
+        desired.clamp(min.get(), max.get())
     } else {
         1.0
     };
     TempoMapping {
-        ratio,
-        brake,
-        effective_bpm: detected_bpm * (1.0 / ratio) * brake,
+        ratio: 1.0 / rate,
+        effective_bpm: detected_bpm * rate,
     }
 }
 
@@ -354,23 +328,16 @@ pub struct TimeStretchApp {
     /// Frame-based grid cache for the waveform painters and beat counter.
     grid_marks: GridMarks,
 
-    /// Wide-fader brake factor `b` in `[0, 1]` (1.0 = no brake), shared
-    /// lock-free with the audio callback and the deck thread. Below the
-    /// engine's -75% floor the Wide range's fader drives this instead of
-    /// the stretch ratio; see `brake.rs`.
-    brake_shared: Arc<AtomicRate>,
-
     // UI state
     stretch_ratio: f64,
-    /// UI-side copy of the published brake factor.
-    brake: f64,
+    pitch_semitones: f64,
     /// Target playback BPM the tempo fader binds to (0.0 until a BPM is
     /// detected). Derived view of `stretch_ratio`, kept in sync.
     target_bpm: f64,
     volume: f32,
-    preset: PresetChoice,
     deck_engine: DeckEngine,
-    deck_range: DeckRange,
+    /// Session numerical-provider preference.
+    backend: BackendChoice,
     target_bpm_text: String,
     /// Auto-loop length as a ladder exponent (`2^exp` beats).
     loop_beats_exp: i32,
@@ -380,28 +347,33 @@ pub struct TimeStretchApp {
 }
 
 impl TimeStretchApp {
-    /// Widest stretch ratio the active tempo path supports.
-    #[inline]
-    fn max_stretch_ratio(&self) -> f64 {
-        // The engine's tempo axis is the varispeed resampler.
-        MAX_VARISPEED_RATIO
+    fn pitch(&self) -> timestretch::PitchRatio {
+        timestretch::PitchRatio::from_semitones(self.pitch_semitones).unwrap()
     }
 
-    /// Sets the playback tempo to `target_bpm` (for a track at `detected_bpm`)
-    /// and syncs every derived view — stretch ratio, brake factor, the fader's
-    /// `target_bpm`, and the BPM text box — to the value that actually plays
-    /// after the engine's ratio clamp. Single write point for the tempo
-    /// control.
+    /// Publish tempo, pitch and mode together so the worker never observes an
+    /// unsupported intermediate combination after a mode or pitch change.
     fn apply_target_bpm(&mut self, detected_bpm: f64, target_bpm: f64) {
-        let m = tempo_mapping(self.deck_range, detected_bpm, target_bpm);
+        let pitch = self.pitch();
+        let m = tempo_mapping(detected_bpm, target_bpm, self.deck_engine, pitch);
         self.stretch_ratio = m.ratio;
-        self.brake = m.brake;
-        self.brake_shared.store(m.brake);
         self.target_bpm = m.effective_bpm;
-        self.target_bpm_text = format!("{:.1}", m.effective_bpm);
+        self.target_bpm_text = format!("{:.3}", m.effective_bpm);
         let mut st = self.state.lock().unwrap();
         st.stretch_ratio = m.ratio;
         st.target_bpm = m.effective_bpm;
+        st.deck_engine = self.deck_engine;
+        st.pitch = pitch;
+    }
+
+    fn apply_pitch_mode(&mut self, detected_bpm: f64) {
+        // Use unity as a virtual source BPM before analysis is available.
+        let source = if detected_bpm > 0.0 {
+            detected_bpm
+        } else {
+            1.0
+        };
+        self.apply_target_bpm(source, source / self.stretch_ratio);
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
@@ -445,14 +417,12 @@ impl TimeStretchApp {
             zoom_tiles: ZoomedTiles::default(),
             beat_grid: None,
             grid_marks: GridMarks::empty(),
-            brake_shared: Arc::new(AtomicRate::new(1.0)),
             stretch_ratio: 1.0,
-            brake: 1.0,
+            pitch_semitones: 0.0,
             target_bpm: 0.0,
             volume: 0.8,
-            preset: PresetChoice::DjBeatmatch,
             deck_engine: DeckEngine::Keylock,
-            deck_range: DeckRange::Standard,
+            backend: BackendChoice::default(),
             target_bpm_text: String::new(),
             loop_beats_exp: 2,
             error_message: None,
@@ -491,8 +461,7 @@ impl TimeStretchApp {
         // A fresh track starts at its own tempo (fader centered) and
         // unity ratio, regardless of any prior track's settings.
         self.stretch_ratio = 1.0;
-        self.brake = 1.0;
-        self.brake_shared.store(1.0);
+        self.pitch_semitones = 0.0;
         self.target_bpm = 0.0;
         self.target_bpm_text.clear();
         self.position.store(0);
@@ -507,6 +476,7 @@ impl TimeStretchApp {
             st.target_bpm = 0.0;
             st.transport = Transport::Stopped;
             st.stretch_ratio = 1.0;
+            st.pitch = timestretch::PitchRatio::UNITY;
             st.pre_analysis = None;
             st.loop_region = None;
             st.loop_in = None;
@@ -535,6 +505,16 @@ impl TimeStretchApp {
     /// Drains the load worker's channel: installs the decoded track, then
     /// the analysis when it lands. Called at the top of every `update`.
     fn poll_pending_load(&mut self) {
+        if self.audio_engine.as_ref().is_some_and(AudioEngine::failed) {
+            self.stop_playback();
+            self.error_message = Some(
+                "Audio device failed; select a working output device and restart playback".into(),
+            );
+        }
+
+        if let Some(error) = self.state.lock().unwrap().processing_error.take() {
+            self.error_message = Some(error);
+        }
         loop {
             let msg = match &self.pending_load {
                 Some(pending) => pending.rx.try_recv(),
@@ -588,18 +568,15 @@ impl TimeStretchApp {
             st.position_frames = 0;
             st.transport = Transport::Stopped;
             st.stretch_ratio = self.stretch_ratio;
-            st.preset = self.preset;
         }
 
         self.source_audio = Some(track.samples);
         self.file_path = Some(track.path);
-        self.output_sample_rate = track.sample_rate;
         self.position.store(0);
     }
 
     /// Installs the pre-analysis artifact as the UI's beat grid + BPM —
-    /// the artifact is the same analysis the engine consumes, so the fader
-    /// and the splice guidance now agree by construction.
+    /// the artifact supplies tempo and beat positions for presentation and jumps.
     fn install_analysis(&mut self, artifact: &timestretch::PreAnalysisArtifact) {
         let grid = grid_from_artifact(artifact);
         let bpm = grid.bpm;
@@ -614,7 +591,7 @@ impl TimeStretchApp {
         if bpm > 0.0 {
             // Honor whatever ratio is set by the time analysis lands
             // (unity on a fresh load): the fader binds to effective BPM.
-            let effective = bpm / self.stretch_ratio.max(MIN_STRETCH_RATIO);
+            let effective = bpm / self.stretch_ratio;
             self.target_bpm = effective;
             self.target_bpm_text = format!("{effective:.1}");
             let mut st = self.state.lock().unwrap();
@@ -629,103 +606,49 @@ impl TimeStretchApp {
         }
     }
 
-    /// Starts playback: the audio callback owns the processor and reads
-    /// from it; the feed thread keeps the source ring topped up and forwards
-    /// tempo control.
+    /// Starts the desktop worker and a device-only callback.
     fn start_playback(&mut self) {
         let source = match &self.source_audio {
             Some(s) => s.clone(),
             None => return,
         };
-
-        // Stop any existing processing thread
         self.stop_processing_thread();
-
-        let sample_rate = {
-            let st = self.state.lock().unwrap();
-            st.sample_rate
-        };
-
-        let initial_ratio = {
-            let st = self.state.lock().unwrap();
-            st.stretch_ratio
-        };
-        // The tempo range picks the profile (Standard = primary keylock
-        // chain, Wide = wide-range Master Tempo chain); the Tape/Keylock
-        // deck mode stays a live engine parameter (delay-matched
-        // crossfade) INSIDE whichever profile is running — switching deck
-        // mode mid-play is instant, switching range is a seek-priced
-        // rebuild handled by the range selector.
-        let profile = self.state.lock().unwrap().deck_range.profile();
-        // Analyze-on-load artifact: the engine's primary transient control
-        // signal (splice guidance + PV phase resets). Arc-shared with the
-        // analysis thread's result.
-        let pre_analysis = self.state.lock().unwrap().pre_analysis.clone();
-        let config = timestretch::engine::EngineConfig {
-            sample_rate,
-            channels: 2,
-            profile,
-            initial_tempo_rate: 1.0 / initial_ratio.clamp(0.25, MAX_VARISPEED_RATIO),
-            max_block_frames: 2048,
-            source_capacity_frames: 65_536,
-            pre_analysis,
-        };
-        let handles = match timestretch::engine::Engine::build(config) {
-            Ok(h) => h,
-            Err(e) => {
-                self.error_message = Some(format!("Engine error: {e}"));
-                return;
-            }
-        };
-        let pipeline_latency_secs =
-            handles.processor.pipeline_latency_frames() as f64 / sample_rate as f64;
-        let warm_start_preroll = handles.processor.warm_start_preroll_frames();
-
-        let reset_request = Arc::new(AtomicBool::new(false));
+        {
+            let mut st = self.state.lock().unwrap();
+            st.transport = Transport::Playing;
+            st.output_sample_rate = self.output_sample_rate;
+            st.backend = self.backend.backend();
+            st.processing_error = None;
+        }
+        let (producer, consumer) = crate::output_queue::channel(32768);
         self.volume_shared.store(self.volume);
         let engine = match AudioEngine::new(
             self.volume_shared.clone(),
             self.stream_active.clone(),
-            Some(sample_rate),
-            handles.processor,
-            reset_request.clone(),
+            Some(self.output_sample_rate),
+            consumer,
             self.scrub.clone(),
             source.clone(),
-            self.brake_shared.clone(),
         ) {
-            Ok(e) => e,
-            Err(e) => {
-                self.error_message = Some(format!("Audio error: {e}"));
+            Ok(engine) => engine,
+            Err(error) => {
+                self.error_message = Some(error);
+                self.state.lock().unwrap().transport = Transport::Stopped;
                 return;
             }
         };
         self.audio_engine = Some(engine);
-
-        {
-            let mut st = self.state.lock().unwrap();
-            st.transport = Transport::Playing;
-            st.total_frames = source.len() / 2;
-        }
-
-        let stop_flag = Arc::new(StopFlag::new());
-        self.stop_flag = Some(stop_flag.clone());
-
-        let handle = deck::start_deck_thread(
+        let stop = Arc::new(StopFlag::new());
+        self.stop_flag = Some(stop.clone());
+        self.processing_handle = Some(deck::start_deck_thread(
             self.state.clone(),
             source,
-            handles.source,
-            handles.controller,
+            producer,
             self.position.clone(),
             self.stream_active.clone(),
-            stop_flag,
-            reset_request,
+            stop,
             self.scrub.clone(),
-            pipeline_latency_secs,
-            warm_start_preroll,
-            self.brake_shared.clone(),
-        );
-
-        self.processing_handle = Some(handle);
+        ));
     }
 
     fn stop_playback(&mut self) {
@@ -818,9 +741,7 @@ impl eframe::App for TimeStretchApp {
                 if transport == Transport::Playing
                     && self.stream_active.load(Ordering::Relaxed) =>
             {
-                // The brake scales the audible rate below the Wide floor;
-                // at a full stop the rate is 0 and the display pins.
-                Some(sample_rate as f64 / self.stretch_ratio.max(MIN_STRETCH_RATIO) * self.brake)
+                Some(sample_rate as f64 / self.stretch_ratio)
             }
             ScrubPhase::Settling => Some(self.scrub.voice_rate() * self.output_sample_rate as f64),
             _ => None,
@@ -996,17 +917,12 @@ impl TimeStretchApp {
                         // and the landing consumer below warm-starts the
                         // engine there in parallel.
                         let playing = self.state.lock().unwrap().transport == Transport::Playing;
-                        // While the wide-fader brake is engaged the deck's
-                        // audible rate is floor·b (= b/ratio), not 1.0 —
-                        // ease the glide into the braked speed so the
-                        // crossfade back to the (braked) engine doesn't
-                        // lurch.
-                        let play_rate = if self.brake < 1.0 {
-                            self.brake / self.stretch_ratio.max(MIN_STRETCH_RATIO)
+                        let play_rate = 1.0 / self.stretch_ratio;
+                        self.scrub.release(if playing {
+                            play_rate * sample_rate as f64 / self.output_sample_rate as f64
                         } else {
-                            1.0
-                        };
-                        self.scrub.release(if playing { play_rate } else { 0.0 });
+                            0.0
+                        });
                     } else {
                         // No audio stream to render a glide — land instantly.
                         self.scrub.cancel();
@@ -1072,10 +988,7 @@ impl TimeStretchApp {
     fn request_seek(&mut self, frame: usize) {
         let stopped = {
             let mut st = self.state.lock().unwrap();
-            st.seek_request = Some(frame);
-            if st.transport == Transport::Stopped {
-                st.position_frames = frame;
-            }
+            st.request_seek(frame);
             st.transport == Transport::Stopped
         };
         if stopped {
@@ -1171,7 +1084,7 @@ impl TimeStretchApp {
                         }
                     }
                     .min(total_frames.saturating_sub(1));
-                    self.state.lock().unwrap().seek_request = Some(target);
+                    self.state.lock().unwrap().request_seek(target);
                 }
             }
 
@@ -1293,58 +1206,48 @@ impl TimeStretchApp {
             .spacing([16.0, 8.0])
             .show(ui, |ui| {
                 // Tempo control. With a detected BPM it is a CDJ-style tempo
-                // fader in BPM (0.1-BPM steps, centered on the track tempo);
+                // fader in BPM across the library's supported tempo domain;
                 // otherwise it falls back to a raw stretch-ratio slider.
                 let detected = fs.detected_bpm;
                 ui.label("Tempo:");
                 ui.horizontal(|ui| {
                     if detected > 0.0 {
-                        // 0.0 means "uninitialized" only while no brake is
-                        // engaged — at a full WIDE stop the fader honestly
-                        // reads 0.0 BPM and must not snap back.
-                        if self.target_bpm <= 0.0 && self.brake >= 1.0 {
-                            self.target_bpm = detected;
+                        if self.target_bpm <= 0.0 {
+                            self.target_bpm = detected / self.stretch_ratio;
                         }
-                        // The WIDE range reaches a CDJ-style full stop:
-                        // below the wide chain's -50% floor the engine
-                        // pins and the brake resampler takes the rest
-                        // (see brake.rs).
-                        let min_bpm = if self.deck_range == DeckRange::Wide {
-                            0.0
-                        } else {
-                            detected / self.max_stretch_ratio()
-                        };
-                        let max_bpm = detected * MAX_TEMPO_FACTOR;
+                        let (min, max) = self.deck_engine.tempo_bounds(self.pitch());
+                        let min_bpm = detected * min.get();
+                        let max_bpm = detected * max.get();
                         let old_bpm = self.target_bpm;
-                        // Widen the fader (3x the default) so 0.1-BPM steps
-                        // are easy to hit by drag.
+                        // Logarithmic travel keeps very slow rates accessible.
                         ui.spacing_mut().slider_width = TEMPO_SLIDER_WIDTH;
                         ui.add(
                             egui::Slider::new(&mut self.target_bpm, min_bpm..=max_bpm)
-                                .step_by(0.1)
-                                .fixed_decimals(1)
+                                .logarithmic(true)
+                                .fixed_decimals(3)
                                 .suffix(" BPM"),
                         );
-                        if (self.target_bpm - old_bpm).abs() > 0.001 {
+                        if self.target_bpm != old_bpm {
                             self.apply_target_bpm(detected, self.target_bpm);
                         }
-                        let pct = ((1.0 / self.stretch_ratio) * self.brake - 1.0) * 100.0;
-                        ui.label(egui::RichText::new(format!("{pct:+.1}%")).weak());
+                        let pct = (1.0 / self.stretch_ratio - 1.0) * 100.0;
+                        ui.label(egui::RichText::new(format!("{pct:+.3}%")).weak());
                         if ui.button("Reset").clicked() {
                             self.apply_target_bpm(detected, detected);
                         }
                     } else {
                         let old_ratio = self.stretch_ratio;
-                        let max_ratio = self.max_stretch_ratio();
+                        let (min, max) = self.deck_engine.tempo_bounds(self.pitch());
                         ui.add(
                             egui::Slider::new(
                                 &mut self.stretch_ratio,
-                                MIN_STRETCH_RATIO..=max_ratio,
+                                max.duration().get()..=min.duration().get(),
                             )
-                            .text("x")
-                            .fixed_decimals(2),
+                            .logarithmic(true)
+                            .text("× duration")
+                            .fixed_decimals(3),
                         );
-                        if (self.stretch_ratio - old_ratio).abs() > 0.001 {
+                        if self.stretch_ratio != old_ratio {
                             self.state.lock().unwrap().stretch_ratio = self.stretch_ratio;
                         }
                         if ui.button("Reset").clicked() {
@@ -1382,28 +1285,28 @@ impl TimeStretchApp {
                 });
                 ui.end_row();
 
-                // EDM Preset
-                ui.label("Preset:");
+                ui.label("Pitch:");
                 ui.horizontal(|ui| {
-                    let old_preset = self.preset;
-                    egui::ComboBox::from_id_salt("preset_combo")
-                        .selected_text(self.preset.label())
-                        .show_ui(ui, |ui| {
-                            for &p in PresetChoice::ALL {
-                                ui.selectable_value(&mut self.preset, p, p.label());
-                            }
-                        });
-                    if self.preset != old_preset {
-                        let mut st = self.state.lock().unwrap();
-                        st.preset = self.preset;
+                    let old = self.pitch_semitones;
+                    ui.add_enabled(
+                        self.deck_engine == DeckEngine::Keylock,
+                        egui::Slider::new(&mut self.pitch_semitones,
+                            12.0 * timestretch::PitchRatio::MIN.get().log2()..=12.0 * timestretch::PitchRatio::MAX.get().log2())
+                            .suffix(" semitones").fixed_decimals(2),
+                    );
+                    if ui.button("Reset").clicked() {
+                        self.pitch_semitones = 0.0;
+                    }
+                    if self.pitch_semitones != old {
+                        self.apply_pitch_mode(detected);
                     }
                 });
                 ui.end_row();
 
-                // Deck engine mode: Tape (pitch follows tempo) vs Keylock
-                // (pitch-preserving). A live engine parameter — the deck
-                // thread forwards it and the keylock stage crossfades
-                // (~12 ms), so switching mid-play is instant and gapless.
+                // Tape links pitch to tempo; Keylock holds the selected pitch.
+                // The worker schedules this intent at the
+                // session's next legal control boundary; queued audio retains
+                // the parameters with which it was rendered.
                 ui.label("Deck:");
                 ui.horizontal(|ui| {
                     let old_deck = self.deck_engine;
@@ -1415,102 +1318,37 @@ impl TimeStretchApp {
                             }
                         });
                     if self.deck_engine != old_deck {
-                        self.state.lock().unwrap().deck_engine = self.deck_engine;
+                        self.apply_pitch_mode(detected);
                     }
-                    match (self.deck_engine, self.deck_range) {
-                        (DeckEngine::Tape, _) => {
-                            ui.label(egui::RichText::new("tape: pitch follows tempo").weak())
-                                .on_hover_text(
-                                    "Tape mode: pitch follows the fader (delay-matched \
-                                     varispeed at the active range's constant pipeline \
-                                     delay, so switching live is seamless).",
-                                );
-                        }
-                        (DeckEngine::Keylock, DeckRange::Standard) => {
-                            ui.label(egui::RichText::new("keylock: two-band").weak())
-                                .on_hover_text(
-                                    "Keylock mode: both bands pitch-corrected at the \
-                                     delay-matched transposition — the bass corrector \
-                                     engages beyond ~±1–2% deviation; mild nudges keep \
-                                     pitch-follow bass (~13 ms pipeline delay).",
-                                );
-                        }
-                        (DeckEngine::Keylock, DeckRange::Wide) => {
-                            ui.label(egui::RichText::new("keylock: full-spectrum").weak())
-                                .on_hover_text(
-                                    "Wide-range Master Tempo: the full spectrum is \
-                                     pitch-corrected across the whole tempo range \
-                                     (0 ms pipeline delay — the analysis window is \
-                                     source-side lookahead).",
-                                );
-                        }
-                    }
+                    let st = self.state.lock().unwrap();
+                    ui.label(egui::RichText::new(format!("timestretch · {:?} · {} Hz DSP",
+                        st.resolved_backend, st.native_sample_rate)).weak());
                 });
                 ui.end_row();
 
-                // Tempo range: Standard (primary keylock chain, ±20% full
-                // keylock, ~13 ms) vs Wide (CDJ-style wide-range Master
-                // Tempo, 0 ms — source-side lookahead). A range change
-                // rebuilds the engine and restores the playhead via
-                // warm-start seek.
-                ui.label("Range:");
+                ui.label("Backend:");
                 ui.horizontal(|ui| {
-                    let old_range = self.deck_range;
-                    egui::ComboBox::from_id_salt("deck_range_combo")
-                        .selected_text(self.deck_range.label())
+                    let previous = self.backend;
+                    egui::ComboBox::from_id_salt("backend_combo")
+                        .selected_text(self.backend.label())
                         .show_ui(ui, |ui| {
-                            for &range in DeckRange::ALL {
-                                ui.selectable_value(&mut self.deck_range, range, range.label());
+                            for &backend in BackendChoice::ALL {
+                                ui.selectable_value(&mut self.backend, backend, backend.label());
                             }
                         });
-                    if old_range.rebuild_needed(self.deck_range) {
-                        // Leaving Wide while braked below the floor: the
-                        // brake zone doesn't exist in Standard, so release
-                        // it and let the ratio clamp snap the fader to the
-                        // -75% floor before the rebuild.
-                        if self.brake < 1.0 {
-                            let detected = self.state.lock().unwrap().detected_bpm;
-                            if detected > 0.0 {
-                                self.apply_target_bpm(
-                                    detected,
-                                    self.target_bpm.max(detected / MAX_VARISPEED_RATIO),
-                                );
-                            } else {
-                                self.brake = 1.0;
-                                self.brake_shared.store(1.0);
-                            }
-                        }
-                        let (transport, latency_secs) = {
-                            let mut st = self.state.lock().unwrap();
-                            st.deck_range = self.deck_range;
-                            (st.transport, st.reported_latency_secs)
-                        };
-                        let _ = latency_secs;
-                        if transport != Transport::Stopped {
-                            // Seek-priced rebuild: keep the playhead (NOT
-                            // stop_playback — that zeroes the position).
-                            let pos = self.position.load();
-                            self.stop_processing_thread();
-                            self.start_playback();
-                            self.request_seek(pos);
-                        }
+                    if previous != self.backend {
+                        self.state.lock().unwrap().backend = self.backend.backend();
                     }
-                    let latency_ms = {
-                        let st = self.state.lock().unwrap();
-                        st.reported_latency_secs.map(|secs| secs * 1_000.0)
-                    };
-                    // Show whatever the engine has reported — 0.0 ms is the
-                    // Wide range's honest number (source-side lookahead),
-                    // not "no info"; before the first build there is no
-                    // figure to show.
-                    if let Some(latency_ms) = latency_ms {
-                        ui.label(egui::RichText::new(format!("{latency_ms:.1} ms")).weak())
-                            .on_hover_text(
-                                "Constant pipeline delay reported by the active engine \
-                                 (host-compensated; each range has its own honest \
-                                 figure).",
-                            );
-                    }
+                    let st = self.state.lock().unwrap();
+                    ui.label(format!("tempo {:.5}× · pitch {:.5}× · {:.1} ms reserve", st.achieved_tempo, st.achieved_pitch,
+                        st.reported_latency_secs.unwrap_or(0.0)*1000.0))
+                        .on_hover_text(format!(
+                            "Achieved tempo includes hop quantization. Reserve is separate from DSP lookahead and device latency.\nProcessor control delay upper estimate: {:.1} ms, before scrub and excluding device latency.\nUnderrun frames: {}\nWorker policy: {}{}",
+                            st.reported_control_latency_secs * 1000.0,
+                            st.underrun_frames,
+                            st.worker_scheduling,
+                            st.worker_scheduling_error.as_ref().map(|e| format!(" ({e})")).unwrap_or_default(),
+                        ));
                 });
                 ui.end_row();
 
@@ -1663,8 +1501,7 @@ fn run_load_worker(req: LoadRequest) {
     }
     ctx.request_repaint();
 
-    // Pre-analysis: beat grid + BPM for the UI, splice guidance for the
-    // engine. Skip early when a newer load has already started.
+    // Pre-analysis: beat grid + BPM for the UI and transport gestures. Skip early when a newer load has already started.
     if state.lock().unwrap().analysis_generation != generation {
         return;
     }
@@ -1712,9 +1549,8 @@ fn run_load_worker(req: LoadRequest) {
 
     let artifact = Arc::new(artifact);
     {
-        // Store worker-side (not only via the channel) so `start_playback`
-        // sees the artifact even if `update` hasn't polled — e.g. with the
-        // window minimized.
+        // Retain the artifact for application consumers even when the UI is
+        // minimized. The DSP session does not consume analysis artifacts.
         let mut st = state.lock().unwrap();
         if st.analysis_generation != generation {
             log::info!("Pre-analysis: discarding stale result (newer file loaded)");
@@ -2059,62 +1895,41 @@ mod tests {
     }
 
     #[test]
-    fn deck_range_maps_to_profiles_and_labels() {
-        assert_eq!(DeckRange::ALL.len(), 2);
-        assert_eq!(
-            DeckRange::Standard.profile(),
-            timestretch::engine::EngineProfile::Keylock
-        );
-        assert_eq!(
-            DeckRange::Wide.profile(),
-            timestretch::engine::EngineProfile::WideKeylock
-        );
-        assert_eq!(DeckRange::Standard.label(), "Standard");
-        assert_eq!(DeckRange::Wide.label(), "Wide");
-    }
-
-    #[test]
-    fn tempo_mapping_is_continuous_at_the_wide_floor() {
-        // Exactly at the wide chain's -50% floor: ratio pinned, brake
-        // exactly 1.0 — the brake resampler engages with zero effect, so
-        // the handoff between the direct and braked paths is seamless.
-        let m = tempo_mapping(DeckRange::Wide, 128.0, 64.0);
-        assert_eq!(m.ratio, 2.0);
-        assert_eq!(m.brake, 1.0);
-        assert!((m.effective_bpm - 64.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn tempo_mapping_brakes_below_the_wide_floor() {
-        // Halfway between -50% and -100%: engine stays pinned at the
-        // floor, the brake takes the rest, and the effective BPM equals
-        // the fader value (no snap).
-        let m = tempo_mapping(DeckRange::Wide, 128.0, 32.0);
-        assert_eq!(m.ratio, 2.0);
-        assert!((m.brake - 0.5).abs() < 1e-9);
-        assert!((m.effective_bpm - 32.0).abs() < 1e-9);
-
-        let stop = tempo_mapping(DeckRange::Wide, 128.0, 0.0);
-        assert_eq!(stop.ratio, 2.0);
-        assert_eq!(stop.brake, 0.0);
-        assert_eq!(stop.effective_bpm, 0.0);
-    }
-
-    #[test]
-    fn tempo_mapping_never_brakes_in_standard_range() {
-        for target in [0.0, 16.0, 32.0, 128.0, 256.0] {
-            let m = tempo_mapping(DeckRange::Standard, 128.0, target);
-            assert_eq!(m.brake, 1.0);
-            assert!((0.25..=4.0).contains(&m.ratio));
+    fn tempo_mapping_uses_full_library_range_without_pitch_changes() {
+        use timestretch::PitchRatio;
+        for (target, ratio) in [
+            (512.0, 0.25),
+            (128.0, 1.0),
+            (32.0, 4.0),
+            (16.0, 8.0),
+            (8.0, 16.0),
+            (4.0, 32.0),
+        ] {
+            let m = tempo_mapping(128.0, target, DeckEngine::Keylock, PitchRatio::UNITY);
+            assert_eq!(m.ratio, ratio);
+            assert_eq!(m.effective_bpm, target);
+            let parameters = DeckEngine::Keylock
+                .parameters(m.ratio, PitchRatio::UNITY)
+                .unwrap();
+            assert_eq!(parameters.pitch, PitchRatio::UNITY);
         }
+        let below = tempo_mapping(128.0, 0.0, DeckEngine::Keylock, PitchRatio::UNITY);
+        assert_eq!(below.ratio, 32.0);
+        assert_eq!(below.effective_bpm, 4.0);
     }
 
     #[test]
-    fn only_range_changes_require_a_rebuild() {
-        assert!(DeckRange::Standard.rebuild_needed(DeckRange::Wide));
-        assert!(DeckRange::Wide.rebuild_needed(DeckRange::Standard));
-        assert!(!DeckRange::Standard.rebuild_needed(DeckRange::Standard));
-        assert!(!DeckRange::Wide.rebuild_needed(DeckRange::Wide));
+    fn tempo_mapping_respects_pitch_and_linked_mode_limits() {
+        use timestretch::PitchRatio;
+        for mode in [DeckEngine::Keylock, DeckEngine::Tape] {
+            for step in -2400..=2400 {
+                let pitch = PitchRatio::from_semitones(step as f64 / 100.0).unwrap();
+                for target in [0.0, 4.0, 8.0, 16.0, 128.0, 512.0, 1000.0] {
+                    let m = tempo_mapping(128.0, target, mode, pitch);
+                    mode.parameters(m.ratio, pitch).unwrap();
+                }
+            }
+        }
     }
 
     const SR: f64 = 44100.0;

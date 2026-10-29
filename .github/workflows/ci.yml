@@ -1,29 +1,22 @@
 name: CI
-
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-
 env:
   CARGO_TERM_COLOR: always
-
 jobs:
-  test:
-    name: Test
+  library:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        # "pinned" = the toolchain in rust-toolchain.toml (same compiler
-        # as local builds); the MSRV row overrides it via the dtolnay
-        # action's RUSTUP_TOOLCHAIN env var.
         rust: [pinned]
         include:
           - os: ubuntu-latest
-            rust: "1.85.0"  # MSRV
+            rust: '1.85.0'
     steps:
       - uses: actions/checkout@v4
       - if: matrix.rust == 'pinned'
@@ -32,152 +25,76 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
+      - if: matrix.rust != 'pinned'
+        shell: bash
+        run: echo "RUSTUP_TOOLCHAIN=${{ matrix.rust }}" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
-      # Regression tests read fixtures from test_audio/ (gitignored, *.wav).
-      # The generator is deterministic, so regenerate them before testing.
       - run: cargo run --example generate_test_audio
-      - run: cargo test --all-targets
-
-  quality-gates:
-    name: Quality Gates
-    runs-on: ubuntu-latest
+      - run: cargo test --release -p timestretch --all-features --all-targets
+      - run: cargo test --release -p timestretch-core --features qa,accelerate
+      - run: cargo test --release -p timestretch-analysis
+      - run: cargo test -p timestretch --no-default-features --lib --test session_contracts
+      - run: cargo check -p timestretch --no-default-features --features io
+      - run: cargo check -p timestretch --no-default-features --features analysis
+      - run: cargo test -p timestretch --all-features --doc
+  consumers:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      # Installs the pinned toolchain + components from rust-toolchain.toml.
       - run: rustup toolchain install
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - uses: Swatinem/rust-cache@v2
-      # The engine A/B matrix is the quality dashboard: absolute gates
-      # re-derived from new-engine measurements at Stage 9 (the old
-      # engine's quality_gates suite was deleted with the old engine).
-      - run: cargo test --features qa-harnesses --release --test engine_ab_matrix -- --nocapture
-        env:
-          TIMESTRETCH_QUALITY_DASHBOARD_DIR: target/quality_dashboard
-      # New-engine WCET gate (ROADMAP Stage 6): p99.9 per-callback ratio
-      # bounded per profile and callback size, priming and threshold-riding
-      # included. Same hardware-headroom multiplier as above (local
-      # measurements sit at p99.9 <= 0.21 vs the 0.5 strict bound).
-      - run: cargo test --features qa-harnesses --release --test engine_wcet -- --nocapture
-        env:
-          TIMESTRETCH_STRICT_CALLBACK_BUDGET: "1"
-          TIMESTRETCH_CALLBACK_BUDGET_MULTIPLIER: "2.0"
-      # Ride-quality gates (ROADMAP Stage 15 promotion): cents wobble on
-      # sustained rides and transient sharpness — the two harnesses most
-      # directly tied to how the deck sounds under the fader; previously
-      # local-only.
-      - run: cargo test --features qa-harnesses --release --test engine_keylock -- --nocapture
-      - run: cargo test --features qa-harnesses --release --test engine_transients -- --nocapture
-      # Stage 12 robustness gates: seeded adversarial input against every
-      # parsing/validation surface, plus the bounded deck-gesture soak
-      # (~1 s each in release; the full-length soak recipe stays local,
-      # see qa/soak.rs docs). These are feature-gated targets, so the
-      # plain test jobs never build them — without these lines they have
-      # zero CI coverage.
-      - run: cargo test --features qa-harnesses --release --test robustness -- --nocapture
-      - run: cargo test --features qa-harnesses --release --test soak -- --nocapture
-      - uses: actions/upload-artifact@v4
+      - run: cargo test --release -p timestretch-desktop -p ab-tui
+      - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+      - run: cargo run --release -p timestretch-qa -- quality --strict
+      - run: cargo run --release -p timestretch-qa -- callback-audit
+      - uses: actions/setup-python@v5
         with:
-          name: quality-dashboard-${{ github.run_id }}
-          path: target/quality_dashboard/
-          if-no-files-found: error
-
+          python-version: '3.13'
+      - run: python -B tools/qualify.py --quick --output target/contributor-smoke
+      # Wall-clock/device headroom is qualified on declared hardware with
+      # tools/qualify.py; noisy hosted CI cannot certify it.
   public-corpus:
-    name: Public Corpus (BPM accuracy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      # The corpus is CC-licensed netlabel audio fetched from the Internet
-      # Archive with pinned SHA-256 (ROADMAP Stage 7). Cached on the fetch
-      # script's hash so CI only downloads when the corpus changes.
       - uses: actions/cache@v4
         with:
           path: benchmarks/audio/public-corpus
           key: public-corpus-${{ hashFiles('scripts/fetch_public_corpus.sh') }}
-          # Seed from the previous corpus on a key miss: the fetch script
-          # sha-verifies and skips files already present, so a script
-          # change only downloads the DELTA — which keeps CI alive through
-          # archive.org's outages (2026-08-17: a nine-file refetch flapped
-          # for hours on their degraded CDN; the delta was two files).
-          restore-keys: |
-            public-corpus-
+          restore-keys: public-corpus-
       - run: bash scripts/fetch_public_corpus.sh
-      # Regression tests read fixtures from test_audio/ (gitignored, *.wav).
-      # The generator is deterministic, so regenerate them before testing.
-      - run: cargo run --example generate_test_audio
-      # Accuracy floors on the public corpus (ROADMAP Stage 10 exit
-      # criterion, enabled once the DnB metrical-level fix landed and
-      # the corpus returned to 100% acc1 — the two DnB rows are the
-      # non-EDM gate).
-      - run: cargo test --features qa-harnesses --release --test bpm_accuracy -- --nocapture
+      - run: cargo test --features qa --release --test bpm_accuracy -- --nocapture
         env:
-          TIMESTRETCH_BPM_MIN_ACC1: "90"
-          TIMESTRETCH_BPM_MIN_ACC2: "90"
-      # External-reference gate (ROADMAP Stage 7, REQUIRED): the pull
-      # engine's keylock render vs a Rubber Band CLI render of the same
-      # public-corpus track, gated on spectral similarity and level.
+          TIMESTRETCH_BPM_MIN_ACC1: '90'
+          TIMESTRETCH_BPM_MIN_ACC2: '90'
       - run: sudo apt-get update && sudo apt-get install -y rubberband-cli
-      - run: cargo test --features qa-harnesses --release --test rubberband_reference_gate -- --nocapture
+      - run: cargo test --features qa --release --test rubberband_reference_gate -- --nocapture
         env:
-          TIMESTRETCH_REQUIRE_RUBBERBAND: "1"
+          TIMESTRETCH_REQUIRE_RUBBERBAND: '1'
       - uses: actions/upload-artifact@v4
         with:
-          name: bpm-accuracy-report-${{ github.run_id }}
+          name: bpm-accuracy-${{ github.run_id }}
           path: target/bpm_accuracy_report.json
           if-no-files-found: error
-
-  clippy:
-    name: Clippy
+  docs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
-
-  desktop:
-    name: Desktop
-    # The desktop crate is excluded from the workspace, so the root jobs
-    # never build it. macOS is the app's target platform (wgpu -> native
-    # Metal) and the only runner that needs no extra system packages for
-    # eframe/cpal/rfd.
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
         with:
-          workspaces: |
-            desktop
-            tools/ab-tui
-      - run: cargo test --all-targets
-        working-directory: desktop
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: desktop
-      # The blind A/B TUI is likewise a standalone excluded crate
-      # (cpal/ratatui); excluded targets have zero CI coverage unless a
-      # workflow names them (Stage 12 lesson), and macOS builds cpal
-      # without extra system packages.
-      - run: cargo test --all-targets
-        working-directory: tools/ab-tui
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: tools/ab-tui
-
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install
+          python-version: '3.13'
+      - run: python -B -m unittest discover -s tools -p test_benchmark_backends.py
       - run: cargo fmt --all --check
-
-  doc:
-    name: Documentation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps
+      - run: cargo doc -p timestretch -p timestretch-core -p timestretch-analysis --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings

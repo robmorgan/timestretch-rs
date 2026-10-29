@@ -11,3 +11,7 @@ benchmarks/audio/
 *.tspeaks
 *.tsa
 .claude/worktrees/
+
+/tools/__pycache__/
+
+/benchmarks/artifacts/

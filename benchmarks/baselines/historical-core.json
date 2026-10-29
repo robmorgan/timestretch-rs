@@ -1,0 +1,24 @@
+{
+  "date": "2026-10-28",
+  "hardware": "Apple M1 Max",
+  "os": "macOS 27.0.1",
+  "scope": "Historical finite local campaign; original evidence preserved separately; no contributor dependency.",
+  "host_runs": 369,
+  "device_conditions": 18,
+  "boundary_runs": 12,
+  "core_runs": 855,
+  "session_runs": 339,
+  "host_deadline_misses": 0,
+  "host_underrun_frames": 0,
+  "quality_rows_passed": 30,
+  "earlier_scheduling_trials": "ordinary-thread and interactive-priority trials had starvation/deadline failures; retained historical results must not be generalized to those policies",
+  "binary_sha256": {
+    "numerical_and_unpaced": "0bd2264c0b63c9740dfc72e8fc487a8d8ad522b0107b3e21bedea2ee269c3e69",
+    "host_playback": "17ef35851be9c747eeb138f2a96973eac44390d183e413099bffd32a45a95adb",
+    "physical_device": "17ef35851be9c747eeb138f2a96973eac44390d183e413099bffd32a45a95adb",
+    "listening": "5c6f69a373bb2e6884c0c0e9b4e33c035810aa3cf6f8dfbfe151559e89428070",
+    "allocation_audits": "17ef35851be9c747eeb138f2a96973eac44390d183e413099bffd32a45a95adb",
+    "boundary_stress": "dce6099d2c0d67dbf0c9cefd5283d6b8ad266adafb4b7c2af3d738e14507a705"
+  },
+  "pre_cleanup_source_archive_sha256": "2b2efcf7119d9e65cd44d3970fe7fa0c1562ec7a0d885612a0b21df458b4064d"
+}

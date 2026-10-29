@@ -1,11 +1,11 @@
 MODEL ?= gpt-5.4
 ITERATIONS ?= 50
 STATE_DIR ?= .codex-loop
-TEST_CMD ?= cargo test --test engine_realtime_allocations --test engine_modulation_torture
+TEST_CMD ?= cargo test --test realtime_allocations --test session_contracts --test session_soak
 PLAN_MODEL ?= $(MODEL)
 PLAN_ITERATIONS ?= $(ITERATIONS)
 PLAN_STATE_DIR ?= .codex-plan-loop
-PLAN_SMOKE_CMD ?= cargo test --test engine_realtime_allocations --test engine_modulation_torture
+PLAN_SMOKE_CMD ?= cargo test --test realtime_allocations --test session_contracts --test session_soak
 
 .PHONY: loop resume plan-loop plan-resume plan-status test-fast clean-loop clean-plan-loop help
 

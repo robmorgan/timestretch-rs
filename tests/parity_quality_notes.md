@@ -1,6 +1,6 @@
 # Stretch Quality Parity Notes
 
-This suite adds strict, signal-driven regression gates modeled after established C++ DSP test patterns, implemented natively for this crate.
+This suite provides strict, signal-driven DSP regression gates implemented natively for this crate.
 
 - Test file: `tests/stretch_quality_regressions.rs`
 - Helper module: `tests/common/mod.rs`

@@ -383,7 +383,7 @@ fn test_wav_incomplete_float_sample() {
 
 #[test]
 fn test_wav_roundtrip_empty_buffer() {
-    let buf = AudioBuffer::from_mono(vec![], 44100);
+    let buf = AudioBuffer::from_mono(vec![], 44100).unwrap();
     let wav_16 = write_wav_16bit(&buf);
     let decoded = read_wav(&wav_16).unwrap();
     assert!(decoded.data.is_empty());
@@ -392,7 +392,7 @@ fn test_wav_roundtrip_empty_buffer() {
 
 #[test]
 fn test_wav_roundtrip_single_sample_all_formats() {
-    let buf = AudioBuffer::from_mono(vec![0.5], 44100);
+    let buf = AudioBuffer::from_mono(vec![0.5], 44100).unwrap();
 
     // 16-bit
     let decoded = read_wav(&write_wav_16bit(&buf)).unwrap();
@@ -413,7 +413,7 @@ fn test_wav_roundtrip_single_sample_all_formats() {
 #[test]
 fn test_wav_clipping_boundary_values() {
     // Values outside [-1, 1] should be clamped by writer
-    let buf = AudioBuffer::from_mono(vec![-2.0, -1.0, 0.0, 1.0, 2.0], 44100);
+    let buf = AudioBuffer::from_mono(vec![-2.0, -1.0, 0.0, 1.0, 2.0], 44100).unwrap();
 
     // 16-bit clamps
     let decoded_16 = read_wav(&write_wav_16bit(&buf)).unwrap();
@@ -430,7 +430,7 @@ fn test_wav_clipping_boundary_values() {
 fn test_wav_16bit_quantization_accuracy() {
     // 16-bit has 1/32768 ≈ 3e-5 resolution
     let values: Vec<f32> = (-10..=10).map(|i| i as f32 / 10.0).collect();
-    let buf = AudioBuffer::from_mono(values.clone(), 44100);
+    let buf = AudioBuffer::from_mono(values.clone(), 44100).unwrap();
     let decoded = read_wav(&write_wav_16bit(&buf)).unwrap();
     for (i, (&orig, &dec)) in values.iter().zip(decoded.data.iter()).enumerate() {
         let clamped = orig.clamp(-1.0, 1.0);
@@ -448,7 +448,7 @@ fn test_wav_16bit_quantization_accuracy() {
 fn test_wav_24bit_quantization_accuracy() {
     // 24-bit has 1/8388608 ≈ 1.2e-7 resolution
     let values: Vec<f32> = (-10..=10).map(|i| i as f32 / 10.0).collect();
-    let buf = AudioBuffer::from_mono(values.clone(), 44100);
+    let buf = AudioBuffer::from_mono(values.clone(), 44100).unwrap();
     let decoded = read_wav(&write_wav_24bit(&buf)).unwrap();
     for (i, (&orig, &dec)) in values.iter().zip(decoded.data.iter()).enumerate() {
         let clamped = orig.clamp(-1.0, 1.0);
@@ -474,7 +474,7 @@ fn test_wav_float_exact_roundtrip() {
         f32::MIN_POSITIVE,
         -f32::MIN_POSITIVE,
     ];
-    let buf = AudioBuffer::from_mono(values.clone(), 48000);
+    let buf = AudioBuffer::from_mono(values.clone(), 48000).unwrap();
     let decoded = read_wav(&write_wav_float(&buf)).unwrap();
     for (i, (&orig, &dec)) in values.iter().zip(decoded.data.iter()).enumerate() {
         assert!(
@@ -490,7 +490,7 @@ fn test_wav_float_exact_roundtrip() {
 #[test]
 fn test_wav_stereo_roundtrip_all_formats() {
     let data = vec![0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8];
-    let buf = AudioBuffer::from_stereo(data.clone(), 44100);
+    let buf = AudioBuffer::from_stereo(data.clone(), 44100).unwrap();
 
     // 16-bit stereo
     let decoded = read_wav(&write_wav_16bit(&buf)).unwrap();
@@ -510,7 +510,7 @@ fn test_wav_stereo_roundtrip_all_formats() {
 
 #[test]
 fn test_wav_48khz_sample_rate_preservation() {
-    let buf = AudioBuffer::from_mono(vec![0.5; 48000], 48000);
+    let buf = AudioBuffer::from_mono(vec![0.5; 48000], 48000).unwrap();
     let decoded = read_wav(&write_wav_float(&buf)).unwrap();
     assert_eq!(decoded.sample_rate, 48000);
 }
@@ -519,7 +519,7 @@ fn test_wav_48khz_sample_rate_preservation() {
 fn test_wav_24bit_negative_values() {
     // Specifically test 24-bit sign extension for negative values
     let values = vec![-1.0, -0.5, -0.25, -0.125];
-    let buf = AudioBuffer::from_mono(values.clone(), 44100);
+    let buf = AudioBuffer::from_mono(values.clone(), 44100).unwrap();
     let decoded = read_wav(&write_wav_24bit(&buf)).unwrap();
     for (i, (&orig, &dec)) in values.iter().zip(decoded.data.iter()).enumerate() {
         assert!(dec < 0.0, "Sample {} should be negative, got {}", i, dec);
@@ -549,7 +549,7 @@ fn test_wav_file_read_nonexistent() {
 
 #[test]
 fn test_wav_file_write_invalid_directory() {
-    let buf = AudioBuffer::from_mono(vec![0.0; 100], 44100);
+    let buf = AudioBuffer::from_mono(vec![0.0; 100], 44100).unwrap();
     let result = timestretch::io::wav::write_wav_file_16bit("/nonexistent/dir/out.wav", &buf);
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -562,14 +562,14 @@ fn test_wav_file_write_invalid_directory() {
 
 #[test]
 fn test_wav_file_write_24bit_invalid_directory() {
-    let buf = AudioBuffer::from_mono(vec![0.0; 100], 44100);
+    let buf = AudioBuffer::from_mono(vec![0.0; 100], 44100).unwrap();
     let result = timestretch::io::wav::write_wav_file_24bit("/nonexistent/dir/out.wav", &buf);
     assert!(result.is_err());
 }
 
 #[test]
 fn test_wav_file_write_float_invalid_directory() {
-    let buf = AudioBuffer::from_mono(vec![0.0; 100], 44100);
+    let buf = AudioBuffer::from_mono(vec![0.0; 100], 44100).unwrap();
     let result = timestretch::io::wav::write_wav_file_float("/nonexistent/dir/out.wav", &buf);
     assert!(result.is_err());
 }

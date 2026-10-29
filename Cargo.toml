@@ -1,22 +1,45 @@
 [package]
 name = "timestretch"
-version = "0.15.1"
+version = "0.16.0"
 edition = "2024"
-description = "Pure Rust audio time stretching library optimized for EDM"
+description = "timestretch audio time and pitch processing with host-driven streaming"
 license = "MIT"
 rust-version = "1.85"
-keywords = ["audio", "dsp", "time-stretching", "phase-vocoder", "edm"]
+keywords = ["audio", "dsp", "time-stretching", "pitch-shifting"]
 categories = ["multimedia::audio", "algorithms"]
 readme = "README.md"
 repository = "https://github.com/robmorgan/timestretch-rs"
-exclude = ["samples", "optimize", "desktop", "docs", "tools"]
+exclude = ["samples", "optimize", "desktop", "docs", "tools", "benchmarks/artifacts"]
 
 [dependencies]
-rustfft = "6"
+timestretch-core = { version = "0.16.0", path = "crates/timestretch-core", default-features = false }
+timestretch-analysis = { version = "0.16.0", path = "crates/timestretch-analysis", optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = ["accelerate"]
+accelerate = ["timestretch-core/accelerate"]
+analysis = ["dep:timestretch-analysis"]
+io = ["dep:serde_json"]
+cli = ["io", "analysis"]
+qa = ["analysis", "io", "timestretch-core/qa"]
+
+[dev-dependencies]
 serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+sha2 = "0.10"
+hound = "3"
 serde_json = "1"
-arc-swap = "1.7"
-ebur128 = "0.1.10"
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aiff", "pcm"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+
+[workspace]
+resolver = "2"
+members = ["crates/timestretch-core", "crates/timestretch-analysis", "crates/timestretch-accelerate", "desktop", "tools/ab-tui", "tools/qa"]
+default-members = [".", "crates/timestretch-core", "crates/timestretch-analysis"]
 
 [[bin]]
 name = "timestretch-cli"
@@ -27,92 +50,39 @@ required-features = ["cli"]
 name = "generate_test_audio"
 path = "test_audio/generate.rs"
 
-[[example]]
-name = "stage16_audition"
-
-[features]
-cli = []
-qa-harnesses = []
-
-[dev-dependencies]
-toml = "0.8"
-sha2 = "0.10"
-hound = "3"
-symphonia = { version = "0.5", default-features = false, features = ["mp3", "aiff", "pcm"] }
-
-[profile.release]
-opt-level = 3
-lto = true
-
-[workspace]
-exclude = ["desktop"]
+[[test]]
+name = "wav_error_paths"
+required-features = ["io"]
 
 [[test]]
-name = "benchmarks"
-path = "qa/benchmarks.rs"
-required-features = ["qa-harnesses"]
-
-[[test]]
-name = "reference_quality"
-path = "qa/reference_quality.rs"
-required-features = ["qa-harnesses"]
-
-[[test]]
-name = "rubberband_comparison"
-path = "qa/rubberband_comparison.rs"
-required-features = ["qa-harnesses"]
+name = "beat_tracking"
+required-features = ["analysis"]
 
 [[test]]
 name = "track_analysis_qa"
 path = "qa/track_analysis_qa.rs"
-required-features = ["qa-harnesses"]
+required-features = ["qa"]
 
 [[test]]
 name = "bpm_accuracy"
 path = "qa/bpm_accuracy.rs"
-required-features = ["qa-harnesses"]
+required-features = ["qa"]
 
-[[test]]
-name = "engine_ab"
-path = "qa/engine_ab.rs"
-required-features = ["qa-harnesses"]
-
-[[test]]
-name = "engine_keylock"
-path = "qa/engine_keylock.rs"
-required-features = ["qa-harnesses"]
-
-[[test]]
-name = "engine_transients"
-path = "qa/engine_transients.rs"
-required-features = ["qa-harnesses"]
-
-[[test]]
-name = "engine_wcet"
-path = "qa/engine_wcet.rs"
-required-features = ["qa-harnesses"]
+[[example]]
+name = "annotate_rigid_grid"
+required-features = ["analysis", "io"]
 
 [[test]]
 name = "rubberband_reference_gate"
 path = "qa/rubberband_reference_gate.rs"
-required-features = ["qa-harnesses"]
+required-features = ["qa"]
 
 [[test]]
-name = "engine_ab_matrix"
-path = "qa/engine_ab_matrix.rs"
-required-features = ["qa-harnesses"]
+name = "rubberband_comparison"
+path = "qa/rubberband_comparison.rs"
+required-features = ["qa"]
 
-[[test]]
-name = "wide_falsification"
-path = "qa/wide_falsification.rs"
-required-features = ["qa-harnesses"]
 
-[[test]]
-name = "robustness"
-path = "qa/robustness.rs"
-required-features = ["qa-harnesses"]
-
-[[test]]
-name = "soak"
-path = "qa/soak.rs"
-required-features = ["qa-harnesses"]
+[[example]]
+name = "ab_render"
+required-features = ["io"]

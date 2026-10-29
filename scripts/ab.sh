@@ -72,7 +72,7 @@ rm -rf "$out"
 mkdir -p "$out/raw"
 
 echo "== rendering arm 'current' (working tree) =="
-cargo run --release --example ab_render -- current "$out/raw" "$rates" "${tracks[@]}"
+cargo run --release --features io --example ab_render -- current "$out/raw" "$rates" "${tracks[@]}"
 
 # Extra current-tree arms under env settings, e.g. for env-gated
 # prototypes:  --env-arm "w5:TIMESTRETCH_PROTO_WIDTH=0.2"
@@ -80,7 +80,7 @@ for spec in ${env_arms[@]+"${env_arms[@]}"}; do
     label=${spec%%:*}
     kv=${spec#*:}
     echo "== rendering arm '$label' ($kv) =="
-    env "$kv" cargo run --release --example ab_render -- "$label" "$out/raw" "$rates" "${tracks[@]}"
+    env "$kv" cargo run --release --features io --example ab_render -- "$label" "$out/raw" "$rates" "${tracks[@]}"
 done
 
 if [ -n "$base_ref" ]; then
@@ -95,9 +95,19 @@ if [ -n "$base_ref" ]; then
     done
     wt=$(mktemp -d)/ab-base
     git worktree add --detach -q "$wt" "$base_ref"
-    # The baseline may predate ab_render; carry it in.
-    cp examples/ab_render.rs "$wt/examples/ab_render.rs"
-    (cd "$wt" && cargo run --release --example ab_render -- base "$abs_out" "$rates" "${abs_tracks[@]}")
+    if [ ! -f "$wt/examples/ab_render.rs" ]; then
+        echo "baseline revision has no examples/ab_render.rs renderer" >&2
+        git worktree remove --force "$wt"
+        exit 1
+    fi
+    # Historical revisions use their own API and renderer. No old processor is
+    # linked into the current product. New revisions use the session example.
+    if rg -q 'timestretch-core' "$wt/Cargo.toml"; then
+        cp examples/ab_render.rs "$wt/examples/ab_render.rs"
+        (cd "$wt" && cargo run --release --features io --example ab_render -- base "$abs_out" "$rates" "${abs_tracks[@]}")
+    else
+        (cd "$wt" && cargo run --release --example ab_render -- base "$abs_out" "$rates" "${abs_tracks[@]}")
+    fi
     git worktree remove --force "$wt"
 fi
 

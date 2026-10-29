@@ -1,0 +1,73 @@
+{
+  "geometry": {
+    "44100": {
+      "block": 4096,
+      "input_hop": 512,
+      "output_hop": 512,
+      "input_span": 512,
+      "output_span": 512,
+      "max_input": 12800,
+      "direct_capacity": 12800,
+      "input_capacity": 12800,
+      "output_capacity": 12288,
+      "synthesis_input": 152174,
+      "synthesis_output": 152174,
+      "synthesis_pad": 9510,
+      "analysis_base": 512,
+      "analysis_capacity": 8192,
+      "history_slots": 32,
+      "prefill": 2560,
+      "unused": 2050,
+      "main_capacity": 2048,
+      "splitter_capacity": 12800
+    },
+    "48000": {
+      "block": 4096,
+      "input_hop": 512,
+      "output_hop": 512,
+      "input_span": 512,
+      "output_span": 512,
+      "max_input": 12800,
+      "direct_capacity": 12800,
+      "input_capacity": 12800,
+      "output_capacity": 12288,
+      "synthesis_input": 152174,
+      "synthesis_output": 152174,
+      "synthesis_pad": 9510,
+      "analysis_base": 512,
+      "analysis_capacity": 8192,
+      "history_slots": 32,
+      "prefill": 2560,
+      "unused": 2050,
+      "main_capacity": 2048,
+      "splitter_capacity": 12800
+    },
+    "96000": {
+      "block": 8192,
+      "input_hop": 1024,
+      "output_hop": 1024,
+      "input_span": 1024,
+      "output_span": 1024,
+      "max_input": 25600,
+      "direct_capacity": 25600,
+      "input_capacity": 25600,
+      "output_capacity": 24576,
+      "synthesis_input": 304348,
+      "synthesis_output": 304348,
+      "synthesis_pad": 19021,
+      "analysis_base": 1024,
+      "analysis_capacity": 16384,
+      "history_slots": 32,
+      "prefill": 5120,
+      "unused": 4098,
+      "main_capacity": 4096,
+      "splitter_capacity": 25600
+    }
+  },
+  "provider": {
+    "system": "Darwin",
+    "macos": "27.0.1",
+    "machine": "arm64",
+    "initialization": "Accelerate/vForce"
+  }
+}

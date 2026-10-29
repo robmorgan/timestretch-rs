@@ -89,7 +89,7 @@ impl ScrubVoice {
 
     /// Start the release glide easing the current rate toward `rate_target`
     /// and return the predicted landing frame. The trajectory is simulated
-    /// once with the same per-frame arithmetic [`render_settle`] runs, so
+    /// once with the same per-frame arithmetic [`Self::render_settle`] runs, so
     /// the voice lands exactly on the returned frame — the engine can be
     /// warm-started there in parallel for a seamless handoff.
     pub fn begin_settle(&mut self, rate_target: f64, source: &[f32]) -> f64 {

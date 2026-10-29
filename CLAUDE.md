@@ -1,54 +1,27 @@
-# CLAUDE.md
+# Development
 
-## Analysis Version Policy
+The workspace provides one `StreamSession` adapter. Consult [README](README.md),
+[architecture](docs/CORE_ARCHITECTURE.md) and [session contracts](docs/SESSION_CONTRACT.md).
+Desktop, CLI, examples and QA are workspace consumers. The library owns media
+semantics; applications own threads and devices. Analysis is independent of DSP.
 
-`src/core/preanalysis.rs` carries two constants that control cached
-analysis artifacts (`.tsa` sidecars and Halo's stored blobs):
+## Analysis version policy
 
-- Bump `PREANALYSIS_VERSION` on any release whose **analysis output**
-  changes materially (beat grids, onsets, key, tempo candidates) — not
-  just on schema changes.
-- Raise `MIN_COMPATIBLE_VERSION` with it whenever cached results from the
-  previous version would be *worse* than re-analysis, so stale sidecars
-  regenerate. Schema compatibility alone is not the bar.
+`crates/timestretch-analysis/src/analysis/preanalysis.rs` defines
+`PREANALYSIS_VERSION` and `MIN_COMPATIBLE_VERSION`. Increment the former when
+analysis output changes materially; raise the latter when older cached results
+should be regenerated. A naming-only change does not alter either version.
 
-Learned from v0.10.0 shipping the rigid-grid beat fit without a bump,
-which left v7 artifacts ambiguous between old wandering and new rigid
-grids (LEARNINGS.md). Checked at release time via RELEASE_CHECKLIST.md.
+## Verification
 
-## CI Checks
-
-The following checks run on every push to `main` and on every pull request. All must pass.
-
-### Tests
-```bash
-cargo test --all-targets
-```
-Runs on Ubuntu, macOS, and Windows with the pinned toolchain from
-`rust-toolchain.toml` (currently 1.97.0 — local builds use the same compiler),
-plus Ubuntu with MSRV (1.85.0).
-
-### Clippy
-```bash
-cargo clippy --all-targets -- -D warnings
-```
-All warnings are treated as errors.
-
-### Format
-```bash
+```sh
+cargo test --release --workspace --all-features
+cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo fmt --all --check
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+python3 -B -m unittest discover -s tools -p 'test_*.py'
 ```
-Code must be formatted with `rustfmt`.
 
-### Documentation
-```bash
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-```
-Documentation must build without warnings.
-
-### Desktop
-```bash
-cd desktop && cargo test --all-targets && cargo clippy --all-targets -- -D warnings
-```
-The `desktop/` crate is excluded from the workspace, so the root checks never
-build it; CI checks it separately on macOS (its target platform).
+Library MSRV is 1.85; the development compiler is pinned in rust-toolchain.toml.
+[QA usage](qa/README.md) describes self-contained qualification and optional
+public corpus/device checks. The standard checks use this checkout and generated signals.
