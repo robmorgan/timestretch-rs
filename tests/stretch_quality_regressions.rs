@@ -4,7 +4,19 @@ use common::{
     best_lag_crosscorr, detect_peaks, energy_at_freq, gen_click_pad, gen_impulse_train, gen_sine,
     gen_two_tone, rmse_with_lag, windowed_rms,
 };
-use timestretch::{StretchParams, stretch};
+use timestretch::{Backend, DurationRatio, Parameters, RatioConstraint, SessionConfig};
+fn render_config(ratio: f64, rate: u32, channels: usize) -> SessionConfig {
+    let mut parameters = Parameters::keylock(DurationRatio::new(ratio).unwrap().tempo());
+    parameters.constraint = RatioConstraint::PreserveDuration;
+    SessionConfig {
+        backend: Backend::Portable,
+        source_sample_rate: rate,
+        output_sample_rate: rate,
+        channels,
+        parameters,
+        ..Default::default()
+    }
+}
 
 const SR: u32 = 44_100;
 const N_IDENTITY: usize = 10_000;
@@ -13,10 +25,8 @@ const RATIOS: [f64; 5] = [0.5, 0.75, 1.0, 1.25, 2.0];
 // Bounds in this file are engine-measured baselines (rebaselined against the
 // pull-engine batch path after the analytic tonal fast path was removed with
 // the EDM presets), not analytic ideals.
-fn parity_params(ratio: f64) -> StretchParams {
-    StretchParams::new(ratio)
-        .with_sample_rate(SR)
-        .with_channels(1)
+fn parity_params(ratio: f64) -> SessionConfig {
+    render_config(ratio, SR, 1)
 }
 
 /// Goertzel energy of `signal` at `freq` Hz.
@@ -282,7 +292,7 @@ fn test_ratio_sweep_impulse_train_transient_count_and_sharpness() {
 
         // The PV with 87.5% overlap (hop=FFT/8) disperses single-sample
         // impulses across many frames. Only check peak structure for
-        // expansion ratios where the PV has enough room to reconstruct
+        // expansion ratios where the PV has enough room to synthesize
         // transients, and use an adaptive threshold.
         let min_distance = ((period as f64 * ratio * 0.4).round() as usize).max(1);
         let peaks = detect_peaks(&output, 0.10, min_distance);
@@ -349,4 +359,8 @@ fn test_ratio_sweep_click_pad_transient_survival() {
             );
         }
     }
+}
+
+fn stretch(input: &[f32], config: &SessionConfig) -> Result<Vec<f32>, timestretch::SessionError> {
+    timestretch::render(input, config.clone()).map(|r| r.samples)
 }

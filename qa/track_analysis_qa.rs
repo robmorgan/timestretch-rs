@@ -9,7 +9,7 @@
 //! into a failure.
 //!
 //! Run with:
-//! `TIMESTRETCH_TRACK_QA_DIR=~/music cargo test --features qa-harnesses \
+//! `TIMESTRETCH_TRACK_QA_DIR=~/music cargo test --features qa \
 //!    --release --test track_analysis_qa -- --nocapture`
 
 use std::path::PathBuf;

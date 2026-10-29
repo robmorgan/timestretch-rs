@@ -1,26 +1,24 @@
-//! Regression guard for onset detection on dense, mastered material.
-//!
-//! Before the robust-detection front end (log-compressed ODF + median+MAD
-//! thresholding), `detect_transients` returned ZERO onsets on continuously
-//! loud broadband audio, so `analyze` produced empty artifacts (BPM 0,
-//! confidence 0) and analyze-on-load silently no-opped. Every prior test used
-//! sparse clicks-over-silence, which never exercised that regime.
-//!
-//! The fixture `test_audio/dense_mastered_128bpm.wav` reproduces the failure
-//! on the pre-fix code (verified: 0 onsets at every sensitivity). These
-//! assertions lock in the fix.
+#![cfg(all(feature = "analysis", feature = "io"))]
+// Regression guard for onset detection on dense, mastered material.
+//
+// Before the robust-detection front end (log-compressed ODF + median+MAD
+// thresholding), `detect_transients` returned ZERO onsets on continuously
+// loud broadband audio, so `analyze` produced empty artifacts (BPM 0,
+// confidence 0) and analyze-on-load silently no-opped. Every prior test used
+// sparse clicks-over-silence, which never exercised that regime.
+//
+// The deterministic dense signal reproduces the failure
+// on the pre-fix code (verified: 0 onsets at every sensitivity). These
+// assertions lock in the fix.
 
 use timestretch::analysis::transient::detect_transients;
-use timestretch::io::wav::read_wav_file;
-
-const FIXTURE: &str = "test_audio/dense_mastered_128bpm.wav";
+#[allow(dead_code)]
+#[path = "../test_audio/generate.rs"]
+mod test_signals;
 const SR: u32 = 44_100;
 
 fn load_dense_mid() -> Vec<f32> {
-    let buffer = read_wav_file(FIXTURE).unwrap_or_else(|e| {
-        panic!("missing {FIXTURE}: run `cargo run --example generate_test_audio` first ({e})")
-    });
-    timestretch::downmix_to_mid(&buffer.data, buffer.channels.count())
+    test_signals::dense_mastered_edm(128.0, 12.0)
 }
 
 #[test]

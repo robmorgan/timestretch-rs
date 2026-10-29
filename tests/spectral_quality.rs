@@ -1,7 +1,19 @@
 /// Spectral quality tests: frequency content preservation, transient timing,
 /// spectral centroid, and harmonic structure after time-stretching.
 use std::f32::consts::PI;
-use timestretch::{StretchParams, stretch};
+use timestretch::{Backend, DurationRatio, Parameters, RatioConstraint, SessionConfig};
+fn render_config(ratio: f64, rate: u32, channels: usize) -> SessionConfig {
+    let mut parameters = Parameters::keylock(DurationRatio::new(ratio).unwrap().tempo());
+    parameters.constraint = RatioConstraint::PreserveDuration;
+    SessionConfig {
+        backend: Backend::Portable,
+        source_sample_rate: rate,
+        output_sample_rate: rate,
+        channels,
+        parameters,
+        ..Default::default()
+    }
+}
 
 const TWO_PI: f32 = 2.0 * PI;
 
@@ -46,9 +58,7 @@ fn test_spectral_440hz_preserved_after_stretch() {
     let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
 
     for &ratio in &[0.75, 1.0, 1.25, 1.5, 2.0] {
-        let params = StretchParams::new(ratio)
-            .with_sample_rate(sample_rate)
-            .with_channels(1);
+        let params = render_config(ratio, sample_rate, 1);
 
         let output = stretch(&input, &params).unwrap();
 
@@ -90,9 +100,7 @@ fn test_spectral_multi_tone_preserved() {
         })
         .collect();
 
-    let params = StretchParams::new(1.5)
-        .with_sample_rate(sample_rate)
-        .with_channels(1);
+    let params = render_config(1.5, sample_rate, 1);
 
     let output = stretch(&input, &params).unwrap();
     let skip = 4096.min(output.len() / 4);
@@ -127,9 +135,7 @@ fn test_spectral_sub_bass_preserved_60hz() {
     let sample_rate = 44100u32;
     let input = sine_wave(60.0, sample_rate, sample_rate as usize * 3);
 
-    let params = StretchParams::new(1.5)
-        .with_sample_rate(sample_rate)
-        .with_channels(1);
+    let params = render_config(1.5, sample_rate, 1);
 
     let output = stretch(&input, &params).unwrap();
 
@@ -174,9 +180,7 @@ fn test_spectral_centroid_preserved() {
         .collect();
 
     for &ratio in &[0.75, 1.25, 1.5, 2.0] {
-        let params = StretchParams::new(ratio)
-            .with_sample_rate(sample_rate)
-            .with_channels(1);
+        let params = render_config(ratio, sample_rate, 1);
 
         let output = stretch(&input, &params).unwrap();
         let skip = 4096.min(output.len() / 4);
@@ -210,9 +214,7 @@ fn test_spectral_no_new_harmonics() {
     let sample_rate = 44100u32;
     let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
 
-    let params = StretchParams::new(1.5)
-        .with_sample_rate(sample_rate)
-        .with_channels(1);
+    let params = render_config(1.5, sample_rate, 1);
 
     let output = stretch(&input, &params).unwrap();
     let skip = 4096.min(output.len() / 4);
@@ -266,9 +268,7 @@ fn test_band_energy_distribution_preserved() {
         input_high
     );
 
-    let params = StretchParams::new(1.5)
-        .with_sample_rate(sample_rate)
-        .with_channels(1);
+    let params = render_config(1.5, sample_rate, 1);
 
     let output = stretch(&input, &params).unwrap();
     let skip = 4096.min(output.len() / 4);
@@ -312,9 +312,7 @@ fn test_transient_attack_preserved() {
     }
 
     let ratio = 1.5;
-    let params = StretchParams::new(ratio)
-        .with_sample_rate(sample_rate)
-        .with_channels(1);
+    let params = render_config(ratio, sample_rate, 1);
 
     let output = stretch(&input, &params).unwrap();
 
@@ -360,9 +358,7 @@ fn test_click_train_spacing_preserved() {
     }
 
     let ratio = 1.5;
-    let params = StretchParams::new(ratio)
-        .with_sample_rate(sample_rate)
-        .with_channels(1);
+    let params = render_config(ratio, sample_rate, 1);
 
     let output = stretch(&input, &params).unwrap();
 
@@ -470,9 +466,7 @@ fn test_dj_small_ratio_spectral_transparency() {
 
     // 126 -> 128 BPM ratio
     let ratio = 126.0 / 128.0;
-    let params = StretchParams::new(ratio)
-        .with_sample_rate(sample_rate)
-        .with_channels(1);
+    let params = render_config(ratio, sample_rate, 1);
 
     let output = stretch(&input, &params).unwrap();
     let skip = 4096.min(output.len() / 4);
@@ -504,9 +498,7 @@ fn test_extreme_stretch_still_has_frequency_content() {
     let sample_rate = 44100u32;
     let input = sine_wave(440.0, sample_rate, sample_rate as usize * 2);
 
-    let params = StretchParams::new(4.0)
-        .with_sample_rate(sample_rate)
-        .with_channels(1);
+    let params = render_config(4.0, sample_rate, 1);
 
     let output = stretch(&input, &params).unwrap();
     let skip = 8192.min(output.len() / 4);
@@ -530,9 +522,7 @@ fn test_compression_preserves_frequency() {
     let sample_rate = 44100u32;
     let input = sine_wave(440.0, sample_rate, sample_rate as usize * 4);
 
-    let params = StretchParams::new(0.5)
-        .with_sample_rate(sample_rate)
-        .with_channels(1);
+    let params = render_config(0.5, sample_rate, 1);
 
     let output = stretch(&input, &params).unwrap();
     let skip = 4096.min(output.len() / 4);
@@ -565,9 +555,7 @@ fn test_stereo_spectral_independence() {
         input[i * 2 + 1] = (TWO_PI * 880.0 * t).sin();
     }
 
-    let params = StretchParams::new(1.5)
-        .with_sample_rate(sample_rate)
-        .with_channels(2);
+    let params = render_config(1.5, sample_rate, 2);
 
     let output = stretch(&input, &params).unwrap();
 
@@ -615,9 +603,7 @@ fn test_frequency_sweep_no_holes() {
         })
         .collect();
 
-    let params = StretchParams::new(1.5)
-        .with_sample_rate(sample_rate)
-        .with_channels(1);
+    let params = render_config(1.5, sample_rate, 1);
 
     let output = stretch(&input, &params).unwrap();
 
@@ -646,4 +632,8 @@ fn test_frequency_sweep_no_holes() {
         silent_chunks,
         total_chunks
     );
+}
+
+fn stretch(input: &[f32], config: &SessionConfig) -> Result<Vec<f32>, timestretch::SessionError> {
+    timestretch::render(input, config.clone()).map(|r| r.samples)
 }

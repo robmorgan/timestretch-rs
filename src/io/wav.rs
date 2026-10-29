@@ -1,6 +1,6 @@
 //! WAV file reading and writing (16-bit PCM, 32-bit PCM, 32-bit IEEE float).
 
-use crate::core::types::{AudioBuffer, Channels, Sample};
+use crate::audio::{AudioBuffer, Channels, Sample};
 use crate::error::StretchError;
 use std::io::{Read, Write};
 
@@ -185,7 +185,7 @@ pub fn read_wav(data: &[u8]) -> Result<AudioBuffer, StretchError> {
         chunks.format_code,
         chunks.bits_per_sample,
     )?;
-    Ok(AudioBuffer::new(samples, chunks.sample_rate, channels))
+    AudioBuffer::try_new(samples, chunks.sample_rate, channels)
 }
 
 /// Creates an I/O error with the file path prepended to the message.
@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     fn test_wav_roundtrip_16bit() {
-        let original = AudioBuffer::from_mono(vec![0.0, 0.5, -0.5, 1.0, -1.0], 44100);
+        let original = AudioBuffer::from_mono(vec![0.0, 0.5, -0.5, 1.0, -1.0], 44100).unwrap();
         let wav_data = write_wav_16bit(&original);
         let decoded = read_wav(&wav_data).unwrap();
         assert_eq!(decoded.sample_rate, 44100);
@@ -354,7 +354,8 @@ mod tests {
 
     #[test]
     fn test_wav_roundtrip_float() {
-        let original = AudioBuffer::from_stereo(vec![0.1, -0.2, 0.3, -0.4, 0.5, -0.6], 48000);
+        let original =
+            AudioBuffer::from_stereo(vec![0.1, -0.2, 0.3, -0.4, 0.5, -0.6], 48000).unwrap();
         let wav_data = write_wav_float(&original);
         let decoded = read_wav(&wav_data).unwrap();
         assert_eq!(decoded.sample_rate, 48000);
@@ -373,7 +374,7 @@ mod tests {
 
     #[test]
     fn test_wav_roundtrip_24bit() {
-        let original = AudioBuffer::from_mono(vec![0.0, 0.5, -0.5, 1.0, -1.0], 44100);
+        let original = AudioBuffer::from_mono(vec![0.0, 0.5, -0.5, 1.0, -1.0], 44100).unwrap();
         let wav_data = write_wav_24bit(&original);
         let decoded = read_wav(&wav_data).unwrap();
         assert_eq!(decoded.sample_rate, 44100);
@@ -394,7 +395,7 @@ mod tests {
     #[test]
     fn test_wav_24bit_stereo() {
         let data = vec![0.25, -0.25, 0.5, -0.5, 0.75, -0.75];
-        let original = AudioBuffer::from_stereo(data, 48000);
+        let original = AudioBuffer::from_stereo(data, 48000).unwrap();
         let wav_data = write_wav_24bit(&original);
         let decoded = read_wav(&wav_data).unwrap();
         assert_eq!(decoded.channels, Channels::Stereo);
@@ -420,7 +421,7 @@ mod tests {
     #[test]
     fn test_wav_stereo_16bit() {
         let data = vec![0.25, -0.25, 0.5, -0.5];
-        let original = AudioBuffer::from_stereo(data, 44100);
+        let original = AudioBuffer::from_stereo(data, 44100).unwrap();
         let wav = write_wav_16bit(&original);
         let decoded = read_wav(&wav).unwrap();
         assert_eq!(decoded.channels, Channels::Stereo);

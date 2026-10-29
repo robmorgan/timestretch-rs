@@ -1,5 +1,5 @@
 //! One arm of an A/B listening comparison: renders excerpts through THIS
-//! build's `stretch()` at the given rates. Driven by `scripts/ab.sh`,
+//! build's `StreamSession` renderer at the given rates. Driven by `scripts/ab.sh`,
 //! which renders the other arm from a baseline git ref (or Rubber Band),
 //! level-matches, and blinds the set with a sealed key.
 //!
@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use timestretch::io::{read_wav_file, write_wav_file_float};
-use timestretch::{AudioBuffer, StretchParams};
+use timestretch::{AudioBuffer, Backend, Parameters, SessionConfig, TempoRate};
 
 const EXCERPT_SECS: f64 = 20.0;
 
@@ -59,14 +59,29 @@ fn main() {
             let rate_tag = format!("{}{:.0}pct", if pct >= 0.0 { "+" } else { "-" }, pct.abs());
             let dir = out_base.join(&stem).join(&rate_tag);
             std::fs::create_dir_all(&dir).expect("mkdir");
-            let params = StretchParams::new(1.0 / rate)
-                .with_sample_rate(sr)
-                .with_channels(ch as u32);
-            let out = timestretch::stretch(excerpt, &params).expect("stretch");
-            let out_buf = AudioBuffer::new(out, sr, buf.channels);
+            let backend = match std::env::var("TIMESTRETCH_BACKEND").as_deref() {
+                Ok("portable") => Backend::Portable,
+                Ok("accelerate") => Backend::Accelerate,
+                Ok("auto") | Err(_) => Backend::Auto,
+                Ok(value) => panic!("unknown backend: {value}"),
+            };
+            let out = timestretch::render(
+                excerpt,
+                SessionConfig {
+                    backend,
+                    source_sample_rate: sr,
+                    output_sample_rate: sr,
+                    channels: ch,
+                    parameters: Parameters::keylock(TempoRate::new(rate).expect("tempo")),
+                    ..Default::default()
+                },
+            )
+            .expect("render")
+            .samples;
+            let out_buf = AudioBuffer::new(out, sr, buf.channels).unwrap();
             write_wav_file_float(dir.join(format!("{arm}.wav")).to_str().unwrap(), &out_buf)
                 .expect("write");
-            let src_buf = AudioBuffer::new(excerpt.to_vec(), sr, buf.channels);
+            let src_buf = AudioBuffer::new(excerpt.to_vec(), sr, buf.channels).unwrap();
             write_wav_file_float(dir.join("source.wav").to_str().unwrap(), &src_buf)
                 .expect("write");
             println!("rendered {stem}/{rate_tag} [{arm}]");

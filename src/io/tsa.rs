@@ -31,8 +31,8 @@ use crate::analysis::waveform::{
     BASE_BUCKETS_PER_SEC, BandPeaks, CROSSOVER_HIGH_HZ, CROSSOVER_LOW_HZ, NUM_BANDS, PeakLevel,
     base_num_buckets,
 };
-use crate::core::preanalysis::{PreAnalysisArtifact, hash_samples};
 use crate::error::StretchError;
+use timestretch_analysis::{PreAnalysisArtifact, hash_samples};
 
 /// Current `.tsa` container format version.
 pub const TSA_CONTAINER_VERSION: u32 = 1;
@@ -190,9 +190,9 @@ fn parse(bytes: &[u8], expected: Option<(u32, usize, u64)>) -> Result<AnalysisFi
         .map_err(|_| invalid("source length exceeds addressable memory"))?;
     let content_hash = u64_at(20);
 
-    if let Some((want_sr, want_len, want_hash)) = expected
-        && (sample_rate != want_sr || source_len_samples != want_len || content_hash != want_hash)
-    {
+    if expected.is_some_and(|(want_sr, want_len, want_hash)| {
+        sample_rate != want_sr || source_len_samples != want_len || content_hash != want_hash
+    }) {
         return Err(invalid("identity mismatch"));
     }
 
@@ -386,7 +386,7 @@ mod tests {
 
     fn test_artifact(mono: &[f32]) -> PreAnalysisArtifact {
         PreAnalysisArtifact {
-            version: crate::core::preanalysis::PREANALYSIS_VERSION,
+            version: timestretch_analysis::PREANALYSIS_VERSION,
             sample_rate: SR,
             bpm: 128.0,
             confidence: 0.9,

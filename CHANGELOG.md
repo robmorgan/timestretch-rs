@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.16.0 (unreleased)
+
+### Breaking changes
+
+- timestretch is the sole processor. Removed Standard/Wide, engine graphs,
+  standalone stretch/pitch implementations, presets and their old APIs/features.
+- Added prepared, host-driven `StreamSession`: source demand, controls with
+  achieved ratios, conversion, EOF, consumption receipts, epochs, seek/loop and
+  prepared backend replacement. Offline rendering uses the same session.
+- Split native DSP, optional analysis and isolated Accelerate bindings into
+  workspace crates. Explicit owned providers replace thread-local selection;
+  Auto selects Accelerate when available and Portable otherwise.
+- Desktop processing runs on its host-owned worker. Device delivery uses a
+  bounded queue; source/transport semantics live in the library.
+- Migrated CLI, examples, A/B tools and analysis artifacts. Audio-buffer
+  constructors now validate input and return `Result`. No automatic normalization.
+- Widened absolute native positions to avoid 32-bit continuous-stream overflow.
+  Reference kernels/tables and retained quality thresholds are unchanged.
+- Added reproducible fidelity, quality, allocation, performance and listening
+  reports. Local timing/starvation failures remain release blockers; see
+  [qualification](benchmarks/QUALIFICATION.md) and
+  [migration](docs/MIGRATION_0_16.md).
+
 ## 0.15.1
 
 ### Fixed

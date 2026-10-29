@@ -9,13 +9,7 @@
 #   ./scripts/compare_rubberband.sh --ratios "0.95 1.05 1.08"
 #   TIMESTRETCH_RUBBERBAND_ENGINE=realtime ./scripts/compare_rubberband.sh --ratios "0.95 1.05"
 #
-# Mode selection (TIMESTRETCH_RUBBERBAND_ENGINE, inherited by the test):
-#   batch (default) - offline stretch() over the engine graph.
-#   realtime - the engine's keylock chain at constant rate, callback by
-#     callback. Only meaningful at DJ ratios (0.92-1.08, +/-20%
-#     secondary): beyond ~+/-10% rate deviation keylock deliberately
-#     fades toward plain varispeed (pitch follows tempo) while RubberBand
-#     always preserves pitch.
+# All renders use the same StreamSession facade; old execution-mode selection is removed.
 
 set -euo pipefail
 
@@ -97,7 +91,7 @@ for entry in "${TRACKS[@]}"; do
         TIMESTRETCH_RUBBERBAND_RATIO="$ratio" \
         TIMESTRETCH_RUBBERBAND_MAX_SECONDS="20.0" \
             cargo test \
-                --features qa-harnesses \
+                --features qa \
                 --release \
                 --test rubberband_comparison \
                 -- --nocapture 2>&1 \

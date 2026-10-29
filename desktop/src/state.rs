@@ -1,50 +1,11 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use timestretch::PreAnalysisArtifact;
+use timestretch::{Parameters, PitchRatio, PreAnalysisArtifact, SessionResult, TempoRate};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Transport {
-    Stopped,
-    Playing,
-    Paused,
-}
+pub use timestretch::Transport;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PresetChoice {
-    None,
-    DjBeatmatch,
-    HouseLoop,
-    Halftime,
-    Ambient,
-    VocalChop,
-}
-
-impl PresetChoice {
-    pub const ALL: &'static [PresetChoice] = &[
-        PresetChoice::None,
-        PresetChoice::DjBeatmatch,
-        PresetChoice::HouseLoop,
-        PresetChoice::Halftime,
-        PresetChoice::Ambient,
-        PresetChoice::VocalChop,
-    ];
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            PresetChoice::None => "None",
-            PresetChoice::DjBeatmatch => "DJ Beatmatch",
-            PresetChoice::HouseLoop => "House Loop",
-            PresetChoice::Halftime => "Halftime",
-            PresetChoice::Ambient => "Ambient",
-            PresetChoice::VocalChop => "Vocal Chop",
-        }
-    }
-}
-
-/// Which engine mode drives the deck.
-///
-/// `Tape` runs the engine in tape mode (pitch follows tempo, zero pipeline
-/// delay); `Keylock` preserves pitch while the tempo changes.
+/// Requested pitch behavior for the sole timestretch processor.
+/// Tape links pitch to tempo; Keylock keeps pitch independent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeckEngine {
     Tape,
@@ -54,6 +15,34 @@ pub enum DeckEngine {
 impl DeckEngine {
     pub const ALL: &'static [DeckEngine] = &[DeckEngine::Tape, DeckEngine::Keylock];
 
+    pub fn tempo_bounds(self, pitch: PitchRatio) -> (TempoRate, TempoRate) {
+        match self {
+            Self::Keylock => pitch.tempo_bounds(),
+            Self::Tape => (
+                TempoRate::new(PitchRatio::MIN.get()).unwrap(),
+                TempoRate::new(PitchRatio::MAX.get()).unwrap(),
+            ),
+        }
+    }
+
+    pub fn parameters(self, duration: f64, pitch: PitchRatio) -> SessionResult<Parameters> {
+        let tempo = TempoRate::new(1.0 / duration)?;
+        // The UI stores duration. Its reciprocal can round past a joint-domain
+        // endpoint; use the same library bounds as the fader when converting.
+        let (min, max) = self.tempo_bounds(pitch);
+        let tempo = TempoRate::new(tempo.get().clamp(min.get(), max.get()))?;
+        let parameters = match self {
+            Self::Keylock => Parameters {
+                tempo,
+                pitch,
+                ..Default::default()
+            },
+            Self::Tape => Parameters::linked(tempo)?,
+        };
+        parameters.validate()?;
+        Ok(parameters)
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             DeckEngine::Tape => "Tape",
@@ -62,65 +51,27 @@ impl DeckEngine {
     }
 }
 
-/// Tempo-range profile driving the deck, like a CDJ range setting.
-///
-/// `Standard` runs the primary keylock chain (full keylock through ±20%,
-/// ~13 ms pipeline delay); `Wide` runs the wide-range Master Tempo chain
-/// (full-spectrum keylock across its 0.5–2.0 rate range — the PV head's
-/// ratio clamp; below rate 0.5 the deck's brake resampler carries the
-/// fader to a full stop).
-/// Unlike the Tape/Keylock deck mode — a live parameter inside either
-/// profile — changing the range REBUILDS the engine: a seek-priced event,
-/// never a live morph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeckRange {
-    Standard,
-    Wide,
-}
-
-impl DeckRange {
-    pub const ALL: &'static [DeckRange] = &[DeckRange::Standard, DeckRange::Wide];
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            DeckRange::Standard => "Standard",
-            DeckRange::Wide => "Wide",
-        }
-    }
-
-    pub fn profile(&self) -> timestretch::engine::EngineProfile {
-        match self {
-            DeckRange::Standard => timestretch::engine::EngineProfile::Keylock,
-            DeckRange::Wide => timestretch::engine::EngineProfile::WideKeylock,
-        }
-    }
-
-    /// Whether switching from `self` to `to` requires an engine rebuild
-    /// (profile change = seek-priced; everything else is live).
-    pub fn rebuild_needed(&self, to: DeckRange) -> bool {
-        self != &to
-    }
-}
-
 /// State shared between UI, processing, and audio threads.
 pub struct SharedState {
     pub transport: Transport,
     pub stretch_ratio: f64,
-    pub preset: PresetChoice,
-    /// Deck engine mode. Forwarded live to the engine's keylock toggle by
-    /// the deck thread (the engine always runs a keylock chain; Tape is
-    /// the delay-matched varispeed bypass), so switching mid-play is
-    /// instant — no rebuild, constant pipeline latency.
+    /// Pitch behavior applied at a library-reported algorithm boundary.
     pub deck_engine: DeckEngine,
-    /// Tempo-range profile (Standard/Wide). A range change rebuilds the
-    /// engine and restores the playhead via warm-start seek.
-    pub deck_range: DeckRange,
+    pub pitch: PitchRatio,
+    pub backend: timestretch::Backend,
+    pub resolved_backend: timestretch::Backend,
+    pub achieved_tempo: f64,
+    pub achieved_pitch: f64,
+    pub underrun_frames: u64,
+    pub processing_error: Option<String>,
 
     /// Current playback position in source frames.
     pub position_frames: usize,
     /// Total source frames (per channel).
     pub total_frames: usize,
     pub sample_rate: u32,
+    pub output_sample_rate: u32,
+    pub native_sample_rate: u32,
 
     /// Detected BPM of the source audio.
     pub detected_bpm: f64,
@@ -130,30 +81,28 @@ pub struct SharedState {
     /// Set by UI to request a seek.
     pub seek_request: Option<usize>,
 
-    /// Constant pipeline (content) delay reported by the active processor,
-    /// in seconds. Published by the processing thread at every build; read
-    /// by the UI next to the profile selector. `None` until an engine has
-    /// reported — 0.0 is the Wide range's honest figure (source-side
-    /// lookahead), so absence must be distinguishable from zero.
+    /// Additional desktop output reserve in seconds, published by the worker.
+    /// This excludes session lookahead, pending output and device latency.
     pub reported_latency_secs: Option<f64>,
-    /// Tempo control-to-audio latency reported by the active processor, in
-    /// seconds (excludes the callback size). Near-zero on the varispeed-
-    /// first path; equals the pipeline delay on the vocoder path.
+    /// Conservative control delay from the session's processing quantum,
+    /// pending session output and all unacknowledged media (including transport
+    /// voice buffers). Excludes device latency and scrub rate changes.
     pub reported_control_latency_secs: f64,
+    /// Host scheduling status, distinct from the numerical provider.
+    pub worker_scheduling: &'static str,
+    pub worker_scheduling_error: Option<String>,
 
     /// Offline pre-analysis of the loaded track (beat grid, onsets).
     ///
-    /// Arrives asynchronously from the analysis thread after load and is
-    /// consumed at the next processor rebuild (seek/preset/EOF); running
-    /// processors are never hot-swapped.
+    /// Arrives asynchronously after load for UI/grid use. It is never an input
+    /// to timestretch processing.
     pub pre_analysis: Option<Arc<PreAnalysisArtifact>>,
     /// Bumped on every file load; a background analysis result is discarded
     /// unless its generation still matches (guards rapid successive loads).
     pub analysis_generation: u64,
 
     /// Active loop region in source frames, if looping is engaged. When set,
-    /// the processing thread wraps `[start, end)` gaplessly via the library's
-    /// warm-start machinery.
+    /// the library requests wrapped source spans while retaining DSP history.
     pub loop_region: Option<(usize, usize)>,
     /// Loop-in point staged by the UI (source frame) before the loop-out is
     /// set to complete a region.
@@ -161,21 +110,44 @@ pub struct SharedState {
 }
 
 impl SharedState {
+    /// A user seek outside the selected loop exits that loop.
+    pub fn request_seek(&mut self, frame: usize) {
+        if self
+            .loop_region
+            .is_some_and(|(start, end)| frame < start || frame >= end)
+        {
+            self.loop_region = None;
+        }
+        self.seek_request = Some(frame);
+        if self.transport == Transport::Stopped {
+            self.position_frames = frame;
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             transport: Transport::Stopped,
             stretch_ratio: 1.0,
-            preset: PresetChoice::DjBeatmatch,
             deck_engine: DeckEngine::Keylock,
-            deck_range: DeckRange::Standard,
+            pitch: PitchRatio::UNITY,
+            backend: timestretch::Backend::Auto,
+            resolved_backend: timestretch::Backend::Auto,
+            achieved_tempo: 1.0,
+            achieved_pitch: 1.0,
+            underrun_frames: 0,
+            processing_error: None,
             position_frames: 0,
             total_frames: 0,
             sample_rate: 44100,
+            output_sample_rate: 44100,
+            native_sample_rate: 44100,
             detected_bpm: 0.0,
             target_bpm: 0.0,
             seek_request: None,
             reported_latency_secs: None,
             reported_control_latency_secs: 0.0,
+            worker_scheduling: "not running",
+            worker_scheduling_error: None,
             pre_analysis: None,
             analysis_generation: 0,
             loop_region: None,
@@ -205,31 +177,6 @@ impl AtomicVolume {
 
     pub fn load(&self) -> f32 {
         f32::from_bits(self.bits.load(Ordering::Relaxed))
-    }
-}
-
-/// Lock-free rate factor (f64 bits), same pattern as [`AtomicVolume`].
-///
-/// Carries the wide-fader brake factor `b` in `[0, 1]`: 1.0 = no brake
-/// (engine output passes through untouched), 0.0 = full stop. Written by
-/// the UI's tempo write point, read by the audio callback every block.
-pub struct AtomicRate {
-    bits: AtomicU64,
-}
-
-impl AtomicRate {
-    pub fn new(rate: f64) -> Self {
-        Self {
-            bits: AtomicU64::new(rate.to_bits()),
-        }
-    }
-
-    pub fn store(&self, rate: f64) {
-        self.bits.store(rate.to_bits(), Ordering::Relaxed);
-    }
-
-    pub fn load(&self) -> f64 {
-        f64::from_bits(self.bits.load(Ordering::Relaxed))
     }
 }
 

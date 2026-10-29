@@ -1,11 +1,15 @@
 mod app;
 mod audio_engine;
-mod brake;
+mod backend;
 mod deck;
 mod decoder;
+mod delivery;
+mod output_queue;
+mod render_worker;
 mod scrub;
 mod state;
 mod waveform;
+mod worker_priority;
 
 fn main() -> eframe::Result<()> {
     env_logger::init();

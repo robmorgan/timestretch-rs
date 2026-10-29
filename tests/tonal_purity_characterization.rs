@@ -7,7 +7,18 @@
 //! listening verdict (a sine-purity figure overstates audibility on
 //! dense mixes, which is exactly why the verdict is by ear).
 
-use timestretch::{StretchParams, stretch};
+use timestretch::{Backend, DurationRatio, Parameters, SessionConfig};
+fn render_config(ratio: f64, rate: u32, channels: usize) -> SessionConfig {
+    let parameters = Parameters::keylock(DurationRatio::new(ratio).unwrap().tempo());
+    SessionConfig {
+        backend: Backend::Portable,
+        source_sample_rate: rate,
+        output_sample_rate: rate,
+        channels,
+        parameters,
+        ..Default::default()
+    }
+}
 
 const SR: u32 = 44_100;
 
@@ -24,9 +35,7 @@ fn goertzel(seg: &[f32], freq: f64) -> f64 {
 }
 
 fn render(input: &[f32], ratio: f64) -> Vec<f32> {
-    let params = StretchParams::new(ratio)
-        .with_sample_rate(SR)
-        .with_channels(1);
+    let params = render_config(ratio, SR, 1);
     stretch(input, &params).expect("stretch")
 }
 
@@ -99,4 +108,8 @@ fn nearby_tone_pair_keeps_beating_structure() {
              (characterized 62.1/+8%, 41.3/-8% with the Stage 18 cadence stretch)"
         );
     }
+}
+
+fn stretch(input: &[f32], config: &SessionConfig) -> Result<Vec<f32>, timestretch::SessionError> {
+    timestretch::render(input, config.clone()).map(|r| r.samples)
 }

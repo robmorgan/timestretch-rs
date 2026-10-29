@@ -2,9 +2,9 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
+use timestretch::AudioBuffer;
 use timestretch::analysis::comparison;
 use timestretch::io::wav::{read_wav_file, write_wav_file_float};
-use timestretch::{AudioBuffer, StretchParams};
 
 const ORIG_WAV_ENV: &str = "TIMESTRETCH_RUBBERBAND_ORIGINAL_WAV";
 const REF_WAV_ENV: &str = "TIMESTRETCH_RUBBERBAND_REFERENCE_WAV";
@@ -12,13 +12,7 @@ const RATIO_ENV: &str = "TIMESTRETCH_RUBBERBAND_RATIO";
 const SOURCE_BPM_ENV: &str = "TIMESTRETCH_RUBBERBAND_SOURCE_BPM";
 const TARGET_BPM_ENV: &str = "TIMESTRETCH_RUBBERBAND_TARGET_BPM";
 const MAX_SECONDS_ENV: &str = "TIMESTRETCH_RUBBERBAND_MAX_SECONDS";
-/// `batch` (default) renders through offline `stretch()`; `realtime`
-/// renders through the engine's keylock chain at constant rate, callback
-/// by callback. The realtime arm is only meaningful at DJ ratios
-/// (0.92–1.08, ±20% secondary): beyond ~±10% rate deviation the keylock
-/// deliberately fades toward plain varispeed and no longer preserves
-/// pitch, while RubberBand always does.
-const ENGINE_ENV: &str = "TIMESTRETCH_RUBBERBAND_ENGINE";
+// Optional comparison against user-supplied output from the public Rubber Band tool.
 const FFT_SIZE: usize = 2048;
 const HOP_SIZE: usize = 512;
 const DEFAULT_MAX_SECONDS: f64 = 20.0;
@@ -62,52 +56,21 @@ fn resolve_ratio(original: &AudioBuffer, reference: &AudioBuffer) -> Option<f64>
     None
 }
 
-/// Renders through the engine's keylock chain at constant rate
-/// `1 / ratio`, trimming the pipeline-latency prefix so the output aligns
-/// with the source timeline like the batch render does.
-fn render_engine(input: &[f32], sample_rate: u32, ratio: f64) -> Vec<f32> {
-    use timestretch::engine::{Engine, EngineConfig, EngineProfile};
-    let rate = 1.0 / ratio;
-    let handles = Engine::build(EngineConfig {
-        sample_rate,
-        channels: 1,
-        profile: EngineProfile::Keylock,
-        initial_tempo_rate: rate,
-        ..EngineConfig::default()
-    })
-    .expect("engine builds");
-    let (controller, mut processor, mut source) =
-        (handles.controller, handles.processor, handles.source);
-    source.set_track_position(0);
-    let latency = processor.pipeline_latency_frames();
-
-    let mut feed = 0usize;
-    let mut finished = false;
-    let mut out = vec![0.0f32; 256];
-    let mut collected: Vec<f32> = Vec::with_capacity((input.len() as f64 * ratio) as usize + 4096);
-    loop {
-        while feed < input.len() && source.occupied_frames() < 8_192 {
-            let end = (feed + 8_192).min(input.len());
-            feed += source.push(&input[feed..end]);
-        }
-        if feed >= input.len() && !finished {
-            finished = source.finish();
-        }
-        let underruns_before = controller.underrun_frames();
-        processor.process(&mut out);
-        if controller.underrun_frames() > underruns_before {
-            let shortfall = (controller.underrun_frames() - underruns_before) as usize;
-            collected.extend_from_slice(&out[..out.len() - shortfall.min(out.len())]);
-            break;
-        }
-        collected.extend_from_slice(&out);
-        if collected.len() > input.len() * 6 + 100_000 {
-            panic!("realtime render did not terminate");
-        }
-    }
-    // Drop the constant pipeline-latency prefix (silence + fill).
-    collected.drain(..latency.min(collected.len()));
-    collected
+fn render_session(input: &[f32], sample_rate: u32, ratio: f64) -> Vec<f32> {
+    use timestretch::{Backend, DurationRatio, Parameters, SessionConfig};
+    timestretch::render(
+        input,
+        SessionConfig {
+            backend: Backend::Portable,
+            channels: 1,
+            source_sample_rate: sample_rate,
+            output_sample_rate: sample_rate,
+            parameters: Parameters::keylock(DurationRatio::new(ratio).unwrap().tempo()),
+            ..Default::default()
+        },
+    )
+    .expect("session render")
+    .samples
 }
 
 #[test]
@@ -166,15 +129,7 @@ fn benchmark_against_external_rubberband_render() {
         trim_to_seconds(&reference, max_seconds * ratio.max(0.01)).mix_to_mono();
     let original_mono = original.mix_to_mono();
 
-    let engine = std::env::var(ENGINE_ENV).unwrap_or_else(|_| "batch".to_string());
-    let stretched = if engine.trim().eq_ignore_ascii_case("realtime") {
-        render_engine(&original_mono.data, original_mono.sample_rate, ratio)
-    } else {
-        let params = StretchParams::new(ratio)
-            .with_sample_rate(original_mono.sample_rate)
-            .with_channels(1);
-        timestretch::stretch(&original_mono.data, &params).expect("stretch failed")
-    };
+    let stretched = render_session(&original_mono.data, original_mono.sample_rate, ratio);
     assert!(!stretched.is_empty(), "stretched output must not be empty");
 
     let compare_len = stretched.len().min(reference_mono.data.len());
@@ -201,7 +156,7 @@ fn benchmark_against_external_rubberband_render() {
     fs::create_dir_all(&out_dir).expect("failed to create rubberband benchmark output directory");
 
     let output_wav = out_dir.join("timestretch_vs_rubberband_output.wav");
-    let output_buffer = AudioBuffer::from_mono(test.to_vec(), original_mono.sample_rate);
+    let output_buffer = AudioBuffer::from_mono(test.to_vec(), original_mono.sample_rate).unwrap();
     write_wav_file_float(output_wav.to_string_lossy().as_ref(), &output_buffer)
         .expect("failed to write benchmark output WAV");
 

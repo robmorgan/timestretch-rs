@@ -1,12 +1,12 @@
 //! External-reference quality gate (ROADMAP Stage 7): the engine's
-//! keylock chain vs a Rubber Band CLI render of the same public-corpus
+//! timestretch session vs a Rubber Band CLI render of the same public-corpus
 //! track, REQUIRED in CI.
 //!
 //! Unlike `rubberband_comparison.rs` (a manual harness fed by env vars),
 //! this test is self-contained: it decodes a pinned public-corpus track
 //! (see `scripts/fetch_public_corpus.sh`), produces the external reference
 //! by invoking the `rubberband` CLI, renders the same stretch through the
-//! engine, and gates on spectral similarity and level integrity.
+//! session, and gates on spectral similarity and level integrity.
 //!
 //! Skips (with a message) when the corpus or the `rubberband` binary is
 //! missing so local `--all-targets` runs stay green; CI exports
@@ -35,7 +35,7 @@ const CORPUS_FILE: &str = "benchmarks/audio/public-corpus/02-Valya_Kan-Memories.
 const START_SECS: f64 = 60.0;
 const WINDOW_SECS: f64 = 25.0;
 /// DJ beatmatch stretches under gate: 125 -> 118 BPM (slow down) and
-/// 125 -> 132 BPM (speed up); both inside the keylock's SOLA band.
+/// 125 -> 132 BPM (speed up); within the retained product comparison range.
 const TARGET_BPMS: [f64; 2] = [118.0, 132.0];
 const SOURCE_BPM: f64 = 125.0;
 
@@ -99,51 +99,21 @@ fn decode_mp3(path: &Path) -> (Vec<f32>, u32, usize) {
     (samples, sample_rate, channels)
 }
 
-/// Renders through the engine's keylock chain at constant rate
-/// `1 / ratio` and trims the pipeline-latency prefix (same driver as
-/// `rubberband_comparison.rs`).
-fn render_engine(input: &[f32], sample_rate: u32, ratio: f64) -> Vec<f32> {
-    use timestretch::engine::{Engine, EngineConfig, EngineProfile};
-    let rate = 1.0 / ratio;
-    let handles = Engine::build(EngineConfig {
-        sample_rate,
-        channels: 1,
-        profile: EngineProfile::Keylock,
-        initial_tempo_rate: rate,
-        ..EngineConfig::default()
-    })
-    .expect("engine builds");
-    let (controller, mut processor, mut source) =
-        (handles.controller, handles.processor, handles.source);
-    source.set_track_position(0);
-    let latency = processor.pipeline_latency_frames();
-
-    let mut feed = 0usize;
-    let mut finished = false;
-    let mut out = vec![0.0f32; 256];
-    let mut collected: Vec<f32> = Vec::with_capacity((input.len() as f64 * ratio) as usize + 4096);
-    loop {
-        while feed < input.len() && source.occupied_frames() < 8_192 {
-            let end = (feed + 8_192).min(input.len());
-            feed += source.push(&input[feed..end]);
-        }
-        if feed >= input.len() && !finished {
-            finished = source.finish();
-        }
-        let underruns_before = controller.underrun_frames();
-        processor.process(&mut out);
-        if controller.underrun_frames() > underruns_before {
-            let shortfall = (controller.underrun_frames() - underruns_before) as usize;
-            collected.extend_from_slice(&out[..out.len() - shortfall.min(out.len())]);
-            break;
-        }
-        collected.extend_from_slice(&out);
-        if collected.len() > input.len() * 6 + 100_000 {
-            panic!("engine render did not terminate");
-        }
-    }
-    collected.drain(..latency.min(collected.len()));
-    collected
+fn render_session(input: &[f32], sample_rate: u32, ratio: f64) -> Vec<f32> {
+    use timestretch::{Backend, DurationRatio, Parameters, SessionConfig};
+    timestretch::render(
+        input,
+        SessionConfig {
+            backend: Backend::Portable,
+            channels: 1,
+            source_sample_rate: sample_rate,
+            output_sample_rate: sample_rate,
+            parameters: Parameters::keylock(DurationRatio::new(ratio).unwrap().tempo()),
+            ..Default::default()
+        },
+    )
+    .expect("session render")
+    .samples
 }
 
 #[test]
@@ -182,7 +152,7 @@ fn keylock_meets_external_rubberband_reference() {
     let out_dir = output_dir();
     std::fs::create_dir_all(&out_dir).expect("create output dir");
     let original_wav = out_dir.join("original.wav");
-    let original_buffer = AudioBuffer::from_mono(window.to_vec(), sample_rate);
+    let original_buffer = AudioBuffer::from_mono(window.to_vec(), sample_rate).unwrap();
     write_wav_file_float(original_wav.to_string_lossy().as_ref(), &original_buffer)
         .expect("write original wav");
 
@@ -202,7 +172,7 @@ fn keylock_meets_external_rubberband_reference() {
         let reference = read_wav_file(reference_wav.to_string_lossy().as_ref())
             .expect("read rubberband reference")
             .mix_to_mono();
-        let stretched = render_engine(window, sample_rate, ratio);
+        let stretched = render_session(window, sample_rate, ratio);
 
         let compare_len = stretched.len().min(reference.data.len());
         assert!(compare_len >= FFT_SIZE, "comparison window too short");

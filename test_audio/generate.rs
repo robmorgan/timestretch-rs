@@ -69,7 +69,7 @@ fn sine_stereo(freq_l: f32, freq_r: f32, duration: f32) -> Vec<f32> {
     data
 }
 
-fn click_train(bpm: f32, duration: f32) -> Vec<f32> {
+pub(crate) fn click_train(bpm: f32, duration: f32) -> Vec<f32> {
     let n = (SAMPLE_RATE as f32 * duration) as usize;
     let samples_per_beat = (SAMPLE_RATE as f32 * 60.0 / bpm) as usize;
     let click_len = (SAMPLE_RATE as f32 * 0.001) as usize; // 1ms click
@@ -87,7 +87,7 @@ fn click_train(bpm: f32, duration: f32) -> Vec<f32> {
     data
 }
 
-fn kick_pattern(bpm: f32, duration: f32) -> Vec<f32> {
+pub(crate) fn kick_pattern(bpm: f32, duration: f32) -> Vec<f32> {
     let n = (SAMPLE_RATE as f32 * duration) as usize;
     let samples_per_beat = (SAMPLE_RATE as f32 * 60.0 / bpm) as usize;
     let kick_len = (SAMPLE_RATE as f32 * 0.05) as usize; // 50ms kick
@@ -189,7 +189,7 @@ fn edm_mix(bpm: f32, duration: f32) -> Vec<f32> {
 /// from a real club mashup). Unlike `edm_mix`, there is no quiet background
 /// anywhere: this is the regime where onset detectors tuned on
 /// clicks-over-silence go blind.
-fn dense_mastered_edm(bpm: f32, duration: f32) -> Vec<f32> {
+pub(crate) fn dense_mastered_edm(bpm: f32, duration: f32) -> Vec<f32> {
     let n = (SAMPLE_RATE as f32 * duration) as usize;
     let samples_per_beat = (SAMPLE_RATE as f32 * 60.0 / bpm) as usize;
     let samples_per_8th = samples_per_beat / 2;
@@ -284,7 +284,7 @@ fn masterize(data: &mut [f32], target_peak: f32, target_rms: f32) {
 
 // ── WAV writer (minimal, self-contained) ─────────────────────────────────────
 
-fn build_wav_float(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
+pub(crate) fn build_wav_float(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
     let bits_per_sample: u16 = 32;
     let data_size = (samples.len() * 4) as u32;
     let byte_rate = sample_rate * channels as u32 * (bits_per_sample as u32 / 8);

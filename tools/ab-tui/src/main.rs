@@ -10,7 +10,7 @@
 //! at save time, never before.
 //!
 //! Usage:
-//!   ab-tui <set_dir> [--results <path>] [--no-unblind]
+//!   `ab-tui <set_dir> [--results <path>] [--no-unblind]`
 //!
 //! `<set_dir>` is the `target/ab/<name>` directory `scripts/ab.sh render`
 //! produced. On save the results path is printed as the LAST stdout line
