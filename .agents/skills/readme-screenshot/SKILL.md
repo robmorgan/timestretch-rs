@@ -1,6 +1,6 @@
 ---
 name: readme-screenshot
-description: Capture a fresh presentation-quality shot of the desktop app and refresh the README image (docs/desktop-app.png). Use after big UI changes when Rob asks to update/refresh the README or docs screenshot. Usage: /readme-screenshot
+description: Capture a fresh presentation-quality shot of the desktop app and refresh the README image (docs/desktop-app.png). Use after big UI changes when Rob asks to update/refresh the README or docs screenshot. Invoke as /readme-screenshot (Claude Code) or $readme-screenshot (Codex).
 ---
 
 # Refresh the README screenshot
@@ -11,8 +11,9 @@ and replace `docs/desktop-app.png`, the image the repo-root `README.md` embeds
 after big UI changes, not on every release. The shot must be **reviewed and
 approved by Rob in-chat before anything in the repo changes**.
 
-`$SCRATCH` below is the session scratchpad directory. Paths are relative to
-the repo root unless noted. The `desktop:verify` skill shares this machinery
+`$SCRATCH` below is the session scratchpad directory (if your agent has none,
+`SCRATCH=$(mktemp -d)`). Paths are relative to
+the repo root unless noted. The `desktop-verify` skill shares this machinery
 (`uidrive.swift` lives in this skill directory) and has deeper UI-driving
 details (coordinates, drag gotchas, transport-state reading).
 
@@ -54,7 +55,7 @@ details (coordinates, drag gotchas, transport-state reading).
    `drag <x1> <y1> <x2> <y2> <ms> [holdBeforeMs] [holdAfterMs]`):
 
    ```bash
-   swiftc -O -o "$SCRATCH/uidrive" .claude/skills/readme-screenshot/uidrive.swift
+   swiftc -O -o "$SCRATCH/uidrive" .agents/skills/readme-screenshot/uidrive.swift
    ```
 
 3. Safety check before driving the pointer — CGEvent clicks land on whatever
@@ -140,10 +141,10 @@ details (coordinates, drag gotchas, transport-state reading).
    embed is missing, or if the captured state no longer matches the alt
    text / italic caption under it — then update those to match.
 3. Commit the image (plus `README.md` only if touched) — commit signing hangs
-   on a 1Password `op-ssh-sign` prompt, so run in **background Bash** and tell
+   on a 1Password `op-ssh-sign` prompt, so run in the **background** and tell
    Rob to approve it. Subject `docs: refresh README screenshot`, a 1–2 line
-   body noting what UI change prompted the refresh, ending with the
-   `Co-Authored-By` trailer. Do **not** push unless Rob asks.
+   body noting what UI change prompted the refresh. No AI attribution
+   trailer. Do **not** push unless Rob asks.
 
 ## Phase 6 — Cleanup & report
 

@@ -1,6 +1,6 @@
 ---
 name: release
-description: Cut a timestretch release — CHANGELOG fold, version bump, CI checks, signed tag, GitHub release, crates.io publish. Use when Rob asks to release/publish/ship a new version of the crate. Usage: /release [X.Y.Z]
+description: Cut a timestretch release — CHANGELOG fold, version bump, CI checks, signed tag, GitHub release, crates.io publish. Use when Rob asks to release/publish/ship a new version of the crate. Invoke as /release [X.Y.Z] (Claude Code) or $release (Codex).
 ---
 
 # Release timestretch
@@ -36,7 +36,7 @@ release third.
 
 If Rob gave a version argument, use it. Otherwise propose one from the `Unreleased`
 section — while the crate is 0.x, breaking changes mean a **minor** bump, otherwise
-patch — and confirm the choice with AskUserQuestion before touching files.
+patch — and confirm the choice with Rob before touching files.
 
 ## Phase 3 — File updates (four release files only)
 
@@ -61,19 +61,19 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo test --all-targets
 ```
 
-The `.claude/settings.json` pre-commit hook re-runs fmt+clippy at commit time; that
-is a safety net, not a substitute. Note clippy is also expected to pass with
+Run these yourself before committing. Claude Code's `.claude/settings.json`
+pre-commit hook re-runs fmt+clippy, but other agents (Codex) have no such hook. Note clippy is also expected to pass with
 `--features qa-harnesses` — check it if qa files changed since the last release.
 
 ## Phase 5 — Commit, tag, push
 
 Commit and tag signing hangs on a 1Password `op-ssh-sign` approval prompt: run these
-in **background Bash** and tell Rob to approve the prompt.
+in the **background** and tell Rob to approve the prompt.
 
 1. Stage only the four release files (`Cargo.toml Cargo.lock CHANGELOG.md README.md`).
 2. Commit in house style — subject `Release vX.Y.Z`, body of 3–6 lines summarising
-   the span since the previous version ("Since X.Y this release lands ..."), ending
-   with the `Co-Authored-By` trailer.
+   the span since the previous version ("Since X.Y this release lands ...").
+   No AI attribution trailer.
 3. `git tag -a vX.Y.Z -m "vX.Y.Z"`, then `git push origin main vX.Y.Z`.
 
 ## Phase 6 — GitHub release

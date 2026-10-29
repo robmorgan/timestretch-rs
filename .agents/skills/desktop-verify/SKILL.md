@@ -1,5 +1,5 @@
 ---
-name: verify
+name: desktop-verify
 description: Build, launch, and drive the desktop deck app on macOS to verify UI/audio changes end-to-end (screenshots + synthesized clicks/drags).
 ---
 
@@ -22,12 +22,12 @@ steps, and remember Play/Pause is one toggle button (two clicks = pause).
 
 No cliclick or python-Quartz on this machine. Compile the CGEvent helper
 from the copy kept in the repo-root readme-screenshot skill
-(`.claude/skills/readme-screenshot/uidrive.swift` — winid/click/drag
+(`.agents/skills/readme-screenshot/uidrive.swift` — winid/click/drag
 subcommands posting CGEvents):
 
 ```bash
 # from the repo root; swift JIT is too slow for timing-sensitive drags
-swiftc -O -o uidrive .claude/skills/readme-screenshot/uidrive.swift
+swiftc -O -o uidrive .agents/skills/readme-screenshot/uidrive.swift
 ./uidrive winid timestretch          # -> "windowID x y w h" (screen points)
 ./uidrive click <x> <y>
 ./uidrive drag <x1> <y1> <x2> <y2> <ms> [holdBeforeMs] [holdAfterMs]
@@ -54,8 +54,8 @@ window is frontmost at the click points and (b) its position hasn't moved
 (Rob may drag it aside or be actively working — seen 2026-07-17: clicks
 went into his Ghostty terminal after he moved the test window off-screen).
 If another app is on top or the user is clearly active, STOP driving
-pointer events and hand live testing to Rob. AX-element clicks (see the
-desktop-ui-verification memory) are safe for buttons regardless of
+pointer events and hand live testing to Rob. AX-element clicks (System Events
+`click button` via osascript) are safe for buttons regardless of
 z-order, but drags have no AX equivalent.
 
 ## Timing gotchas
