@@ -1,7 +1,7 @@
 # timestretch
 
 Audio tempo and pitch processing in _mostly_ safe Rust, with an optional
-Apple Accelerate numerical provider.
+Apple Accelerate numerical provider on macOS.
 
 There is one production processor and one host-driven execution adapter,
 `StreamSession`. Offline rendering, the CLI and desktop playback use that same
