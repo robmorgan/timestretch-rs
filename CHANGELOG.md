@@ -15,6 +15,10 @@
 
 ### Fixed
 
+- `render` and `StreamSession` no longer fault with "grain requires
+  unavailable padded samples" (#91). At some tempos above 1 a grain could
+  reach a few samples past the buffered input, which stopped the stream;
+  those samples now read as silence at the near-zero end of the window.
 - `analyze` no longer panics on `wasm32-unknown-unknown`, which has no
   clock; `AnalysisReport::analysis_elapsed_secs` is zero there.
 
