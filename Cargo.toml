@@ -38,7 +38,7 @@ lto = true
 
 [workspace]
 resolver = "2"
-members = ["crates/timestretch-core", "crates/timestretch-analysis", "crates/timestretch-accelerate", "desktop", "tools/ab-tui", "tools/qa"]
+members = ["crates/timestretch-core", "crates/timestretch-analysis", "crates/timestretch-accelerate", "crates/timestretch-wasm", "desktop", "tools/ab-tui", "tools/qa"]
 default-members = [".", "crates/timestretch-core", "crates/timestretch-analysis"]
 
 [[bin]]

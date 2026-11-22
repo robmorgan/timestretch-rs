@@ -15,3 +15,5 @@ benchmarks/audio/
 /tools/__pycache__/
 
 /benchmarks/artifacts/
+
+desktop/dist/

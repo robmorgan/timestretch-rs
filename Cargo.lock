@@ -1206,6 +1206,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "egui_glow",
+ "glow",
  "glutin",
  "glutin-winit",
  "image",
@@ -4000,10 +4001,15 @@ dependencies = [
  "cpal",
  "eframe",
  "env_logger",
+ "js-sys",
  "log",
  "rfd",
  "symphonia",
  "timestretch",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
 ]
 
 [[package]]
@@ -4016,6 +4022,14 @@ dependencies = [
  "timestretch",
  "timestretch-accelerate",
  "timestretch-core",
+]
+
+[[package]]
+name = "timestretch-wasm"
+version = "0.16.0"
+dependencies = [
+ "timestretch",
+ "wasm-bindgen",
 ]
 
 [[package]]

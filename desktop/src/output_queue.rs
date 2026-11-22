@@ -22,6 +22,7 @@ struct Queue {
     underruns: AtomicU64,
 }
 /// Host-held lifetime guard: the audio thread never owns the final queue Arc.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct QueueLifetime {
     _queue: Arc<Queue>,
 }
@@ -145,6 +146,7 @@ impl Producer {
     }
 }
 impl Consumer {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn keep_alive(&self) -> QueueLifetime {
         QueueLifetime {
             _queue: self.queue.clone(),

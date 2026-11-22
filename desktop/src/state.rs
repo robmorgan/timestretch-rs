@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use timestretch::{Parameters, PitchRatio, PreAnalysisArtifact, SessionResult, TempoRate};
 
@@ -343,14 +343,16 @@ impl ScrubState {
 }
 
 /// Flag for signaling the processing thread to stop.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct StopFlag {
-    flag: AtomicBool,
+    flag: std::sync::atomic::AtomicBool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl StopFlag {
     pub fn new() -> Self {
         Self {
-            flag: AtomicBool::new(false),
+            flag: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

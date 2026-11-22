@@ -1,0 +1,7 @@
+# Browser build of the deck app: `trunk serve` for development,
+# `trunk build --release` for the static site in dist/.
+[build]
+target = "index.html"
+dist = "dist"
+# Relative URLs, so the site works from any path (e.g. GitHub Pages).
+public_url = "./"

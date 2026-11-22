@@ -93,6 +93,23 @@ the library does not require them to process audio.
 The library crates declare Rust 1.85; development and desktop builds use the
 pinned toolchain in `rust-toolchain.toml`.
 
+### WebAssembly
+
+The library builds for `wasm32-unknown-unknown` without changes and resolves
+to the Portable backend there:
+
+```sh
+cargo build --release --target wasm32-unknown-unknown --no-default-features
+```
+
+[`crates/timestretch-wasm`](crates/timestretch-wasm/README.md) provides
+JavaScript/TypeScript bindings for `render` and `StreamSession`, a browser
+example, and guidance for AudioWorklet playback.
+
+The reference deck app also runs in the browser:
+<https://robmorgan.github.io/timestretch-rs/>. See
+[desktop usage](desktop/README.md#browser-build).
+
 For streaming, prepare once, then satisfy `source_request`, call `advance` with
 a work quota, collect stamped audio with `read_output`, and `acknowledge` its
 actual consumption. Collection alone never advances playback position.

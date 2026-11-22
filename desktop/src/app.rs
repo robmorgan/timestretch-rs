@@ -3,13 +3,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::Instant;
+use web_time::Instant;
 
-use crate::audio_engine::AudioEngine;
 use crate::backend::BackendChoice;
-use crate::deck;
 use crate::decoder;
+use crate::playback::{Playback, PlaybackParts};
 use crate::state::*;
 use crate::waveform::{
     self, BandPeaks, GridMarks, OverviewParams, OverviewTexture, ScrubGesture, ZoomSpan,
@@ -27,13 +25,48 @@ const LOOP_EXP_MAX: i32 = 5;
 /// Extensions the decoder accepts, shared by the file dialog and drops.
 const AUDIO_EXTENSIONS: &[&str] = &["wav", "mp3", "flac", "ogg"];
 
-/// First path with a supported audio extension (case-insensitive).
-fn first_supported_audio(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
-    paths.into_iter().find(|path| {
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| AUDIO_EXTENSIONS.iter().any(|a| ext.eq_ignore_ascii_case(a)))
-    })
+/// Whether a file name carries a supported audio extension
+/// (case-insensitive).
+fn is_supported_audio(name: &std::path::Path) -> bool {
+    name.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| AUDIO_EXTENSIONS.iter().any(|a| ext.eq_ignore_ascii_case(a)))
+}
+
+/// Where a track's encoded audio comes from.
+enum TrackSource {
+    /// A file on disk; its `.tsa` analysis cache lives beside it.
+    Path(PathBuf),
+    /// An in-memory file from the browser's picker, a drop or a URL. There
+    /// is no filesystem to cache analysis in.
+    #[cfg(target_arch = "wasm32")]
+    Bytes { name: String, bytes: Vec<u8> },
+}
+
+/// A browser file pick or URL fetch: the source, or why it failed.
+#[cfg(target_arch = "wasm32")]
+type Picked = Result<TrackSource, String>;
+
+impl TrackSource {
+    /// File name or path, used for display and the format hint.
+    fn name(&self) -> &std::path::Path {
+        match self {
+            Self::Path(path) => path,
+            #[cfg(target_arch = "wasm32")]
+            Self::Bytes { name, .. } => std::path::Path::new(name),
+        }
+    }
+
+    /// A file dropped onto the window: a path natively, bytes in a browser.
+    fn from_dropped(file: &egui::DroppedFile) -> Option<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        return file.path.clone().map(Self::Path);
+        #[cfg(target_arch = "wasm32")]
+        return file.bytes.as_ref().map(|bytes| Self::Bytes {
+            name: file.name.clone(),
+            bytes: bytes.to_vec(),
+        });
+    }
 }
 
 /// Map BPM to the library's supported domain for the selected pitch behavior.
@@ -278,7 +311,7 @@ struct LoadInProgress {
 
 /// Bundled inputs for [`run_load_worker`].
 struct LoadRequest {
-    path: PathBuf,
+    source: TrackSource,
     state: SharedStateHandle,
     /// `analysis_generation` at spawn; results are discarded on mismatch.
     generation: u64,
@@ -305,16 +338,16 @@ pub struct TimeStretchApp {
     /// Smoothed playhead the painters draw, refreshed every `update`.
     display_pos: f64,
 
-    // Audio engine (lives for the lifetime of the app)
-    audio_engine: Option<AudioEngine>,
+    /// Worker and audio output of the playing deck (platform-specific).
+    playback: Playback,
     output_sample_rate: u32,
+    /// Files chosen through the browser's asynchronous picker or fetched
+    /// from the `?track=` URL parameter, awaiting load.
+    #[cfg(target_arch = "wasm32")]
+    picked: (mpsc::Sender<Picked>, mpsc::Receiver<Picked>),
 
     // Source audio data
     source_audio: Option<Arc<Vec<f32>>>,
-
-    // Processing thread
-    processing_handle: Option<JoinHandle<()>>,
-    stop_flag: Option<Arc<StopFlag>>,
 
     // File info
     file_name: String,
@@ -398,12 +431,10 @@ impl TimeStretchApp {
 
         // Detect the default output sample rate to size the UI; the real
         // engine is built when a track starts playing.
-        let output_sample_rate = AudioEngine::default_sample_rate().unwrap_or_else(|| {
+        let output_sample_rate = Playback::default_sample_rate().unwrap_or_else(|| {
             log::error!("No default audio output device; falling back to 44100 Hz");
             44100
         });
-        let audio_engine = None;
-
         let mut app = Self {
             state,
             position,
@@ -414,11 +445,11 @@ impl TimeStretchApp {
             landing_seq_seen: 0,
             playhead_smoother: PlayheadSmoother::new(Instant::now()),
             display_pos: 0.0,
-            audio_engine,
+            playback: Playback::default(),
             output_sample_rate,
+            #[cfg(target_arch = "wasm32")]
+            picked: mpsc::channel(),
             source_audio: None,
-            processing_handle: None,
-            stop_flag: None,
             file_name: String::new(),
             file_path: None,
             pending_load: None,
@@ -440,8 +471,10 @@ impl TimeStretchApp {
             error_message: None,
         };
         if let Some(path) = initial_file {
-            app.load_file(path);
+            app.load_file(TrackSource::Path(path));
         }
+        #[cfg(target_arch = "wasm32")]
+        app.fetch_url_track();
         app
     }
 
@@ -449,17 +482,18 @@ impl TimeStretchApp {
     /// sidecar), and pre-analysis all run on a worker thread, so the UI
     /// stays responsive however long the track is. Results arrive through
     /// [`Self::poll_pending_load`].
-    fn load_file(&mut self, path: PathBuf) {
+    fn load_file(&mut self, source: TrackSource) {
         // Stop any existing playback
         self.stop_playback();
 
         self.error_message = None;
-        self.file_name = path
+        self.file_name = source
+            .name()
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        log::info!("Loading file: {}", path.display());
+        log::info!("Loading file: {}", source.name().display());
 
         // Clear the old track everywhere before the worker starts — the
         // deck must not stay interactable against audio that's going away.
@@ -505,19 +539,74 @@ impl TimeStretchApp {
             track_received: false,
         });
         let req = LoadRequest {
-            path,
+            source,
             state: self.state.clone(),
             generation,
             tx,
             ctx: self.egui_ctx.clone(),
         };
+        #[cfg(not(target_arch = "wasm32"))]
         std::thread::spawn(move || run_load_worker(req));
+        // No threads in the browser: the load runs on the page's main
+        // thread, yielding between its stages so the "Loading…" state and
+        // then the waveform get painted. The page is unresponsive while a
+        // stage runs.
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.egui_ctx.request_repaint();
+            wasm_bindgen_futures::spawn_local(async move {
+                yield_to_browser(50).await;
+                if let Some(analysis) = load_track(req) {
+                    yield_to_browser(50).await;
+                    load_analysis(analysis);
+                }
+            });
+        }
+    }
+
+    /// Loads the audio file named by the page's `?track=<url>` parameter,
+    /// the browser's counterpart of the command-line path.
+    #[cfg(target_arch = "wasm32")]
+    fn fetch_url_track(&mut self) {
+        let Some(url) = web_sys::window()
+            .and_then(|window| window.location().search().ok())
+            .and_then(|query| web_sys::UrlSearchParams::new_with_str(&query).ok())
+            .and_then(|params| params.get("track"))
+        else {
+            return;
+        };
+        let tx = self.picked.0.clone();
+        let ctx = self.egui_ctx.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = tx.send(fetch_track(&url).await);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Opens the browser's file picker; the choice arrives via `picked`.
+    #[cfg(target_arch = "wasm32")]
+    fn pick_file(&mut self) {
+        let tx = self.picked.0.clone();
+        let ctx = self.egui_ctx.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let picked = rfd::AsyncFileDialog::new()
+                .add_filter("Audio", AUDIO_EXTENSIONS)
+                .pick_file()
+                .await;
+            if let Some(file) = picked {
+                let _ = tx.send(Ok(TrackSource::Bytes {
+                    name: file.file_name(),
+                    bytes: file.read().await,
+                }));
+                ctx.request_repaint();
+            }
+        });
     }
 
     /// Drains the load worker's channel: installs the decoded track, then
     /// the analysis when it lands. Called at the top of every `update`.
     fn poll_pending_load(&mut self) {
-        if self.audio_engine.as_ref().is_some_and(AudioEngine::failed) {
+        if self.playback.device_failed() {
             self.stop_playback();
             self.error_message = Some(
                 "Audio device failed; select a working output device and restart playback".into(),
@@ -634,33 +723,20 @@ impl TimeStretchApp {
         }
         let (producer, consumer) = crate::output_queue::channel(32768);
         self.volume_shared.store(self.volume);
-        let engine = match AudioEngine::new(
-            self.volume_shared.clone(),
-            self.stream_active.clone(),
-            Some(self.output_sample_rate),
-            consumer,
-            self.scrub.clone(),
-            source.clone(),
-        ) {
-            Ok(engine) => engine,
-            Err(error) => {
-                self.error_message = Some(error);
-                self.state.lock().unwrap().transport = Transport::Stopped;
-                return;
-            }
-        };
-        self.audio_engine = Some(engine);
-        let stop = Arc::new(StopFlag::new());
-        self.stop_flag = Some(stop.clone());
-        self.processing_handle = Some(deck::start_deck_thread(
-            self.state.clone(),
+        if let Err(error) = self.playback.start(PlaybackParts {
+            state: self.state.clone(),
             source,
             producer,
-            self.position.clone(),
-            self.stream_active.clone(),
-            stop,
-            self.scrub.clone(),
-        ));
+            consumer,
+            position: self.position.clone(),
+            stream_active: self.stream_active.clone(),
+            scrub: self.scrub.clone(),
+            volume: self.volume_shared.clone(),
+            output_sample_rate: self.output_sample_rate,
+        }) {
+            self.error_message = Some(error);
+            self.state.lock().unwrap().transport = Transport::Stopped;
+        }
     }
 
     fn stop_playback(&mut self) {
@@ -686,14 +762,8 @@ impl TimeStretchApp {
     }
 
     fn stop_processing_thread(&mut self) {
-        if let Some(flag) = self.stop_flag.take() {
-            flag.set();
-        }
-        if let Some(handle) = self.processing_handle.take() {
-            let _ = handle.join();
-        }
+        self.playback.stop();
         self.stream_active.store(false, Ordering::Relaxed);
-        self.audio_engine = None;
     }
 
     fn format_time(secs: f64) -> String {
@@ -706,21 +776,36 @@ impl TimeStretchApp {
 impl eframe::App for TimeStretchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let frame_start = Instant::now();
+        #[cfg(target_arch = "wasm32")]
+        {
+            // The page timer also pumps; doing it here keeps audio and the
+            // painted playhead in step with the frame.
+            self.playback.pump();
+            while let Ok(picked) = self.picked.1.try_recv() {
+                match picked {
+                    Ok(source) => self.load_file(source),
+                    Err(error) => self.error_message = Some(error),
+                }
+            }
+        }
         // Install any background load results before painting from them.
         self.poll_pending_load();
         // OS file drags are reported per window, without a reliable pointer
         // position, so a drop anywhere loads; the deck area is the visual
         // drop zone.
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
+        let dropped: Vec<TrackSource> = ctx.input(|i| {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|file| file.path.clone())
+                .filter_map(TrackSource::from_dropped)
                 .collect()
         });
         if !dropped.is_empty() {
-            match first_supported_audio(dropped) {
-                Some(path) => self.load_file(path),
+            match dropped
+                .into_iter()
+                .find(|source| is_supported_audio(source.name()))
+            {
+                Some(source) => self.load_file(source),
                 None => {
                     self.error_message = Some(format!(
                         "Unsupported file type ({})",
@@ -806,7 +891,11 @@ impl eframe::App for TimeStretchApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Timestretch Desktop");
+            ui.heading(if cfg!(target_arch = "wasm32") {
+                "Timestretch"
+            } else {
+                "Timestretch Desktop"
+            });
             ui.add_space(8.0);
 
             // Error message
@@ -844,13 +933,14 @@ impl eframe::App for TimeStretchApp {
             "frame raw={pos_frames} disp={:.1} cpu_us={} us={}",
             self.display_pos,
             frame_start.elapsed().as_micros(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_micros()
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn on_exit(&mut self) {
         self.stop_processing_thread();
     }
@@ -887,12 +977,17 @@ impl TimeStretchApp {
 
     fn file_panel(&mut self, ui: &mut egui::Ui, fs: &FrameState) {
         ui.horizontal(|ui| {
+            #[cfg(not(target_arch = "wasm32"))]
             if ui.button("Load Audio File").clicked()
                 && let Some(path) = rfd::FileDialog::new()
                     .add_filter("Audio", AUDIO_EXTENSIONS)
                     .pick_file()
             {
-                self.load_file(path);
+                self.load_file(TrackSource::Path(path));
+            }
+            #[cfg(target_arch = "wasm32")]
+            if ui.button("Load Audio File").clicked() {
+                self.pick_file();
             }
 
             let decoding = self
@@ -976,7 +1071,7 @@ impl TimeStretchApp {
             }
             Some(ScrubGesture::Release) => {
                 if let Some(frame) = self.scrub_pos.take() {
-                    if self.audio_engine.is_some() {
+                    if self.playback.has_engine() {
                         // Momentum glide: the audio callback eases the voice
                         // toward play speed (or rest), predicts the landing,
                         // and the landing consumer below warm-starts the
@@ -1462,21 +1557,70 @@ fn legacy_peaks_path(audio_path: &std::path::Path) -> PathBuf {
 ///
 /// Results are dropped if another file was loaded in the meantime (the
 /// receiver is gone and the `generation` guard rejects the artifact).
+#[cfg(not(target_arch = "wasm32"))]
 fn run_load_worker(req: LoadRequest) {
+    if let Some(stage) = load_track(req) {
+        load_analysis(stage);
+    }
+}
+
+/// What [`load_track`] hands to [`load_analysis`].
+struct AnalysisStage {
+    /// The on-disk source whose `.tsa` cache is kept; `None` for in-memory
+    /// (browser) sources, which have nowhere to cache.
+    path: Option<PathBuf>,
+    state: SharedStateHandle,
+    generation: u64,
+    tx: mpsc::Sender<LoadMsg>,
+    ctx: egui::Context,
+    mono: Vec<f32>,
+    sample_rate: u32,
+    analysis: timestretch::AnalysisFile,
+    /// The container holds results that are not on disk yet.
+    dirty: bool,
+    /// The container on disk already supersedes both legacy sidecars; kept
+    /// true across best-effort rewrites of the same content.
+    persisted_complete: bool,
+}
+
+/// Best-effort container write. Returns whether it reached the disk.
+fn persist_analysis(path: Option<&std::path::Path>, analysis: &timestretch::AnalysisFile) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let tsa_path = timestretch::analysis_file_path(path);
+    match timestretch::write_analysis_file(&tsa_path, analysis) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("Analysis: could not write {}: {e}", tsa_path.display());
+            false
+        }
+    }
+}
+
+/// First load stage: decode and peaks, sent to the UI as `LoadMsg::Track`.
+/// Returns `None` when the load failed or was superseded.
+fn load_track(req: LoadRequest) -> Option<AnalysisStage> {
     let LoadRequest {
-        path,
+        source,
         state,
         generation,
         tx,
         ctx,
     } = req;
 
-    let decoded = match decoder::decode_file(&path) {
+    let display_path = source.name().to_path_buf();
+    let (decoded, path) = match source {
+        TrackSource::Path(path) => (decoder::decode_file(&path), Some(path)),
+        #[cfg(target_arch = "wasm32")]
+        TrackSource::Bytes { bytes, .. } => (decoder::decode_bytes(bytes, &display_path), None),
+    };
+    let decoded = match decoded {
         Ok(d) => d,
         Err(e) => {
             let _ = tx.send(LoadMsg::Track(Err(format!("Failed to load: {e}"))));
             ctx.request_repaint();
-            return;
+            return None;
         }
     };
     log::info!(
@@ -1492,46 +1636,48 @@ fn run_load_worker(req: LoadRequest) {
     // One mono downmix + one hash: the container identity, the peaks
     // input, and the pre-analysis input.
     let mono = timestretch::downmix_to_mid(&decoded.samples, num_channels);
-    let content_hash = timestretch::hash_samples(&mono);
 
-    let tsa_path = timestretch::analysis_file_path(&path);
-    let on_disk =
-        timestretch::read_analysis_file_validated(&tsa_path, sample_rate, mono.len(), content_hash);
-    // Whether the container on disk already supersedes both legacy
-    // sidecars; kept true across best-effort rewrites of the same content.
+    let on_disk = path.as_deref().and_then(|path| {
+        let tsa_path = timestretch::analysis_file_path(path);
+        let content_hash = timestretch::hash_samples(&mono);
+        let found = timestretch::read_analysis_file_validated(
+            &tsa_path,
+            sample_rate,
+            mono.len(),
+            content_hash,
+        );
+        if found.is_some() {
+            log::info!("Analysis: using cached container {}", tsa_path.display());
+        }
+        found
+    });
     let mut persisted_complete = on_disk
         .as_ref()
         .is_some_and(|af| af.artifact.is_some() && af.peaks.is_some());
-    let mut analysis = match on_disk {
-        Some(af) => {
-            log::info!("Analysis: using cached container {}", tsa_path.display());
-            af
-        }
-        None => timestretch::AnalysisFile::for_source(&mono, sample_rate),
-    };
+    let mut analysis =
+        on_disk.unwrap_or_else(|| timestretch::AnalysisFile::for_source(&mono, sample_rate));
     let mut dirty = false;
 
     // Legacy migration: absorb a still-valid JSON artifact so the slow
     // re-analysis is skipped. The legacy `.tspeaks` cache is deliberately
     // NOT read — recomputing peaks costs milliseconds, keeping its parser
     // alive costs a hundred lines.
-    if analysis.artifact.is_none() {
+    if analysis.artifact.is_none()
+        && let Some(path) = &path
+    {
         #[allow(deprecated)]
-        let legacy = timestretch::read_preanalysis_json(&legacy_json_path(&path));
+        let legacy = timestretch::read_preanalysis_json(&legacy_json_path(path));
         if let Ok(legacy) = legacy
             && legacy.matches_source(&mono, sample_rate)
         {
-            log::info!(
-                "Pre-analysis: migrating legacy JSON sidecar into {}",
-                tsa_path.display()
-            );
+            log::info!("Pre-analysis: migrating legacy JSON sidecar into the .tsa container");
             analysis.artifact = Some(legacy);
             dirty = true;
         }
     }
 
     if analysis.peaks.is_none() {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         // Computed from the hashed mono signal (not the interleaved
         // stereo): identical bucket count, per-quantization-identical
         // values, half the filter work — and the persisted peaks derive
@@ -1543,18 +1689,13 @@ fn run_load_worker(req: LoadRequest) {
 
     // Write #1, before the Track send: peaks (and any migrated artifact)
     // survive a crash during the slow analysis below.
-    if dirty {
-        match timestretch::write_analysis_file(&tsa_path, &analysis) {
-            Ok(()) => {
-                persisted_complete = analysis.artifact.is_some();
-                dirty = false;
-            }
-            Err(e) => log::warn!("Analysis: could not write {}: {e}", tsa_path.display()),
-        }
+    if dirty && persist_analysis(path.as_deref(), &analysis) {
+        persisted_complete = analysis.artifact.is_some();
+        dirty = false;
     }
 
     let track = LoadedTrack {
-        path: path.clone(),
+        path: display_path,
         samples: Arc::new(decoded.samples),
         sample_rate,
         num_frames,
@@ -1562,18 +1703,47 @@ fn run_load_worker(req: LoadRequest) {
     };
     if tx.send(LoadMsg::Track(Ok(track))).is_err() {
         // A newer load replaced this one; skip the expensive analysis too.
-        return;
+        return None;
     }
     ctx.request_repaint();
+    Some(AnalysisStage {
+        path,
+        state,
+        generation,
+        tx,
+        ctx,
+        mono,
+        sample_rate,
+        analysis,
+        dirty,
+        persisted_complete,
+    })
+}
 
-    // Pre-analysis: beat grid + BPM for the UI and transport gestures. Skip early when a newer load has already started.
+/// Second load stage: beat grid + BPM for the UI and transport gestures,
+/// sent as `LoadMsg::Analysis`.
+fn load_analysis(stage: AnalysisStage) {
+    let AnalysisStage {
+        path,
+        state,
+        generation,
+        tx,
+        ctx,
+        mono,
+        sample_rate,
+        mut analysis,
+        mut dirty,
+        mut persisted_complete,
+    } = stage;
+
+    // Skip early when a newer load has already started.
     if state.lock().unwrap().analysis_generation != generation {
         return;
     }
     let artifact = match analysis.artifact.clone() {
         Some(cached) => cached,
         None => {
-            let start = std::time::Instant::now();
+            let start = Instant::now();
             let fresh = timestretch::analyze(&mono, sample_rate);
             log::info!(
                 "Pre-analysis: {:.1} BPM, confidence {:.2}, {} beats, {} onsets ({:.2}s)",
@@ -1591,19 +1761,16 @@ fn run_load_worker(req: LoadRequest) {
 
     // Write #2: the container now carries both chunks. No read-modify-
     // write — this worker holds the whole file.
-    if dirty {
-        match timestretch::write_analysis_file(&tsa_path, &analysis) {
-            Ok(()) => persisted_complete = true,
-            Err(e) => log::warn!("Analysis: could not write {}: {e}", tsa_path.display()),
-        }
+    if dirty && persist_analysis(path.as_deref(), &analysis) {
+        persisted_complete = true;
     }
 
     // Once the on-disk container supersedes both legacy sidecars — it
     // holds a valid artifact AND peaks for exactly this audio — delete
     // them so tracks converge to the single `.tsa` file. Only these two
     // sibling paths are ever touched (Halo's `.halo.*` variants are not).
-    if persisted_complete {
-        for legacy in [legacy_json_path(&path), legacy_peaks_path(&path)] {
+    if persisted_complete && let Some(path) = &path {
+        for legacy in [legacy_json_path(path), legacy_peaks_path(path)] {
             match std::fs::remove_file(&legacy) {
                 Ok(()) => log::info!("Removed superseded legacy sidecar {}", legacy.display()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1625,6 +1792,45 @@ fn run_load_worker(req: LoadRequest) {
     }
     let _ = tx.send(LoadMsg::Analysis(artifact));
     ctx.request_repaint();
+}
+
+/// Resolves after `ms` milliseconds, letting the browser paint and handle
+/// input in between.
+#[cfg(target_arch = "wasm32")]
+async fn yield_to_browser(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+/// Downloads an audio file for the `?track=` parameter.
+#[cfg(target_arch = "wasm32")]
+async fn fetch_track(url: &str) -> Result<TrackSource, String> {
+    use wasm_bindgen::JsCast as _;
+    use wasm_bindgen_futures::JsFuture;
+    let failed = |what: &str| format!("Could not load {url}: {what}");
+    let window = web_sys::window().ok_or_else(|| failed("no window"))?;
+    let response: web_sys::Response = JsFuture::from(window.fetch_with_str(url))
+        .await
+        .map_err(|_| failed("network error"))?
+        .dyn_into()
+        .map_err(|_| failed("unexpected response"))?;
+    if !response.ok() {
+        return Err(failed(&format!("HTTP {}", response.status())));
+    }
+    let buffer = JsFuture::from(response.array_buffer().map_err(|_| failed("no body"))?)
+        .await
+        .map_err(|_| failed("download interrupted"))?;
+    // The last path segment, without any query, names the file.
+    let name = url.split(['?', '#']).next().unwrap_or(url);
+    let name = name.rsplit('/').next().unwrap_or(name).to_owned();
+    Ok(TrackSource::Bytes {
+        name,
+        bytes: js_sys::Uint8Array::new(&buffer).to_vec(),
+    })
 }
 
 /// Rebuilds the [`timestretch::BeatGrid`] view of a pre-analysis artifact:
@@ -1654,13 +1860,12 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn first_supported_audio_filters_by_extension() {
-        let paths = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
-        assert_eq!(
-            first_supported_audio(paths(&["notes.txt", "a.WAV", "b.mp3"])),
-            Some(PathBuf::from("a.WAV"))
-        );
-        assert_eq!(first_supported_audio(paths(&["notes.txt", "noext"])), None);
+    fn is_supported_audio_filters_by_extension() {
+        let supported = |name: &str| is_supported_audio(std::path::Path::new(name));
+        assert!(supported("a.WAV"));
+        assert!(supported("/music/b.mp3"));
+        assert!(!supported("notes.txt"));
+        assert!(!supported("noext"));
     }
 
     #[test]
@@ -1756,7 +1961,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         (
             LoadRequest {
-                path: wav.to_path_buf(),
+                source: TrackSource::Path(wav.to_path_buf()),
                 state: state.clone(),
                 generation,
                 tx,

@@ -6,3 +6,5 @@
 [toolchain]
 channel = "1.97.0"
 components = ["clippy", "rustfmt"]
+# The WebAssembly bindings (crates/timestretch-wasm) build for this target.
+targets = ["wasm32-unknown-unknown"]

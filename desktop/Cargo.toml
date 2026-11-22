@@ -6,6 +6,14 @@ publish = false
 
 [dependencies]
 timestretch = { path = "..", features = ["analysis", "io"] }
+symphonia = { version = "0.5", features = ["mp3", "flac", "ogg", "wav", "pcm", "vorbis"] }
+rfd = "0.15"
+log = "0.4"
+# `Instant`/`SystemTime` that also work in the browser (std's panic there);
+# a plain re-export of std on native targets.
+web-time = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # wgpu backend (native Metal on macOS): the default glow backend presents
 # through CGLFlushDrawable / OpenGL-on-Metal, which profiled as the single
 # biggest CPU cost of the app.
@@ -17,11 +25,33 @@ eframe = { version = "0.31", default-features = false, features = [
     "wayland",
 ] }
 cpal = "0.15"
-symphonia = { version = "0.5", features = ["mp3", "flac", "ogg", "wav", "pcm", "vorbis"] }
-rfd = "0.15"
-log = "0.4"
 env_logger = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 audio_thread_priority = { version = "0.37", default-features = false }
 
+# Browser build (see web/README.md): WebGL2 via glow for the widest support,
+# Web Audio instead of cpal, no threads.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+eframe = { version = "0.31", default-features = false, features = [
+    "default_fonts",
+    "glow",
+] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "AudioBuffer",
+    "AudioBufferSourceNode",
+    "AudioContext",
+    "AudioContextOptions",
+    "AudioDestinationNode",
+    "AudioNode",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "Location",
+    "Response",
+    "UrlSearchParams",
+    "Window",
+] }
