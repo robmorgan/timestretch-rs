@@ -24,6 +24,18 @@ const LOOP_EXP_MIN: i32 = -3;
 /// Ladder ceiling: 32 beats (8 bars).
 const LOOP_EXP_MAX: i32 = 5;
 
+/// Extensions the decoder accepts, shared by the file dialog and drops.
+const AUDIO_EXTENSIONS: &[&str] = &["wav", "mp3", "flac", "ogg"];
+
+/// First path with a supported audio extension (case-insensitive).
+fn first_supported_audio(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    paths.into_iter().find(|path| {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| AUDIO_EXTENSIONS.iter().any(|a| ext.eq_ignore_ascii_case(a)))
+    })
+}
+
 /// Map BPM to the library's supported domain for the selected pitch behavior.
 struct TempoMapping {
     ratio: f64,
@@ -696,6 +708,28 @@ impl eframe::App for TimeStretchApp {
         let frame_start = Instant::now();
         // Install any background load results before painting from them.
         self.poll_pending_load();
+        // OS file drags are reported per window, without a reliable pointer
+        // position, so a drop anywhere loads; the deck area is the visual
+        // drop zone.
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            match first_supported_audio(dropped) {
+                Some(path) => self.load_file(path),
+                None => {
+                    self.error_message = Some(format!(
+                        "Unsupported file type ({})",
+                        AUDIO_EXTENSIONS.join(", ")
+                    ));
+                }
+            }
+        }
+        let drop_hover = ctx.input(|i| !i.raw.hovered_files.is_empty());
         // Scrub glide bookkeeping. During a settle the voice owns the
         // moving position, so mirror it into the shared playhead; and each
         // newly published landing fires the parallel engine warm-start.
@@ -786,7 +820,10 @@ impl eframe::App for TimeStretchApp {
             ui.add_space(8.0);
 
             // Deck waveforms
-            self.deck_panel(ui, &fs);
+            let deck_rect = ui.scope(|ui| self.deck_panel(ui, &fs)).response.rect;
+            if drop_hover {
+                Self::paint_drop_zone(ui, deck_rect);
+            }
             ui.add_space(8.0);
 
             // Transport
@@ -820,11 +857,39 @@ impl eframe::App for TimeStretchApp {
 }
 
 impl TimeStretchApp {
+    /// Drop-zone affordance over the deck, shown only while files hover
+    /// the window.
+    fn paint_drop_zone(ui: &egui::Ui, deck: egui::Rect) {
+        let rect = deck.expand(3.0);
+        let painter = ui.painter();
+        let edge = waveform::palette::LOOP_EDGE;
+        painter.rect_filled(rect, 4.0, edge.gamma_multiply(0.18));
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(2.0_f32, edge),
+            egui::StrokeKind::Outside,
+        );
+        // Label on an opaque pill so it reads over a waveform or placeholder.
+        let galley = painter.layout_no_wrap(
+            "Drop to load".to_owned(),
+            egui::FontId::proportional(20.0),
+            edge,
+        );
+        let label = egui::Rect::from_center_size(deck.center(), galley.size());
+        painter.rect_filled(
+            label.expand2(egui::vec2(14.0, 8.0)),
+            6.0,
+            waveform::palette::BACKGROUND,
+        );
+        painter.galley(label.min, galley, edge);
+    }
+
     fn file_panel(&mut self, ui: &mut egui::Ui, fs: &FrameState) {
         ui.horizontal(|ui| {
             if ui.button("Load Audio File").clicked()
                 && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Audio", &["wav", "mp3", "flac", "ogg"])
+                    .add_filter("Audio", AUDIO_EXTENSIONS)
                     .pick_file()
             {
                 self.load_file(path);
@@ -1587,6 +1652,16 @@ fn grid_from_artifact(artifact: &timestretch::PreAnalysisArtifact) -> timestretc
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn first_supported_audio_filters_by_extension() {
+        let paths = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert_eq!(
+            first_supported_audio(paths(&["notes.txt", "a.WAV", "b.mp3"])),
+            Some(PathBuf::from("a.WAV"))
+        );
+        assert_eq!(first_supported_audio(paths(&["notes.txt", "noext"])), None);
+    }
 
     #[test]
     fn grid_from_artifact_copies_beats_downbeats_segments() {

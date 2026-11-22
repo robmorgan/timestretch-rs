@@ -377,7 +377,7 @@ pub(crate) fn paint_placeholder(painter: &egui::Painter, rect: egui::Rect) {
     painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
-        "Load an audio file to see waveform",
+        "Drop an audio file here, or use Load Audio File",
         egui::FontId::proportional(14.0),
         palette::TEXT_DIM,
     );

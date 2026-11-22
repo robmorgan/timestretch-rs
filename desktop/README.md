@@ -4,6 +4,10 @@ Run the workspace desktop player:
 cargo run --release -p timestretch-desktop -- path/to/track.wav
 ```
 
+Load a track with **Load Audio File**, the path argument, or by dropping a
+wav/mp3/flac/ogg file onto the window; the waveform area highlights as the
+drop zone.
+
 The desktop is the library's reference player. **Deck → Keylock** holds the
 selected pitch (unchanged at 0 semitones). At unity pitch, tempo spans
 **1/32–4×** (−96.875% to +300%), or 32× to 0.25× duration. The logarithmic
