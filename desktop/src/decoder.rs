@@ -1,9 +1,8 @@
-use std::fs::File;
 use std::path::Path;
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
@@ -19,8 +18,19 @@ pub struct DecodedAudio {
 
 /// Decode an audio file to interleaved stereo f32 samples.
 pub fn decode_file(path: &Path) -> Result<DecodedAudio, String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open file: {e}"))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let file = std::fs::File::open(path).map_err(|e| format!("Failed to open file: {e}"))?;
+    decode_source(Box::new(file), path)
+}
+
+/// Decode an in-memory audio file (the browser has no filesystem). `name`
+/// only supplies the extension hint.
+#[cfg(target_arch = "wasm32")]
+pub fn decode_bytes(bytes: Vec<u8>, name: &Path) -> Result<DecodedAudio, String> {
+    decode_source(Box::new(std::io::Cursor::new(bytes)), name)
+}
+
+fn decode_source(source: Box<dyn MediaSource>, path: &Path) -> Result<DecodedAudio, String> {
+    let mss = MediaSourceStream::new(source, Default::default());
 
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {

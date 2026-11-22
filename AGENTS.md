@@ -2,7 +2,8 @@
 
 The workspace provides one `StreamSession` adapter. Consult [README](README.md),
 [architecture](docs/CORE_ARCHITECTURE.md) and [session contracts](docs/SESSION_CONTRACT.md).
-Desktop, CLI, examples and QA are workspace consumers. The library owns media
+Desktop, CLI, examples and QA are workspace consumers. The desktop app also
+builds for the browser ([desktop usage](desktop/README.md#browser-build)). The library owns media
 semantics; applications own threads and devices. Analysis is independent of DSP.
 
 ## Analysis version policy

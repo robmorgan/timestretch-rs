@@ -1,0 +1,15 @@
+[package]
+name = "timestretch-wasm"
+version = "0.16.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "WebAssembly/JavaScript bindings for timestretch"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+timestretch = { path = "../..", default-features = false }
+wasm-bindgen = "0.2"

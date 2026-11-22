@@ -55,7 +55,8 @@ pub struct AnalysisReport {
     pub onset_count: usize,
     /// Detected onsets per second of source audio.
     pub onset_rate_per_sec: f64,
-    /// Wall-clock analysis time in seconds.
+    /// Wall-clock analysis time in seconds. Zero on `wasm32-unknown-unknown`,
+    /// which has no clock.
     pub analysis_elapsed_secs: f64,
     /// Whether the rigid-grid fit replaced the tracked beats (quantized
     /// material) or the tracked grid was kept (live/drifting material).
@@ -92,6 +93,8 @@ pub fn analyze_with_report(
     samples: &[f32],
     sample_rate: u32,
 ) -> (PreAnalysisArtifact, AnalysisReport) {
+    // The browser target has no clock in std; `Instant::now` panics there.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     let started = std::time::Instant::now();
     // One detection pass drives both the onset artifact and beat tracking.
     // Beat detection uses the same 2048/512/0.4 configuration, so a separate
@@ -164,7 +167,10 @@ pub fn analyze_with_report(
         onset_count: transients.onsets.len(),
         onset_rate_per_sec: transients.onsets.len() as f64
             / (samples.len() as f64 / sample_rate.max(1) as f64).max(1e-9),
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         analysis_elapsed_secs: started.elapsed().as_secs_f64(),
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        analysis_elapsed_secs: 0.0,
         rigid_grid_adopted,
     };
 

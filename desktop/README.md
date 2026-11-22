@@ -61,3 +61,36 @@ The executable is `target/release/timestretch-desktop`. Concealed synchronized
 listening is generated separately from the app; the report records unscaled,
 common-gain and loudness-matched audio without timing correction. No listening
 preference is inferred from numerical agreement.
+
+## Browser build
+
+The same app compiles to WebAssembly and is published at
+<https://robmorgan.github.io/timestretch-rs/> from `main` by
+`.github/workflows/pages.yml`. Load a track with **Load Audio File**, by
+dropping a file on the page, or with `?track=<url>` (same-origin, or a host
+that allows cross-origin requests). Files stay in the browser; nothing is
+uploaded.
+
+```sh
+# needs https://trunkrs.dev and the wasm32-unknown-unknown target
+desktop/build-web.sh          # static site in desktop/dist
+desktop/build-web.sh serve    # dev server with rebuild on change
+```
+
+Browsers give a page no threads without cross-origin isolation, so the web
+build hosts the deck differently (`src/playback.rs`):
+
+- A page timer steps the same `DeckWorker` the native worker thread runs, and
+  schedules rendered blocks on the Web Audio clock 120 ms ahead
+  (`src/web_audio.rs`). There is no device callback.
+- The lead adds to control and scrub latency, and the drawn playhead runs
+  ahead of what you hear by up to that much.
+- Decode and analysis run on the main thread. The page is unresponsive for a
+  few seconds after a track's waveform appears, while the beat grid is
+  computed, and audio started during that time will drop out.
+- Analysis is not cached (no `.tsa` files), only the Portable backend exists,
+  and worker scheduling is whatever the browser gives the page. A hidden tab
+  may have its timers throttled.
+
+The browser build is a convenience, not a qualification target: timing and
+starvation are qualified on the native app.

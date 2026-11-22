@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.16.1 (unreleased)
+
+### Added
+
+- WebAssembly support. The library builds for `wasm32-unknown-unknown`
+  unchanged; the new unpublished `timestretch-wasm` crate adds `wasm-bindgen`
+  JavaScript/TypeScript bindings for `render` and `StreamSession`, a browser
+  example and AudioWorklet guidance. CI builds the target and runs a Node
+  smoke test of the bindings.
+- The desktop deck app builds for the browser and is deployed to GitHub
+  Pages. It shares the native app's code; the deck worker and audio
+  scheduling run on the page's main thread.
+
+### Fixed
+
+- `analyze` no longer panics on `wasm32-unknown-unknown`, which has no
+  clock; `AnalysisReport::analysis_elapsed_secs` is zero there.
+
 ## 0.16.0
 
 ### Breaking changes

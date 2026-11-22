@@ -59,6 +59,20 @@ jobs:
       - run: python -B tools/qualify.py --quick --output target/contributor-smoke
       # Wall-clock/device headroom is qualified on declared hardware with
       # tools/qualify.py; noisy hosted CI cannot certify it.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --target wasm32-unknown-unknown -p timestretch --no-default-features
+      - run: cargo check --target wasm32-unknown-unknown -p timestretch --no-default-features --features analysis,io
+      - run: cargo clippy --target wasm32-unknown-unknown -p timestretch-wasm -p timestretch-desktop -- -D warnings
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - run: wasm-pack build crates/timestretch-wasm --target nodejs --out-dir pkg-node
+      - run: node crates/timestretch-wasm/tests/smoke.mjs
   public-corpus:
     runs-on: ubuntu-latest
     steps:
