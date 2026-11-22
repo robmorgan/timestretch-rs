@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.16.1 (unreleased)
+## 0.17.0
 
 ### Added
 
@@ -12,6 +12,7 @@
 - The desktop deck app builds for the browser and is deployed to GitHub
   Pages. It shares the native app's code; the deck worker and audio
   scheduling run on the page's main thread.
+- The desktop app loads tracks dropped onto its window.
 
 ### Fixed
 

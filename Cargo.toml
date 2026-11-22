@@ -1,6 +1,6 @@
 [package]
 name = "timestretch"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 description = "timestretch audio time and pitch processing with host-driven streaming"
 license = "MIT"
@@ -12,8 +12,8 @@ repository = "https://github.com/robmorgan/timestretch-rs"
 exclude = ["samples", "optimize", "desktop", "docs", "tools", "benchmarks/artifacts"]
 
 [dependencies]
-timestretch-core = { version = "0.16.0", path = "crates/timestretch-core", default-features = false }
-timestretch-analysis = { version = "0.16.0", path = "crates/timestretch-analysis", optional = true }
+timestretch-core = { version = "0.17.0", path = "crates/timestretch-core", default-features = false }
+timestretch-analysis = { version = "0.17.0", path = "crates/timestretch-analysis", optional = true }
 serde_json = { version = "1", optional = true }
 
 [features]

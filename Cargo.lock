@@ -3958,7 +3958,7 @@ dependencies = [
 
 [[package]]
 name = "timestretch"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "hound",
  "serde",
@@ -3976,7 +3976,7 @@ version = "0.1.0"
 
 [[package]]
 name = "timestretch-analysis"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "ebur128",
  "rustfft",
@@ -3986,7 +3986,7 @@ dependencies = [
 
 [[package]]
 name = "timestretch-core"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "rustfft",
  "serde_json",
@@ -4014,7 +4014,7 @@ dependencies = [
 
 [[package]]
 name = "timestretch-qa"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "audio_thread_priority",
  "cpal",
@@ -4026,7 +4026,7 @@ dependencies = [
 
 [[package]]
 name = "timestretch-wasm"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "timestretch",
  "wasm-bindgen",
