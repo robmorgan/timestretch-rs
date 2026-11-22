@@ -355,14 +355,26 @@ impl GrainSynthesis {
         let output_center = self.pad as i64 + i64::from(center);
         let reserve = (period as f32).mul_add(1.0, 1.5).floor() as usize;
         let size = (self.pad + self.capacity) as i64;
+        let source_end = source_center + i64::from(period);
         if source_start < 0
             || destination_start < 0
-            || source_center + i64::from(period) > size
+            || source_end > size
             || output_center + reserve as i64 > size
-            || source_center + i64::from(period)
-                > self.pad as i64 + i64::from(self.state.buffered_input)
         {
             return Err(super::invalid("grain requires unavailable padded samples"));
+        }
+        // The outer schedule paces input; it does not wait for this grain's
+        // lookahead. When the newest mark is selected, the grain can reach a
+        // few samples past the buffered input, where the storage holds stale
+        // audio from before the last discard. Those samples read as silence.
+        // They sit at the end of the falling flank, where the window is near
+        // zero. `push` overwrites this region with the real samples later.
+        let buffered_end = self.pad + self.state.buffered_input.max(0) as usize;
+        if source_end as usize > buffered_end {
+            let stale_start = buffered_end.max(source_start as usize);
+            for channel in &mut self.input {
+                channel[stale_start..source_end as usize].fill(0.0);
+            }
         }
         let left = left as usize;
         let period = period as usize;
@@ -423,5 +435,32 @@ mod long_stream_tests {
         };
         assert_eq!(run(0), run(i64::from(i32::MAX) - 512));
         assert_eq!(run(0), run(1_i64 << 40));
+    }
+
+    /// A grain whose falling flank reaches past the buffered input renders
+    /// the missing samples as silence, whatever stale audio the storage held.
+    #[test]
+    fn grain_reaching_past_buffered_input_reads_silence() {
+        let input: Vec<_> = (0..2048).map(|i| (i as f32 * 0.03).sin() * 0.2).collect();
+        const SHORT: usize = 4;
+        // Reference: the same grain with the missing samples supplied as zeros.
+        let mut padded = input.clone();
+        padded.extend([0.0; SHORT]);
+        let mut expected = GrainSynthesis::new(1, 4096, 1024).unwrap();
+        expected.push(&[&padded]).unwrap();
+        expected.grain(128, 128, 2048 - 128 + SHORT as i64).unwrap();
+
+        let mut synth = GrainSynthesis::new(1, 4096, 1024).unwrap();
+        synth.push(&[&input]).unwrap();
+        // Stale audio left behind the buffered input by an earlier discard.
+        let end = synth.pad + input.len();
+        synth.input[0][end..end + 64].fill(0.9);
+        synth.grain(128, 128, 2048 - 128 + SHORT as i64).unwrap();
+        assert_eq!(synth.output, expected.output);
+        assert_eq!(synth.state.next_center, expected.state.next_center);
+
+        // Input pushed afterwards lands where the silence was read.
+        synth.push(&[&[0.5; 8]]).unwrap();
+        assert_eq!(synth.input[0][end..end + 8], [0.5; 8]);
     }
 }

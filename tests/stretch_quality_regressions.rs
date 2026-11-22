@@ -364,3 +364,60 @@ fn test_ratio_sweep_click_pad_transient_survival() {
 fn stretch(input: &[f32], config: &SessionConfig) -> Result<Vec<f32>, timestretch::SessionError> {
     timestretch::render(input, config.clone()).map(|r| r.samples)
 }
+
+/// Issue #91: sparse kicks at tempo 2 select the newest pitch mark, whose
+/// grain reaches a few samples past the buffered input. That used to fault
+/// with "grain requires unavailable padded samples" and stop the stream.
+#[test]
+fn test_sparse_kick_train_at_double_tempo_does_not_fault() {
+    use std::f64::consts::TAU;
+    const RATE: usize = 48_000;
+    const SECONDS: usize = 6;
+    // A 250 ms kick: 180 Hz falling to 50 Hz.
+    let mut phase = 0f64;
+    let kick: Vec<f32> = (0..RATE / 4)
+        .map(|i| {
+            let t = i as f64 / RATE as f64;
+            phase += TAU * (50. + 130. * (-t / 0.03).exp()) / RATE as f64;
+            (phase.sin() * (-t / 0.07).exp() * 0.85) as f32
+        })
+        .collect();
+    // Kicks 450 to 750 ms apart from a fixed xorshift seed; this seed hit
+    // the fault on 0.16.0.
+    let mut state = 10u64.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+    let mut unit = move || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        (state.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut audio = vec![0f32; SECONDS * RATE * 2];
+    let mut at = 2.0;
+    while at < SECONDS as f64 - 0.5 {
+        let start = (at * RATE as f64) as usize;
+        for (i, sample) in kick.iter().enumerate() {
+            audio[(start + i) * 2] += sample;
+            audio[(start + i) * 2 + 1] += sample;
+        }
+        at += 0.45 + 0.3 * unit();
+    }
+    let config = SessionConfig {
+        backend: Backend::Portable,
+        source_sample_rate: RATE as u32,
+        output_sample_rate: RATE as u32,
+        channels: 2,
+        parameters: Parameters::keylock(timestretch::TempoRate::new(2.0).unwrap()),
+        ..Default::default()
+    };
+    let output = timestretch::render(&audio, config)
+        .expect("render must not fault")
+        .samples;
+    let frames = output.len() / 2;
+    assert!(
+        (frames as f64 / (SECONDS * RATE / 2) as f64 - 1.0).abs() < 0.01,
+        "unexpected length: {frames} frames"
+    );
+    assert!(output.iter().all(|x| x.is_finite()));
+    let peak = output.iter().fold(0f32, |m, x| m.max(x.abs()));
+    assert!((0.3..=1.2).contains(&peak), "kick peak {peak}");
+}
